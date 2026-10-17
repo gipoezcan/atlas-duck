@@ -6,9 +6,10 @@
 //! and a non-empty `blocked` means the release must not happen. Drops remove keys and elements
 //! and never write `null`, `""` or `[]`; masking is the only redaction that leaves a placeholder.
 //!
-//! Order inside [`apply`]: drops (`DropItem`, `DropField`, presets) in the order given, then every
-//! every-occurrence mask, then the single-occurrence masks, then the mirror check, then the final
-//! every-occurrence pass. "Also appears in" is computed after the drops, before any mask.
+//! Order inside [`apply`]: drops (`DropItem`, `DropField`, presets) in the order given, then the
+//! mirror check (before any mask, so a mask cannot pair an orphan: review T19c I-1), then every
+//! every-occurrence mask, then the single-occurrence masks, then the final every-occurrence pass.
+//! "Also appears in" is computed after the drops, before any mask.
 
 mod apply;
 mod entities;
@@ -150,10 +151,12 @@ pub enum BlockReason {
     UnstableEncoding { path: String },
     /// A hit no view could mask and re-encode cleanly.
     ReencodeAmbiguous { path: String },
-    /// A mirror entry without a source counterpart, or a key dropped from a source entry that is
-    /// still on its mirror entry.
+    /// A mirror entry without a source counterpart (also one the source has without counterpart
+    /// that is still there, whatever was dropped of it, and one whose mirror key alone a drop
+    /// takes), or a key dropped from a source entry that is still on its mirror entry.
     MirrorOrphan { path: String },
-    /// A keyless mirror entry in arrays of different lengths.
+    /// A keyless mirror entry in arrays of different lengths (also one the source has so that is
+    /// still there).
     MirrorUnmatchable { path: String },
     /// Plan addition: an op that names nothing in the candidate. A drop path that does not
     /// parse or matches nothing (a key holding `.`, `[` or `]` cannot be addressed), a preset

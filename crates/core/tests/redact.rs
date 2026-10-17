@@ -1443,6 +1443,797 @@ fn ops_that_match_nothing_block() -> TestResult {
     Ok(())
 }
 
+/// A list whose `[3]` has no `x` while the `[4]` after it has one: once `[2]` is dropped, the
+/// shown `[3]` is the source's `[4]`.
+fn shifted_list() -> Value {
+    json!({"list": [
+        {"id": 0, "x": "a0"},
+        {"id": 1},
+        {"id": 2, "x": "a2"},
+        {"id": 3},
+        {"id": 4, "x": "a4"}
+    ]})
+}
+
+fn drop_id(array_path: &str, id: Value) -> RedactionOp {
+    RedactionOp::DropItem {
+        array_path: array_path.into(),
+        key: "id".into(),
+        value: id,
+    }
+}
+
+/// M8 T19c (L123, L217): a drop appended after earlier drops of the same revision is checked for
+/// existence against the source **or** the document the earlier drops left, and acts on that
+/// document (the index semantics of the shown candidate): the set gives what applying the ops one
+/// by one to the shown candidate gives.
+#[test]
+fn drop_after_earlier_drops_checks_existence_against_current_doc() -> TestResult {
+    let source = shifted_list();
+    let tail = drop_field("list[3].x", DropScope::PerItem);
+    for first in [
+        drop_field("list[2]", DropScope::PerItem),
+        drop_id("list", json!(2)),
+    ] {
+        let shown = apply(&source, &NO_RULES, None, std::slice::from_ref(&first));
+        assert!(shown.blocked.is_empty(), "{:?}", shown.blocked);
+        let one_by_one = apply(
+            &shown.released,
+            &NO_RULES,
+            None,
+            std::slice::from_ref(&tail),
+        );
+        assert!(one_by_one.blocked.is_empty(), "{:?}", one_by_one.blocked);
+        let out = apply(&source, &NO_RULES, None, &[first.clone(), tail.clone()]);
+        assert!(out.blocked.is_empty(), "{first:?}: {:?}", out.blocked);
+        assert_eq!(out.released, one_by_one.released, "{first:?}");
+        assert_eq!(
+            out.released,
+            json!({"list": [
+                {"id": 0, "x": "a0"}, {"id": 1}, {"id": 3}, {"id": 4}
+            ]})
+        );
+        assert_eq!(out.meta.items_dropped, 1);
+        assert_eq!(out.meta.fields_dropped, vec!["x"]);
+    }
+    // An item drop whose array is named past a shifted index: the source's `groups[1].items` has
+    // no `c`, the shown one (the source's `groups[2]`) has.
+    let groups = json!({"groups": [
+        {"g": 0, "items": [{"id": "a"}]},
+        {"g": 1, "items": [{"id": "b"}]},
+        {"g": 2, "items": [{"id": "c"}, {"id": "d"}]}
+    ]});
+    let ops = [
+        drop_field("groups[0]", DropScope::PerItem),
+        drop_id("groups[1].items", json!("c")),
+    ];
+    let shown = apply(&groups, &NO_RULES, None, &ops[..1]);
+    let one_by_one = apply(&shown.released, &NO_RULES, None, &ops[1..]);
+    let out = apply(&groups, &NO_RULES, None, &ops);
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    assert_eq!(out.released, one_by_one.released);
+    assert_eq!(
+        out.released,
+        json!({"groups": [
+            {"g": 1, "items": [{"id": "b"}]},
+            {"g": 2, "items": [{"id": "d"}]}
+        ]})
+    );
+    Ok(())
+}
+
+/// M8 T19c: fail closed. A drop that names nothing in the source **and** nothing in the document
+/// the earlier drops left is refused (`OpTargetMissing`); one the earlier ops already removed (it
+/// named something in the source) is not a mismatch.
+#[test]
+fn drop_absent_in_original_and_current_doc_is_refused() -> TestResult {
+    let source = shifted_list();
+    let first = drop_field("list[2]", DropScope::PerItem);
+    for (op, at) in [
+        // `[1]` has no `x` in either document.
+        (drop_field("list[1].x", DropScope::PerItem), "list[1].x"),
+        // Past the end of both.
+        (drop_field("list[7]", DropScope::PerItem), "list[7]"),
+        (drop_field("list[].y", DropScope::AllItems), "list[].y"),
+        // No element with that key value in either.
+        (drop_id("list", json!(9)), "list"),
+        (drop_id("list[3].sub", json!(1)), "list[3].sub"),
+    ] {
+        let out = apply(&source, &NO_RULES, None, &[first.clone(), op.clone()]);
+        assert!(
+            has_block(&out, &BlockReason::OpTargetMissing { path: at.into() }),
+            "{op:?}: {:?}",
+            out.blocked
+        );
+    }
+    // Control: a repeat of an earlier drop names something in the source; the earlier op
+    // removed it, nothing more goes and nothing blocks.
+    for repeat in [
+        drop_id("list", json!(2)),
+        drop_field("list[2].x", DropScope::PerItem),
+    ] {
+        let ops = [
+            drop_id("list", json!(2)),
+            drop_field("list[].x", DropScope::AllItems),
+            repeat,
+        ];
+        let out = apply(&source, &NO_RULES, None, &ops);
+        assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+        assert_eq!(
+            out.released,
+            json!({"list": [{"id": 0}, {"id": 1}, {"id": 3}, {"id": 4}]})
+        );
+    }
+    Ok(())
+}
+
+// ---- §5.3 mirror pairing cannot be spoofed (M8 T19c review I-1) ----------------------------------
+
+const RENDERED: &str = "renderedFields.comment.comments";
+
+/// The comment mirror with `src` and `dst` entries.
+fn mirrored(src: Value, dst: Value) -> Value {
+    json!({
+        "fields": {"comment": {"comments": src}},
+        "renderedFields": {"comment": {"comments": dst}}
+    })
+}
+
+/// Arrays of the same length; the rendered `[1]` (id 9, restricted) has no source counterpart,
+/// the source's id 8 has no rendered one.
+fn one_orphan() -> Value {
+    mirrored(
+        json!([{"id": "7", "body": "plain"}, {"id": "8", "body": "other"}]),
+        json!([
+            {"id": "7", "body": "<p>plain</p>"},
+            {"id": "9", "body": "<p>orphan secret</p>", "visibility": {"type": "role", "value": "Administrators"}}
+        ]),
+    )
+}
+
+/// The rendered `[1]` (id 9) and `[3]` (id 11) have no source counterpart.
+fn two_orphans() -> Value {
+    mirrored(
+        json!([{"id": "7", "body": "plain"}, {"id": "8", "body": "other"}]),
+        json!([
+            {"id": "7", "body": "<p>plain</p>"},
+            {"id": "9", "body": "<p>orphan secret</p>"},
+            {"id": "8", "body": "<p>other</p>"},
+            {"id": "11", "body": "<p>second orphan</p>"}
+        ]),
+    )
+}
+
+fn rendered_orphan(i: usize) -> BlockReason {
+    BlockReason::MirrorOrphan {
+        path: format!("{RENDERED}[{i}]"),
+    }
+}
+
+fn single_at(text: &str, at: &str) -> RedactionOp {
+    RedactionOp::MaskText {
+        text: text.into(),
+        every_occurrence: false,
+        at: Some(at.into()),
+    }
+}
+
+/// Review T19c I-1 (a), the probe flow: in arrays of the same length a keyless rendered entry
+/// pairs by position, so dropping only the orphan's mirror key made it look paired and the
+/// restricted body was released. Every way of dropping that key alone (by index, by
+/// `[key=value]`, across all items, after the source's keys went) blocks; the entry is still
+/// there.
+#[test]
+fn a_dropped_mirror_key_does_not_pair_an_orphan() -> TestResult {
+    let r = rules("jira.issue.get")?;
+    let source = one_orphan();
+    let out = apply(&source, r, None, &[]);
+    assert_eq!(out.blocked, vec![rendered_orphan(1)]);
+    for ops in [
+        vec![drop_field(
+            "renderedFields.comment.comments[1].id",
+            DropScope::PerItem,
+        )],
+        vec![drop_field(
+            "renderedFields.comment.comments[id=9].id",
+            DropScope::PerItem,
+        )],
+        vec![drop_field(
+            "renderedFields.comment.comments[].id",
+            DropScope::AllItems,
+        )],
+        vec![
+            drop_field("fields.comment.comments[].id", DropScope::AllItems),
+            drop_field("renderedFields.comment.comments[1].id", DropScope::PerItem),
+        ],
+    ] {
+        let out = apply(&source, r, None, &ops);
+        assert!(
+            has_block(&out, &rendered_orphan(1)),
+            "{ops:?}: {:?}",
+            out.blocked
+        );
+        assert!(
+            out.blocked
+                .iter()
+                .all(|b| matches!(b, BlockReason::MirrorOrphan { .. })),
+            "{ops:?}: {:?}",
+            out.blocked
+        );
+    }
+    Ok(())
+}
+
+/// Review T19c I-1 (b), the probe flow: masks that turn the orphan's id and a source-only id
+/// into the same text (whole, as a partial pattern, every occurrence or single) made the orphan
+/// "find" a counterpart, as the check ran after the masks. The pairing is decided after the drops
+/// and before any mask, on the keys as the source shows them.
+#[test]
+fn masks_do_not_pair_an_orphan() -> TestResult {
+    let r = rules("jira.issue.get")?;
+    let partial = mirrored(
+        json!([{"id": "7", "body": "plain"}, {"id": "18", "body": "other"}]),
+        json!([
+            {"id": "7", "body": "<p>plain</p>"},
+            {"id": "19", "body": "<p>orphan secret</p>"}
+        ]),
+    );
+    for (source, ops) in [
+        (
+            one_orphan(),
+            vec![
+                mask("9"),
+                mask("8"),
+                RedactionOp::UrlField {
+                    mode: UrlMode::ReplaceWhole,
+                },
+            ],
+        ),
+        // Partial pattern: "1[REDACTED]" on both sides.
+        (partial, vec![mask("9"), mask("8")]),
+        // Single occurrences at the two ids.
+        (
+            one_orphan(),
+            vec![
+                single_at("9", "renderedFields.comment.comments[1].id"),
+                single_at("8", "fields.comment.comments[1].id"),
+            ],
+        ),
+    ] {
+        let out = apply(&source, r, None, &ops);
+        assert!(
+            has_block(&out, &rendered_orphan(1)),
+            "{ops:?}: {:?}",
+            out.blocked
+        );
+    }
+    Ok(())
+}
+
+/// The pairing a drop breaks is checked before the masks too, not only a source orphan's: a
+/// duplicate rendered entry dropped takes its source counterpart with it (§5.3), which leaves the
+/// other duplicate without one; masks of both ids must not hide that.
+#[test]
+fn a_pairing_a_drop_breaks_is_checked_before_the_masks() -> TestResult {
+    let r = rules("jira.issue.get")?;
+    let source = mirrored(
+        json!([{"id": "1", "body": "a"}, {"id": "2", "body": "b"}]),
+        json!([
+            {"id": "1", "body": "<p>a</p>"},
+            {"id": "1", "body": "<p>a again</p>"},
+            {"id": "2", "body": "<p>b</p>"}
+        ]),
+    );
+    assert!(apply(&source, r, None, &[]).blocked.is_empty());
+    let dropped = drop_field("renderedFields.comment.comments[1]", DropScope::PerItem);
+    let out = apply(&source, r, None, std::slice::from_ref(&dropped));
+    assert_eq!(out.blocked, vec![rendered_orphan(0)]);
+    let out = apply(&source, r, None, &[dropped, mask("1"), mask("2")]);
+    assert!(has_block(&out, &rendered_orphan(0)), "{:?}", out.blocked);
+    Ok(())
+}
+
+/// A bare drop of the mirror key of a rendered entry that has no source counterpart at that
+/// point blocks, also where the drops made it one (not flagged in the source) and the arrays are
+/// of the same length again afterwards.
+#[test]
+fn dropping_the_mirror_key_of_an_unpaired_entry_blocks() -> TestResult {
+    let r = rules("jira.issue.get")?;
+    let source = mirrored(
+        json!([{"id": "1", "body": "a"}, {"id": "2", "body": "b"}, {"id": "3", "body": "c"}]),
+        json!([
+            {"id": "1", "body": "<p>a</p>"},
+            {"id": "1", "body": "<p>a again</p>"},
+            {"id": "2", "body": "<p>b</p>"}
+        ]),
+    );
+    assert!(apply(&source, r, None, &[]).blocked.is_empty());
+    let ops = [
+        drop_field("renderedFields.comment.comments[1]", DropScope::PerItem),
+        drop_field("renderedFields.comment.comments[0].id", DropScope::PerItem),
+    ];
+    let out = apply(&source, r, None, &ops);
+    assert!(has_block(&out, &rendered_orphan(0)), "{:?}", out.blocked);
+    Ok(())
+}
+
+/// The ruling's "unless the whole flagged entry is dropped": an entry the source's check flags
+/// blocks for as long as it is in the result, whatever the drops did around it. Here keyless
+/// rendered entries in arrays of different lengths, made the same length by dropping a keyed
+/// source entry that has no rendered counterpart.
+#[test]
+fn a_flagged_entry_blocks_until_it_is_dropped_whole() -> TestResult {
+    let r = rules("jira.issue.get")?;
+    let source = mirrored(
+        json!([{"id": "1", "body": "a"}, {"body": "b"}, {"body": "c"}]),
+        json!([{"body": "<p>b</p>"}, {"body": "<p>restricted</p>"}]),
+    );
+    let unmatchable = |i: usize| BlockReason::MirrorUnmatchable {
+        path: format!("{RENDERED}[{i}]"),
+    };
+    assert_eq!(
+        apply(&source, r, None, &[]).blocked,
+        vec![unmatchable(0), unmatchable(1)]
+    );
+    for ops in [
+        vec![drop_id("fields.comment.comments", json!("1"))],
+        vec![drop_field("fields.comment.comments[0]", DropScope::PerItem)],
+    ] {
+        let out = apply(&source, r, None, &ops);
+        assert_eq!(out.blocked, vec![unmatchable(0), unmatchable(1)], "{ops:?}");
+    }
+    // The way out: the whole mirrored array (its source array goes with it).
+    let out = apply(
+        &source,
+        r,
+        None,
+        &[drop_field(RENDERED, DropScope::PerItem)],
+    );
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    assert!(
+        out.released["renderedFields"]["comment"]
+            .get("comments")
+            .is_none()
+    );
+    Ok(())
+}
+
+/// Controls: dropping the flagged entries makes the candidate releasable, by identity or by index
+/// on the document the earlier drops left (also after a drop shifted them), with masks of other
+/// fields, a mask that hits paired ids, and the key drop of a paired entry. A round appended to
+/// ops that dropped one orphan still has to drop the other whole.
+#[test]
+fn dropping_the_flagged_entries_passes_and_nothing_else_does() -> TestResult {
+    let r = rules("jira.issue.get")?;
+    let source = two_orphans();
+    let at = |i: usize| drop_field(&format!("{RENDERED}[{i}]"), DropScope::PerItem);
+    let rest = json!([
+        {"id": "7", "body": "<p>plain</p>"},
+        {"id": "8", "body": "<p>other</p>"}
+    ]);
+    for ops in [
+        vec![
+            drop_id(RENDERED, json!("9")),
+            drop_id(RENDERED, json!("11")),
+        ],
+        vec![at(3), at(1)],
+        vec![drop_id(RENDERED, json!("11")), at(1)],
+        vec![
+            drop_field("renderedFields.comment.comments[id=9]", DropScope::PerItem),
+            at(2),
+        ],
+    ] {
+        let out = apply(&source, r, None, &ops);
+        assert!(out.blocked.is_empty(), "{ops:?}: {:?}", out.blocked);
+        assert_eq!(out.released["renderedFields"]["comment"]["comments"], rest);
+    }
+    // A paired entry dropped first shifts both orphans; the index drops name them where they are.
+    let out = apply(
+        &source,
+        r,
+        None,
+        &[drop_id(RENDERED, json!("7")), at(2), at(0)],
+    );
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    assert_eq!(
+        out.released["renderedFields"]["comment"]["comments"],
+        json!([{"id": "8", "body": "<p>other</p>"}])
+    );
+    // ...and a stale index drops another entry: the orphans stay and block where they now are.
+    let out = apply(&source, r, None, &[drop_id(RENDERED, json!("7")), at(1)]);
+    assert_eq!(out.blocked, vec![rendered_orphan(0), rendered_orphan(1)]);
+    // Masks and key drops on the rest, after the flagged entries are gone.
+    let drops = [at(3), at(1)];
+    for extra in [
+        vec![mask("plain")],
+        vec![mask("7")],
+        vec![drop_field(
+            "renderedFields.comment.comments[0].id",
+            DropScope::PerItem,
+        )],
+        vec![drop_field(
+            "fields.comment.comments[].id",
+            DropScope::AllItems,
+        )],
+    ] {
+        let ops: Vec<RedactionOp> = drops.iter().cloned().chain(extra.clone()).collect();
+        let out = apply(&source, r, None, &ops);
+        assert!(out.blocked.is_empty(), "{extra:?}: {:?}", out.blocked);
+    }
+    // Rounds: one orphan dropped earlier, the other's key (or a mask of it) now.
+    for round in [
+        vec![drop_field(
+            "renderedFields.comment.comments[1].id",
+            DropScope::PerItem,
+        )],
+        vec![mask("9"), mask("8")],
+    ] {
+        let ops: Vec<RedactionOp> = std::iter::once(at(3)).chain(round.clone()).collect();
+        let out = apply(&source, r, None, &ops);
+        assert!(
+            has_block(&out, &rendered_orphan(1)),
+            "{round:?}: {:?}",
+            out.blocked
+        );
+    }
+    Ok(())
+}
+
+// ---- identity ops after a drop of the identity key (M8 T19c review I-1') -------------------------
+
+const SOURCE: &str = "fields.comment.comments";
+
+/// Two paired comments; 7's body is what the approver drops.
+fn two_comments() -> Value {
+    mirrored(
+        json!([{"id": "7", "body": "plain secret"}, {"id": "8", "body": "other"}]),
+        json!([
+            {"id": "7", "body": "<p>plain secret</p>"},
+            {"id": "8", "body": "<p>other</p>"}
+        ]),
+    )
+}
+
+/// Whether any string value or key of the released candidate contains `text`.
+fn released_text(out: &RedactionOutcome, text: &str) -> bool {
+    strings(&out.released).iter().any(|s| s.contains(text))
+}
+
+/// Review T19c I-1', the probe flows: an identity drop (`DropItem id=7`, `drop_field [id=7]`)
+/// after a drop of the same element's identity key (the rendered or the source key, by identity
+/// or by index; the §5.3 mirror takes the other side's key with it) was a silent no-op: "absent
+/// now, present in the source" read as "removed already", and comment 7 was released raw and
+/// rendered with `blocked []`. Identity is the source's: the element is still there and goes,
+/// with its mirrored entry.
+#[test]
+fn an_identity_drop_after_its_key_drop_removes_the_element() -> TestResult {
+    let r = rules("jira.issue.get")?;
+    let source = two_comments();
+    let rest = mirrored(
+        json!([{"id": "8", "body": "other"}]),
+        json!([{"id": "8", "body": "<p>other</p>"}]),
+    );
+    for key in [
+        format!("{RENDERED}[id=7].id"),
+        format!("{SOURCE}[id=7].id"),
+        format!("{RENDERED}[0].id"),
+        format!("{SOURCE}[0].id"),
+    ] {
+        for element in [
+            drop_id(RENDERED, json!("7")),
+            drop_id(SOURCE, json!("7")),
+            drop_field(&format!("{RENDERED}[id=7]"), DropScope::PerItem),
+            drop_field(&format!("{SOURCE}[id=7]"), DropScope::PerItem),
+        ] {
+            let ops = [drop_field(&key, DropScope::PerItem), element];
+            let out = apply(&source, r, None, &ops);
+            assert!(out.blocked.is_empty(), "{ops:?}: {:?}", out.blocked);
+            assert_eq!(out.released, rest, "{ops:?}");
+        }
+    }
+    // A field of the element named by identity after the key drop: both bodies go.
+    let ops = [
+        drop_field(&format!("{RENDERED}[id=7].id"), DropScope::PerItem),
+        drop_field(&format!("{RENDERED}[id=7].body"), DropScope::PerItem),
+    ];
+    let out = apply(&source, r, None, &ops);
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    assert!(!released_text(&out, "plain secret"), "{}", out.released);
+    Ok(())
+}
+
+/// The element is found where the earlier drops left it, and its mirrored entry by the source's
+/// key, not by position: the rendered order is the reverse of the source's, or an earlier drop
+/// shifted both arrays.
+#[test]
+fn an_identity_drop_after_its_key_drop_pairs_by_the_source_key_across_shifts() -> TestResult {
+    let r = rules("jira.issue.get")?;
+    let reversed = mirrored(
+        json!([
+            {"id": "7", "body": "plain secret"},
+            {"id": "8", "body": "other"},
+            {"id": "9", "body": "third"}
+        ]),
+        json!([
+            {"id": "9", "body": "<p>third</p>"},
+            {"id": "8", "body": "<p>other</p>"},
+            {"id": "7", "body": "<p>plain secret</p>"}
+        ]),
+    );
+    let ops = [
+        drop_field(&format!("{RENDERED}[id=7].id"), DropScope::PerItem),
+        drop_id(RENDERED, json!("7")),
+    ];
+    let out = apply(&reversed, r, None, &ops);
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    assert_eq!(
+        out.released,
+        mirrored(
+            json!([{"id": "8", "body": "other"}, {"id": "9", "body": "third"}]),
+            json!([{"id": "9", "body": "<p>third</p>"}, {"id": "8", "body": "<p>other</p>"}]),
+        )
+    );
+    let shifted = mirrored(
+        json!([
+            {"id": "6", "body": "first"},
+            {"id": "7", "body": "plain secret"},
+            {"id": "8", "body": "other"}
+        ]),
+        json!([
+            {"id": "6", "body": "<p>first</p>"},
+            {"id": "7", "body": "<p>plain secret</p>"},
+            {"id": "8", "body": "<p>other</p>"}
+        ]),
+    );
+    for ops in [
+        vec![
+            drop_field(&format!("{RENDERED}[0]"), DropScope::PerItem),
+            drop_field(&format!("{RENDERED}[0].id"), DropScope::PerItem),
+            drop_id(RENDERED, json!("7")),
+        ],
+        vec![
+            drop_id(SOURCE, json!("6")),
+            drop_field(&format!("{SOURCE}[id=7].id"), DropScope::PerItem),
+            drop_field(&format!("{RENDERED}[id=7]"), DropScope::PerItem),
+        ],
+    ] {
+        let out = apply(&shifted, r, None, &ops);
+        assert!(out.blocked.is_empty(), "{ops:?}: {:?}", out.blocked);
+        assert_eq!(
+            out.released,
+            mirrored(
+                json!([{"id": "8", "body": "other"}]),
+                json!([{"id": "8", "body": "<p>other</p>"}]),
+            ),
+            "{ops:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The same at item level (`jira.search`): the issue's `key` dropped, then the issue, one of its
+/// fields (with the rendered copy) or one of its comments named by that key.
+#[test]
+fn search_identity_drops_after_the_key_drop() -> TestResult {
+    let r = rules("jira.search")?;
+    let key_drop = drop_field("issues[key=ABC-1].key", DropScope::PerItem);
+    let out = apply(
+        &search_fixture(),
+        r,
+        Some("issues"),
+        &[
+            key_drop.clone(),
+            RedactionOp::DropItem {
+                array_path: "issues".into(),
+                key: "key".into(),
+                value: json!("ABC-1"),
+            },
+        ],
+    );
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    assert_eq!(out.released["issues"].as_array().map(Vec::len), Some(1));
+    assert_eq!(out.released["issues"][0]["key"], "ABC-2");
+    assert_eq!(out.meta.items_dropped, 1);
+
+    let out = apply(
+        &search_fixture(),
+        r,
+        Some("issues"),
+        &[
+            key_drop.clone(),
+            drop_field("issues[key=ABC-1].fields.customfield_1", DropScope::PerItem),
+        ],
+    );
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    assert!(!released_text(&out, "ABC-1 secret"), "{}", out.released);
+    assert_eq!(
+        out.released["issues"][1]["renderedFields"]["customfield_1"],
+        "<p>ABC-2 secret</p>"
+    );
+
+    let comments = "issues[key=ABC-1].renderedFields.comment.comments";
+    let out = apply(
+        &search_fixture(),
+        r,
+        Some("issues"),
+        &[
+            key_drop,
+            drop_field(&format!("{comments}[id=11].id"), DropScope::PerItem),
+            drop_id(comments, json!("11")),
+        ],
+    );
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    let first = &out.released["issues"][0];
+    assert_eq!(first["fields"]["comment"]["comments"], json!([]));
+    assert_eq!(first["renderedFields"]["comment"]["comments"], json!([]));
+    Ok(())
+}
+
+/// A registry copy is found by identity too: a changelog item whose `fieldId` was dropped is
+/// still the field's history and goes with the field.
+#[test]
+fn a_changelog_copy_goes_after_its_key_field_drop() -> TestResult {
+    let out = apply(
+        &issue_fixture(),
+        rules("jira.issue.get")?,
+        None,
+        &[
+            drop_field(
+                "changelog.histories[0].items[0].fieldId",
+                DropScope::PerItem,
+            ),
+            drop_field("fields.customfield_1", DropScope::AllItems),
+        ],
+    );
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    assert!(!released_text(&out, "secret value"), "{}", out.released);
+    assert_eq!(
+        out.released["changelog"]["histories"],
+        json!([{"id": "101", "items": [
+            {"field": "summary", "fieldtype": "jira", "fieldId": "summary",
+             "fromString": "draft", "toString": "Quarterly plan"}
+        ]}])
+    );
+    Ok(())
+}
+
+/// Fail closed (review T19c I-1'): an identity op that matches nothing where the earlier drops left
+/// the document is a no-op only when tracking shows that every element it names in the source
+/// went whole. One still there (here named past a shifted index) is refused, not skipped.
+#[test]
+fn an_identity_op_is_a_no_op_only_when_its_elements_went() -> TestResult {
+    let groups = json!({"groups": [
+        {"g": 0, "items": [{"id": "a"}]},
+        {"g": 1, "items": [{"id": "b"}]},
+        {"g": 2, "items": [{"id": "c"}, {"id": "d"}]}
+    ]});
+    // The shown `groups[1]` is the source's `groups[2]`; the source's `b` is still there.
+    for (op, at) in [
+        (drop_id("groups[1].items", json!("b")), "groups[1].items"),
+        (
+            drop_field("groups[1].items[id=b]", DropScope::PerItem),
+            "groups[1].items[id=b]",
+        ),
+        (
+            drop_field("groups[1].items[id=b].id", DropScope::PerItem),
+            "groups[1].items[id=b].id",
+        ),
+    ] {
+        let ops = [drop_field("groups[0]", DropScope::PerItem), op];
+        let out = apply(&groups, &NO_RULES, None, &ops);
+        assert!(
+            has_block(&out, &BlockReason::OpTargetMissing { path: at.into() }),
+            "{ops:?}: {:?}",
+            out.blocked
+        );
+    }
+    // Controls: the element went whole earlier (by identity, by index, with a parent).
+    let r = rules("jira.issue.get")?;
+    for first in [
+        drop_id(RENDERED, json!("7")),
+        drop_field(&format!("{RENDERED}[0]"), DropScope::PerItem),
+        drop_field(&format!("{SOURCE}[id=7]"), DropScope::PerItem),
+        drop_field("renderedFields.comment", DropScope::PerItem),
+        drop_field("renderedFields", DropScope::PerItem),
+    ] {
+        for again in [
+            drop_id(RENDERED, json!("7")),
+            drop_field(&format!("{RENDERED}[id=7]"), DropScope::PerItem),
+            drop_field(&format!("{RENDERED}[id=7].body"), DropScope::PerItem),
+        ] {
+            let ops = [first.clone(), again];
+            let out = apply(&two_comments(), r, None, &ops);
+            assert!(out.blocked.is_empty(), "{ops:?}: {:?}", out.blocked);
+        }
+    }
+    Ok(())
+}
+
+/// Review T19c fix m-1: a single-occurrence mask of a paired entry's mirror key masks the mirrored
+/// entry's key too (§5.3: a per-item mask also applies to the mirrored entry). The counterpart was
+/// looked up after the key was rewritten, found none, and the other side's id stayed with "1 other
+/// occurrence remains".
+#[test]
+fn a_single_mask_of_a_mirror_key_masks_the_mirrored_key() -> TestResult {
+    let r = rules("jira.issue.get")?;
+    for at in [format!("{SOURCE}[1].id"), format!("{RENDERED}[1].id")] {
+        let ops = [
+            drop_id(RENDERED, json!("9")),
+            drop_id(RENDERED, json!("11")),
+            single_at("8", &at),
+        ];
+        let out = apply(&two_orphans(), r, None, &ops);
+        assert!(out.blocked.is_empty(), "{at}: {:?}", out.blocked);
+        assert!(
+            out.needs_confirmation.is_empty(),
+            "{at}: {:?}",
+            out.needs_confirmation
+        );
+        assert_eq!(
+            out.released["fields"]["comment"]["comments"][1]["id"], REDACTED,
+            "{at}"
+        );
+        assert_eq!(
+            out.released["renderedFields"]["comment"]["comments"][1]["id"], REDACTED,
+            "{at}"
+        );
+    }
+    // The orphan's key is still not paired by a single mask (it has no counterpart to mask).
+    let out = apply(
+        &one_orphan(),
+        r,
+        None,
+        &[single_at("9", &format!("{RENDERED}[1].id"))],
+    );
+    assert!(has_block(&out, &rendered_orphan(1)), "{:?}", out.blocked);
+    Ok(())
+}
+
+/// Review T19c fix m-6: the flagged-entry tracking follows an item-level shift (`jira.search`):
+/// an orphan in the second issue is reported where it is after the first issue's drop.
+#[test]
+fn a_flagged_entry_follows_an_item_level_shift() -> TestResult {
+    let r = rules("jira.search")?;
+    let mut source = search_fixture();
+    if let Some(a) = source["issues"][1]["renderedFields"]["comment"]["comments"].as_array_mut() {
+        a.push(json!({"id": "99", "body": "<p>orphan secret</p>"}));
+    }
+    let orphan = |i: usize| BlockReason::MirrorOrphan {
+        path: format!("issues[{i}].renderedFields.comment.comments[1]"),
+    };
+    assert_eq!(
+        apply(&source, r, Some("issues"), &[]).blocked,
+        vec![orphan(1)]
+    );
+    for first in [
+        drop_field("issues[0]", DropScope::PerItem),
+        RedactionOp::DropItem {
+            array_path: "issues".into(),
+            key: "key".into(),
+            value: json!("ABC-1"),
+        },
+    ] {
+        let out = apply(&source, r, Some("issues"), std::slice::from_ref(&first));
+        assert_eq!(out.blocked, vec![orphan(0)], "{first:?}");
+    }
+    // The orphan named where it now is: nothing blocks, and it is gone.
+    let out = apply(
+        &source,
+        r,
+        Some("issues"),
+        &[
+            drop_field("issues[0]", DropScope::PerItem),
+            drop_field(
+                "issues[0].renderedFields.comment.comments[1]",
+                DropScope::PerItem,
+            ),
+        ],
+    );
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    assert!(!released_text(&out, "orphan secret"), "{}", out.released);
+    Ok(())
+}
+
 #[test]
 fn whatwg_reference_details() -> TestResult {
     // windows-1252 remap of numeric references 0x80-0x9F.

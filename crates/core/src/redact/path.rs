@@ -37,6 +37,15 @@ struct Seg {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Pattern(Vec<Seg>);
 
+/// The value of field `key` of the element at a location, where the element itself no longer has
+/// it: the source's (an element's identity is the source's, review T19c I-1').
+pub(crate) type Ident<'a> = dyn Fn(&[Step], &str) -> Option<Value> + 'a;
+
+/// No identity beyond the document itself.
+pub(crate) fn no_ident(_: &[Step], _: &str) -> Option<Value> {
+    None
+}
+
 /// `None` for an empty or malformed path.
 pub(crate) fn parse(s: &str) -> Option<Pattern> {
     let mut segs = Vec::new();
@@ -166,8 +175,21 @@ impl Pattern {
         Some(loc)
     }
 
+    /// Whether the pattern names elements by identity (a `[key=value]` selector).
+    pub(crate) fn has_identity(&self) -> bool {
+        self.0
+            .iter()
+            .any(|seg| seg.sels.iter().any(|s| matches!(s, Sel::Eq(..))))
+    }
+
     /// Existing locations under `base` (document order).
     pub(crate) fn resolve_at(&self, doc: &Value, base: &[Step]) -> Vec<Loc> {
+        self.resolve_at_by(doc, base, &no_ident)
+    }
+
+    /// [`resolve_at`](Self::resolve_at), with `[key=value]` matched through `ident` for an element
+    /// that has no `key` itself.
+    pub(crate) fn resolve_at_by(&self, doc: &Value, base: &[Step], ident: &Ident<'_>) -> Vec<Loc> {
         let Some(start) = get(doc, base) else {
             return Vec::new();
         };
@@ -199,7 +221,11 @@ impl Pattern {
                         let keep = match sel {
                             Sel::All => true,
                             Sel::Index(j) => i == *j,
-                            Sel::Eq(k, val) => e.get(k).is_some_and(|x| scalar_is(x, val)),
+                            Sel::Eq(k, val) => match e.get(k) {
+                                Some(x) => scalar_is(x, val),
+                                None => ident(&with(&loc, Step::Index(i)), k)
+                                    .is_some_and(|x| scalar_is(&x, val)),
+                            },
                         };
                         if keep {
                             out.push((with(&loc, Step::Index(i)), e));
@@ -315,6 +341,34 @@ pub(crate) fn remove(doc: &mut Value, loc: &[Step]) -> Option<Value> {
         (Value::Object(o), Step::Key(k)) => o.remove(k),
         (Value::Array(a), Step::Index(i)) if *i < a.len() => Some(a.remove(*i)),
         _ => None,
+    }
+}
+
+/// Follows the location `at` across the removal of `removed`: `false` if it went with it (`at`
+/// is `removed` or under it), else `at` is updated for a shifted array element.
+pub(crate) fn after_removal(at: &mut Loc, removed: &[Step]) -> bool {
+    if at.starts_with(removed) {
+        return false;
+    }
+    if let Some((Step::Index(i), parent)) = removed.split_last()
+        && at.starts_with(parent)
+        && let Some(Step::Index(j)) = at.get_mut(parent.len())
+        && *j > *i
+    {
+        *j -= 1;
+    }
+    true
+}
+
+/// The inverse of [`after_removal`] for a location that survived the removal of `removed`: where
+/// it was before.
+pub(crate) fn before_removal(at: &mut Loc, removed: &[Step]) {
+    if let Some((Step::Index(i), parent)) = removed.split_last()
+        && at.starts_with(parent)
+        && let Some(Step::Index(j)) = at.get_mut(parent.len())
+        && *j >= *i
+    {
+        *j += 1;
     }
 }
 

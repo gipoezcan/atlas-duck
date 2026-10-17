@@ -15,7 +15,9 @@ use atlas_duck_preview::CandidateRev;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::{DecisionError, MSG_NO_WRITE_REDACTIONS, current_rev, decidable, edit_refused};
+use super::{
+    DecisionError, MSG_NO_WRITE_REDACTIONS, current_rev, decidable, edit_refused, takes_redactions,
+};
 use crate::engine::cache::{RebuildError, check_redacted, source_body};
 use crate::engine::read::normalizer;
 use crate::engine::{Engine, script};
@@ -50,8 +52,10 @@ impl fmt::Debug for RedactionReport {
 
 /// Refused like `raw_page`: unknown or not waiting for a decision → `NotDecidable`; another
 /// revision → `Stale`; not opened → `Invalid(NotOpened)`. A write has nothing to redact (as
-/// `decide` refuses its redactions); an outcome item, or a source record that cannot be read for
-/// good, has no content to redact → `Invalid(NotApprovable)`. Nothing of it is logged.
+/// `decide` refuses its redactions); an outcome item, a source record that cannot be read for
+/// good, or a revision that failed closed (a rebuild hash mismatch: only Deny remains, §5.2;
+/// the M-11 mirror case aside, `takes_redactions`) has no content to redact →
+/// `Invalid(NotApprovable)`. Nothing of it is logged.
 pub(super) async fn redaction_preview(
     engine: Arc<Engine>,
     id: String,
@@ -85,6 +89,10 @@ pub(super) async fn redaction_preview(
                 }
             }
         }
+    }
+    // A revision that failed closed takes no redaction, so none is previewed (M-11 aside).
+    if takes_redactions(&engine, &entry).await?.is_none() {
+        return Err(DecisionError::Invalid(InvalidReason::NotApprovable));
     }
     let (spec, rid) = (entry.spec, id.clone());
     let base = if kind == Kind::Script {

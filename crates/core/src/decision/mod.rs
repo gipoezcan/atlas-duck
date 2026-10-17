@@ -73,7 +73,7 @@ use crate::gate::UiEvent;
 use crate::lifecycle::model::{Event, Hold, Kind, Phase, Rejection, ReleaseItem, is_pending, step};
 use crate::ops::{ExecError, MissingField, PreviewModel, op_table};
 use crate::payloads::{self, InvalidReason, ReleasedItem, SubmittedDecision};
-use crate::redact::RedactionOp;
+use crate::redact::{BlockReason, RedactionOp};
 use crate::similarity::SimHit;
 use crate::validate::{ValidateCtx, ValidationError, echo};
 
@@ -195,6 +195,11 @@ pub struct RedactionContext {
     pub ops: Vec<RedactionOp>,
     /// The op's URL-valued field patterns (§5.3 rule 2, `RedactionRules::url_fields`).
     pub url_fields: Vec<&'static str>,
+    /// M8 T19c (M5 M-11, L217): on a revision whose candidate the §5.3 mirror check blocks
+    /// (`release_blocked`), the entries it flags (`MirrorOrphan` / `MirrorUnmatchable`, in
+    /// document order): what "drop the flagged items" drops. Paths into the shown candidate only,
+    /// never a value. Empty on every other revision.
+    pub flagged: Vec<BlockReason>,
 }
 
 impl RedactionContext {
@@ -202,6 +207,7 @@ impl RedactionContext {
         RedactionContext {
             ops,
             url_fields: spec.redaction_rules.url_fields.to_vec(),
+            flagged: Vec::new(),
         }
     }
 }
@@ -684,7 +690,9 @@ async fn read_preview(
         Ok(c) => c,
         Err(RebuildError::Transient(e)) => return Err(DecisionError::Audit(e)),
         // §5.2: the item failed closed; only Deny remains. No candidate, so no preview: the UI
-        // shows `RELEASE_BLOCKED_INTERNAL` for this refusal itself (M5 M-11).
+        // shows `RELEASE_BLOCKED_INTERNAL` for this refusal itself. A candidate the §5.3 mirror
+        // check blocks is not refused here (M-11): it is rebuilt and shown with its flagged
+        // entries, Release disabled.
         Err(_) => return Err(DecisionError::Invalid(InvalidReason::NotApprovable)),
     };
     let built = {
@@ -701,9 +709,14 @@ async fn read_preview(
             })
         }
     };
-    let Some((read, (shown, approvable, opened), failed, redaction)) = built else {
+    let Some((read, (shown, approvable, opened), failed, mut redaction)) = built else {
         return Ok(None);
     };
+    // M-11: a revision the mirror check failed closed shows the entries it flags (from the bytes
+    // this delivery shows), so "drop the flagged items" can be offered on its tree.
+    if failed && let Some(r) = redaction.as_mut() {
+        r.flagged = crate::redact::mirror_reasons(c.value(), &entry.spec.redaction_rules);
+    }
     let (_, cx) = read_context(engine, entry);
     let model = preview_model(&cx, &read, &c);
     let mut warnings = model.warnings;
@@ -1062,9 +1075,52 @@ async fn deny(
     }
 }
 
+/// §5.2: a revision that failed closed (`rebuild_failed`) takes no new redaction ops: only Deny
+/// remains, and a new revision built from the record would switch Release back on. The one
+/// exception is M-11: a revision without ops whose exact candidate (hash checked by
+/// [`candidate`]) the §5.3 mirror check blocks, where dropping the flagged entries gives a new
+/// revision the check runs on again. `Ok(None)`: refuse as not approvable; `Ok(Some(failed))`:
+/// allowed with `rebuild_failed` as it was read, which the new revision's step re-checks under the
+/// gate ([`unchanged_failure`]).
+async fn takes_redactions(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+) -> Result<Option<bool>, DecisionError> {
+    let (failed, no_ops) = {
+        let st = entry.state();
+        (st.rebuild_failed, st.redaction_ops.is_empty())
+    };
+    if !failed {
+        return Ok(Some(false));
+    }
+    if !no_ops {
+        return Ok(None);
+    }
+    match candidate(engine, entry).await {
+        Ok(c) => Ok(
+            crate::redact::mirror_blocked(c.value(), &entry.spec.redaction_rules).then_some(true),
+        ),
+        Err(RebuildError::Transient(e)) => Err(DecisionError::Audit(e)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// The step guard of a redaction [`takes_redactions`] allowed with `failed`: a rebuild failure
+/// marked since (review T19c m-2) refuses it as not approvable.
+fn unchanged_failure(failed: bool) -> impl FnOnce(&EntryState) -> Result<(), Rejection> {
+    move |st| {
+        if st.rebuild_failed == failed {
+            Ok(())
+        } else {
+            Err(Rejection::NotApprovable)
+        }
+    }
+}
+
 /// A new set of redaction ops on the normalized body: a new revision (`CandidateChanged`, inv.
 /// 5) that must be opened before it can be released. No record: the ops are recorded with the
-/// release (`READ_RELEASED.redaction_ops`).
+/// release (`READ_RELEASED.redaction_ops`). A revision that failed closed takes none
+/// ([`takes_redactions`]).
 async fn redact(
     engine: &Arc<Engine>,
     entry: &Arc<RequestEntry>,
@@ -1076,8 +1132,12 @@ async fn redact(
         Ok(snap) => snap,
         Err(rej) => return Err(rejected(engine, entry, rej, rev.counter, dec).await),
     };
+    let Some(failed) = takes_redactions(engine, entry).await? else {
+        let rej = (Rejection::NotApprovable, at);
+        return Err(rejected(engine, entry, rej, rev.counter, dec).await);
+    };
     if entry.kind() == Kind::Script {
-        return redact_script(engine, entry, rev, ops, at).await;
+        return redact_script(engine, entry, rev, ops, at, failed).await;
     }
     let read = entry.state().read.clone();
     let Some(read) = read else {
@@ -1154,10 +1214,11 @@ async fn redact(
     let c = Arc::new(c);
     let (cache, id) = (engine.clone(), entry.head.request_id.clone());
     let applied = engine
-        .step_unlogged(
+        .step_unlogged_if(
             entry,
             Event::CandidateChanged,
             Some(rev.counter),
+            unchanged_failure(failed),
             move |st| {
                 st.candidate_hash = *c.hash();
                 st.redaction_ops = ops;
@@ -1313,6 +1374,7 @@ async fn redact_script(
     rev: CandidateRev,
     ops: Vec<RedactionOp>,
     at: Snapshot,
+    failed: bool,
 ) -> Result<DecisionOutcome, DecisionError> {
     let dec = SubmittedDecision::Release;
     let Some(script) = entry.state().script.clone() else {
@@ -1367,10 +1429,11 @@ async fn redact_script(
     let c = Arc::new(c);
     let (cache, id) = (engine.clone(), entry.head.request_id.clone());
     let applied = engine
-        .step_unlogged(
+        .step_unlogged_if(
             entry,
             Event::CandidateChanged,
             Some(rev.counter),
+            unchanged_failure(failed),
             move |st| {
                 st.candidate_hash = *c.hash();
                 st.redaction_ops = ops;

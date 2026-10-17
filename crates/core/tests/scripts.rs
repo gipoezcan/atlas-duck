@@ -1364,6 +1364,126 @@ async fn raw_page_and_redacted_release_of_a_result() -> TestResult {
     Ok(())
 }
 
+/// §5.2 (M8 T19c): a script result whose rebuild does not reproduce its hash fails closed for
+/// good: no redaction is previewed or taken (a new revision built from the record would switch
+/// Release back on), only Deny remains.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hash_mismatch_script_takes_no_redaction() -> TestResult {
+    use atlas_duck_core::DecisionError;
+    use atlas_duck_core::payloads::InvalidReason;
+    let value = json!({ "keep": 1, "secret": "hunter2" });
+    let (h, _runner) = harness(vec![ScriptPlan::new(Vec::new(), result_end(value))]).await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let ap = h.approver();
+    ap.open(&id).map_err(de)?;
+    assert!(h.corrupt_candidate_hash(&id));
+    let res = ap.release_unopened(&id);
+    assert!(
+        matches!(
+            res,
+            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+        ),
+        "{res:?}"
+    );
+    let rev = ap.rev(&id).map_err(de)?;
+    let ops = vec![atlas_duck_core::RedactionOp::DropField {
+        path: "result.secret".to_owned(),
+        scope: atlas_duck_core::DropScope::PerItem,
+    }];
+    let res = ap.redaction_preview(&id, &ops);
+    assert!(
+        matches!(
+            res,
+            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+        ),
+        "{res:?}"
+    );
+    let invalid = || async {
+        let events = h.events(&id).await?;
+        Ok::<_, TestError>(
+            events
+                .into_iter()
+                .filter(|(t, _)| *t == EventType::DECISION_INVALID)
+                .map(|(_, p)| p)
+                .collect::<Vec<Value>>(),
+        )
+    };
+    let before = invalid().await?.len();
+    let res = ap.redact(&id, ops);
+    assert!(
+        matches!(
+            res,
+            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+        ),
+        "{res:?}"
+    );
+    let logged = invalid().await?;
+    assert_eq!(logged.len(), before + 1, "the refused redaction is logged");
+    let last = logged.last().ok_or("no DECISION_INVALID")?;
+    assert_eq!(
+        (
+            &last["reason"],
+            &last["decision"],
+            &last["submitted_rev"],
+            &last["batch"]
+        ),
+        (
+            &json!("not_approvable"),
+            &json!("release"),
+            &json!(rev.counter),
+            &json!(false)
+        )
+    );
+    assert_eq!(ap.rev(&id).map_err(de)?, rev, "no new revision");
+    assert!(!ap.item(&id).ok_or("not queued")?.approvable);
+    ap.deny_unopened(&id, "rebuild failed").map_err(de)?;
+    assert_eq!(h.await_(&id, 5000).await.status, Status::Denied);
+    Ok(())
+}
+
+/// Review T19c m-2 for a script result: a rebuild failure marked while a redaction that passed
+/// the failed-closed gate waits for the transition gate refuses it at the step.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn script_failure_marked_before_the_redaction_step_refuses_it() -> TestResult {
+    use atlas_duck_core::DecisionError;
+    use atlas_duck_core::payloads::InvalidReason;
+    let value = json!({ "keep": 1, "secret": "hunter2" });
+    let (h, _runner) = harness(vec![ScriptPlan::new(Vec::new(), result_end(value))]).await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let ap = h.approver();
+    ap.open(&id).map_err(de)?;
+    let rev = ap.rev(&id).map_err(de)?;
+    let entry = h.engine().entry(&id).ok_or("not in memory")?;
+    let gate = entry.hold_gate().await;
+    let (waiting, at) = (h.approver(), id.clone());
+    let ops = vec![atlas_duck_core::RedactionOp::DropField {
+        path: "result.secret".to_owned(),
+        scope: atlas_duck_core::DropScope::PerItem,
+    }];
+    let pending = tokio::task::spawn_blocking(move || waiting.redact(&at, ops));
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(!pending.is_finished(), "the redaction waits for the gate");
+    {
+        let mut st = entry.state();
+        st.rebuild_failed = true;
+        st.model.set_approvable(false);
+    }
+    drop(gate);
+    let res = tokio::time::timeout(std::time::Duration::from_secs(10), pending).await??;
+    assert!(
+        matches!(
+            res,
+            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+        ),
+        "{res:?}"
+    );
+    assert_eq!(ap.rev(&id).map_err(de)?, rev, "no new revision");
+    assert!(!ap.item(&id).ok_or("not queued")?.approvable);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scripts_release_in_a_batch() -> TestResult {
     let runner = FakeScriptRunner::new(vec![

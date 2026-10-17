@@ -1118,13 +1118,15 @@ async fn m11_first_build_internal_banner() -> TestResult {
     Ok(())
 }
 
-/// M5 M-11: a rebuild after eviction that the mirror check refuses (`Blocked`) keeps the item
-/// failed closed: no preview, nothing logged for the refusal, the release refused as
-/// `not_approvable`, Deny still works.
+/// M5 M-11 as M8 T19c changed it: a rebuild after eviction that the mirror check blocks keeps
+/// the item failed closed (Release disabled, the `internal` banner, the release refused as
+/// `not_approvable`, Deny still works), and shows the same preview again: the tree of the source,
+/// where the flagged entries can be dropped (`decisions_ui.rs` `m11_*`). The reopen of an opened
+/// revision logs nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn m11_rebuild_after_eviction_blocked() -> TestResult {
-    use atlas_duck_core::DecisionError;
     use atlas_duck_core::payloads::InvalidReason;
+    use atlas_duck_core::{DecisionError, RELEASE_BLOCKED_INTERNAL};
     let h = Harness::jira().await?;
     mount_issue(jira(&h)?, KEY, &orphan_issue()).await;
     let id = queued(
@@ -1133,23 +1135,18 @@ async fn m11_rebuild_after_eviction_blocked() -> TestResult {
     )
     .await?;
     let ap = h.approver();
-    ap.open(&id).map_err(de)?;
+    let first = ap.open(&id).map_err(de)?.preview;
     h.evict_candidate(&id);
     let count = h.event_count().await?;
-    let res = ap.open(&id);
+    let again = ap.open(&id).map_err(de)?.preview;
+    assert_eq!(again.candidate_rev, first.candidate_rev);
+    assert!(!again.approvable);
+    assert_eq!(again.header.release_blocked, Some(RELEASE_BLOCKED_INTERNAL));
+    assert_eq!(h.event_count().await?, count, "the reopen logs nothing");
     assert!(
-        matches!(
-            res,
-            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
-        ),
-        "{res:?}"
+        h.engine().candidates().contains(&id),
+        "the rebuild is cached"
     );
-    assert_eq!(
-        h.event_count().await?,
-        count,
-        "the refused open logs nothing"
-    );
-    assert!(!h.engine().candidates().contains(&id), "nothing cached");
     let item = ap.item(&id).ok_or("not queued")?;
     assert!(!item.approvable);
     let res = ap.release_unopened(&id);
