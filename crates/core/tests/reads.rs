@@ -195,6 +195,54 @@ async fn i08_fetch_cap_is_outcome_item() -> TestResult {
     assert_outcome_delivery(&h.await_(&id, 5000).await, "result_too_large")
 }
 
+/// M8 T19d: only a script's host call cuts a plain GET at the read budget's bytes. A direct
+/// read's single GET (the issue of `--comments` included) keeps the fixed 32 MiB cap, whatever
+/// the budget says: a 200 KiB issue under a 64 KiB `max_response_bytes` is a result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_single_get_keeps_the_32_mib_cap() -> TestResult {
+    let h = Harness::builder()
+        .jira("jira-main")
+        .read_budget(ReadBudget {
+            max_response_bytes: 64 * 1024,
+            max_bytes: 1024 * 1024,
+            ..ReadBudget::default()
+        })
+        .start()
+        .await?;
+    let body = issue_body("ABC-1", 200 * 1024, 'q');
+    let mock = jira(&h)?;
+    mock.json("/rest/api/2/issue/ABC-1", 200, &body).await;
+    mock.json(
+        "/rest/api/2/issue/ABC-1/comment",
+        200,
+        r#"{"startAt":0,"maxResults":50,"total":0,"comments":[]}"#,
+    )
+    .await;
+    for params in [
+        json!({ "key": "ABC-1" }),
+        json!({ "key": "ABC-1", "comments": true }),
+    ] {
+        let id = queued(&h, ISSUE, params.clone()).await?;
+        if let PreviewBody::Outcome { outcome, .. } =
+            h.approver().open(&id).map_err(de)?.preview.body
+        {
+            return Err(format!("{params}: an outcome card: {outcome:?}").into());
+        }
+        let fetched = record(&h, &id, EventType::READ_FETCHED).await?;
+        assert_eq!(fetched["outcome"], Value::Null, "{params}");
+        h.approver().release(&id).map_err(de)?;
+        let env = h.await_(&id, 5000).await;
+        assert_eq!(env.status, Status::Released, "{params}");
+        let summary = env
+            .data
+            .as_ref()
+            .and_then(|d| d["result"]["fields"]["summary"].as_str())
+            .map(str::len);
+        assert_eq!(summary, Some(200 * 1024), "{params}");
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn i08_read_budget_is_outcome_item() -> TestResult {
     let h = Harness::builder()

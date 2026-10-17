@@ -3738,13 +3738,12 @@ async fn dispatch_case_3() -> TestResult {
     Ok(())
 }
 
-/// I-14 case 3 for a plain (non-paged) call: the first response of a `jira.issue.get` takes
-/// the run's fetched bytes past `max_fetch_mb`; the run's next call is refused `script_limit`
-/// before it is sent, and the run ends `pending`, then a release item. What the first call
-/// itself answers and how many bytes its record keeps are not asserted: a plain GET's body is
-/// not cut at the run's remaining fetch budget yet (only the paged reads apply it).
+/// I-14 case 3 for a plain (non-paged) call: the first response of a `jira.issue.get` is over
+/// the run's remaining `max_fetch_mb`. Its body is cut there (T19d): the call answers
+/// `script_limit` and its record keeps the bytes received up to the cut, not the 4 MiB body.
+/// They take the run's fetched bytes to `max_fetch_mb`, so the next call is refused
+/// `script_limit` before it is sent, and the run ends `pending`, then a release item.
 async fn dispatch_case_3_plain() -> TestResult {
-    const SUMMARY: usize = 1_300_000;
     let end = RunEnd::HostLimit {
         name: "max_fetch_mb".to_owned(),
     };
@@ -3753,18 +3752,7 @@ async fn dispatch_case_3_plain() -> TestResult {
         end,
     )])
     .await?;
-    let mut issue: Value = serde_json::from_str(fixtures::JIRA_ISSUE)?;
-    issue["fields"]["summary"] = json!("s".repeat(SUMMARY));
-    let mock = requests_of(&h)?;
-    Mock::given(method("GET"))
-        .and(path(mock.path("/rest/api/2/issue/ABC-1")))
-        .respond_with(
-            mock.response(200)
-                .set_body_raw(issue.to_string(), "application/json"),
-        )
-        .with_priority(1)
-        .mount(mock.server())
-        .await;
+    mount_big_issue(&h, "ABC-1", BIG_BODY).await?;
     let id = submit(
         &h,
         json!({ "source": SRC, "limits": { "max_fetch_mb": 1 } }),
@@ -3773,16 +3761,18 @@ async fn dispatch_case_3_plain() -> TestResult {
     h.queued(&id, 30_000).await.ok_or("never queued")?;
     assert_eq!(h.status(&id).await.status, Status::Pending);
     match runner.results().as_slice() {
-        [_, HostCallResult::Rejected { class, .. }] => assert_eq!(class, "script_limit"),
-        other => return Err(format!("unexpected answers: {other:?}").into()),
+        [
+            HostCallResult::Rejected { class: first, .. },
+            HostCallResult::Rejected { class, .. },
+        ] => {
+            assert_eq!(first, "script_limit");
+            assert_eq!(class, "script_limit");
+        }
+        other => return Err(format!("unexpected answers: {:?}", outline(other)).into()),
     }
-    let sent = mock
-        .received()
-        .await
-        .iter()
-        .filter(|r| r.url.path() == mock.path("/rest/api/2/issue/ABC-1"))
-        .count();
-    assert_eq!(sent, 1, "the refused call was sent");
+    assert_eq!(sent_to(&h, "ABC-1").await?, 1, "the refused call was sent");
+    let call = record(&h, &id, EventType::SCRIPT_CALL).await?;
+    assert_cut(&call, "max_fetch_mb", "fetch_cap_50mib", MIB)?;
     let types = h.event_types(&id).await?;
     assert_eq!(
         types,
@@ -3935,6 +3925,171 @@ async fn i14_dispatch_rule_cases_1_to_5() -> TestResult {
             return Err(format!("{name}: {e}").into());
         }
     }
+    Ok(())
+}
+
+// ---- T19d: a plain call's body is cut at the run's fetch budget and the call's result cap -----
+
+const MIB: u64 = 1024 * 1024;
+
+/// The summary of an issue far larger than any cut below plus its tolerance.
+const BIG_BODY: usize = 4 * 1024 * 1024;
+
+/// How far past a cut a record's bytes may reach: the chunk that crossed it is kept, and one
+/// read of the mock's body can return up to two of its 512 KiB writes (atlassian
+/// `pagination.rs`, `FETCH_CAP_TOLERANCE`).
+const CUT_TOLERANCE: u64 = 1024 * 1024;
+
+/// The answers as `ok` or the rejection class (an answer can be megabytes).
+fn outline(results: &[HostCallResult]) -> Vec<String> {
+    results
+        .iter()
+        .map(|r| match r {
+            HostCallResult::Ok(_) => "ok".to_owned(),
+            HostCallResult::Rejected { class, .. } => class.clone(),
+        })
+        .collect()
+}
+
+/// `key`'s issue with a summary of `summary` bytes, ahead of the harness's fixture.
+async fn mount_big_issue(h: &Harness, key: &str, summary: usize) -> TestResult {
+    let mut issue: Value = serde_json::from_str(fixtures::JIRA_ISSUE)?;
+    issue["key"] = json!(key);
+    issue["fields"]["summary"] = json!("s".repeat(summary));
+    let mock = requests_of(h)?;
+    Mock::given(method("GET"))
+        .and(path(mock.path(&format!("/rest/api/2/issue/{key}"))))
+        .respond_with(
+            mock.response(200)
+                .set_body_raw(issue.to_string(), "application/json"),
+        )
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    Ok(())
+}
+
+/// The requests the mock received for `key`'s issue.
+async fn sent_to(h: &Harness, key: &str) -> Result<usize, TestError> {
+    let mock = requests_of(h)?;
+    let want = mock.path(&format!("/rest/api/2/issue/{key}"));
+    Ok(mock
+        .received()
+        .await
+        .iter()
+        .filter(|r| r.url.path() == want)
+        .count())
+}
+
+/// A `SCRIPT_CALL` record of a body cut with `left` bytes of budget: rejected as `rejection`,
+/// naming `cap`, no complete answer, and the bytes received up to the cut, not the whole body.
+fn assert_cut(call: &Value, rejection: &str, cap: &str, left: u64) -> TestResult {
+    assert_eq!(call["rejection"], rejection, "{call}");
+    assert_eq!(call["cap_or_budget"], cap, "{call}");
+    assert_eq!(call["outcome"], "too_large", "{call}");
+    let bytes = call["bytes"].as_u64().ok_or("no bytes")?;
+    assert!(bytes > left, "{bytes} vs {left}");
+    assert!(bytes <= left + CUT_TOLERANCE, "{bytes} vs {left}");
+    Ok(())
+}
+
+async fn script_calls(h: &Harness, id: &str) -> Result<Vec<Value>, TestError> {
+    Ok(h.events(id)
+        .await?
+        .into_iter()
+        .filter(|(t, _)| *t == EventType::SCRIPT_CALL)
+        .map(|(_, p)| p)
+        .collect())
+}
+
+/// §9.5 "`max_call_result_mb` overrun on a streaming body": a plain call's body is cut at
+/// `max_call_result_mb` (`result_too_large`), not read whole and measured afterwards. The run's
+/// fetch budget is far away, so the next call is sent and cut the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plain_call_body_is_cut_at_max_call_result_mb() -> TestResult {
+    let (h, runner) = harness(vec![ScriptPlan::new(
+        vec![issue_call(1), issue_call(2)],
+        result_end(json!(1)),
+    )])
+    .await?;
+    mount_big_issue(&h, "ABC-1", BIG_BODY).await?;
+    let id = submit(
+        &h,
+        json!({ "source": SRC, "limits": { "max_call_result_mb": 1 } }),
+    )
+    .await?;
+    h.queued(&id, 30_000).await.ok_or("never queued")?;
+    assert_eq!(
+        outline(&runner.results()),
+        ["result_too_large", "result_too_large"]
+    );
+    assert_eq!(sent_to(&h, "ABC-1").await?, 2);
+    let calls = script_calls(&h, &id).await?;
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    for call in &calls {
+        assert_cut(call, "result_too_large", "response_cap_32mib", MIB)?;
+    }
+    Ok(())
+}
+
+/// A plain call's fetch budget is `max_fetch_mb` minus the bytes the run already fetched: after
+/// a 600 KiB answer, the next body is cut with about 424 KiB left (`script_limit`), below the
+/// 1 MiB `max_call_result_mb` (with the full cap as its budget it would be cut at the result cap,
+/// `result_too_large`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plain_call_fetch_budget_is_the_cap_minus_the_bytes_fetched() -> TestResult {
+    let second = host_call(2, "jira.issue.get", json!({ "key": "ABC-2" }));
+    let (h, runner) = harness(vec![ScriptPlan::new(
+        vec![issue_call(1), second],
+        result_end(json!(1)),
+    )])
+    .await?;
+    mount_big_issue(&h, "ABC-1", 600 * 1024).await?;
+    mount_big_issue(&h, "ABC-2", BIG_BODY).await?;
+    let id = submit(
+        &h,
+        json!({ "source": SRC, "limits": { "max_fetch_mb": 1, "max_call_result_mb": 1 } }),
+    )
+    .await?;
+    h.queued(&id, 30_000).await.ok_or("never queued")?;
+    assert_eq!(outline(&runner.results()), ["ok", "script_limit"]);
+    let calls = script_calls(&h, &id).await?;
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(calls[0]["rejection"], Value::Null, "{}", calls[0]);
+    let first = calls[0]["bytes"].as_u64().ok_or("no bytes")?;
+    assert!(first > 600 * 1024 && first < MIB, "{first}");
+    assert_cut(&calls[1], "max_fetch_mb", "fetch_cap_50mib", MIB - first)?;
+    Ok(())
+}
+
+/// `jira.issue.get` with `comments: true` (a composite read): its issue GET is a plain GET, cut
+/// at the run's fetch budget like any other; no comment page is requested.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plain_call_with_comments_cuts_the_issue_at_the_fetch_budget() -> TestResult {
+    let call = host_call(
+        1,
+        "jira.issue.get",
+        json!({ "key": "ABC-1", "comments": true }),
+    );
+    let (h, runner) = harness(vec![ScriptPlan::new(vec![call], result_end(json!(1)))]).await?;
+    mount_big_issue(&h, "ABC-1", BIG_BODY).await?;
+    let id = submit(
+        &h,
+        json!({ "source": SRC, "limits": { "max_fetch_mb": 1 } }),
+    )
+    .await?;
+    h.queued(&id, 30_000).await.ok_or("never queued")?;
+    assert_eq!(outline(&runner.results()), ["script_limit"]);
+    let calls = script_calls(&h, &id).await?;
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_cut(&calls[0], "max_fetch_mb", "fetch_cap_50mib", MIB)?;
+    let comment_pages = requests_of(&h)?
+        .received()
+        .await
+        .iter()
+        .filter(|r| r.url.path().ends_with("/comment"))
+        .count();
+    assert_eq!(comment_pages, 0);
     Ok(())
 }
 
