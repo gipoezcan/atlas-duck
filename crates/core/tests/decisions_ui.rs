@@ -185,9 +185,9 @@ fn falcon_page() -> Value {
     })
 }
 
-const FALCON_PATHS: [&str; 7] = [
-    "results[0].breadcrumbs",
-    "results[0].content.title",
+/// The fixture's paths that hold a form of the title once the search is pruned to the §7.4
+/// release list (PD-101: `breadcrumbs` and `content.title` are never released).
+const FALCON_PATHS: [&str; 5] = [
     "results[0].excerpt",
     "results[0].lastModified",
     "results[0].resultGlobalContainer.title",
@@ -238,7 +238,7 @@ async fn redaction_preview_reports_also_appears_in_and_other_occurrences() -> Te
     // One occurrence: "N other occurrences remain" (§5.3 single-occurrence confirmation).
     let ops = [mask(title, false)];
     let report = ap.redaction_preview(&id, &ops).map_err(de)?;
-    assert!(report.other_occurrences >= 6, "{report:?}");
+    assert!(report.other_occurrences >= 4, "{report:?}");
     assert_eq!(report, engine_report("confluence.search", &doc, &ops)?);
 
     assert_eq!(h.event_count().await?, count, "a preview logs nothing");

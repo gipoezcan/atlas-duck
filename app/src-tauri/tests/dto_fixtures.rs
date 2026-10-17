@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use atlas_duck_app_lib::cli_install::InstallError;
 use atlas_duck_app_lib::commands::CommandError;
 use atlas_duck_app_lib::commands::approvals::{
-    DenyCount, QueueDetail, RawPageDto, RedactionContextDto,
+    DenyCount, QueueDetail, RawPageDto, RedactionContextDto, preview_fetch_response,
 };
 use atlas_duck_app_lib::commands::credential::{
     ArchiveOutcome, CLASS_CONTEXT_CHANGED, Connected, CredentialContextDto, NoteSaved,
@@ -38,10 +38,10 @@ use atlas_duck_core::running::RunningScriptView;
 use atlas_duck_core::validate::ValidationError;
 use atlas_duck_core::{
     AdminError, AttentionMode, BatchFailure, BatchOutcome, CandidateRev, ConfigBanner,
-    ConnectionFailure, DecisionError, DecisionOutcome, InstanceView, LimitsView, Product,
-    PruneReport, QueueItem, RELEASE_BLOCKED_INTERNAL, RecentItem, RedactionContext, RedactionOp,
-    RedactionReport, RequestDetail, SessionKey, SettingsError, SettingsView, StoreHealthView,
-    UrlMode, VerifyNow,
+    ConnectionFailure, DecisionError, DecisionOutcome, InstanceView, LimitsView, PreviewDelivery,
+    Product, PruneReport, QueueItem, RELEASE_BLOCKED_INTERNAL, RecentItem, RedactionContext,
+    RedactionOp, RedactionReport, RequestDetail, SessionKey, SettingsError, SettingsView,
+    StoreHealthView, UrlMode, VerifyNow,
 };
 use atlas_duck_ipc::envelope::{ErrorCode, Status};
 use atlas_duck_ipc::sandbox::ScriptLimits;
@@ -49,9 +49,10 @@ use atlas_duck_preview::diff::{DiffLine, DiffOp};
 use atlas_duck_preview::form::{AllowedValues, EditForm, EditInput, InputKind};
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{
-    BodyView, CommentView, ConstructList, DenyOffer, DenyOfferKind, FieldRow, IssueCard, ItemCount,
-    OutcomeKind, PREVIEW_BUILDER_VERSION, Preselect, Preview, PreviewBody, PreviewHeader,
-    ProvenanceRow, RawPager, RequestView, ScriptItemKind, json_tree,
+    BodyView, CommentView, ConfluenceComment, ConstructList, ConversionFacts, DenyOffer,
+    DenyOfferKind, FieldRow, IssueCard, ItemCount, OutcomeKind, PREVIEW_BUILDER_VERSION, Preselect,
+    Preview, PreviewBody, PreviewHeader, ProvenanceRow, RawPager, RequestView, ScriptItemKind,
+    json_tree,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -272,6 +273,22 @@ fn bodies() -> Vec<PreviewBody> {
         PreviewBody::Conflict {
             summary: "the issue changed since the preview".into(),
             diff_text: "- old\n+ new\n".into(),
+            // M7 Δ2: the base → current diff, the agent's intended change and the requests.
+            base_to_current: vec![
+                DiffLine {
+                    op: DiffOp::Del,
+                    text: "old\n".into(),
+                },
+                DiffLine {
+                    op: DiffOp::Add,
+                    text: "current\n".into(),
+                },
+            ],
+            intended: vec![DiffLine {
+                op: DiffOp::Add,
+                text: "new".into(),
+            }],
+            requests: requests(),
         },
         PreviewBody::CouldNotRecheck {
             class: "network".into(),
@@ -341,6 +358,7 @@ fn bodies() -> Vec<PreviewBody> {
                 text: "h1. new".into(),
             }],
             raw_only_changes: 1,
+            constructs: None,
             requests: requests(),
         },
         PreviewBody::Transition {
@@ -350,6 +368,84 @@ fn bodies() -> Vec<PreviewBody> {
             fields: vec![("Resolution".into(), "Fixed".into())],
             constructs: None,
             requests: requests(),
+        },
+        // M7 Δ2: the Confluence bodies.
+        PreviewBody::ConfluencePage {
+            title: "Release plan".into(),
+            space: "Development (DEV)".into(),
+            version: Some(7),
+            ancestors: vec!["Home".into(), "Projects".into()],
+            format: "markdown".into(),
+            body_html: "<p>sanitized</p>".into(),
+            conversion: Some(ConversionFacts {
+                lossy: true,
+                macros: 1,
+                images: 0,
+                links: 2,
+                layouts: 0,
+                unresolved_users: 1,
+                fallback: false,
+            }),
+        },
+        PreviewBody::ConfluenceComments {
+            comments: vec![
+                ConfluenceComment {
+                    id: "11".into(),
+                    author: Some("jdoe".into()),
+                    created: Some("2026-10-16T10:00:00.000Z".into()),
+                    location: Some("footer".into()),
+                    depth: 0,
+                    parent_id: None,
+                    body_html: "<p>a comment</p>".into(),
+                },
+                // Every `Option` null: no author, date or location reported.
+                ConfluenceComment {
+                    id: "12".into(),
+                    author: None,
+                    created: None,
+                    location: None,
+                    depth: 1,
+                    parent_id: Some("11".into()),
+                    body_html: "<p>a reply</p>".into(),
+                },
+            ],
+            count: None,
+        },
+        PreviewBody::ContentWrite {
+            sentence: "Create page 'Release plan' in Development (DEV)".into(),
+            rows: vec![("title".into(), "Release plan".into())],
+            body_html: Some("<p>sanitized</p>".into()),
+            constructs: Some(constructs()),
+            requests: requests(),
+        },
+        PreviewBody::PageMove {
+            page: "Release plan".into(),
+            from_path: vec!["Home".into(), "Release plan".into()],
+            to_path: vec!["Home".into(), "Archive".into(), "Release plan".into()],
+            requests: requests(),
+        },
+        PreviewBody::AttachmentUpload {
+            filename: "logo.png".into(),
+            size: 70,
+            mime: "image/png".into(),
+            sha256: "5a".repeat(32),
+            thumbnail_data_uri: Some("data:image/png;base64,AAAA".into()),
+            replaces_version: Some(3),
+            existing: Some("attachment att9001, version 2".into()),
+            comment: None,
+            notes: vec!["extension and content type differ".into()],
+            // The digest-only body view (M7 Δ2).
+            requests: vec![RequestView {
+                index: 0,
+                method: "POST".into(),
+                resolved_url: "https://wiki.example.com/wiki/rest/api/content/1/child/attachment"
+                    .into(),
+                content_type: Some("multipart/form-data; boundary=atlas-duck-5a".into()),
+                body: BodyView::Digest {
+                    bytes: 2_000_000,
+                    sha256: "5a".repeat(32),
+                },
+            }],
         },
         // M8 T17 (Δ5): a script's error-details item with every section.
         PreviewBody::Script {
@@ -401,6 +497,8 @@ fn previews() -> Vec<Preview> {
                     | PreviewBody::UpstreamError { .. }
                     | PreviewBody::JiraIssue { .. }
                     | PreviewBody::Table { .. }
+                    | PreviewBody::ConfluencePage { .. }
+                    | PreviewBody::ConfluenceComments { .. }
                     | PreviewBody::Script { .. }
             );
             let script = matches!(body, PreviewBody::Script { .. });
@@ -1242,10 +1340,41 @@ fn every_preview_body_variant_has_a_fixture() -> TestResult {
         })
         .unwrap_or_default();
     let unique: std::collections::BTreeSet<&String> = kinds.iter().collect();
-    // Fourteen `PreviewBody` variants (C.6, Δ5 `script`), one fixture each; a new one must get a
-    // fixture.
-    assert_eq!(kinds.len(), 14, "{kinds:?}");
-    assert_eq!(unique.len(), 14, "{kinds:?}");
+    // Nineteen `PreviewBody` variants (C.6, M7 Δ2, M8 Δ5 `script`), one fixture each; a new one
+    // must get a fixture.
+    assert_eq!(kinds.len(), 19, "{kinds:?}");
+    assert_eq!(unique.len(), 19, "{kinds:?}");
+    Ok(())
+}
+
+/// T20b review m-1: the attachment thumbnail reaches the screen only through the `srcdoc` (no UI
+/// code reads `thumbnail_data_uri`), so `preview_fetch` sends it once: in the document, never in
+/// the preview DTO beside it. Everything else in the preview is sent as core built it.
+#[test]
+fn preview_fetch_sends_the_thumbnail_in_the_srcdoc_only() -> TestResult {
+    let uri = "data:image/png;base64,AAAA";
+    for preview in previews() {
+        let upload = matches!(preview.body, PreviewBody::AttachmentUpload { .. });
+        let mut want = preview.clone();
+        if let PreviewBody::AttachmentUpload {
+            thumbnail_data_uri, ..
+        } = &mut want.body
+        {
+            assert_eq!(thumbnail_data_uri.as_deref(), Some(uri));
+            *thumbnail_data_uri = None;
+        }
+        let r = preview_fetch_response(PreviewDelivery {
+            preview,
+            redaction: None,
+        });
+        assert_eq!(r.preview, want);
+        assert_eq!(
+            r.srcdoc.contains(&format!("<img src=\"{uri}\"")),
+            upload,
+            "the document shows the thumbnail"
+        );
+        assert!(!serde_json::to_string(&r.preview)?.contains(uri));
+    }
     Ok(())
 }
 

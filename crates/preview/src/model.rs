@@ -26,18 +26,23 @@ pub const PREVIEW_BUILDER_VERSION: &str =
 /// Each `renderN` with the FNV-1a 64 digest of what it renders: the goldens in
 /// `tests/golden/render` and `app/ui/public/preview.css` (`tests/render.rs` recomputes it and
 /// fails on a mismatch, T10 review M-8). When the document's output or the stylesheet changes,
-/// bump `renderN` in [`PREVIEW_BUILDER_VERSION`] and APPEND its pair here; never edit an entry.
-/// The last entry is the current version.
+/// bump `renderN` in [`PREVIEW_BUILDER_VERSION`] and APPEND its pair here; never edit an entry
+/// (an entry no merged branch carries yet may be re-pinned in place by lead ruling, as render4
+/// was in M7). The last entry is the current version.
 #[doc(hidden)]
 pub const RENDER_VERSIONS: &[(&str, u64)] = &[
     ("render1", 0x50e0_b962_fa25_e8fa),
     ("render2", 0x5977_a808_67ef_8b73),
     ("render3", 0x18d6_262f_815e_9ad3),
-    // M8 Task 18 (Δ5): the script result and error documents. `render4` is M7's (not on this
-    // branch); the M7 merge puts it before this entry and re-pins this one over all the goldens.
-    // Re-pinned in place by the T18 review fix (unmerged and unpushed: the reserved script
-    // sections and the view's h3 heading).
-    ("render5", 0x339f_984b_9c68_f842),
+    // M7 Task 8 (Δ2): the Confluence arms, the conflict card's diffs and requests (only when
+    // there are any), the attachment notes, the digest body. M7 Task 15 (re-pinned while
+    // render4 is unmerged): the edit diff's storage construct list, the "no newline at end"
+    // mark only on a side's last line, the `confluence_update_diff` golden.
+    ("render4", 0x8ea8_55c4_f735_bb5c),
+    // M8 Task 18 (Δ5): the script result and error documents. Re-pinned in place while render5
+    // was unmerged and unpushed: by the T18 review fix (the reserved script sections and the
+    // view's h3 heading), then at the M7 merge (over the union of the M6, M7 and M8 goldens).
+    ("render5", 0xc888_734b_35e9_df53),
 ];
 
 /// `UpstreamError.error_messages_text` cap (bytes, including the trailing ellipsis).
@@ -174,6 +179,19 @@ pub enum BodyView {
     None,
     Text(String),
     Base64(String),
+    /// M7 Δ2 (PD-109, plan review I-4): a body shown as its size and SHA-256 only (lowercase
+    /// hex), so the preview never carries the bytes; `WRITE_APPROVED` and `request_set_hash`
+    /// still cover them. Rendered as the one line of [`body_digest_line`].
+    Digest {
+        bytes: u64,
+        sha256: String,
+    },
+}
+
+/// plan text (M7 Δ2): the one line that stands for a body (or a multipart part body) the preview
+/// does not show: "<bytes> bytes, SHA-256 <hex> (not shown)".
+pub fn body_digest_line(bytes: u64, sha256: &str) -> String {
+    format!("{bytes} bytes, SHA-256 {sha256} (not shown)")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -216,9 +234,17 @@ pub enum PreviewBody {
         matches: u64,
         candidates: Vec<String>,
     },
+    /// §6.3 Conflict. `summary` and `diff_text` are display text; M7 Δ2 (M6 T10 review M-5) adds
+    /// the rendered diff from the agent's base to the current state, the agent's intended change
+    /// (base → outgoing) and the requests. Jira leaves both line lists empty (its card lists the
+    /// differing `expected` fields in `diff_text`); the renderer shows a diff section only when
+    /// its list is not empty.
     Conflict {
         summary: String,
         diff_text: String,
+        base_to_current: Vec<DiffLine>,
+        intended: Vec<DiffLine>,
+        requests: Vec<RequestView>,
     },
     CouldNotRecheck {
         class: String,
@@ -254,11 +280,16 @@ pub enum PreviewBody {
     /// line terminators and trailing whitespace visible. A `LineDiff.truncated` diff must be
     /// flagged by the builder (a warning), since its lines are not the whole change. Each field's
     /// section starts with a `DiffOp::Field` line naming it (T13); the UI shows that line as a
-    /// heading, apart from the text lines.
+    /// heading, apart from the text lines. `constructs` (M7 Task 15, T9 review I-2): the storage
+    /// constructs of a Confluence update's outgoing body (§7.6: listed whatever the diff caps
+    /// leave out), display-escaped as [`ConstructList`] says; `None` for a Jira edit. A raw
+    /// line may end without `\n` (a storage line ends at a block tag): only a side's last line
+    /// says so.
     EditDiff {
         rendered: Vec<DiffLine>,
         raw: Vec<DiffLine>,
         raw_only_changes: u64,
+        constructs: Option<ConstructList>,
         requests: Vec<RequestView>,
     },
     /// §6.3 transition. Status names and field rows are display-escaped text. `constructs` lists
@@ -272,6 +303,64 @@ pub enum PreviewBody {
         to: String,
         fields: Vec<(String, String)>,
         constructs: Option<ConstructList>,
+        requests: Vec<RequestView>,
+    },
+    /// §6.3 Confluence page (M7 Δ2). `title`, `space`, `ancestors` (titles, root first) and
+    /// `format` (`markdown`, `storage` or `view`) are display-escaped text; `body_html` is
+    /// sanitized HTML (by core). A `view` body is the server-rendered HTML and is labelled a
+    /// secondary view (§6.4, PD-100). `conversion`: the storage→Markdown facts of a Markdown body.
+    ConfluencePage {
+        title: String,
+        space: String,
+        version: Option<u64>,
+        ancestors: Vec<String>,
+        format: String,
+        body_html: String,
+        conversion: Option<ConversionFacts>,
+    },
+    /// §6.3 Confluence comments (M7 Δ2, PD-103): in thread order, each with its depth below the
+    /// top-level comment. Core emits them depth-first (a reply right after its parent's earlier
+    /// replies): the renderer nests by `depth` and order alone, not by `parent_id` (T8 review
+    /// m-6).
+    ConfluenceComments {
+        comments: Vec<ConfluenceComment>,
+        count: Option<ItemCount>,
+    },
+    /// §6.3 create page and add comment (M7 Δ2): the sentence and rows are display-escaped text,
+    /// `body_html` the sanitized rendering of the outgoing body, `constructs` its storage
+    /// constructs.
+    ContentWrite {
+        sentence: String,
+        rows: Vec<(String, String)>,
+        body_html: Option<String>,
+        constructs: Option<ConstructList>,
+        requests: Vec<RequestView>,
+    },
+    /// §6.3 page move (M7 Δ2, PD-106): the old and the new ancestor path (titles, root first,
+    /// the page last), display-escaped.
+    PageMove {
+        page: String,
+        from_path: Vec<String>,
+        to_path: Vec<String>,
+        requests: Vec<RequestView>,
+    },
+    /// §6.3 attachment upload (M7 Δ2, PD-109, PD-110): digest, size, file name, sniffed MIME
+    /// type and the capped thumbnail only, never the file bytes (plan review I-4).
+    /// `thumbnail_data_uri` is rendered as an image only when it is a
+    /// `data:image/{png,jpeg,gif,webp};base64,` URI; `existing` holds the facts of the attachment
+    /// a collision hold found; `replaces_version` is the version a `replace` upload replaces.
+    /// `notes` are display-escaped facts about the file shown under the fact table, such as
+    /// PD-110's "extension and content type differ" (T8 review I-2); empty for none.
+    AttachmentUpload {
+        filename: String,
+        size: u64,
+        mime: String,
+        sha256: String,
+        thumbnail_data_uri: Option<String>,
+        replaces_version: Option<u64>,
+        existing: Option<String>,
+        comment: Option<String>,
+        notes: Vec<String>,
         requests: Vec<RequestView>,
     },
     /// §6.3 Script result / Script error details (Δ5, PD-146): the candidate view (`view`, today
@@ -312,6 +401,34 @@ pub struct ProvenanceRow {
     pub target_display: String,
     /// `ok`, `rejected:<class>` or `cancelled_in_flight`.
     pub outcome: String,
+}
+
+/// One Confluence comment (M7 Δ2, PD-103). `id`, `author`, `created`, `location` (`inline` or
+/// `footer` as Confluence sent it; `None` when the answer did not say) and `parent_id` are
+/// display-escaped text; `body_html` is sanitized HTML; `depth` is 0 for a top-level comment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfluenceComment {
+    pub id: String,
+    pub author: Option<String>,
+    pub created: Option<String>,
+    pub location: Option<String>,
+    pub depth: u32,
+    pub parent_id: Option<String>,
+    pub body_html: String,
+}
+
+/// The storage→Markdown conversion facts of a Confluence body (M7 Δ2, from `ConversionReport`):
+/// the constructs the Markdown lost per kind, the mentions left unresolved, and whether the XML
+/// parse failed and the fallback ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ConversionFacts {
+    pub lossy: bool,
+    pub macros: u64,
+    pub images: u64,
+    pub links: u64,
+    pub layouts: u64,
+    pub unresolved_users: u64,
+    pub fallback: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -382,8 +499,9 @@ impl PreviewBody {
     }
 
     /// The warning this body's content implies: `CouldNotRecheck` for that card, `RawOnlyDiff`
-    /// for an edit diff with raw-only changes. The model must carry it: the Caution strip shows
-    /// exactly the model's warnings, and those are what `PREVIEW_SHOWN.warning_ids` records
+    /// for an edit diff with raw-only changes, `ServerRenderedView` for a Confluence page shown
+    /// in its `view` format (§6.2, T8 review I-3). The model must carry it: the Caution strip
+    /// shows exactly the model's warnings, and those are what `PREVIEW_SHOWN.warning_ids` records
     /// (shown = audited). Core asserts it where it assembles a `Preview`.
     pub fn implied_warning(&self) -> Option<WarningId> {
         match self {
@@ -391,6 +509,9 @@ impl PreviewBody {
             PreviewBody::EditDiff {
                 raw_only_changes, ..
             } if *raw_only_changes > 0 => Some(WarningId::RawOnlyDiff),
+            PreviewBody::ConfluencePage { format, .. } if format == "view" => {
+                Some(WarningId::ServerRenderedView)
+            }
             _ => None,
         }
     }

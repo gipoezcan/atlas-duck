@@ -1,17 +1,20 @@
-//! §5.4 step 5 per-op stale rules in M3 (PD-10), and M5's assignee (PD-52) and sprint (PD-54)
-//! rules. The identity call that precedes every write is not one of these (C.7); an op without a
-//! rule here has `stale_check: None`.
+//! §5.4 step 5 per-op stale rules in M3 (PD-10), M5's assignee (PD-52) and sprint (PD-54) rules,
+//! and M7's page move (PD-106) and attachment replace (PD-109). The identity call that precedes
+//! every write is not one of these (C.7); an op without a rule here has `stale_check: None`.
 
 use atlas_duck_atlassian::GetCall;
 use atlas_duck_preview::invisible::escape_for_display;
 use serde_json::Value;
 
 use super::confluence::content_version;
+use super::confluence_ext::{
+    ReplaceTarget, attachment_call, listed_attachments, replace_target, wants_replace,
+};
 use super::jira::{field_values_equal, issue_fields_call, transition_calls, transition_facts};
 use super::jira_ext::{
     SPRINT_CLOSED, assignee_call, current_assignee, sprint_call, sprint_facts, sprint_open,
 };
-use super::{StaleCtx, StaleRule, StaleVerdict, get_call};
+use super::{StaleCtx, StaleRule, StaleVerdict, get_call, str_param};
 
 /// Shown when the judge did not get the answers its plan names (fail closed: never `Unchanged`).
 const DELTA_UNREADABLE: &str = "the target could not be re-read";
@@ -48,6 +51,22 @@ pub static SPRINT_MOVE: StaleRule = StaleRule {
 pub static PAGE_UPDATE: StaleRule = StaleRule {
     plan: page_plan,
     judge: page_judge,
+};
+
+/// `confluence.page.move` (T17, PD-106): `version.number` unchanged, the rule of the update; the
+/// `PUT` sends that version + 1, so a change after this check is Confluence's 409.
+pub static PAGE_MOVE: StaleRule = StaleRule {
+    plan: page_plan,
+    judge: page_judge,
+};
+
+/// `confluence.attachment.upload` with `replace` (T20a, PD-109, §5.4 step 5 "attachment
+/// `version.number` unchanged"): the filename lookup again; exactly one attachment of that name
+/// (exactly, else in another case: the judge's rule), the one enrichment found (same id), at the
+/// same version. A new attachment (`replace` absent or false) has no rule: no GET, unchanged.
+pub static ATTACHMENT_REPLACE: StaleRule = StaleRule {
+    plan: attachment_plan,
+    judge: attachment_judge,
 };
 
 fn changed(delta: &str) -> StaleVerdict {
@@ -188,5 +207,40 @@ fn page_judge(ctx: &StaleCtx<'_>, responses: &[Value]) -> StaleVerdict {
             "page version changed since review (v{was} → v{now})"
         )),
         _ => changed(DELTA_UNREADABLE),
+    }
+}
+
+fn attachment_plan(ctx: &StaleCtx<'_>) -> Vec<GetCall> {
+    if wants_replace(ctx.params) {
+        vec![attachment_call(ctx.params)]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Ids compared exactly, then versions; a baseline or an answer it cannot read is a change (fail
+/// closed).
+fn attachment_judge(ctx: &StaleCtx<'_>, responses: &[Value]) -> StaleVerdict {
+    if !wants_replace(ctx.params) {
+        return StaleVerdict::Unchanged;
+    }
+    let was_id = ctx.baseline.get("attachment_id").and_then(Value::as_str);
+    let was = ctx.baseline.get("version").and_then(Value::as_u64);
+    let listed = responses.first().and_then(listed_attachments);
+    let (Some(was_id), Some(was), Some(listed)) = (was_id, was, listed) else {
+        return changed(DELTA_UNREADABLE);
+    };
+    // The judge's own rule (an exact name, else the one case variant, T20a review m-1).
+    match replace_target(&listed, str_param(ctx.params, "filename")) {
+        ReplaceTarget::None => changed("attachment no longer present"),
+        ReplaceTarget::One(now) if now.id != was_id => {
+            changed("attachment replaced by another since review")
+        }
+        ReplaceTarget::One(now) if now.version == was => StaleVerdict::Unchanged,
+        ReplaceTarget::One(now) => changed(&format!(
+            "attachment version changed since review (v{was} → v{})",
+            now.version
+        )),
+        ReplaceTarget::Ambiguous => changed("more than one attachment of this name since review"),
     }
 }

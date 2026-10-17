@@ -5,6 +5,7 @@ use atlas_duck_ipc::envelope::Envelope;
 use atlas_duck_ipc::proto::exit_code;
 use serde_json::Value;
 
+pub mod confluence;
 pub mod flows;
 pub mod jira;
 

@@ -114,6 +114,8 @@ fn container(wiki: &str, kind: ContainerKind, range: &Range<usize>) -> Option<us
         ContainerKind::Code => ("{code}", "code"),
         ContainerKind::Noformat => ("{noformat}", "noformat"),
         ContainerKind::Quote => ("{quote}", "quote"),
+        // A storage code macro is never a wiki container: fail closed.
+        ContainerKind::CodeMacro => return None,
     };
     let open = opening_tag_len(kind, slice)?;
     let body = slice.get(open..slice.len().checked_sub(close.len())?)?;
@@ -125,13 +127,14 @@ fn opening_tag_len(kind: ContainerKind, slice: &str) -> Option<usize> {
         ContainerKind::Code => "{code}",
         ContainerKind::Noformat => "{noformat}",
         ContainerKind::Quote => "{quote}",
+        ContainerKind::CodeMacro => return None,
     };
     if slice.starts_with(tag) {
         return Some(tag.len());
     }
     let rest = match kind {
         ContainerKind::Code => slice.strip_prefix("{code:")?,
-        ContainerKind::Noformat | ContainerKind::Quote => return None,
+        ContainerKind::Noformat | ContainerKind::Quote | ContainerKind::CodeMacro => return None,
     };
     let lang = rest.get(..rest.find('}')?)?;
     let ok = !lang.is_empty()

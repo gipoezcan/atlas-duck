@@ -4,11 +4,11 @@
 //! decides, this layer only maps the wire types and never decides anything itself.
 
 use atlas_duck_core::{
-    BatchOutcome, CandidateRev, Decision, DecisionApi, DecisionOutcome, QueueItem, RecentItem,
-    RedactionContext, RedactionReport, RequestDetail,
+    BatchOutcome, CandidateRev, Decision, DecisionApi, DecisionOutcome, PreviewDelivery, QueueItem,
+    RecentItem, RedactionContext, RedactionReport, RequestDetail,
 };
 use atlas_duck_preview::render::raw::incomplete_tail;
-use atlas_duck_preview::{Platform, Preview, render};
+use atlas_duck_preview::{Platform, Preview, PreviewBody, render};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Runtime};
@@ -338,12 +338,27 @@ pub fn preview_fetch_dto(
     let delivery = decisions
         .preview_fetch(request_id, rev)
         .map_err(CommandError::from_candidate_read)?;
+    Ok(preview_fetch_response(delivery))
+}
+
+/// The response for a delivered preview: the document rendered from it, and the preview without
+/// the attachment thumbnail (T20b review m-1). The thumbnail reaches the screen only through the
+/// document (no UI code reads `thumbnail_data_uri`), so at the 2 MiB cap it is sent once, not
+/// twice.
+pub fn preview_fetch_response(delivery: PreviewDelivery) -> PreviewFetchResponse {
     let srcdoc = render::document(&delivery.preview, Platform::current());
-    Ok(PreviewFetchResponse {
+    let mut preview = delivery.preview;
+    if let PreviewBody::AttachmentUpload {
+        thumbnail_data_uri, ..
+    } = &mut preview.body
+    {
+        *thumbnail_data_uri = None;
+    }
+    PreviewFetchResponse {
         redaction: delivery.redaction.as_ref().map(RedactionContextDto::from),
-        preview: delivery.preview,
+        preview,
         srcdoc,
-    })
+    }
 }
 
 /// `preview_fetch` (§5.6 "Opened"): on the blocking pool as well (a large candidate takes a

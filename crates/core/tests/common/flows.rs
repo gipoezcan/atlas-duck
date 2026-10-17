@@ -15,13 +15,22 @@ use atlas_duck_core::{DecisionError, Edits, RedactionOp, ShutdownReason};
 use atlas_duck_ipc::build_info::APP_VERSION;
 use atlas_duck_ipc::envelope::Status;
 use serde_json::{Map, Value, json};
-use wiremock::matchers::{method, path_regex};
+use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, Request, ResponseTemplate};
 
+use super::confluence::{
+    content_path, mount_history_version, mount_page, mount_users, page_with_storage,
+};
 use super::jira::{
     comment_page, mount_assignable, mount_create_stages, mount_link_types, mount_sprint,
 };
 use super::{TestError, de, request_id};
+
+const PAGE_GET: &str = "confluence.page.get";
+const PAGE_UPDATE: &str = "confluence.page.update";
+const PAGE_MOVE: &str = "confluence.page.move";
+const LABEL_REMOVE: &str = "confluence.label.remove";
+const ATTACHMENT_UPLOAD: &str = "confluence.attachment.upload";
 
 const ISSUE: &str = "jira.issue.get";
 const SEARCH: &str = "jira.search";
@@ -604,6 +613,175 @@ pub async fn run_flow(h: &Harness, flow: Flow, n: usize) -> Result<(), TestError
     }
 }
 
+// ---- Confluence flows (M7 Task 22) ---------------------------------------------------------------------
+
+/// The Confluence request shapes the I-19 property runs over, beside the Jira `Flow`s: every one
+/// reaches the instance with calls beyond the op's own (identity, lookups, stage 2, stale checks,
+/// a multipart write).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfluenceFlow {
+    /// A Markdown page get whose body mentions two users: the identity GET and two user lookups.
+    PageGetMarkdown,
+    /// A page update at the current version: stage 1, the identity and stale checks, the `PUT`.
+    PageUpdate,
+    /// A page update from an older version: stage 2 (the base body), the conflict card, denied.
+    PageUpdateConflict,
+    /// A page move: the page and the parent in stage 1, the stale check, the `PUT`.
+    PageMove,
+    /// An attachment upload: the filename lookup and the multipart `POST`.
+    AttachmentUpload,
+    /// A label remove: the content with its labels, the `DELETE` answering an empty 204.
+    LabelRemove,
+}
+
+impl ConfluenceFlow {
+    pub const ALL: [ConfluenceFlow; 6] = [
+        ConfluenceFlow::PageGetMarkdown,
+        ConfluenceFlow::PageUpdate,
+        ConfluenceFlow::PageUpdateConflict,
+        ConfluenceFlow::PageMove,
+        ConfluenceFlow::AttachmentUpload,
+        ConfluenceFlow::LabelRemove,
+    ];
+}
+
+/// Sequences of Confluence flows, one to seven long.
+pub fn confluence_flow_sequences() -> impl proptest::strategy::Strategy<Value = Vec<ConfluenceFlow>>
+{
+    use proptest::prelude::*;
+    prop::collection::vec(prop::sample::select(ConfluenceFlow::ALL.to_vec()), 1..8)
+}
+
+fn wiki(h: &Harness) -> Result<&MockDc, TestError> {
+    h.mock("wiki").ok_or_else(|| "no wiki mock".into())
+}
+
+/// `method` on `p` (any query) answers `status` with `body`.
+async fn mount_confluence(mock: &MockDc, m: &str, p: &str, status: u16, body: Option<&Value>) {
+    let t = mock.response(status);
+    let t = match body {
+        Some(b) => t.set_body_raw(b.to_string(), "application/json"),
+        None => t,
+    };
+    Mock::given(method(m))
+        .and(path(mock.path(p)))
+        .respond_with(t)
+        .mount(mock.server())
+        .await;
+}
+
+/// A page of space `DOC` as a stage-1 GET answers it: `id`, version, space, ancestors, a body.
+fn wiki_page(id: &str, version: u64, storage: &str) -> Value {
+    let mut page = page_with_storage(storage);
+    page["id"] = json!(id);
+    page["version"]["number"] = json!(version);
+    page
+}
+
+/// The answers of the Confluence flows, on the `wiki` mock of `h` (a `Harness::confluence()`).
+pub async fn mount_confluence_flows(h: &Harness) -> Result<(), TestError> {
+    let mock = wiki(h)?;
+    let updated: Value = serde_json::from_str(fixtures::CONFLUENCE_PAGE_UPDATED)?;
+    // PageGetMarkdown: two mentions, both users known.
+    let owners = r#"<p>Owners <ac:link><ri:user ri:userkey="key-jdoe"/></ac:link> and <ac:link><ri:user ri:userkey="key-asmith"/></ac:link>.</p>"#;
+    mount_page(mock, "65543", &wiki_page("65543", 4, owners)).await;
+    mount_users(
+        mock,
+        &[("key-jdoe", Some("jdoe")), ("key-asmith", Some("asmith"))],
+    )
+    .await;
+    // PageUpdate: the page at version 5 for stage 1 and the stale check alike.
+    mount_confluence(
+        mock,
+        "GET",
+        &content_path("65538"),
+        200,
+        Some(&wiki_page("65538", 5, "<p>old</p>")),
+    )
+    .await;
+    mount_confluence(mock, "PUT", &content_path("65538"), 200, Some(&updated)).await;
+    // PageUpdateConflict: at version 6 against a base of 5, with the base body for stage 2.
+    mount_page(mock, "65537", &wiki_page("65537", 6, "<p>current</p>")).await;
+    mount_history_version(mock, "65537", 5, &wiki_page("65537", 5, "<p>base</p>")).await;
+    // PageMove: the page and its new parent, both in `DOC`.
+    let moved = json!({"id": "65539", "type": "page", "status": "current", "title": "Page",
+                       "space": {"key": "DOC"}, "version": {"number": 3}, "ancestors": []});
+    let parent = json!({"id": "65540", "type": "page", "status": "current", "title": "Parent",
+                        "space": {"key": "DOC"}, "ancestors": []});
+    mount_confluence(mock, "GET", &content_path("65539"), 200, Some(&moved)).await;
+    mount_confluence(mock, "GET", &content_path("65540"), 200, Some(&parent)).await;
+    mount_confluence(mock, "PUT", &content_path("65539"), 200, Some(&updated)).await;
+    // AttachmentUpload: no attachment of that name, then the wrapped receipt of the new one.
+    let attachments = format!("{}/child/attachment", content_path("65541"));
+    let none = json!({"results": [], "start": 0, "limit": 50, "size": 0});
+    let receipt = json!({"results": [{"id": "att3002", "type": "attachment", "status": "current",
+                                      "version": {"number": 1}}]});
+    mount_confluence(mock, "GET", &attachments, 200, Some(&none)).await;
+    mount_confluence(mock, "POST", &attachments, 200, Some(&receipt)).await;
+    // LabelRemove: the content with its one label, the empty 204.
+    let mut labelled = wiki_page("65542", 2, "<p>x</p>");
+    labelled["metadata"] = json!({"labels": {"results": [{"prefix": "global", "name": "release",
+                                  "id": "2001"}], "start": 0, "limit": 200, "size": 1}});
+    mount_confluence(mock, "GET", &content_path("65542"), 200, Some(&labelled)).await;
+    mount_confluence(
+        mock,
+        "DELETE",
+        &format!("{}/label/release", content_path("65542")),
+        204,
+        None,
+    )
+    .await;
+    Ok(())
+}
+
+/// Runs Confluence flow `flow` (its pages are unique to it; `n` is only for the error text).
+pub async fn run_confluence_flow(
+    h: &Harness,
+    flow: ConfluenceFlow,
+    n: usize,
+) -> Result<(), TestError> {
+    let ap = h.approver();
+    match flow {
+        ConfluenceFlow::PageGetMarkdown => {
+            let id = submit_queued(h, PAGE_GET, json!({ "id": "65543" })).await?;
+            ap.release(&id).map_err(de)?;
+            expect(
+                "page get",
+                h.await_(&id, 10_000).await.status,
+                Status::Released,
+            )
+        }
+        ConfluenceFlow::PageUpdate => {
+            let params =
+                json!({ "id": "65538", "base_version": 5, "body": format!("New *text* {n}.") });
+            approved_write(h, PAGE_UPDATE, params).await
+        }
+        ConfluenceFlow::PageUpdateConflict => {
+            let params = json!({ "id": "65537", "base_version": 5, "body": "Mine." });
+            let id = submit_queued(h, PAGE_UPDATE, params).await?;
+            ap.deny(&id, "conflict").map_err(de)?;
+            expect(
+                "conflict",
+                h.await_(&id, 10_000).await.status,
+                Status::Denied,
+            )
+        }
+        ConfluenceFlow::PageMove => {
+            let params = json!({ "id": "65539", "parent": "65540" });
+            approved_write(h, PAGE_MOVE, params).await
+        }
+        ConfluenceFlow::AttachmentUpload => {
+            let params = json!({ "id": "65541", "filename": "notes.txt",
+                                 "content_base64": "aGVsbG8gd29ybGQ=" });
+            approved_write(h, ATTACHMENT_UPLOAD, params).await
+        }
+        ConfluenceFlow::LabelRemove => {
+            let params = json!({ "id": "65542", "label": "release" });
+            approved_write(h, LABEL_REMOVE, params).await
+        }
+    }
+}
+
 /// Decisions on revisions nobody opened (M3 T29 M-11): after a redaction (a read) and after an
 /// edit (a write) the new revision is refused as `NotOpened`, then opened and decided, so the
 /// U-32 property runs over a log that saw the guard fire. Flow number `n` (its keys are unique).
@@ -698,7 +876,12 @@ fn bare(p: &str) -> String {
 /// such records. Every hit carries the app's `User-Agent`. Returns how many authenticated hits it
 /// covered.
 pub async fn check_coverage(h: &Harness) -> Result<usize, String> {
-    let mock = jira(h).map_err(|e| e.to_string())?;
+    check_coverage_on(h, "jira-main").await
+}
+
+/// [`check_coverage`] over the mock of instance `alias` (the Confluence flows' `wiki`).
+pub async fn check_coverage_on(h: &Harness, alias: &str) -> Result<usize, String> {
+    let mock = h.mock(alias).ok_or_else(|| format!("no {alias} mock"))?;
     let recs = h.audit_records().await.map_err(|e| e.to_string())?;
     let mut received: HashMap<String, (u64, Value)> = HashMap::new();
     let mut started: HashMap<String, u64> = HashMap::new();
@@ -757,6 +940,10 @@ pub async fn check_coverage(h: &Harness) -> Result<usize, String> {
                         ("GET", mock.path(&format!("/rest/api/2/issue/{key}")))
                     }
                     Some(SEARCH) => ("POST", mock.path("/rest/api/2/search")),
+                    Some(PAGE_GET) => {
+                        let id = params["id"].as_str().ok_or("read without an id")?;
+                        ("GET", mock.path(&content_path(id)))
+                    }
                     other => return Err(format!("unexpected read op {other:?}")),
                 };
                 let pages = r.payload["responses"].as_array().map_or(0, Vec::len);

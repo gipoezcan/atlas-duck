@@ -62,6 +62,9 @@ pub mod settings;
 pub(crate) mod shutdown;
 /// The "possible duplicate" and "similar request" flags and their RF-4 seeding (§5.6, L45).
 pub mod similarity;
+/// The per-instance Confluence user cache and the user lookups of a Markdown page read (§7.6,
+/// PD-99); crate-private (Δ3).
+pub(crate) mod users;
 /// Static params validation: schema, field rules, caps, move limit, `min_version` (§2.3, §5.2).
 pub mod validate;
 
@@ -69,11 +72,11 @@ pub mod validate;
 #[cfg(feature = "testing")]
 pub mod testing;
 
+#[cfg(feature = "testing")]
+pub use crate::core::{BuildPause, HookPoint, Pause, TestHooks};
 pub use crate::core::{
     Confirm, Core, CoreDeps, NativeConfirmer, ShutdownReason, ShutdownReport, StartError,
 };
-#[cfg(feature = "testing")]
-pub use crate::core::{HookPoint, Pause, TestHooks};
 pub use atlas_duck_preview::CandidateRev;
 /// The product of `AddInstance` (M6 T25: the app parses the add-instance form's `product` into it
 /// without a registry dependency of its own).

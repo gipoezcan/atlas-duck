@@ -531,3 +531,74 @@ async fn similarity_text_uses_local_offset() -> TestResult {
     assert!(similar_text(&h, &fourth).await?.ends_with("UTC"));
     Ok(())
 }
+
+/// RF-4 for `confluence.page.create` (M7 Task 16; a `Create` op over `(space, parent, title)`):
+/// a create that crashed after `WRITE_APPROVED` is `outcome_unknown` after the restart, and the
+/// same create submitted again is flagged "similar to req_… outcome unknown", a Caution with
+/// Approve still enabled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rf4_page_create_after_crash_is_flagged() -> TestResult {
+    const PAGE_CREATE: &str = "confluence.page.create";
+    let mut h = Harness::confluence().await?;
+    let create = json!({"space": "DOC", "title": "Release 1.5 notes", "body": "Hello.",
+                        "parent": "123400"});
+    {
+        let mock = h.mock("wiki").ok_or("no wiki mock")?;
+        let answer = |body: Value| {
+            mock.response(200)
+                .set_body_raw(body.to_string(), "application/json")
+        };
+        common::confluence::mount_space(
+            mock,
+            "DOC",
+            &json!({"id": 98305, "key": "DOC", "name": "Documentation", "type": "global"}),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path(mock.path("/rest/api/content/123400")))
+            .respond_with(answer(json!({
+                "id": "123400", "type": "page", "status": "current", "title": "Release notes",
+                "space": {"key": "DOC", "name": "Documentation"}, "ancestors": [],
+            })))
+            .mount(mock.server())
+            .await;
+        common::confluence::mount_title_lookup(mock, "DOC", "Release 1.5 notes", &[]).await;
+        // The identity call of the approved create never answers: it stays mid-execution, as if
+        // the app crashed there.
+        Mock::given(path(mock.path("/rest/api/user/current")))
+            .respond_with(
+                answer(
+                    json!({"type": "known", "username": TEST_USER, "userKey": TEST_USER_KEY,
+                              "displayName": "Jane Doe"}),
+                )
+                .set_delay(Duration::from_secs(60)),
+            )
+            .mount(mock.server())
+            .await;
+    }
+    let approved = queued(&h, h.submit(PAGE_CREATE, create.clone()).await).await?;
+    assert!(h.approver().open(&approved).map_err(de)?.preview.approvable);
+    h.approver().approve(&approved).map_err(de)?;
+    let mut seen = false;
+    for _ in 0..400 {
+        if h.event_types(&approved)
+            .await?
+            .contains(&EventType::WRITE_APPROVED)
+        {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(seen, "WRITE_APPROVED never committed");
+
+    h.crash_and_restart().await?;
+    assert_eq!(h.core().startup_notice().len(), 1);
+    let again = queued(&h, h.submit(PAGE_CREATE, create).await).await?;
+    let row = h.approver().item(&again).ok_or("not queued")?;
+    assert_eq!(row.similar_to.as_deref(), Some(approved.as_str()));
+    assert!(row.approvable && row.caution_count >= 1);
+    let text = similar_text(&h, &again).await?;
+    assert_eq!(text, format!("similar to {approved} outcome unknown"));
+    Ok(())
+}

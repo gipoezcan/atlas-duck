@@ -1,5 +1,5 @@
 use atlas_duck_preview::diff::{
-    DIFF_MAX_LINES, DIFF_MAX_MIDDLE_BYTES, DiffLine, DiffOp, hunks, line_diff,
+    DIFF_MAX_LINES, DIFF_MAX_MIDDLE_BYTES, DiffLine, DiffOp, hunks, line_diff, line_diff_lines,
 };
 
 fn d(op: DiffOp, t: &str) -> DiffLine {
@@ -275,6 +275,79 @@ fn line_diff_bounded_work_on_dissimilar_inputs() {
     assert_eq!(out.lines.last(), Some(&d(DiffOp::Same, "s\n")));
     assert!(out.lines[1..5001].iter().all(|l| l.op == DiffOp::Del));
     assert!(out.lines[5001..10_001].iter().all(|l| l.op == DiffOp::Add));
+}
+
+/// M7 Task 15 (T7 review I-2): a diff over a caller's own line projection (the raw storage
+/// lines, which end at block tags, not only at `\n`) keeps every line as given: no line is
+/// re-split, nothing is added, and `line_diff` is the slice diff of its `\n` split.
+#[test]
+fn line_diff_lines_keeps_the_projection() {
+    let old = ["<p>a</p>", "<p>b</p>", "<p>c</p>"];
+    let new = ["<p>a</p>", "<p>B</p>", "<p>c</p>", "<hr/>"];
+    let out = line_diff_lines(&old, &new);
+    assert!(!out.truncated);
+    assert_eq!(
+        out.lines,
+        vec![
+            d(DiffOp::Same, "<p>a</p>"),
+            d(DiffOp::Del, "<p>b</p>"),
+            d(DiffOp::Add, "<p>B</p>"),
+            d(DiffOp::Same, "<p>c</p>"),
+            d(DiffOp::Add, "<hr/>"),
+        ]
+    );
+    check_script(&old.concat(), &new.concat(), &out.lines);
+    // A line holding a `\n` inside is not split again.
+    let out = line_diff_lines(&["x\ny"], &["x\nz"]);
+    assert_eq!(
+        out.lines,
+        vec![d(DiffOp::Del, "x\ny"), d(DiffOp::Add, "x\nz")]
+    );
+    for (old, new) in [("a\nb\nc", "a\nx\nc\n"), ("", "q\n"), ("p\nq", "p\nq")] {
+        let a: Vec<&str> = old.split_inclusive('\n').collect();
+        let b: Vec<&str> = new.split_inclusive('\n').collect();
+        assert_eq!(
+            line_diff(old, new),
+            line_diff_lines(&a, &b),
+            "{old:?} {new:?}"
+        );
+    }
+}
+
+/// M7 T15 review m-4: storage-sized middles (4 MiB a side) of long lines that share all but
+/// their last bytes. The search compares interned line ids, not the line text, so its cost does
+/// not grow with the line length (measured on the dev profile: the text comparisons took about
+/// 170 ms for the first case, the ids about 30 ms); the script is still the minimal,
+/// byte-faithful one.
+/// - 1 000 lines a side, each differing from every line of the other side only after a common
+///   4 000-byte run: an edit distance of exactly the search bound, every step of the search a
+///   mismatch over the whole run.
+/// - long equal lines, one side 1 990 lines shorter and both framed by a line the other lacks
+///   (neither the prefix nor the suffix cut takes them): a snake over almost the whole middle.
+#[test]
+fn line_diff_long_equal_lines_stay_fast() {
+    let run = "x".repeat(4_000);
+    let old: String = (0..1_000).map(|i| format!("{run}a{i}\n")).collect();
+    let new: String = (0..1_000).map(|i| format!("{run}b{i}\n")).collect();
+    let started = std::time::Instant::now();
+    let out = line_diff(&old, &new);
+    let took = started.elapsed();
+    assert!(!out.truncated);
+    assert_eq!(check_script(&old, &new, &out.lines), 2_000);
+    assert!(took < std::time::Duration::from_millis(500), "{took:?}");
+
+    let line = format!("{}\n", "x".repeat(199));
+    let side = |head: &str, n: usize, tail: &str| format!("{head}\n{}{tail}\n", line.repeat(n));
+    let (old, new) = (
+        side("old", 19_990, "end old"),
+        side("new", 18_000, "end new"),
+    );
+    let started = std::time::Instant::now();
+    let out = line_diff(&old, &new);
+    let took = started.elapsed();
+    assert!(!out.truncated);
+    assert_eq!(check_script(&old, &new, &out.lines), 1_994);
+    assert!(took < std::time::Duration::from_secs(1), "{took:?}");
 }
 
 #[test]

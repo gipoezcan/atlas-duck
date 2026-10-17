@@ -22,7 +22,9 @@ use atlas_duck_core::config::limits::{LimitsError, limits_config};
 use atlas_duck_core::engine::cache::{
     Candidate, CandidateCache, RebuildError, build_candidate, fetched_responses,
 };
-use atlas_duck_core::engine::queue::{Admission, AgentKey, KeyOrigin, Limits, MIB, Reservation};
+use atlas_duck_core::engine::queue::{
+    Admission, AgentKey, KeyOrigin, Limits, MIB, Reservation, UPLOAD_PART_HEADERS,
+};
 use atlas_duck_core::payloads::InvalidReason;
 use atlas_duck_core::payloads::{ReadFetched, read_fetched};
 use atlas_duck_core::settings::ScriptLimitsReq;
@@ -33,6 +35,7 @@ use atlas_duck_ipc::proto::{
     BUSY_RETRY_PENDING_S, ClientKind, ConnectionMeta, PeerInfo, busy_envelope,
 };
 use atlas_duck_registry::RELEASE_CAP_BYTES;
+use common::confluence::{mount_page, page_with_storage};
 use common::{TestError, TestResult, code, detail, exit, request_id};
 use serde_json::{Value, json};
 
@@ -165,38 +168,60 @@ fn key(name: &str) -> AgentKey {
 async fn x03_storage_low_refuses_nothing_queued() -> TestResult {
     let h = Harness::jira().await?;
     // The start fill of the field-name cache (T8) logs its own records: let it end first.
-    assert!(h.field_cache_filled().await);
+    // (60 s: under a loaded parallel run the fill's GET and its append can outlast the 10 s default.)
+    assert!(
+        h.field_cache_filled_within(Duration::from_secs(60)).await,
+        "the start fill of the field-name cache was still running after 60 s"
+    );
     mount_issue(&h, "ABC-1", 64, 'a').await?;
     let before = h.event_count().await?;
     h.free_space().set(0);
     let env = h.submit(ISSUE, issue("ABC-1")).await;
-    assert_eq!(env.status, Status::Failed);
-    assert_eq!(code(&env), "audit_storage_low");
+    assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
+    assert_eq!(code(&env), "audit_storage_low", "{}", env.to_json_line());
     assert_eq!(exit(&env), 1);
     assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(true));
-    assert_eq!(env.request_id, None);
+    assert_eq!(env.request_id, None, "{}", env.to_json_line());
     // Nothing queued, nothing logged, nothing sent, nothing reserved.
-    assert!(h.engine().pending_entries().is_empty());
-    assert_eq!(h.event_count().await?, before);
-    assert_eq!(h.engine().admission().pending_total(), 0);
+    assert!(
+        h.engine().pending_entries().is_empty(),
+        "the refused submit left a queued entry"
+    );
+    let after = h.event_count().await?;
+    assert_eq!(
+        after,
+        before,
+        "the refused submit appended {} event(s)",
+        after.saturating_sub(before)
+    );
+    assert_eq!(
+        h.engine().admission().pending_total(),
+        0,
+        "the refused submit reserved admission bytes"
+    );
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
         common::test_hits(h.mock("jira-main").ok_or("no mock")?)
             .await
-            .is_empty()
+            .is_empty(),
+        "a refused submit reached Jira"
     );
     // A failing probe refuses the same way (the store reports it as low space).
     h.free_space().set(u64::MAX);
     h.free_space().set_failing(true);
-    assert_eq!(
-        code(&h.submit(ISSUE, issue("ABC-1")).await),
-        "audit_storage_low"
-    );
+    let env = h.submit(ISSUE, issue("ABC-1")).await;
+    assert_eq!(code(&env), "audit_storage_low", "{}", env.to_json_line());
     h.free_space().set_failing(false);
-    assert_eq!(h.event_count().await?, before);
+    let after = h.event_count().await?;
+    assert_eq!(
+        after,
+        before,
+        "the failing probe appended {} event(s)",
+        after.saturating_sub(before)
+    );
     // Space back: admitted.
     let env = h.submit(ISSUE, issue("ABC-1")).await;
-    assert_eq!(env.status, Status::Pending);
+    assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
     Ok(())
 }
 
@@ -475,7 +500,10 @@ async fn i37_max_pending_bytes_busy() -> TestResult {
     let read = Reservation::read(atlas_duck_registry::get(ISSUE).ok_or("op")?);
     assert_eq!(read.bytes(), RELEASE_CAP_BYTES);
     assert_eq!(Reservation::script(&limits.script).bytes(), 16 * MIB);
-    let write = Reservation::for_op(atlas_duck_registry::get("jira.issue.create").ok_or("op")?);
+    let write = Reservation::for_op(
+        atlas_duck_registry::get("jira.issue.create").ok_or("op")?,
+        &limits,
+    );
     assert_eq!(write.bytes(), 0);
     let adm = Admission::new(limits_with(|l| {
         l.max_pending_bytes = Some(32 * MIB);
@@ -698,6 +726,125 @@ fn admission_tickets_release_exactly_once() -> TestResult {
         .map_err(|_| "busy")?;
     assert!(adm.admit(key("k9"), read).is_err());
     assert_eq!((adm.pending_total(), adm.reserved_bytes()), (3, 48 * MIB));
+    Ok(())
+}
+
+/// T23 (T15 review I-1 residual): a pending `confluence.page.update` reserves its two enrichment
+/// bodies (2 x 16 MiB) against `max_pending_bytes`; the other Confluence writes but the upload
+/// reserve nothing.
+#[test]
+fn page_update_reserves_its_two_bodies() -> TestResult {
+    let limits = limits_with(|l| l.max_pending_bytes = Some(48 * MIB));
+    let spec = atlas_duck_registry::get("confluence.page.update").ok_or("no page.update")?;
+    let update = Reservation::for_op(spec, &limits);
+    assert_eq!(update.bytes(), 32 * MIB);
+    // No cap: the same static figure (`admit` ignores bytes then).
+    assert_eq!(
+        Reservation::for_op(spec, &Limits::default()).bytes(),
+        32 * MIB
+    );
+    for other in [
+        "confluence.page.create",
+        "confluence.label.add",
+        "jira.issue.create",
+    ] {
+        let spec = atlas_duck_registry::get(other).ok_or("op")?;
+        assert_eq!(Reservation::for_op(spec, &limits).bytes(), 0, "{other}");
+    }
+    let adm = Admission::new(limits);
+    let t = adm.admit(key("a"), update).map_err(|_| "busy")?;
+    assert!(adm.admit(key("b"), update).is_err(), "32 + 32 > 48");
+    drop(t);
+    assert!(adm.admit(key("b"), update).is_ok());
+    Ok(())
+}
+
+/// T23 review I-1: under a `max_pending_bytes` below 32 MiB a page update reserves the cap, so
+/// one update fits an empty queue (before: `busy` for good) and a second one waits for it.
+#[test]
+fn page_update_under_a_small_cap_reserves_the_cap() -> TestResult {
+    let spec = atlas_duck_registry::get("confluence.page.update").ok_or("no page.update")?;
+    for mb in [1, 24, 31] {
+        let limits = limits_with(|l| l.max_pending_bytes = Some(mb * MIB));
+        let update = Reservation::for_op(spec, &limits);
+        assert_eq!(update.bytes(), mb * MIB, "cap {mb} MiB");
+        let adm = Admission::new(limits);
+        let t = adm.admit(key("a"), update).map_err(|_| "busy")?;
+        assert!(adm.admit(key("b"), update).is_err(), "cap {mb} MiB: full");
+        drop(t);
+        assert!(adm.admit(key("b"), update).is_ok(), "cap {mb} MiB: freed");
+    }
+    // At or above 32 MiB the full figure.
+    let at = limits_with(|l| l.max_pending_bytes = Some(64 * MIB));
+    assert_eq!(Reservation::for_op(spec, &at).bytes(), 32 * MIB);
+    Ok(())
+}
+
+/// T23 review I-2: a pending `confluence.attachment.upload` reserves what it holds at worst: the
+/// base64 content three times (validated params, write params, an edit's delivery view), each
+/// at the schema's `maxLength`, plus the 10 MiB wire body and its part headers; at most the cap.
+#[test]
+fn upload_reserves_its_file_copies() -> TestResult {
+    let spec = atlas_duck_registry::get("confluence.attachment.upload").ok_or("no upload")?;
+    let n = spec.caps.upload_max_bytes.ok_or("no upload cap")?;
+    assert_eq!(n, 10 * MIB);
+    // The base64 length the reservation uses is the schema's own bound.
+    let max_len = spec.params_schema_json()["properties"]["content_base64"]["maxLength"]
+        .as_u64()
+        .ok_or("no maxLength")?;
+    assert_eq!(n.div_ceil(3) * 4, max_len);
+    let full = 3 * max_len + n + UPLOAD_PART_HEADERS;
+    assert_eq!(full, 52_437_000, "about 50 MiB");
+    assert_eq!(Reservation::for_op(spec, &Limits::default()).bytes(), full);
+    let limits = limits_with(|l| l.max_pending_bytes = Some(64 * MIB));
+    let upload = Reservation::for_op(spec, &limits);
+    assert_eq!(upload.bytes(), full);
+    let adm = Admission::new(limits);
+    let t = adm.admit(key("a"), upload).map_err(|_| "busy")?;
+    assert!(adm.admit(key("b"), upload).is_err(), "50 + 50 > 64");
+    drop(t);
+    assert!(adm.admit(key("b"), upload).is_ok());
+    // Under a smaller cap: the cap, so one upload fits an empty queue.
+    let small = limits_with(|l| l.max_pending_bytes = Some(24 * MIB));
+    let upload = Reservation::for_op(spec, &small);
+    assert_eq!(upload.bytes(), 24 * MIB);
+    let adm = Admission::new(small);
+    let _t = adm.admit(key("a"), upload).map_err(|_| "busy")?;
+    assert!(adm.admit(key("b"), upload).is_err());
+    Ok(())
+}
+
+/// T23 review: the reservation reaches admission through the handler. With
+/// `max_pending_bytes_mb = 33` one queued `confluence.page.update` (32 MiB) fills the cap: a
+/// second is `busy`; denying the first gives its bytes back at the terminal state and a third is
+/// admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn page_update_reservation_is_admitted_by_the_handler() -> TestResult {
+    let h = Harness::builder()
+        .confluence("wiki")
+        .extra_config("[limits]\nmax_pending_bytes_mb = 33\n")
+        .start()
+        .await?;
+    let mock = h.mock("wiki").ok_or("no confluence mock")?;
+    mount_page(mock, "65537", &page_with_storage("<p>a</p>")).await;
+    let params = json!({ "id": "65537", "base_version": 7, "body": "<p>b</p>",
+                         "body_format": "storage" });
+    let update = || params.clone();
+    let first = h.submit("confluence.page.update", update()).await;
+    assert_eq!(first.status, Status::Pending, "{}", first.to_json_line());
+    let first = request_id(&first)?;
+    // Queued (enriched), so the first is pending for its own reason and not ended by a failure.
+    let item = h.queued(&first, 10_000).await.ok_or("never queued")?;
+    assert!(item.approvable);
+    assert_eq!(h.engine().admission().reserved_bytes(), 32 * MIB);
+    assert_busy(&h.submit("confluence.page.update", update()).await)?;
+    h.approver()
+        .deny_unopened(&first, "no")
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(h.engine().admission().reserved_bytes(), 0);
+    let third = h.submit("confluence.page.update", update()).await;
+    assert_eq!(third.status, Status::Pending, "{}", third.to_json_line());
+    assert_eq!(h.engine().admission().reserved_bytes(), 32 * MIB);
     Ok(())
 }
 

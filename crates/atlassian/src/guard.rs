@@ -75,6 +75,7 @@ mod tests {
     /// there, add its path here.
     const REGISTRY_PATHS: &[&str] = &[
         "/rest/api/2/myself",
+        "/rest/api/user",
         "/rest/api/2/project",
         "/rest/api/2/project/{key}",
         "/rest/api/2/issue",
@@ -106,6 +107,8 @@ mod tests {
         "/rest/api/content/{id}/child/page",
         "/rest/api/content/{id}/child/comment",
         "/rest/api/content/{id}/child/attachment",
+        // M7 Task 20a (PD-109): the replace of an attachment, built in core (plan review m-12).
+        "/rest/api/content/{id}/child/attachment/{attachmentId}/data",
         "/rest/api/content/{id}/label",
         "/rest/api/content/{id}/label/{label}",
         "/rest/api/content/{id}/history",

@@ -1,0 +1,5 @@
+<p><a href="https://example.com/a_b?x=1&amp;y=2">Example</a> and <a href="https://auto.example/~u">https://auto.example/~u</a> and <a href="mailto:me@example.com">me@example.com</a>.</p>
+<p><a href="https://img.example/logo.png">logo</a> and <a href="https://img.example/empty.png">https://img.example/empty.png</a></p>
+<p>js (javascript:alert(1)) data (data:text/html,x) rel (/wiki/x) anchor (#top) <a href="https://x.example/e">https://x.example/e</a> empty <a href="HTTPS://UP.example">up</a></p>
+<p><a href="https://x.example/&quot;q&quot;">t</a> <a href="https://x.example">i go</a> x (javascript:y)</p>
+<p><a href="https://ref.example/r">ref link</a> and <a href="mailto:a@b.example"><em>em</em> text</a> and javascript:z</p>

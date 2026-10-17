@@ -7,6 +7,9 @@
 //! deterministic (same context, same bytes): `WRITE_APPROVED` hashes their output.
 
 pub mod confluence;
+pub(crate) mod confluence_body;
+pub(crate) mod confluence_ext;
+pub(crate) mod confluence_preview;
 pub mod generic;
 pub mod jira;
 pub(crate) mod jira_body;
@@ -16,7 +19,7 @@ pub mod stale;
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use atlas_duck_atlassian::{
     GetCall, HttpRequestSpec, NormalizedBaseUrl, PagedCall, SearchCall, TemplateError, build_url,
@@ -136,7 +139,9 @@ pub enum ReadPlan {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExecError {
-    /// PD-09: a write completed in M5/M7; answered at validation as `internal`.
+    /// PD-09: an op the build does not run; answered at validation as `internal`. Every registry
+    /// write has its executor since M7 Task 20a (`generic::not_in_this_build` stays for an op
+    /// without one).
     NotInThisBuild,
     /// A static check only the op knows (e.g. the `confluence.search` CQL rules): answered at
     /// validation with the error's code, never echoing the offending value.
@@ -175,8 +180,9 @@ pub struct ExecCtx<'a> {
     /// `Validated::comments_cap` (Δ7): at most this many comments for `jira.issue.get
     /// --comments`; `None` for every other op and for writes.
     pub comments_cap: Option<u32>,
-    /// U-24 (PD-64): the engine copies `TestHooks::converter_fault` here; `jira_body` appends it
-    /// to converted Markdown before the hard check. Absent from production builds.
+    /// U-24 (PD-64): the engine copies `TestHooks::converter_fault` here; `jira_body` and
+    /// `confluence_body` append it to converted Markdown of its product before the hard check.
+    /// Absent from production builds.
     #[cfg(feature = "testing")]
     pub test_fault: Option<crate::testing::ConverterFault>,
 }
@@ -339,6 +345,91 @@ pub struct WriteSummaryFacts {
     pub link_type: Option<JiraLinkType>,
     /// `jira.sprint.move_issues` (T18, PD-54): the sprint enrichment read.
     pub sprint: Option<JiraSprint>,
+    /// M7 Δ3: what a Confluence write's enrichment read (Task 15: `confluence.page.update`).
+    pub confluence: Option<ConfluenceFacts>,
+}
+
+/// M7 Δ3: a Confluence write's enrichment facts (raw server text; the previewers escape what they
+/// show). Task 15 fills the `page.update` part; the later write tasks fill theirs.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ConfluenceFacts {
+    pub space_key: String,
+    pub space_name: Option<String>,
+    /// The page the write is about, as the current page answered.
+    pub page: Option<PageRef>,
+    pub parent: Option<PageRef>,
+    pub from_path: Vec<String>,
+    pub to_path: Vec<String>,
+    pub container_type: Option<String>,
+    pub existing_attachment: Option<ExistingAttachment>,
+    pub duplicate_title: bool,
+    pub current_labels: Vec<String>,
+    /// Task 15 (PD-104; additive to Δ3, the judge has no executor output, T15 report): the
+    /// current page's storage (stage 1), which the update card diffs against the storage the
+    /// request sends and the lossy check counts. Shared (T15 review I-1): every clone of the
+    /// write's state (an open, an edit snapshot) points at the one copy, of at most
+    /// `confluence::PAGE_BODY_LIMIT` bytes.
+    pub current_storage: Option<Arc<str>>,
+    /// Task 15: the agent's base version's storage (stage 2, a conflict only), the "before" of
+    /// both conflict diffs. Shared and bounded like `current_storage`.
+    pub base_storage: Option<Arc<str>>,
+    /// Task 15 (PD-94, plan review I-3 c): the current storage does not parse, so a Markdown
+    /// update cannot be counted: the judge holds it (`EnrichmentError`) and the card says why.
+    pub current_unparsable: bool,
+    /// T15 review I-1 (lead ruling c): the current or the base storage is longer than
+    /// `confluence::PAGE_BODY_LIMIT`; neither body is kept, the judge holds the update
+    /// (`EnrichmentError`) and the card says why.
+    pub page_too_large: bool,
+    /// Task 17 (PD-106): the new parent of a `page.move` is the page itself or one of its
+    /// descendants: the judge holds it (`EnrichmentError`) and the card says why.
+    pub into_own_subtree: bool,
+}
+
+/// Redacting `Debug` (§7.7): page bodies, titles and keys are Atlassian data.
+impl fmt::Debug for ConfluenceFacts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfluenceFacts")
+            .field(
+                "current_storage",
+                &self.current_storage.as_ref().map(|s| s.len()),
+            )
+            .field("base_storage", &self.base_storage.as_ref().map(|s| s.len()))
+            .field("current_unparsable", &self.current_unparsable)
+            .field("page_too_large", &self.page_too_large)
+            .field("into_own_subtree", &self.into_own_subtree)
+            .finish_non_exhaustive()
+    }
+}
+
+/// M7 Δ3: a Confluence page as enrichment named it (raw server text).
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct PageRef {
+    pub id: String,
+    pub title: String,
+}
+
+/// Redacting `Debug` (§7.7).
+impl fmt::Debug for PageRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PageRef").finish_non_exhaustive()
+    }
+}
+
+/// M7 Δ3: the attachment an upload collides with or replaces (Task 20a, raw server text).
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ExistingAttachment {
+    pub id: String,
+    pub version: u64,
+    pub size: Option<u64>,
+}
+
+/// Redacting `Debug` (§7.7).
+impl fmt::Debug for ExistingAttachment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExistingAttachment")
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
 }
 
 /// T18: the target sprint of a `jira.sprint.move_issues` as enrichment read it (raw server text).
@@ -481,6 +572,9 @@ pub struct ReadView<'a> {
     /// total)`, shown as Info `truncated_by_cap(N, total)` (PD-45). `None` otherwise. For such a
     /// read `more_available`/`server_total` describe the comment pages, not the issue.
     pub comments_truncated: Option<(u64, u64)>,
+    /// Δ3 (PD-100): what the storage → Markdown conversion of a Confluence page body reduced;
+    /// `None` for every other read (and for a page read without a storage body).
+    pub conversion: Option<atlas_duck_convert::ConversionReport>,
 }
 
 pub struct WriteView<'a> {
@@ -542,13 +636,10 @@ const READ: OpImpl = OpImpl {
     enrich_keys: &[],
 };
 
-/// PD-09: completed in M5/M7.
-const LATER_WRITE: OpImpl = OpImpl {
-    executor: generic::not_in_this_build,
-    previewer: generic::fallback_preview,
-    stale_check: None,
-    enrich: None,
-    enrich_keys: &[],
+/// PD-114: a read whose result is an item list (the Confluence list ops).
+const LIST: OpImpl = OpImpl {
+    previewer: generic::list_preview,
+    ..READ
 };
 
 /// One entry per registry id, in registry order (U-05: `tests/op_table.rs` checks the set).
@@ -788,11 +879,19 @@ static ENTRIES: &[(&str, OpImpl)] = &[
             enrich_keys: &[],
         },
     ),
+    // §6.3: a single object (the user, a space) keeps the JSON tree.
     ("confluence.user.current", READ),
-    ("confluence.space.list", READ),
+    ("confluence.space.list", LIST),
     ("confluence.space.get", READ),
-    ("confluence.page.get", READ),
-    ("confluence.page.find", READ),
+    (
+        "confluence.page.get",
+        OpImpl {
+            executor: confluence::page_get_executor,
+            previewer: confluence_preview::page_preview,
+            ..READ
+        },
+    ),
+    ("confluence.page.find", LIST),
     (
         "confluence.search",
         OpImpl {
@@ -801,27 +900,112 @@ static ENTRIES: &[(&str, OpImpl)] = &[
             ..READ
         },
     ),
-    ("confluence.page.children", READ),
-    ("confluence.comment.list", READ),
-    ("confluence.label.list", READ),
-    ("confluence.attachment.list", READ),
-    ("confluence.page.history", READ),
-    ("confluence.page.create", LATER_WRITE),
+    ("confluence.page.children", LIST),
+    (
+        "confluence.comment.list",
+        OpImpl {
+            previewer: confluence_preview::comments_preview,
+            ..READ
+        },
+    ),
+    ("confluence.label.list", LIST),
+    ("confluence.attachment.list", LIST),
+    (
+        "confluence.page.history",
+        OpImpl {
+            executor: confluence::page_history_executor,
+            // The summary (without `version`) keeps the JSON tree.
+            previewer: confluence_preview::page_preview,
+            ..READ
+        },
+    ),
+    (
+        "confluence.page.create",
+        OpImpl {
+            executor: confluence_ext::page_create_executor,
+            previewer: confluence_preview::create_preview,
+            // §5.4 step 5: an additive write has no stale rule; the identity call still runs.
+            stale_check: None,
+            enrich: Some(&confluence_ext::PAGE_CREATE_ENRICH),
+            // PD-105: space and parent are target params (read-only); a new title re-runs the
+            // duplicate check.
+            enrich_keys: &["title", "body"],
+        },
+    ),
     (
         "confluence.page.update",
         OpImpl {
             executor: confluence::page_update_executor,
-            previewer: generic::write_preview,
+            previewer: confluence_preview::update_preview,
             stale_check: Some(&stale::PAGE_UPDATE),
             enrich: Some(&confluence::PAGE_UPDATE_ENRICH),
-            enrich_keys: &["body", "title"],
+            // PD-104 (plan review I-6 b): the lossy check depends on `body_format` too.
+            enrich_keys: &["body", "body_format", "title"],
         },
     ),
-    ("confluence.page.move", LATER_WRITE),
-    ("confluence.comment.add", LATER_WRITE),
-    ("confluence.label.add", LATER_WRITE),
-    ("confluence.label.remove", LATER_WRITE),
-    ("confluence.attachment.upload", LATER_WRITE),
+    (
+        "confluence.page.move",
+        OpImpl {
+            executor: confluence_ext::page_move_executor,
+            previewer: confluence_preview::move_preview,
+            // PD-106 / §5.4 step 5: `version.number` unchanged.
+            stale_check: Some(&stale::PAGE_MOVE),
+            enrich: Some(&confluence_ext::PAGE_MOVE_ENRICH),
+            // `id` is the target param (read-only); an edited `parent` re-runs the resolution
+            // and the cycle check (plan review I-6 c).
+            enrich_keys: &["parent"],
+        },
+    ),
+    (
+        "confluence.comment.add",
+        OpImpl {
+            executor: confluence_ext::comment_add_executor,
+            previewer: confluence_preview::comment_preview,
+            // §5.4 step 5: an additive write has no stale rule; the identity call still runs.
+            stale_check: None,
+            enrich: Some(&confluence_ext::COMMENT_ADD_ENRICH),
+            // `reply_to` is resolved in stage 2 and is no target param: an edit of it re-runs the
+            // resolution (plan review I-6 a).
+            enrich_keys: &["reply_to"],
+        },
+    ),
+    (
+        "confluence.label.add",
+        OpImpl {
+            executor: confluence_ext::label_add_executor,
+            previewer: confluence_preview::labels_preview,
+            // §5.4 step 5: an additive write has no stale rule; the identity call still runs.
+            stale_check: None,
+            enrich: Some(&confluence_ext::LABELS_ENRICH),
+            enrich_keys: &[],
+        },
+    ),
+    (
+        "confluence.label.remove",
+        OpImpl {
+            executor: confluence_ext::label_remove_executor,
+            previewer: confluence_preview::labels_preview,
+            stale_check: None,
+            enrich: Some(&confluence_ext::LABELS_ENRICH),
+            enrich_keys: &[],
+        },
+    ),
+    (
+        "confluence.attachment.upload",
+        OpImpl {
+            executor: confluence_ext::attachment_upload_executor,
+            // §6.3 Attachment upload (Task 20b, PD-110) over the request list (its multipart
+            // body as the Δ2 envelope).
+            previewer: confluence_preview::attachment_preview,
+            // PD-109 / §5.4 step 5: with `replace`, the attachment's id and `version.number`
+            // unchanged; a new attachment plans no GET (the identity call still runs).
+            stale_check: Some(&stale::ATTACHMENT_REPLACE),
+            enrich: Some(&confluence_ext::ATTACHMENT_ENRICH),
+            // `id` is the target param (read-only); an edited filename or `replace` looks up the
+            // attachments again (the collision, the replaced attachment).
+            enrich_keys: &["filename", "replace"],
+        },
+    ),
 ];
 
 /// The rows of the explicit table before deduplication: U-05 checks it equals `op_table().len()`,

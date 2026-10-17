@@ -1,6 +1,8 @@
 //! Line diff for the edit previews (§6.3, PD-51): a small Myers O(ND) implementation with caps,
 //! so no diff crate enters the trusted base.
 
+use std::collections::HashMap;
+
 use serde::Serialize;
 
 /// More differing lines than this on either side (after the common prefix and suffix are cut):
@@ -81,7 +83,15 @@ fn push(out: &mut Vec<DiffLine>, op: DiffOp, text: &str) {
 pub fn line_diff(old: &str, new: &str) -> LineDiff {
     let a: Vec<&str> = old.split_inclusive('\n').collect();
     let b: Vec<&str> = new.split_inclusive('\n').collect();
-    let prefix = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    line_diff_lines(&a, &b)
+}
+
+/// [`line_diff`] over lines the caller split (M7 Task 15, T7 review I-2: the raw storage diff
+/// diffs `convert::storage_lines`, which end at block tags too). Each line is kept exactly as
+/// given, never split again and never joined, so the script is byte-faithful to the
+/// concatenation of each side; the caps are those of [`line_diff`].
+pub fn line_diff_lines(a: &[&str], b: &[&str]) -> LineDiff {
+    let prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
     let a_rest = a.get(prefix..).unwrap_or_default();
     let b_rest = b.get(prefix..).unwrap_or_default();
     let suffix = a_rest
@@ -103,8 +113,21 @@ pub fn line_diff(old: &str, new: &str) -> LineDiff {
             && m.iter().map(|t| t.len()).sum::<usize>() <= DIFF_MAX_MIDDLE_BYTES
     };
     let small = fits(a_mid) && fits(b_mid);
-    match small.then(|| myers(a_mid, b_mid)).flatten() {
-        Some(script) => out.extend(script),
+    let script = small
+        .then(|| {
+            let (a_ids, b_ids) = intern(a_mid, b_mid);
+            myers(&a_ids, &b_ids)
+        })
+        .flatten();
+    match script {
+        Some(script) => {
+            for (op, i) in script {
+                let src = if op == DiffOp::Add { b_mid } else { a_mid };
+                if let Some(t) = src.get(i) {
+                    push(&mut out, op, t);
+                }
+            }
+        }
         None => truncated = replace_all(&mut out, a_mid, b_mid),
     }
     for t in a_rest.iter().skip(a_rest.len() - suffix) {
@@ -146,9 +169,23 @@ fn push_bounded(out: &mut Vec<DiffLine>, op: DiffOp, lines: &[&str]) -> bool {
     false
 }
 
-/// Myers' forward search with a trace for the backtrack. `None` when the edit distance exceeds
-/// [`DIFF_MAX_D`].
-fn myers(a: &[&str], b: &[&str]) -> Option<Vec<DiffLine>> {
+/// Each line of both middles as an id, equal ids for equal lines (M7 T15 review m-4): the search
+/// compares integers, so its cost does not grow with the line length.
+fn intern<'a>(a: &[&'a str], b: &[&'a str]) -> (Vec<u32>, Vec<u32>) {
+    let mut ids: HashMap<&'a str, u32> = HashMap::new();
+    let mut id_of = |t: &'a str| {
+        let next = u32::try_from(ids.len()).unwrap_or(u32::MAX);
+        *ids.entry(t).or_insert(next)
+    };
+    let a_ids = a.iter().map(|t| id_of(t)).collect();
+    let b_ids = b.iter().map(|t| id_of(t)).collect();
+    (a_ids, b_ids)
+}
+
+/// Myers' forward search with a trace for the backtrack, over line ids ([`intern`]): the script
+/// as `(op, index)`, the index into `a` for `Same` and `Del`, into `b` for `Add`. `None` when the
+/// edit distance exceeds [`DIFF_MAX_D`].
+fn myers(a: &[u32], b: &[u32]) -> Option<Vec<(DiffOp, usize)>> {
     let n = isize::try_from(a.len()).ok()?;
     let m = isize::try_from(b.len()).ok()?;
     let max_d = isize::try_from(DIFF_MAX_D).ok()?.min(n + m);
@@ -194,7 +231,7 @@ fn myers(a: &[&str], b: &[&str]) -> Option<Vec<DiffLine>> {
     let d_end = found?;
 
     // Backtrack from (n, m); edits are collected in reverse.
-    let mut rev: Vec<DiffLine> = Vec::new();
+    let mut rev: Vec<(DiffOp, usize)> = Vec::new();
     let (mut x, mut y) = (n, m);
     let mut d = d_end;
     while d > 0 {
@@ -211,29 +248,22 @@ fn myers(a: &[&str], b: &[&str]) -> Option<Vec<DiffLine>> {
         while x > prev_x && y > prev_y {
             x -= 1;
             y -= 1;
-            rev.push(line(DiffOp::Same, a, x)?);
+            rev.push((DiffOp::Same, usize::try_from(x).ok()?));
         }
         if x == prev_x {
             y -= 1;
-            rev.push(line(DiffOp::Add, b, y)?);
+            rev.push((DiffOp::Add, usize::try_from(y).ok()?));
         } else {
             x -= 1;
-            rev.push(line(DiffOp::Del, a, x)?);
+            rev.push((DiffOp::Del, usize::try_from(x).ok()?));
         }
         d -= 1;
     }
     while x > 0 && y > 0 {
         x -= 1;
         y -= 1;
-        rev.push(line(DiffOp::Same, a, x)?);
+        rev.push((DiffOp::Same, usize::try_from(x).ok()?));
     }
     rev.reverse();
     Some(rev)
-}
-
-fn line(op: DiffOp, src: &[&str], i: isize) -> Option<DiffLine> {
-    Some(DiffLine {
-        op,
-        text: (*src.get(usize::try_from(i).ok()?)?).to_owned(),
-    })
 }

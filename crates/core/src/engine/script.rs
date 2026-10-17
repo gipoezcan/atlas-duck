@@ -62,7 +62,10 @@ use super::envelope::{self, OpenStatus};
 use super::handler::{CoreHandler, excerpt, internal_error};
 use super::queue::{AgentKey, Reservation};
 use super::read::{self, Classified};
-use super::{Engine, NewEntry, OnAuditFailure, RequestEntry, RequestHead, audit_failure_retryable};
+use super::{
+    Engine, InstanceHttp, NewEntry, OnAuditFailure, RequestEntry, RequestHead,
+    audit_failure_retryable,
+};
 use crate::audit_port::commit_request_received;
 use crate::gate::{AttentionKind, GateState, UiEvent};
 use crate::identity;
@@ -75,8 +78,8 @@ use crate::ops::{
     ExecError, ExecPlan, PreviewCtx, PreviewInput, PreviewModel, ReadPlan, ReadView, op_table,
 };
 use crate::payloads::{
-    self, EventCtx, InFlightReason, OutcomeKind, ReadFetched, ScriptCallMeta, ScriptErrorDetails,
-    ScriptFailed,
+    self, EventCtx, FetchRecord, InFlightReason, OutcomeKind, ReadFetched, ScriptCallMeta,
+    ScriptErrorDetails, ScriptFailed,
 };
 use crate::redact::RedactionMeta;
 use crate::running::KillAnswer;
@@ -503,6 +506,18 @@ pub(crate) struct CallInfo {
 struct InFlight {
     info: CallInfo,
     ctl: FetchControl,
+    /// PD-99: the call's user lookup in flight (purpose and resolved path).
+    lookup: Option<super::InFlight>,
+    /// PD-99: the record of the call's last user lookup, finished but not committed yet.
+    parked: Option<NewEvent>,
+}
+
+/// One call the end of a run (or a cancel) takes from the in-flight table.
+pub(crate) struct TakenCall {
+    pub info: CallInfo,
+    pub ctl: FetchControl,
+    pub lookup: Option<super::InFlight>,
+    pub parked: Option<NewEvent>,
 }
 
 /// Whether a call or the next page of an `atlas.all` call may be requested
@@ -675,7 +690,15 @@ impl RunShared {
             }
             g.calls = g.calls.saturating_add(1);
         }
-        g.in_flight.insert(info.call_id, InFlight { info, ctl });
+        g.in_flight.insert(
+            info.call_id,
+            InFlight {
+                info,
+                ctl,
+                lookup: None,
+                parked: None,
+            },
+        );
         PageStart::Go
     }
 
@@ -685,17 +708,56 @@ impl RunShared {
         lock(&self.inner).in_flight.remove(&call_id).is_some()
     }
 
-    /// The calls in flight, taken by the cancel path or the end of the run under the entry's gate.
-    pub(crate) fn take_in_flight(&self) -> Vec<(CallInfo, FetchControl)> {
+    /// PD-99: the call's user lookup starts (`Some`: the previous lookup's record is committed)
+    /// or ended (`None`).
+    pub(crate) fn set_lookup(&self, call_id: u64, f: Option<super::InFlight>) {
+        if let Some(call) = lock(&self.inner).in_flight.get_mut(&call_id) {
+            if f.is_some() {
+                call.parked = None;
+            }
+            call.lookup = f;
+        }
+    }
+
+    /// PD-99: the call's user lookup finished and its record is built: kept until
+    /// [`append_lookup`] commits it, or the end of the run records it with the call.
+    pub(crate) fn park_lookup(&self, call_id: u64, record: &NewEvent) {
+        if let Some(call) = lock(&self.inner).in_flight.get_mut(&call_id) {
+            call.parked = Some(record.clone());
+        }
+    }
+
+    /// The parked lookup record of a call still in flight (`Err`: the end of the run took the
+    /// call, and with it the record). Under the entry's gate only.
+    fn take_lookup_record(&self, call_id: u64) -> Result<Option<NewEvent>, ()> {
         let mut g = lock(&self.inner);
-        let mut calls: Vec<_> = g.in_flight.drain().map(|(_, f)| (f.info, f.ctl)).collect();
-        calls.sort_by_key(|(i, _)| i.call_id);
+        let call = g.in_flight.get_mut(&call_id).ok_or(())?;
+        Ok(call.parked.take())
+    }
+
+    /// The calls in flight, taken by the cancel path or the end of the run under the entry's gate.
+    pub(crate) fn take_in_flight(&self) -> Vec<TakenCall> {
+        let mut g = lock(&self.inner);
+        let mut calls: Vec<_> = g
+            .in_flight
+            .drain()
+            .map(|(_, f)| TakenCall {
+                info: f.info,
+                ctl: f.ctl,
+                lookup: f.lookup,
+                parked: f.parked,
+            })
+            .collect();
+        calls.sort_by_key(|c| c.info.call_id);
         calls
     }
 
     /// The `SCRIPT_CALL {cancelled_in_flight}` records of the calls in flight (§9.5): each call
     /// is taken, its control cancelled and the bytes received recorded. A call whose request was
-    /// never written has nothing to record. Under the entry's gate only.
+    /// never written has nothing to record. A call in its user lookups (PD-99) first gets the
+    /// record of its last finished lookup (if not committed yet) and `PREVIEW_FETCH {resolve,
+    /// cancelled_in_flight}` for the lookup in flight; its `SCRIPT_CALL` then holds the content
+    /// page. Under the entry's gate only.
     pub(crate) fn in_flight_records(
         &self,
         ctx: &EventCtx,
@@ -713,22 +775,45 @@ impl RunShared {
     ) -> (Vec<NewEvent>, Vec<CallInfo>) {
         let mut records = Vec::new();
         let mut recorded = Vec::new();
-        for (info, ctl) in self.take_in_flight() {
+        for TakenCall {
+            info,
+            ctl,
+            lookup,
+            parked,
+        } in self.take_in_flight()
+        {
             ctl.cancel();
             let cap = ctl.take_captured();
             if !cap.sent {
                 continue;
             }
+            let ctx = EventCtx {
+                instance_id: Some(info.instance_id.clone()),
+                ..ctx.clone()
+            };
+            // A parked record is the lookup in flight, finished.
+            let had_parked = parked.is_some();
+            records.extend(parked);
+            if let Some(f) = lookup.as_ref().filter(|_| !had_parked) {
+                records.push(payloads::preview_fetch(
+                    &ctx,
+                    f.purpose,
+                    "GET",
+                    &f.path,
+                    &FetchRecord::CancelledInFlight {
+                        reason,
+                        received: &cap.partial,
+                    },
+                ));
+            }
+            // During a lookup the partial bytes are the lookup's; the call's are its pages.
+            let partial: &[u8] = if lookup.is_some() { &[] } else { &cap.partial };
             let size = cap
                 .pages
                 .iter()
                 .map(|p| p.body.len() as u64)
                 .sum::<u64>()
-                .saturating_add(cap.partial.len() as u64);
-            let ctx = EventCtx {
-                instance_id: Some(info.instance_id.clone()),
-                ..ctx.clone()
-            };
+                .saturating_add(partial.len() as u64);
             records.push(payloads::script_call(
                 &ctx,
                 &ScriptCallMeta {
@@ -743,7 +828,7 @@ impl RunShared {
                 &ReadFetched::CancelledInFlight {
                     reason,
                     responses: &cap.pages,
-                    partial: &cap.partial,
+                    partial,
                     size,
                 },
                 size,
@@ -752,6 +837,42 @@ impl RunShared {
             recorded.push(info);
         }
         (records, recorded)
+    }
+}
+
+/// PD-99: commits the parked record of host call `call_id`'s last user lookup, under the entry's
+/// gate while the run is `Running` and the call still in flight (otherwise the end of the run
+/// took the call and records the lookup itself). `false`: the run ended, or the append failed
+/// (the request then fails `audit_failure`).
+pub(crate) async fn append_lookup(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    shared: &Arc<RunShared>,
+    call_id: u64,
+) -> bool {
+    let (e, en, sh) = (engine.clone(), entry.clone(), shared.clone());
+    let appended = tokio::spawn(async move {
+        let _gate = en.gate.clone().lock_owned().await;
+        if !matches!(en.state().model.phase(), Phase::Running) {
+            return Appended::Ended;
+        }
+        let Ok(Some(ev)) = sh.take_lookup_record(call_id) else {
+            return Appended::Ended;
+        };
+        match e.blocking(move |p| p.append(ev).map(|_| ())).await {
+            Ok(()) => Appended::Done,
+            Err(_) => Appended::Failed,
+        }
+    })
+    .await
+    .unwrap_or(Appended::Failed);
+    match appended {
+        Appended::Done => true,
+        Appended::Ended => false,
+        Appended::Failed => {
+            audit_failure(engine, entry, shared).await;
+            false
+        }
     }
 }
 
@@ -1200,7 +1321,21 @@ impl LiveBackend {
         {
             return refused;
         }
-        let classified = match self.fetch(&call, &vc, &ctl, None).await {
+        // PD-99: the call's user lookups share its read budget, counted from its first GET.
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.engine.read_budget().total)
+            .unwrap_or_else(tokio::time::Instant::now);
+        let (classified, http) = match self.fetch(&call, &vc, &ctl, None).await {
+            Ok(c) => c,
+            Err(result) => {
+                self.shared.finish_in_flight(call.id);
+                return result;
+            }
+        };
+        let classified = match self
+            .with_users(&call, &vc, &ctl, &http, classified, deadline)
+            .await
+        {
             Ok(c) => c,
             Err(result) => {
                 self.shared.finish_in_flight(call.id);
@@ -1215,7 +1350,7 @@ impl LiveBackend {
             s.rendered_call = true;
         }
         // The control was cancelled by the end of the run, which took the call and records it.
-        let Some(settled) = self.settle(&call, &vc, &info, classified) else {
+        let Some(settled) = self.settle(&call, &vc, &info, classified).await else {
             self.shared.finish_in_flight(call.id);
             return rejected_msg(ErrorCode::Cancelled, MSG_CALL_CANCELLED);
         };
@@ -1292,7 +1427,7 @@ impl LiveBackend {
                 return refused;
             }
             let classified = match self.fetch(&call, &vc, &ctl, Some((page, start))).await {
-                Ok(c) => c,
+                Ok((c, _)) => c,
                 Err(result) => {
                     self.shared.finish_in_flight(call.id);
                     self.answer_row(call.id, &result);
@@ -1312,7 +1447,10 @@ impl LiveBackend {
                 Classified::Direct(d) if page > 0 => read::gate_later(d, true),
                 c => c,
             };
-            let Some(settled) = self.settle_page(&call, &vc, &info, classified, &mut all) else {
+            let Some(settled) = self
+                .settle_page(&call, &vc, &info, classified, &mut all)
+                .await
+            else {
                 self.shared.finish_in_flight(call.id);
                 return rejected_msg(ErrorCode::Cancelled, MSG_CALL_CANCELLED);
             };
@@ -1376,7 +1514,7 @@ impl LiveBackend {
     /// exceed `max_call_result_mb` (`result_too_large`, before concatenating); any other answer
     /// ends the call with the rejection a single call gets. `None` = cancelled (the end of the
     /// run records the page).
-    fn settle_page(
+    async fn settle_page(
         &self,
         call: &HostCall,
         vc: &ValidatedCall,
@@ -1387,7 +1525,7 @@ impl LiveBackend {
         let rec = match classified {
             Classified::Item(rec) if rec.item == ReleaseItem::Result => rec,
             other => {
-                let s = self.settle(call, vc, info, other)?;
+                let s = self.settle(call, vc, info, other).await?;
                 return Some(PageSettled {
                     record: s.record,
                     size: s.size,
@@ -1396,18 +1534,22 @@ impl LiveBackend {
             }
         };
         let size = rec.size();
-        let event = rec.record(&self.ctx_for(vc));
-        let next_start = rec.page.and_then(|p| p.next_start);
         let shape = read::ReadShape::of(vc.spec, &vc.validated.params);
+        // A paged op is never a Markdown page body: no user resolutions (§7.6).
+        let users = read::user_resolutions(shape, &rec);
+        let event = rec.record(&self.ctx_for(vc), users.as_ref());
+        let next_start = rec.page.and_then(|p| p.next_start);
         let bodies = rec.responses.iter().map(|r| r.body.as_slice());
-        let added = read::result_value(vc.spec, shape, bodies)
-            .map(|(page, _)| all.add(page, next_start.is_none()));
+        let max_result = u64::from(self.limits.max_call_result_mb).saturating_mul(MIB);
+        let max_markdown = usize::try_from(max_result).unwrap_or(usize::MAX);
+        let added = read::result_value(vc.spec, shape, bodies, users.as_ref(), max_markdown)
+            .map(|n| all.add(n.body, next_start.is_none()));
         let (next, rejection) = match added {
             Ok(true) => match next_start {
                 Some(at) => (PageNext::Continue(at), None),
                 None => (PageNext::Answer(HostCallResult::Ok(all.take())), None),
             },
-            Ok(false) => (
+            Ok(false) | Err(read::Unnormalized::TooLarge) => (
                 PageNext::Answer(rejected_msg(
                     ErrorCode::ResultTooLarge,
                     "the result is above max_call_result_mb",
@@ -1429,17 +1571,98 @@ impl LiveBackend {
         })
     }
 
+    /// PD-99 (§7.6 "also inside script runs"): the user lookups of a `confluence.page.get` host
+    /// call of the Markdown shape, as for a direct read (`read::with_users`): after the content
+    /// answered, before the call's `SCRIPT_CALL`, which commits the map. They are part of the
+    /// host call: they count toward the run's wall-clock limit, the call's read budget (the
+    /// 20 s reserve) and the run's `max_fetch_mb` (their bytes are added to the run's counter
+    /// before the call returns; `SCRIPT_CALL.size` stays the content's), not as host calls
+    /// (`max_calls`). They run on the client of the call's fetch (T11 review m-4). `Err`: the run
+    /// ended meanwhile (the end of the run recorded the lookup in flight with the call).
+    async fn with_users(
+        &self,
+        call: &HostCall,
+        vc: &ValidatedCall,
+        ctl: &FetchControl,
+        http: &InstanceHttp,
+        classified: Classified,
+        deadline: tokio::time::Instant,
+    ) -> Result<Classified, HostCallResult> {
+        let Classified::Item(rec) = classified else {
+            return Ok(classified);
+        };
+        let shape = read::ReadShape::of(vc.spec, &vc.validated.params);
+        if rec.item != ReleaseItem::Result || !shape.commits_user_resolutions() {
+            return Ok(Classified::Item(rec));
+        }
+        let spec = vc.spec;
+        let found = tokio::task::spawn_blocking(move || {
+            let keys = read::lookup_keys(spec, &rec);
+            (rec, keys)
+        })
+        .await;
+        let Ok((mut rec, keys)) = found else {
+            return Err(rejected_msg(ErrorCode::Internal, MSG_RUN_NOT_POSSIBLE));
+        };
+        if keys.is_empty() {
+            return Ok(Classified::Item(rec));
+        }
+        let cover = self
+            .engine
+            .covers()
+            .for_request(&self.entry.head.request_id)
+            .ok();
+        let Some(cover) = cover else {
+            rec.users = Some(keys.into_iter().map(|k| (k, None)).collect());
+            return Ok(Classified::Item(rec));
+        };
+        let fetch_cap = u64::from(self.limits.max_fetch_mb).saturating_mul(MIB);
+        let max_bytes = fetch_cap
+            .saturating_sub(self.shared.fetched_bytes())
+            .saturating_sub(rec.size());
+        let ctx = self.ctx_for(vc);
+        let pass = crate::users::Pass {
+            engine: &self.engine,
+            site: crate::users::Site::Script {
+                entry: &self.entry,
+                shared: &self.shared,
+                call_id: call.id,
+                ctx: &ctx,
+            },
+            instance_id: &vc.instance_id,
+            client: &http.client,
+            cover: &cover,
+            ctl,
+            deadline,
+            max_bytes,
+        };
+        match crate::users::resolve_users(&pass, &keys).await {
+            Ok(resolved) => {
+                // Seen by the next call's `max_fetch_mb` check (T11 review I-2).
+                self.shared.add_fetched(resolved.bytes);
+                // A host call has no identity step yet (PD-93: M8), so its answers are cached now.
+                resolved.puts.apply(&self.engine, &vc.instance_id);
+                rec.users = Some(resolved.users);
+                Ok(Classified::Item(rec))
+            }
+            Err(crate::users::Cancelled) => {
+                Err(rejected_msg(ErrorCode::Cancelled, MSG_CALL_CANCELLED))
+            }
+        }
+    }
+
     /// The call's fetch under the request's cover, with the identity handling of Task 26
     /// (§7.1): a failed header check or a JSON 401 runs the token re-check, and a rename
     /// re-fetches once. `page = Some((n, start))`: page `n` of an `atlas.all` call, one request
-    /// at `start` (PD-144). `Err` = nothing was sent.
+    /// at `start` (PD-144). The instance's client comes back with the classification (the user
+    /// lookups run on it, T11 review m-4). `Err` = nothing was sent.
     async fn fetch(
         &self,
         call: &HostCall,
         vc: &ValidatedCall,
         ctl: &FetchControl,
         page: Option<(u32, u64)>,
-    ) -> Result<Classified, HostCallResult> {
+    ) -> Result<(Classified, Arc<InstanceHttp>), HostCallResult> {
         let internal = || rejected_msg(ErrorCode::Internal, MSG_RUN_NOT_POSSIBLE);
         let http = self
             .engine
@@ -1464,8 +1687,10 @@ impl LiveBackend {
             .get("start")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        // A Markdown page body is kept in the control: its user lookups follow under it (PD-99).
+        let keep = read::ReadShape::of(vc.spec, &vc.validated.params).commits_user_resolutions();
         let plan = match page {
-            None => CallPlan::Whole(plan, start),
+            None => CallPlan::Whole(plan, start, keep),
             Some((_, at)) => CallPlan::Page(PagePlan::of(plan).ok_or_else(internal)?, at),
         };
         let cover = self
@@ -1484,7 +1709,7 @@ impl LiveBackend {
             let seen = self.engine.identity_epoch(&vc.instance_id);
             let fetched = plan.run(&http.client, &cover, &budget, ctl).await;
             let Some(trigger) = read::fetched_trigger(&fetched) else {
-                return Ok(read::classify_read(fetched, &http.proxy));
+                return Ok((read::classify_read(fetched, &http.proxy), http));
             };
             let effect = if refetched {
                 identity::Effect::HeaderCheckFailed
@@ -1494,7 +1719,8 @@ impl LiveBackend {
             };
             match effect {
                 identity::Effect::Ordinary => {
-                    return Ok(read::classify_read(read::ordinary(fetched), &http.proxy));
+                    let classified = read::classify_read(read::ordinary(fetched), &http.proxy);
+                    return Ok((classified, http));
                 }
                 identity::Effect::Refetch => {
                     let (earlier, answer) = read::split_answer(fetched);
@@ -1537,15 +1763,18 @@ impl LiveBackend {
                             return Err(internal());
                         }
                     }
+                    // The first answer is recorded: a cancel during the second attempt must not
+                    // record it again from the control (T11 review handoff).
+                    ctl.clear_pages();
                     refetched = true;
                 }
-                other => return Ok(read::identity_classified(other, fetched)),
+                other => return Ok((read::identity_classified(other, fetched), http)),
             }
         }
     }
 
     /// What the script sees, the `SCRIPT_CALL` record and the bytes received.
-    fn settle(
+    async fn settle(
         &self,
         call: &HostCall,
         vc: &ValidatedCall,
@@ -1557,10 +1786,20 @@ impl LiveBackend {
         match classified {
             Classified::Item(rec) => {
                 let size = rec.size();
-                let event = rec.record(&ctx);
+                let shape = read::ReadShape::of(vc.spec, &vc.validated.params);
+                let users = read::user_resolutions(shape, &rec);
+                let event = rec.record(&ctx, users.as_ref());
                 let (result, rejection, lossy) = match rec.item {
                     ReleaseItem::Result => {
-                        settle_result(vc.spec, &vc.validated.params, &rec, call.all, max_result)
+                        let (spec, params, all) = (vc.spec, vc.validated.params.clone(), call.all);
+                        let users = event.payload.get("user_resolutions").cloned();
+                        // Parsing the answer and converting a page body to Markdown is CPU work
+                        // (T10 review m-2), as for a direct read.
+                        tokio::task::spawn_blocking(move || {
+                            settle_result(spec, &params, &rec, all, max_result, users.as_ref())
+                        })
+                        .await
+                        .unwrap_or_else(|_| unreadable())
                     }
                     ReleaseItem::UpstreamError => {
                         let (status, text) = rec.responses.last().map_or((0, String::new()), |r| {
@@ -1679,26 +1918,35 @@ struct Settled {
 }
 
 /// A 2xx answer: its body as the script's result, unless it is over `max_call_result_mb`.
+/// `user_resolutions` is the map the call's `SCRIPT_CALL` commits (§7.6).
 fn settle_result(
     spec: &'static OperationSpec,
     params: &Value,
     rec: &read::ItemRecord,
     all: bool,
     max_result: u64,
+    user_resolutions: Option<&Value>,
 ) -> (HostCallResult, Option<&'static str>, bool) {
+    let too_large = || {
+        (
+            rejected_msg(
+                ErrorCode::ResultTooLarge,
+                "the result is above max_call_result_mb",
+            ),
+            Some("result_too_large"),
+            false,
+        )
+    };
     let shape = read::ReadShape::of(spec, params);
-    match read::result_value(spec, shape, rec.responses.iter().map(|r| r.body.as_slice())) {
-        Ok((body, _)) => {
+    let bodies = rec.responses.iter().map(|r| r.body.as_slice());
+    // A page's Markdown stops converting at the call's result limit (T10 review B-1).
+    let max_markdown = usize::try_from(max_result).unwrap_or(usize::MAX);
+    match read::result_value(spec, shape, bodies, user_resolutions, max_markdown) {
+        Err(read::Unnormalized::TooLarge) => too_large(),
+        Ok(read::Normalized { body, .. }) => {
             let len = serde_json::to_vec(&body).map_or(u64::MAX, |b| b.len() as u64);
             if len > max_result {
-                (
-                    rejected_msg(
-                        ErrorCode::ResultTooLarge,
-                        "the result is above max_call_result_mb",
-                    ),
-                    Some("result_too_large"),
-                    false,
-                )
+                too_large()
             } else {
                 // `atlas.all` pages to the end; a single call that stopped early is lossy, and
                 // so are comments cut at the comments cap (which `atlas.all` keeps).
@@ -1707,15 +1955,20 @@ fn settle_result(
                 (HostCallResult::Ok(body), None, lossy)
             }
         }
-        Err(_) => (
-            rejected_msg(
-                ErrorCode::UpstreamUnavailable,
-                "the answer of the server could not be read",
-            ),
-            Some("upstream_unavailable"),
-            false,
-        ),
+        Err(read::Unnormalized::Rebuild(_)) => unreadable(),
     }
+}
+
+/// A 2xx answer the host could not read.
+fn unreadable() -> (HostCallResult, Option<&'static str>, bool) {
+    (
+        rejected_msg(
+            ErrorCode::UpstreamUnavailable,
+            "the answer of the server could not be read",
+        ),
+        Some("upstream_unavailable"),
+        false,
+    )
 }
 
 #[async_trait]
@@ -1728,9 +1981,10 @@ impl HostCalls for LiveBackend {
 }
 
 /// What one fetch of a host call runs: the op's whole read plan (`atlas.call`, from the agent's
-/// `start`), or one page of an `atlas.all` call at an offset.
+/// `start`; `keep`: its single GET's answer is kept in the control, `read::run_plan`), or one page
+/// of an `atlas.all` call at an offset.
 enum CallPlan {
-    Whole(ReadPlan, u64),
+    Whole(ReadPlan, u64, bool),
     Page(PagePlan, u64),
 }
 
@@ -1743,8 +1997,8 @@ impl CallPlan {
         ctl: &FetchControl,
     ) -> read::Fetched {
         match self {
-            CallPlan::Whole(plan, start) => {
-                read::run_plan(client, cover, plan, budget, ctl, *start, true).await
+            CallPlan::Whole(plan, start, keep) => {
+                read::run_plan(client, cover, plan, budget, ctl, *start, true, *keep).await
             }
             CallPlan::Page(plan, start) => plan.run(client, cover, budget, ctl, *start).await,
         }
@@ -2184,6 +2438,7 @@ pub(crate) fn preview_model(st: &ScriptState, c: &Candidate) -> PreviewModel {
         more_available: false,
         clamped: false,
         comments_truncated: None,
+        conversion: None,
     };
     let mut m = fallback_preview(&PreviewCtx {
         spec: &SCRIPT_SPEC,

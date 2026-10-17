@@ -90,6 +90,22 @@ impl fmt::Display for EditError {
 
 impl std::error::Error for EditError {}
 
+/// PD-110: the params an edit form never inlines, per op: the form shows each read-only with the
+/// value `null` (a 10 MiB base64 string must not enter the preview DTO), so the UI's raw-JSON
+/// editor, seeded from the form, sends `null` back. Such a `null` is no edit: the stored value
+/// stays (plan review m-17). Any other value is applied and re-validated like every edit. The one
+/// list for every view of such a param (T20b review I-3): each holds a base64 file, which the
+/// form's label and the Request tab (`confluence_ext::request_tab_params`, T20a review I-2) name
+/// by its size and SHA-256 only (`confluence_ext::file_digest`).
+pub const NOT_INLINED: [(&str, &str); 1] = [("confluence.attachment.upload", "content_base64")];
+
+/// `param` of `spec` is one of [`NOT_INLINED`].
+pub fn is_not_inlined(spec: &OperationSpec, param: &str) -> bool {
+    NOT_INLINED
+        .iter()
+        .any(|(op, name)| *op == spec.id && *name == param)
+}
+
 /// Params addressed per sub-key (`<param>.<sub>`): every `type: object` property of the params
 /// schema (the fields map, `update`, a transition's `fields`, the `expected` baseline), plus the
 /// registry's `fields_map_param`.
@@ -253,7 +269,8 @@ fn executed_params(agent: &Map<String, Value>, params: &Map<String, Value>) -> V
 /// Apply `edits` to `current_params` (§5.4 step 4). `agent_params` are the params the agent sent
 /// (the base of `executed_params` and `edited_keys`); `enrich_keys` are the param names whose
 /// change re-runs enrichment (judged on `current_params` against the new params, so reverting an
-/// enrichment-relevant key re-enriches). The executor runs `EditResult::params`.
+/// enrichment-relevant key re-enriches). A `null` set of a [`NOT_INLINED`] param is skipped
+/// (PD-110). The executor runs `EditResult::params`.
 pub fn apply_edits(
     spec: &OperationSpec,
     agent_params: &Value,
@@ -268,6 +285,10 @@ pub fn apply_edits(
     let mut params = current.clone();
     for (key, value) in &edits.set {
         let (name, sub) = parse_key(&maps, key)?;
+        // PD-110 / m-17: the `null` the form showed for a not-inlined param leaves it unchanged.
+        if sub.is_none() && value.is_null() && is_not_inlined(spec, name) {
+            continue;
+        }
         set_key(&mut params, name, sub, value)?;
     }
     for key in &edits.remove {

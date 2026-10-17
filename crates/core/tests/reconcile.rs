@@ -38,6 +38,8 @@ const COMMENT: &str = "jira.comment.add";
 const TRANSITION: &str = "jira.issue.transition";
 const ASSIGN: &str = "jira.issue.assign";
 const PAGE_UPDATE: &str = "confluence.page.update";
+const PAGE_MOVE: &str = "confluence.page.move";
+const ATTACHMENT_UPLOAD: &str = "confluence.attachment.upload";
 
 fn jira(h: &Harness) -> Result<&MockDc, TestError> {
     h.mock("jira-main").ok_or_else(|| "no jira mock".into())
@@ -124,6 +126,56 @@ async fn queued_page_update(h: &Harness) -> Result<String, TestError> {
         h,
         PAGE_UPDATE,
         json!({ "id": "65537", "base_version": 5, "body": "<p>New text.</p>", "body_format": "storage" }),
+    )
+    .await
+}
+
+/// A move of page 65537 (version 5, under `Home`) under page 123400, a sibling, in the queue
+/// (both enrichment GETs done); the next `PREVIEW_FETCH` is the stale check's identity call.
+async fn queued_page_move(h: &Harness) -> Result<String, TestError> {
+    let mock = wiki(h)?;
+    mock.confluence_user_current(
+        atlas_duck_atlassian::testing::UserKind::Known,
+        TEST_USER,
+        TEST_USER_KEY,
+    )
+    .await;
+    mock.json("/rest/api/content/65537", 200, &page_at(5)).await;
+    let parent = json!({
+        "id": "123400", "type": "page", "status": "current", "title": "Release notes",
+        "space": {"key": "DOC", "name": "Documentation"},
+        "ancestors": [{"id": "65536", "type": "page", "status": "current", "title": "Home"}],
+    });
+    mock.json("/rest/api/content/123400", 200, &parent.to_string())
+        .await;
+    queued(h, PAGE_MOVE, json!({ "id": "65537", "parent": "123400" })).await
+}
+
+/// A replace of `notes.txt` (attachment `att3001`, version 2) on page 65537 in the queue (the
+/// lookup done); the next `PREVIEW_FETCH` is the stale check's identity call.
+async fn queued_attachment_replace(h: &Harness) -> Result<String, TestError> {
+    let mock = wiki(h)?;
+    mock.confluence_user_current(
+        atlas_duck_atlassian::testing::UserKind::Known,
+        TEST_USER,
+        TEST_USER_KEY,
+    )
+    .await;
+    let found = json!({"results": [{
+        "id": "att3001", "type": "attachment", "status": "current", "title": "notes.txt",
+        "version": {"number": 2},
+    }], "start": 0, "limit": 50, "size": 1});
+    mock.json(
+        "/rest/api/content/65537/child/attachment",
+        200,
+        &found.to_string(),
+    )
+    .await;
+    queued(
+        h,
+        ATTACHMENT_UPLOAD,
+        json!({ "id": "65537", "filename": "notes.txt", "content_base64": "aGVsbG8gd29ybGQ=",
+                "replace": true }),
     )
     .await
 }
@@ -607,6 +659,108 @@ async fn i26_crash_after_stale_check_fetch_is_outcome_unknown_confluence_update(
     assert_listed_unknown(&h, &id, "65537").await
 }
 
+/// I-26 for the stale rule M7 adds (T17, `stale::PAGE_MOVE`): the move's stale-check record
+/// committed, the crash comes before anything else, and the restart reconciles it as
+/// `outcome_unknown` like the update; nothing was sent before the crash.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i26_crash_after_stale_check_fetch_is_outcome_unknown_confluence_move() -> TestResult {
+    let mut h = Harness::confluence().await?;
+    let id = queued_page_move(&h).await?;
+    crash_after_stale_check(&mut h, &id).await?;
+    assert_listed_unknown(&h, &id, "65537").await?;
+    let t = types(&h, &id).await?;
+    assert!(t.ends_with(&[EventType::PREVIEW_FETCH, EventType::WRITE_OUTCOME_UNKNOWN]));
+    let unknown = h.events_of(EventType::WRITE_OUTCOME_UNKNOWN).await?;
+    assert_eq!(
+        unknown
+            .last()
+            .map(|p| (p["request_index"].clone(), p["reason"].clone())),
+        Some((json!(0), json!("crash")))
+    );
+    let puts = wiki(&h)?
+        .received()
+        .await
+        .into_iter()
+        .filter(|r| r.method.as_str() == "PUT")
+        .count();
+    assert_eq!(puts, 0);
+    Ok(())
+}
+
+/// I-26 for the attachment stale rule M7 adds (T20a, `stale::ATTACHMENT_REPLACE`): the identity
+/// call's stale-check record committed, the crash comes before anything else (the rule's own
+/// lookup cannot be recorded), and the restart reconciles it as `outcome_unknown` like the update;
+/// nothing was sent before the crash.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i26_crash_after_stale_check_fetch_is_outcome_unknown_confluence_replace() -> TestResult {
+    let mut h = Harness::confluence().await?;
+    let id = queued_attachment_replace(&h).await?;
+    crash_after_stale_check(&mut h, &id).await?;
+    assert_listed_unknown(&h, &id, "65537").await?;
+    let t = types(&h, &id).await?;
+    assert!(t.ends_with(&[EventType::PREVIEW_FETCH, EventType::WRITE_OUTCOME_UNKNOWN]));
+    let posts = wiki(&h)?
+        .received()
+        .await
+        .into_iter()
+        .filter(|r| r.method.as_str() == "POST")
+        .count();
+    assert_eq!(posts, 0);
+    Ok(())
+}
+
+/// T20a review m-3: the crash after the record of the rule's own lookup (the second stale-check
+/// fetch, after the identity call) committed, before any other record; the restart reconciles it
+/// as `outcome_unknown`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i26_crash_after_attachment_lookup_is_outcome_unknown_confluence_replace() -> TestResult {
+    let mut h = Harness::confluence().await?;
+    let id = queued_attachment_replace(&h).await?;
+    let freeze = h.plan().freeze_after_nth(EventType::PREVIEW_FETCH, 2);
+    h.approver().approve(&id).map_err(de)?;
+    tripped(&freeze).await?;
+    let fetches: Vec<Value> = h
+        .events(&id)
+        .await?
+        .into_iter()
+        .filter(|(t, _)| *t == EventType::PREVIEW_FETCH)
+        .map(|(_, p)| p)
+        .collect();
+    let [.., identity, lookup] = fetches.as_slice() else {
+        return Err("fewer than two fetches".into());
+    };
+    assert_eq!(identity["purpose"], json!("stale_check"));
+    assert_eq!(lookup["purpose"], json!("stale_check"));
+    let at = lookup["path"].as_str().unwrap_or_default();
+    assert!(at.contains("/child/attachment"), "{at}");
+    assert_eq!(
+        types(&h, &id).await?.last(),
+        Some(&EventType::PREVIEW_FETCH)
+    );
+    h.crash_and_restart().await?;
+    assert_listed_unknown(&h, &id, "65537").await?;
+    let t = types(&h, &id).await?;
+    assert!(t.ends_with(&[EventType::PREVIEW_FETCH, EventType::WRITE_OUTCOME_UNKNOWN]));
+    let unknown = h.events_of(EventType::WRITE_OUTCOME_UNKNOWN).await?;
+    assert_eq!(
+        unknown
+            .last()
+            .map(|p| (p["request_index"].clone(), p["reason"].clone())),
+        Some((json!(0), json!("crash")))
+    );
+    // No record lies between this one and the send (`WRITE_APPROVED` came first), and the freeze
+    // stops appends only: the frozen core may still send the POST before the restart, which is
+    // why the restart cannot claim more than `outcome_unknown`. Never twice.
+    let posts = wiki(&h)?
+        .received()
+        .await
+        .into_iter()
+        .filter(|r| r.method.as_str() == "POST")
+        .count();
+    assert!(posts <= 1, "{posts} POSTs");
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn i26_crash_after_post_approval_decision_stale() -> TestResult {
     let mut h = Harness::jira().await?;
@@ -725,7 +879,7 @@ async fn i26_control_after_write_stale_is_abandoned() -> TestResult {
     )
     .await;
     let content = mock.path("/rest/api/content/65537");
-    let enrich_q = "body.storage,version,space";
+    let enrich_q = "body.storage,version,space,ancestors";
     // Enrichment sees v5 once, the refresh after the conflict sees v6; the stale check sees v5.
     for (version, once, priority) in [(5, true, 1u8), (6, false, 2u8)] {
         let mut m = Mock::given(method("GET"))
@@ -741,6 +895,14 @@ async fn i26_control_after_write_stale_is_abandoned() -> TestResult {
         }
         m.mount(mock.server()).await;
     }
+    // M7 Task 15: the refresh at v6 reads the agent's base body (stage 2).
+    common::confluence::mount_history_version(
+        mock,
+        "65537",
+        5,
+        &serde_json::from_str(&page_at(5))?,
+    )
+    .await;
     Mock::given(method("GET"))
         .and(path(content.clone()))
         .and(query_param("expand", "version"))
@@ -818,6 +980,94 @@ async fn i26_pending_read_abandoned() -> TestResult {
     assert_eq!(
         types(&h, &id).await?,
         [EventType::REQUEST_RECEIVED, EventType::ABANDONED]
+    );
+    assert!(h.core().startup_notice().is_empty());
+    Ok(())
+}
+
+/// A Confluence read that crashed after the records of its user lookup and its identity GET
+/// (PD-99, PD-93) and before `READ_FETCHED`: `PREVIEW_FETCH` is no write's, so the read is
+/// abandoned like any pending read, never `outcome_unknown`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crash_after_identity_fetch_reconciles_as_read() -> TestResult {
+    let pause = atlas_duck_core::Pause::new();
+    let mut h = Harness::builder()
+        .confluence("wiki")
+        .hooks(TestHooks {
+            pause_after_lookups: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    let mock = wiki(&h)?;
+    let storage = r#"<p>Owner <ri:user ri:userkey="key-jdoe"/>.</p>"#;
+    common::confluence::mount_page(
+        mock,
+        "65537",
+        &common::confluence::page_with_storage(storage),
+    )
+    .await;
+    common::confluence::mount_users(mock, &[("key-jdoe", Some("jdoe"))]).await;
+    let env = h
+        .submit("confluence.page.get", json!({ "id": "65537" }))
+        .await;
+    let id = request_id(&env)?;
+    // The lookup is committed; the identity GET's record is the crash point. Bounded: a change that
+    // skips the hook fails here instead of hanging (T13 review I-3).
+    tokio::time::timeout(Duration::from_secs(20), pause.reached.notified())
+        .await
+        .map_err(|_| "hook never reached")?;
+    let freeze = h.plan().freeze_after(EventType::PREVIEW_FETCH);
+    pause.release.notify_one();
+    tripped(&freeze).await?;
+    let fetches = h.events_of(EventType::PREVIEW_FETCH).await?;
+    let purposes: Vec<&Value> = fetches.iter().map(|f| &f["purpose"]).collect();
+    assert_eq!(purposes, [&json!("resolve"), &json!("identity")]);
+    h.crash_and_restart().await?;
+    let env = h.await_(&id, 10_000).await;
+    assert_abandoned(&env);
+    assert_eq!(
+        types(&h, &id).await?,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::PREVIEW_FETCH,
+            EventType::PREVIEW_FETCH,
+            EventType::ABANDONED,
+        ]
+    );
+    assert!(h.core().startup_notice().is_empty());
+    Ok(())
+}
+
+/// The same after the user lookup's record alone (the identity GET never ran).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crash_after_resolve_fetch_reconciles_as_read() -> TestResult {
+    let mut h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    let storage = r#"<p>Owner <ri:user ri:userkey="key-jdoe"/>.</p>"#;
+    common::confluence::mount_page(
+        mock,
+        "65537",
+        &common::confluence::page_with_storage(storage),
+    )
+    .await;
+    common::confluence::mount_users(mock, &[("key-jdoe", Some("jdoe"))]).await;
+    let freeze = h.plan().freeze_after(EventType::PREVIEW_FETCH);
+    let env = h
+        .submit("confluence.page.get", json!({ "id": "65537" }))
+        .await;
+    let id = request_id(&env)?;
+    tripped(&freeze).await?;
+    h.crash_and_restart().await?;
+    let env = h.await_(&id, 10_000).await;
+    assert_abandoned(&env);
+    assert_eq!(
+        types(&h, &id).await?,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::PREVIEW_FETCH,
+            EventType::ABANDONED,
+        ]
     );
     assert!(h.core().startup_notice().is_empty());
     Ok(())

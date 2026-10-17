@@ -24,10 +24,16 @@ pub struct InMemoryCredentials {
     fail_store: AtomicBool,
     fail_delete: AtomicBool,
     /// Runs once, at the start of the next `load` (a test holds the caller there).
-    on_next_load: Mutex<Option<LoadHook>>,
+    on_next_load: Mutex<Option<Hook>>,
+    /// Runs once, at the start of the next `store`, before the entry changes.
+    on_next_store: Mutex<Option<Hook>>,
 }
 
-type LoadHook = Box<dyn FnOnce() + Send>;
+type Hook = Box<dyn FnOnce() + Send>;
+
+fn take(hook: &Mutex<Option<Hook>>) -> Option<Hook> {
+    hook.lock().unwrap_or_else(PoisonError::into_inner).take()
+}
 
 impl std::fmt::Debug for InMemoryCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -82,6 +88,15 @@ impl InMemoryCredentials {
             .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
     }
 
+    /// `hook` runs at the start of the next `store`, on the caller's thread, once, while the old
+    /// entry is still the one `load` returns (a test holds the keychain write there).
+    pub fn on_next_store(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .on_next_store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+    }
+
     pub fn contains(&self, instance_id: &str) -> bool {
         self.lock().contains_key(instance_id)
     }
@@ -89,12 +104,7 @@ impl InMemoryCredentials {
 
 impl CredentialProvider for InMemoryCredentials {
     fn load(&self, instance_id: &str) -> Result<Option<StoredCredential>, CredentialError> {
-        let hook = self
-            .on_next_load
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(hook) = hook {
+        if let Some(hook) = take(&self.on_next_load) {
             hook();
         }
         Ok(self.lock().get(instance_id).map(|e| StoredCredential {
@@ -106,6 +116,9 @@ impl CredentialProvider for InMemoryCredentials {
     }
 
     fn store(&self, instance_id: &str, c: StoredCredential) -> Result<(), CredentialError> {
+        if let Some(hook) = take(&self.on_next_store) {
+            hook();
+        }
         if self.fail_store.load(Ordering::SeqCst) {
             return Err(CredentialError::Unavailable);
         }

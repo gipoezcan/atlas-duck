@@ -43,6 +43,9 @@ pub enum WarningId {
     /// M5 T16 review I1: a `jira.issuelink.create` type named only by its inward phrase, so the
     /// link reads the other way round from the agent's wording.
     LinkTypeInwardPhrase,
+    /// M7 Δ2 (PD-105, §6.3 "duplicate-title warning (Confluence)"): a page with the title of a
+    /// `confluence.page.create` already exists in its space; Approve stays enabled.
+    DuplicateTitle,
     /// M8 T17 (M5 M-13, R8): a script run read with `renderedFields`; a drop of a field leaves
     /// its rendered copy (a plan text, a §6.2 amendment).
     ScriptRenderedCopies,
@@ -60,7 +63,7 @@ pub enum WarningId {
 }
 
 impl WarningId {
-    pub const ALL: [WarningId; 33] = [
+    pub const ALL: [WarningId; 34] = [
         WarningId::RestrictedComments,
         WarningId::SecurityLevel,
         WarningId::AllFields,
@@ -84,6 +87,7 @@ impl WarningId {
         WarningId::DiffTruncated,
         WarningId::NoCurrentValue,
         WarningId::LinkTypeInwardPhrase,
+        WarningId::DuplicateTitle,
         WarningId::ScriptRenderedCopies,
         WarningId::LinkedIssueSummaries,
         WarningId::CustomFields,
@@ -121,6 +125,7 @@ impl WarningId {
             | WarningId::DiffTruncated
             | WarningId::NoCurrentValue
             | WarningId::LinkTypeInwardPhrase
+            | WarningId::DuplicateTitle
             | WarningId::ScriptRenderedCopies => Level::Caution,
             WarningId::LinkedIssueSummaries
             | WarningId::CustomFields
@@ -279,9 +284,21 @@ pub fn link_type_inward_phrase(inward: &str, outward: &str) -> String {
     )
 }
 
-/// "this update will remove N macros / M images / K links" (§7.6)
-pub fn lossy_update(macros: u64, images: u64, links: u64) -> String {
-    format!("this update will remove {macros} macros / {images} images / {links} links")
+/// plan text (PD-105): "a page titled '<title>' already exists in <space>"; the caller
+/// display-escapes both.
+pub fn duplicate_title(title: &str, space: &str) -> String {
+    format!("a page titled '{title}' already exists in {space}")
+}
+
+/// "this update will remove N macros / M images / K links" (§7.6), plus ", L layouts" when
+/// layouts are lost (M7 lead ruling Q10, PD-104: §6.2 amendment).
+pub fn lossy_update(macros: u64, images: u64, links: u64, layouts: u64) -> String {
+    let mut text =
+        format!("this update will remove {macros} macros / {images} images / {links} links");
+    if layouts > 0 {
+        text.push_str(&format!(", {layouts} layouts"));
+    }
+    text
 }
 
 /// "includes summary/status of N linked/parent/sub-task issues"

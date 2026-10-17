@@ -1,0 +1,4 @@
+<blockquote><p>single quote line</p></blockquote>
+<blockquote><p>multi</p><p>block with <code>code</code></p><blockquote><p>nested quote
+second line</p></blockquote><ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[code in quote ]]]]><![CDATA[>]]></ac:plain-text-body></ac:structured-macro></blockquote>
+<ul><li><p>item with code</p><ac:structured-macro ac:name="code"><ac:parameter ac:name="language">sh</ac:parameter><ac:plain-text-body><![CDATA[x]]></ac:plain-text-body></ac:structured-macro></li><li><p>next <em>item</em> with <a href="https://x.example">link</a></p><blockquote><p>quoted in item</p></blockquote></li></ul>

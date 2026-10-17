@@ -229,8 +229,11 @@ impl InstanceClient {
         if (200..300).contains(&status) {
             return unknown(UnknownReason::UndeclaredSuccess);
         }
-        // Lost-update protection is Confluence's optimistic lock (§5.4 steps 2 and 6).
+        // Lost-update protection is Confluence's optimistic lock (§5.4 steps 2 and 6), which only a
+        // PUT carries (`version.number`). A POST (create, comment, label, attachment) answered 409
+        // is a plain refusal, `Failed4xx` with the server's message (M7 Task 16).
         if self.cfg.product == Product::Confluence
+            && spec.method == "PUT"
             && (status == 409 || (status == 400 && is_version_conflict(&response.body)))
         {
             return WriteOutcome::VersionConflict { request_index };
@@ -298,7 +301,8 @@ fn not_answered(f: FetchFailure, request_index: u32) -> WriteOutcome {
 
 /// Confluence's 400 form of a stale `version.number`: `message` or an `errorMessages` entry that
 /// mentions "version" and "conflict", "must be incremented" or "stale", case-insensitively
-/// (V04/V06 confirm the texts in M7).
+/// (V04/V06 confirm the texts in M7). Read on a PUT only, as is a 409: a POST carries no
+/// `version.number`, so its 400 is a plain `Failed4xx` whatever its text (M7 Task 16).
 fn is_version_conflict(body: &[u8]) -> bool {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
         return false;

@@ -1,0 +1,5 @@
+<h2>Plan <ac:structured-macro ac:name="status"><ac:parameter ac:name="title">OK</ac:parameter></ac:structured-macro></h2>
+<p>Due: <time datetime="2026-10-20" /> and <time datetime="2026-11-01">1 Nov</time>.</p>
+<ac:task-list><ac:task><ac:task-id>1</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Outer <time datetime="2026-10-21" /><ac:task-list><ac:task><ac:task-id>2</ac:task-id><ac:task-status>complete</ac:task-status><ac:task-body>Inner</ac:task-body></ac:task></ac:task-list></ac:task-body></ac:task></ac:task-list>
+<p><a href="https://x.example/">see <ac:link><ri:page ri:space-key="D" ri:content-title="T"/></ac:link></a></p>
+<p><ac:emoticon ac:name="tick"/> done <ac:structured-macro ac:name="_x_"/> and <ac:structured-macro ac:name="details"/></p>

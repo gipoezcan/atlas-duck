@@ -45,6 +45,8 @@ libc = "=0.2.190"
 lexopt = "=0.3.2"
 # CommonMark parser for convert (§7.6); no CLI (getopts) or HTML renderer.
 pulldown-cmark = { version = "=0.13.4", default-features = false }
+quick-xml = { version = "=0.42.0", default-features = false, features = ["escape-html"] }
+htmd = "=0.5.5"
 landlock = "=0.4.7"
 seccompiler = "=0.5.0"
 syscalls = { version = "=0.8.1", default-features = false, features = ["x86_64", "aarch64"] }
@@ -80,8 +82,8 @@ zbus-secret-service-keyring-store = { version = "=1.0.1", default-features = fal
 proptest = "=1.11.0"
 # M3 catalog tests (U-05) and core::validate: no `$ref` I/O (plan "Dependency pins").
 jsonschema = { version = "=0.58.6", default-features = false }
-# M3 preview sanitizer (§6.4).
-ammonia = "=4.2.3"
+# M3 preview sanitizer (§6.4); 4.2.4 fixes RUSTSEC-2026-0373.
+ammonia = "=4.2.4"
 # M3 invisible-character classifier, mixed-script check and NFC from one ICU data version (§6.4, V31).
 icu_properties = "=2.3.0"
 icu_normalizer = "=2.3.0"

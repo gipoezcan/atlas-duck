@@ -52,6 +52,16 @@ test("jira_flows: zero tests run fails, eight real passes are fine", () => {
   assert.deepEqual(check(ok(8), JIRA_LIST, ""), []);
 });
 
+// M7 Task 28: confluence_flows (8 flows) is guarded by the same checker; the label only names the
+// target in the messages, the minimum comes from the list.
+test("confluence_flows: a skipped flow fails, eight real passes are fine, zero tests fail", () => {
+  const list = Array.from({ length: 8 }, (_, i) => `confluence_flows_${i}: test`).join("\n") + "\n\n8 tests, 0 benchmarks\n";
+  const skipped = ok(8) + "test confluence_flows_3 ... skipped: confluence_flows_3 spawns the real binaries\n";
+  assert.deepEqual(check(skipped, list, "").length, 1);
+  assert.deepEqual(check(ok(8), list, ""), []);
+  assert.deepEqual(check("running 0 tests\ntest result: ok. 0 passed; 0 failed\n", list, ""), ["0 tests passed, expected at least 8"]);
+});
+
 test("passedCount sums result lines and ignores prose", () => {
   assert.equal(passedCount("test result: ok. 3 passed; 0 failed\ntest result: ok. 4 passed; 0 failed\n"), 7);
   assert.equal(passedCount("3 passed\n"), null);

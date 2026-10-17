@@ -200,6 +200,16 @@ impl FetchControl {
         s.partial.len()
     }
 
+    /// [`Self::append_partial`] that keeps at most `limit` bytes in all (the rest of the chunk is
+    /// dropped); returns the new partial length.
+    pub(crate) fn append_partial_within(&self, chunk: &[u8], limit: usize) -> usize {
+        let mut s = self.state();
+        let room = limit.saturating_sub(s.partial.len());
+        s.partial
+            .extend_from_slice(chunk.get(..room.min(chunk.len())).unwrap_or_default());
+        s.partial.len()
+    }
+
     pub(crate) fn snapshot_partial(&self) -> Vec<u8> {
         self.state().partial.clone()
     }
@@ -211,6 +221,13 @@ impl FetchControl {
     /// A completed page of a paginated read (kept for `take_captured`).
     pub(crate) fn push_page(&self, page: UpstreamResponse) {
         self.state().pages.push(page);
+    }
+
+    /// Forgets the kept pages: a read that fetches again under the same control (a rename's
+    /// re-fetch, §7.1) recorded the first answer already, so a cancel during the second attempt
+    /// must not record it again. `sent` and the partial bytes stay.
+    pub fn clear_pages(&self) {
+        self.state().pages.clear();
     }
 
     /// Never held across an `.await`: every caller above locks, mutates and drops in one statement.
@@ -349,14 +366,44 @@ impl InstanceClient {
         self.send_one(req, ctl).await
     }
 
+    /// `get_ctl` for a small auxiliary GET of a read (`core`'s user lookups, PD-99): the answer is
+    /// cut at `max_response_bytes` and the call ends at `deadline` (the read's budget), so the
+    /// read ends within its budget whatever the server sends. A body over the cap is
+    /// `PostSend {ResponseCap32MiB}` (the variant names the default cap; the cap here is the
+    /// caller's), a deadline is `ReadBudget120s` (`BudgetExpiredBeforeSend` before the send).
+    pub async fn get_bounded_ctl(
+        &self,
+        cover: &AuditCover,
+        call: &GetCall,
+        ctl: &FetchControl,
+        max_response_bytes: u64,
+        deadline: tokio::time::Instant,
+    ) -> FetchOutcome {
+        let req = send::OneRequest {
+            target: send::Target::Template {
+                cover,
+                method: reqwest::Method::GET,
+                template: &call.endpoint_template,
+                params: &call.params,
+                query: &call.query,
+                json_body: None,
+            },
+            overall: Some((deadline, PostSendKind::ReadBudget120s)),
+            max_response_bytes,
+            cap_kind: PostSendKind::ResponseCap32MiB,
+        };
+        self.send_one(req, ctl).await
+    }
+
     pub async fn post_search(&self, cover: &AuditCover, call: &SearchCall) -> FetchOutcome {
         self.post_search_ctl(cover, call, &FetchControl::new())
             .await
     }
 
-    /// `get_ctl` for the first leg of a composite read (`jira.issue.get --comments`: the issue,
-    /// then the comment pages under the same control): a 2xx answer is also kept in `ctl`, so a
-    /// cancel during a later leg records it with the pages (every byte received).
+    /// `get_ctl` for a GET that more GETs follow under the same control (the issue leg of
+    /// `jira.issue.get --comments`; a Confluence read, whose user lookups and identity GET follow,
+    /// `core` PD-99/PD-93): an answer (any status: an upstream error is content too) is also kept
+    /// in `ctl`, so a cancel during a later GET records it with the pages (every byte received).
     pub async fn get_kept_ctl(
         &self,
         cover: &AuditCover,
@@ -408,11 +455,10 @@ impl InstanceClient {
     }
 }
 
-/// A 2xx answer is also kept in `ctl` (the first leg of a composite read).
+/// An answer (any status: an upstream error is content too) is also kept in `ctl`
+/// ([`InstanceClient::get_kept_ctl`]).
 fn kept(out: FetchOutcome, ctl: &FetchControl) -> FetchOutcome {
-    if let FetchOutcome::Response(r) = &out
-        && (200..300).contains(&r.status)
-    {
+    if let FetchOutcome::Response(r) = &out {
         ctl.push_page(r.clone());
     }
     out
@@ -468,6 +514,26 @@ mod tests {
         assert!(ctl.is_cancelled());
         assert_eq!(ctl.take_partial(), b"abc");
         assert!(ctl.take_captured().partial.is_empty());
+    }
+
+    #[test]
+    fn clear_pages_forgets_only_the_pages() {
+        let ctl = FetchControl::new();
+        ctl.mark_sent();
+        let page = UpstreamResponse {
+            status: 200,
+            content_type: Some("application/json".to_owned()),
+            body: b"{}".to_vec(),
+        };
+        ctl.push_page(page.clone());
+        ctl.append_partial(b"ab");
+        ctl.clear_pages();
+        let snap = ctl.take_captured();
+        assert!(snap.pages.is_empty());
+        assert!(snap.sent);
+        assert_eq!(snap.partial, b"ab");
+        ctl.push_page(page);
+        assert_eq!(ctl.take_captured().pages.len(), 1);
     }
 
     #[test]

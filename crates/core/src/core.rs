@@ -130,6 +130,82 @@ impl Pause {
     }
 }
 
+/// A one-shot hold of work on a blocking thread (T23b: the card build behind a write's caution
+/// count): once armed, the first build that reaches it signals `reached` and blocks its thread
+/// until [`BuildPause::release`]; every other build passes. A release also disarms it; it can
+/// be armed again after (a hold waits only for the release that follows it). The flow whose
+/// build was held signals `settled` once it stored or dropped its result.
+#[cfg(feature = "testing")]
+#[derive(Default)]
+pub struct BuildPause {
+    holds: std::sync::Mutex<BuildHolds>,
+    released: std::sync::Condvar,
+    pub reached: tokio::sync::Notify,
+    pub settled: tokio::sync::Notify,
+}
+
+#[cfg(feature = "testing")]
+#[derive(Default)]
+struct BuildHolds {
+    armed: bool,
+    /// Holds taken so far.
+    taken: u64,
+    /// Holds released so far.
+    released: u64,
+}
+
+#[cfg(feature = "testing")]
+impl std::fmt::Debug for BuildPause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BuildPause")
+    }
+}
+
+#[cfg(feature = "testing")]
+impl BuildPause {
+    pub fn new() -> Arc<BuildPause> {
+        Arc::new(BuildPause::default())
+    }
+
+    fn holds(&self) -> std::sync::MutexGuard<'_, BuildHolds> {
+        self.holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The next build that reaches the pause holds there.
+    pub fn arm(&self) {
+        self.holds().armed = true;
+    }
+
+    /// Disarms the pause and lets every build held so far go on.
+    pub fn release(&self) {
+        let mut holds = self.holds();
+        holds.armed = false;
+        holds.released = holds.taken;
+        self.released.notify_all();
+    }
+
+    /// Holds the calling thread if the pause is armed (disarming it); whether it held.
+    pub(crate) fn hold(&self) -> bool {
+        let mut holds = self.holds();
+        if !holds.armed {
+            return false;
+        }
+        holds.armed = false;
+        holds.taken += 1;
+        let mine = holds.taken;
+        self.reached.notify_one();
+        while holds.released < mine {
+            holds = self
+                .released
+                .wait(holds)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        true
+    }
+}
+
 /// Test-only behaviour installed by `Core::start_with_port` before anything runs (Task 28 acts
 /// on `freeze_at` and `panic_on_jql`).
 #[cfg(feature = "testing")]
@@ -158,8 +234,28 @@ pub struct TestHooks {
     /// refused like in a release build (§7.1, I-02).
     pub allow_http: bool,
     /// A write holds after one of its app-initiated GETs finished and its record is parked, before
-    /// any append commits it (Task 24 review I-2).
+    /// any append commits it (Task 24 review I-2); so does a read's or a host call's user lookup
+    /// (PD-99, T11 review I-1) and a Confluence read's identity GET (PD-93).
     pub pause_after_get: Option<Arc<Pause>>,
+    /// A user lookup (PD-99) holds after its GET returned and its record is built, before the
+    /// record is parked (T11 review I-1: a cancel there records the GET as in flight).
+    pub pause_before_lookup_park: Option<Arc<Pause>>,
+    /// A user lookup pass (PD-99) holds after its last lookup was committed, before the read
+    /// goes on to its record (T11 review m-9 (a): a cancel there records no lookup again).
+    pub pause_after_lookups: Option<Arc<Pause>>,
+    /// The identity GET of a Confluence read (PD-93) holds after it returned and its record is
+    /// built, before the record is parked (a cancel there records the GET as in flight).
+    pub pause_before_identity_park: Option<Arc<Pause>>,
+    /// A direct read that fetches again after a rename (§7.1) holds after its first answer's
+    /// record committed, before the second fetch (T13 review m-1: a cancel there records that
+    /// answer once).
+    pub pause_before_refetch: Option<Arc<Pause>>,
+    /// Replaces the 20 s of read budget that must remain for a user lookup to start
+    /// (`LOOKUP_RESERVE`; T11 fix review m-4: short budgets for the lookup cut tests).
+    pub lookup_reserve: Option<std::time::Duration>,
+    /// Replaces the 10 s of read budget kept for a direct Confluence read's identity GET: its user
+    /// lookups end that much before the read's deadline (`IDENTITY_RESERVE`, T13 review I-2).
+    pub identity_reserve: Option<std::time::Duration>,
     /// Replaces the 60 s that `shutdown` waits for writes that are `executing` (§2.5 step 4).
     pub shutdown_write_wait: Option<std::time::Duration>,
     /// Replaces the 5 s that `shutdown` lets the cancelled field fills and token re-checks end
@@ -196,6 +292,9 @@ pub struct TestHooks {
     /// A real run holds after its slot-time policy read, before its `SCRIPT_STARTED` append (M8
     /// T15 review I-1: a setting change committed meanwhile is logged before that record).
     pub pause_before_script_started: Option<Arc<Pause>>,
+    /// The card build behind a write's queue-row caution count holds on its blocking thread
+    /// once armed (T23b: what the entry lock does not wait for).
+    pub hold_caution_build: Option<Arc<BuildPause>>,
 }
 
 #[cfg(feature = "testing")]

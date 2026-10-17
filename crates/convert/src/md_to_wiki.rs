@@ -33,7 +33,7 @@ use std::ops::Range;
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag};
 
-use crate::escape::{Out, SpanMark};
+use crate::escape::{Out, SpanMark, entity_like};
 
 /// Nesting bound for quotes plus lists, and for emphasis.
 const MAX_DEPTH: usize = 32;
@@ -50,16 +50,21 @@ const MAX_LANG: usize = 32;
 /// invisible char) shows `&#8203;` literally: the approver sees it.
 pub(crate) const MONO_BREAK: &str = "&#8203;";
 
-/// A container the converter wrote itself (Δ1, widened by the T2 ruling: `{quote}` too).
+/// A container the converter wrote itself (Δ1, widened by the T2 ruling: `{quote}` too; M7 Δ1:
+/// the storage converter's code macro).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ContainerKind {
     Code,
     Noformat,
     Quote,
+    /// `<ac:structured-macro ac:name="code">` with its CDATA body (`markdown_to_storage`);
+    /// never trusted by the wiki hard check.
+    CodeMacro,
 }
 
 /// One recorded container: `byte_range` runs from its opening `{` through the closing tag's
-/// `}` in the converter's output.
+/// `}` in the converter's output (for a `CodeMacro`, from `<ac:structured-macro` through
+/// `</ac:structured-macro>`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmittedCode {
     pub kind: ContainerKind,
@@ -961,7 +966,9 @@ fn tag_shaped(t: &str) -> bool {
 
 /// A link target: `mailto:` for e-mail autolinks; chars the wiki grammar reads inside
 /// `[…|…]` (`{ } [ ] | ! \`, whitespace, controls, and a leading `~`/`^`, which would make a
-/// mention or attachment link) are percent-encoded.
+/// mention or attachment link) are percent-encoded, and so is a `&` that starts something
+/// shaped like a character reference (`&#123;`), which Jira would decode (M5 final review
+/// M-4).
 fn link_target(link_type: LinkType, dest: &str) -> String {
     let has_scheme = dest
         .get(..7)
@@ -976,7 +983,8 @@ fn link_target(link_type: LinkType, dest: &str) -> String {
         let encode = matches!(c, '{' | '}' | '[' | ']' | '|' | '!' | '\\')
             || c.is_whitespace()
             || c.is_control()
-            || (i == 0 && matches!(c, '~' | '^'));
+            || (i == 0 && matches!(c, '~' | '^'))
+            || (c == '&' && entity_like(full.get(i + 1..).unwrap_or("")));
         if encode {
             let mut buf = [0u8; 4];
             for b in c.encode_utf8(&mut buf).bytes() {

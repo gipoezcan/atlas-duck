@@ -1930,6 +1930,340 @@ async fn host_call_params_over_a_megabyte_are_rejected() -> TestResult {
     Ok(())
 }
 
+/// T10 review I-2 and B-1: a `confluence.page.get` host call commits its `user_resolutions` map
+/// in `SCRIPT_CALL` and gets the page with its Markdown body,
+/// converted with that map; a page whose Markdown would pass `max_call_result_mb` stops
+/// converting there and is rejected `result_too_large` in the script.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn confluence_page_get_host_call_converts_with_the_committed_map() -> TestResult {
+    use common::confluence::{amplified_storage, mount_page, page_with_storage};
+    let storage = r#"<p>Owner <ac:link><ri:user ri:userkey="8a7f808a1"/></ac:link>.</p><ac:structured-macro ac:name="toc"/>"#;
+    let get = |call: u64, id: &str| host_call(call, "confluence.page.get", json!({ "id": id }));
+    let runner = FakeScriptRunner::new(vec![
+        ScriptPlan::new(vec![get(1, "65537")], result_end(json!(1))),
+        ScriptPlan::new(vec![get(1, "65538")], result_end(json!(1))),
+    ]);
+    let h = Harness::builder()
+        .confluence("wiki")
+        .scripts(runner.clone())
+        .start()
+        .await?;
+    let mock = h.mock("wiki").ok_or("no wiki mock")?;
+    let page = page_with_storage(storage);
+    mount_page(mock, "65537", &page).await;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let markdown = atlas_duck_convert::storage_to_markdown(storage, &Default::default()).0;
+    assert!(markdown.contains("@user:8a7f808a1"), "{markdown}");
+    match runner.results().as_slice() {
+        [HostCallResult::Ok(v)] => {
+            assert_eq!(
+                v["body"],
+                json!({ "format": "markdown", "value": markdown })
+            );
+            let mut rest = v.clone();
+            let mut sent = page.clone();
+            for x in [&mut rest, &mut sent] {
+                if let Some(o) = x.as_object_mut() {
+                    o.remove("body");
+                }
+            }
+            assert_eq!(rest, sent, "everything but the body as sent");
+        }
+        other => return Err(format!("unexpected answers: {other:?}").into()),
+    }
+    let call = record(&h, &id, EventType::SCRIPT_CALL).await?;
+    // Task 11: the key was looked up; the mock knows no such user (an unmounted path).
+    assert_eq!(call["user_resolutions"], json!({ "8a7f808a1": null }));
+    assert_eq!(call["rejection"], Value::Null);
+
+    // 2 MiB of Markdown against a 1 MiB call result limit.
+    mount_page(
+        mock,
+        "65538",
+        &page_with_storage(&amplified_storage(21_000)),
+    )
+    .await;
+    let id = submit(
+        &h,
+        json!({ "source": SRC, "limits": { "max_call_result_mb": 1 } }),
+    )
+    .await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    match runner.results().as_slice() {
+        [_, HostCallResult::Rejected { class, .. }] => assert_eq!(class, "result_too_large"),
+        other => return Err(format!("unexpected answers: {other:?}").into()),
+    }
+    let call = record(&h, &id, EventType::SCRIPT_CALL).await?;
+    assert_eq!(call["rejection"], "result_too_large");
+    Ok(())
+}
+
+/// Task 11 (PD-99, §7.6 "also inside script runs"): two mentions by key.
+const TWO_USERS_STORAGE: &str = r#"<p>Owners <ac:link><ri:user ri:userkey="key-jdoe"/></ac:link> and <ac:link><ri:user ri:userkey="key-asmith"/></ac:link>.</p>"#;
+
+/// A Confluence harness (with `hooks`) whose one script makes one `confluence.page.get` host
+/// call of the two-user page; the lookups answer after `delay`.
+async fn page_get_script(
+    delay: Duration,
+    hooks: TestHooks,
+) -> Result<(Harness, Arc<FakeScriptRunner>, String), TestError> {
+    use common::confluence::{mount_page, mount_users_delayed, page_with_storage};
+    let runner = FakeScriptRunner::new(vec![ScriptPlan::new(
+        vec![host_call(
+            1,
+            "confluence.page.get",
+            json!({ "id": "65537" }),
+        )],
+        result_end(json!(1)),
+    )]);
+    let h = Harness::builder()
+        .confluence("wiki")
+        .scripts(runner.clone())
+        .hooks(hooks)
+        .start()
+        .await?;
+    let mock = h.mock("wiki").ok_or("no wiki mock")?;
+    mount_page(mock, "65537", &page_with_storage(TWO_USERS_STORAGE)).await;
+    mount_users_delayed(
+        mock,
+        &[("key-jdoe", Some("jdoe")), ("key-asmith", Some("asmith"))],
+        delay,
+    )
+    .await;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    Ok((h, runner, id))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn script_host_call_commits_user_resolutions() -> TestResult {
+    let (h, runner, id) = page_get_script(Duration::ZERO, TestHooks::none()).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    // The lookups run under the run's cover, each recorded before the call's `SCRIPT_CALL`.
+    assert_eq!(
+        h.event_types(&id).await?,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::SCRIPT_STARTED,
+            EventType::SCRIPT_CALL_SENT,
+            EventType::PREVIEW_FETCH,
+            EventType::PREVIEW_FETCH,
+            EventType::SCRIPT_CALL,
+            EventType::SCRIPT_FINISHED,
+        ]
+    );
+    for (_, p) in h
+        .events(&id)
+        .await?
+        .iter()
+        .filter(|(t, _)| *t == EventType::PREVIEW_FETCH)
+    {
+        assert_eq!(p["purpose"], "resolve", "{p}");
+        assert_eq!(p["status"], 200);
+    }
+    let call = record(&h, &id, EventType::SCRIPT_CALL).await?;
+    assert_eq!(
+        call["user_resolutions"],
+        json!({ "key-jdoe": "jdoe", "key-asmith": "asmith" })
+    );
+    let users = [
+        ("key-jdoe".to_owned(), Some("jdoe".to_owned())),
+        ("key-asmith".to_owned(), Some("asmith".to_owned())),
+    ]
+    .into_iter()
+    .collect();
+    let markdown = atlas_duck_convert::storage_to_markdown(TWO_USERS_STORAGE, &users).0;
+    assert!(markdown.contains("@jdoe"), "{markdown}");
+    match runner.results().as_slice() {
+        [HostCallResult::Ok(v)] => assert_eq!(
+            v["body"],
+            json!({ "format": "markdown", "value": markdown })
+        ),
+        other => return Err(format!("unexpected answers: {other:?}").into()),
+    }
+    Ok(())
+}
+
+/// PD-99: a cancel while a host call's lookup is in flight records the lookup
+/// (`PREVIEW_FETCH {resolve, cancelled_in_flight}`) and then the call with the content page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_during_host_call_lookup_records_it_in_flight() -> TestResult {
+    let (h, _runner, id) = page_get_script(Duration::from_secs(30), TestHooks::none()).await?;
+    let mock = h.mock("wiki").ok_or("no wiki mock")?;
+    let user_path = mock.path("/rest/api/user");
+    for _ in 0..2000 {
+        if mock
+            .received()
+            .await
+            .iter()
+            .any(|r| r.url.path() == user_path)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let env = h.handler().cancel(&id).await;
+    assert_eq!(env.status, Status::Cancelled, "{}", env.to_json_line());
+    let events = h.events(&id).await?;
+    let types: Vec<EventType> = events.iter().map(|(t, _)| *t).collect();
+    assert_eq!(
+        types,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::SCRIPT_STARTED,
+            EventType::SCRIPT_CALL_SENT,
+            EventType::PREVIEW_FETCH,
+            EventType::SCRIPT_CALL,
+            EventType::SCRIPT_FAILED,
+            EventType::CANCELLED,
+        ]
+    );
+    let lookup = &events[3].1;
+    assert_eq!(lookup["purpose"], "resolve", "{lookup}");
+    assert_eq!(lookup["outcome"], "cancelled_in_flight");
+    assert_eq!(lookup["reason"], "by_client");
+    assert_eq!(lookup["path"], "/wiki/rest/api/user?key=key-asmith");
+    let call = &events[4].1;
+    assert_eq!(call["outcome"], "cancelled_in_flight", "{call}");
+    assert_eq!(call["pages"], 1);
+    assert!(
+        call.to_string().contains("Owners"),
+        "the page is recorded: {call}"
+    );
+    Ok(())
+}
+
+/// T11 review I-1, host call: a cancel after the lookup's record is parked (its in-flight mark
+/// still set) records the lookup once, with its answer, then the call with the content page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_after_host_call_lookup_answered_records_it_once() -> TestResult {
+    use common::confluence::user_gets;
+    let pause = Pause::new();
+    let hooks = TestHooks {
+        pause_after_get: Some(pause.clone()),
+        ..TestHooks::none()
+    };
+    let (h, _runner, id) = page_get_script(Duration::ZERO, hooks).await?;
+    pause.reached.notified().await;
+    let env = h.handler().cancel(&id).await;
+    assert_eq!(env.status, Status::Cancelled, "{}", env.to_json_line());
+    pause.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let events = h.events(&id).await?;
+    let types: Vec<EventType> = events.iter().map(|(t, _)| *t).collect();
+    assert_eq!(
+        types,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::SCRIPT_STARTED,
+            EventType::SCRIPT_CALL_SENT,
+            EventType::PREVIEW_FETCH,
+            EventType::SCRIPT_CALL,
+            EventType::SCRIPT_FAILED,
+            EventType::CANCELLED,
+        ]
+    );
+    let lookup = &events[3].1;
+    assert_eq!(lookup["purpose"], "resolve", "{lookup}");
+    assert_eq!(lookup["status"], 200, "{lookup}");
+    assert_ne!(lookup["outcome"], "cancelled_in_flight", "{lookup}");
+    assert_eq!(lookup["path"], "/wiki/rest/api/user?key=key-asmith");
+    let call = &events[4].1;
+    assert_eq!(call["outcome"], "cancelled_in_flight", "{call}");
+    assert_eq!(call["pages"], 1);
+    let mock = h.mock("wiki").ok_or("no wiki mock")?;
+    assert_eq!(user_gets(mock).await.len(), 1, "one record per lookup sent");
+    Ok(())
+}
+
+/// T11 review I-2: a host call's lookup bytes count toward `max_fetch_mb` (added to the run's
+/// counter before the call returns; the call's `bytes` stay the content's), and no lookup starts
+/// once another full lookup answer could pass what is left of the limit. The second page leaves
+/// room for exactly one lookup answer (64 KiB); a cut answer holds `MAX_LOOKUP_BYTES + 1` bytes,
+/// so the rule asks for that much room (T11 fix review m-3). The first call's lookups count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_call_lookup_bytes_count_toward_max_fetch_mb() -> TestResult {
+    lookup_byte_rule(64 * 1024, false).await
+}
+
+/// The same with one byte more room: the lookup starts (kills `>` -> `>=` at the byte rule).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_call_lookup_starts_with_room_for_a_cut_answer() -> TestResult {
+    lookup_byte_rule(64 * 1024 + 1, true).await
+}
+
+/// `room`: the bytes of `max_fetch_mb` left to the second call.
+async fn lookup_byte_rule(room: usize, looked_up: bool) -> TestResult {
+    use common::confluence::{mount_page, mount_users, page_with_storage, user, user_gets};
+    const FETCH_CAP: usize = 1024 * 1024;
+    let get = |call: u64, id: &str| host_call(call, "confluence.page.get", json!({ "id": id }));
+    let runner = FakeScriptRunner::new(vec![ScriptPlan::new(
+        vec![get(1, "65537"), get(2, "65538")],
+        result_end(json!(1)),
+    )]);
+    let h = Harness::builder()
+        .confluence("wiki")
+        .scripts(runner.clone())
+        .start()
+        .await?;
+    let mock = h.mock("wiki").ok_or("no wiki mock")?;
+    let first = page_with_storage(TWO_USERS_STORAGE);
+    let s1 = first.to_string().len();
+    let l1 =
+        user("key-asmith", "asmith").to_string().len() + user("key-jdoe", "jdoe").to_string().len();
+    mount_page(mock, "65537", &first).await;
+    mount_users(
+        mock,
+        &[
+            ("key-jdoe", Some("jdoe")),
+            ("key-asmith", Some("asmith")),
+            ("key-third", Some("third")),
+        ],
+    )
+    .await;
+    let mut second = page_with_storage(r#"<p><ri:user ri:userkey="key-third"/></p>"#);
+    second["title"] = json!("");
+    let base = second.to_string().len();
+    let s2 = FETCH_CAP - s1 - l1 - room;
+    second["title"] = json!("x".repeat(s2 - base));
+    assert_eq!(second.to_string().len(), s2);
+    mount_page(mock, "65538", &second).await;
+    let id = submit(
+        &h,
+        json!({ "source": SRC, "limits": { "max_fetch_mb": 1 } }),
+    )
+    .await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let calls: Vec<Value> = h
+        .events(&id)
+        .await?
+        .into_iter()
+        .filter(|(t, _)| *t == EventType::SCRIPT_CALL)
+        .map(|(_, p)| p)
+        .collect();
+    let [one, two] = calls.as_slice() else {
+        return Err(format!("{} SCRIPT_CALL records", calls.len()).into());
+    };
+    assert_eq!(
+        one["user_resolutions"],
+        json!({ "key-jdoe": "jdoe", "key-asmith": "asmith" })
+    );
+    assert_eq!(one["bytes"], json!(s1), "the content only");
+    assert_eq!(two["rejection"], Value::Null, "{two}");
+    let third = if looked_up {
+        json!("third")
+    } else {
+        Value::Null
+    };
+    assert_eq!(two["user_resolutions"], json!({ "key-third": third }));
+    assert_eq!(
+        user_gets(mock).await.len(),
+        if looked_up { 3 } else { 2 },
+        "key-third is looked up only with room for a cut answer"
+    );
+    Ok(())
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fetch_cap_overrun_is_a_script_limit_inside_the_script() -> TestResult {
     let mut call = host_call(

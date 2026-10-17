@@ -1212,6 +1212,7 @@ fn preview_of(
             more_available: false,
             clamped: false,
             comments_truncated: None,
+            conversion: None,
         }),
         field_names: names,
     }))
@@ -1839,6 +1840,7 @@ fn read_preview(
             more_available: false,
             clamped: false,
             comments_truncated: None,
+            conversion: None,
         }),
         field_names: names,
     }))

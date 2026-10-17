@@ -438,6 +438,11 @@ fn confluence_table_rules_hold() {
         spec("confluence.label.add").result_projection,
         Projection::AgentLabels
     );
+    // M7 Δ4 b: a new attachment answers `{"results":[…]}`; the receipt is `results[0]`'s.
+    assert_eq!(
+        spec("confluence.attachment.upload").result_projection,
+        Projection::FirstResultFields(&["id", "type", "status", "version.number", "_links.webui"])
+    );
     let history = spec("confluence.page.history");
     let alt = history.alt_endpoint.expect("alt_endpoint");
     assert_eq!(alt.when_param_present, "version");
@@ -459,6 +464,65 @@ fn confluence_table_rules_hold() {
         spec("confluence.search").target_display,
         TargetDisplay::Query { param: "cql" }
     );
+}
+
+/// Δ4 a (lead ruling Q2, PD-105, PD-106): the `parent` of `confluence.page.create` and of
+/// `confluence.page.move` is a page id or a page title (an ambiguous title is the I-35 ambiguous
+/// case); empty is refused. Both describe the all-digit rule the same way (T16 review m-6).
+#[test]
+fn parent_schema_accepts_id_and_title() {
+    let create = |parent: Value| serde_json::json!({"space": "DOC", "title": "T", "body": "b", "parent": parent});
+    let move_ = |parent: Value| serde_json::json!({"id": "65537", "parent": parent});
+    let cases: [(&str, &dyn Fn(Value) -> Value); 2] = [
+        ("confluence.page.create", &create),
+        ("confluence.page.move", &move_),
+    ];
+    for (id, with) in cases {
+        let spec = get(id).expect("op");
+        let schema = jsonschema::validator_for(&spec.params_schema_json()).expect("schema");
+        let longest = "x".repeat(255);
+        for ok in [
+            "123400",
+            "Release notes",
+            "Notes / 2026 (draft)",
+            longest.as_str(),
+        ] {
+            assert!(schema.is_valid(&with(Value::from(ok))), "{id}: {ok}");
+        }
+        for bad in [
+            Value::from(""),
+            Value::from("x".repeat(256)),
+            Value::from(123_400),
+            Value::Null,
+        ] {
+            assert!(!schema.is_valid(&with(bad.clone())), "{id}: {bad}");
+        }
+        assert_eq!(
+            spec.params_schema_json()["properties"]["parent"]["description"],
+            "Parent page id or title (same space); a value of digits only is always a page id.",
+            "{id}"
+        );
+    }
+}
+
+/// Δ4 f (PD-100, plan review m-11): `ops describe` shows agents the default release of
+/// `confluence.page.get`, the Markdown body `{"format": "markdown", "value": …}`, and both
+/// examples validate against `PAGE_GET_RESULT` (U-05 checks the latter for every op).
+#[test]
+fn page_get_examples_show_the_markdown_release() {
+    let spec = get("confluence.page.get").expect("op");
+    let full = spec.result_example_json();
+    assert_eq!(
+        full["body"],
+        serde_json::json!({"format": "markdown", "value": "Version 1.4 fixes the login.\n"})
+    );
+    let sparse = spec.result_example_sparse_json();
+    assert_eq!(
+        sparse["body"],
+        serde_json::json!({"format": "markdown", "value": ""})
+    );
+    let schema = jsonschema::validator_for(&spec.result_schema_json()).expect("schema");
+    assert!(schema.is_valid(&full) && schema.is_valid(&sparse));
 }
 
 /// Does `pattern` (`*` one key, `name[]` every element, a leading `[]` the root array) address

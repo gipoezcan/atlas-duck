@@ -229,6 +229,7 @@ async fn check(engine: &Arc<Engine>, item: &BatchItem) -> Result<Checked, Fail> 
                 Some(write::Snapshot {
                     write: w,
                     hold: Some(hold),
+                    ..
                 }) => write::preview_model(spec, &alias, &w, hold, executes_as).warnings,
                 _ => return Err(Fail::Item(BatchFailure::NotPending)),
             };

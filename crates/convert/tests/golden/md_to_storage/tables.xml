@@ -1,0 +1,1 @@
+<table><tbody><tr><th>Name</th><th>Value</th></tr><tr><td>a | b</td><td><code>x|y</code></td></tr><tr><td></td><td><em>e</em></td></tr><tr><td><a href="https://x.example">link</a></td><td>&lt;b&gt;raw&lt;/b&gt; &amp; "q" ]]&gt;</td></tr><tr><td>&lt;ri:user ri:userkey="x"/&gt;</td><td><code>&lt;ac:link&gt;</code></td></tr></tbody></table>

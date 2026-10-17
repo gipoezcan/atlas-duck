@@ -136,9 +136,12 @@ fn diffs(m: &PreviewModel) -> Result<Diffs, TestError> {
             rendered,
             raw,
             raw_only_changes,
+            constructs,
             requests,
         } => {
             assert_eq!(requests.len(), 1, "§5.1 inv. 4: the exact request stays");
+            // The storage construct list is Confluence's (M7 Task 15); a Jira edit has none.
+            assert!(constructs.is_none());
             Ok(Diffs {
                 rendered: rendered.clone(),
                 raw: raw.clone(),
@@ -242,9 +245,17 @@ fn conflict_diff_is_the_raw_diff_of_expected_and_current() -> TestResult {
     // The conflict card shows it.
     let m = preview_of(&params, &v)?;
     match &m.body {
-        PreviewBody::Conflict { summary, diff_text } => {
+        PreviewBody::Conflict {
+            summary,
+            diff_text,
+            base_to_current,
+            intended,
+            ..
+        } => {
             assert_eq!(Some(summary.as_str()), v.conflict.as_deref());
             assert_eq!(diff_text, &v.diff_text);
+            // M7 Δ2: Jira lists the differing fields in `diff_text`, no rendered diffs.
+            assert!(base_to_current.is_empty() && intended.is_empty());
         }
         other => return Err(format!("not the conflict card: {other:?}").into()),
     }
@@ -963,11 +974,28 @@ async fn i36_edit_expected_conflict_not_approvable() -> TestResult {
         "conflict: fields changed since the agent read it: summary"
     );
     match &p.body {
-        PreviewBody::Conflict { summary, diff_text } => {
+        PreviewBody::Conflict {
+            summary,
+            diff_text,
+            base_to_current,
+            intended,
+            requests,
+        } => {
             assert_eq!(summary, &w.text);
             assert_eq!(
                 diff_text,
                 "summary (- read, + current)\n- \"Login page time out\"\n+ \"Login page times out\"\n"
+            );
+            // M7 Δ2: Jira lists the differing fields in `diff_text`, no rendered diffs.
+            assert!(base_to_current.is_empty() && intended.is_empty());
+            // M7 Task 15 (T8 review I-1): the enrichment-time conflict card carries the `PUT`
+            // an approval would have sent (§5.1 inv. 4), although it is not approvable.
+            assert_eq!(requests.len(), 1, "{requests:?}");
+            assert_eq!(requests[0].method, "PUT");
+            assert!(
+                requests[0]
+                    .resolved_url
+                    .ends_with("/rest/api/2/issue/ABC-1")
             );
         }
         other => return Err(format!("not the conflict card: {other:?}").into()),

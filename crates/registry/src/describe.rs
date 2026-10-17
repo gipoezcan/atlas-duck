@@ -3,7 +3,17 @@
 use serde_json::{Map, Value, json};
 
 use crate::model::{FlagKind, OpClass, OperationSpec, Product, Version};
-use crate::{JIRA_VERBATIM_GUIDANCE, PAGINATION_GUIDANCE, WRITE_GUIDANCE};
+use crate::{
+    CONFLUENCE_CQL_GUIDANCE, CONFLUENCE_LOSSY_GUIDANCE, CONFLUENCE_PLACEHOLDER_GUIDANCE,
+    JIRA_VERBATIM_GUIDANCE, PAGINATION_GUIDANCE, WRITE_GUIDANCE,
+};
+
+/// PD-112: the Confluence ops whose Markdown body runs the placeholder check (§7.6).
+const CONFLUENCE_BODY_OPS: [&str; 3] = [
+    "confluence.page.create",
+    "confluence.page.update",
+    "confluence.comment.add",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimitsSource {
@@ -110,6 +120,16 @@ fn description(spec: &OperationSpec) -> String {
     // PD-42: keyed on the class, so a read flagged for the write guidance does not get it.
     if spec.product == Product::Jira && spec.class == OpClass::Write {
         parts.push(JIRA_VERBATIM_GUIDANCE.to_string());
+    }
+    // PD-112: the placeholder check, the lossy advice and the CQL rewrite, by op id.
+    if CONFLUENCE_BODY_OPS.contains(&spec.id) {
+        parts.push(CONFLUENCE_PLACEHOLDER_GUIDANCE.to_string());
+    }
+    if spec.id == "confluence.page.update" {
+        parts.push(CONFLUENCE_LOSSY_GUIDANCE.to_string());
+    }
+    if spec.id == "confluence.search" {
+        parts.push(CONFLUENCE_CQL_GUIDANCE.to_string());
     }
     if spec.paginated.is_some() {
         parts.push(format!("Paginated: {PAGINATION_GUIDANCE}."));

@@ -270,15 +270,12 @@ pub(crate) const SEARCH: OperationSpec = OperationSpec {
     target_display: TargetDisplay::Query { param: "cql" },
     caps: max_caps(25, 200),
     paginated: Some(RESULTS_PAGE),
+    // PD-101 (Δ4 c): the released results keep only the §7.4 keys, so `url` is their one URL
+    // field (`content._links` and `resultGlobalContainer.displayUrl` are never released).
     redaction_rules: RedactionRules {
         copies: &[],
         mirrors: &[],
-        url_fields: &[
-            "_links.*",
-            "results[].url",
-            "results[].content._links.*",
-            "results[].resultGlobalContainer.displayUrl",
-        ],
+        url_fields: &["_links.*", "results[].url"],
     },
     result_example: schemas::SEARCH_EXAMPLE,
     result_example_sparse: schemas::SEARCH_EXAMPLE_SPARSE,

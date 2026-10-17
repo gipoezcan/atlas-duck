@@ -617,17 +617,21 @@ impl InstanceClient {
 }
 
 /// Appends every chunk to the control's shared buffer until the end, the cap, the deadline, a
-/// read error or a cancel; the bytes stay in the control.
+/// read error or a cancel; the bytes stay in the control. A body over the cap is kept up to
+/// `cap + 1` bytes (the byte that shows it is over), not up to the end of the chunk that crossed
+/// it (T11 review I-2).
 pub(crate) async fn read_body(
     mut resp: reqwest::Response,
     ctl: &FetchControl,
     deadline: Instant,
     cap: u64,
 ) -> BodyRead {
-    // The announced length, never more than the cap allows: a server cannot make this reserve
-    // more than the read may hold anyway.
+    // The announced length, never more than the read may hold (the cap plus the one byte that
+    // proves it was passed): a server cannot make this reserve more, and an over-cap body does
+    // not reallocate at its last byte.
+    let limit = usize::try_from(cap.saturating_add(1)).unwrap_or(usize::MAX);
     if let Some(n) = resp.content_length() {
-        ctl.reserve_partial(usize::try_from(n.min(cap)).unwrap_or(0));
+        ctl.reserve_partial(usize::try_from(n).unwrap_or(usize::MAX).min(limit));
     }
     loop {
         let next = tokio::select! {
@@ -638,7 +642,7 @@ pub(crate) async fn read_body(
         };
         match next {
             Ok(Some(chunk)) => {
-                let len = ctl.append_partial(&chunk);
+                let len = ctl.append_partial_within(&chunk, limit);
                 if u64::try_from(len).unwrap_or(u64::MAX) > cap {
                     return BodyRead::OverCap;
                 }

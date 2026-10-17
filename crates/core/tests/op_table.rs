@@ -43,15 +43,19 @@ const M5_WRITES: [&str; 5] = [
 /// enrichment).
 const M5_WITHOUT_ENRICH: [&str; 2] = ["jira.worklog.add", "jira.backlog.move_issues"];
 
-/// No Jira write is left after T18; the Confluence writes land in M7.
-const LATER_WRITES: [&str; 6] = [
+/// Confluence writes completed in M7 beyond `confluence.page.update` (each task moves its op here
+/// from [`LATER_WRITES`]). Each needs its enrichment verdict before it renders a request.
+const M7_WRITES: [&str; 6] = [
     "confluence.page.create",
-    "confluence.page.move",
     "confluence.comment.add",
     "confluence.label.add",
     "confluence.label.remove",
+    "confluence.page.move",
     "confluence.attachment.upload",
 ];
+
+/// No write is left after M7 Task 20a (the attachment upload was the last).
+const LATER_WRITES: [&str; 0] = [];
 
 fn op(id: &str) -> Result<&'static OperationSpec, String> {
     atlas_duck_registry::get(id).ok_or_else(|| format!("no op {id}"))
@@ -211,6 +215,10 @@ fn u05_only_writes_have_stale_check() -> TestResult {
         // T18 (PD-54): the sprint is still future or active.
         "jira.sprint.move_issues",
         "confluence.page.update",
+        // M7 T17 (PD-106): `version.number` unchanged, as for the update.
+        "confluence.page.move",
+        // M7 T20a (PD-109): the replaced attachment's id and version unchanged (replace only).
+        "confluence.attachment.upload",
     ]
     .into_iter()
     .collect();
@@ -238,6 +246,17 @@ fn reads_have_no_enrich() -> TestResult {
         "jira.issuelink.create",
         "jira.sprint.move_issues",
         "confluence.page.update",
+        // M7 Task 16 (PD-105): the space, the parent page, the duplicate-title check.
+        "confluence.page.create",
+        // M7 Task 17 (PD-106): the page, and the new parent in its space.
+        "confluence.page.move",
+        // M7 Task 18 (PD-107): the container, and the reply target.
+        "confluence.comment.add",
+        // M7 Task 19 (PD-108): the content's current labels, for the card.
+        "confluence.label.add",
+        "confluence.label.remove",
+        // M7 Task 20a (PD-109): the attachments of that filename (collision, replace target).
+        "confluence.attachment.upload",
     ]
     .into_iter()
     .collect();
@@ -694,6 +713,67 @@ fn cql_paren_escape_attempt_rejected() -> TestResult {
     Ok(())
 }
 
+/// `n` parentheses around `inner`.
+fn nested(n: usize, inner: &str) -> String {
+    format!("{}{inner}{}", "(".repeat(n), ")".repeat(n))
+}
+
+/// Runs `f` on a thread with a 256 KiB stack (an eighth of a tokio worker's 2 MiB).
+fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
+    std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(f)
+        .map_err(|e| e.to_string())?
+        .join()
+        .map_err(|_| "the small-stack thread panicked".to_owned())
+}
+
+/// T30 review I-1: `cql_broad` recurses once per parenthesis level, so a balanced CQL nested
+/// thousands deep (the 20 000-char schema cap allows about 10 000 levels) overflowed the stack and
+/// aborted the app. The tokenizer refuses more than `CQL_MAX_DEPTH` levels: a fixed validation
+/// error before anything is sent, and `cql_broad` never walks such a query.
+#[test]
+fn cql_nesting_deeper_than_the_cap_rejected() -> TestResult {
+    let deep = nested(9_000, "space = DOC");
+    assert!(deep.len() < 20_000);
+    // The preview's rule on the same text, on a small stack: not flagged, no overflow.
+    let walked = deep.clone();
+    assert!(!on_small_stack(move || confluence::cql_broad(&walked))?);
+    let over = nested(confluence::CQL_MAX_DEPTH as usize + 1, "space = DOC");
+    for cql in [&deep, &over] {
+        let e = rejected_cql(cql)?;
+        assert_eq!(e.code, ErrorCode::Validation);
+        assert_eq!(e.details.get("param"), Some(&json!("cql")));
+        assert!(!serde_json::to_string(&e)?.contains("space"));
+        assert!(
+            e.message.contains(&confluence::CQL_MAX_DEPTH.to_string()),
+            "{}",
+            e.message
+        );
+    }
+    // The executor is the validator hook: the same rejection, before any fetch.
+    let r = exec("confluence.search", &json!({ "cql": deep }), None, Some(25))?;
+    assert!(matches!(r, Err(ExecError::Invalid(e)) if e.code == ErrorCode::Validation));
+    Ok(())
+}
+
+/// I-1: exactly `CQL_MAX_DEPTH` levels still parse, and `cql_broad` walks them on a small stack
+/// (the recursion at the cap leaves a wide margin below a worker's stack).
+#[test]
+fn cql_nesting_at_the_cap_parses() -> TestResult {
+    let cap = confluence::CQL_MAX_DEPTH as usize;
+    let narrow = nested(cap, "space = DOC");
+    assert_eq!(
+        confluence::effective_cql(&narrow)?,
+        format!("({narrow}) AND {TYPES}")
+    );
+    let broad = nested(cap, "title ~ x OR label = a");
+    confluence::effective_cql(&broad)?;
+    assert!(!on_small_stack(move || confluence::cql_broad(&narrow))?);
+    assert!(on_small_stack(move || confluence::cql_broad(&broad))?);
+    Ok(())
+}
+
 #[test]
 fn cql_quoted_parens_and_order_by_are_text() -> TestResult {
     assert_eq!(
@@ -745,12 +825,13 @@ fn not_in_this_build_writes() -> TestResult {
         .count();
     assert_eq!(
         writes,
-        M3_WRITES.len() + M5_WRITES.len() + LATER_WRITES.len()
+        M3_WRITES.len() + M5_WRITES.len() + M7_WRITES.len() + LATER_WRITES.len()
     );
     // Each needs its enrichment verdict before it renders a request.
     for id in M5_WRITES
         .into_iter()
         .filter(|id| !M5_WITHOUT_ENRICH.contains(id))
+        .chain(M7_WRITES)
     {
         assert_eq!(
             exec(id, &example(op(id)?), None, None)?,
@@ -905,7 +986,133 @@ fn fixture_cases() -> Vec<(&'static str, Value, Option<EnrichVerdict>)> {
             json!({"key": "ABC-1", "body": MARKDOWN, "body_format": "markdown"}),
             None,
         ),
+        // M7 Task 9: a Markdown page body converts to storage in the executor too.
+        (
+            "confluence.page.update",
+            json!({"id": "65537", "base_version": 5, "body": MARKDOWN}),
+            Some(page_verdict()),
+        ),
+        // M7 Task 18: a comment, and a reply, on a page.
+        (
+            "confluence.comment.add",
+            json!({"content_id": "65537", "body": MARKDOWN}),
+            Some(comment_verdict(None)),
+        ),
+        (
+            "confluence.comment.add",
+            json!({"content_id": "65537", "body": "<p>x</p>", "body_format": "storage",
+                   "reply_to": "790"}),
+            Some(comment_verdict(Some("790"))),
+        ),
+        // M7 Task 16: a page created under a parent, Markdown and storage.
+        (
+            "confluence.page.create",
+            json!({"space": "DOC", "title": "Notes", "body": MARKDOWN, "parent": "Home"}),
+            Some(create_page_verdict(Some(("Home", "65536")))),
+        ),
+        (
+            "confluence.page.create",
+            json!({"space": "DOC", "title": "Notes", "body": "<p>x</p>",
+                   "body_format": "storage"}),
+            Some(create_page_verdict(None)),
+        ),
+        // M7 Task 19: the label writes, rendered after the enrichment read of the content.
+        (
+            "confluence.label.add",
+            json!({"id": "65537", "labels": ["release", "docs"]}),
+            Some(label_verdict()),
+        ),
+        (
+            "confluence.label.remove",
+            json!({"id": "65537", "label": "release"}),
+            Some(label_verdict()),
+        ),
+        // M7 Task 17: a page moved under a parent named by title.
+        (
+            "confluence.page.move",
+            json!({"id": "65537", "parent": "Release notes"}),
+            Some(move_verdict()),
+        ),
+        // M7 Task 20a: a new attachment with a comment, and a replace (PD-109: the multipart body
+        // and its boundary are pure functions of the params).
+        (
+            "confluence.attachment.upload",
+            json!({"id": "65537", "filename": "notes.txt", "content_base64": "aGVsbG8gd29ybGQ=",
+                   "comment": "Meeting notes"}),
+            Some(upload_verdict(false)),
+        ),
+        (
+            "confluence.attachment.upload",
+            json!({"id": "65537", "filename": "notes.txt", "content_base64": "aGVsbG8gd29ybGQ=",
+                   "replace": true}),
+            Some(upload_verdict(true)),
+        ),
     ]
+}
+
+/// What enrichment gives for `notes.txt` on page 65537: no attachment of that name, or (replace)
+/// `att3001` at version 2.
+fn upload_verdict(replace: bool) -> EnrichVerdict {
+    let mut resolved = Map::new();
+    resolved.insert("id".to_owned(), json!("65537"));
+    resolved.insert("filename".to_owned(), json!("notes.txt"));
+    resolved.insert("replace".to_owned(), json!(replace));
+    if replace {
+        resolved.insert("attachment_id".to_owned(), json!("att3001"));
+        EnrichVerdict::preview(json!({"attachment_id": "att3001", "version": 2}), resolved)
+    } else {
+        EnrichVerdict::preview(Value::Null, resolved)
+    }
+}
+
+/// What enrichment gives for moving page 65537 (version 7) under `Release notes` (123400).
+fn move_verdict() -> EnrichVerdict {
+    let mut resolved = Map::new();
+    resolved.insert("id".to_owned(), json!("65537"));
+    resolved.insert("title".to_owned(), json!("Release checklist"));
+    resolved.insert("parent".to_owned(), json!("Release notes"));
+    resolved.insert("parent_id".to_owned(), json!("123400"));
+    EnrichVerdict::preview(
+        json!({
+            "version": 7,
+            "title": "Release checklist",
+            "space_key": "DOC",
+            "from_parent_id": "65536",
+            "to_parent_id": "123400",
+        }),
+        resolved,
+    )
+}
+
+/// What enrichment gives for a page `Notes` in `DOC`, under `(parent param, resolved id)`.
+fn create_page_verdict(parent: Option<(&str, &str)>) -> EnrichVerdict {
+    let mut resolved = Map::new();
+    resolved.insert("space".to_owned(), json!("DOC"));
+    resolved.insert("space_key".to_owned(), json!("DOC"));
+    resolved.insert("title".to_owned(), json!("Notes"));
+    if let Some((param, id)) = parent {
+        resolved.insert("parent".to_owned(), json!(param));
+        resolved.insert("parent_id".to_owned(), json!(id));
+    }
+    EnrichVerdict::preview(json!({"space_key": "DOC"}), resolved)
+}
+
+/// What enrichment gives for the labels of page 65537.
+fn label_verdict() -> EnrichVerdict {
+    let mut resolved = Map::new();
+    resolved.insert("id".to_owned(), json!("65537"));
+    EnrichVerdict::preview(Value::Null, resolved)
+}
+
+/// What enrichment gives for a comment on page 65537, replying to `reply_to` when given.
+fn comment_verdict(reply_to: Option<&str>) -> EnrichVerdict {
+    let mut resolved = Map::new();
+    resolved.insert("content_id".to_owned(), json!("65537"));
+    resolved.insert("container_type".to_owned(), json!("page"));
+    if let Some(reply) = reply_to {
+        resolved.insert("reply_to".to_owned(), json!(reply));
+    }
+    EnrichVerdict::preview(json!({"container_type": "page"}), resolved)
 }
 
 /// A Markdown body with a heading, emphasis, wiki specials, a quote and a code block.
@@ -920,6 +1127,24 @@ fn executors_deterministic() -> TestResult {
         assert_eq!(a, b, "{id}");
         assert_eq!(a.len(), 1, "{id}");
         assert_eq!(a[0].index, 0);
+        if a[0].method == "DELETE" {
+            // The only DELETE (§1.3): no body and no content type.
+            assert_eq!(
+                id, "confluence.label.remove",
+                "only the label remove may DELETE"
+            );
+            assert!(a[0].content_type.is_none() && a[0].body.is_empty(), "{id}");
+            continue;
+        }
+        if id == "confluence.attachment.upload" {
+            // PD-109: the one multipart write; its boundary comes from the file's SHA-256.
+            let ct = a[0].content_type.as_deref().unwrap_or_default();
+            assert!(
+                ct.starts_with("multipart/form-data; boundary=atlas-duck-"),
+                "{ct}"
+            );
+            continue;
+        }
         assert_eq!(a[0].content_type.as_deref(), Some("application/json"));
         // Key order is fixed (serde_json's ordered map): re-serializing gives the same bytes.
         assert_eq!(serde_json::to_vec(&body_json(&a[0])?)?, a[0].body, "{id}");
@@ -933,6 +1158,15 @@ fn executors_deterministic() -> TestResult {
     let comment = json!({"key": "ABC-1", "body": MARKDOWN});
     let r = &write_requests("jira.comment.add", &comment, None)?[0];
     assert_eq!(body_json(r)?["body"], wiki);
+    // M7 Task 9: the page body is the storage converter's output, never the agent's Markdown.
+    let storage = json!(atlas_duck_convert::markdown_to_storage(MARKDOWN).0);
+    let page = json!({"id": "65537", "base_version": 5, "body": MARKDOWN});
+    let r = &write_requests("confluence.page.update", &page, Some(&page_verdict()))?[0];
+    assert_eq!(body_json(r)?["body"]["storage"]["value"], storage);
+    assert_eq!(
+        body_json(r)?["body"]["storage"]["representation"],
+        json!("storage")
+    );
     // M5 M-6: the two executors that write enrichment facts send the resolved names, never the
     // agent's spelling: the link type `blocks` resolved to `Blocks`, the assignee `Jane` to the
     // user name `jdoe`.
@@ -1705,7 +1939,7 @@ fn page_update_conflict_and_stale_rule() -> TestResult {
     assert_eq!(plan[0].1.endpoint_template, "/rest/api/content/{id}");
     assert_eq!(
         query_of(&plan[0].1),
-        vec![("expand", "body.storage,version,space")]
+        vec![("expand", "body.storage,version,space,ancestors")]
     );
     assert_eq!(v.hold, Hold::Preview);
     assert_eq!(
@@ -1713,13 +1947,14 @@ fn page_update_conflict_and_stale_rule() -> TestResult {
         json!({"version": 7, "title": "Release checklist", "space_key": "DOC"})
     );
 
+    // M7 Task 15 (PD-104): a base behind the page asks for the base body (stage 2), and the
+    // judge takes both answers.
     let stale_base =
         json!({"id": "65537", "base_version": 5, "body": "b", "body_format": "storage"});
-    let (_, v) = enrich(
-        "confluence.page.update",
-        &stale_base,
-        std::slice::from_ref(&page),
-    )?;
+    let mut base = page.clone();
+    base["version"]["number"] = json!(5);
+    base["status"] = json!("historical");
+    let (_, v) = enrich("confluence.page.update", &stale_base, &[page.clone(), base])?;
     assert_eq!(v.hold, Hold::Conflict);
     assert_eq!(
         v.conflict.as_deref(),
@@ -1780,13 +2015,62 @@ fn fixtures_match_registry_schemas() -> TestResult {
         ),
         ("confluence.page.get", fixtures::CONFLUENCE_PAGE),
         ("confluence.page.history", fixtures::CONFLUENCE_PAGE),
-        ("confluence.search", fixtures::CONFLUENCE_SEARCH_PAGE),
         ("confluence.page.update", fixtures::CONFLUENCE_PAGE_UPDATED),
+        // A move answers the `PUT` like an update (M7 Task 17).
+        ("confluence.page.move", fixtures::CONFLUENCE_PAGE_UPDATED),
+        // What `POST /rest/api/content` answers for a comment (M7 Task 18), with the fields the
+        // receipt does not keep.
+        (
+            "confluence.comment.add",
+            r#"{"id":"792","type":"comment","status":"current","title":"Re: Release checklist","version":{"number":1,"when":"2026-10-07T10:00:00.000+02:00"},"container":{"id":"65537","type":"page"},"_links":{"webui":"/display/DOC/Release+checklist?focusedCommentId=792","self":"https://wiki.corp.example/rest/api/content/792"}}"#,
+        ),
+        // What `POST /rest/api/content` answers for a new page (M7 Task 16), with the fields the
+        // receipt does not keep.
+        (
+            "confluence.page.create",
+            r#"{"id":"123500","type":"page","status":"current","title":"Release 1.5 notes","space":{"key":"DOC","name":"Documentation"},"version":{"number":1,"when":"2026-10-17T10:00:00.000+02:00"},"ancestors":[{"id":"123400"}],"body":{"storage":{"value":"<p>x</p>","representation":"storage"}},"_links":{"webui":"/display/DOC/Release+1.5+notes","self":"https://wiki.corp.example/rest/api/content/123500"}}"#,
+        ),
+        // M7 Task 19: the labels the server now has (the receipt keeps the agent's), and the
+        // empty 204 of a remove.
+        (
+            "confluence.label.add",
+            r#"{"results":[{"prefix":"global","name":"release","id":"10"},{"prefix":"global","name":"docs","id":"11"}],"start":0,"limit":200,"size":2}"#,
+        ),
+        ("confluence.label.remove", "null"),
+        // M7 Task 20a (Δ4 b): a new attachment answers `{"results":[…]}`; the receipt is
+        // `results[0]`'s projection.
+        (
+            "confluence.attachment.upload",
+            r#"{"results":[{"id":"att3002","type":"attachment","status":"current","title":"notes.txt","version":{"number":1,"when":"2026-10-17T10:00:00.000+02:00"},"extensions":{"mediaType":"text/plain","fileSize":11},"_links":{"webui":"/display/DOC/Release+checklist?preview=/65537/3002/notes.txt","download":"/download/attachments/65537/notes.txt"}}],"size":1}"#,
+        ),
     ];
+    // PD-101: a search is released pruned, so its schema (strict) is checked on the normalized
+    // fixture, not on the raw answer.
+    let search = {
+        let raw: Value = serde_json::from_str(fixtures::CONFLUENCE_SEARCH_PAGE)?;
+        // The READ_FETCHED payload of one 2xx answer (as `common::confluence::fetched_payload`;
+        // this suite does not link `common`, which needs the `testing` feature).
+        let payload = json!({
+            "pages": 1,
+            "responses": [{
+                "status": 200,
+                "content_type": "application/json",
+                "body": atlas_duck_core::payloads::body_json(raw.to_string().as_bytes()),
+            }],
+        });
+        let released = atlas_duck_core::engine::read::normalize(
+            op("confluence.search")?,
+            &json!({ "cql": "space = DOC" }),
+            &payload,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        released.to_string()
+    };
     let cases = owned
         .iter()
         .map(|(id, body)| (*id, body.as_str()))
-        .chain(fixed);
+        .chain(fixed)
+        .chain([("confluence.search", search.as_str())]);
     for (id, body) in cases {
         let spec = op(id)?;
         let mut value: Value = serde_json::from_str(body)?;
@@ -1856,6 +2140,7 @@ fn read_preview(
             more_available: more,
             clamped,
             comments_truncated: None,
+            conversion: None,
         }),
         field_names: None,
     };
@@ -2114,7 +2399,10 @@ fn write_preview_hold_bodies() -> TestResult {
 
     let params = json!({"id": "65537", "base_version": 5, "body": "b", "body_format": "storage"});
     let page: Value = serde_json::from_str(fixtures::CONFLUENCE_PAGE)?;
-    let (_, v) = enrich("confluence.page.update", &params, &[page])?;
+    let mut base = page.clone();
+    base["version"]["number"] = json!(5);
+    base["status"] = json!("historical");
+    let (_, v) = enrich("confluence.page.update", &params, &[page, base])?;
     let m = write_preview(
         "confluence.page.update",
         &params,

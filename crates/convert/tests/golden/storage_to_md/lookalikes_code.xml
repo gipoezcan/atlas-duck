@@ -1,0 +1,4 @@
+<p>Inline <code>[macro: toc {}] @user:abc</code> stays.</p>
+<ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[[macro: toc {}]
+@user:abc
+[x](confluence:y)]]></ac:plain-text-body></ac:structured-macro>

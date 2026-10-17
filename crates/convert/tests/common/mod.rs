@@ -1,14 +1,214 @@
 //! Shared by the `md_to_wiki` and `hard_check` tests (and the wiki renderer's properties):
-//! the Markdown fuzz strategy and the strict span/record agreement check.
+//! the Markdown fuzz strategy and the strict span/record agreement check; and by the storage
+//! tests: the storage fuzz strategies and the strict check of Markdown → storage output.
 //!
 //! Each integration test binary compiles this module on its own and uses only part of it.
 #![allow(dead_code)]
 
 use std::ops::Range;
 
+use atlas_duck_convert::storage::{self, Element, Node, Ns};
 use atlas_duck_convert::wiki::{self, construct_spans};
-use atlas_duck_convert::{ConstructKind, ContainerKind, EmittedConstructs, wiki_constructs};
+use atlas_duck_convert::{
+    ConstructKind, ContainerKind, EmittedConstructs, check_storage_body, storage_constructs,
+    wiki_constructs,
+};
 use proptest::prelude::*;
+
+/// The HTML elements PD-96 lets the storage converter write (the parser's `CONVERTER_HTML`).
+pub const STORAGE_HTML: [&str; 22] = [
+    "p",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "em",
+    "strong",
+    "s",
+    "ul",
+    "ol",
+    "li",
+    "table",
+    "tbody",
+    "tr",
+    "th",
+    "td",
+    "blockquote",
+    "hr",
+    "br",
+    "code",
+];
+
+pub const CODE_MACRO_OPEN: &str = "<ac:structured-macro ac:name=\"code\">";
+pub const CODE_MACRO_CLOSE: &str = "</ac:structured-macro>";
+
+/// The code-macro language pattern `[A-Za-z0-9+#-]{1,32}` (PD-95, PD-96).
+fn code_language(s: &str) -> bool {
+    (1..=32).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'#' | b'-'))
+}
+
+/// Every element of `nodes` is one the storage converter writes, with only the attributes it
+/// writes: HTML from [`STORAGE_HTML`] without attributes, `<a>` with exactly an `href`, and code
+/// macros of exactly the converter's shape (`ac:name="code"`, an optional first
+/// `ac:parameter ac:name="language"` holding one text matching the language pattern, then one
+/// `ac:plain-text-body` holding only CDATA sections; nothing else, no nesting). No `ri:` and no
+/// foreign element.
+pub fn only_converter_markup(nodes: &[Node]) -> Result<(), String> {
+    for n in nodes {
+        let e = match n {
+            Node::Element(e) => e,
+            Node::Text(_) => continue,
+            // Code macro bodies are `code_macro_shape`'s; CDATA anywhere else is stray.
+            Node::CData { .. } => return Err("CDATA outside a code macro body".to_owned()),
+        };
+        let attrs: Vec<(&str, &str)> = e
+            .attrs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        match (e.ns, e.local.as_str()) {
+            (Ns::Ac, "structured-macro") => {
+                code_macro_shape(e)?;
+                continue;
+            }
+            (Ns::Html, "a") if matches!(attrs.as_slice(), [("href", _)]) => {}
+            (Ns::Html, local) if STORAGE_HTML.contains(&local) && attrs.is_empty() => {}
+            _ => {
+                return Err(format!(
+                    "element {} {attrs:?} is not converter markup",
+                    e.qname()
+                ));
+            }
+        }
+        only_converter_markup(&e.children)?;
+    }
+    Ok(())
+}
+
+fn code_macro_shape(m: &Element) -> Result<(), String> {
+    let bad = || format!("code macro {m:?} is not the converter's shape");
+    let name_only = |e: &Element, v: &str| matches!(e.attrs.as_slice(), [(k, val)] if k == "ac:name" && val == v);
+    if !name_only(m, "code") {
+        return Err(bad());
+    }
+    let parts: Vec<&Element> = m
+        .children
+        .iter()
+        .map(|n| match n {
+            Node::Element(e) => Some(e),
+            _ => None,
+        })
+        .collect::<Option<_>>()
+        .ok_or_else(bad)?;
+    let body = match parts.as_slice() {
+        [body] => body,
+        [param, body] => {
+            let lang_ok = param.ns == Ns::Ac
+                && param.local == "parameter"
+                && name_only(param, "language")
+                && matches!(param.children.as_slice(), [Node::Text(t)] if code_language(t));
+            if !lang_ok {
+                return Err(bad());
+            }
+            body
+        }
+        _ => return Err(bad()),
+    };
+    let body_ok = body.ns == Ns::Ac
+        && body.local == "plain-text-body"
+        && body.attrs.is_empty()
+        && !body.children.is_empty()
+        && body
+            .children
+            .iter()
+            .all(|n| matches!(n, Node::CData { .. }));
+    if body_ok { Ok(()) } else { Err(bad()) }
+}
+
+fn cdata_ranges(nodes: &[Node], out: &mut Vec<Range<usize>>) {
+    for n in nodes {
+        match n {
+            Node::CData { byte_range, .. } => out.push(byte_range.clone()),
+            Node::Element(e) => cdata_ranges(&e.children, out),
+            Node::Text(_) => {}
+        }
+    }
+}
+
+/// Defence in depth (T6 review m-3): every `&` outside CDATA begins a reference the converter
+/// writes: `&amp;`, `&lt;`, `&gt;`, `&quot;` or a numeric `&#`.
+fn only_known_references(out: &str, nodes: &[Node]) -> Result<(), String> {
+    let mut cdata = Vec::new();
+    cdata_ranges(nodes, &mut cdata);
+    for (i, _) in out.match_indices('&') {
+        if cdata.iter().any(|r| r.contains(&i)) {
+            continue;
+        }
+        let rest = out.get(i..).unwrap_or("");
+        if !["&amp;", "&lt;", "&gt;", "&quot;", "&#"]
+            .iter()
+            .any(|p| rest.starts_with(p))
+        {
+            return Err(format!("unknown reference at {i} in {out:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// The checks every Markdown → storage conversion must pass: no trailing newline,
+/// `check_storage_body` is `Ok`, only converter markup, the construct spans are exactly the
+/// recorded code macros (each a `Macro` span), each record slices one whole code macro, and the
+/// inventory holds no mention, include, image or attachment and no macro but `code`.
+pub fn check_storage_output(out: &str, e: &EmittedConstructs) -> Result<(), String> {
+    if out.ends_with('\n') {
+        return Err(format!("output ends with a newline: {out:?}"));
+    }
+    check_storage_body(out).map_err(|r| format!("check_storage_body: {r:?} for {out:?}"))?;
+    let doc = storage::parse(out);
+    if !doc.xml_ok {
+        return Err(format!("not xml_ok: {out:?}"));
+    }
+    only_converter_markup(&doc.nodes).map_err(|m| format!("{m} in {out:?}"))?;
+    only_known_references(out, &doc.nodes)?;
+    let mut spans = Vec::new();
+    for (kind, r) in storage::construct_spans(&doc) {
+        if kind != ConstructKind::Macro {
+            return Err(format!("unrecorded {kind:?} at {r:?} in {out:?}"));
+        }
+        spans.push(r);
+    }
+    let recorded: Vec<_> = e.code_blocks.iter().map(|c| c.byte_range.clone()).collect();
+    if spans != recorded {
+        return Err(format!(
+            "spans {spans:?} != recorded {recorded:?} in {out:?}"
+        ));
+    }
+    for c in &e.code_blocks {
+        if c.kind != ContainerKind::CodeMacro {
+            return Err(format!("record kind {:?}", c.kind));
+        }
+        let slice = out
+            .get(c.byte_range.clone())
+            .ok_or_else(|| format!("range {:?} not on char boundaries", c.byte_range))?;
+        if !(slice.starts_with(CODE_MACRO_OPEN) && slice.ends_with(CODE_MACRO_CLOSE)) {
+            return Err(format!("record slices {slice:?}"));
+        }
+    }
+    let inv = storage_constructs(out);
+    if !(inv.mentions.is_empty()
+        && inv.includes.is_empty()
+        && inv.images.is_empty()
+        && inv.attachments.is_empty()
+        && inv.macros.iter().all(|m| m == "code"))
+    {
+        return Err(format!("unexpected constructs {inv:?} in {out:?}"));
+    }
+    Ok(())
+}
 
 /// The parser's view of `out` agrees with the record: every construct span is a `Macro`
 /// whose range is a recorded container, every recorded container is one span, and each
@@ -41,6 +241,8 @@ pub fn spans_match_record(out: &str, e: &EmittedConstructs) -> Result<(), String
                 slice.starts_with("{noformat}") && slice.ends_with("{noformat}")
             }
             ContainerKind::Quote => slice.starts_with("{quote}") && slice.ends_with("{quote}"),
+            // The storage converter's container; never in wiki output.
+            ContainerKind::CodeMacro => false,
         };
         if !ok {
             return Err(format!("{:?} range slices {slice:?}", c.kind));
@@ -84,6 +286,7 @@ pub fn tags_only_at_containers(out: &str, e: &EmittedConstructs) -> Result<(), S
                 ContainerKind::Code => "{code}".len(),
                 ContainerKind::Noformat => "{noformat}".len(),
                 ContainerKind::Quote => "{quote}".len(),
+                ContainerKind::CodeMacro => return false,
             };
             let opaque = c.kind != ContainerKind::Quote && c.byte_range.contains(&i);
             opaque || i == c.byte_range.start || Some(i) == c.byte_range.end.checked_sub(close)
@@ -258,5 +461,201 @@ pub fn markdown() -> impl Strategy<Value = String> {
         3 => proptest::collection::vec(md_fragment(), 0..40).prop_map(|v| v.concat()),
         2 => quote_markdown(),
         1 => code_pair_markdown(),
+    ]
+}
+
+/// Confluence storage fragments (M7 Task 2): markup delimiters, `]]>`, `ac:`/`ri:` elements,
+/// entities, unbalanced and foreign tags, declarations, non-ASCII text.
+pub fn storage_fragment() -> impl Strategy<Value = String> {
+    prop_oneof![
+        prop::sample::select(vec![
+            "<",
+            ">",
+            "&",
+            ";",
+            "/",
+            "\"",
+            "'",
+            "=",
+            "]]>",
+            "<![CDATA[",
+            "]]]]><![CDATA[>",
+            "<!--",
+            "-->",
+            "ac:",
+            "ri:",
+            "<p>",
+            "</p>",
+            "<b>",
+            "</b>",
+            "<br/>",
+            "<p title=\"a&amp;b\">",
+            "<a href=\"https://x.example/?a&amp;b\">",
+            "<a href=\"javascript:x\">",
+            "</a>",
+            "<ac:structured-macro ac:name=\"code\">",
+            "<ac:structured-macro ac:name=\"include\">",
+            "<ac:structured-macro ac:name=\"toc\"/>",
+            "</ac:structured-macro>",
+            "<ac:parameter ac:name=\"language\">",
+            "</ac:parameter>",
+            "<ac:plain-text-body>",
+            "</ac:plain-text-body>",
+            "<ac:rich-text-body>",
+            "</ac:rich-text-body>",
+            "<ac:link>",
+            "</ac:link>",
+            "<ac:image>",
+            "</ac:image>",
+            "<ri:user ri:userkey=\"8a7f\"/>",
+            "<ri:user ri:username=\"jdoe\"/>",
+            "<ri:page ri:space-key=\"DOC\" ri:content-title=\"T\"/>",
+            "<ri:attachment ri:filename=\"f.png\"/>",
+            "<ri:url ri:value=\"https://x\"/>",
+            "<zz:x xmlns:zz=\"u\">",
+            "</zz:x>",
+            "<at:var/>",
+            "<p xmlns=\"u\">",
+            "<!DOCTYPE x [<!ENTITY e \"y\">]>",
+            "<!ENTITY e \"y\">",
+            "<?php x ?>",
+            "<?xml version=\"1.0\"?>",
+            "&nbsp;",
+            "&uuml;",
+            "&#252;",
+            "&#x20AC;",
+            "&#0;",
+            "&#xD800;",
+            "&foo;",
+            "&amp;",
+            "&lt;",
+            "</ad-storage-root>",
+            "<ad-storage-root>",
+            "\u{1}",
+            "\u{FFFF}",
+            "\r\n",
+            "\t",
+            "é",
+            "😀",
+            "\u{202E}",
+        ])
+        .prop_map(str::to_owned),
+        "[a-z]{1,5}",
+        any::<char>().prop_map(String::from),
+    ]
+}
+
+/// Well-formed storage (Task 2 review M-10): nested `ac:`, `ri:`, HTML and foreign elements,
+/// text with references, CDATA (split ones included) and comments; attribute values with a raw
+/// `>`, references and look-alike attribute text. Chains of 58 to 70 `<div>`s reach past
+/// `MAX_DEPTH`, so a few draws are refused as too deep.
+pub fn storage_well_formed() -> impl Strategy<Value = String> {
+    let leaf = prop::sample::select(vec![
+        "a",
+        " ",
+        "\n",
+        "Grüße 😀",
+        "&amp;",
+        "&lt;ri:user/&gt;",
+        "&nbsp;",
+        "&#252;",
+        "&foo;",
+        "]]&gt;",
+        "<![CDATA[x <ri:user ri:userkey=\"c\"/> <a href=\"h\">]]>",
+        "<![CDATA[a]]]]><![CDATA[>b]]>",
+        "<!-- <ri:user ri:userkey=\"m\"/> -->",
+        "<br/>",
+        "<hr/>",
+        "<img src=\"i.png\"/>",
+        "<IMG src=\"I.png\"/>",
+        "<ri:user ri:userkey=\"8a7f\"/>",
+        "<ri:user ri:username=\"jdoe\"/>",
+        "<ri:user ri:userkey=\"\" ri:username=\"legacy\"/>",
+        "<ri:page ri:space-key=\"DOC\" ri:content-title=\"T &amp; U\"/>",
+        "<ri:blog-post ri:content-title=\"B\"/>",
+        "<ri:attachment ri:filename=\"f.png\"/>",
+        "<ri:url ri:value=\"https://x.example/i.png\"/>",
+        "<ri:space ri:space-key=\"S\"/>",
+        "<ri:content-entity ri:content-id=\"1\"/>",
+        "<ri:shortcut ri:key=\"g\"/>",
+        "<ac:structured-macro ac:name=\"toc\"/>",
+        "<ac:structured-macro ac:name=\"inc&#108;ude\"/>",
+        "<ac:structured-macro ac:title=\"a > b\" ac:name=\"excerpt-include\"/>",
+        "<ac:structured-macro ac:title=' ac:name=\"include\"' ac:name=\"toc\"/>",
+        "<ac:structured-macro zz:x=\"1\" ac:name=\"include\"/>",
+        "<ac:emoticon ac:name=\"smile\"/>",
+        "<ac:placeholder>p</ac:placeholder>",
+        "<ac:parameter ac:name=\"stray\">v</ac:parameter>",
+        "<ac:plain-text-link-body><![CDATA[t]]></ac:plain-text-link-body>",
+        "<at:var at:name=\"x\"/>",
+        "<p zz:a=\"1\"/>",
+        "<p xml:lang=\"de\">x</p>",
+        "<p xmlns=\"u\"/>",
+        "<zz:x xmlns:zz=\"u\"><ri:user ri:userkey=\"z\"/></zz:x>",
+    ])
+    .prop_map(str::to_owned);
+    let wrappers = prop::sample::select(vec![
+        ("<p>", "</p>"),
+        ("<div>", "</div>"),
+        ("<span style=\"color: red;\">", "</span>"),
+        ("<a href=\"https://x.example/?a=1&amp;b\">", "</a>"),
+        ("<a title=\"x > y\" href=\"https://y.example/\">", "</a>"),
+        ("<A href=\"https://z.example/\">", "</A>"),
+        ("<a name=\"anchor\">", "</a>"),
+        ("<table><tbody><tr><td>", "</td></tr></tbody></table>"),
+        (
+            "<ac:structured-macro ac:name=\"code\">",
+            "</ac:structured-macro>",
+        ),
+        (
+            "<ac:structured-macro ac:name=\"info\">",
+            "</ac:structured-macro>",
+        ),
+        (
+            "<ac:structured-macro ac:name=\"include\">",
+            "</ac:structured-macro>",
+        ),
+        ("<ac:parameter ac:name=\"language\">", "</ac:parameter>"),
+        ("<ac:plain-text-body>", "</ac:plain-text-body>"),
+        ("<ac:rich-text-body>", "</ac:rich-text-body>"),
+        ("<ac:link>", "</ac:link>"),
+        ("<ac:link ac:anchor=\"top\">", "</ac:link>"),
+        ("<ac:link-body>", "</ac:link-body>"),
+        ("<ac:image ac:width=\"200\">", "</ac:image>"),
+        ("<ac:caption>", "</ac:caption>"),
+        (
+            "<ac:layout><ac:layout-section><ac:layout-cell>",
+            "</ac:layout-cell></ac:layout-section></ac:layout>",
+        ),
+        (
+            "<ac:task-list><ac:task><ac:task-body>",
+            "</ac:task-body></ac:task></ac:task-list>",
+        ),
+        (
+            "<ac:inline-comment-marker ac:ref=\"r\">",
+            "</ac:inline-comment-marker>",
+        ),
+        ("<ri:attachment ri:filename=\"g.png\">", "</ri:attachment>"),
+        ("<zz:x xmlns:zz=\"u\">", "</zz:x>"),
+        ("<p zz:a=\"1\">", "</p>"),
+    ]);
+    let tree = leaf.prop_recursive(8, 64, 4, move |inner| {
+        (wrappers.clone(), proptest::collection::vec(inner, 0..4))
+            .prop_map(|((open, close), kids)| format!("{open}{}{close}", kids.concat()))
+    });
+    let chain = (58..71usize, tree.clone())
+        .prop_map(|(n, inner)| format!("{}{inner}{}", "<div>".repeat(n), "</div>".repeat(n)));
+    prop_oneof![
+        4 => proptest::collection::vec(tree, 0..6).prop_map(|v| v.concat()),
+        1 => chain,
+    ]
+}
+
+/// Arbitrary strings, fragment sequences biased to storage syntax, and well-formed storage.
+pub fn storage_input() -> impl Strategy<Value = String> {
+    prop_oneof![
+        1 => any::<String>(),
+        4 => proptest::collection::vec(storage_fragment(), 0..60).prop_map(|v| v.concat()),
+        3 => storage_well_formed(),
     ]
 }

@@ -142,27 +142,36 @@ async fn pd02_unknown_alias_validation() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pd09_markdown_body_rejected() -> TestResult {
-    // Jira converts Markdown from M5 on (PD-43); Confluence keeps the refusal until M7.
+async fn pd09_markdown_body_converted_or_placeholder_rejected() -> TestResult {
+    // Jira converts Markdown from M5 on (PD-43), Confluence from M7 on (Task 9): the same two
+    // param sets the M3 refusal answered now pass validation and wait.
     let h = Harness::confluence().await?;
     for params in [
         json!({ "id": "65537", "base_version": 5, "body": "**hi**" }),
         json!({ "id": "65537", "base_version": 5, "body": "**hi**", "body_format": "markdown" }),
     ] {
         let env = h.submit("confluence.page.update", params).await;
-        assert_eq!(code(&env), "validation");
-        assert_eq!(exit(&env), 2);
-        assert_eq!(detail(&env, "param"), json!("body_format"));
-        assert_eq!(
-            detail(&env, "message"),
-            json!("markdown conversion is not available in this build")
-        );
-        let id = request_id(&env)?;
-        assert_eq!(
-            h.event_types(&id).await?,
-            [EventType::REQUEST_RECEIVED, EventType::REQUEST_REJECTED]
-        );
+        assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
     }
+    // The dry executor call answers a Markdown body that still holds a `page get` placeholder
+    // (§7.6): `markdown_placeholders`, exit 2, received then rejected.
+    let env = h
+        .submit(
+            "confluence.page.update",
+            json!({ "id": "65537", "base_version": 5, "body": "**hi** [macro: toc {}]" }),
+        )
+        .await;
+    assert_eq!(code(&env), "markdown_placeholders");
+    assert_eq!(exit(&env), 2);
+    assert_eq!(
+        detail(&env, "placeholders"),
+        json!([{"kind": "macro", "count": 1}])
+    );
+    let id = request_id(&env)?;
+    assert_eq!(
+        h.event_types(&id).await?,
+        [EventType::REQUEST_RECEIVED, EventType::REQUEST_REJECTED]
+    );
     // Storage passes validation and waits.
     let env = h
         .submit(
@@ -174,10 +183,10 @@ async fn pd09_markdown_body_rejected() -> TestResult {
     Ok(())
 }
 
-/// Whether any write is still `NotInThisBuild`: true while one is (the Confluence writes of M7,
-/// e.g. `confluence.page.move`, are), so the test below keeps picking one of them. Flip it to
-/// false in M7's last Confluence write task; only then is an empty pick the documented outcome.
-const WRITES_STILL_LATER: bool = true;
+/// Whether any write is still `NotInThisBuild`: true while one was, so the test below kept picking
+/// one of them. M7 Task 20a landed the last one (`confluence.attachment.upload`) and set it to
+/// false: an empty pick is now the documented outcome.
+const WRITES_STILL_LATER: bool = false;
 
 /// The first write (registry order) whose schema example validates and whose executor is still
 /// `NotInThisBuild`, with that example: picked from the op table, never named, so the task that

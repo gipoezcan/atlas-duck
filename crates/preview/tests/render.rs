@@ -9,7 +9,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use atlas_duck_preview::diff::{DiffLine, DiffOp, line_diff};
+use atlas_duck_preview::diff::{DiffLine, DiffOp, line_diff, line_diff_lines};
 use atlas_duck_preview::invisible::{self, escape_for_display};
 use atlas_duck_preview::render::{
     self, DOC_MAX_BYTES, DOC_MAX_DIFF_LINES, DOC_MAX_ROWS, DOC_SCRIPT_CALLS_BYTES,
@@ -18,10 +18,10 @@ use atlas_duck_preview::render::{
 };
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{
-    BodyView, CandidateRev, CommentView, ConstructList, FieldRow, IssueCard, ItemCount,
-    OutcomeKind, PREVIEW_BUILDER_VERSION, PREVIEW_CSS, PREVIEW_CSS_HASH, Platform, Preview,
-    PreviewBody, PreviewHeader, ProvenanceRow, RENDER_VERSIONS, RawPager, RequestView,
-    ScriptItemKind, json_tree, sanitize_html,
+    BodyView, CandidateRev, CommentView, ConfluenceComment, ConstructList, ConversionFacts,
+    FieldRow, IssueCard, ItemCount, OutcomeKind, PREVIEW_BUILDER_VERSION, PREVIEW_CSS,
+    PREVIEW_CSS_HASH, Platform, Preview, PreviewBody, PreviewHeader, ProvenanceRow,
+    RENDER_VERSIONS, RawPager, RequestView, ScriptItemKind, json_tree, sanitize_html,
 };
 use proptest::prelude::*;
 use serde_json::json;
@@ -107,7 +107,7 @@ fn edit_lines() -> Vec<DiffLine> {
     lines
 }
 
-/// One preview per `PreviewBody` variant (14), each with strings that exercise escaping.
+/// One preview per `PreviewBody` variant (19), each with strings that exercise escaping.
 fn variants() -> Vec<(&'static str, Preview)> {
     let tree = json_tree(&json!({
         "key": "PROJ-1",
@@ -181,6 +181,11 @@ fn variants() -> Vec<(&'static str, Preview)> {
                 PreviewBody::Conflict {
                     summary: "conflict: fields changed since the agent read it: summary".into(),
                     diff_text: "summary: \"Old\" → \"New\"\n".into(),
+                    // Jira (M7 Δ2): no line lists. An enrichment-time hold carries no requests
+                    // yet (T8 review I-1), so the card has no requests section (render3's card).
+                    base_to_current: Vec::new(),
+                    intended: Vec::new(),
+                    requests: Vec::new(),
                 },
                 vec![Warning::new(
                     WarningId::Conflict,
@@ -299,6 +304,7 @@ fn variants() -> Vec<(&'static str, Preview)> {
                     rendered: edit_lines(),
                     raw: edit_lines(),
                     raw_only_changes: 1,
+                    constructs: None,
                     requests: requests(),
                 },
                 vec![Warning::new(
@@ -322,7 +328,280 @@ fn variants() -> Vec<(&'static str, Preview)> {
                 Vec::new(),
             ),
         ),
+        // ---- M7 Δ2: the Confluence variants (appended: tests pick variants by index) ----------
+        (
+            "confluence_page_markdown",
+            confluence(
+                "read",
+                "confluence.page.get",
+                PreviewBody::ConfluencePage {
+                    title: escape_for_display("Release \u{202E}plan"),
+                    space: "Development (DEV)".into(),
+                    version: Some(7),
+                    ancestors: vec!["Home".into(), "Projects".into()],
+                    format: "markdown".into(),
+                    body_html: core_html(
+                        "<h1>Plan</h1><p>See <a href=\"https://evil.example/\">the site</a> and \
+                         [macro: toc {}]</p><img src=\"https://evil.example/t.png\">\
+                         <ul><li>one</li></ul><script>alert(1)</script>",
+                    ),
+                    conversion: Some(ConversionFacts {
+                        lossy: true,
+                        macros: 1,
+                        images: 0,
+                        links: 2,
+                        layouts: 1,
+                        unresolved_users: 1,
+                        fallback: false,
+                    }),
+                },
+                vec![Warning::new(
+                    WarningId::UnresolvedMention,
+                    warning::TEXT_UNRESOLVED_MENTION,
+                )],
+            ),
+        ),
+        (
+            "confluence_comments",
+            confluence(
+                "read",
+                "confluence.comment.list",
+                PreviewBody::ConfluenceComments {
+                    comments: comment_thread(),
+                    count: Some(ItemCount {
+                        shown: 4,
+                        total: Some(4),
+                        more_available: false,
+                    }),
+                },
+                Vec::new(),
+            ),
+        ),
+        (
+            "confluence_content_write",
+            confluence(
+                "write",
+                "confluence.page.create",
+                PreviewBody::ContentWrite {
+                    sentence: "Create page 'Release plan' in Development (DEV) under 'Projects'"
+                        .into(),
+                    rows: vec![
+                        ("space".into(), "Development (DEV)".into()),
+                        ("parent".into(), "Projects".into()),
+                        ("title".into(), "Release plan".into()),
+                    ],
+                    body_html: Some(core_html(
+                        "<h2>Goals</h2><p>Ship <strong>M7</strong>, see \
+                         <a href=\"https://example.com/\">notes</a></p>",
+                    )),
+                    constructs: Some(ConstructList {
+                        links: vec!["https://example.com/".into()],
+                        ..ConstructList::default()
+                    }),
+                    requests: confluence_requests("POST", "/rest/api/content"),
+                },
+                vec![Warning::new(
+                    WarningId::DuplicateTitle,
+                    warning::duplicate_title("Release plan", "DEV"),
+                )],
+            ),
+        ),
+        (
+            "confluence_page_move",
+            confluence(
+                "write",
+                "confluence.page.move",
+                PreviewBody::PageMove {
+                    page: "Release plan".into(),
+                    from_path: vec!["Home".into(), "Projects".into(), "Release plan".into()],
+                    to_path: vec!["Home".into(), "Archive".into(), "Release plan".into()],
+                    requests: confluence_requests("PUT", "/rest/api/content/65537"),
+                },
+                Vec::new(),
+            ),
+        ),
+        (
+            "confluence_attachment_card",
+            confluence(
+                "write",
+                "confluence.attachment.upload",
+                PreviewBody::AttachmentUpload {
+                    filename: escape_for_display("logo\u{200B}.png"),
+                    size: 70,
+                    mime: "image/png".into(),
+                    sha256: "5a".repeat(32),
+                    thumbnail_data_uri: Some(PNG_DATA_URI.into()),
+                    replaces_version: Some(3),
+                    existing: None,
+                    comment: Some("new logo".into()),
+                    notes: vec!["extension and content type differ".into()],
+                    requests: vec![RequestView {
+                        index: 0,
+                        method: "POST".into(),
+                        resolved_url: "https://wiki.example/wiki/rest/api/content/65537/child/\
+                                       attachment/att9001/data"
+                            .into(),
+                        content_type: Some("multipart/form-data; boundary=atlas-duck-5a5a".into()),
+                        body: BodyView::Text(format!(
+                            "--atlas-duck-5a5a\r\nContent-Disposition: form-data; name=\"file\"; \
+                             filename=\"logo.png\"\r\nContent-Type: image/png\r\n\r\n{}\r\n\
+                             --atlas-duck-5a5a--\r\n",
+                            atlas_duck_preview::body_digest_line(70, &"5a".repeat(32))
+                        )),
+                    }],
+                },
+                Vec::new(),
+            ),
+        ),
+        // ---- M8 T18: the script item (last: tests pick variants by index) ------------------
         ("script_result", script_preview(ScriptItemKind::Result)),
+    ]
+}
+
+/// A 1×1 PNG as the attachment thumbnail (PD-110).
+const PNG_DATA_URI: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+/// A Confluence preview: the instance and op named.
+fn confluence(class: &str, op: &str, body: PreviewBody, warnings: Vec<Warning>) -> Preview {
+    let mut p = preview(class, body, warnings);
+    p.header.instance_alias = "wiki".into();
+    p.header.op_id = op.into();
+    p
+}
+
+/// One Confluence write request with a JSON body.
+fn confluence_requests(method: &str, path: &str) -> Vec<RequestView> {
+    vec![RequestView {
+        index: 0,
+        method: method.into(),
+        resolved_url: format!("https://wiki.example/wiki{path}"),
+        content_type: Some("application/json".into()),
+        body: BodyView::Text("{\"type\":\"page\",\"title\":\"Release plan\"}".into()),
+    }]
+}
+
+/// A thread: a top-level comment, a reply, a reply to the reply, another top-level comment
+/// without a reported location.
+fn comment_thread() -> Vec<ConfluenceComment> {
+    let c =
+        |id: &str, depth: u32, parent: Option<&str>, location: Option<&str>| ConfluenceComment {
+            id: id.into(),
+            author: Some(format!("User {id} (u{id})")),
+            created: Some(format!("2026-10-1{id}T10:00:00.000Z")),
+            location: location.map(Into::into),
+            depth,
+            parent_id: parent.map(Into::into),
+            body_html: core_html(&format!("<p>comment <em>{id}</em></p>")),
+        };
+    vec![
+        c("1", 0, None, Some("footer")),
+        c("2", 1, Some("1"), Some("footer")),
+        c("3", 2, Some("2"), Some("inline")),
+        c("4", 0, None, None),
+    ]
+}
+
+/// The Confluence goldens beyond one per variant: the server-rendered view, the collision card,
+/// the conflict card with both diffs.
+fn confluence_extras() -> Vec<(&'static str, Preview)> {
+    let page_view = confluence(
+        "read",
+        "confluence.page.get",
+        PreviewBody::ConfluencePage {
+            title: "Release plan".into(),
+            space: "Development (DEV)".into(),
+            version: Some(7),
+            ancestors: Vec::new(),
+            format: "view".into(),
+            body_html: core_html(
+                "<div class=\"confluence-information-macro\" style=\"color:red\"><p>Included \
+                 from <a href=\"/wiki/display/DEV/Other\">Other</a></p></div>\
+                 <script>alert(1)</script>",
+            ),
+            conversion: None,
+        },
+        vec![Warning::new(
+            WarningId::ServerRenderedView,
+            warning::TEXT_SERVER_RENDERED_VIEW,
+        )],
+    );
+    let mut collision = confluence(
+        "write",
+        "confluence.attachment.upload",
+        PreviewBody::AttachmentUpload {
+            filename: "report.pdf".into(),
+            size: 2_000_000,
+            mime: "application/pdf".into(),
+            sha256: "c3".repeat(32),
+            thumbnail_data_uri: None,
+            replaces_version: None,
+            existing: Some("attachment att9001, version 2, 1200 bytes".into()),
+            comment: None,
+            notes: Vec::new(),
+            requests: vec![RequestView {
+                index: 0,
+                method: "POST".into(),
+                resolved_url: "https://wiki.example/wiki/rest/api/content/65537/child/\
+                               attachment?allowDuplicated=false"
+                    .into(),
+                content_type: Some("multipart/form-data; boundary=atlas-duck-c3c3".into()),
+                body: BodyView::Digest {
+                    bytes: 2_000_321,
+                    sha256: "d4".repeat(32),
+                },
+            }],
+        },
+        Vec::new(),
+    );
+    collision.approvable = false;
+    let mut conflict = confluence(
+        "write",
+        "confluence.page.update",
+        PreviewBody::Conflict {
+            summary: warning::conflict(5, 6),
+            diff_text: "base version v5, current version v6".into(),
+            base_to_current: line_diff("# Plan\nold line\nend\n", "# Plan\ncurrent line\nend\n")
+                .lines,
+            intended: line_diff("# Plan\nold line\nend\n", "# Plan\nnew  line\nend\n").lines,
+            requests: confluence_requests("PUT", "/rest/api/content/65537"),
+        },
+        vec![Warning::new(WarningId::Conflict, warning::conflict(5, 6))],
+    );
+    conflict.approvable = false;
+    // M7 Task 15: a `page.update` card: the rendered diff of the Markdown projections, the raw
+    // diff of the storage lines (no `\n` but at a side's end), the outgoing storage constructs.
+    let update = confluence(
+        "write",
+        "confluence.page.update",
+        PreviewBody::EditDiff {
+            rendered: line_diff("# Plan\n\n[macro: toc {}]\n\nold\n", "# Plan\n\nnew\n").lines,
+            raw: line_diff_lines(
+                &[
+                    "<h1>Plan</h1>",
+                    "<ac:structured-macro ac:name=\"toc\"/>",
+                    "<p>old</p>",
+                ],
+                &["<h1>Plan</h1>", "<p>new</p>"],
+            )
+            .lines,
+            raw_only_changes: 0,
+            constructs: Some(ConstructList {
+                macros: vec!["code".into()],
+                links: vec!["https://example.com/".into()],
+                ..ConstructList::default()
+            }),
+            requests: confluence_requests("PUT", "/rest/api/content/65537"),
+        },
+        vec![Warning::new(
+            WarningId::LossyUpdate,
+            warning::lossy_update(1, 0, 0, 0),
+        )],
+    );
+    vec![
+        ("confluence_page_view", page_view),
+        ("confluence_attachment_collision", collision),
+        ("confluence_conflict_intended", conflict),
+        ("confluence_update_diff", update),
     ]
 }
 
@@ -462,7 +741,8 @@ fn text_outside_tags(html: &str) -> String {
 #[test]
 fn goldens_every_body_variant_and_the_header() -> TestResult {
     let mut all = variants();
-    assert_eq!(all.len(), 14, "one golden per PreviewBody variant");
+    assert_eq!(all.len(), 19, "one golden per PreviewBody variant");
+    all.extend(confluence_extras());
     all.push((
         "script_error_details",
         script_preview(ScriptItemKind::ErrorDetails),
@@ -516,9 +796,62 @@ fn goldens_have_no_class_or_style_attribute() -> TestResult {
         n += 1;
     }
     assert_eq!(
-        n, 16,
-        "14 variants + the script error details + the header golden"
+        n, 25,
+        "19 variants + 4 Confluence extras + the script error details + the header golden"
     );
+    Ok(())
+}
+
+/// M7 Task 8: the golden rule over the eight Confluence goldens by name (each exists, so the rule
+/// is not vacuous for them), plus what the Confluence arms must never emit: a remote or non-image
+/// source, a link.
+#[test]
+fn confluence_goldens_have_no_class_or_style() -> TestResult {
+    let names = [
+        "page_markdown",
+        "page_view",
+        "comments",
+        "content_write",
+        "page_move",
+        "attachment_card",
+        "attachment_collision",
+        "conflict_intended",
+    ];
+    for name in names {
+        let path = golden_dir().join(format!("confluence_{name}.html"));
+        let text = std::fs::read_to_string(&path)?;
+        assert!(
+            text.starts_with(&head(Platform::MacOsLinux)),
+            "{name}: head"
+        );
+        let body = body_of(&text);
+        for bad in [
+            "class=",
+            "style=",
+            "<style",
+            "<script",
+            "<a ",
+            "<a>",
+            "<form",
+            "<iframe",
+            "<link",
+            "src=\"http",
+            "src=\"/",
+            "href=",
+        ] {
+            assert!(!body.contains(bad), "{name}: {bad}");
+        }
+        // The only image source is the attachment card's thumbnail, a data URI (a remote image
+        // in a page body keeps no source).
+        let sources = body.matches("src=").count();
+        assert_eq!(sources, usize::from(name == "attachment_card"), "{name}");
+        assert_eq!(
+            body.matches("<img src=\"data:image/png;base64,").count(),
+            sources,
+            "{name}"
+        );
+        assert_inert(&text, Platform::MacOsLinux);
+    }
     Ok(())
 }
 
@@ -815,6 +1148,9 @@ fn arbitrary_preview(kind: usize, s: &[String]) -> Preview {
         6 => PreviewBody::Conflict {
             summary: e(0),
             diff_text: e(1),
+            base_to_current: lines(2),
+            intended: lines(5),
+            requests: vec![req(0)],
         },
         7 => PreviewBody::CouldNotRecheck {
             class: e(0),
@@ -860,6 +1196,7 @@ fn arbitrary_preview(kind: usize, s: &[String]) -> Preview {
             rendered: lines(0),
             raw: lines(3),
             raw_only_changes: 1,
+            constructs: Some(constructs(6)),
             requests: vec![req(3)],
         },
         12 => PreviewBody::Transition {
@@ -870,7 +1207,87 @@ fn arbitrary_preview(kind: usize, s: &[String]) -> Preview {
             constructs: Some(constructs(5)),
             requests: vec![req(4)],
         },
-        // M8 T18: the script item; source, provenance, logs and stderr are raw (T17).
+        13 => PreviewBody::ConfluencePage {
+            title: e(0),
+            space: e(1),
+            version: Some(7),
+            ancestors: vec![e(2), e(3)],
+            format: if r(4).len() % 2 == 0 {
+                "view".into()
+            } else {
+                e(4)
+            },
+            body_html: core_html(&r(5)),
+            conversion: Some(ConversionFacts {
+                lossy: true,
+                macros: 1,
+                images: 2,
+                links: 3,
+                layouts: 4,
+                unresolved_users: 5,
+                fallback: true,
+            }),
+        },
+        14 => PreviewBody::ConfluenceComments {
+            // Arbitrary depths: jumps, drops and a huge depth keep the lists balanced.
+            comments: [0, 3, u32::MAX, 1, 0, 2]
+                .into_iter()
+                .enumerate()
+                .map(|(i, depth)| ConfluenceComment {
+                    id: e(i),
+                    author: (i % 2 == 0).then(|| e(i + 1)),
+                    created: Some(e(i + 2)),
+                    location: (i % 3 != 0).then(|| e(i + 3)),
+                    depth,
+                    parent_id: Some(e(i + 4)),
+                    body_html: core_html(&r(i + 5)),
+                })
+                .collect(),
+            count: None,
+        },
+        15 => PreviewBody::ContentWrite {
+            sentence: e(0),
+            rows: vec![(e(1), e(2))],
+            body_html: Some(core_html(&r(3))),
+            constructs: Some(constructs(4)),
+            requests: vec![req(5)],
+        },
+        16 => PreviewBody::PageMove {
+            page: e(0),
+            from_path: vec![e(1), e(2)],
+            to_path: vec![e(3), e(4), e(5)],
+            requests: vec![req(6)],
+        },
+        17 => PreviewBody::AttachmentUpload {
+            filename: e(0),
+            size: 1,
+            mime: e(1),
+            sha256: e(2),
+            // An arbitrary text after an image prefix: only base64 may become a source.
+            thumbnail_data_uri: Some(if r(2).len() % 2 == 0 {
+                format!("data:image/png;base64,{}", r(3))
+            } else {
+                r(3)
+            }),
+            replaces_version: Some(2),
+            existing: Some(e(4)),
+            comment: Some(e(5)),
+            notes: vec![e(6), e(7)],
+            requests: vec![
+                req(6),
+                RequestView {
+                    index: 1,
+                    method: r(7),
+                    resolved_url: r(8),
+                    content_type: None,
+                    body: BodyView::Digest {
+                        bytes: 9,
+                        sha256: r(9),
+                    },
+                },
+            ],
+        },
+        // M8 T18 (index 18): the script item; source, provenance, logs and stderr are raw (T17).
         _ => PreviewBody::Script {
             item: if r(0).len().is_multiple_of(2) {
                 ScriptItemKind::Result
@@ -914,7 +1331,7 @@ proptest! {
 
     #[test]
     fn s06_document_has_no_active_content(
-        kind in 0usize..14,
+        kind in 0usize..19,
         strings in prop::collection::vec(text(), 12),
         windows in any::<bool>(),
     ) {
@@ -956,6 +1373,7 @@ fn assert_inert_rejects_active_content() {
 fn every_golden_variant_is_inert() {
     for (name, p) in variants()
         .into_iter()
+        .chain(confluence_extras())
         .chain([("header", header_and_strip())])
     {
         for platform in [Platform::MacOsLinux, Platform::Windows] {
@@ -1072,6 +1490,7 @@ fn pd69_trailing_ws_cr_and_missing_newline_visible() {
             rendered: Vec::new(),
             raw,
             raw_only_changes: 3,
+            constructs: None,
             requests: Vec::new(),
         },
         Vec::new(),
@@ -1095,6 +1514,92 @@ fn pd69_trailing_ws_cr_and_missing_newline_visible() {
         "{}",
         doc(&w)
     );
+}
+
+/// M7 Task 15 (T7 review I-2): a raw storage diff ends its lines at block tags, so most lines
+/// carry no `\n`. The marker says where a side's text ends: only the last old-side line
+/// (`Same`/`Del`) and the last new-side line (`Same`/`Add`) of a section can carry it; a line
+/// without `\n` anywhere else gets none.
+#[test]
+fn no_newline_marker_only_where_a_side_ends() {
+    let marker = |p: &Preview| doc(p).matches(ws::NO_NEWLINE_AT_END).count();
+    let edit = |raw: Vec<DiffLine>| {
+        preview(
+            "write",
+            PreviewBody::EditDiff {
+                rendered: Vec::new(),
+                raw,
+                raw_only_changes: 0,
+                constructs: None,
+                requests: Vec::new(),
+            },
+            Vec::new(),
+        )
+    };
+    // Storage lines: only `<p>c</p>`, the end of both sides, is marked.
+    let raw = line_diff_lines(
+        &["<p>a</p>", "<p>b</p>", "<p>c</p>"],
+        &["<p>a</p>", "<p>B</p>", "<p>c</p>"],
+    )
+    .lines;
+    let d = doc(&edit(raw.clone()));
+    assert_eq!(marker(&edit(raw)), 1, "{d}");
+    assert!(
+        d.contains(&format!(
+            "<bdi>&lt;p&gt;c&lt;/p&gt; <mark>{}</mark></bdi>",
+            ws::NO_NEWLINE_AT_END
+        )),
+        "{d}"
+    );
+    assert!(
+        d.contains("<del><bdi>&lt;p&gt;b&lt;/p&gt;</bdi></del>"),
+        "{d}"
+    );
+    // The old side ends in a `Del`, the new side in an `Add`: both marked.
+    let raw = line_diff_lines(&["<p>a</p>", "<p>b</p>"], &["<p>a</p>", "<p>c</p>"]).lines;
+    assert_eq!(marker(&edit(raw)), 2);
+    // `x` against `x\n` (a final newline added) still differs visibly (PD-69).
+    let raw = line_diff("x", "x\n").lines;
+    let d = doc(&edit(raw));
+    assert!(
+        d.contains(&format!(
+            "<del><bdi>x <mark>{}</mark></bdi></del>",
+            ws::NO_NEWLINE_AT_END
+        )),
+        "{d}"
+    );
+    assert!(d.contains("<ins><bdi>x</bdi></ins>"), "{d}");
+    // Each field's section has its own ends.
+    let field = |t: &str| DiffLine {
+        op: DiffOp::Field,
+        text: t.into(),
+    };
+    let mut raw = vec![field("one")];
+    raw.extend(line_diff_lines(&["p", "q"], &["p", "r"]).lines);
+    raw.push(field("two"));
+    raw.extend(line_diff_lines(&["s"], &["s"]).lines);
+    assert_eq!(marker(&edit(raw)), 3);
+}
+
+/// M7 Task 15 (T9 review I-2, ruling a; §7.6 "the preview lists every macro, mention, include
+/// and link target present in an outgoing payload"): an update card lists the outgoing storage
+/// constructs after its diffs, whatever the diff caps left out; a Jira edit has no list.
+#[test]
+fn edit_diff_lists_the_outgoing_constructs() {
+    let d = golden_doc("confluence_update_diff");
+    let list = d
+        .find("<h3>Storage constructs in the body</h3>")
+        .unwrap_or(0);
+    assert!(
+        list > d.find("<h2>Raw diff</h2>").unwrap_or(usize::MAX),
+        "{d}"
+    );
+    assert!(
+        list < d.find("<h2>Requests to be sent</h2>").unwrap_or(0),
+        "{d}"
+    );
+    assert!(d.contains("<th>macros</th><td><bdi>code</bdi></td>"), "{d}");
+    assert!(!golden_doc("edit_diff").contains("Storage constructs"));
 }
 
 #[test]
@@ -1152,6 +1657,7 @@ fn whitespace_shows_without_the_stylesheet() {
             rendered: Vec::new(),
             raw: line_diff("a  b\n", "a b\n").lines,
             raw_only_changes: 0,
+            constructs: None,
             requests: Vec::new(),
         },
         Vec::new(),
@@ -1177,6 +1683,7 @@ fn whitespace_shows_without_the_stylesheet() {
             rendered: Vec::new(),
             raw: line_diff("x\n", "  x\n").lines,
             raw_only_changes: 0,
+            constructs: None,
             requests: Vec::new(),
         },
         Vec::new(),
@@ -1432,6 +1939,7 @@ fn caps_insert_hidden_note_and_count_bytes() {
             rendered: Vec::new(),
             raw,
             raw_only_changes: 0,
+            constructs: None,
             requests: Vec::new(),
         },
         Vec::new(),
@@ -1461,6 +1969,9 @@ fn caps_insert_hidden_note_and_count_bytes() {
         PreviewBody::Conflict {
             summary: String::new(),
             diff_text: big,
+            base_to_current: Vec::new(),
+            intended: Vec::new(),
+            requests: Vec::new(),
         },
         Vec::new(),
     );
@@ -1587,17 +2098,21 @@ fn amp_8203_literal() {
 }
 
 /// M8 T18: the script documents are `render5`, the next part after M7's `render4` (M8 plan Δ5).
-/// `render4` is M7's and is not on this branch: the M7 merge inserts it before `render5` and
-/// re-pins `render5` over the union of the goldens (this branch's entry is not merged yet).
+/// The M7 merge put `render4` before `render5` and re-pinned `render5` over the union of the
+/// goldens (the entry was unmerged and unpushed then).
 #[test]
 fn render_version_is_render5() {
     assert_eq!(PREVIEW_BUILDER_VERSION, "pb2;render5;icu-17.0;emoji-17.0");
     let names: Vec<&str> = RENDER_VERSIONS.iter().map(|(n, _)| *n).collect();
-    assert_eq!(names, ["render1", "render2", "render3", "render5"]);
-    // The M6 entries never change.
+    assert_eq!(
+        names,
+        ["render1", "render2", "render3", "render4", "render5"]
+    );
+    // Every M6 entry and M7's `render4` are pinned (T8 review m-8: "never edit an entry").
     assert_eq!(RENDER_VERSIONS[0], ("render1", 0x50e0_b962_fa25_e8fa));
     assert_eq!(RENDER_VERSIONS[1], ("render2", 0x5977_a808_67ef_8b73));
     assert_eq!(RENDER_VERSIONS[2], ("render3", 0x18d6_262f_815e_9ad3));
+    assert_eq!(RENDER_VERSIONS[3], ("render4", 0x8ea8_55c4_f735_bb5c));
 }
 
 /// FNV-1a 64 over every golden (by file name: the name, NUL, the bytes, NUL), then
@@ -1938,7 +2453,7 @@ proptest! {
         windows in any::<bool>(),
     ) {
         let platform = if windows { Platform::Windows } else { Platform::MacOsLinux };
-        let p = arbitrary_preview(13, &strings);
+        let p = arbitrary_preview(18, &strings);
         let is_script = matches!(p.body, PreviewBody::Script { .. });
         prop_assert!(is_script);
         assert_inert(&render::document(&p, platform), platform);
@@ -1958,7 +2473,7 @@ proptest! {
         long_first in any::<bool>(),
     ) {
         let platform = if windows { Platform::Windows } else { Platform::MacOsLinux };
-        let mut p = arbitrary_preview(13, &strings);
+        let mut p = arbitrary_preview(18, &strings);
         let s = |i: usize| strings[i % strings.len()].as_str();
         // Each text long enough to cross its share whatever the strings are (they may be empty),
         // with markup, a lone `⟨` and a bidi control between them.
@@ -2329,4 +2844,491 @@ fn script_source_cap_is_bytes_not_lines() {
             "{title}"
         );
     }
+}
+
+// ---- M7 Task 8: the Confluence arms (Δ2) --------------------------------------------------------
+
+/// The fixture named `name` (a variant or a Confluence extra).
+fn named(name: &str) -> Preview {
+    variants()
+        .into_iter()
+        .chain(confluence_extras())
+        .find(|(n, _)| *n == name)
+        .map(|(_, p)| p)
+        .unwrap_or_else(|| panic!("no fixture {name}"))
+}
+
+/// The document of fixture `name`, checked against its golden and for inertness.
+fn golden_doc(name: &str) -> String {
+    let d = doc(&named(name));
+    let path = golden_dir().join(format!("{name}.html"));
+    if std::env::var_os("UPDATE_GOLDENS").is_none() {
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some(d.as_str()),
+            "{name}: golden"
+        );
+    }
+    assert_inert(&d, Platform::MacOsLinux);
+    d
+}
+
+fn assert_has(d: &str, wants: &[&str]) {
+    for want in wants {
+        assert!(d.contains(want), "{want}\n{d}");
+    }
+}
+
+#[test]
+fn render_confluence_page_golden() {
+    let d = golden_doc("confluence_page_markdown");
+    assert_has(
+        &d,
+        &[
+            "</header><section><h2>Confluence page</h2><table><tbody>\
+             <tr><th>title</th><td><bdi>Release <mark>⟨U+202E⟩</mark>plan</bdi></td></tr>",
+            "<tr><th>space</th><td><bdi>Development (DEV)</bdi></td></tr>",
+            "<tr><th>version</th><td>7</td></tr>",
+            "<tr><th>ancestors</th><td><bdi>Home</bdi> / <bdi>Projects</bdi></td></tr>",
+            "<tr><th>format</th><td><bdi>markdown</bdi></td></tr>",
+            "<h3>Body</h3><h1>Plan</h1>",
+            "the site (https://evil.example/)",
+            "<h3>Conversion</h3><table><tbody><tr><th>lossy</th><td>yes</td></tr>\
+             <tr><th>macros lost</th><td>1</td></tr><tr><th>images lost</th><td>0</td></tr>\
+             <tr><th>links lost</th><td>2</td></tr><tr><th>layouts lost</th><td>1</td></tr>\
+             <tr><th>unresolved mentions</th><td>1</td></tr>\
+             <tr><th>fallback conversion</th><td>no</td></tr></tbody></table>",
+        ],
+    );
+    assert!(!d.contains("evil.example/t.png") && !d.contains("alert(1)"));
+    assert!(!d.contains("server-rendered view (secondary)"));
+    // No version, no ancestors, no conversion facts: "none" rows, no Conversion section.
+    let mut p = named("confluence_page_markdown");
+    if let PreviewBody::ConfluencePage {
+        version,
+        ancestors,
+        conversion,
+        ..
+    } = &mut p.body
+    {
+        *version = None;
+        ancestors.clear();
+        *conversion = None;
+    }
+    let d = doc(&p);
+    assert_has(
+        &d,
+        &[
+            "<tr><th>version</th><td>none</td></tr>",
+            "<tr><th>ancestors</th><td>none</td></tr>",
+        ],
+    );
+    assert!(!d.contains("<h3>Conversion</h3>"));
+}
+
+#[test]
+fn render_page_view_labelled_secondary() {
+    let d = golden_doc("confluence_page_view");
+    assert_has(
+        &d,
+        &[
+            "<tr><th>format</th><td><bdi>view</bdi></td></tr>",
+            "<h3>Body</h3><p><strong>server-rendered view (secondary)</strong></p>",
+            // §6.2: the Caution comes from the model's warning.
+            "<li><bdi>server-rendered view: macros may include content from other pages</bdi></li>",
+            "Included from Other (/wiki/display/DEV/Other)",
+        ],
+    );
+    assert!(!d.contains("confluence-information-macro") && !d.contains("alert(1)"));
+    // §6.2: a `view` body implies the Caution, so core cannot build one without it (T8 review
+    // I-3); the golden carries it.
+    let p = named("confluence_page_view");
+    assert_eq!(
+        p.body.implied_warning(),
+        Some(WarningId::ServerRenderedView)
+    );
+    assert!(p.body.implied_warning_present(&p.warnings));
+    let mut q = p.clone();
+    q.warnings.clear();
+    assert!(!q.body.implied_warning_present(&q.warnings));
+    // Only `view` is labelled, and only `view` implies the Caution.
+    for format in ["markdown", "storage"] {
+        let mut p = named("confluence_page_view");
+        if let PreviewBody::ConfluencePage { format: f, .. } = &mut p.body {
+            *f = format.into();
+        }
+        assert!(
+            !doc(&p).contains("server-rendered view (secondary)"),
+            "{format}"
+        );
+        assert_eq!(p.body.implied_warning(), None, "{format}");
+    }
+}
+
+/// Every golden carries the warning its body implies (the strip shows exactly the model's
+/// warnings, core asserts the same, T8 review I-3).
+#[test]
+fn goldens_carry_their_implied_warning() {
+    for (name, p) in variants().into_iter().chain(confluence_extras()) {
+        assert!(
+            p.body.implied_warning_present(&p.warnings),
+            "{name}: {:?}",
+            p.body.implied_warning()
+        );
+    }
+}
+
+/// The nesting of `<ul>` lists in `html`: (opened, closed, deepest).
+fn list_nesting(html: &str) -> (usize, usize, usize) {
+    let (mut open, mut close, mut level, mut deepest) = (0, 0, 0usize, 0);
+    let mut rest = html;
+    while let Some(i) = rest.find('<') {
+        rest = &rest[i..];
+        if rest.starts_with("<ul>") {
+            open += 1;
+            level += 1;
+            deepest = deepest.max(level);
+        } else if rest.starts_with("</ul>") {
+            close += 1;
+            level = level.saturating_sub(1);
+        }
+        rest = &rest[1..];
+    }
+    (open, close, deepest)
+}
+
+#[test]
+fn render_comments_thread_golden() {
+    let d = golden_doc("confluence_comments");
+    let start = d.find("<h2>Comments</h2>").unwrap_or(0);
+    let section = &d[start..];
+    assert_has(
+        section,
+        &[
+            "<h2>Comments</h2><p>4 of 4</p><ul><li><section><h4>Comment <bdi>1</bdi></h4>\
+             <div><bdi>User 1 (u1)</bdi>, <bdi>2026-10-11T10:00:00.000Z</bdi>, \
+             <strong><bdi>footer</bdi></strong></div><p>comment <em>1</em></p></section>",
+            // The reply nests under its parent, the reply to the reply under the reply.
+            "</section><ul><li><section><h4>Comment <bdi>2</bdi></h4>",
+            "</section><ul><li><section><h4>Comment <bdi>3</bdi></h4>",
+            "<strong><bdi>inline</bdi></strong>",
+            // Back to the top level.
+            "</section></li></ul></li></ul></li><li><section><h4>Comment <bdi>4</bdi></h4>",
+            // PD-103: no location in the answer.
+            "<bdi>2026-10-14T10:00:00.000Z</bdi>, location not reported</div>",
+        ],
+    );
+    assert_eq!(list_nesting(section), (3, 3, 3));
+    assert_eq!(
+        section.matches("<li>").count(),
+        section.matches("</li>").count()
+    );
+
+    // Jumps, drops and huge depths keep the lists balanced; a reply is never more than one level
+    // below the comment before it, and nesting stops at 32 levels.
+    let mut p = named("confluence_comments");
+    let depths: Vec<u32> = [5, 0, u32::MAX, 1, 3, 0].into_iter().chain(0..40).collect();
+    if let PreviewBody::ConfluenceComments { comments, .. } = &mut p.body {
+        let template = comments[0].clone();
+        *comments = depths
+            .iter()
+            .enumerate()
+            .map(|(i, &depth)| ConfluenceComment {
+                id: i.to_string(),
+                depth,
+                ..template.clone()
+            })
+            .collect();
+    }
+    let d = doc(&p);
+    assert_inert(&d, Platform::MacOsLinux);
+    let (open, close, deepest) = list_nesting(&d);
+    assert_eq!(open, close, "{d}");
+    assert_eq!(deepest, 32);
+    assert_eq!(d.matches("<li>").count(), d.matches("</li>").count());
+    // The first comment (depth 5) starts at the top; the u32::MAX reply sits one level below the
+    // comment before it.
+    assert!(d.contains("<h2>Comments</h2><p>4 of 4</p><ul><li><section><h4>Comment <bdi>0</bdi>"));
+    assert!(d.contains("</section></li><li><section><h4>Comment <bdi>1</bdi></h4>"));
+    assert!(d.contains("</section><ul><li><section><h4>Comment <bdi>2</bdi></h4>"));
+
+    // Past the row cap: the comment left out counts every text it would have shown (T8 review
+    // m-5), not only its body.
+    let mut q = named("confluence_comments");
+    let last = comment_thread()[3].clone();
+    if let PreviewBody::ConfluenceComments { comments, .. } = &mut q.body {
+        *comments = vec![comment_thread()[0].clone(); DOC_MAX_ROWS];
+        comments.push(last.clone());
+    }
+    let d = doc(&q);
+    assert!(d.contains("<p>1 more comments not shown here; see Structured or Raw</p>"));
+    let want = last.id.len()
+        + last.author.as_ref().map_or(0, String::len)
+        + last.created.as_ref().map_or(0, String::len)
+        + last.body_html.len();
+    assert!(last.location.is_none());
+    assert!(
+        d.contains(&format!(
+            "<tr><th>hidden in preview</th><td>{want} bytes</td></tr>"
+        )),
+        "{want}"
+    );
+
+    // No comments.
+    if let PreviewBody::ConfluenceComments { comments, count } = &mut p.body {
+        comments.clear();
+        *count = None;
+    }
+    assert!(doc(&p).contains("<h2>Comments</h2><p>none</p></section>"));
+}
+
+#[test]
+fn render_content_write_card() {
+    let d = golden_doc("confluence_content_write");
+    assert_has(
+        &d,
+        &[
+            "<li><bdi>a page titled 'Release plan' already exists in DEV</bdi></li>",
+            "<section><h2>Summary</h2><div><bdi>Create page 'Release plan' in Development (DEV) \
+             under 'Projects'</bdi></div>",
+            "<tr><th><bdi>parent</bdi></th><td><bdi>Projects</bdi></td></tr>",
+            "<h3>Body</h3><h2>Goals</h2><p>Ship <strong>M7</strong>, see notes (https://example.com/)</p>",
+            "<h3>Storage constructs in the body</h3><table><tbody><tr><th>links</th>\
+             <td><bdi>https://example.com/</bdi></td></tr></tbody></table>",
+            "</section><section><h2>Requests to be sent</h2><h3>Request 0</h3>",
+        ],
+    );
+}
+
+#[test]
+fn render_page_move_paths_golden() {
+    let d = golden_doc("confluence_page_move");
+    assert_has(
+        &d,
+        &[
+            // PD-106: the fixed row next to the page (T8 review m-3).
+            "</header><section><h2>Page move</h2><table><tbody>\
+             <tr><th>page</th><td><bdi>Release plan</bdi></td></tr>\
+             <tr><th>body</th><td>body not sent; title and body kept by Confluence</td></tr>\
+             </tbody></table>\
+             <h3>Old ancestor path</h3><ol><li><bdi>Home</bdi></li><li><bdi>Projects</bdi></li>\
+             <li><bdi>Release plan</bdi></li></ol>\
+             <h3>New ancestor path</h3><ol><li><bdi>Home</bdi></li><li><bdi>Archive</bdi></li>\
+             <li><bdi>Release plan</bdi></li></ol></section>\
+             <section><h2>Requests to be sent</h2><h3>Request 0</h3>",
+            "<tr><th>method</th><td><bdi>PUT</bdi></td></tr>",
+        ],
+    );
+}
+
+#[test]
+fn render_attachment_card_thumbnail_data_uri_only() {
+    let d = golden_doc("confluence_attachment_card");
+    assert_has(
+        &d,
+        &[
+            "<tr><th>file name</th><td><bdi>logo<mark>⟨U+200B⟩</mark>.png</bdi></td></tr>",
+            "<tr><th>size</th><td>70 bytes</td></tr>",
+            "<tr><th>MIME type</th><td><bdi>image/png</bdi></td></tr>",
+            &format!(
+                "<tr><th>SHA-256</th><td><bdi>{}</bdi></td></tr>",
+                "5a".repeat(32)
+            ),
+            // PD-110's note right after the fact table (T8 review I-2).
+            "<tr><th>comment</th><td><bdi>new logo</bdi></td></tr></tbody></table>\
+             <ul><li><bdi>extension and content type differ</bdi></li></ul>\
+             <p>replaces existing attachment v3</p>",
+            &format!("<h3>Thumbnail</h3><img src=\"{PNG_DATA_URI}\" alt=\"\">"),
+        ],
+    );
+    assert!(!d.contains("no thumbnail"));
+    // No notes, no list (and no "none").
+    let c = golden_doc("confluence_attachment_collision");
+    assert!(
+        c.contains("<tr><th>comment</th><td>none</td></tr></tbody></table><h3>Thumbnail</h3>"),
+        "{c}"
+    );
+    // A note is display text: escaped, never markup.
+    let mut p = named("confluence_attachment_card");
+    if let PreviewBody::AttachmentUpload { notes, .. } = &mut p.body {
+        *notes = vec!["<b>x.html</b> & more".into()];
+    }
+    let n = doc(&p);
+    assert!(
+        n.contains("<ul><li><bdi>&lt;b&gt;x.html&lt;/b&gt; &amp; more</bdi></li></ul>"),
+        "{n}"
+    );
+    let thumb = |uri: Option<&str>| {
+        let mut p = named("confluence_attachment_card");
+        if let PreviewBody::AttachmentUpload {
+            thumbnail_data_uri, ..
+        } = &mut p.body
+        {
+            *thumbnail_data_uri = uri.map(Into::into);
+        }
+        let d = doc(&p);
+        assert_inert(&d, Platform::MacOsLinux);
+        d
+    };
+    // The four raster types are shown.
+    for t in ["png", "jpeg", "gif", "webp"] {
+        let uri = format!("data:image/{t};base64,R0lGODlhAQABAAAAACw=");
+        assert!(
+            thumb(Some(&uri)).contains(&format!("<img src=\"{uri}\" alt=\"\">")),
+            "{t}"
+        );
+    }
+    // Anything else is the PD-110 text and no image.
+    for uri in [
+        None,
+        Some("https://evil.example/a.png"),
+        Some("http://evil.example/a.png"),
+        Some("data:image/svg+xml;base64,PHN2ZyBvbmxvYWQ9YWxlcnQoMSk+"),
+        Some("data:image/svg+xml,<svg onload=alert(1)>"),
+        Some("DATA:image/png;base64,AAAA"),
+        Some(" data:image/png;base64,AAAA"),
+        Some("data:image/png,AAAA"),
+        Some("data:image/png;base64,"),
+        Some("data:image/png;base64,AA\" onerror=\"alert(1)"),
+        Some("data:image/png;base64,AA AA"),
+        Some("data:text/html;base64,PHNjcmlwdD4="),
+        Some("javascript:alert(1)"),
+        Some(""),
+    ] {
+        let d = thumb(uri);
+        assert!(!d.contains("<img"), "{uri:?}");
+        assert!(
+            d.contains(
+                "<h3>Thumbnail</h3><p>no thumbnail (not an image, or larger than 2 MiB)</p>"
+            ),
+            "{uri:?}"
+        );
+    }
+}
+
+#[test]
+fn render_attachment_collision_line() {
+    let d = golden_doc("confluence_attachment_collision");
+    assert_has(
+        &d,
+        &[
+            "</header><section><h2>Attachment upload</h2>\
+             <p><strong>attachment already exists</strong></p>\
+             <div><bdi>attachment att9001, version 2, 1200 bytes</bdi></div>",
+            "<tr><th>comment</th><td>none</td></tr>",
+        ],
+    );
+    assert!(!d.contains("replaces existing attachment"));
+    let d = doc(&named("confluence_attachment_card"));
+    assert!(d.contains("<p>replaces existing attachment v3</p>"), "{d}");
+    assert!(!d.contains("attachment already exists"));
+}
+
+#[test]
+fn conflict_card_shows_intended_change() {
+    let d = golden_doc("confluence_conflict_intended");
+    let base = d
+        .find("<h3>Rendered diff: the agent's base → the current state</h3><table>")
+        .unwrap_or(usize::MAX);
+    let intended = d
+        .find("<h3>The agent's intended change</h3><table>")
+        .unwrap_or(usize::MAX);
+    let deny = d.find("<li><strong>Deny</strong>").unwrap_or(usize::MAX);
+    let sent = d
+        .find("</section><section><h2>Requests to be sent</h2>")
+        .unwrap_or(usize::MAX);
+    assert!(base < intended && intended < deny && deny < sent, "{d}");
+    assert_has(
+        &d,
+        &[
+            "<section><h2>Changed since the agent read it</h2><div><bdi>conflict: page changed \
+             since the agent read it (v5 → v6)</bdi></div>",
+            "<td>+</td><td><pre><ins><bdi>current line</bdi></ins></pre></td>",
+            "<td>+</td><td><pre><ins><bdi>new  line</bdi></ins></pre></td>",
+            "<tr><th>method</th><td><bdi>PUT</bdi></td></tr>",
+        ],
+    );
+    // The two headings differ (T8 review m-1): the `diff_text` one and the rendered one.
+    assert_has(
+        &d,
+        &[
+            "<h3>Agent's base against the current state</h3><pre><code><bdi>base version v5, \
+             current version v6</bdi></code></pre>\
+             <h3>Rendered diff: the agent's base → the current state</h3>",
+        ],
+    );
+    // Jira: no line lists, so no diff sections; an enrichment-time hold has no requests yet, so
+    // no requests section either (T8 review I-1: the card is render3's).
+    let j = golden_doc("conflict");
+    assert!(!j.contains("Rendered diff") && !j.contains("intended change"));
+    assert!(!j.contains("Requests to be sent"), "{j}");
+    assert!(
+        j.ends_with("+ your reason</li></ul></section></body></html>"),
+        "{j}"
+    );
+    // With requests (the send-time 409 hold) they are shown (M6 T10 review M-5).
+    let mut q = named("conflict");
+    if let PreviewBody::Conflict { requests: r, .. } = &mut q.body {
+        *r = requests();
+    }
+    let j = doc(&q);
+    assert!(j.contains("</section><section><h2>Requests to be sent</h2><h3>Request 0</h3>"));
+    assert!(!j.contains("<p>none</p>"));
+    // Neither does a Confluence conflict without requests say "none".
+    let mut q = named("confluence_conflict_intended");
+    if let PreviewBody::Conflict { requests: r, .. } = &mut q.body {
+        r.clear();
+    }
+    let c = doc(&q);
+    assert!(
+        !c.contains("Requests to be sent") && !c.contains("<p>none</p>"),
+        "{c}"
+    );
+    // Each list is capped on its own.
+    let lines = |n: usize| -> Vec<DiffLine> {
+        (0..n)
+            .map(|i| DiffLine {
+                op: DiffOp::Add,
+                text: format!("l{i}\n"),
+            })
+            .collect()
+    };
+    let mut p = named("confluence_conflict_intended");
+    if let PreviewBody::Conflict {
+        base_to_current,
+        intended,
+        ..
+    } = &mut p.body
+    {
+        *base_to_current = lines(DOC_MAX_DIFF_LINES + 2);
+        *intended = lines(DOC_MAX_DIFF_LINES + 3);
+    }
+    let d = doc(&p);
+    assert_has(
+        &d,
+        &[
+            "<p>2 more lines not shown here; see Structured or Raw</p>\
+             <h3>The agent's intended change</h3>",
+            "<p>3 more lines not shown here; see Structured or Raw</p>",
+        ],
+    );
+}
+
+#[test]
+fn render_digest_body_one_line() {
+    let d = golden_doc("confluence_attachment_collision");
+    let section = &d[d.find("<h2>Requests to be sent</h2>").unwrap_or(0)..];
+    let line = format!(
+        "<p><bdi>2000321 bytes, SHA-256 {} (not shown)</bdi></p>",
+        "d4".repeat(32)
+    );
+    assert!(section.contains(&line), "{section}");
+    assert!(
+        section.ends_with(&format!("{line}</section></body></html>")),
+        "{section}"
+    );
+    for other in ["Body:", "Binary body", "No body.", "<pre>"] {
+        assert!(!section.contains(other), "{other}: {section}");
+    }
+    assert_eq!(section.matches("(not shown)").count(), 1);
 }

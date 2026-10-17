@@ -7,7 +7,7 @@ use atlas_duck_core::validate::{
 use atlas_duck_ipc::envelope::ErrorCode;
 use atlas_duck_ipc::sandbox::ScriptLimits;
 use atlas_duck_ipc::sandbox::script::MAX_ARGS_NESTING as MAX_SCRIPT_ARGS_NESTING;
-use atlas_duck_registry::{OperationSpec, Product, Version};
+use atlas_duck_registry::{OperationSpec, Version};
 use serde_json::{Value, json};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -100,16 +100,11 @@ fn u33_all_ops_compile_and_accept_their_example() -> TestResult {
             .and_then(|e| e.get(0))
             .cloned()
             .ok_or_else(|| format!("{} has no example", spec.id))?;
-        let r = check(spec.id, example)?;
-        // Confluence writes with a body and no `body_format` hit the PD-09 rule (no Markdown
-        // conversion before M7); Jira converts from M5 on (PD-43), so every Jira example and
-        // everything else passes.
-        match r {
-            Ok(_) => {}
-            Err(e) => {
-                assert_eq!(spec.product, Product::Confluence, "{}: {e}", spec.id);
-                assert_eq!(param(&e), Some("body_format"), "{}: {e}", spec.id);
-            }
+        // Jira converts Markdown from M5 on (PD-43), Confluence from M7 on (Task 9): every
+        // example passes, the Confluence body writes without `body_format` included (M5 T7 review
+        // M-2: the M3 exception is gone).
+        if let Err(e) = check(spec.id, example)? {
+            return Err(format!("{}: {e}", spec.id).into());
         }
     }
     Ok(())
@@ -487,7 +482,7 @@ fn x10_min_version_unsupported_never_version_string() -> TestResult {
 }
 
 #[test]
-fn pd09_markdown_rejected_absent_counts_as_markdown() -> TestResult {
+fn pd09_markdown_accepted_absent_counts_as_markdown() -> TestResult {
     let jira = |extra: Value| {
         let mut p = json!({"key": "ABC-1", "body": "hello"});
         if let (Some(p), Some(extra)) = (p.as_object_mut(), extra.as_object()) {
@@ -495,7 +490,9 @@ fn pd09_markdown_rejected_absent_counts_as_markdown() -> TestResult {
         }
         p
     };
-    // Jira converts Markdown from M5 on (PD-43): the refusal is Confluence's until M7.
+    // Jira converts Markdown from M5 on (PD-43), Confluence from M7 on (Task 9): static
+    // validation refuses neither; the conversion and its checks are the executor's (the
+    // validation dry call, `tests/confluence_validate.rs`).
     let confluence = |extra: Value| {
         let mut p = json!({"content_id": "1", "body": "hello"});
         if let (Some(p), Some(extra)) = (p.as_object_mut(), extra.as_object()) {
@@ -503,19 +500,8 @@ fn pd09_markdown_rejected_absent_counts_as_markdown() -> TestResult {
         }
         p
     };
-    for params in [
-        confluence(json!({})),
-        confluence(json!({"body_format": "markdown"})),
-    ] {
-        let e = rejected(check("confluence.comment.add", params)?)?;
-        assert_eq!(e.code, ErrorCode::Validation);
-        assert_eq!(param(&e), Some("body_format"));
-        assert_eq!(
-            e.details.get("message"),
-            Some(&json!("markdown conversion is not available in this build"))
-        );
-    }
     for format in [json!({}), json!({"body_format": "markdown"})] {
+        assert!(check("confluence.comment.add", confluence(format.clone()))?.is_ok());
         assert!(check("jira.comment.add", jira(format))?.is_ok());
     }
     assert!(check("jira.comment.add", jira(json!({"body_format": "wiki"})))?.is_ok());
@@ -526,12 +512,19 @@ fn pd09_markdown_rejected_absent_counts_as_markdown() -> TestResult {
         )?
         .is_ok()
     );
+    assert!(
+        check(
+            "confluence.page.update",
+            json!({"id": "1", "base_version": 1, "body": "x"}),
+        )?
+        .is_ok()
+    );
+    // An invalid enum value is the schema's, for both products (`wiki` is Jira's only).
     let e = rejected(check(
-        "confluence.page.update",
-        json!({"id": "1", "base_version": 1, "body": "x"}),
+        "confluence.comment.add",
+        confluence(json!({"body_format": "wiki"})),
     )?)?;
-    assert_eq!(param(&e), Some("body_format"));
-    // An invalid enum value is the schema's.
+    assert_eq!(e.message, "params/body_format: enum");
     let e = rejected(check(
         "jira.comment.add",
         jira(json!({"body_format": "html"})),
@@ -766,7 +759,6 @@ fn create_without_a_body_needs_no_body_format() -> TestResult {
         .is_ok()
     );
     // With a Markdown description it passes too from M5 on: the executor converts it (PD-43).
-    // The body rule itself stays Confluence's (every Confluence body write requires `body`).
     assert!(
         check(
             "jira.issue.create",
@@ -774,11 +766,14 @@ fn create_without_a_body_needs_no_body_format() -> TestResult {
         )?
         .is_ok()
     );
-    let e = rejected(check(
-        "confluence.page.create",
-        json!({"space": "DOC", "title": "t", "body": "d"}),
-    )?)?;
-    assert_eq!(param(&e), Some("body_format"));
+    // Confluence converts from M7 on (Task 9): a Markdown body passes static validation too.
+    assert!(
+        check(
+            "confluence.page.create",
+            json!({"space": "DOC", "title": "t", "body": "d"}),
+        )?
+        .is_ok()
+    );
     Ok(())
 }
 

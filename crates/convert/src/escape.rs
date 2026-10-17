@@ -326,8 +326,9 @@ impl Out {
 // The lookaheads below see the rest of the text only, so a text must not be split where
 // markup does not follow (the converter joins consecutive text events first).
 
-/// `&` + optional `#` + alphanumerics + `;`, the shape of a character reference.
-fn entity_like(after_amp: &str) -> bool {
+/// `&` + optional `#` + alphanumerics + `;`, the shape of a character reference (`after_amp` is
+/// the text after the `&`). Shared with `md_to_wiki::link_target` (M5 final review M-4).
+pub(crate) fn entity_like(after_amp: &str) -> bool {
     let body = after_amp.strip_prefix('#').unwrap_or(after_amp);
     let n = body.bytes().take_while(u8::is_ascii_alphanumeric).count();
     n > 0 && body.as_bytes().get(n) == Some(&b';')

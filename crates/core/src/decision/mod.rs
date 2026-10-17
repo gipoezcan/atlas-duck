@@ -71,6 +71,7 @@ use crate::engine::write;
 use crate::engine::{Engine, EntryState, OnAuditFailure, RequestEntry, TransitionError};
 use crate::gate::UiEvent;
 use crate::lifecycle::model::{Event, Hold, Kind, Phase, Rejection, ReleaseItem, is_pending, step};
+use crate::ops::confluence_ext::request_tab_params;
 use crate::ops::{ExecError, MissingField, PreviewModel, op_table};
 use crate::payloads::{self, InvalidReason, ReleasedItem, SubmittedDecision};
 use crate::redact::{BlockReason, RedactionOp};
@@ -329,7 +330,8 @@ pub struct QueueItem {
 /// What the Approvals window's Request tab shows of a queued request (§5.6): the agent's params,
 /// their hash, the normalized reason and the connection facts. Every string that came from an
 /// agent or from the peer's process is display-escaped here (§6.4), the strings and keys of
-/// `params` included; `params` is JSON the UI renders as text. The peer facts are the OS's, not
+/// `params` included; `params` is JSON the UI renders as text (an upload's `content_base64` as
+/// its size and SHA-256, the content `null`: T20a review I-2). The peer facts are the OS's, not
 /// the agent's: the UI shows them as unverified (§3.1).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RequestDetail {
@@ -1651,6 +1653,14 @@ async fn edit_write(
             write::render(engine, spec, base, &result.params, verdict, effective_max)
                 .map_err(exec_refused)?,
         )
+    } else if write::renders_requests(snap.write.verdict.hold) {
+        // M7 Task 15: an unapprovable hold's card shows the list the edit would send; one that
+        // cannot be built is shown as none (T8 review I-1), never refused here.
+        let verdict = Some(&snap.write.verdict);
+        Some(
+            write::render(engine, spec, base, &result.params, verdict, effective_max)
+                .unwrap_or_default(),
+        )
     } else {
         Some(Vec::new())
     };
@@ -1670,7 +1680,10 @@ async fn edit_write(
         executed_params: result.executed_params,
         edited_keys: result.edited_keys,
     };
-    let apply = write::edit_apply(engine.clone(), entry, result.params, view, rendered, pat);
+    // T23b: the new revision's caution count, built off the entry lock before the transition.
+    let (params, rendered, caution) =
+        write::edit_caution(engine, entry, snap, result.params, rendered).await;
+    let apply = write::edit_apply(engine.clone(), entry, params, view, rendered, pat, caution);
     match engine
         .transition_with(entry, event, record, OnAuditFailure::FailRequest, apply)
         .await
@@ -1706,6 +1719,24 @@ fn resolution_message(op: &str, params: &Value, param: &str, value: &str) -> Str
         }
         // PD-62 (plan text).
         ("jira.issuelink.create", "type") => format!("no issue link type named '{value}'"),
+        // PD-105 (plan text): the space key, and the parent page within that space.
+        ("confluence.page.create", "space") => format!("no space '{value}'"),
+        ("confluence.page.create", "parent") => {
+            format!("no page '{value}' in space {}", of("space"))
+        }
+        // PD-106: the parent within the page's own space. That space is fetched data (no param
+        // names it), so the text names the page the agent gave instead.
+        ("confluence.page.move", "parent") => {
+            format!("no page '{value}' in the space of page {}", of("id"))
+        }
+        // PD-107 (plan text): a reply target that is no comment on this content.
+        ("confluence.comment.add", "reply_to") => {
+            format!("no comment {value} on content {}", of("content_id"))
+        }
+        // PD-109 (plan text): a replace without an attachment of that name.
+        ("confluence.attachment.upload", "filename") => {
+            format!("no attachment '{value}' on content {}", of("id"))
+        }
         _ => format!("no {param} named '{value}'"),
     }
 }
@@ -1962,7 +1993,10 @@ impl DecisionApi for CoreDecisions {
         in_queue(&self.engine, &e)?;
         let actor = &e.connection;
         Some(RequestDetail {
-            params: e.params().map_or(Value::Null, escape_json),
+            // T20a review I-2: an upload's file is its size and SHA-256 here, never its base64.
+            params: e.params().map_or(Value::Null, |p| {
+                escape_json(request_tab_params(e.spec, p).as_ref().unwrap_or(p))
+            }),
             params_sha256: e.params_sha256.clone(),
             reason: e.reason.as_deref().map(escape_for_display),
             submitted_at: e.submitted_at.clone(),

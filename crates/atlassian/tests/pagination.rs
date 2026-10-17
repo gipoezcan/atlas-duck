@@ -368,19 +368,213 @@ async fn u04_pagination_stays_under_context_path() -> TestResult {
     Ok(())
 }
 
-/// The most the mock hands the client in one read: wiremock gives hyper the whole body, which
-/// writes it in pieces up to this size (no chunk constant exists in the mock itself).
-const MOCK_WRITE_CHUNK: usize = 512 * 1024;
+/// T14 (M3 T10 minor 8): an answer whose `_links` object has no `next` key is the last page, even
+/// when it is full and carries no `total`.
+#[tokio::test]
+async fn links_next_absent_ends_paging() -> TestResult {
+    let dc = MockDc::start(Product::Confluence, "").await;
+    // 50 spaces in all, 25 per page: the second page is full and its `_links` has no `next`.
+    Mock::given(path("/rest/api/space"))
+        .respond_with(space_pages(&dc, 50, 0))
+        .mount(dc.server())
+        .await;
+    let t = test_client(dc.client_config())?;
+    let out = t
+        .client
+        .read_paginated(&test_cover()?, &space_call(25, 0), &ReadBudget::default())
+        .await;
+    assert_eq!((out.end, out.items_fetched), (PageEnd::ResultsEnded, 50));
+    assert_eq!(
+        (out.failure, out.next_start, out.server_total),
+        (None, None, None)
+    );
+    assert_eq!(
+        offsets(&dc.received().await, "start", "limit"),
+        [(Some(0), Some(25)), (Some(25), Some(25))]
+    );
+    Ok(())
+}
 
-/// How far past the 50 MiB cap the cut page may reach: `max(512 KiB, 2 x MOCK_WRITE_CHUNK)`, which
-/// is 1 MiB with the chunk above. One read normally returns one written piece, but it can return
-/// several: the macOS arm64 CI run at `66fdca1` saw the cut 580 KB past 512 KiB, so the bound is
-/// twice the chunk.
-const FETCH_CAP_TOLERANCE: usize = if 2 * MOCK_WRITE_CHUNK > 512 * 1024 {
-    2 * MOCK_WRITE_CHUNK
-} else {
-    512 * 1024
-};
+/// An endpoint that omits `_links` altogether gives no end signal: paging goes on to the short
+/// page, as before.
+#[tokio::test]
+async fn page_without_links_object_is_no_end_signal() -> TestResult {
+    let dc = MockDc::start(Product::Confluence, "").await;
+    let ok = dc.response(200);
+    Mock::given(path("/rest/api/space"))
+        .respond_with(move |req: &Request| {
+            let start = param(req, "start").unwrap_or(0);
+            let limit = param(req, "limit").unwrap_or(25);
+            let size = limit.min(60u64.saturating_sub(start));
+            let results: Vec<Value> = (start..start + size).map(|i| json!({"id": i})).collect();
+            ok.clone().set_body_raw(
+                json!({"results": results, "start": start, "limit": limit, "size": size})
+                    .to_string(),
+                "application/json",
+            )
+        })
+        .mount(dc.server())
+        .await;
+    let t = test_client(dc.client_config())?;
+    let out = t
+        .client
+        .read_paginated(&test_cover()?, &space_call(25, 0), &ReadBudget::default())
+        .await;
+    assert_eq!((out.end, out.items_fetched), (PageEnd::ResultsEnded, 60));
+    assert_eq!(
+        offsets(&dc.received().await, "start", "limit"),
+        [
+            (Some(0), Some(25)),
+            (Some(25), Some(25)),
+            (Some(50), Some(25))
+        ]
+    );
+    Ok(())
+}
+
+/// The `_links` end signal is Confluence's (§7.2): a Jira answer with a `_links` object lacking
+/// `next` still pages by arithmetic, to the short page.
+#[tokio::test]
+async fn jira_links_object_without_next_is_no_end_signal() -> TestResult {
+    let dc = MockDc::start(Product::Jira, "").await;
+    let ok = dc.response(200);
+    Mock::given(path("/rest/agile/1.0/board"))
+        .respond_with(move |req: &Request| {
+            let start = param(req, "startAt").unwrap_or(0);
+            let count = 2u64.min(5u64.saturating_sub(start));
+            let values: Vec<Value> = (start..start + count).map(|i| json!({"id": i})).collect();
+            let page = json!({
+                "maxResults": 2, "startAt": start, "values": values,
+                "_links": {"base": "https://jira.corp.example"}
+            });
+            ok.clone()
+                .set_body_raw(page.to_string(), "application/json")
+        })
+        .mount(dc.server())
+        .await;
+    let t = test_client(dc.client_config())?;
+    let out = t
+        .client
+        .read_paginated(&test_cover()?, &board_call(2, 0), &ReadBudget::default())
+        .await;
+    assert_eq!((out.end, out.items_fetched), (PageEnd::ResultsEnded, 5));
+    assert_eq!(
+        offsets(&dc.received().await, "startAt", "maxResults"),
+        [(Some(0), Some(2)), (Some(2), Some(2)), (Some(4), Some(2))]
+    );
+    Ok(())
+}
+
+/// `_links.next: null` is a present key: "more" (the value is never read).
+#[tokio::test]
+async fn links_next_null_means_more() -> TestResult {
+    let dc = MockDc::start(Product::Confluence, "").await;
+    let ok = dc.response(200);
+    Mock::given(path("/rest/api/space"))
+        .respond_with(move |req: &Request| {
+            let start = param(req, "start").unwrap_or(0);
+            let limit = param(req, "limit").unwrap_or(25);
+            let size = limit.min(40u64.saturating_sub(start));
+            let results: Vec<Value> = (start..start + size).map(|i| json!({"id": i})).collect();
+            ok.clone().set_body_raw(
+                json!({
+                    "results": results, "start": start, "limit": limit, "size": size,
+                    "_links": {"next": null}
+                })
+                .to_string(),
+                "application/json",
+            )
+        })
+        .mount(dc.server())
+        .await;
+    let t = test_client(dc.client_config())?;
+    let out = t
+        .client
+        .read_paginated(&test_cover()?, &space_call(25, 0), &ReadBudget::default())
+        .await;
+    assert_eq!((out.end, out.items_fetched), (PageEnd::ResultsEnded, 40));
+    assert_eq!(
+        offsets(&dc.received().await, "start", "limit"),
+        [(Some(0), Some(25)), (Some(25), Some(25))]
+    );
+    Ok(())
+}
+
+/// The last page fills `max` exactly and has no `next`: the results ended, there is no
+/// `next_start` to a range that is empty.
+#[tokio::test]
+async fn last_page_filling_max_without_next_has_no_next_start() -> TestResult {
+    let dc = MockDc::start(Product::Confluence, "").await;
+    Mock::given(path("/rest/api/space"))
+        .respond_with(space_pages(&dc, 50, 0))
+        .mount(dc.server())
+        .await;
+    let t = test_client(dc.client_config())?;
+    let out = t
+        .client
+        .read_paginated_ctl(
+            &test_cover()?,
+            &space_call(25, 0),
+            &ReadBudget::default(),
+            50,
+            &FetchControl::new(),
+        )
+        .await;
+    assert_eq!(
+        (out.end, out.items_fetched, out.next_start),
+        (PageEnd::ResultsEnded, 50, None)
+    );
+    Ok(())
+}
+
+/// A present `_links.next` only says "more": its value (here another origin) is never requested,
+/// the next page is rebuilt from the template under the context path.
+#[tokio::test]
+async fn links_next_present_never_followed() -> TestResult {
+    let dc = MockDc::start(Product::Confluence, "/confluence").await;
+    let ok = dc.response(200);
+    Mock::given(path("/confluence/rest/api/space"))
+        .respond_with(move |req: &Request| {
+            let start = param(req, "start").unwrap_or(0);
+            let limit = param(req, "limit").unwrap_or(25);
+            let size = limit.min(40u64.saturating_sub(start));
+            let next = (start + size < 40).then_some("https://elsewhere.example/other?start=999");
+            ok.clone().set_body_raw(
+                confluence_space_page(start, limit, size, next),
+                "application/json",
+            )
+        })
+        .with_priority(1)
+        .mount(dc.server())
+        .await;
+    Mock::given(any())
+        .respond_with(
+            dc.response(200)
+                .set_body_raw(r#"{"results":[]}"#, "application/json"),
+        )
+        .with_priority(10)
+        .mount(dc.server())
+        .await;
+    let t = test_client(dc.client_config())?;
+    let out = t
+        .client
+        .read_paginated(&test_cover()?, &space_call(25, 0), &ReadBudget::default())
+        .await;
+    assert_eq!((out.end, out.items_fetched), (PageEnd::ResultsEnded, 40));
+    let got = dc.received().await;
+    assert!(
+        got.iter()
+            .all(|r| r.url.path() == "/confluence/rest/api/space"
+                && r.url.host_str() == got[0].url.host_str()),
+        "{:?}",
+        got.iter().map(|r| r.url.to_string()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        offsets(&got, "start", "limit"),
+        [(Some(0), Some(25)), (Some(25), Some(25))]
+    );
+    Ok(())
+}
 
 #[tokio::test]
 async fn fetch_cap_50mib() -> TestResult {
@@ -411,14 +605,10 @@ async fn fetch_cap_50mib() -> TestResult {
     match out.failure {
         Some(FetchFailure::PostSend { kind, received }) => {
             assert_eq!(kind, PostSendKind::FetchCap50MiB);
-            // Page 3 was cut where the 50 MiB were exceeded, by at most one read chunk.
+            // Page 3 was cut at the byte that shows the 50 MiB were exceeded (T11 review I-2),
+            // not at the end of the read chunk that crossed it.
             let left = 50 * MIB - complete;
-            assert!(received.len() > left, "{} vs {left}", received.len());
-            assert!(
-                received.len() <= left + FETCH_CAP_TOLERANCE,
-                "{} vs {left}",
-                received.len()
-            );
+            assert_eq!(received.len(), left + 1);
         }
         other => return Err(format!("{other:?}").into()),
     }

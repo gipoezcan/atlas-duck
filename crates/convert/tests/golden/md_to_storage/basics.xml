@@ -1,0 +1,8 @@
+<h1>Title</h1>
+<h2>Sub <em>heading</em></h2>
+<p>Plain paragraph with <em>emphasis</em>, <strong>strong</strong>, <s>strike</s> and <code>code</code>.
+Second line of the same paragraph.<br/>Hard break above.</p>
+<hr/>
+<p>Text with snake_case_name and a-b, naïve café 日本語.</p>
+<h1>Setext heading</h1>
+<h6>Six</h6>

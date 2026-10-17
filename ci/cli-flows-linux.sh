@@ -7,7 +7,7 @@
 #   bash ci/cli-flows-linux.sh            run every non-ignored flow and check the output
 #   CLI_FLOWS_TEST=jira_flows bash ci/cli-flows-linux.sh
 #                                         the same for another test target of the app (M5
-#                                         jira_flows); the default is cli_flows
+#                                         jira_flows, M7 confluence_flows); the default is cli_flows
 #   bash ci/cli-flows-linux.sh a b ...    extra test-binary arguments (e.g. `--ignored s02_`); the
 #                                         pass-count minimum is not checked then, skip lines still are
 set -euo pipefail

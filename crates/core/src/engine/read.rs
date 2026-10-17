@@ -18,14 +18,19 @@
 //! an upstream error is `{status, error_messages}`; an outcome item `{code, hint}`. Nothing of a
 //! candidate reaches an envelope before a release (§4.5): the agent sees `pending` throughout.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use atlas_duck_atlassian::{
     AuditCover, BodyFailure, ConnClass, FetchControl, FetchFailure, FetchOutcome, InstanceClient,
     PageEnd, PagedOutcome, PostSendKind, ReadBudget, UnavailableReason, UpstreamResponse,
 };
 use atlas_duck_audit::NewEvent;
+use atlas_duck_convert::{
+    ConversionReport, MarkdownTooLarge, UserResolutions, storage_to_markdown_within,
+};
 use atlas_duck_ipc::envelope::ErrorCode;
 use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::{
@@ -34,22 +39,26 @@ use atlas_duck_preview::{
 use atlas_duck_registry::{OperationSpec, Product, RELEASE_CAP_BYTES};
 use serde_json::{Map, Value, json};
 use tokio::sync::OwnedSemaphorePermit;
+use tokio::time::Instant;
 
 use super::cache::{Candidate, RebuildError, build_candidate, build_unredacted, fetched_refs};
 use super::envelope::{MSG_IDENTITY_HEADER, OpenStatus};
-use super::{Engine, InstanceHttp, OnAuditFailure, RequestEntry};
+use super::write::{call_path, get_record, identity_call, park};
+use super::{Engine, InFlight, InstanceHttp, OnAuditFailure, RequestEntry};
 use crate::gate::{AttentionKind, UiEvent};
-use crate::identity::{self, Lost};
+use crate::identity::{self, Lost, RecheckResult};
 use crate::instances::InstanceState;
 use crate::lifecycle::model::{Event, ReleaseItem};
 use crate::metadata::{FieldCache, FieldNames};
+use crate::ops::confluence::{self, BodyFormat};
 use crate::ops::generic::{count_value, fallback_preview, invisible_warnings, query_display};
 use crate::ops::{
     ExecPlan, PreviewCtx, PreviewInput, PreviewModel, ReadPlan, ReadView, jira, op_table,
 };
-use crate::payloads::{self, CapOrBudget, EventCtx, OutcomeKind, ReadFetched};
+use crate::payloads::{self, CapOrBudget, EventCtx, OutcomeKind, PreviewFetchPurpose, ReadFetched};
 use crate::proxy::{PAC_HINT, ResolvedProxy};
 use crate::redact::RedactionMeta;
+use crate::users;
 
 /// §5.2 step 6: the fixed hint a released outcome item carries. Plan wording: the spec names the
 /// hint ("narrow `fields`/`max`/`expand`") without fixing its text.
@@ -111,6 +120,9 @@ pub struct ReadState {
     /// Results the normalization removed (§7.4: `confluence.search` results without a `content`
     /// object), counted in `meta.redactions.items_dropped`.
     pub normalized_dropped: u64,
+    /// Δ3 (PD-100): what the Markdown conversion of a Confluence page body reduced; released as
+    /// `meta.conversion` (§4.2). `None` for every other read.
+    pub conversion: Option<ConversionReport>,
     /// What the current revision's redaction ops did (`None` without ops).
     pub redaction_meta: Option<RedactionMeta>,
     /// "also appears in" of the current revision's masks (§6.3; UI only).
@@ -127,6 +139,7 @@ impl fmt::Debug for ReadState {
             .field("pages", &self.pages)
             .field("page", &self.page)
             .field("normalized_dropped", &self.normalized_dropped)
+            .field("converted", &self.conversion.is_some())
             .field("redacted", &self.redaction_meta.is_some())
             .finish_non_exhaustive()
     }
@@ -187,7 +200,13 @@ async fn run(engine: Arc<Engine>, entry: Arc<RequestEntry>) {
         settle(&engine, &entry, Classified::Direct(d)).await;
         return;
     }
-    let classified = fetch_classified(&engine, &entry).await;
+    // PD-99, PD-93: the user lookups and the identity GET share the read budget, counted from the
+    // first GET.
+    let budget = engine.read_budget().total;
+    let deadline = Instant::now()
+        .checked_add(budget)
+        .unwrap_or_else(Instant::now);
+    let classified = fetch_classified(&engine, &entry, deadline).await;
     settle(&engine, &entry, classified).await;
 }
 
@@ -210,50 +229,511 @@ pub(crate) fn state_refusal(state: InstanceState) -> Option<Direct> {
 
 /// The fetch and its classification, with the identity handling of Task 26 in between: a failed
 /// identity check or a JSON 401 runs the token re-check (§7.1) and the table of
-/// [`identity::effect`] decides what the read becomes. A rename re-fetches once under the same
-/// request id; the first answer is recorded audit-only before the second fetch.
-async fn fetch_classified(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) -> Classified {
+/// [`identity::effect`] decides what the read becomes. Then the user lookups of a Markdown page
+/// body ([`with_users`], PD-99) and the identity step of a Confluence read ([`with_identity`],
+/// PD-93), in that order; the lookups' answers are cached only once the identity matched. A
+/// rename (from either check) re-fetches once under the same request id, under a new control;
+/// the first answer is recorded audit-only before the second fetch.
+async fn fetch_classified(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    deadline: Instant,
+) -> Classified {
     let mut refetched = false;
     loop {
         let seen = engine.identity_epoch(&entry.instance_id);
+        // Taken before the first GET of this attempt (T13 review B-1).
+        let cred_gen = engine.credential_generation(&entry.instance_id);
         let (fetched, http) = match fetch(engine, entry).await {
             Ok(f) => f,
             Err(message) => return Classified::Direct(Direct::internal(message, Vec::new())),
         };
-        let Some(trigger) = fetched_trigger(&fetched) else {
-            return classify_read(fetched, &http.proxy);
-        };
-        // The re-fetch failed the check again: `upstream_unavailable`, retryable (§7.1).
-        let effect = if refetched {
-            identity::Effect::HeaderCheckFailed
-        } else {
-            let result = identity::recheck(engine, &entry.instance_id, seen).await;
-            identity::effect(identity::Path::DirectRead, trigger, &result)
-        };
-        match effect {
-            identity::Effect::Ordinary => {
-                return classify_read(ordinary(fetched), &http.proxy);
+        let classified = match fetched_trigger(&fetched) {
+            None => classify_read(fetched, &http.proxy),
+            Some(trigger) => {
+                // The re-fetch failed the check again: `upstream_unavailable`, retryable (§7.1).
+                let effect = if refetched {
+                    identity::Effect::HeaderCheckFailed
+                } else {
+                    let result = identity::recheck(engine, &entry.instance_id, seen).await;
+                    identity::effect(identity::Path::DirectRead, trigger, &result)
+                };
+                match effect {
+                    identity::Effect::Ordinary => classify_read(ordinary(fetched), &http.proxy),
+                    identity::Effect::Refetch => {
+                        let (earlier, answer) = split_answer(fetched);
+                        let mut responses = earlier;
+                        responses.extend(answer);
+                        if !record_first(engine, entry, &responses).await {
+                            return Classified::Cancelled;
+                        }
+                        refetched = true;
+                        continue;
+                    }
+                    other => return identity_classified(other, fetched),
+                }
             }
-            identity::Effect::Refetch => {
-                let (earlier, answer) = split_answer(fetched);
-                let mut responses = earlier;
-                responses.extend(answer);
-                let first = payloads::read_fetched(
-                    &entry.ctx,
-                    &ReadFetched::Unavailable {
-                        responses: &responses,
-                        reason: "identity_check",
-                    },
-                    None,
-                );
-                if !engine.append_pending(entry, vec![first], None).await {
+        };
+        let (classified, puts) = with_users(engine, entry, classified, &http, deadline).await;
+        let attempt = Attempt {
+            seen,
+            cred_gen,
+            refetched,
+        };
+        match with_identity(engine, entry, classified, &http, deadline, attempt).await {
+            Checked::Proceed(classified) => {
+                puts.apply(engine, &entry.instance_id);
+                return classified;
+            }
+            Checked::Ended(classified) => return classified,
+            Checked::Refetch(responses) => {
+                if !record_first(engine, entry, &responses).await {
                     return Classified::Cancelled;
                 }
                 refetched = true;
             }
-            other => return identity_classified(other, fetched),
         }
     }
+}
+
+/// The answer of a read that fetches again after a rename (§7.1): `READ_FETCHED {unavailable:
+/// identity_check}`, audit-only. The pages kept in the control are dropped under the same entry
+/// gate, so a cancel before the second fetch replaces the control does not record them again
+/// (T13 review m-1). `false`: the request ended meanwhile.
+async fn record_first(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    responses: &[UpstreamResponse],
+) -> bool {
+    let first = payloads::read_fetched(
+        &entry.ctx,
+        &ReadFetched::Unavailable {
+            responses,
+            reason: IDENTITY_CAUSE.1,
+        },
+        None,
+    );
+    let ctl = entry.fetch_control();
+    let recorded = engine
+        .append_pending_then(entry, vec![first], None, || {
+            if let Some(c) = ctl {
+                c.clear_pages();
+            }
+        })
+        .await;
+    #[cfg(feature = "testing")]
+    if recorded && let Some(pause) = engine.hooks().pause_before_refetch.clone() {
+        pause.hold().await;
+    }
+    recorded
+}
+
+/// PD-99 (§7.6): the user lookups of a Markdown page body, in `Fetching` after the content
+/// answered and before its `READ_FETCHED`: the map they give is committed in that record
+/// ([`user_resolutions`]) and is the one the candidate is converted with. Only a released result
+/// of the Markdown shape whose storage parses (`xml_ok`) resolves anything; the storage and view
+/// formats, every other read and every other item pass through unchanged. A cancel, an expiry
+/// or a quit during a lookup ends the read here (`Classified::Cancelled`): the gated cancel
+/// section recorded the lookup in flight and the content received. The answers to cache come
+/// back beside the item: the caller stores them once the read's identity matched (PD-93).
+async fn with_users(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    classified: Classified,
+    http: &InstanceHttp,
+    deadline: Instant,
+) -> (Classified, users::Puts) {
+    let Classified::Item(rec) = classified else {
+        return (classified, users::Puts::default());
+    };
+    let spec = entry.spec;
+    let params = entry
+        .validated
+        .as_ref()
+        .map(|v| v.params.clone())
+        .unwrap_or(Value::Null);
+    let shape = ReadShape::of(spec, &params);
+    if rec.item != ReleaseItem::Result || !shape.commits_user_resolutions() {
+        return (Classified::Item(rec), users::Puts::default());
+    }
+    // Parsing the page (up to 32 MiB of JSON) and its storage is CPU work.
+    let found = tokio::task::spawn_blocking(move || {
+        let keys = lookup_keys(spec, &rec);
+        (rec, keys)
+    })
+    .await;
+    let Ok((mut rec, keys)) = found else {
+        let d = Direct::internal("the response could not be processed", Vec::new());
+        return (Classified::Direct(d), users::Puts::default());
+    };
+    if keys.is_empty() {
+        return (Classified::Item(rec), users::Puts::default());
+    }
+    let cover = engine.covers().for_request(&entry.head.request_id).ok();
+    let (Some(ctl), Some(cover)) = (entry.fetch_control(), cover) else {
+        // Nothing can be looked up (cannot happen after a fetch): every key unresolved.
+        rec.users = Some(keys.into_iter().map(|k| (k, None)).collect());
+        return (Classified::Item(rec), users::Puts::default());
+    };
+    let pass = users::Pass {
+        engine,
+        site: users::Site::Read(entry),
+        instance_id: &entry.instance_id,
+        client: &http.client,
+        cover: &cover,
+        ctl: &ctl,
+        // The identity GET that follows keeps its reserve: a slow lookup degrades the text, it
+        // never costs the read (L141, T13 review I-2).
+        deadline: deadline
+            .checked_sub(identity_reserve(engine))
+            .unwrap_or_else(Instant::now),
+        // The content and the lookups share the read's byte cap (T11 review I-2).
+        max_bytes: engine.read_budget().max_bytes.saturating_sub(rec.size()),
+    };
+    match users::resolve_users(&pass, &keys).await {
+        Ok(resolved) => {
+            rec.users = Some(resolved.users);
+            (Classified::Item(rec), resolved.puts)
+        }
+        Err(users::Cancelled) => (Classified::Cancelled, users::Puts::default()),
+    }
+}
+
+/// What the identity step made of a read.
+enum Checked {
+    /// The read settles with this: its identity matched, or the step does not apply.
+    Proceed(Classified),
+    /// The step ended the read: its answer did not match or failed, or the request ended.
+    Ended(Classified),
+    /// A rename (§7.1): these content answers are recorded audit-only and the read fetches once
+    /// more.
+    Refetch(Vec<UpstreamResponse>),
+}
+
+/// What [`with_identity`] needs from the fetch attempt it checks.
+#[derive(Clone, Copy)]
+struct Attempt {
+    /// The identity epoch, read before the attempt's first GET.
+    seen: u64,
+    /// The credential generation, read before the attempt's first GET (T13 review B-1).
+    cred_gen: u64,
+    /// The attempt is the re-fetch after a rename.
+    refetched: bool,
+}
+
+/// The op whose answer is the identity answer itself (PD-93: judged, no second GET).
+const USER_CURRENT_OP: &str = "confluence.user.current";
+/// PD-93 (T13 review I-2): the read budget kept for the identity GET of a direct Confluence read.
+/// Its user lookups end this much before the read's deadline; the identity GET runs to the
+/// deadline.
+pub const IDENTITY_RESERVE: Duration = Duration::from_secs(10);
+
+/// [`IDENTITY_RESERVE`]; a test hook replaces it.
+fn identity_reserve(engine: &Engine) -> Duration {
+    #[cfg(feature = "testing")]
+    if let Some(r) = engine.hooks().identity_reserve {
+        return r;
+    }
+    let _ = engine;
+    IDENTITY_RESERVE
+}
+/// The most bytes of an identity answer received (a `user/current` object is about 1 KiB); a
+/// longer one is cut there (`too_large` in its record) and confirms nobody.
+const MAX_IDENTITY_BYTES: u64 = 64 * 1024;
+/// The `READ_FETCHED`/`READ_FAILED` cause of a read whose answer is not attributed to the user.
+const IDENTITY_CAUSE: (&str, &str) = ("reason", "identity_check");
+
+/// The content of a direct read (the 32 MiB response cap), its lookups and its identity answer
+/// (each cut one byte past its cap) stay within the 50 MiB read byte cap.
+const _: () = assert!(
+    32 * 1024 * 1024
+        + users::MAX_LOOKUPS as u64 * (users::MAX_LOOKUP_BYTES + 1)
+        + (MAX_IDENTITY_BYTES + 1)
+        <= 50 * 1024 * 1024
+);
+
+/// PD-93 (RF-5a; §7.2: "Confluence responses are not header-checked until §15 confirms an
+/// equivalent header"): a Confluence read whose content arrived (a result, or a JSON upstream
+/// error, which is server content attributed to the user too) ends its fetch with one
+/// `GET /rest/api/user/current` under the request's cover, after its last page and its user
+/// lookups, recorded `PREVIEW_FETCH {purpose: identity}` and committed before `READ_FETCHED`. A
+/// revoked or expired PAT does not become valid again, so a known identity after the last page
+/// proves the pages were fetched as the user.
+///
+/// * A match (`judge` on the stored identity: `type == "known"`, the stored `userKey` and
+///   username): the read settles as before.
+/// * A JSON answer that is no match (anonymous, another key, a rename, a JSON 401, a JSON 503) is
+///   handled like a failed Jira header check (`Trigger::HeaderCheck`, a JSON 401 as
+///   `Trigger::Json401`): the token re-check runs and [`identity::effect`] decides; the content
+///   is audit-only (`READ_FETCHED {unavailable: identity_check}`). A passing re-check is a race:
+///   `upstream_unavailable`, retryable. A rename fetches once more.
+/// * A failed GET follows the M3 tables (RF-2), see [`identity_failure`]; a non-JSON answer the
+///   client did not decide (an HTML 4xx or 5xx) is `upstream_unavailable` without a re-check.
+/// * The step does not run for a read that already ended directly, nor for an outcome item: its
+///   candidate carries no server content (Task 13 decision; an anonymous read whose content was an
+///   outcome item is noticed by the next read).
+/// * `confluence.user.current` sends no second GET: its own answer is judged ([`identity::conclude`]
+///   applies a non-match like a re-check would).
+///
+/// The GET runs on the read's control, cut at [`MAX_IDENTITY_BYTES`] and at the read's deadline.
+/// Its record follows the T11 review I-1 order (in flight, GET, record, park, in-flight cleared,
+/// commit), so a cancel, an expiry or a quit at any point records it once, with the content kept
+/// in the control (`READ_FETCHED {cancelled_in_flight}`).
+///
+/// Every call loads the stored PAT when it is sent, so a PAT stored or deleted between the
+/// content GET and the identity GET would let the identity GET vouch for a token the content never
+/// used (T13 review B-1). The credential generation of the attempt is compared once the identity
+/// answer is recorded (for `confluence.user.current`, before its answer is judged): any change is
+/// `upstream_unavailable {identity_check}`, retryable, with no re-check and nothing cached.
+async fn with_identity(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    classified: Classified,
+    http: &InstanceHttp,
+    deadline: Instant,
+    attempt: Attempt,
+) -> Checked {
+    let Attempt {
+        seen: seen_fetch,
+        cred_gen,
+        refetched,
+    } = attempt;
+    let credential_changed = || engine.credential_generation(&entry.instance_id) != cred_gen;
+    let Classified::Item(rec) = classified else {
+        return Checked::Proceed(classified);
+    };
+    if entry.spec.product != Product::Confluence
+        || !matches!(rec.item, ReleaseItem::Result | ReleaseItem::UpstreamError)
+    {
+        return Checked::Proceed(Classified::Item(rec));
+    }
+    let stored = engine
+        .instances()
+        .by_id(&entry.instance_id)
+        .and_then(|i| i.identity.clone());
+    let judged = |r: &UpstreamResponse| {
+        stored.as_ref().map_or(RecheckResult::Inconclusive, |s| {
+            identity::judge_confluence_answer(r, s)
+        })
+    };
+    if entry.spec.id == USER_CURRENT_OP {
+        // Fetched under a PAT that may be gone: judged against nobody (B-1).
+        if credential_changed() {
+            return Checked::Ended(Classified::Direct(unconfirmed(rec.responses)));
+        }
+        // Only a 2xx is an identity answer; an upstream error confirms nobody (fail closed).
+        let verdict = match rec.responses.last() {
+            Some(r) if rec.item == ReleaseItem::Result => judged(r),
+            _ => RecheckResult::Inconclusive,
+        };
+        if verdict == RecheckResult::IdentityMatch {
+            return Checked::Proceed(Classified::Item(rec));
+        }
+        let effect = if refetched {
+            identity::Effect::HeaderCheckFailed
+        } else {
+            let result = identity::conclude(engine, &entry.instance_id, seen_fetch, verdict).await;
+            identity::effect(
+                identity::Path::DirectRead,
+                identity::Trigger::HeaderCheck,
+                &result,
+            )
+        };
+        return identity_effect(effect, rec.responses);
+    }
+    let cover = engine.covers().for_request(&entry.head.request_id).ok();
+    let (Some(ctl), Some(cover)) = (entry.fetch_control(), cover) else {
+        // Cannot happen after a fetch: fail closed.
+        let d = Direct::internal(MSG_INTERNAL, rec.responses);
+        return Checked::Ended(Classified::Direct(d));
+    };
+    let call = identity_call(Product::Confluence);
+    let base = http.client.base();
+    let purpose = PreviewFetchPurpose::Identity;
+    let seen = engine.identity_epoch(&entry.instance_id);
+    entry.set_in_flight(Some(InFlight {
+        purpose,
+        path: call_path(base, &call),
+    }));
+    let outcome = http
+        .client
+        .get_bounded_ctl(&cover, &call, &ctl, MAX_IDENTITY_BYTES, deadline)
+        .await;
+    if matches!(
+        outcome,
+        FetchOutcome::Failed(
+            FetchFailure::CancelledInFlight { .. } | FetchFailure::CancelledBeforeSend
+        )
+    ) {
+        // The cancel recorded this GET in its gated section; the request is ending.
+        return Checked::Ended(Classified::Cancelled);
+    }
+    let record = get_record(&entry.ctx, purpose, base, &call, &outcome);
+    #[cfg(feature = "testing")]
+    if let Some(pause) = engine.hooks().pause_before_identity_park.clone() {
+        pause.hold().await;
+    }
+    // T11 review I-1: parked first, then the in-flight mark cleared, then committed.
+    park(engine, entry, &record).await;
+    entry.set_in_flight(None);
+    if !engine.append_pending(entry, vec![record], None).await {
+        return Checked::Ended(Classified::Cancelled);
+    }
+    // The content and the identity answer may have been fetched under different PATs (B-1):
+    // whatever the answer says, it is not attributed to the content.
+    if credential_changed() {
+        return Checked::Ended(Classified::Direct(unconfirmed(rec.responses)));
+    }
+    let answer = match outcome {
+        FetchOutcome::Response(r) => r,
+        FetchOutcome::Failed(f) => {
+            return Checked::Ended(identity_failure(f, rec.responses, &http.proxy));
+        }
+    };
+    if !users::is_json(&answer) {
+        return Checked::Ended(Classified::Direct(unconfirmed(rec.responses)));
+    }
+    if judged(&answer) == RecheckResult::IdentityMatch {
+        return Checked::Proceed(Classified::Item(rec));
+    }
+    let trigger = if answer.status == 401 {
+        identity::Trigger::Json401
+    } else {
+        identity::Trigger::HeaderCheck
+    };
+    // A re-fetch whose identity fails again: `upstream_unavailable`, retryable (§7.1).
+    let effect = if refetched {
+        identity::Effect::HeaderCheckFailed
+    } else {
+        let result = identity::recheck(engine, &entry.instance_id, seen).await;
+        identity::effect(identity::Path::DirectRead, trigger, &result)
+    };
+    identity_effect(effect, rec.responses)
+}
+
+/// What the effect table makes of a read whose identity answer did not match. The content is
+/// audit-only in every case (RF-2a). `Ordinary` (a JSON 401 the re-check did not confirm) is no
+/// release here: the answer is still not attributed to the user.
+fn identity_effect(effect: identity::Effect, responses: Vec<UpstreamResponse>) -> Checked {
+    let d = match effect {
+        identity::Effect::Refetch => return Checked::Refetch(responses),
+        identity::Effect::NeedsToken => Direct {
+            code: ErrorCode::NeedsToken,
+            message: MSG_NEEDS_TOKEN.to_owned(),
+            cause: Some(IDENTITY_CAUSE),
+            reason_detail: None,
+            responses,
+        },
+        identity::Effect::HeaderLost(l) => Direct::header_lost(l, responses),
+        identity::Effect::Ordinary
+        | identity::Effect::HeaderCheckFailed
+        | identity::Effect::Inconclusive => unconfirmed(responses),
+    };
+    Checked::Ended(Classified::Direct(d))
+}
+
+/// `upstream_unavailable {reason: identity_check}` (retryable): the answer is not attributed to
+/// the token's user.
+fn unconfirmed(responses: Vec<UpstreamResponse>) -> Direct {
+    Direct {
+        code: ErrorCode::UpstreamUnavailable,
+        message: MSG_IDENTITY.to_owned(),
+        cause: Some(IDENTITY_CAUSE),
+        reason_detail: None,
+        responses,
+    }
+}
+
+/// A failed identity GET, by the M3 tables (RF-2, L31). The GET runs for every read that got this
+/// far, whatever its query selected, so a failure decided from status and headers, a connection
+/// failure or a missing token is direct (as for a first page); a body-decided failure, a cap or
+/// the read budget is an outcome item (the identity GET counts in the read budget). The content
+/// answers stay audit-only in the read's record; the identity answer is in its `PREVIEW_FETCH`.
+fn identity_failure(
+    f: FetchFailure,
+    responses: Vec<UpstreamResponse>,
+    proxy: &ResolvedProxy,
+) -> Classified {
+    let gated = |responses, kind, cap, card| {
+        let mut rec = ItemRecord::outcome(responses, kind, cap, card, Vec::new());
+        if let Some(o) = rec.outcome.as_mut() {
+            o.cause = Some(IDENTITY_CAUSE);
+        }
+        Classified::Item(rec)
+    };
+    match f {
+        FetchFailure::PreSendConnection(class) => Classified::Direct(Direct {
+            code: ErrorCode::UpstreamNetwork,
+            message: connection_message(class, proxy),
+            cause: Some(("class", class_name(class))),
+            reason_detail: None,
+            responses,
+        }),
+        FetchFailure::StatusHeaderDecided { reason, .. } => Classified::Direct(Direct {
+            code: ErrorCode::UpstreamUnavailable,
+            message: unavailable_message(reason).to_owned(),
+            cause: Some(("reason", unavailable_name(reason))),
+            reason_detail: None,
+            responses,
+        }),
+        FetchFailure::BodyDecided { kind, .. } => {
+            let kind = match kind {
+                BodyFailure::ParseFailure => OutcomeKind::Unparsable,
+                BodyFailure::ReadError => OutcomeKind::Network,
+            };
+            gated(responses, kind, None, CardKind::JsonBodyUnreadable)
+        }
+        // An answer cut at `MAX_IDENTITY_BYTES` (the client names every cap the 32 MiB one) is no
+        // identity answer: not attributed, and no "response over 32 MiB" card either.
+        FetchFailure::PostSend {
+            kind: PostSendKind::ResponseCap32MiB,
+            ..
+        } => Classified::Direct(unconfirmed(responses)),
+        FetchFailure::PostSend { kind, .. } => {
+            let (kind, cap, card) = post_send_facts(kind);
+            gated(responses, kind, cap, card)
+        }
+        FetchFailure::BudgetExpiredBeforeSend => gated(
+            responses,
+            OutcomeKind::Timeout,
+            Some(CapOrBudget::ReadBudget120s),
+            CardKind::ReadBudget120,
+        ),
+        FetchFailure::OriginGuardRefused | FetchFailure::NeedsToken => Classified::Direct(Direct {
+            code: ErrorCode::NeedsToken,
+            message: MSG_NEEDS_TOKEN.to_owned(),
+            cause: Some(IDENTITY_CAUSE),
+            reason_detail: None,
+            responses,
+        }),
+        // Confluence answers are not header-checked (§7.2): not reached.
+        FetchFailure::IdentityCheckFailed { .. } => Classified::Direct(unconfirmed(responses)),
+        FetchFailure::CancelledInFlight { .. } | FetchFailure::CancelledBeforeSend => {
+            Classified::Cancelled
+        }
+        FetchFailure::MethodGuardRefused => Classified::Direct(Direct::internal(
+            "the identity GET was refused by the method guard",
+            responses,
+        )),
+    }
+}
+
+/// The user keys a released result of the Markdown shape resolves (PD-99): the `ri:userkey`
+/// references of its `body.storage.value`, decided by the same parse the conversion uses, and
+/// none when that parse is not `xml_ok` (the fallback renders no mention) or the answer has no
+/// storage body. The storage is parsed once (T11 review m-6).
+pub(super) fn lookup_keys(spec: &OperationSpec, rec: &ItemRecord) -> BTreeSet<String> {
+    let Ok((body, _)) = result_body(spec, rec.responses.iter().map(|r| &*r.body)) else {
+        return BTreeSet::new();
+    };
+    let Some(storage) = body.pointer("/body/storage/value").and_then(Value::as_str) else {
+        return BTreeSet::new();
+    };
+    let doc = atlas_duck_convert::storage::parse(storage);
+    if !doc.xml_ok {
+        return BTreeSet::new();
+    }
+    atlas_duck_convert::storage::user_refs(&doc).keys
 }
 
 /// The trigger of a read's fetch, if its answer failed the identity check or is a JSON 401.
@@ -379,7 +859,11 @@ pub(crate) enum Fetched {
 /// read sends the issue GET, then the comment pages with what is left of the one read budget
 /// (time and bytes): `budget` bounds the read as a whole (§7.2). `script`: a script's host call,
 /// whose single GETs (a composite's issue included) are cut at the budget's bytes too (§9.5,
-/// M8 T19d); a direct read's are cut at the fixed 32 MiB alone.
+/// M8 T19d); a direct read's are cut at the fixed 32 MiB alone. `keep`: the answer of a single
+/// GET is also kept in `ctl` (a Confluence read, whose user lookups and identity GET follow under
+/// the same control: a cancel during them records the answer, every byte received, PD-99,
+/// PD-93; a host call's Markdown page body, PD-99).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_plan(
     client: &InstanceClient,
     cover: &AuditCover,
@@ -388,12 +872,15 @@ pub(crate) async fn run_plan(
     ctl: &FetchControl,
     start: u64,
     script: bool,
+    keep: bool,
 ) -> Fetched {
     match plan {
-        ReadPlan::Get(call) if script => {
-            Fetched::Single(client.get_budget_ctl(cover, call, budget, ctl).await)
-        }
-        ReadPlan::Get(call) => Fetched::Single(client.get_ctl(cover, call, ctl).await),
+        ReadPlan::Get(call) => Fetched::Single(match (script, keep) {
+            (true, true) => client.get_kept_budget_ctl(cover, call, budget, ctl).await,
+            (true, false) => client.get_budget_ctl(cover, call, budget, ctl).await,
+            (false, true) => client.get_kept_ctl(cover, call, ctl).await,
+            (false, false) => client.get_ctl(cover, call, ctl).await,
+        }),
         ReadPlan::Paged { call, max_items } => Fetched::Paged {
             outcome: client
                 .read_paginated_ctl(cover, call, budget, *max_items, ctl)
@@ -479,7 +966,20 @@ async fn fetch(
         .get("start")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let fetched = run_plan(&http.client, &cover, &plan, &budget, &ctl, start, false).await;
+    // PD-93: every Confluence read's answer is kept in the control, since its user lookups and
+    // its identity GET follow under the same control.
+    let keep = entry.spec.product == Product::Confluence;
+    let fetched = run_plan(
+        &http.client,
+        &cover,
+        &plan,
+        &budget,
+        &ctl,
+        start,
+        false,
+        keep,
+    )
+    .await;
     Ok((fetched, http))
 }
 
@@ -504,6 +1004,8 @@ pub(crate) struct ItemRecord {
     more_available: bool,
     /// A composite read's comments stopped at the cap: `(fetched, server total)` (PD-45).
     pub(super) comments_truncated: Option<(u64, u64)>,
+    /// PD-99: what the user lookups of a Markdown page body resolved (`None`: no lookup ran).
+    pub(super) users: Option<UserResolutions>,
 }
 
 pub(super) struct OutcomeFacts {
@@ -576,7 +1078,9 @@ impl ItemRecord {
             .fold(0u64, u64::saturating_add)
     }
 
-    pub(super) fn record(&self, ctx: &EventCtx) -> NewEvent {
+    /// The `READ_FETCHED` of this item, with the `user_resolutions` it commits (§7.6; see
+    /// [`user_resolutions`]).
+    pub(super) fn record(&self, ctx: &EventCtx, user_resolutions: Option<&Value>) -> NewEvent {
         let fetched = match (&self.outcome, self.item) {
             (Some(o), _) => ReadFetched::Outcome {
                 outcome: o.kind,
@@ -592,7 +1096,7 @@ impl ItemRecord {
                 responses: &self.responses,
             },
         };
-        let mut ev = payloads::read_fetched(ctx, &fetched, None);
+        let mut ev = payloads::read_fetched(ctx, &fetched, user_resolutions);
         if let (Some((k, v)), Some(o)) = (
             self.outcome.as_ref().and_then(|o| o.cause),
             ev.payload.as_object_mut(),
@@ -623,6 +1127,7 @@ impl ItemRecord {
             server_total: None,
             more_available: false,
             comments_truncated: None,
+            users: None,
         }
     }
 }
@@ -649,6 +1154,7 @@ pub(crate) fn classify_read(fetched: Fetched, proxy: &ResolvedProxy) -> Classifi
                 server_total: None,
                 more_available: false,
                 comments_truncated: None,
+                users: None,
             })
         }
         Fetched::Single(FetchOutcome::Failed(f)) => classify_failure(f, Vec::new(), proxy),
@@ -691,6 +1197,7 @@ pub(crate) fn classify_read(fetched: Fetched, proxy: &ResolvedProxy) -> Classifi
                     server_total: outcome.server_total,
                     more_available: outcome.next_start.is_some(),
                     comments_truncated: None,
+                    users: None,
                 })
             };
             match (outcome.end, outcome.failure) {
@@ -818,31 +1325,7 @@ fn classify_one(
             )
         }
         FetchFailure::PostSend { kind, received } => {
-            let (o, cap, card) = match kind {
-                PostSendKind::PerCallTimeout => (
-                    OutcomeKind::Timeout,
-                    Some(CapOrBudget::CallTimeout30s),
-                    CardKind::PerCallTimeout30,
-                ),
-                PostSendKind::NetworkError => {
-                    (OutcomeKind::Network, None, CardKind::NetworkAfterSend)
-                }
-                PostSendKind::ResponseCap32MiB => (
-                    OutcomeKind::TooLarge,
-                    Some(CapOrBudget::ResponseCap32MiB),
-                    CardKind::ResponseCap32,
-                ),
-                PostSendKind::FetchCap50MiB => (
-                    OutcomeKind::TooLarge,
-                    Some(CapOrBudget::FetchCap50MiB),
-                    CardKind::FetchCap50,
-                ),
-                PostSendKind::ReadBudget120s => (
-                    OutcomeKind::Timeout,
-                    Some(CapOrBudget::ReadBudget120s),
-                    CardKind::ReadBudget120,
-                ),
-            };
+            let (o, cap, card) = post_send_facts(kind);
             outcome(responses, o, cap, card, received)
         }
         // The read budget ran out in the limiter before anything left: gated anyway (whether a
@@ -880,6 +1363,33 @@ fn classify_one(
             "the read plan was refused by the method guard",
             responses,
         )),
+    }
+}
+
+/// The outcome item of a GET that failed after it was sent: its kind, cap or budget and card.
+fn post_send_facts(kind: PostSendKind) -> (OutcomeKind, Option<CapOrBudget>, CardKind) {
+    match kind {
+        PostSendKind::PerCallTimeout => (
+            OutcomeKind::Timeout,
+            Some(CapOrBudget::CallTimeout30s),
+            CardKind::PerCallTimeout30,
+        ),
+        PostSendKind::NetworkError => (OutcomeKind::Network, None, CardKind::NetworkAfterSend),
+        PostSendKind::ResponseCap32MiB => (
+            OutcomeKind::TooLarge,
+            Some(CapOrBudget::ResponseCap32MiB),
+            CardKind::ResponseCap32,
+        ),
+        PostSendKind::FetchCap50MiB => (
+            OutcomeKind::TooLarge,
+            Some(CapOrBudget::FetchCap50MiB),
+            CardKind::FetchCap50,
+        ),
+        PostSendKind::ReadBudget120s => (
+            OutcomeKind::Timeout,
+            Some(CapOrBudget::ReadBudget120s),
+            CardKind::ReadBudget120,
+        ),
     }
 }
 
@@ -1132,40 +1642,51 @@ fn build_item(
     clamped: bool,
 ) -> Result<Built, Vec<UpstreamResponse>> {
     let shape = ReadShape::of(cx.spec, cx.params);
-    let mut record = rec.record(ctx);
+    // §5.2 steps 3–4: the map is committed in the record the candidate is built from, so the
+    // first build and every rebuild convert with the same map.
+    let users = user_resolutions(shape, &rec);
+    let mut record = rec.record(ctx, users.as_ref());
     // §5.3 mirror check on the unredacted candidate (T10 review I-1): a candidate that fails it
     // is still shown, but Release stays disabled (`rebuild_failed`: `internal` banner, only Deny
     // remains) until a redaction drops the orphan entry.
-    let built =
-        normalize_with_drops(cx.spec, shape, &record.payload).and_then(|(body, dropped)| {
-            let (c, blocked) = build_unredacted(cx.spec, body)?;
-            Ok((c, dropped, blocked))
-        });
-    let (mut candidate, mut dropped, mut mirror_blocked) = match built {
-        Ok(b) => b,
-        Err(_) => return Err(rec.responses),
+    let first = match normalize_with_drops(cx.spec, shape, &record.payload) {
+        Ok(n) => match build_unredacted(cx.spec, n.body) {
+            Ok((c, blocked)) => Some((c, n.dropped, n.conversion, blocked)),
+            Err(_) => return Err(rec.responses),
+        },
+        // A Markdown body that would pass the release cap stops converting there (T10 review
+        // B-1): the 16 MiB outcome below, never a candidate built past the cap.
+        Err(Unnormalized::TooLarge) => None,
+        Err(Unnormalized::Rebuild(_)) => return Err(rec.responses),
     };
     // §5.2 step 4: the 16 MiB release cap on the serialized candidate.
-    let over_cap = u64::try_from(candidate.bytes().len()).unwrap_or(u64::MAX) > RELEASE_CAP_BYTES;
-    if rec.item == ReleaseItem::Result && over_cap {
-        drop(candidate);
-        rec = ItemRecord::outcome(
-            rec.responses,
-            OutcomeKind::TooLarge,
-            Some(CapOrBudget::ReleaseCap16MiB),
-            CardKind::ReleaseCap16,
-            Vec::new(),
-        );
-        record = rec.record(ctx);
-        let built = normalize_with_drops(cx.spec, shape, &record.payload)
-            .and_then(|(body, _)| build_candidate(cx.spec, body, &[]));
-        candidate = match built {
-            Ok(c) => c,
-            Err(_) => return Err(rec.responses),
+    let over_cap = first.as_ref().is_none_or(|(c, ..)| {
+        u64::try_from(c.bytes().len()).unwrap_or(u64::MAX) > RELEASE_CAP_BYTES
+    });
+    let (candidate, dropped, conversion, mirror_blocked) =
+        if rec.item == ReleaseItem::Result && over_cap {
+            drop(first);
+            rec = ItemRecord::outcome(
+                rec.responses,
+                OutcomeKind::TooLarge,
+                Some(CapOrBudget::ReleaseCap16MiB),
+                CardKind::ReleaseCap16,
+                Vec::new(),
+            );
+            record = rec.record(ctx, None);
+            let built = normalize_with_drops(cx.spec, shape, &record.payload)
+                .ok()
+                .and_then(|n| build_candidate(cx.spec, n.body, &[]).ok());
+            match built {
+                Some(c) => (c, 0, None, false),
+                None => return Err(rec.responses),
+            }
+        } else {
+            match first {
+                Some(b) => b,
+                None => return Err(rec.responses),
+            }
         };
-        dropped = 0;
-        mirror_blocked = false;
-    }
     let state = ReadState {
         item: rec.item,
         outcome: rec.outcome.as_ref().map(|o| o.card),
@@ -1177,6 +1698,7 @@ fn build_item(
         clamped,
         comments_truncated: rec.comments_truncated,
         normalized_dropped: dropped,
+        conversion,
         redaction_meta: None,
         also_appears_in: Vec::new(),
     };
@@ -1210,6 +1732,14 @@ pub enum ReadShape {
     /// `jira.issue.get --comments`: the issue, then the comment pages, merged into
     /// `fields.comment` (and with `rendered`, `renderedFields.comment`).
     IssueWithComments { rendered: bool },
+    /// Δ3 (PD-100): `confluence.page.get`, and `confluence.page.history` with `version`
+    /// (`historical`). `Markdown` replaces `body` with `{"format": "markdown", "value": …}`,
+    /// converted from `body.storage` with the record's committed `user_resolutions`; `Storage`
+    /// and `View` are the answer as sent.
+    ConfluenceBody {
+        format: BodyFormat,
+        historical: bool,
+    },
 }
 
 impl ReadShape {
@@ -1218,21 +1748,104 @@ impl ReadShape {
             ReadShape::IssueWithComments {
                 rendered: jira::comments_rendered(params),
             }
+        } else if let Some((format, historical)) = confluence::body_format(spec, params) {
+            ReadShape::ConfluenceBody { format, historical }
         } else {
             ReadShape::Plain
         }
     }
+
+    /// The shape converts with a committed `user_resolutions` map (§7.6): a Markdown page body.
+    pub fn commits_user_resolutions(self) -> bool {
+        matches!(
+            self,
+            ReadShape::ConfluenceBody {
+                format: BodyFormat::Markdown,
+                ..
+            }
+        )
+    }
+}
+
+/// The `user_resolutions` the `READ_FETCHED` of a released result (or the `SCRIPT_CALL` of a
+/// host call) commits (§7.6, §5.2 step 3): only a Markdown page body has one, always an object
+/// (`{}` when no key was resolved: no mention, or a storage the parse rejected), holding what
+/// the lookups resolved (PD-99: user key → username, `null` when unresolved).
+pub(crate) fn user_resolutions(shape: ReadShape, rec: &ItemRecord) -> Option<Value> {
+    (rec.item == ReleaseItem::Result && shape.commits_user_resolutions()).then(|| {
+        let map = rec.users.iter().flatten().map(|(key, name)| {
+            let name = name
+                .as_ref()
+                .map_or(Value::Null, |n| Value::String(n.clone()));
+            (key.clone(), name)
+        });
+        Value::Object(map.collect())
+    })
+}
+
+/// What a committed payload normalizes to.
+pub(crate) struct Normalized {
+    /// The bare candidate body.
+    pub(crate) body: Value,
+    /// Results the normalization removed (§7.4).
+    pub(crate) dropped: u64,
+    /// The report of a Markdown page body's conversion (PD-100).
+    pub(crate) conversion: Option<ConversionReport>,
+}
+
+impl Normalized {
+    fn plain(body: Value) -> Normalized {
+        Normalized {
+            body,
+            dropped: 0,
+            conversion: None,
+        }
+    }
+}
+
+/// Why a committed payload gives no candidate body.
+pub(crate) enum Unnormalized {
+    /// The record or the normalization did not give one.
+    Rebuild(RebuildError),
+    /// The Markdown of a page body would pass its budget (T10 review B-1): the conversion
+    /// stopped there. A read's first build releases the 16 MiB outcome instead, a host call
+    /// rejects `result_too_large`; a rebuild never meets it (the outcome was committed).
+    TooLarge,
+}
+
+impl From<RebuildError> for Unnormalized {
+    fn from(e: RebuildError) -> Self {
+        Unnormalized::Rebuild(e)
+    }
+}
+
+impl Unnormalized {
+    /// For the rebuild callers: a body that is too large cannot be the committed candidate.
+    fn rebuild(self) -> RebuildError {
+        match self {
+            Unnormalized::Rebuild(e) => e,
+            Unnormalized::TooLarge => RebuildError::Malformed,
+        }
+    }
+}
+
+/// The Markdown budget of a direct read's body: the release cap (§5.2 step 4).
+fn read_markdown_budget() -> usize {
+    usize::try_from(RELEASE_CAP_BYTES).unwrap_or(usize::MAX)
 }
 
 /// The bare candidate body of a committed `READ_FETCHED` payload: the one normalization the
-/// first build and every rebuild use (`cache`'s contract). Reads nothing but the payload and the
-/// request's validated `params` (which decide the [`ReadShape`]).
+/// first build and every rebuild use (`cache`'s contract). Reads nothing but the payload (its
+/// responses and its committed `user_resolutions`) and the request's validated `params` (which
+/// decide the [`ReadShape`]).
 pub fn normalize(
     spec: &OperationSpec,
     params: &Value,
     payload: &Value,
 ) -> Result<Value, RebuildError> {
-    normalize_with_drops(spec, ReadShape::of(spec, params), payload).map(|(body, _)| body)
+    normalize_with_drops(spec, ReadShape::of(spec, params), payload)
+        .map(|n| n.body)
+        .map_err(Unnormalized::rebuild)
 }
 
 /// [`normalize`] for `Engine::candidate`, with the shape decided from `params` up front.
@@ -1241,48 +1854,119 @@ pub(crate) fn normalizer(
     params: &Value,
 ) -> impl FnOnce(&Value) -> Result<Value, RebuildError> + Send + 'static {
     let shape = ReadShape::of(spec, params);
-    move |payload| normalize_with_drops(spec, shape, payload).map(|(body, _)| body)
+    move |payload| {
+        normalize_with_drops(spec, shape, payload)
+            .map(|n| n.body)
+            .map_err(Unnormalized::rebuild)
+    }
 }
 
-/// [`normalize`] plus the number of results it removed (§7.4).
+/// [`normalize`] plus the number of results it removed (§7.4) and the conversion report; a
+/// Markdown body is held to the release cap ([`read_markdown_budget`]).
 fn normalize_with_drops(
     spec: &OperationSpec,
     shape: ReadShape,
     payload: &Value,
-) -> Result<(Value, u64), RebuildError> {
+) -> Result<Normalized, Unnormalized> {
     if let Some(outcome) = payload.get("outcome") {
         let code = outcome
             .as_str()
             .and_then(outcome_code)
             .ok_or(RebuildError::Malformed)?;
         let code = serde_json::to_value(code).map_err(|_| RebuildError::Malformed)?;
-        return Ok((json!({ "code": code, "hint": OUTCOME_HINT }), 0));
+        return Ok(Normalized::plain(
+            json!({ "code": code, "hint": OUTCOME_HINT }),
+        ));
     }
     // A direct failure's answer is never a candidate.
     if payload.get("unavailable").is_some() {
-        return Err(RebuildError::Malformed);
+        return Err(RebuildError::Malformed.into());
     }
     let responses = fetched_refs(payload)?;
     if payload.get("upstream_error") == Some(&Value::Bool(true)) {
         let last = responses.last().ok_or(RebuildError::Malformed)?;
-        return Ok((error_candidate(last.status, &last.body), 0));
+        return Ok(Normalized::plain(error_candidate(last.status, &last.body)));
     }
-    result_value(spec, shape, responses.iter().map(|r| &*r.body))
+    result_value(
+        spec,
+        shape,
+        responses.iter().map(|r| &*r.body),
+        payload.get("user_resolutions"),
+        read_markdown_budget(),
+    )
 }
 
 /// The result of a read's 2xx pages in its [`ReadShape`] (the direct read's candidate, a script
-/// host call's result).
+/// host call's result). `user_resolutions` is the committed map of the record (§7.6);
+/// `max_markdown` the budget of a Markdown body's text ([`Unnormalized::TooLarge`] above it).
 pub(super) fn result_value<'a>(
     spec: &OperationSpec,
     shape: ReadShape,
     bodies: impl IntoIterator<Item = &'a [u8]>,
-) -> Result<(Value, u64), RebuildError> {
+    user_resolutions: Option<&Value>,
+    max_markdown: usize,
+) -> Result<Normalized, Unnormalized> {
     match shape {
-        ReadShape::Plain => result_body(spec, bodies),
+        ReadShape::Plain => Ok(result_body(spec, bodies).map(|(body, dropped)| Normalized {
+            body,
+            dropped,
+            conversion: None,
+        })?),
         ReadShape::IssueWithComments { rendered } => {
-            merge_comments(bodies, rendered).map(|body| (body, 0))
+            Ok(merge_comments(bodies, rendered).map(Normalized::plain)?)
+        }
+        ReadShape::ConfluenceBody { format, .. } => {
+            let (body, _) = result_body(spec, bodies)?;
+            match format {
+                BodyFormat::Markdown => markdown_body(body, user_resolutions, max_markdown),
+                BodyFormat::Storage | BodyFormat::View => Ok(Normalized::plain(body)),
+            }
         }
     }
+}
+
+/// PD-100: the content with `body` replaced by `{"format": "markdown", "value": …}` (§4.2),
+/// converted with the committed map only, never the live user cache (§5.2, I-37), and stopped
+/// once the Markdown would pass `max` bytes (T10 review B-1). A content answer without a
+/// `body.storage.value` string (e.g. an id that is not a page) is the answer as sent,
+/// unconverted and without a report.
+fn markdown_body(
+    mut body: Value,
+    users: Option<&Value>,
+    max: usize,
+) -> Result<Normalized, Unnormalized> {
+    let users = committed_users(users)?;
+    let Some(storage) = body.pointer("/body/storage/value").and_then(Value::as_str) else {
+        return Ok(Normalized::plain(body));
+    };
+    let (markdown, report, _) = storage_to_markdown_within(storage, &users, max)
+        .map_err(|MarkdownTooLarge| Unnormalized::TooLarge)?;
+    let root = body.as_object_mut().ok_or(RebuildError::Malformed)?;
+    root.insert(
+        "body".into(),
+        json!({ "format": "markdown", "value": markdown }),
+    );
+    Ok(Normalized {
+        body,
+        dropped: 0,
+        conversion: Some(report),
+    })
+}
+
+/// The committed `user_resolutions` (§7.6): user key → username, or `null` when unresolved. The
+/// record of a Markdown page body always carries the object; a record without it, or with any
+/// other value in it, is malformed (fail closed: nothing stands in for the committed map).
+fn committed_users(users: Option<&Value>) -> Result<UserResolutions, RebuildError> {
+    let map = users
+        .and_then(Value::as_object)
+        .ok_or(RebuildError::Malformed)?;
+    map.iter()
+        .map(|(key, name)| match name {
+            Value::String(s) => Ok((key.clone(), Some(s.clone()))),
+            Value::Null => Ok((key.clone(), None)),
+            _ => Err(RebuildError::Malformed),
+        })
+        .collect()
 }
 
 /// PD-45: the issue (the first body) with `fields.comment = {startAt, maxResults, total,
@@ -1365,7 +2049,8 @@ fn outcome_code(outcome: &str) -> Option<ErrorCode> {
 
 /// The result: one response's JSON, or for a paged op the first page's object with the items of
 /// every page under `items_key` (server totals as sent, §4.2). `confluence.search` results
-/// without a `content` object are removed and counted (§7.4 defence in depth).
+/// without a `content` object are removed and counted (§7.4 defence in depth), and the rest is
+/// pruned to the §7.4 release list (PD-101).
 pub(super) fn result_body<'a>(
     spec: &OperationSpec,
     bodies: impl IntoIterator<Item = &'a [u8]>,
@@ -1381,16 +2066,24 @@ pub(super) fn result_body<'a>(
             Some(Value::Array(a)) => a,
             _ => Vec::new(),
         };
+        let mut merged = false;
         for page in pages {
+            merged = true;
             if let Some(Value::Array(a)) = page?.get_mut(paging.items_key).map(Value::take) {
                 items.extend(a);
             }
+        }
+        if merged && let Some(links) = body.get_mut("_links").and_then(Value::as_object_mut) {
+            // Page 1's navigation links are stale after a merge and never followed.
+            links.remove("next");
+            links.remove("prev");
         }
         let mut dropped = 0u64;
         if spec.id == "confluence.search" {
             let before = items.len();
             items.retain(|r| r.get("content").is_some_and(Value::is_object));
             dropped = u64::try_from(before - items.len()).unwrap_or(u64::MAX);
+            confluence::prune_search(&mut body, &mut items);
         }
         if let Some(o) = body.as_object_mut() {
             o.insert(paging.items_key.to_owned(), Value::Array(items));
@@ -1457,6 +2150,7 @@ pub(crate) fn preview_model(cx: &ReadContext<'_>, read: &ReadState, c: &Candidat
                     more_available: read.more_available,
                     clamped: read.clamped,
                     comments_truncated: read.comments_truncated,
+                    conversion: read.conversion.clone(),
                 }),
                 field_names: cx.field_names.as_deref(),
             })
@@ -1541,11 +2235,27 @@ fn card(cx: &ReadContext<'_>, value: &Value, byte_size: u64, body: PreviewBody) 
     }
 }
 
-/// `meta.page` (§7.5, paged ops) and `meta.redactions` (§4.2) of a release, stored in its
-/// `READ_RELEASED` so a delivery needs nothing but the record. `returned` counts the released
-/// items, so `returned + items_dropped` equals the items fetched.
+/// `meta.page` (§7.5, paged ops), `meta.redactions` and `meta.conversion` (§4.2) of a release,
+/// stored in its `READ_RELEASED` so a delivery needs nothing but the record. `returned` counts
+/// the released items, so `returned + items_dropped` equals the items fetched.
 pub(crate) fn release_meta(spec: &OperationSpec, read: &ReadState, released: &Value) -> Value {
     let mut meta = Map::new();
+    // §4.2: `{lossy, lost: {macros, images, links, layouts}}` of a released Markdown body; the
+    // rest of the report (macro names, unresolved mentions) is preview-only.
+    if let (ReleaseItem::Result, Some(c)) = (read.item, &read.conversion) {
+        meta.insert(
+            "conversion".into(),
+            json!({
+                "lossy": c.lossy,
+                "lost": {
+                    "macros": c.lost.macros,
+                    "images": c.lost.images,
+                    "links": c.lost.links,
+                    "layouts": c.lost.layouts,
+                },
+            }),
+        );
+    }
     // An upstream error's details have no items: `meta.page` belongs to a released result.
     if let (ReleaseItem::Result, Some(p), Some(paging)) = (read.item, read.page, spec.paginated) {
         let returned = released

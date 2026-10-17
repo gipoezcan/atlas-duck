@@ -159,8 +159,8 @@ pub fn body_ref_from_json(v: &Value) -> Option<Cow<'_, [u8]>> {
     }
 }
 
-/// The bytes one `READ_FETCHED` can carry: the 50 MiB fetch cap (§5.2 step 2) plus the chunk
-/// that crossed it (a cap is noticed after a chunk was buffered; 1 MiB is generous).
+/// The bytes one `READ_FETCHED` can carry: the 50 MiB fetch cap (§5.2 step 2) plus one byte (the
+/// cut keeps the byte that shows the cap was passed, T11 review I-2; 1 MiB of slack is kept).
 pub const READ_FETCHED_MAX_BODY_BYTES: u64 = 51 * 1024 * 1024;
 /// Framing allowance of one `READ_FETCHED` beside its bodies (per page `{status, content_type}`
 /// and keys, `user_resolutions`).
@@ -396,6 +396,8 @@ pub enum PreviewFetchPurpose {
     StaleCheck,
     Refresh,
     Resolve,
+    /// Δ5 (PD-93, RF-5a): the `GET /rest/api/user/current` that ends a Confluence read's fetch.
+    Identity,
 }
 
 impl PreviewFetchPurpose {
@@ -405,6 +407,7 @@ impl PreviewFetchPurpose {
             Self::StaleCheck => "stale_check",
             Self::Refresh => "refresh",
             Self::Resolve => "resolve",
+            Self::Identity => "identity",
         }
     }
 }

@@ -22,8 +22,8 @@ pub const ZSTD_LEVEL: i32 = 3;
 /// Upper bound on a payload's JCS plaintext: the writer refuses a larger append (`Invalid`) and
 /// `decompress` rejects a larger stored `payload_len` (a corrupt or crafted row) before the
 /// output buffer is allocated. Sized for the largest record M3 writes (M3 Task 17 review I-3):
-/// a `READ_FETCHED` holds every byte of a read up to the 50 MiB fetch cap (+ the chunk that
-/// crossed it), each body encoded in at most 4/3 of its size + 4 bytes (`core::payloads`), so
+/// a `READ_FETCHED` holds every byte of a read up to the 50 MiB fetch cap (+ 1 byte, the cut; 1 MiB of slack
+/// is kept), each body encoded in at most 4/3 of its size + 4 bytes (`core::payloads`), so
 /// ≈ 68 MiB of bodies plus per-page framing; 96 MiB leaves room for that framing and for a
 /// `REQUEST_RECEIVED` of a 24 MiB frame whose JCS re-encoding expands number literals.
 pub const MAX_PAYLOAD_LEN: u64 = 96 * 1024 * 1024;

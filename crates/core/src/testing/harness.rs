@@ -59,6 +59,8 @@ pub const HARNESS_CWD: &str = "workdir";
 pub const JIRA_FIELDS: &str = r#"[{"id":"summary","name":"Summary","custom":false,"schema":{"type":"string","system":"summary"}},{"id":"customfield_10100","name":"Story Points","custom":true,"schema":{"type":"number","custom":"com.atlassian.jira.plugin.system.customfieldtypes:float","customId":10100}}]"#;
 /// The alias of the instance `HarnessBuilder::live` configures.
 pub const LIVE_ALIAS: &str = "jira-live";
+/// The alias of the instance `HarnessBuilder::live_confluence` configures.
+pub const LIVE_CONFLUENCE_ALIAS: &str = "confluence-live";
 /// How long the harness waits for field-name cache fills it started (start, token set).
 const FIELD_CACHE_WAIT: Duration = Duration::from_secs(10);
 
@@ -113,6 +115,8 @@ pub struct HarnessBuilder {
     pats_deleted: Vec<String>,
     app_start_extra: Map<String, Value>,
     live: LiveState,
+    /// The alias of the live instance (`LIVE_ALIAS` unless `live_confluence` set it).
+    live_alias: &'static str,
 }
 
 /// Where `HarnessBuilder::live` stands: not asked for, set up, or refused (not https).
@@ -162,17 +166,33 @@ impl HarnessBuilder {
     /// the instance admin's token set (so the identity it keeps is the one the server reports),
     /// and `strict_https` on so no release lock is weakened. A `url` that is not `https://` makes
     /// `start` fail. The PAT is never printed or written to the config.
-    pub fn live(mut self, url: &str, pat: &str) -> Self {
+    pub fn live(self, url: &str, pat: &str) -> Self {
+        self.live_instance(LIVE_ALIAS, Product::Jira, url, pat)
+    }
+
+    /// `live` for a real Confluence Data Center instance (alias `LIVE_CONFLUENCE_ALIAS`, M7 T25).
+    pub fn live_confluence(self, url: &str, pat: &str) -> Self {
+        self.live_instance(LIVE_CONFLUENCE_ALIAS, Product::Confluence, url, pat)
+    }
+
+    fn live_instance(
+        mut self,
+        alias: &'static str,
+        product: Product,
+        url: &str,
+        pat: &str,
+    ) -> Self {
         if !url.to_ascii_lowercase().starts_with("https://") {
             self.live = LiveState::Refused;
             return self;
         }
         self.live = LiveState::On;
+        self.live_alias = alias;
         self.strict_https = true;
         self.pat = pat.to_owned();
         self.instance_at(
-            LIVE_ALIAS,
-            Product::Jira,
+            alias,
+            product,
             InstanceAt {
                 base_url: url.to_owned(),
                 ..InstanceAt::default()
@@ -304,8 +324,14 @@ impl HarnessBuilder {
                 Product::Confluence => atlas_duck_atlassian::Product::Confluence,
             };
             let mock = MockDc::start(product, context).await;
-            if spec.product == Product::Jira {
-                mock.json_once("/rest/api/2/field", 200, JIRA_FIELDS).await;
+            match spec.product {
+                Product::Jira => mock.json_once("/rest/api/2/field", 200, JIRA_FIELDS).await,
+                // RF-5a (PD-93): every Confluence read ends with an identity GET; a test mounts
+                // its own answer to change it.
+                Product::Confluence => {
+                    mock.confluence_user_current_default(TEST_USER, TEST_USER_KEY)
+                        .await;
+                }
             }
             let id = InstanceId::new()?.0;
             let (base_url, bound) = match &spec.at {
@@ -316,7 +342,7 @@ impl HarnessBuilder {
                 None => (mock.base_url(), url_hash(&mock.base())),
             };
             // The live instance gets the token and the identity the server's own answer names.
-            if !(live && spec.alias == LIVE_ALIAS) {
+            if !(live && spec.alias == self.live_alias) {
                 credentials.put(&id, &self.pat, bound, TEST_USER, TEST_USER_KEY);
             }
             let ca_bundle = match spec.at.as_ref().and_then(|a| a.ca_pem.as_ref()) {
@@ -400,7 +426,7 @@ impl HarnessBuilder {
         let at_raw = self
             .instances
             .iter()
-            .any(|i| i.at.is_some() && !(live && i.alias == LIVE_ALIAS));
+            .any(|i| i.at.is_some() && !(live && i.alias == self.live_alias));
         let hooks = TestHooks {
             limits: self.limits,
             allow_http: !self.strict_https,
@@ -443,7 +469,7 @@ impl HarnessBuilder {
         let h = Harness { default_conn, ..h };
         if live {
             h.instances()
-                .set_token(LIVE_ALIAS, secrecy::SecretString::from(self.pat), None)
+                .set_token(self.live_alias, secrecy::SecretString::from(self.pat), None)
                 .await
                 .map_err(|e| format!("live token set failed: {e:?}"))?;
         }
@@ -595,6 +621,7 @@ impl Harness {
             pats_deleted: Vec::new(),
             app_start_extra: Map::new(),
             live: LiveState::Off,
+            live_alias: LIVE_ALIAS,
         }
     }
 
@@ -778,6 +805,32 @@ impl Harness {
         self.engine()
             .update_instance(&id, |rt| rt.version = Some(version));
         true
+    }
+
+    /// I-37 seam (PD-99): caches `username` for user `key` of `alias` (`None`: "no such user"),
+    /// as a lookup answered now would. `false`: no such instance.
+    pub fn user_cache_set(&self, alias: &str, key: &str, username: Option<&str>) -> bool {
+        let Some(id) = self.routed_id(alias) else {
+            return false;
+        };
+        let now = self.engine().clock().now_utc();
+        let cache = self.engine().user_cache();
+        cache.put(
+            &id,
+            cache.generation(&id),
+            key,
+            username.map(str::to_owned),
+            now,
+        );
+        true
+    }
+
+    /// What the user cache of `alias` holds for `key` now (PD-99): `None` when nothing usable is
+    /// cached, `Some(None)` for a cached "no such user".
+    pub fn user_cached(&self, alias: &str, key: &str) -> Option<Option<String>> {
+        let id = self.routed_id(alias)?;
+        let now = self.engine().clock().now_utc();
+        self.engine().user_cache().get(&id, key, now)
     }
 
     /// The id the core routes `alias` to.

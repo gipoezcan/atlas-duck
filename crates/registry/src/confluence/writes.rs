@@ -214,7 +214,9 @@ pub(crate) const LABEL_REMOVE: OperationSpec = OperationSpec {
     ..LABEL_ADD
 };
 
-/// `replace` (PUT to `/{attachmentId}/data`) is M7.
+/// A new attachment is a multipart `POST` to this endpoint with `allowDuplicated=false`;
+/// `replace=true` is a `POST` to `…/child/attachment/{attachmentId}/data` of the one attachment
+/// of that filename (§7.4, PD-109; core builds both requests).
 pub(crate) const ATTACHMENT_UPLOAD: OperationSpec = OperationSpec {
     id: "confluence.attachment.upload",
     endpoint: post("/rest/api/content/{id}/child/attachment"),
@@ -257,7 +259,8 @@ pub(crate) const ATTACHMENT_UPLOAD: OperationSpec = OperationSpec {
         ..NO_CAPS
     },
     success: DEFAULT_SUCCESS,
-    result_projection: Projection::Fields(RECEIPT_FIELDS),
+    // Δ4 b: a new attachment answers `{"results":[…]}` (V06 confirms the shape live).
+    result_projection: Projection::FirstResultFields(RECEIPT_FIELDS),
     result_example: schemas::ATTACHMENT_RECEIPT_EXAMPLE,
     result_example_sparse: schemas::ATTACHMENT_RECEIPT_EXAMPLE,
     result_schema: schemas::CONTENT_RECEIPT_RESULT,

@@ -204,6 +204,9 @@ fn delete_stored(engine: &Engine, id: &str, on_request: bool) -> Result<bool, Ad
         None,
     );
     engine.port().append(ev).map_err(AdminError::Audit)?;
+    // Before the keychain changes: a Confluence read in flight concludes nothing from an identity
+    // GET that may run without the token its content was fetched with (T13 review B-1).
+    engine.credential_changing(id);
     if let Err(e) = creds.delete(id) {
         // The record above said the token went; it did not: say so (as `set_token`'s
         // `store_failed`).
@@ -561,8 +564,10 @@ impl CoreInstances {
         // (review I-4), and the first error is reported afterwards.
         let deleted = delete_stored(&self.engine, &id, false);
         self.engine.invalidate_client(&id);
-        // Another server's field names (PD-46, T8 review M-5).
+        // Another server's field names (PD-46, T8 review M-5) and users (PD-99:
+        // `instance_changed`).
         self.engine.field_cache().forget(&id);
+        self.engine.user_cache().clear(&id);
         let reloaded = self.reload();
         if reloaded.is_err() {
             // The table could not be rebuilt: the instance still moves to the confirmed origin,
@@ -918,11 +923,22 @@ impl InstanceAdmin for CoreInstances {
             identity: identity.clone(),
             expires_at,
         };
-        let (creds, store_id) = (self.engine.credentials().clone(), id.clone());
-        let stored = tokio::task::spawn_blocking(move || creds.store(&store_id, cred))
-            .await
-            .map_err(|_| AdminError::Keychain(CredentialError::Unavailable))
-            .and_then(|r| r.map_err(AdminError::Keychain));
+        // Before the keychain changes: a Confluence read in flight concludes nothing from an
+        // identity GET that may run under the new token (T13 review B-1).
+        self.engine.credential_changing(&id);
+        let (engine, store_id) = (self.engine.clone(), id.clone());
+        let stored = tokio::task::spawn_blocking(move || {
+            let stored = engine.credentials().store(&store_id, cred);
+            // Again as soon as the store returned, on its thread (T30 review I-2): a read that
+            // took the generation while the store ran may have fetched its content under the old
+            // token and send its identity GET under the new one; its compare now differs. Also
+            // after a failed store (fail closed: one retryable read).
+            engine.credential_changing(&store_id);
+            stored
+        })
+        .await
+        .map_err(|_| AdminError::Keychain(CredentialError::Unavailable))
+        .and_then(|r| r.map_err(AdminError::Keychain));
         if let Err(e) = stored {
             // The record above said the token changed; it did not (review M-1): say so.
             let failed = payloads::credential_changed(
@@ -938,6 +954,9 @@ impl InstanceAdmin for CoreInstances {
                 .await;
             return Err(e);
         }
+        // PD-99: users are looked up again under the new token (`credential_changed`); cleared
+        // before the instance is `ok` with it.
+        self.engine.user_cache().clear(&id);
         self.pat_stored(&id, identity, expires_at, tested.version);
         let change = if other_user {
             InstanceChange::TokenReplaced

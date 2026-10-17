@@ -13,9 +13,13 @@
 //! - `*_html` strings pass `sanitize_html` again; flagged characters in their text are escaped,
 //!   in their attribute values (an `alt`) too.
 //! - Semantic elements only (`header`, `section`, `table`, `th`, `td`, `ins`, `del`, `h2`–`h4`,
-//!   `ul`, `li`, `p`, `div`, `pre`, `code`, `bdi`, `mark`, `strong`), never a `class` or `style`
-//!   attribute: `preview.css` styles by element and position. A value that may need a `<pre>`
-//!   sits in a `div`, never a `p` (which cannot hold one).
+//!   `ul`, `ol`, `li`, `p`, `div`, `pre`, `code`, `bdi`, `mark`, `strong`), never a `class` or
+//!   `style` attribute: `preview.css` styles by element and position. A value that may need a
+//!   `<pre>` sits in a `div`, never a `p` (which cannot hold one). The one attribute-bearing
+//!   element the renderer itself writes is the attachment thumbnail (M7 Δ2, PD-110):
+//!   `<img src="data:image/<raster>;base64,…" alt="">`, emitted through the sanitizer and only
+//!   for a raster `data:` URI (a sanitized `*_html` string may still carry a data-raster `<img>`
+//!   with `src` and `alt`, T8 review m-4).
 //! - Display caps: [`DOC_MAX_ROWS`] rows per table or list, [`DOC_MAX_DIFF_LINES`] lines per diff,
 //!   [`DOC_MAX_BYTES`] for the whole body. What a cap leaves out is replaced by the PD-67 note and
 //!   counted in the header's "hidden in preview" bytes. A script item's own sections have a
@@ -266,10 +270,11 @@ impl Doc {
         self.value(&shown, Frame::Quoted);
     }
 
-    /// One diff line (raw): display-escaped, PD-69 line notation, in `<bdi>`. The caller puts
-    /// every diff line in a `<pre>`, so a whitespace-only change shows without the stylesheet.
-    pub(crate) fn diff_line(&mut self, s: &str) {
-        let shown = ws::visible_line(&invisible::escape_for_display(s));
+    /// One diff line (raw): display-escaped, PD-69 line notation (the missing-newline mark only
+    /// when the line ends its side, `side_end`), in `<bdi>`. The caller puts every diff line in
+    /// a `<pre>`, so a whitespace-only change shows without the stylesheet.
+    pub(crate) fn diff_line(&mut self, s: &str, side_end: bool) {
+        let shown = ws::visible_line_at(&invisible::escape_for_display(s), side_end);
         self.bdi(&shown);
     }
 

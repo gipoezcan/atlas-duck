@@ -11,9 +11,12 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use atlas_duck_atlassian::testing::MockDc;
+use atlas_duck_atlassian::testing::{MockDc, fixtures};
 use atlas_duck_core::testing::Harness;
 use atlas_duck_preview::{Platform, Preview, render};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use common::confluence::{mount_attachments, mount_page, mount_users, page_with_storage};
 use common::jira::{full_issue, mount_create_stages, mount_issue, mount_search};
 use common::{TestError, TestResult, de, request_id};
 use serde_json::{Value, json};
@@ -126,6 +129,151 @@ async fn p01_rust_preview_build_and_document_under_budget() -> TestResult {
     )
     .await?;
     build_and_render(&h, &id, "jira.issue.create")?;
+    Ok(())
+}
+
+fn wiki(h: &Harness) -> Result<&MockDc, TestError> {
+    h.mock("wiki").ok_or_else(|| "no confluence mock".into())
+}
+
+/// P-01 for Confluence (§1.4 SC3): a ~5,000-word `confluence.page.get` (default Markdown, the four
+/// mentions resolved) and a small `confluence.page.update` diff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p01_confluence_page_and_update_diff_under_budget() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+
+    let storage = fixtures::confluence_page_5000_words(7);
+    mount_page(mock, "65537", &page_with_storage(&storage)).await;
+    let users: Vec<(&str, Option<&str>)> = fixtures::PAGE_5000_MENTION_KEYS
+        .iter()
+        .map(|k| (*k, Some("jdoe")))
+        .collect();
+    mount_users(mock, &users).await;
+    let id = queued(&h, "confluence.page.get", json!({ "id": "65537" })).await?;
+    let p = build_and_render(&h, &id, "confluence.page.get 5000 words")?;
+    let doc = render::document(&p, Platform::current());
+    assert!(
+        doc.contains("Release checklist"),
+        "the card shows the title"
+    );
+    assert!(doc.contains("Section 1"), "the card shows the body");
+
+    // A short page: two of its three paragraphs change.
+    let mut short =
+        page_with_storage("<p>Check the build.</p><p>Tag the release.</p><p>Notify the team.</p>");
+    short["id"] = json!("65538");
+    mount_page(mock, "65538", &short).await;
+    let id = queued(
+        &h,
+        "confluence.page.update",
+        json!({ "id": "65538", "base_version": 7,
+                "body": "Check the build twice.\n\nTag the release.\n\nNotify the whole team." }),
+    )
+    .await?;
+    let p = build_and_render(&h, &id, "confluence.page.update small diff")?;
+    let doc = render::document(&p, Platform::current());
+    assert!(
+        doc.contains("Release checklist"),
+        "the card shows the title"
+    );
+    assert!(
+        doc.contains("Check the build twice"),
+        "the diff shows the changed line"
+    );
+    Ok(())
+}
+
+/// T23 measurements (T15 m-3, T20a m-6), print-only, no bound: the card of a page update near
+/// the 16 MiB body limit and of a 10 MiB upload. Every enrichment builds the same card once more
+/// for the queue row's caution count (off the entry lock since T23b). Ignored (T23 review I-3):
+/// in a debug build it takes about a minute and waits up to 60 s for each enrichment, which must
+/// not make the enforced P-01 test red. Run it alone:
+/// `cargo test -p atlas-duck-core --features testing --test perf_sc3 -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "print-only measurement of the largest bodies; about a minute in a debug build"]
+async fn t23_largest_page_update_and_upload_measured() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    let mut big = page_with_storage(&"<p>Release note line.</p>".repeat(15 * 1024 * 1024 / 26));
+    big["id"] = json!("65539");
+    println!(
+        "perf_sc3 big page storage: {} bytes",
+        big["body"]["storage"]["value"].as_str().map_or(0, str::len)
+    );
+    mount_page(mock, "65539", &big).await;
+    let id = queued_within(
+        &h,
+        "confluence.page.update",
+        json!({ "id": "65539", "base_version": 7, "body": "Release note line." }),
+        "confluence.page.update ~15 MiB page",
+    )
+    .await?;
+    measure(&h, &id, "confluence.page.update ~15 MiB page")?;
+
+    mount_page(mock, "65537", &page_with_storage("<p>Attachments.</p>")).await;
+    mount_attachments(
+        mock,
+        "65537",
+        &json!({"results": [], "start": 0, "limit": 50, "size": 0, "_links": {}}),
+    )
+    .await;
+    let file: Vec<u8> = (0..10 * 1024 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    let id = queued_within(
+        &h,
+        "confluence.attachment.upload",
+        json!({ "id": "65537", "filename": "big.bin", "content_base64": STANDARD.encode(&file) }),
+        "confluence.attachment.upload 10 MiB",
+    )
+    .await?;
+    measure(&h, &id, "confluence.attachment.upload 10 MiB")?;
+    Ok(())
+}
+
+/// [`queued`] with a 60 s wait for the enrichment of a large body, printing its submit-to-queued
+/// time.
+async fn queued_within(
+    h: &Harness,
+    op: &str,
+    params: Value,
+    what: &str,
+) -> Result<String, TestError> {
+    let t = Instant::now();
+    let env = h.submit(op, params).await;
+    let id = request_id(&env)?;
+    h.queued(&id, 60_000).await.ok_or("never queued")?;
+    println!(
+        "perf_sc3 {what} submit to queued: {:.1} ms",
+        t.elapsed().as_secs_f64() * 1000.0
+    );
+    Ok(id)
+}
+
+/// Prints the open, the build and `render::document` of `id` (no bound: see
+/// [`build_and_render`] for the bounded form).
+fn measure(h: &Harness, id: &str, what: &str) -> Result<(), TestError> {
+    let decisions = h.decisions();
+    let t = Instant::now();
+    decisions.preview_fetch(id, None).map_err(de)?;
+    println!(
+        "perf_sc3 {what} open: {:.1} ms",
+        t.elapsed().as_secs_f64() * 1000.0
+    );
+    let t = Instant::now();
+    let built = decisions.preview_fetch(id, None).map_err(de)?;
+    println!(
+        "perf_sc3 {what} preview build: {:.1} ms",
+        t.elapsed().as_secs_f64() * 1000.0
+    );
+    let t = Instant::now();
+    let doc = render::document(&built.preview, Platform::current());
+    println!(
+        "perf_sc3 {what} render::document: {:.1} ms ({} bytes)",
+        t.elapsed().as_secs_f64() * 1000.0,
+        doc.len()
+    );
     Ok(())
 }
 

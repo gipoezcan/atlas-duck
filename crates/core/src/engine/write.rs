@@ -57,7 +57,7 @@ use super::read::{
 use super::{
     Engine, EntryState, InFlight, InstanceHttp, OnAuditFailure, RequestEntry, TransitionError,
 };
-use crate::edit::{EditedKeys, Edits};
+use crate::edit::{EditedKeys, Edits, is_not_inlined};
 use crate::gate::{AttentionKind, UiEvent};
 use crate::identity::{self, Lost};
 use crate::instances::InstanceState;
@@ -260,8 +260,17 @@ fn expectation(spec: &OperationSpec) -> SuccessExpectation {
     }
 }
 
-/// The exact request list for `params` and a `Preview` verdict (§5.1 inv. 3). The executor sees
-/// the verdict only when it is `Preview` (T18 as built).
+/// The holds whose card shows the request list (M7 Task 15, T8 review I-1): `Preview`, and the
+/// unapprovable `Conflict` and `Collision`, whose cards show what an approval would have sent
+/// (Δ2: "every write body keeps its `requests`"). Approvability stays `Preview`-only
+/// ([`approvable`]).
+pub(crate) fn renders_requests(hold: Hold) -> bool {
+    matches!(hold, Hold::Preview | Hold::Conflict | Hold::Collision)
+}
+
+/// The exact request list for `params` and a verdict whose hold shows requests (§5.1 inv. 3,
+/// [`renders_requests`]). The executor sees the verdict only then (T18 as built; Task 15 adds
+/// the two unapprovable holds); an executor may still need a `Preview` verdict and refuse.
 pub(crate) fn render(
     engine: &Engine,
     spec: &'static OperationSpec,
@@ -271,7 +280,7 @@ pub(crate) fn render(
     effective_max: Option<u32>,
 ) -> Result<Vec<HttpRequestSpec>, ExecError> {
     let op = op_table().get(spec.id).ok_or(ExecError::NotInThisBuild)?;
-    let enrichment = verdict.filter(|v| v.hold == Hold::Preview);
+    let enrichment = verdict.filter(|v| renders_requests(v.hold));
     match (op.executor)(&engine.exec_ctx(spec, params, base, enrichment, effective_max, None))? {
         ExecPlan::Write(requests) => Ok(requests),
         ExecPlan::Read(_) => Err(ExecError::NotInThisBuild),
@@ -533,7 +542,9 @@ pub(crate) fn choice_edits(
 /// read-only, then one pre-added input per missing required field of the latest verdict. A missing
 /// field that is a param of its own (a create's `description`) marks that param's input required
 /// instead (`fields.description` would duplicate the param, which validation refuses). Labels
-/// from the server are display-escaped; values are the params as they are.
+/// from the server are display-escaped; values are the params as they are, except a param the
+/// form never inlines (`edit::NOT_INLINED`, PD-110): read-only, value `null`, labelled with what
+/// it holds ([`file_content_label`]).
 pub(crate) fn edit_form(spec: &OperationSpec, w: &WriteState) -> EditForm {
     let schema = spec.params_schema_json();
     let required: Vec<&str> = schema
@@ -548,14 +559,24 @@ pub(crate) fn edit_form(spec: &OperationSpec, w: &WriteState) -> EditForm {
         .and_then(Value::as_object)
         .into_iter()
         .flatten()
-        .map(|(name, prop)| EditInput {
-            path: name.clone(),
-            label: name.clone(),
-            kind: param_kind(name, prop),
-            read_only: fixed(name),
-            required: required.contains(&name.as_str()),
-            pre_added: false,
-            value: w.params.get(name).cloned().unwrap_or(Value::Null),
+        .map(|(name, prop)| {
+            let opaque = is_not_inlined(spec, name);
+            EditInput {
+                path: name.clone(),
+                label: if opaque {
+                    file_content_label(w.params.get(name))
+                } else {
+                    name.clone()
+                },
+                kind: param_kind(name, prop),
+                read_only: fixed(name) || opaque,
+                required: required.contains(&name.as_str()),
+                pre_added: false,
+                value: match w.params.get(name) {
+                    Some(v) if !opaque => v.clone(),
+                    _ => Value::Null,
+                },
+            }
         })
         .collect();
     for f in &w.verdict.missing_fields {
@@ -577,17 +598,169 @@ pub(crate) fn edit_form(spec: &OperationSpec, w: &WriteState) -> EditForm {
     EditForm { inputs }
 }
 
-/// The queue row's "caution (N)" of the current revision (§5.6).
-fn refresh_caution(st: &mut EntryState, spec: &'static OperationSpec, alias: &str) {
-    let (Phase::AwaitingApproval(hold), Some(w)) = (st.model.phase(), st.write.as_ref()) else {
-        return;
-    };
+/// plan text (PD-110): the label of a not-inlined input (the upload's `content_base64`), naming
+/// the decoded file's size and the first 8 hex of its SHA-256 (`confluence_ext::file_digest`, the
+/// Request tab's facts too).
+fn file_content_label(value: Option<&Value>) -> String {
+    const NOT_EDITABLE: &str = "not editable here; deny and resubmit to change it";
+    match value.and_then(crate::ops::confluence_ext::file_digest) {
+        Some((len, sha)) => format!(
+            "file content ({len} bytes, SHA-256 {}…): {NOT_EDITABLE}",
+            sha.get(..8).unwrap_or(&sha)
+        ),
+        None => format!("file content: {NOT_EDITABLE}"),
+    }
+}
+
+/// The queue row's "caution (N)" of `w` in `hold` (§5.6): the Caution warnings of the card the
+/// previewer builds. A whole card (seconds for a body near `PAGE_BODY_LIMIT` in a debug build,
+/// T23), so it never runs under the entry lock (T23b): see [`caution_off_lock`].
+fn caution_of(spec: &'static OperationSpec, alias: &str, w: &WriteState, hold: Hold) -> u32 {
     let n = preview_model(spec, alias, w, hold, None)
         .warnings
         .iter()
         .filter(|w| w.level == Level::Caution)
         .count();
-    st.caution_count = u32::try_from(n).unwrap_or(u32::MAX);
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// A caution count built off the entry lock and what it was built for (T23b): the revision and
+/// candidate the entry was at when its write state was read, and the hold it was counted in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Caution {
+    pub count: u32,
+    pub hold: Hold,
+    pub rev: u64,
+    pub candidate_hash: [u8; 32],
+}
+
+impl Caution {
+    /// Stores the count in a closure that applies an event bumping the revision by one (`Enriched`,
+    /// `Edit`), called before the closure sets a new candidate hash: only if the entry was still
+    /// at the revision and candidate the count was built from and is now in its hold. Otherwise
+    /// nothing is stored and `false` tells the caller to [`recount`].
+    fn store_bumped(self, st: &mut EntryState, hash_before: [u8; 32]) -> bool {
+        let current = st.model.rev() == self.rev.saturating_add(1)
+            && hash_before == self.candidate_hash
+            && st.model.phase() == Phase::AwaitingApproval(self.hold);
+        if current {
+            st.caution_count = self.count;
+        }
+        current
+    }
+}
+
+/// The test hold of a caution build (`TestHooks::hold_caution_build`); nothing in a release.
+#[cfg(feature = "testing")]
+#[derive(Clone)]
+struct BuildHook(Option<Arc<crate::core::BuildPause>>);
+#[cfg(not(feature = "testing"))]
+#[derive(Clone)]
+struct BuildHook;
+
+impl BuildHook {
+    #[cfg(feature = "testing")]
+    fn of(engine: &Engine) -> BuildHook {
+        BuildHook(engine.hooks.hold_caution_build.clone())
+    }
+
+    #[cfg(not(feature = "testing"))]
+    fn of(_: &Engine) -> BuildHook {
+        BuildHook
+    }
+
+    /// Holds this blocking thread while a test's armed pause says so; whether it held.
+    #[cfg(feature = "testing")]
+    fn hold(&self) -> bool {
+        self.0.as_ref().is_some_and(|p| p.hold())
+    }
+
+    #[cfg(not(feature = "testing"))]
+    fn hold(&self) -> bool {
+        false
+    }
+
+    /// The flow of a held build stored or dropped its result (`BuildPause::settled`).
+    #[cfg(feature = "testing")]
+    fn settled(&self, held: bool) {
+        if let Some(pause) = self.0.as_ref().filter(|_| held) {
+            pause.settled.notify_one();
+        }
+    }
+
+    #[cfg(not(feature = "testing"))]
+    fn settled(&self, _: bool) {}
+}
+
+/// [`caution_of`] on a blocking thread, off every lock (T23b), so neither the entry lock nor an
+/// async worker waits for the card. `w` comes back unchanged (moved, not copied); the count is
+/// `None` if the build did not finish (a panic in the previewer), and the caller stores nothing.
+/// The `bool`: a test's `BuildPause` held this build.
+async fn caution_off_lock(
+    engine: &Engine,
+    spec: &'static OperationSpec,
+    alias: String,
+    w: WriteState,
+    hold: Hold,
+) -> (WriteState, Option<u32>, bool) {
+    let w = Arc::new(w);
+    let (basis, hook) = (w.clone(), BuildHook::of(engine));
+    let built = tokio::task::spawn_blocking(move || {
+        let held = hook.hold();
+        (caution_of(spec, &alias, &basis, hold), held)
+    })
+    .await
+    .ok();
+    // The blocking closure dropped its handle when it returned (or unwound).
+    let w = Arc::try_unwrap(w).unwrap_or_else(|w| (*w).clone());
+    match built {
+        Some((n, held)) => (w, Some(n), held),
+        None => (w, None, false),
+    }
+}
+
+/// T23b: the queue row's caution count of the entry's current revision, built off the entry
+/// lock: the write state is read under it, the card is built on a blocking thread, and the count
+/// is stored only if the entry is still at that revision and candidate (`rev` and
+/// `candidate_hash`) in that hold. A newer revision's own path counts it, so a result for an
+/// older one is dropped, never stored. Until the count is stored the row shows the previous
+/// revision's count; the card itself (`write_preview`) is always built fresh from the current
+/// revision, and approvability never reads the count.
+pub(crate) async fn recount(engine: &Engine, entry: &RequestEntry) {
+    let basis = {
+        let st = entry.state();
+        match (st.model.phase(), st.write.as_ref()) {
+            (Phase::AwaitingApproval(hold), Some(w)) => {
+                Some((w.clone(), hold, st.model.rev(), st.candidate_hash))
+            }
+            _ => None,
+        }
+    };
+    let Some((w, hold, rev, candidate_hash)) = basis else {
+        return;
+    };
+    let alias = entry.head.instance.clone();
+    let (_, count, held) = caution_off_lock(engine, entry.spec, alias, w, hold).await;
+    let stored = count.is_some_and(|n| {
+        let mut st = entry.state();
+        let current = st.model.rev() == rev
+            && st.candidate_hash == candidate_hash
+            && st.model.phase() == Phase::AwaitingApproval(hold);
+        if current {
+            st.caution_count = n;
+        }
+        current
+    });
+    BuildHook::of(engine).settled(held);
+    if stored {
+        queue_changed(engine, entry);
+    }
+}
+
+/// [`recount`] as a task of its own: a closure that could not store its precomputed count
+/// starts it (it runs once that closure released the lock).
+fn recount_later(engine: Arc<Engine>, entry: Arc<RequestEntry>) {
+    tokio::spawn(async move { recount(&engine, &entry).await });
 }
 
 /// The instance's stored identity, if it has a usable PAT (§5.1 inv. 6; Task 26 adds the
@@ -687,8 +860,21 @@ impl Engine {
     pub(crate) async fn append_pending(
         self: &Arc<Self>,
         entry: &Arc<RequestEntry>,
+        evs: Vec<NewEvent>,
+        approval: Option<Approval>,
+    ) -> bool {
+        self.append_pending_then(entry, evs, approval, || {}).await
+    }
+
+    /// [`Engine::append_pending`] that runs `committed` once the records committed, still under
+    /// the entry gate: a cancel sees the state from before the append or the one `committed`
+    /// left, never one between them.
+    pub(crate) async fn append_pending_then(
+        self: &Arc<Self>,
+        entry: &Arc<RequestEntry>,
         mut evs: Vec<NewEvent>,
         approval: Option<Approval>,
+        committed: impl FnOnce(),
     ) -> bool {
         let _gate = entry.gate.clone().lock_owned().await;
         {
@@ -711,6 +897,7 @@ impl Engine {
             return false;
         }
         entry.take_parked();
+        committed();
         true
     }
 
@@ -1141,7 +1328,8 @@ fn attention(engine: &Engine, kind: AttentionKind) {
 /// ("the user may approve again later", §5.4 step 5). Every other return stays not approvable
 /// (review I-2): a refresh decides at its `Enriched`, `instance_changed` waits for the new PAT,
 /// an identity mismatch for a matching identity call. The control of the GET or send it
-/// replaces is cancelled. `approval`: the stale-check task making the return (review I-1).
+/// replaces is cancelled, and the row's caution count follows off the lock ([`recount`]).
+/// `approval`: the stale-check task making the return (review I-1).
 async fn stale_return(
     engine: &Arc<Engine>,
     entry: &Arc<RequestEntry>,
@@ -1152,7 +1340,6 @@ async fn stale_return(
     approval: Option<Approval>,
 ) -> Result<Applied, TransitionError> {
     let credential = stored_identity(engine, entry).await.is_some();
-    let (spec, alias) = (entry.spec, entry.head.instance.clone());
     let (eng, id) = (engine.clone(), entry.instance_id.clone());
     let recompute = returned == Returned::RecheckFailed && !refresh;
     let pending = Arc::new(std::sync::Mutex::new(None));
@@ -1186,9 +1373,6 @@ async fn stale_return(
                 *pending_out
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = missed;
-                if !refreshing {
-                    refresh_caution(st, spec, &alias);
-                }
             },
             bound(approval),
         )
@@ -1213,6 +1397,10 @@ async fn stale_return(
             // A task of its own: `follow_pending` can return the write again (recursion).
             tokio::spawn(follow_task(engine.clone(), entry.clone(), missed));
         }
+        // T23b: the row's caution count of the hold the write is back in, built off the entry
+        // lock after the return (none while a refresh runs: its `Enriched` counts). A task of its
+        // own: the caller (`instance_changed` walks every queued write) does not wait for a build.
+        recount_later(engine.clone(), entry.clone());
     }
     applied
 }
@@ -1380,6 +1568,22 @@ pub(super) async fn gate_get(
     let Some(trigger) = identity::trigger(&outcome) else {
         return Gated::Proceed(outcome);
     };
+    match gate_trigger(engine, instance_id, seen, trigger, mode, allow_rerun).await {
+        Some(gated) => gated,
+        None => Gated::Proceed(identity::as_response(outcome)),
+    }
+}
+
+/// [`gate_get`] once the GET is a trigger: the re-check and its [`identity::effect`]; `None` is
+/// a JSON 401 the re-check passed (the GET's answer is an ordinary one).
+async fn gate_trigger(
+    engine: &Arc<Engine>,
+    instance_id: &str,
+    seen: u64,
+    trigger: identity::Trigger,
+    mode: GetMode,
+    allow_rerun: bool,
+) -> Option<Gated> {
     let effect = if allow_rerun {
         let path = match mode {
             GetMode::Enrich => identity::Path::Enrichment,
@@ -1391,8 +1595,8 @@ pub(super) async fn gate_get(
         identity::Effect::HeaderCheckFailed
     };
     let enrich = mode == GetMode::Enrich;
-    match effect {
-        identity::Effect::Ordinary => Gated::Proceed(identity::as_response(outcome)),
+    Some(match effect {
+        identity::Effect::Ordinary => return None,
         identity::Effect::Refetch => Gated::Rerun,
         identity::Effect::HeaderCheckFailed if enrich => {
             Gated::Held(Effect::Direct(identity_unavailable()))
@@ -1410,7 +1614,7 @@ pub(super) async fn gate_get(
         }
         identity::Effect::NeedsToken if enrich => Gated::Held(Effect::Direct(needs_token_direct())),
         identity::Effect::NeedsToken => Gated::Stale((StaleReason::IdentityMismatch, None)),
-    }
+    })
 }
 
 /// An instance already `needs_token` or in an identity-header state is not called (PD-03):
@@ -1620,7 +1824,7 @@ pub(super) fn recheck(outcome: FetchOutcome) -> Result<Value, Recheck> {
 }
 
 /// The resolved path and query of a GET, for `PREVIEW_FETCH.path`.
-pub(super) fn call_path(base: &NormalizedBaseUrl, call: &GetCall) -> String {
+pub(crate) fn call_path(base: &NormalizedBaseUrl, call: &GetCall) -> String {
     match build_url(base, &call.endpoint_template, &call.params, &call.query) {
         Ok(u) => match u.query() {
             Some(q) => format!("{}?{q}", u.path()),
@@ -1632,7 +1836,7 @@ pub(super) fn call_path(base: &NormalizedBaseUrl, call: &GetCall) -> String {
 
 /// `PREVIEW_FETCH {purpose, method, path, status, response | outcome}` of one GET, with every
 /// byte received (§5.4 step 2); a GET that was refused or never left names its `class`.
-pub(super) fn get_record(
+pub(crate) fn get_record(
     ctx: &EventCtx,
     purpose: PreviewFetchPurpose,
     base: &NormalizedBaseUrl,
@@ -1810,7 +2014,7 @@ async fn enrich(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
         None => (EnrichVerdict::preview(Value::Null, Map::new()), None),
     };
     let effective_max = entry.validated.as_ref().and_then(|v| v.effective_max);
-    let rendered = if verdict.hold == Hold::Preview {
+    let rendered = if renders_requests(verdict.hold) {
         render(
             engine,
             spec,
@@ -1824,6 +2028,9 @@ async fn enrich(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
     };
     let (verdict, failure, requests) = match rendered {
         Ok(requests) => (verdict, None, requests),
+        // T8 review I-1: an unapprovable hold keeps its card when its list cannot be built (it
+        // shows no requests section); only a `Preview` becomes "unrenderable".
+        Err(_) if verdict.hold != Hold::Preview => (verdict, None, Vec::new()),
         Err(_) => (
             EnrichVerdict::unusable(),
             Some(Failure {
@@ -1842,7 +2049,7 @@ async fn enrich(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
 
 /// The GET finished and its record is built: park it until an append commits it, so a cancel or
 /// expiry in between still logs it (Task 24 review I-2).
-pub(super) async fn park(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, record: &NewEvent) {
+pub(crate) async fn park(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, record: &NewEvent) {
     entry.park_record(record);
     #[cfg(feature = "testing")]
     if let Some(pause) = engine.hooks.pause_after_get.clone() {
@@ -1940,11 +2147,46 @@ async fn enriched(
     let hash = list_hash(&requests);
     let credential = stored_identity(engine, entry).await.is_some();
     let (eng, id) = (engine.clone(), entry.instance_id.clone());
-    let (spec, alias) = (entry.spec, entry.head.instance.clone());
-    let refresh = entry.state().model.refreshing();
+    // T23b: the row's caution count of the new revision, built here off the entry lock from the
+    // write as the verdict leaves it. While `Enriching` nothing else changes the write (an edit,
+    // a decision and an instance change are refused or deferred; a cancel or an expiry makes
+    // `Enriched` illegal), so the params and return reason read now are the ones the closure
+    // keeps; the closure checks the revision and candidate it was built from all the same.
+    let (refresh, basis) = {
+        let st = entry.state();
+        let basis = st.write.as_ref().map(|w| {
+            let mut next = WriteState::new(w.params.clone());
+            next.returned = w.returned.clone();
+            (next, st.model.rev(), st.candidate_hash)
+        });
+        (st.model.refreshing(), basis)
+    };
+    let (verdict, failure, requests, caution) = match basis {
+        Some((next, rev, candidate_hash)) => {
+            let next = WriteState {
+                verdict,
+                failure,
+                requests,
+                ..next
+            };
+            let alias = entry.head.instance.clone();
+            let (next, count, _) = caution_off_lock(engine, entry.spec, alias, next, hold).await;
+            let caution = count.map(|count| Caution {
+                count,
+                hold,
+                rev,
+                candidate_hash,
+            });
+            (next.verdict, next.failure, next.requests, caution)
+        }
+        None => (verdict, failure, requests, None),
+    };
+    let (eng_later, entry_later) = (engine.clone(), entry.clone());
     let pending = Arc::new(std::sync::Mutex::new(None));
     let pending_out = pending.clone();
     let apply = move |st: &mut EntryState| {
+        let before = st.candidate_hash;
+        let stored = caution.is_some_and(|c| c.store_bumped(st, before));
         st.candidate_hash = hash;
         if let Some(w) = st.write.as_mut() {
             w.verdict = verdict;
@@ -1954,7 +2196,9 @@ async fn enriched(
         let missed = take_pending(st);
         let ok = missed.is_none() && approvable(st, pat_now(&eng, &id, credential));
         st.model.set_approvable(ok);
-        refresh_caution(st, spec, &alias);
+        if !stored && matches!(st.model.phase(), Phase::AwaitingApproval(_)) {
+            recount_later(eng_later, entry_later);
+        }
         *pending_out
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = missed;
@@ -2029,26 +2273,43 @@ pub(crate) fn identity_call(product: Product) -> GetCall {
     }
 }
 
+/// What the identity call's answer showed (§5.4 step 5, §7.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityCall {
+    Match,
+    /// Confluence: the stored `userKey` under another `username` (§7.1 *Username rename*).
+    Renamed,
+}
+
 /// An identity match (§5.4 step 5, §7.1): Jira 200 JSON whose `key` is the stored user key (the
-/// client already checked `X-AUSERNAME` against the stored name); Confluence 200 JSON with
-/// `type == "known"` and the stored `userKey`. A parsed answer that is not a match is
+/// client already checked `X-AUSERNAME` against the stored name); Confluence 200 JSON judged by
+/// the re-check's own rule (`type == "known"`, a `username`, the stored `userKey`; L99), where
+/// the stored key under another `username` is a rename. A parsed answer that is not a match is
 /// `identity_mismatch`; anything else is `recheck_failed {class}`.
-fn identity_check(outcome: FetchOutcome, product: Product, user_key: &str) -> Result<(), Recheck> {
+fn identity_check(
+    outcome: FetchOutcome,
+    product: Product,
+    stored: &StoredIdentity,
+) -> Result<IdentityCall, Recheck> {
+    const MISMATCH: Recheck = (StaleReason::IdentityMismatch, None);
     // §7.1: a match is a 200; another parsed 2xx JSON answer is not one (review M-4).
     let ok_status = matches!(&outcome, FetchOutcome::Response(r) if r.status == 200);
     let v = recheck(outcome)?;
-    let matched = ok_status
-        && match product {
-            Product::Jira => v.get("key").and_then(Value::as_str) == Some(user_key),
-            Product::Confluence => {
-                v.get("type").and_then(Value::as_str) == Some("known")
-                    && v.get("userKey").and_then(Value::as_str) == Some(user_key)
-            }
-        };
-    if matched {
-        Ok(())
-    } else {
-        Err((StaleReason::IdentityMismatch, None))
+    if !ok_status {
+        return Err(MISMATCH);
+    }
+    match product {
+        Product::Jira
+            if v.get("key").and_then(Value::as_str) == Some(&stored.atlassian_user_key) =>
+        {
+            Ok(IdentityCall::Match)
+        }
+        Product::Jira => Err(MISMATCH),
+        Product::Confluence => match identity::judge_confluence_body(&v, stored) {
+            identity::RecheckResult::IdentityMatch => Ok(IdentityCall::Match),
+            identity::RecheckResult::Renamed { .. } => Ok(IdentityCall::Renamed),
+            _ => Err(MISMATCH),
+        },
     }
 }
 
@@ -2114,10 +2375,6 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
         stale_fail(engine, entry, approval, None, fail).await;
         return;
     }
-    let Some(identity) = stored_identity(engine, entry).await else {
-        stale_fail(engine, entry, approval, None, recheck_failed("needs_token")).await;
-        return;
-    };
     let Ok(cover) = engine.covers().for_request(&entry.head.request_id) else {
         stale_fail(engine, entry, approval, None, recheck_failed("internal")).await;
         return;
@@ -2133,6 +2390,13 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
     let mut attempt = 0u8;
     let mut last = loop {
         let seen = engine.identity_epoch(&entry.instance_id);
+        // Loaded after `seen`, on every run (T21 review I-1): a re-run is judged against the name
+        // a re-check just stored, and a rename stored after this load bumps the epoch past
+        // `seen`, so the re-check it triggers answers that rename.
+        let Some(identity) = stored_identity(engine, entry).await else {
+            stale_fail(engine, entry, approval, None, recheck_failed("needs_token")).await;
+            return;
+        };
         ctl.begin_call();
         entry.set_in_flight(Some(InFlight {
             purpose,
@@ -2161,10 +2425,39 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
                     return;
                 }
             }
-            Gated::Proceed(outcome) => {
-                if let Err(fail) =
-                    identity_check(outcome, spec.product, &identity.atlassian_user_key)
-                {
+            Gated::Proceed(outcome) => match identity_check(outcome, spec.product, &identity) {
+                Ok(IdentityCall::Match) => break record,
+                // §7.1 *Username rename* (L99): the token re-check confirms the rename and stores
+                // the new name, then the identity call runs once more, as after a Jira header
+                // check; it is judged against the name stored now (loaded at the loop's top).
+                Ok(IdentityCall::Renamed) => {
+                    let gated = gate_trigger(
+                        engine,
+                        &entry.instance_id,
+                        seen,
+                        identity::Trigger::HeaderCheck,
+                        GetMode::Recheck,
+                        attempt == 0,
+                    )
+                    .await;
+                    let fail = match gated {
+                        Some(Gated::Rerun) => {
+                            attempt += 1;
+                            if !engine
+                                .append_pending(entry, vec![record], Some(approval))
+                                .await
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+                        Some(Gated::Stale(fail)) => fail,
+                        _ => (StaleReason::IdentityMismatch, None),
+                    };
+                    stale_fail(engine, entry, approval, Some(record), fail).await;
+                    return;
+                }
+                Err(fail) => {
                     // A parsed answer for another user (or an anonymous one) is the §7.1
                     // trigger the identity call itself is the only place to notice for
                     // Confluence: the token re-check runs and decides the instance state.
@@ -2174,8 +2467,7 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
                     stale_fail(engine, entry, approval, Some(record), fail).await;
                     return;
                 }
-                break record;
-            }
+            },
             Gated::Stale(fail) => {
                 stale_fail(engine, entry, approval, Some(record), fail).await;
                 return;
@@ -2628,6 +2920,9 @@ async fn settle_execution(
 pub(crate) struct Snapshot {
     pub write: WriteState,
     pub hold: Option<Hold>,
+    /// The revision and candidate the entry was at (T23b: what an edit's caution count is for).
+    pub rev: u64,
+    pub candidate_hash: [u8; 32],
 }
 
 pub(crate) fn snapshot(entry: &RequestEntry) -> Option<Snapshot> {
@@ -2636,25 +2931,63 @@ pub(crate) fn snapshot(entry: &RequestEntry) -> Option<Snapshot> {
         Phase::AwaitingApproval(h) => Some(h),
         _ => None,
     };
-    st.write.clone().map(|write| Snapshot { write, hold })
+    st.write.clone().map(|write| Snapshot {
+        write,
+        hold,
+        rev: st.model.rev(),
+        candidate_hash: st.candidate_hash,
+    })
+}
+
+/// T23b: the caution count of an edit that does not re-enrich (`rendered`), built off the entry
+/// lock from `snap` as the edit leaves it: the edited params, the re-rendered list, no return
+/// reason, the same hold. `params` and `rendered` come back unchanged. `None` for an edit that
+/// re-enriches (its `Enriched` counts) or when the build did not finish.
+pub(crate) async fn edit_caution(
+    engine: &Engine,
+    entry: &RequestEntry,
+    snap: Snapshot,
+    params: Value,
+    rendered: Option<Vec<HttpRequestSpec>>,
+) -> (Value, Option<Vec<HttpRequestSpec>>, Option<Caution>) {
+    let (hold, requests) = match (snap.hold, rendered) {
+        (Some(hold), Some(requests)) => (hold, requests),
+        (_, rendered) => return (params, rendered, None),
+    };
+    let next = WriteState {
+        params,
+        requests,
+        returned: None,
+        ..snap.write
+    };
+    let alias = entry.head.instance.clone();
+    let (next, count, _) = caution_off_lock(engine, entry.spec, alias, next, hold).await;
+    let caution = count.map(|count| Caution {
+        count,
+        hold,
+        rev: snap.rev,
+        candidate_hash: snap.candidate_hash,
+    });
+    (next.params, Some(next.requests), caution)
 }
 
 /// The new revision of an edit that does not re-enrich, applied with the `Edit` event: the list
-/// rendered from the edited params and the latest verdict (§5.4 step 4, inv. 5).
+/// rendered from the edited params and the latest verdict (§5.4 step 4, inv. 5), and its caution
+/// count from [`edit_caution`] (T23b: built before, off the lock; counted again off the lock if
+/// the entry is no longer at the revision it was built for).
 pub(crate) fn edit_apply(
     engine: Arc<Engine>,
-    entry: &RequestEntry,
+    entry: &Arc<RequestEntry>,
     params: Value,
     view: EditView,
     rendered: Option<Vec<HttpRequestSpec>>,
     credential: bool,
+    caution: Option<Caution>,
 ) -> impl FnOnce(&mut EntryState) + Send + 'static {
-    let (spec, alias, instance_id) = (
-        entry.spec,
-        entry.head.instance.clone(),
-        entry.instance_id.clone(),
-    );
+    let (later, instance_id) = (entry.clone(), entry.instance_id.clone());
     move |st: &mut EntryState| {
+        let before = st.candidate_hash;
+        let stored = caution.is_some_and(|c| c.store_bumped(st, before));
         if let Some(w) = st.write.as_mut() {
             w.params = params;
             w.edit = Some(view);
@@ -2670,7 +3003,10 @@ pub(crate) fn edit_apply(
         }
         let ok = approvable(st, pat_now(&engine, &instance_id, credential));
         st.model.set_approvable(ok);
-        refresh_caution(st, spec, &alias);
+        // A re-enriching edit is `Enriching`: its `Enriched` counts.
+        if !stored && matches!(st.model.phase(), Phase::AwaitingApproval(_)) {
+            recount_later(engine, later);
+        }
     }
 }
 
@@ -2910,29 +3246,137 @@ mod tests {
 
     #[test]
     fn identity_match_rules() {
+        let stored = StoredIdentity {
+            atlassian_user: "jdoe".into(),
+            atlassian_user_key: "JIRAUSER1".into(),
+        };
         let ok = |body: &str, product| {
             identity_check(
                 FetchOutcome::Response(resp(200, "application/json", body.as_bytes())),
                 product,
-                "JIRAUSER1",
+                &stored,
             )
         };
-        assert_eq!(ok(r#"{"key":"JIRAUSER1"}"#, Product::Jira), Ok(()));
+        assert_eq!(
+            ok(r#"{"key":"JIRAUSER1"}"#, Product::Jira),
+            Ok(IdentityCall::Match)
+        );
         assert_eq!(
             ok(r#"{"key":"JIRAUSER9"}"#, Product::Jira),
             Err((StaleReason::IdentityMismatch, None))
         );
         assert_eq!(
             ok(
+                r#"{"type":"known","username":"jdoe","userKey":"JIRAUSER1"}"#,
+                Product::Confluence
+            ),
+            Ok(IdentityCall::Match)
+        );
+        // §7.1 (review M-4): a match is a 200, never another parsed 2xx.
+        for (body, product) in [
+            (r#"{"key":"JIRAUSER1"}"#, Product::Jira),
+            (
+                r#"{"type":"known","username":"jdoe","userKey":"JIRAUSER1"}"#,
+                Product::Confluence,
+            ),
+        ] {
+            assert_eq!(
+                identity_check(
+                    FetchOutcome::Response(resp(201, "application/json", body.as_bytes())),
+                    product,
+                    &stored,
+                ),
+                Err((StaleReason::IdentityMismatch, None))
+            );
+        }
+        // L99: without a `username` the re-check sees no user; the identity call agrees.
+        assert_eq!(
+            ok(
                 r#"{"type":"known","userKey":"JIRAUSER1"}"#,
                 Product::Confluence
             ),
-            Ok(())
+            Err((StaleReason::IdentityMismatch, None))
         );
         assert_eq!(
             ok(r#"{"type":"anonymous"}"#, Product::Confluence),
             Err((StaleReason::IdentityMismatch, None))
         );
+    }
+
+    /// L99 (L153, plan review I-10): the same `user/current` answers give the same verdict class
+    /// through the pre-write identity call and through the re-check's `judge_confluence`.
+    #[test]
+    fn l99_confluence_identity_call_and_recheck_agree() {
+        let stored = StoredIdentity {
+            atlassian_user: "jdoe".into(),
+            atlassian_user_key: "JIRAUSER1".into(),
+        };
+        let answer = |body: &Value| {
+            FetchOutcome::Response(resp(200, "application/json", body.to_string().as_bytes()))
+        };
+        let known =
+            |name: &str, key: &str| json!({"type": "known", "username": name, "userKey": key});
+        let cases = [
+            (
+                "known, same key, same name",
+                known("jdoe", "JIRAUSER1"),
+                "match",
+            ),
+            ("known, other key", known("bob", "JIRAUSER9"), "mismatch"),
+            ("anonymous", json!({"type": "anonymous"}), "mismatch"),
+            (
+                "known, no userKey",
+                json!({"type": "known", "username": "jdoe"}),
+                "mismatch",
+            ),
+            (
+                "known, same key, no username",
+                json!({"type": "known", "userKey": "JIRAUSER1"}),
+                "mismatch",
+            ),
+            (
+                "known, same key, other username",
+                known("jdoe2", "JIRAUSER1"),
+                "rename",
+            ),
+            (
+                "known, same key, the name in another case",
+                known(" JDoe ", "JIRAUSER1"),
+                "match",
+            ),
+            // T21 review M-1: a name no stored name can match is no rename either.
+            (
+                "known, same key, blank username",
+                known("  ", "JIRAUSER1"),
+                "mismatch",
+            ),
+            (
+                "known, same key, username anonymous",
+                known("Anonymous", "JIRAUSER1"),
+                "mismatch",
+            ),
+            (
+                "known, same key, undecodable username",
+                known("jdoe%E0", "JIRAUSER1"),
+                "mismatch",
+            ),
+        ];
+        for (what, body, want) in cases {
+            use identity::RecheckResult as R;
+            let recheck = match identity::judge(Product::Confluence, &answer(&body), &stored) {
+                R::IdentityMatch => "match".to_owned(),
+                R::Renamed { .. } => "rename".to_owned(),
+                R::TokenFailure { .. } => "mismatch".to_owned(),
+                other => format!("{other:?}"),
+            };
+            let call = match identity_check(answer(&body), Product::Confluence, &stored) {
+                Ok(IdentityCall::Match) => "match".to_owned(),
+                Ok(IdentityCall::Renamed) => "rename".to_owned(),
+                Err((StaleReason::IdentityMismatch, None)) => "mismatch".to_owned(),
+                Err(other) => format!("{other:?}"),
+            };
+            assert_eq!((recheck.as_str(), call.as_str()), (want, want), "{what}");
+        }
     }
 
     #[test]
