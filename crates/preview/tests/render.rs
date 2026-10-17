@@ -1940,10 +1940,14 @@ proptest! {
     }
 }
 
+/// Changes a script body's source, provenance, logs and stderr.
+type ScriptEdit<'a> =
+    &'a dyn Fn(&mut String, &mut Vec<ProvenanceRow>, &mut Vec<String>, &mut String);
+
 #[test]
 fn doc_caps_note_for_long_logs() {
     let base = script_preview(ScriptItemKind::Result);
-    let with = |f: &dyn Fn(&mut String, &mut Vec<ProvenanceRow>, &mut Vec<String>, &mut String)| {
+    let with = |f: ScriptEdit<'_>| {
         let mut p = base.clone();
         if let PreviewBody::Script {
             source,
