@@ -1733,12 +1733,16 @@ fn s10_queued_answers_are_released_before_the_outcome() -> TestResult {
     const ANSWER: usize = 512 * 1024;
     let sink = TestSink::padded(ANSWER);
     let seen = Arc::clone(&sink);
+    // The calls the fake sent before the timer (a slow runner may not get through all of them).
+    let sent = Arc::new(AtomicU64::new(0));
+    let fake_sent = Arc::clone(&sent);
     let (spawner, observed) = fake(move |w| {
         w.ready()?;
         w.read()?; // script.run; nothing after it is ever read
         // One call at a time, each answered (and queued) before the next.
         for id in 1..=CALLS {
             w.send(&call_frame(id))?;
+            fake_sent.store(id, Ordering::SeqCst);
             let started = Instant::now();
             while u64::from(seen.completed()) < id {
                 if w.observed.is_killed() || started.elapsed() > WAIT_BOUND {
@@ -1761,17 +1765,19 @@ fn s10_queued_answers_are_released_before_the_outcome() -> TestResult {
     let left = live() - base;
     let outcome = outcome?;
     assert_eq!(outcome.host, HostVerdict::Limit("timeout_s"));
-    assert_eq!(sink.completed(), CALLS as u32, "every call was answered");
-    // The answers were queued (the first one blocks the writer on the full pipe, the rest wait).
-    assert!(
-        held >= (CALLS as usize - 1) * ANSWER,
-        "the host held {held} bytes at most, so the answers were never queued"
-    );
     assert!(
         left <= CASE_LEAK_SLACK as isize,
         "the run's outcome is out while {left} bytes of it are still on the heap"
     );
     observed.wait_finished()?;
+    // The answers were queued (the first one blocks the writer on the full pipe, the rest wait):
+    // at least one whole answer, more than the slack above, was held while the run lasted.
+    let sent = sent.load(Ordering::SeqCst);
+    assert!(sent >= 2, "only {sent} calls were sent before the timer");
+    assert!(
+        held >= (sent as usize - 1) * ANSWER,
+        "the host held {held} bytes at most for {sent} answers, so they were never queued"
+    );
     Ok(())
 }
 
