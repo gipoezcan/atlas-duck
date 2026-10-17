@@ -50,17 +50,25 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// How long a poller waits, by the clock (T21 review I-2: a count of polls is no bound when each
+/// poll gets slower).
+const WAIT: Duration = Duration::from_secs(30);
+
 /// The queue item once its revision moved past `rev`.
 async fn item_after(h: &Harness, id: &str, rev: u64) -> Result<QueueItem, TestError> {
-    for _ in 0..1200 {
-        if let Some(item) = h.approver().item(id)
-            && item.candidate_rev.counter > rev
-        {
-            return Ok(item);
+    let advanced = async {
+        loop {
+            if let Some(item) = h.approver().item(id)
+                && item.candidate_rev.counter > rev
+            {
+                return item;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    Err("the revision never advanced".into())
+    };
+    tokio::time::timeout(WAIT, advanced)
+        .await
+        .map_err(|_| "the revision never advanced".into())
 }
 
 /// The payloads of `id`'s records of type `t`, in order.
@@ -563,14 +571,18 @@ async fn opened(h: &Harness, row: &Row) -> Result<(String, u64), TestError> {
 
 /// The `WRITE_STALE` records of `id` once there are `n`, `null` members left out.
 async fn stale_records(h: &Harness, id: &str, n: usize) -> Result<Vec<Value>, TestError> {
-    let mut stale = Vec::new();
-    for _ in 0..1200 {
-        stale = payloads(h, id, EventType::WRITE_STALE).await?;
-        if stale.len() >= n {
-            break;
+    let enough = async {
+        loop {
+            let stale = payloads(h, id, EventType::WRITE_STALE).await?;
+            if stale.len() >= n {
+                return Ok::<_, TestError>(stale);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    };
+    let stale = tokio::time::timeout(WAIT, enough)
+        .await
+        .map_err(|_| format!("fewer than {n} WRITE_STALE records"))??;
     Ok(stale
         .into_iter()
         .map(|mut p| {
@@ -802,6 +814,44 @@ async fn update_with_identity_answers(
     Ok((router, h, id, rev))
 }
 
+/// The `GET user/current` requests the router saw: identity calls and token re-checks.
+fn identity_gets(router: &Router) -> usize {
+    let key = format!("GET {IDENTITY}");
+    router.hits().iter().filter(|h| **h == key).count()
+}
+
+/// Runs a rename test's `checks` bounded (T21 review I-2): they fail, instead of hanging, after
+/// [`WAIT`] twice or as soon as the router saw more than `max` `user/current` GETs (an identity
+/// call re-run without bound).
+async fn bounded(
+    router: &Router,
+    max: usize,
+    checks: impl std::future::Future<Output = TestResult>,
+) -> TestResult {
+    let runaway = async {
+        loop {
+            let n = identity_gets(router);
+            if n > max {
+                return n;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::select! {
+        done = tokio::time::timeout(2 * WAIT, checks) => done.map_err(|_| "the checks timed out")?,
+        n = runaway => Err(format!("{n} user/current GETs, at most {max} expected").into()),
+    }
+}
+
+/// The `INSTANCE_STATE_CHANGED {user_renamed}` records.
+async fn renames(h: &Harness) -> Result<Vec<Value>, TestError> {
+    Ok(h.events_of(EventType::INSTANCE_STATE_CHANGED)
+        .await?
+        .into_iter()
+        .filter(|c| c["state"] == "user_renamed")
+        .collect())
+}
+
 /// L99: a known user with the stored key but no `username` is not an identity match at the
 /// identity call either (the re-check's rule): `WRITE_STALE {identity_mismatch}`, nothing sent,
 /// and the re-check's own answer (the same) sets `needs_token`.
@@ -827,35 +877,68 @@ async fn l99_confluence_identity_call_without_username_is_identity_mismatch() ->
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l99_confluence_identity_call_rename_reruns_once() -> TestResult {
     let (router, h, id, _) = update_with_identity(user_current("jdoe2")).await?;
-    assert!(h.settled(&id, 30_000).await, "never settled");
-    let env = h.await_(&id, 1000).await;
-    assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
+    bounded(&router, 3, assert_renamed_and_sent(&h, &router, &id)).await?;
     assert_eq!(
-        fetch_paths(&h, &id, "stale_check").await?,
+        identity_gets(&router),
+        3,
+        "two identity calls, one re-check"
+    );
+    Ok(())
+}
+
+/// T21 review I-1: the identity call answers a JSON 401 and the token re-check finds the stored
+/// key under another `username`: the rename is recorded and stored, the identity call runs once
+/// more and is judged against the name stored now, so it passes and the write is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn l99_confluence_json_401_rename_reruns_against_the_new_name() -> TestResult {
+    let unauthorized = json_answer(
+        "401 Unauthorized",
+        r#"{"statusCode":401,"message":"Unauthorized"}"#,
+    );
+    let (router, h, id, _) =
+        update_with_identity_answers(vec![unauthorized, user_current("jdoe2")]).await?;
+    bounded(&router, 3, assert_renamed_and_sent(&h, &router, &id)).await?;
+    assert_eq!(
+        identity_gets(&router),
+        3,
+        "two identity calls, one re-check"
+    );
+    Ok(())
+}
+
+/// The page update `id` passed its stale check after one confirmed rename `jdoe` → `jdoe2`: the
+/// identity call ran twice, the rule once, the write was sent and the new name is stored.
+async fn assert_renamed_and_sent(h: &Harness, router: &Router, id: &str) -> TestResult {
+    if !h.settled(id, 30_000).await {
+        let stale = stale_records(h, id, 0).await?;
+        return Err(format!("never settled, returned as {stale:?}").into());
+    }
+    let env = h.await_(id, 1000).await;
+    assert_eq!(
+        env.status,
+        Status::Succeeded,
+        "{} {:?}",
+        env.to_json_line(),
+        stale_records(h, id, 0).await?
+    );
+    assert_eq!(
+        fetch_paths(h, id, "stale_check").await?,
         [IDENTITY, IDENTITY, PAGE],
         "the identity call ran twice, the rule once"
     );
-    assert_eq!(rechecks(&h, "start").await?.len(), 1);
-    let renames: Vec<Value> = h
-        .events_of(EventType::INSTANCE_STATE_CHANGED)
-        .await?
-        .into_iter()
-        .filter(|c| c["state"] == "user_renamed")
-        .collect();
+    assert_eq!(rechecks(h, "start").await?.len(), 1);
+    let renames = renames(h).await?;
     assert_eq!(renames.len(), 1, "{renames:?}");
     assert_eq!(
         (&renames[0]["old"], &renames[0]["new"]),
         (&json!(TEST_USER), &json!("jdoe2"))
     );
-    assert!(
-        stale_records(&h, &id, 0).await?.is_empty(),
-        "never returned"
-    );
+    assert!(stale_records(h, id, 0).await?.is_empty(), "never returned");
     assert_eq!(router.sends(), ["PUT /rest/api/content/65537"]);
     let sid = h.instance("wiki").ok_or("instance")?.id.clone();
     let stored = h.credentials().load(&sid)?.ok_or("no token")?;
     assert_eq!(stored.identity.atlassian_user, "jdoe2");
-    assert_eq!(state_of(&h), "ok");
+    assert_eq!(state_of(h), "ok");
     Ok(())
 }
 
@@ -871,26 +954,61 @@ async fn l99_confluence_rename_not_stored_is_identity_mismatch() -> TestResult {
     router.route(&format!("GET {IDENTITY}"), vec![user_current("jdoe2")]);
     h.credentials().fail_store(true);
     h.approver().approve(&id).map_err(de)?;
-    let stale = stale_records(&h, &id, 1).await?;
-    assert_eq!(stale, [json!({"reason": "identity_mismatch"})]);
-    item_after(&h, &id, rev).await?;
+    bounded(&router, 3, async {
+        let stale = stale_records(&h, &id, 1).await?;
+        assert_eq!(stale, [json!({"reason": "identity_mismatch"})]);
+        item_after(&h, &id, rev).await?;
+        assert_eq!(
+            fetch_paths(&h, &id, "stale_check").await?,
+            [IDENTITY, IDENTITY],
+            "re-run once, then returned"
+        );
+        assert_eq!(renames(&h).await?.len(), 1);
+        assert!(router.sends().is_empty(), "{:?}", router.sends());
+        let sid = h.instance("wiki").ok_or("instance")?.id.clone();
+        let stored = h.credentials().load(&sid)?.ok_or("no token")?;
+        assert_eq!(stored.identity.atlassian_user, TEST_USER);
+        Ok(())
+    })
+    .await?;
     assert_eq!(
-        fetch_paths(&h, &id, "stale_check").await?,
-        [IDENTITY, IDENTITY],
-        "re-run once, then returned"
+        identity_gets(&router),
+        3,
+        "two identity calls, one re-check"
     );
-    let renames = h
-        .events_of(EventType::INSTANCE_STATE_CHANGED)
-        .await?
-        .into_iter()
-        .filter(|c| c["state"] == "user_renamed")
-        .count();
-    assert_eq!(renames, 1);
-    assert!(router.sends().is_empty(), "{:?}", router.sends());
-    let sid = h.instance("wiki").ok_or("instance")?.id.clone();
-    let stored = h.credentials().load(&sid)?.ok_or("no token")?;
-    assert_eq!(stored.identity.atlassian_user, TEST_USER);
     Ok(())
+}
+
+/// Option A (ledger L99): a rename found at one write's identity call returns the instance's
+/// other queued write as `WRITE_STALE {user_renamed}` (§7.1 *Username rename*), with a new
+/// revision and nothing sent for it, while the approved write is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn l99_confluence_rename_at_the_identity_call_returns_other_writes() -> TestResult {
+    let rows = rows();
+    let update = rows.first().ok_or("no rows")?;
+    let comment = rows
+        .iter()
+        .find(|r| r.op == "confluence.comment.add")
+        .ok_or("no comment row")?;
+    let (router, h) = row_server(update).await?;
+    router.route(comment.write.0, vec![comment.write.1.clone()]);
+    let (other, other_rev) = opened(&h, comment).await?;
+    let (id, _) = opened(&h, update).await?;
+    router.route(&format!("GET {IDENTITY}"), vec![user_current("jdoe2")]);
+    h.approver().approve(&id).map_err(de)?;
+    bounded(&router, 5, async {
+        assert!(h.settled(&id, 30_000).await, "never settled");
+        let env = h.await_(&id, 1000).await;
+        assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
+        let stale = stale_records(&h, &other, 1).await?;
+        assert_eq!(stale, [json!({"reason": "user_renamed"})]);
+        item_after(&h, &other, other_rev).await?;
+        assert_eq!(renames(&h).await?.len(), 1);
+        assert_eq!(router.sends(), ["PUT /rest/api/content/65537"]);
+        assert_eq!(h.status(&other).await.status, Status::Pending);
+        Ok(())
+    })
+    .await
 }
 
 /// The same rename when the token re-check that would confirm it concludes nothing (a 503): the
@@ -900,21 +1018,24 @@ async fn l99_confluence_rename_with_an_inconclusive_recheck_is_recheck_failed() 
     let unavailable = Fault::Http503.answer();
     let (router, h, id, rev) =
         update_with_identity_answers(vec![user_current("jdoe2"), unavailable]).await?;
-    let stale = stale_records(&h, &id, 1).await?;
-    assert_eq!(
-        stale,
-        [json!({"reason": "recheck_failed", "class": "identity_recheck"})]
-    );
-    item_after(&h, &id, rev).await?;
-    assert_eq!(rechecks(&h, "result").await?.len(), 1);
-    assert!(
-        h.events_of(EventType::INSTANCE_STATE_CHANGED)
-            .await?
-            .is_empty()
-    );
-    assert!(router.sends().is_empty(), "{:?}", router.sends());
-    assert_eq!(state_of(&h), "ok");
-    Ok(())
+    bounded(&router, 2, async {
+        let stale = stale_records(&h, &id, 1).await?;
+        assert_eq!(
+            stale,
+            [json!({"reason": "recheck_failed", "class": "identity_recheck"})]
+        );
+        item_after(&h, &id, rev).await?;
+        assert_eq!(rechecks(&h, "result").await?.len(), 1);
+        assert!(
+            h.events_of(EventType::INSTANCE_STATE_CHANGED)
+                .await?
+                .is_empty()
+        );
+        assert!(router.sends().is_empty(), "{:?}", router.sends());
+        assert_eq!(state_of(&h), "ok");
+        Ok(())
+    })
+    .await
 }
 
 // ---- L101: the spawned re-check (PD-113, L151) ------------------------------------------------------

@@ -309,6 +309,11 @@ pub(crate) fn judge_confluence_body(body: &Value, stored: &StoredIdentity) -> Re
             other_user: Some(name),
         };
     }
+    // A name no stored name can match (blank, `anonymous`, an undecodable escape: the matcher
+    // rejects it, so it does not even match itself) is no rename (T21 review M-1).
+    if !username_matches(&name, &name) {
+        return RecheckResult::TokenFailure { other_user: None };
+    }
     if username_matches(&name, &stored.atlassian_user) {
         RecheckResult::IdentityMatch
     } else {

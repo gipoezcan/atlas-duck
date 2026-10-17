@@ -2199,10 +2199,6 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
         stale_fail(engine, entry, approval, None, fail).await;
         return;
     }
-    let Some(mut identity) = stored_identity(engine, entry).await else {
-        stale_fail(engine, entry, approval, None, recheck_failed("needs_token")).await;
-        return;
-    };
     let Ok(cover) = engine.covers().for_request(&entry.head.request_id) else {
         stale_fail(engine, entry, approval, None, recheck_failed("internal")).await;
         return;
@@ -2218,6 +2214,13 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
     let mut attempt = 0u8;
     let mut last = loop {
         let seen = engine.identity_epoch(&entry.instance_id);
+        // Loaded after `seen`, on every run (T21 review I-1): a re-run is judged against the name
+        // a re-check just stored, and a rename stored after this load bumps the epoch past
+        // `seen`, so the re-check it triggers answers that rename.
+        let Some(identity) = stored_identity(engine, entry).await else {
+            stale_fail(engine, entry, approval, None, recheck_failed("needs_token")).await;
+            return;
+        };
         ctl.begin_call();
         entry.set_in_flight(Some(InFlight {
             purpose,
@@ -2250,7 +2253,7 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
                 Ok(IdentityCall::Match) => break record,
                 // §7.1 *Username rename* (L99): the token re-check confirms the rename and stores
                 // the new name, then the identity call runs once more, as after a Jira header
-                // check; it is judged against the name stored now.
+                // check; it is judged against the name stored now (loaded at the loop's top).
                 Ok(IdentityCall::Renamed) => {
                     let gated = gate_trigger(
                         engine,
@@ -2262,20 +2265,16 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
                     )
                     .await;
                     let fail = match gated {
-                        Some(Gated::Rerun) => match stored_identity(engine, entry).await {
-                            Some(now) => {
-                                identity = now;
-                                attempt += 1;
-                                if !engine
-                                    .append_pending(entry, vec![record], Some(approval))
-                                    .await
-                                {
-                                    return;
-                                }
-                                continue;
+                        Some(Gated::Rerun) => {
+                            attempt += 1;
+                            if !engine
+                                .append_pending(entry, vec![record], Some(approval))
+                                .await
+                            {
+                                return;
                             }
-                            None => recheck_failed("needs_token"),
-                        },
+                            continue;
+                        }
                         Some(Gated::Stale(fail)) => fail,
                         _ => (StaleReason::IdentityMismatch, None),
                     };
@@ -3119,6 +3118,27 @@ mod tests {
                 "known, same key, other username",
                 known("jdoe2", "JIRAUSER1"),
                 "rename",
+            ),
+            (
+                "known, same key, the name in another case",
+                known(" JDoe ", "JIRAUSER1"),
+                "match",
+            ),
+            // T21 review M-1: a name no stored name can match is no rename either.
+            (
+                "known, same key, blank username",
+                known("  ", "JIRAUSER1"),
+                "mismatch",
+            ),
+            (
+                "known, same key, username anonymous",
+                known("Anonymous", "JIRAUSER1"),
+                "mismatch",
+            ),
+            (
+                "known, same key, undecodable username",
+                known("jdoe%E0", "JIRAUSER1"),
+                "mismatch",
             ),
         ];
         for (what, body, want) in cases {
