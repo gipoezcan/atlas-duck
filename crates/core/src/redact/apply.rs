@@ -1,4 +1,4 @@
-//! [`apply`]: drops with copies and mirrors, masks, mirror check, final pass (§5.3).
+//! [`apply`]: drops with copies and mirrors, mirror check, masks, final pass (§5.3).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
@@ -6,7 +6,7 @@ use std::hash::Hash;
 use atlas_duck_registry::{CopyRule, RedactionRules};
 use serde_json::Value;
 
-use super::mirror::{self, Counterpart, DroppedOnEntry};
+use super::mirror::{self, Counterpart, DroppedOnEntry, Flagged};
 use super::path::{self, Loc, Pattern, Step};
 use super::views::{Budget, Masked, Needle, TextInfo, inspect, mask_value};
 use super::{
@@ -36,6 +36,7 @@ pub fn apply(
         blocked: Vec::new(),
         also: Vec::new(),
         dropped_on_entries: Vec::new(),
+        flagged: mirror::flagged(candidate, rules.mirrors),
         dirty: HashSet::new(),
         budget: Budget::for_apply(text_bytes(candidate)),
         url_patterns: rules
@@ -56,6 +57,11 @@ pub fn apply(
             RedactionOp::MaskText { .. } | RedactionOp::UrlField { .. } => {}
         }
     }
+    // §5.3 mirror check after the drops and before any mask, on the keys as the source shows
+    // them; an entry the source's check flags blocks unless it was dropped whole (review T19c
+    // I-1).
+    mirror::check(&r.doc, rules.mirrors, &r.dropped_on_entries, &mut r.blocked);
+    r.blocked.extend(r.flagged.iter().map(Flagged::reason));
     let url_mode = ops.iter().rev().find_map(|op| match op {
         RedactionOp::UrlField { mode } => Some(*mode),
         _ => None,
@@ -96,7 +102,6 @@ pub fn apply(
     for &(i, at) in &singles {
         r.mask_single(&needles, i, at, url_mode, &pre);
     }
-    mirror::check(&r.doc, rules.mirrors, &r.dropped_on_entries, &mut r.blocked);
     let post = Scan::new(&r.doc, &needles, Some((&pre, &r.dirty)), &r.budget);
     r.redact_dropped_names(&needles, &every);
     if !needles.is_empty() {
@@ -247,6 +252,8 @@ struct Redactor<'a> {
     blocked: Vec<BlockReason>,
     also: Vec<String>,
     dropped_on_entries: Vec<DroppedOnEntry>,
+    /// The entries the source's mirror check flags that are still in `doc`, where they now are.
+    flagged: Vec<Flagged>,
     /// String values rewritten or removed by a mask.
     dirty: HashSet<Loc>,
     /// The canonical-form work budget of this call (shared by every text).
@@ -364,8 +371,24 @@ impl Redactor<'_> {
                 self.mirrored(&loc, &mut remove);
             }
         }
+        // The key alone of an entry without counterpart: the entry stays, so it blocks.
+        for loc in &remove {
+            if let Some(entry) = mirror::unpaired_key(&self.doc, self.rules.mirrors, loc) {
+                self.blocked.push(BlockReason::MirrorOrphan {
+                    path: path::display(&entry),
+                });
+            }
+        }
         for loc in remove.iter().rev() {
-            path::remove(&mut self.doc, loc);
+            self.remove(loc);
+        }
+    }
+
+    /// Removes `loc` and follows the flagged entries across it.
+    fn remove(&mut self, loc: &[Step]) {
+        if path::remove(&mut self.doc, loc).is_some() {
+            self.flagged
+                .retain_mut(|f| path::after_removal(&mut f.at, loc));
         }
     }
 
@@ -404,12 +427,15 @@ impl Redactor<'_> {
         }
         let mut gone = Vec::new();
         for (at, keep) in levels {
-            if let Some(Value::Object(o)) = path::get_mut(&mut self.doc, &at) {
-                let drop: Vec<String> = o.keys().filter(|k| k.as_str() != keep).cloned().collect();
-                for k in drop {
-                    o.remove(&k);
-                    gone.push(k);
+            let drop: Vec<String> = match path::get(&self.doc, &at) {
+                Some(Value::Object(o)) => {
+                    o.keys().filter(|k| k.as_str() != keep).cloned().collect()
                 }
+                _ => Vec::new(),
+            };
+            for k in drop {
+                self.remove(&path::with(&at, Step::Key(k.clone())));
+                gone.push(k);
             }
         }
         for k in &gone {

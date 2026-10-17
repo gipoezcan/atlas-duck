@@ -830,6 +830,85 @@ async fn failed_closed_without_a_mirror_block_takes_no_redaction() -> TestResult
     Ok(())
 }
 
+/// One rendered comment (id 55509, restricted) without a source counterpart, in arrays of the
+/// same length (the source's 55508 has no rendered counterpart).
+fn one_orphan(key: &str) -> Value {
+    let mut issue = full_issue(key);
+    issue["fields"]["comment"] = json!({
+        "total": 2, "startAt": 0, "maxResults": 50,
+        "comments": [{"id": "55507", "body": "plain"}, {"id": "55508", "body": "other"}]
+    });
+    issue["renderedFields"] = json!({"comment": {"comments": [
+        {"id": "55507", "body": "<p>plain</p>"},
+        {"id": "55509", "body": "<p>orphan</p>", "visibility": common::jira::restriction()}
+    ]}});
+    issue
+}
+
+/// Review T19c I-1 end to end: the M-11 exception lets a mirror-blocked revision take
+/// redactions, but only a set that drops the flagged entry whole passes. Dropping only its mirror
+/// key (positional pairing in arrays of the same length) or masking its id and a source-only id
+/// into the same text is refused as not approvable, logged as `DECISION_INVALID`, and gives no
+/// revision; nothing is released. Control: the entry dropped by id, another field masked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m11_mirror_key_drop_or_mask_collision_is_refused() -> TestResult {
+    let h = Harness::jira().await?;
+    mount_issue(jira(&h)?, KEY, &one_orphan(KEY)).await;
+    let id = queued(&h, ISSUE, rendered_comments(KEY)).await?;
+    let ap = h.approver();
+    let ctx = ap.open(&id).map_err(de)?.redaction.ok_or("read")?;
+    assert_eq!(ctx.flagged, vec![orphan_at(1)]);
+    let rev = ap.rev(&id).map_err(de)?;
+    for ops in [
+        vec![drop_at("renderedFields.comment.comments[1].id")],
+        vec![mask("55509", true), mask("55508", true)],
+    ] {
+        let report = ap.redaction_preview(&id, &ops).map_err(de)?;
+        assert!(
+            report.blocked.contains(&orphan_at(1)),
+            "{ops:?}: {report:?}"
+        );
+        let invalid = records(&h, &id, EventType::DECISION_INVALID).await?.len();
+        let res = ap.redact(&id, ops.clone());
+        assert!(
+            matches!(
+                res,
+                Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+            ),
+            "{ops:?}: {res:?}"
+        );
+        let logged = records(&h, &id, EventType::DECISION_INVALID).await?;
+        assert_eq!(logged.len(), invalid + 1, "the refused redaction is logged");
+        assert_eq!(
+            logged.last().map(|p| (&p["reason"], &p["decision"])),
+            Some((&json!("not_approvable"), &json!("release")))
+        );
+        assert_eq!(ap.rev(&id).map_err(de)?, rev, "no new revision");
+        assert!(!ap.item(&id).ok_or("not queued")?.approvable);
+        plain_release_refused(&h, &id).await?;
+    }
+    let ops = vec![
+        RedactionOp::DropItem {
+            array_path: "renderedFields.comment.comments".to_owned(),
+            key: "id".to_owned(),
+            value: json!("55509"),
+        },
+        mask("other", true),
+    ];
+    let next = ap.redact(&id, ops).map_err(de)?;
+    let shown = h.decisions().preview_fetch(&id, Some(next)).map_err(de)?;
+    assert!(shown.preview.approvable);
+    assert_eq!(shown.preview.header.release_blocked, None);
+    ap.release(&id).map_err(de)?;
+    let env = h.await_(&id, 5000).await;
+    assert_eq!(env.status, Status::Released, "{}", env.to_json_line());
+    let text = env.to_json_line();
+    for gone in ["orphan", "Administrators", "55509"] {
+        assert!(!text.contains(gone), "{gone}: {text}");
+    }
+    Ok(())
+}
+
 // ---- recent / needs attention (§5.6, X-13) ---------------------------------------------------------
 
 /// The identity call of the stale check (§5.4 step 5) answers as the PAT's user.

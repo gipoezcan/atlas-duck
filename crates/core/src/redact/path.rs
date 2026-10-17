@@ -318,6 +318,22 @@ pub(crate) fn remove(doc: &mut Value, loc: &[Step]) -> Option<Value> {
     }
 }
 
+/// Follows the location `at` across the removal of `removed`: `false` if it went with it (`at`
+/// is `removed` or under it), else `at` is updated for a shifted array element.
+pub(crate) fn after_removal(at: &mut Loc, removed: &[Step]) -> bool {
+    if at.starts_with(removed) {
+        return false;
+    }
+    if let Some((Step::Index(i), parent)) = removed.split_last()
+        && at.starts_with(parent)
+        && let Some(Step::Index(j)) = at.get_mut(parent.len())
+        && *j > *i
+    {
+        *j -= 1;
+    }
+    true
+}
+
 /// Every node of `v` with its location, in document order (keys sorted, elements in order).
 pub(crate) fn walk<'a>(v: &'a Value, loc: &mut Loc, f: &mut impl FnMut(&[Step], &'a Value)) {
     f(loc, v);
