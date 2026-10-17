@@ -7,7 +7,7 @@ use atlas_duck_registry::{CopyRule, RedactionRules};
 use serde_json::Value;
 
 use super::mirror::{self, Counterpart, DroppedOnEntry, Flagged};
-use super::path::{self, Loc, Pattern, Step};
+use super::path::{self, Ident, Loc, Pattern, Step};
 use super::views::{Budget, Masked, Needle, TextInfo, inspect, mask_value};
 use super::{
     BlockReason, DropScope, REDACTED, RedactionMeta, RedactionOp, RedactionOutcome,
@@ -37,6 +37,7 @@ pub fn apply(
         also: Vec::new(),
         dropped_on_entries: Vec::new(),
         flagged: mirror::flagged(candidate, rules.mirrors),
+        removed: Vec::new(),
         dirty: HashSet::new(),
         budget: Budget::for_apply(text_bytes(candidate)),
         url_patterns: rules
@@ -254,6 +255,9 @@ struct Redactor<'a> {
     dropped_on_entries: Vec<DroppedOnEntry>,
     /// The entries the source's mirror check flags that are still in `doc`, where they now are.
     flagged: Vec<Flagged>,
+    /// Every location the drop phase removed, in order: what follows a source location to where
+    /// it is now, or back (review T19c I-1').
+    removed: Vec<Loc>,
     /// String values rewritten or removed by a mask.
     dirty: HashSet<Loc>,
     /// The canonical-form work budget of this call (shared by every text).
@@ -294,13 +298,51 @@ impl Redactor<'_> {
         });
     }
 
-    fn elements(doc: &Value, pat: &Pattern, key: &str, value: &Value) -> Vec<Loc> {
+    /// The source location of `cur`, a location in `doc`: the drop phase's removals undone.
+    fn source_loc(&self, cur: &[Step]) -> Loc {
+        let mut at = cur.to_vec();
+        for removed in self.removed.iter().rev() {
+            path::before_removal(&mut at, removed);
+        }
+        at
+    }
+
+    /// Field `key` of the element at `cur` as the source has it. The drop phase only removes,
+    /// so where the element still has `key` it is the same value; where it has not, a drop took
+    /// the key and the element is still the source's (review T19c I-1').
+    fn source_field(&self, cur: &[Step], key: &str) -> Option<Value> {
+        path::get(self.original, &self.source_loc(cur))?
+            .get(key)
+            .cloned()
+    }
+
+    /// Whether the source location `src` went whole with an earlier removal.
+    fn went(&self, src: &[Step]) -> bool {
+        let mut at = src.to_vec();
+        !self
+            .removed
+            .iter()
+            .all(|removed| path::after_removal(&mut at, removed))
+    }
+
+    fn elements(
+        doc: &Value,
+        pat: &Pattern,
+        key: &str,
+        value: &Value,
+        ident: &Ident<'_>,
+    ) -> Vec<Loc> {
         let mut out = Vec::new();
-        for arr in pat.resolve(doc) {
+        for arr in pat.resolve_at_by(doc, &[], ident) {
             if let Some(Value::Array(a)) = path::get(doc, &arr) {
                 for (i, e) in a.iter().enumerate() {
-                    if e.get(key) == Some(value) {
-                        out.push(path::with(&arr, Step::Index(i)));
+                    let at = path::with(&arr, Step::Index(i));
+                    let hit = match e.get(key) {
+                        Some(v) => v == value,
+                        None => ident(&at, key).as_ref() == Some(value),
+                    };
+                    if hit {
+                        out.push(at);
                     }
                 }
             }
@@ -312,13 +354,19 @@ impl Redactor<'_> {
         let Some(pat) = path::parse(array_path) else {
             return self.missing(array_path);
         };
-        let targets = Self::elements(&self.doc, &pat, key, value);
+        // Identity is the source's: an element whose key an earlier op dropped is still named.
+        let ident = |l: &[Step], k: &str| self.source_field(l, k);
+        let targets = Self::elements(&self.doc, &pat, key, value, &ident);
         // The UI offers only what is there: matching nothing is a mismatch (e.g. a key holding
-        // `.`), not a no-op. "There" is the source (an earlier op may have removed it already)
-        // or the document the earlier ops left, which an op built on the shown revision names
-        // (L123, M8 T19c).
-        if targets.is_empty() && Self::elements(self.original, &pat, key, value).is_empty() {
-            return self.missing(array_path);
+        // `.`), not a no-op, unless every element it names in the source went whole with an
+        // earlier op (L123, M8 T19c). One still there (an array named past a shifted index)
+        // cannot be proven gone and is refused (review T19c I-1').
+        if targets.is_empty() {
+            let named = Self::elements(self.original, &pat, key, value, &path::no_ident);
+            if named.is_empty() || !named.iter().all(|s| self.went(s)) {
+                self.missing(array_path);
+            }
+            return;
         }
         self.drop_locs(targets, BTreeSet::new());
     }
@@ -334,26 +382,31 @@ impl Redactor<'_> {
         // Copies hang off the item root, so they go even where the item has no `fields.<X>`
         // itself (a rendered or changelog copy alone must not stay behind).
         let suffix = pat.field_suffix();
-        let copies_in = |doc: &Value, remove: &mut BTreeSet<Loc>| {
+        let copies_in = |doc: &Value, ident: &Ident<'_>, remove: &mut BTreeSet<Loc>| {
             let mut copied = false;
             if let Some((base, x)) = &suffix {
-                for root in base.resolve(doc) {
-                    copied |= copies(self.rules, doc, &root, x, all_items, remove);
+                for root in base.resolve_at_by(doc, &[], ident) {
+                    copied |= copies(self.rules, doc, &root, x, all_items, ident, remove);
                 }
             }
             copied
         };
+        let ident = |l: &[Step], k: &str| self.source_field(l, k);
         let mut remove = BTreeSet::new();
-        let copied = copies_in(&self.doc, &mut remove);
-        let targets = pat.resolve(&self.doc);
-        // As for an item drop: it must name something in the source or in the document the
-        // earlier ops left (index paths resolve against the latter, the shown revision).
-        let existed = !targets.is_empty()
-            || copied
-            || !pat.resolve(self.original).is_empty()
-            || copies_in(self.original, &mut BTreeSet::new());
-        if !existed {
-            return self.missing(field_path);
+        let copied = copies_in(&self.doc, &ident, &mut remove);
+        let targets = pat.resolve_at_by(&self.doc, &[], &ident);
+        if targets.is_empty() && !copied {
+            // As for an item drop: it must name something in the source or in the document the
+            // earlier ops left (index paths resolve against the latter, the shown revision). An
+            // op naming by identity is a no-op only if what it names in the source went whole;
+            // a stale index is (T24: a silent no-op).
+            let mut named = BTreeSet::new();
+            copies_in(self.original, &path::no_ident, &mut named);
+            named.extend(pat.resolve(self.original));
+            if named.is_empty() || (pat.has_identity() && !named.iter().all(|s| self.went(s))) {
+                self.missing(field_path);
+            }
+            return;
         }
         if copied && let Some((_, x)) = &suffix {
             self.note_field(x);
@@ -384,16 +437,23 @@ impl Redactor<'_> {
         }
     }
 
-    /// Removes `loc` and follows the flagged entries across it.
+    /// Removes `loc`, follows the flagged entries across it and logs it.
     fn remove(&mut self, loc: &[Step]) {
         if path::remove(&mut self.doc, loc).is_some() {
             self.flagged
                 .retain_mut(|f| path::after_removal(&mut f.at, loc));
+            self.removed.push(loc.to_vec());
         }
     }
 
+    fn counterparts(&self, loc: &[Step]) -> Vec<Counterpart> {
+        mirror::counterparts(&self.doc, self.rules.mirrors, loc, &|l, k| {
+            self.source_field(l, k)
+        })
+    }
+
     fn mirrored(&mut self, loc: &[Step], remove: &mut BTreeSet<Loc>) {
-        for c in mirror::counterparts(&self.doc, self.rules.mirrors, loc) {
+        for c in self.counterparts(loc) {
             match c {
                 Counterpart::Found(target, check) => {
                     if path::get(&self.doc, &target).is_some() {
@@ -603,7 +663,7 @@ impl Redactor<'_> {
         }
         self.set_string(&loc, masked);
         // §5.3: a per-item mask also applies to the mirrored entry (every hit in that value).
-        for c in mirror::counterparts(&self.doc, self.rules.mirrors, &loc) {
+        for c in self.counterparts(&loc) {
             match c {
                 Counterpart::Found(target, Some(_)) => {
                     if let Some(Value::String(t)) = path::get(&self.doc, &target) {
@@ -694,13 +754,15 @@ fn needed_path(p: RedactionPreset) -> &'static str {
 }
 
 /// Registry copies of field `x` under the item root `base` (item-relative), plus the
-/// document-root copies for a drop across all items. `true` if any copy exists.
+/// document-root copies for a drop across all items. `true` if any copy exists. A changelog item
+/// whose key field a drop removed is matched through `ident`.
 fn copies(
     rules: &RedactionRules,
     doc: &Value,
     base: &[Step],
     x: &str,
     all_items: bool,
+    ident: &Ident<'_>,
     remove: &mut BTreeSet<Loc>,
 ) -> bool {
     let mut found = false;
@@ -734,10 +796,16 @@ fn copies(
                     let hit: Vec<usize> = items
                         .iter()
                         .enumerate()
-                        .filter(|(_, it)| {
-                            key_fields
-                                .iter()
-                                .any(|k| it.get(*k).and_then(Value::as_str) == Some(x))
+                        .filter(|(i, it)| {
+                            key_fields.iter().any(|k| match it.get(*k) {
+                                Some(v) => v.as_str() == Some(x),
+                                None => {
+                                    ident(&path::with(&arr_loc, Step::Index(*i)), k)
+                                        .as_ref()
+                                        .and_then(Value::as_str)
+                                        == Some(x)
+                                }
+                            })
                         })
                         .map(|(i, _)| i)
                         .collect();

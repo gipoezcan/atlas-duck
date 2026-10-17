@@ -7,13 +7,15 @@
 //!
 //! The pairing cannot be spoofed (review T19c I-1): the check runs before any mask, a bare drop
 //! of the key of an entry without counterpart blocks ([`unpaired_key`]), and an entry the check
-//! flags in the source blocks until it is dropped whole ([`flagged`], tracked by `apply`).
+//! flags in the source blocks until it is dropped whole ([`flagged`], tracked by `apply`). A drop
+//! that names an entry pairs it by the source's key where an earlier drop took the key (review
+//! T19c I-1'); the check itself uses only the keys still there.
 
 use atlas_duck_registry::Mirror;
 use serde_json::Value;
 
 use super::BlockReason;
-use super::path::{self, Loc, Step};
+use super::path::{self, Ident, Loc, Step};
 
 /// A per-item field drop that must also be gone from the mirrored entry (re-checked after all
 /// ops).
@@ -38,8 +40,23 @@ fn starts_with_keys(loc: &[Step], at: usize, keys: &[Step]) -> bool {
     loc.get(at..at + keys.len()) == Some(keys)
 }
 
-/// Counterparts of `loc` in the current document, for every mirror and both directions.
-pub(crate) fn counterparts(doc: &Value, mirrors: &[Mirror], loc: &[Step]) -> Vec<Counterpart> {
+/// The mirror key of the entry `arr[i]`: its own, or through `ident` if a drop removed it.
+fn key_of(e: &Value, key: &str, arr: &[Step], i: usize, ident: &Ident<'_>) -> Option<Value> {
+    match e.get(key) {
+        Some(v) => Some(v.clone()),
+        None => ident(&path::with(arr, Step::Index(i)), key),
+    }
+}
+
+/// Counterparts of `loc` in the current document, for every mirror and both directions. Entries
+/// pair by their key, or the source's key through `ident` where a drop removed it (review T19c
+/// I-1': the identity of an entry is the source's).
+pub(crate) fn counterparts(
+    doc: &Value,
+    mirrors: &[Mirror],
+    loc: &[Step],
+    ident: &Ident<'_>,
+) -> Vec<Counterpart> {
     let mut out = Vec::new();
     for m in mirrors {
         for (side, other) in [(m.src, m.dst), (m.dst, m.src)] {
@@ -69,15 +86,18 @@ pub(crate) fn counterparts(doc: &Value, mirrors: &[Mirror], loc: &[Step]) -> Vec
                 };
                 let Some(entry) = src.get(i) else { continue };
                 let rest = &loc[at + side.len() + 1..];
-                let (key_value, js) = match entry.get(m.key) {
-                    Some(kv) => (
-                        Some(kv.clone()),
-                        dst.iter()
+                let (key_value, js) = match key_of(entry, m.key, &side_arr, i, ident) {
+                    Some(kv) => {
+                        let js = dst
+                            .iter()
                             .enumerate()
-                            .filter(|(_, e)| e.get(m.key) == Some(kv))
+                            .filter(|(j, e)| {
+                                key_of(e, m.key, &other_arr, *j, ident).as_ref() == Some(&kv)
+                            })
                             .map(|(j, _)| j)
-                            .collect::<Vec<_>>(),
-                    ),
+                            .collect::<Vec<_>>();
+                        (Some(kv), js)
+                    }
                     None if src.len() == dst.len() => (None, vec![i]),
                     None => {
                         out.push(Counterpart::Unmatchable(path::display(&path::with(
