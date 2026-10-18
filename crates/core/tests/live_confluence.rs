@@ -374,7 +374,9 @@ async fn create_page(
         "body": body,
         "body_format": format
     });
-    if let (Some(p), Some(o)) = (parent, params.as_object_mut()) {
+    // Optional operator-approved anchor: with no explicit parent a scratch page goes under this page.
+    let anchor = var("ATLAS_DUCK_LIVE_CONFLUENCE_PARENT_ID");
+    if let (Some(p), Some(o)) = (parent.or(anchor.as_deref()), params.as_object_mut()) {
         o.insert("parent".to_owned(), json!(p));
     }
     let r = write(l, "confluence.page.create", params).await?;
