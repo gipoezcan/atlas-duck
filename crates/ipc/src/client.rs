@@ -15,6 +15,9 @@
 //! progress callback. A call whose future is dropped leaves the connection usable; its answer
 //! is discarded when it arrives. Memory per client is one frame (at most 24 MiB) plus a bounded
 //! notification queue.
+//!
+//! `IpcClient` calls are sequential (`&mut self`); `into_shared` turns a connected client into
+//! a [`SharedClient`] that serves concurrent calls over the same connection (Δ1, `shared.rs`).
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -41,6 +44,10 @@ use crate::rpc::{
 use crate::sandbox::MAX_FRAME_BYTES;
 use crate::server::HELLO_MAX_BYTES;
 use crate::transport::Conn;
+
+mod shared;
+
+pub use shared::{SHARED_IN_FLIGHT, Sent, SharedClient};
 
 /// The server-owner check `connect_at` runs before the first byte (§3.2 (a)): Unix
 /// `transport::unix::OwnerCheck`, Windows `transport::windows::PipeOwnerProbe`.
@@ -184,7 +191,8 @@ pub enum ClientError {
     /// The server broke the protocol, the answer does not have the expected shape, or an
     /// earlier call was cancelled mid-write (the stream is no longer framed).
     Protocol(String),
-    /// For callers that bound a call by a deadline; `call` itself has no deadline.
+    /// For callers that bound a call by a deadline; `IpcClient::call` itself has no deadline,
+    /// `SharedClient::call` returns it at its `at`.
     DeadlineExceeded,
     /// The request could not be encoded or is over the frame limit (nothing was written), or
     /// another IO error.
@@ -240,7 +248,7 @@ fn version_part(part: Option<&str>) -> Option<u64> {
 pub struct IpcClient {
     writer: WriteHalf<Conn>,
     routes: Arc<Mutex<Routes>>,
-    reader: JoinHandle<()>,
+    reader: AbortOnDrop,
     next_id: u64,
     /// Any byte of a non-hello request was written.
     written: bool,
@@ -263,9 +271,12 @@ impl fmt::Debug for IpcClient {
     }
 }
 
-impl Drop for IpcClient {
+/// A background task that ends with its owner.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        self.reader.abort();
+        self.0.abort();
     }
 }
 
@@ -319,7 +330,7 @@ impl IpcClient {
 
     fn start(rd: ReadHalf<Conn>, writer: WriteHalf<Conn>) -> IpcClient {
         let routes = Arc::new(Mutex::new(Routes::default()));
-        let reader = tokio::spawn(read_loop(rd, routes.clone()));
+        let reader = AbortOnDrop(tokio::spawn(read_loop(rd, routes.clone())));
         IpcClient {
             writer,
             routes,
@@ -334,6 +345,26 @@ impl IpcClient {
     /// (PD-16: an interrupt before that point queued nothing).
     pub fn written_request(&self) -> bool {
         self.written
+    }
+
+    /// The same connection as a [`SharedClient`] for concurrent calls (Δ1); its ids continue
+    /// this client's. A client a cancelled call left torn, or whose connection was lost,
+    /// gives a closed one. Requests of calls this client dropped are not counted in its
+    /// slots. Must be called inside a tokio runtime (it starts the writer task).
+    pub fn into_shared(self) -> SharedClient {
+        let IpcClient {
+            writer,
+            routes,
+            reader,
+            next_id,
+            written: _,
+            unusable,
+        } = self;
+        let closed = unusable.map(|u| match u {
+            Unusable::Torn => Closed::Protocol(MSG_TORN.to_owned()),
+            Unusable::Lost => Closed::Lost,
+        });
+        SharedClient::start(writer, &routes, reader, next_id, closed)
     }
 
     /// Sends `method` with `params` and waits for its answer. `request.progress` notifications
@@ -730,6 +761,9 @@ struct Routes {
     progress: Option<(String, mpsc::Sender<ProgressNotification>)>,
     /// Set once the reader stopped; no answer will arrive.
     closed: Option<Closed>,
+    /// Set by `into_shared`: from then on everything the reader reads, and its end, goes to
+    /// the shared client.
+    shared: Option<Arc<shared::Core>>,
 }
 
 #[derive(Debug, Clone)]
@@ -770,8 +804,9 @@ impl Drop for Unroute<'_> {
 }
 
 /// Reads frames until EOF, an error or a protocol violation, then marks the routes closed
-/// (dropping the waiting sender wakes the call). Never blocks on anything but the read.
-async fn read_loop(mut rd: ReadHalf<Conn>, routes: Arc<Mutex<Routes>>) {
+/// (dropping the waiting sender wakes the call) or closes the shared client. Never blocks on
+/// anything but the read.
+async fn read_loop<R: AsyncRead + Unpin>(mut rd: R, routes: Arc<Mutex<Routes>>) {
     let closed = loop {
         let frame = match read_frame_async(&mut rd, MAX_FRAME_BYTES).await {
             Ok(Some(frame)) => frame,
@@ -785,17 +820,28 @@ async fn read_loop(mut rd: ReadHalf<Conn>, routes: Arc<Mutex<Routes>>) {
             Err(_) => break Closed::Protocol(MSG_BAD_MESSAGE.to_owned()),
         }
     };
-    let mut r = lock(&routes);
-    r.closed = Some(closed);
-    r.waiting = None;
-    r.progress = None;
+    let shared = {
+        let mut r = lock(&routes);
+        r.closed = Some(closed.clone());
+        r.waiting = None;
+        r.progress = None;
+        r.shared.clone()
+    };
+    if let Some(core) = shared {
+        core.close(closed);
+    }
 }
 
 /// Hands a response to the waiting call with its id. A `null` id (the server could not read
 /// the request's id) goes to the waiting call if it is an error. Anything else (the answer to
-/// a dropped call) is discarded.
+/// a dropped call) is discarded. A shared client routes it itself.
 fn deliver(routes: &Mutex<Routes>, response: Response) {
     let mut r = lock(routes);
+    if let Some(core) = r.shared.clone() {
+        drop(r);
+        core.deliver(response);
+        return;
+    }
     let ours = match (&r.waiting, response.id) {
         (Some((id, _)), Some(got)) => *id == got,
         (Some(_), None) => matches!(response.body, ResponseBody::Error(_)),
@@ -816,7 +862,13 @@ fn notify(routes: &Mutex<Routes>, n: Notification) {
     let Ok(p) = serde_json::from_value::<ProgressNotification>(n.params) else {
         return;
     };
-    if let Some((request_id, tx)) = &lock(routes).progress
+    let r = lock(routes);
+    if let Some(core) = r.shared.clone() {
+        drop(r);
+        core.notify(p);
+        return;
+    }
+    if let Some((request_id, tx)) = &r.progress
         && *request_id == p.request_id
     {
         let _ = tx.try_send(p);
