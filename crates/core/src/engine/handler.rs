@@ -26,6 +26,7 @@ use atlas_duck_ipc::proto::{
     params_sha256_hex,
 };
 use atlas_duck_ipc::sandbox::ScriptLimits;
+use atlas_duck_preview::invisible::cut_boundary;
 use atlas_duck_registry::{
     DescribeEnv, LimitsSource, OperationSpec, Product, TargetDisplay, Version, describe,
     target_display,
@@ -300,9 +301,12 @@ fn target_column(
     }
 }
 
+/// The first [`REASON_EXCERPT_CHARS`] chars of the (stripped) reason, cut where
+/// `invisible::cut_boundary` allows: the queue row shows it raw, so a cut inside an emoji sequence
+/// must not leave its U+200D or U+FE0F behind (cut review I-1).
 pub(super) fn excerpt(s: &str) -> String {
     match s.char_indices().nth(REASON_EXCERPT_CHARS) {
-        Some((cut, _)) => format!("{}…", &s[..cut]),
+        Some((cut, _)) => format!("{}…", &s[..cut_boundary(s, cut)]),
         None => s.to_owned(),
     }
 }
@@ -1032,5 +1036,73 @@ impl RequestHandler for CoreHandler {
             "config_unreadable": table.config_unreadable(),
             "pac_configured": pac_configured,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use atlas_duck_preview::invisible::{escape_for_display, flags, strip};
+
+    use super::*;
+
+    const WOMAN_TECHNOLOGIST: &str = "\u{1F469}\u{200D}\u{1F4BB}";
+
+    /// A reason the way `normalize_reason` leaves it: stripped, and a fixpoint of `strip`.
+    fn reason(s: &str) -> String {
+        let stripped = strip(s, true).0;
+        assert_eq!(strip(&stripped, true).0, stripped, "not a strip fixpoint");
+        stripped
+    }
+
+    /// Cut review I-1: the 60-char cut falls on the 💻 of 👩‍💻, which would leave a raw U+200D
+    /// that the queue row shows without a badge.
+    #[test]
+    fn excerpt_does_not_cut_inside_an_emoji_sequence() {
+        let s = reason(&format!("{}{WOMAN_TECHNOLOGIST}", "x".repeat(58)));
+        assert_eq!(s.chars().count(), 61);
+        assert_eq!(excerpt(&s), format!("{}…", "x".repeat(58)));
+    }
+
+    /// The keycap variant: a cut after the U+FE0F would leave it raw.
+    #[test]
+    fn excerpt_does_not_cut_inside_a_keycap() {
+        let s = reason(&format!("{}#\u{FE0F}\u{20E3}", "x".repeat(59)));
+        assert_eq!(s.chars().count(), 62);
+        assert_eq!(excerpt(&s), format!("{}…", "x".repeat(59)));
+    }
+
+    /// Every cut position (the sequence at every offset): the excerpt never holds a flagged
+    /// char, is a prefix of the reason plus `…`, and is no longer than the char cap.
+    #[test]
+    fn excerpt_sweep_every_cut_position() {
+        let tail = format!("{WOMAN_TECHNOLOGIST}{WOMAN_TECHNOLOGIST}#\u{FE0F}\u{20E3}tail");
+        for pad in 0..=(REASON_EXCERPT_CHARS + 4) {
+            let s = reason(&format!("{}{tail}", "x".repeat(pad)));
+            let got = excerpt(&s);
+            let Some(kept) = got.strip_suffix('…').filter(|_| got != s) else {
+                assert_eq!(got, s, "pad {pad}: short reasons are kept whole");
+                continue;
+            };
+            assert!(s.starts_with(kept), "pad {pad}: {got:?}");
+            assert!(
+                kept.chars().count() <= REASON_EXCERPT_CHARS,
+                "pad {pad}: {got:?}"
+            );
+            assert!(
+                !flags(kept).contains(&true),
+                "pad {pad}: a flagged char in {got:?}"
+            );
+            assert_eq!(strip(kept, true).0, kept, "pad {pad}: {got:?}");
+        }
+    }
+
+    /// A cut inside a `⟨U+XXXX⟩` lookalike in the (raw) reason backs off before it.
+    #[test]
+    fn excerpt_does_not_cut_inside_an_escape_shaped_run() {
+        let s = format!("{}⟨U+202E⟩tail", "x".repeat(58));
+        assert_eq!(excerpt(&s), format!("{}…", "x".repeat(58)));
+        // And the escape of a real flagged char stays whole when it fits.
+        let shown = escape_for_display("\u{202E}");
+        assert_eq!(excerpt(&shown), shown);
     }
 }

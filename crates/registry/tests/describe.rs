@@ -170,7 +170,8 @@ fn confluence_describe_documents_cql_placeholders_lossy() {
     // PD-112 (plan texts, verbatim; the placeholder sentence is §12.4's onboarding sentence).
     let cql = "The CQL is sent as `(<your CQL>) AND type in (page,blogpost,comment,attachment)` \
                plus your trailing ORDER BY; an ORDER BY elsewhere, an unterminated quote, \
-               unbalanced parentheses or parentheses nested deeper than 64 levels are rejected.";
+               a backslash outside a quoted string, unbalanced parentheses or parentheses nested \
+               deeper than 64 levels are rejected.";
     let placeholders = "A Markdown body that still contains `page get` placeholders \
                         (`[macro: …]`, `confluence:` links or images, `@user:<key>`) is rejected \
                         with `markdown_placeholders`: fetch with `--format storage` and submit \

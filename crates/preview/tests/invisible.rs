@@ -599,6 +599,33 @@ fn escapes(s: &str) -> Vec<std::ops::Range<usize>> {
     out
 }
 
+/// `mixed_input` joined with escape-shaped runs: `⟨U+XXXX⟩` lookalikes (4 to 6 upper-case hex
+/// digits, and too few, too many or lower-case ones), lone `⟨` and `⟩`, and bare hex (cut review
+/// M-4). In raw text they are what the escape back-off must not cut into.
+fn cut_input() -> impl Strategy<Value = String> {
+    let shaped = prop::sample::select(vec![
+        "⟨",
+        "⟩",
+        "U+",
+        "⟨U+",
+        "⟨U+202E⟩",
+        "⟨U+1F469⟩",
+        "⟨U+10FFFF⟩",
+        "⟨U+0041",
+        "⟨U+00",
+        "⟨U+abcd⟩",
+        "⟨U+ABCDEFF⟩",
+        "202E",
+        "10FFFF",
+        "0041",
+    ]);
+    prop::collection::vec(
+        prop_oneof![3 => mixed_input(), 2 => shaped.prop_map(String::from)],
+        0..8,
+    )
+    .prop_map(|v| v.concat())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -609,9 +636,9 @@ proptest! {
     /// text it stays stripped.
     #[test]
     fn cut_boundary_keeps_sequences_and_escapes_whole(
-        raw in mixed_input(),
+        raw in cut_input(),
         display in any::<bool>(),
-        maxes in prop::collection::vec(0usize..1200, 8),
+        cuts in prop::collection::vec(any::<prop::sample::Index>(), 8),
     ) {
         // Raw text, or its display escape.
         let s = if display { escape_for_display(&raw) } else { raw };
@@ -625,8 +652,9 @@ proptest! {
             sequences.iter().chain(&escaped).any(|r| r.start < b && b < r.end)
         };
         let stripped = strip(&s, true).0;
-        for max in maxes {
-            let max = max.min(s.len() + 2);
+        for at in cuts {
+            // Cut points inside the string (0 to `s.len()`, where it fits).
+            let max = at.index(s.len() + 1);
             let cut = cut_boundary(&s, max);
             prop_assert!(cut <= max.min(s.len()), "{} > {}", cut, max);
             prop_assert!(s.is_char_boundary(cut));

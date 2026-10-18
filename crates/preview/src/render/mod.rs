@@ -365,13 +365,7 @@ fn escape_len(rest: &str) -> Option<usize> {
     if rest.starts_with(ws::NO_NEWLINE_AT_END) {
         return Some(ws::NO_NEWLINE_AT_END.len());
     }
-    let inner = rest.strip_prefix("⟨U+")?;
-    let hex = inner
-        .bytes()
-        .take_while(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(b))
-        .count();
-    ((4..=6).contains(&hex) && inner[hex..].starts_with('⟩'))
-        .then(|| "⟨U+".len() + hex + '⟩'.len_utf8())
+    invisible::escape_len(rest)
 }
 
 /// Writes display text `s` HTML-escaped with every `⟨…⟩` escape (and every flagged character
@@ -646,4 +640,29 @@ fn row_list(doc: &mut Doc, label: &str, items: &[String]) {
     }
     doc.close("td");
     doc.close("tr");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ZWJ review M-2 (cut review M-7): a text cut back to a sequence's start leaves bytes of the
+    /// budget, and `html` must still leave its markup out whole and count it (it would fit).
+    #[test]
+    fn html_after_a_cut_text_is_left_out_though_it_would_fit() {
+        // 35 bytes, one sequence (char boundaries 0 4 8 11 14 17 20 24 27 31 35).
+        const KISS: &str =
+            "\u{1F469}\u{1F3FB}\u{200D}\u{2764}\u{FE0F}\u{200D}\u{1F48B}\u{200D}\u{1F468}\u{1F3FC}";
+        let mut doc = Doc::with_limit(40);
+        doc.text(&format!("{}{KISS}", "e".repeat(10)));
+        assert!(doc.exhausted);
+        // `<bdi>` + ten `e` + `…` + `</bdi>`: the cut moved back to the sequence's start.
+        assert_eq!(doc.out, "<bdi>eeeeeeeeee…</bdi>");
+        assert_eq!(doc.cut, 35);
+        // 8 bytes more still fit the budget: only the cut text keeps them out.
+        assert!(doc.out.len() + "<p>x</p>".len() <= doc.limit);
+        doc.html("<p>x</p>");
+        assert!(!doc.out.contains("<p>x</p>"), "{}", doc.out);
+        assert_eq!(doc.cut, 35 + 8);
+    }
 }

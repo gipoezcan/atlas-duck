@@ -169,7 +169,8 @@ pub fn cut_boundary(s: &str, max: usize) -> usize {
 const MAX_ESCAPE_BYTES: usize = "⟨U+".len() + 6 + '⟩'.len_utf8();
 
 /// The byte length of the `⟨U+XXXX⟩` escape (4 to 6 upper-case hex digits) `rest` starts with.
-fn escape_len(rest: &str) -> Option<usize> {
+/// The one rule of what an escape is: the cut here and the renderer's marking agree on it.
+pub(crate) fn escape_len(rest: &str) -> Option<usize> {
     let inner = rest.strip_prefix("⟨U+")?;
     let hex = inner
         .bytes()
