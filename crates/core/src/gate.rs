@@ -25,6 +25,9 @@ use serde_json::{Map, Value, json};
 pub const MSG_FIRST_RUN: &str =
     "atlas-duck is not set up yet: finish the setup window on the desktop";
 
+/// M9 Δ4: the fixed message of the `store_unavailable` refusal (spec §4.3).
+const MSG_STORE_UNAVAILABLE: &str = "the audit store could not be opened; restart atlas-duck";
+
 /// Which attention a queue change raised (C.7, one-to-one with the C.10 events).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum AttentionKind {
@@ -64,11 +67,17 @@ pub enum GateState {
     NotConfigured(&'static str),
     /// §2.5.
     ShuttingDown,
+    /// The audit store failed to open or the core failed to start (PD-06, L217): nothing will
+    /// serve until the app is restarted (M9 Δ4).
+    StoreFailed,
 }
 
 impl GateState {
     /// The envelope every refused method gets in this state (C.7, L46).
     pub fn envelope(&self) -> Envelope {
+        // Every gate answer is retryable (the state may change) except `StoreFailed`: only a
+        // restart of the app opens the store again.
+        let mut retryable = true;
         let (code, reason, message): (ErrorCode, &str, String) = match self {
             GateState::FirstRun => (
                 ErrorCode::NotConfigured,
@@ -95,8 +104,16 @@ impl GateState {
                 "app_shutting_down",
                 "atlas-duck is shutting down".to_owned(),
             ),
+            GateState::StoreFailed => {
+                retryable = false;
+                (
+                    ErrorCode::Unreachable,
+                    "store_unavailable",
+                    MSG_STORE_UNAVAILABLE.to_owned(),
+                )
+            }
         };
-        let mut env = Envelope::failed(code, true, &message);
+        let mut env = Envelope::failed(code, retryable, &message);
         if let Some(err) = env.error.as_mut() {
             let mut d = Map::new();
             d.insert("reason".into(), Value::String(reason.to_owned()));
@@ -113,6 +130,7 @@ impl GateState {
             GateState::StoreNewer => "store_newer",
             GateState::NotConfigured(_) => "not_configured",
             GateState::ShuttingDown => "shutting_down",
+            GateState::StoreFailed => "store_failed",
         }
     }
 }
@@ -338,9 +356,8 @@ impl RequestHandler for GateHandler {
 
 #[cfg(test)]
 mod tests {
-    use atlas_duck_ipc::proto::{AgentNameSource, ClientKind};
-
     use super::*;
+    use atlas_duck_ipc::proto::{AgentNameSource, ClientKind};
 
     fn hello(build_id: &str) -> Hello {
         Hello {
@@ -354,6 +371,92 @@ mod tests {
 
     fn server_build(env: &Envelope) -> Option<&Value> {
         env.error.as_ref()?.details.as_ref()?.get("server_build")
+    }
+
+    struct NoUi;
+    impl UiSink for NoUi {
+        fn emit(&self, _: UiEvent) {}
+    }
+
+    struct NoProgress;
+    impl ProgressSink for NoProgress {
+        fn progress(&self, _: atlas_duck_ipc::proto::ProgressNotification) {}
+    }
+
+    fn meta() -> ConnectionMeta {
+        ConnectionMeta {
+            connection_id: "c1".to_owned(),
+            peer: atlas_duck_ipc::proto::PeerInfo::default(),
+        }
+    }
+
+    fn submit_params() -> SubmitParams {
+        SubmitParams {
+            op_id: "jira.issue.get".to_owned(),
+            params: json!({"key": "ABC-1"}),
+            instance: None,
+            reason: None,
+        }
+    }
+
+    /// M9 Δ4 (L217): a failed audit store answers `unreachable {store_unavailable}`, not
+    /// retryable (only a restart opens the store), exit 5; `hello`, `doctor` and the local
+    /// `ops.*` answer as for every gate; `doctor` says `store_failed`.
+    #[tokio::test]
+    async fn store_failed_gate_answers_store_unavailable() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let want = GateState::StoreFailed.envelope();
+        assert_eq!(want.status, Status::Failed);
+        let err = want.error.as_ref().ok_or("no error object")?;
+        assert_eq!(err.code, ErrorCode::Unreachable);
+        assert!(!err.retryable);
+        assert_eq!(err.message, MSG_STORE_UNAVAILABLE);
+        assert_eq!(
+            err.details.as_ref().and_then(|d| d.get("reason")),
+            Some(&json!("store_unavailable"))
+        );
+        assert!(want.request_id.is_none());
+        assert_eq!(atlas_duck_ipc::proto::exit_code(&want), 5);
+
+        let h = GateHandler::new(GateState::StoreFailed, Arc::new(NoUi));
+        let c = meta();
+        assert_eq!(h.state(), GateState::StoreFailed);
+        // Every refused method.
+        assert_eq!(h.submit(&c, submit_params()).await.envelope, want);
+        assert_eq!(h.submit_script(&c, submit_params()).await.envelope, want);
+        assert_eq!(h.cancel("req_x").await, want);
+        assert_eq!(h.status("req_x").await, want);
+        assert_eq!(h.instances_list().await, want);
+        assert_eq!(h.requests_list(None, None, None).await, want);
+        assert_eq!(h.ops_list(Some("x")).await, want);
+        assert_eq!(h.ops_describe("jira.issue.get", Some("x")).await, want);
+        let awaited = h
+            .await_request(
+                &c,
+                AwaitParams {
+                    request_id: "req_x".to_owned(),
+                    timeout_ms: None,
+                },
+                &NoProgress,
+            )
+            .await;
+        assert_eq!(awaited, want);
+        assert_eq!(h.refused(), 4, "submit, submit_script, await and cancel");
+
+        // The methods every gate answers.
+        assert!(h.hello(&c, hello(BUILD_ID)).await.is_ok());
+        assert_eq!(h.ops_list(None).await.status, Status::Succeeded);
+        assert_eq!(
+            h.ops_describe("jira.issue.get", None).await.status,
+            Status::Succeeded
+        );
+        let doctor = h.doctor().await;
+        assert_eq!(doctor.status, Status::Succeeded);
+        assert_eq!(
+            doctor.data.as_ref().and_then(|d| d.get("gate")),
+            Some(&json!("store_failed"))
+        );
+        Ok(())
     }
 
     /// PD-129 (b): the build-id comparison is one function over an expected value; the answer

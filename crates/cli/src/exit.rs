@@ -97,6 +97,21 @@ mod tests {
         assert_eq!(exit_for(&status_cmd(), &down), 5);
     }
 
+    /// M9 Δ4 (L217): `unreachable` with the reason `store_unavailable` (the app's failed-store
+    /// gate, not retryable) is exit 5 for every kind of call; the CLI code is unchanged.
+    #[test]
+    fn store_unavailable_is_exit_5() {
+        let down = app_row(
+            Status::Failed,
+            Some(ErrorCode::Unreachable),
+            Some("store_unavailable"),
+        );
+        assert_eq!(exit_for(&Command::Instances, &down), 5);
+        assert_eq!(exit_for(&status_cmd(), &down), 5);
+        assert_eq!(exit_for(&Command::Await { id: "req_1".into() }, &down), 5);
+        assert_eq!(exit_for_kind(CallKind::Submit, &down), 5);
+    }
+
     // ---------- I-39: the §4.3 matrix, every row ----------
 
     use serde_json::{Map, Value, json};

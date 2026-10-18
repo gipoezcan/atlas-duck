@@ -130,6 +130,10 @@ pub struct ServeHooks {
     /// Tests: the next `n` retry `open`s of this serving state fail with an I/O error.
     #[doc(hidden)]
     pub fail_retry_open: Option<Arc<AtomicU32>>,
+    /// Tests: the next `n` retry `open`s of this serving state fail with an integrity error (a
+    /// class that is final until a restart, unlike the I/O error of `fail_retry_open`).
+    #[doc(hidden)]
+    pub fail_retry_open_integrity: Option<Arc<AtomicU32>>,
 }
 
 impl Default for ServeHooks {
@@ -142,6 +146,7 @@ impl Default for ServeHooks {
             scripts: ScriptInputs::default(),
             fail_core_start: None,
             fail_retry_open: None,
+            fail_retry_open_integrity: None,
         }
     }
 }
@@ -285,6 +290,7 @@ fn served_name(s: &Served) -> &'static str {
         Served::Gate(GateState::StoreNewer) => "store_newer",
         Served::Gate(GateState::NotConfigured(_)) => "not_configured",
         Served::Gate(GateState::ShuttingDown) => "shutting_down",
+        Served::Gate(GateState::StoreFailed) => "store_failed",
     }
 }
 
@@ -384,9 +390,9 @@ pub struct ServeState {
     /// the task itself right before it tells the watcher it ended (a `JoinHandle` only reports
     /// "finished" after the task returned).
     retrying: AtomicBool,
-    /// An open or a core start failed after the endpoint was bound (M6 T22, M4 T19 m-4): the gate
-    /// answers as before, but the app says the store is unusable (tray text, relaunch dialog) and
-    /// offers no unlock, archive or retry. Only a restart clears it.
+    /// An open or a core start failed after the endpoint was bound (M6 T22, M4 T19 m-4): the app
+    /// says the store is unusable (tray text, relaunch dialog), offers no unlock, archive or
+    /// retry, and (M9 Δ4) serves the `StoreFailed` gate. Only a restart clears it.
     store_failed: AtomicBool,
     hooks: ServeHooks,
 }
@@ -472,9 +478,16 @@ impl ServeState {
     }
 
     /// The store is unusable (the retry's `open` failed, or a core start did): see the field.
+    /// With no core serving, the cell also serves the `StoreFailed` gate from the next request
+    /// on, so an agent no longer gets the stale `locked` or `first_run` answer (M9 Δ4, L217).
+    /// The flag is set first: the watcher that hears of the swap already sees a failed store.
     fn mark_store_failed(&self) {
         self.store_failed.store(true, Ordering::SeqCst);
-        self.hooks.notify();
+        // `install_gate` tells the watcher itself; it refuses once a core serves or the quit
+        // path froze the state (the `ShuttingDown` gate stays), and then only the flag changed.
+        if !self.install_gate(GateState::StoreFailed) {
+            self.hooks.notify();
+        }
     }
 
     /// True while the `serve` task runs.
@@ -1811,10 +1824,11 @@ impl CoreStarter {
 /// §8.7: while the keychain is unavailable, `open` is re-run after each delay of `schedule`.
 /// `Ready` starts `Core` and swaps the cell (no rebind; T8 replays each connection's `hello`);
 /// another locked reason, `StoreNewer` or `FirstRun` swaps to that gate and stops; a failure
-/// (`Err`, or `Core::start` refusing) is logged and keeps the locked gate (the endpoint is
-/// already bound, PD-06 cannot apply) and marks the store failed ([`ServeState::store_failed`]:
-/// the tray and the relaunch say so), except an I/O error of the `open`, which only ends this run
-/// (a manual retry may try again). After the schedule the app stays locked; the tray's and the
+/// (`Err`, or `Core::start` refusing) is logged and marks the store failed
+/// ([`ServeState::store_failed`]: the tray and the relaunch say so; the cell swaps to the
+/// `StoreFailed` gate, M9 Δ4; the endpoint is already bound, PD-06 cannot apply), except an I/O
+/// error of the `open`, which only ends this run and keeps the locked gate (a manual retry may
+/// try again). After the schedule the app stays locked; the tray's and the
 /// credential window's "Retry keychain" run one more attempt (`manual`, PD-89). Ends early on the
 /// shutdown signal and after [`ServeState::freeze`].
 async fn retry_keychain(
@@ -1837,6 +1851,8 @@ async fn retry_keychain(
         }
         let opened = if take_one(state.hooks.fail_retry_open.as_deref()) {
             Err(StoreFailure::Io)
+        } else if take_one(state.hooks.fail_retry_open_integrity.as_deref()) {
+            Err(StoreFailure::Integrity)
         } else {
             with_prompt_hint(opener.clone().retry_open(), &state.hooks).await
         };
@@ -2131,6 +2147,150 @@ mod tests {
         state.shutdown.cancel();
         assert!(!state.install_gate(GateState::StoreNewer));
         assert_eq!(gate_label(&state).await, "locked");
+    }
+
+    struct NoKeysFactory;
+    impl KeysFactory for NoKeysFactory {
+        fn keys(&self, _: &str) -> Result<Arc<dyn KeyStore>, KeyStoreError> {
+            Err(KeyStoreError::Unavailable)
+        }
+    }
+
+    type RetryRig = (Arc<ServeState>, Arc<Opener>, Arc<CoreStarter>);
+
+    /// A `keychain_unavailable` serving state (no endpoint, no store) with an opener and a core
+    /// starter for [`retry_keychain`]; the failures the tests inject happen before the opener is
+    /// used.
+    fn retry_rig(
+        tmp: &tempfile::TempDir,
+        hooks: ServeHooks,
+    ) -> Result<RetryRig, Box<dyn std::error::Error>> {
+        use atlas_duck_ipc::paths::{DataDirResolution, check_data_dir};
+
+        let dir = tmp.path().join("data");
+        std::fs::create_dir(&dir)?;
+        let DataDirResolution::Local(data) = check_data_dir(&dir)? else {
+            return Err("the temp dir is not a local data dir".into());
+        };
+        let lock = Arc::new(InstanceLock::acquire(&data, "thishost")?);
+        let opener = Arc::new(Opener {
+            data,
+            lock,
+            keys: Arc::new(NoKeysFactory),
+            pinned_install_id: None,
+            install_id: OnceLock::new(),
+        });
+        let starter = Arc::new(CoreStarter {
+            config_dir: tmp.path().to_owned(),
+            ui: Arc::new(NoUi),
+            confirmer: Arc::new(NoConfirm),
+            tray_host: None,
+            scripts: ScriptInputs::default(),
+            fail_next: None,
+        });
+        let state = Arc::new(gate_serving_with(
+            GateState::Locked(LockedReason::KeychainUnavailable),
+            hooks,
+        ));
+        Ok((state, opener, starter))
+    }
+
+    /// What a submit gets from the cell now.
+    async fn submit_answer(state: &ServeState) -> atlas_duck_ipc::envelope::Envelope {
+        let meta = atlas_duck_ipc::proto::ConnectionMeta {
+            connection_id: "c1".to_owned(),
+            peer: atlas_duck_ipc::proto::PeerInfo::default(),
+        };
+        let params = atlas_duck_ipc::proto::SubmitParams {
+            op_id: "jira.issue.get".to_owned(),
+            params: serde_json::json!({"key": "ABC-1"}),
+            instance: None,
+            reason: None,
+        };
+        state.cell.current().submit(&meta, params).await.envelope
+    }
+
+    fn reason_of(env: &atlas_duck_ipc::envelope::Envelope) -> Option<&str> {
+        env.error
+            .as_ref()?
+            .details
+            .as_ref()?
+            .get("reason")?
+            .as_str()
+    }
+
+    /// M9 Δ4 (L217): a store failure of a class that is final until a restart (here an
+    /// integrity failure of the keychain retry's `open`) installs the `StoreFailed` gate, so the
+    /// served handler answers `unreachable {store_unavailable}`, not retryable, instead of the
+    /// stale `locked {keychain_unavailable}`; the watcher hears of it once. An I/O failure of
+    /// the same retry (`fail_retry_open`) is not a verdict on the store and still keeps the
+    /// locked gate and a manual retry possible, as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_failure_installs_store_failed_gate() -> Result<(), Box<dyn std::error::Error>> {
+        use atlas_duck_ipc::envelope::{ErrorCode, Status};
+
+        // Integrity: final until a restart.
+        let tmp = tempfile::tempdir()?;
+        let told = Arc::new(Told::default());
+        let fail = Arc::new(AtomicU32::new(1));
+        let hooks = ServeHooks {
+            fail_retry_open_integrity: Some(fail.clone()),
+            ..watched(&told)
+        };
+        let (state, opener, starter) = retry_rig(&tmp, hooks)?;
+        assert_eq!(gate_label(&state).await, "locked");
+        let stale = submit_answer(&state).await;
+        assert_eq!(reason_of(&stale), Some("keychain_unavailable"));
+        retry_keychain(state.clone(), opener, starter, vec![Duration::ZERO], true).await;
+        assert_eq!(fail.load(Ordering::SeqCst), 0, "the failure was used");
+        assert!(state.store_failed());
+        assert_eq!(state.gate_state(), Some(GateState::StoreFailed));
+        assert_eq!(gate_label(&state).await, "store_failed");
+        assert_eq!(told.count(), 1, "one change, heard once");
+        let env = submit_answer(&state).await;
+        assert_eq!(env.status, Status::Failed);
+        let err = env.error.as_ref().ok_or("no error object")?;
+        assert_eq!(err.code, ErrorCode::Unreachable);
+        assert!(!err.retryable);
+        assert_eq!(reason_of(&env), Some("store_unavailable"));
+        assert_eq!(state.refused(), Some(1), "the kept gate counts the refusal");
+        // Nothing offers a retry any more.
+        assert_eq!(state.keychain_lost(), None);
+
+        // I/O: the locked gate stays, nothing is marked failed.
+        let tmp = tempfile::tempdir()?;
+        let fail = Arc::new(AtomicU32::new(1));
+        let hooks = ServeHooks {
+            fail_retry_open: Some(fail.clone()),
+            ..ServeHooks::default()
+        };
+        let (state, opener, starter) = retry_rig(&tmp, hooks)?;
+        retry_keychain(state.clone(), opener, starter, vec![Duration::ZERO], true).await;
+        assert_eq!(fail.load(Ordering::SeqCst), 0, "the failure was used");
+        assert!(!state.store_failed());
+        assert_eq!(
+            state.gate_state(),
+            Some(GateState::Locked(LockedReason::KeychainUnavailable))
+        );
+        assert_eq!(
+            reason_of(&submit_answer(&state).await),
+            Some("keychain_unavailable")
+        );
+        Ok(())
+    }
+
+    /// The quit path wins over a failed store: after the freeze the cell keeps answering
+    /// `app_shutting_down`, only the flag changes (and the watcher is told of that).
+    #[tokio::test]
+    async fn a_failed_store_after_the_freeze_keeps_the_shutting_down_gate() {
+        let told = Arc::new(Told::default());
+        let state = gate_serving_with(GateState::FirstRun, watched(&told));
+        assert!(state.freeze_for_shutdown().is_none());
+        state.mark_store_failed();
+        assert!(state.store_failed());
+        assert_eq!(state.gate_state(), Some(GateState::ShuttingDown));
+        assert_eq!(gate_label(&state).await, "shutting_down");
+        assert_eq!(told.count(), 1);
     }
 
     #[tokio::test]
