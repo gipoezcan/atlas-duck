@@ -376,11 +376,12 @@ async fn i04_e2e_heartbeat_timeout_cancel() -> Result<()> {
         "{heartbeats} heartbeats in {took:?}\n{}",
         mcp.transcript()
     );
-    let counters: Vec<u64> = progress
+    // rmcp serializes `progress` as a float (`1.0`), so `as_u64()` would read it as absent.
+    let counters: Vec<f64> = progress
         .iter()
-        .map(|n| n["params"]["progress"].as_u64().unwrap_or(0))
+        .map(|n| n["params"]["progress"].as_f64().unwrap_or(0.0))
         .collect();
-    assert_eq!(counters.first(), Some(&1), "{counters:?}");
+    assert_eq!(counters.first(), Some(&1.0), "{counters:?}");
     assert!(
         counters.windows(2).all(|w| w[0] < w[1]),
         "progress is not strictly increasing: {counters:?}"
