@@ -26,7 +26,7 @@ use serde_json::{Map, Value, json};
 
 use super::config::{McpConfig, ToolSet};
 use super::result::RESTART_TEXT;
-use super::rig::{RIG_BUILD, RIG_HEARTBEAT, Rig, RigApp, RigOpts};
+use super::rig::{Called, RIG_BUILD, RIG_HEARTBEAT, Rig, RigApp, RigOpts};
 use super::server::{AtlasMcp, SendFuture, Shared, ToolBodies, ToolCall};
 use super::session::{Session, hello_of};
 use super::tools::catalog;
@@ -2557,5 +2557,183 @@ async fn cancelled_tool_call_keeps_the_connection() -> TestResult {
     assert_eq!(rig.fake().count(Kind::Status), 1);
     assert_eq!(rig.fake().hellos().len(), 1);
     assert_eq!(rig.fake().count(Kind::Cancel), 0);
+    Ok(())
+}
+
+// ---------- survival and restart (Task 10, I-41 MCP case) ----------
+
+/// The first text block of a result.
+fn first_text(called: &Called) -> Option<String> {
+    called.texts().into_iter().next()
+}
+
+/// §4.6 "App restarts and upgrades": the app restarts with the same build; the server does not
+/// exit, the next tool call re-handshakes once and succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i41_mcp_survives_server_restart_and_rehandshakes() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    let first = rig
+        .call("request_status", json!({"request_id": REQ_ID}), false)
+        .await;
+    assert!(!first.is_error(), "{:?}", first.texts());
+    assert_eq!(rig.fake().hellos().len(), 1);
+
+    rig.app.restart_server(RIG_BUILD).await;
+
+    let second = rig
+        .call("request_status", json!({"request_id": REQ_ID}), false)
+        .await;
+    assert!(!second.is_error(), "{:?}", second.texts());
+    assert_eq!(
+        second.envelope()["data"],
+        json!({"method": "request.status"})
+    );
+    let ids = connection_ids(&rig);
+    assert_eq!(ids.len(), 2, "exactly one new hello: {ids:?}");
+    assert_ne!(ids[0], ids[1], "the new hello kept the old connection id");
+    assert_eq!(rig.connector().connect_count(), 2);
+
+    // The new connection is shared again.
+    let third = rig
+        .call("request_status", json!({"request_id": REQ_ID}), false)
+        .await;
+    assert!(!third.is_error(), "{:?}", third.texts());
+    assert_eq!(rig.fake().hellos().len(), 2);
+    assert!(
+        rig.serve_result(Duration::from_millis(200)).await.is_none(),
+        "serve ended because of the restart"
+    );
+    Ok(())
+}
+
+/// §3.3 build mismatch texts, L16: a newer app is an error with the restart text and both
+/// builds; an older app is `app_upgraded`; the app coming back at the client's build recovers
+/// the very same `serve` run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i41_build_mismatch_is_error_then_recovers() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    let ok = rig
+        .call("request_status", json!({"request_id": REQ_ID}), false)
+        .await;
+    assert!(!ok.is_error(), "{:?}", ok.texts());
+
+    // The app is newer than this server (the client `1.0.0+test` is older).
+    rig.app.restart_server("2.0.0+x").await;
+    let called = rig
+        .call("request_status", json!({"request_id": REQ_ID}), false)
+        .await;
+    let env = called.envelope();
+    assert!(called.is_error(), "{env}");
+    assert_eq!(code(&env), Some("protocol_mismatch"));
+    assert_eq!(
+        detail(&env, "client_build"),
+        Some(&json!(RIG_BUILD)),
+        "{env}"
+    );
+    assert_eq!(
+        detail(&env, "server_build"),
+        Some(&json!("2.0.0+x")),
+        "{env}"
+    );
+    assert_eq!(first_text(&called).as_deref(), Some(RESTART_TEXT));
+
+    // The app is older than this server (the client is newer).
+    rig.app.restart_server("0.9.0+x").await;
+    let called = rig
+        .call("request_status", json!({"request_id": REQ_ID}), false)
+        .await;
+    let env = called.envelope();
+    assert!(called.is_error(), "{env}");
+    assert_eq!(code(&env), Some("unreachable"));
+    assert_eq!(
+        detail(&env, "reason"),
+        Some(&json!("app_upgraded")),
+        "{env}"
+    );
+    assert_eq!(first_text(&called).as_deref(), Some(RESTART_TEXT));
+
+    // The app is back at the client's build: the next call succeeds, `serve` never restarted.
+    rig.app.restart_server(RIG_BUILD).await;
+    let called = rig
+        .call("request_status", json!({"request_id": REQ_ID}), false)
+        .await;
+    assert!(!called.is_error(), "{:?}", called.texts());
+    assert!(
+        rig.serve_result(Duration::from_millis(200)).await.is_none(),
+        "serve ended because of a build mismatch"
+    );
+    Ok(())
+}
+
+/// §4.4 / L63: the connection drops while a `request_await` is in flight: `pending` +
+/// `connection_lost` with the id kept and the restart text; a later `request_await` reconnects
+/// and gets the decision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i41_connection_drop_mid_await_is_connection_lost() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    // The app holds the await until its `timeout_ms` (5 s).
+    rig.fake().set_await_script(Some(AwaitScript::default()));
+    let waiting = rig
+        .start("request_await", json!({"request_id": REQ_ID}), false)
+        .await;
+    rig.fake().wait_for(Kind::AwaitStart, 1).await;
+
+    rig.app.drop_connections().await;
+
+    let called = rig.finish_within(waiting, Duration::from_secs(3)).await;
+    let env = called.envelope();
+    assert_eq!(env["status"], "pending", "{env}");
+    assert_eq!(env["request_id"], REQ_ID, "{env}");
+    assert_eq!(code(&env), Some("unreachable"));
+    assert_eq!(
+        detail(&env, "reason"),
+        Some(&json!("connection_lost")),
+        "{env}"
+    );
+    assert_eq!(first_text(&called).as_deref(), Some(RESTART_TEXT));
+    assert_eq!(rig.fake().count(Kind::Cancel), 0);
+
+    rig.fake()
+        .set_await_script(Some(script(&[], Some((50, released(json!({"n": 1})))))));
+    let again = rig
+        .call("request_await", json!({"request_id": REQ_ID}), false)
+        .await;
+    assert!(!again.is_error(), "{:?}", again.texts());
+    assert_eq!(again.envelope()["status"], "released");
+    let ids = connection_ids(&rig);
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert_ne!(ids[0], ids[1]);
+    assert_eq!(rig.fake().count(Kind::Cancel), 0);
+    Ok(())
+}
+
+/// §3.3: an app that is shutting down refuses the hello with `unreachable {app_shutting_down}`:
+/// an error result with the restart text; once it accepts again the next call succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i41_app_shutting_down_is_error_with_restart_text() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    rig.fake().set_hello_mode(HelloMode::Refuse(reason_envelope(
+        ErrorCode::Unreachable,
+        "app_shutting_down",
+    )));
+    let called = rig
+        .call("request_status", json!({"request_id": REQ_ID}), false)
+        .await;
+    let env = called.envelope();
+    assert!(called.is_error(), "{env}");
+    assert_eq!(code(&env), Some("unreachable"));
+    assert_eq!(
+        detail(&env, "reason"),
+        Some(&json!("app_shutting_down")),
+        "{env}"
+    );
+    assert_eq!(first_text(&called).as_deref(), Some(RESTART_TEXT));
+    assert_eq!(rig.fake().count(Kind::Status), 0);
+
+    rig.fake().set_hello_mode(HelloMode::Exact);
+    let called = rig
+        .call("request_status", json!({"request_id": REQ_ID}), false)
+        .await;
+    assert!(!called.is_error(), "{:?}", called.texts());
     Ok(())
 }
