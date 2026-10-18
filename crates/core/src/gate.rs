@@ -161,9 +161,39 @@ impl GateHandler {
 // The `Err` type is fixed by `RequestHandler::hello`.
 #[allow(clippy::result_large_err)]
 pub fn hello_check(h: &Hello) -> Result<HelloReply, Envelope> {
-    if h.build_id == BUILD_ID {
+    check_build(h, expected_build_id())
+}
+
+/// PD-129 (b), test builds only: the build id the next `hello` is compared against and answered
+/// with. Set once by the scripted-approver app from `ATLAS_DUCK_TEST_SERVER_BUILD_ID` before it
+/// serves; this item and its one use below exist only with the `testing` feature, which
+/// `lib.rs` refuses in a release build.
+#[cfg(feature = "testing")]
+static TEST_SERVER_BUILD_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// PD-129 (b): makes every later `hello` compare against and answer with `id` instead of
+/// `BUILD_ID`. The first call wins.
+#[cfg(feature = "testing")]
+pub fn set_test_server_build_id(id: &str) {
+    let _ = TEST_SERVER_BUILD_ID.set(id.to_owned());
+}
+
+/// The build id this process answers `hello` with: `BUILD_ID`, or the PD-129 test override.
+#[cfg(feature = "testing")]
+fn expected_build_id() -> &'static str {
+    TEST_SERVER_BUILD_ID.get().map_or(BUILD_ID, String::as_str)
+}
+
+#[cfg(not(feature = "testing"))]
+fn expected_build_id() -> &'static str {
+    BUILD_ID
+}
+
+#[allow(clippy::result_large_err)]
+fn check_build(h: &Hello, expected: &str) -> Result<HelloReply, Envelope> {
+    if h.build_id == expected {
         return Ok(HelloReply {
-            build_id: BUILD_ID.to_owned(),
+            build_id: expected.to_owned(),
         });
     }
     let mut env = Envelope::failed(
@@ -174,7 +204,7 @@ pub fn hello_check(h: &Hello) -> Result<HelloReply, Envelope> {
     if let Some(err) = env.error.as_mut() {
         let mut d = Map::new();
         d.insert("client_build".into(), Value::String(h.build_id.clone()));
-        d.insert("server_build".into(), Value::String(BUILD_ID.to_owned()));
+        d.insert("server_build".into(), Value::String(expected.to_owned()));
         err.details = Some(d);
     }
     Err(env)
@@ -299,5 +329,64 @@ impl RequestHandler for GateHandler {
     }
     async fn doctor(&self) -> Envelope {
         succeeded(json!({ "gate": self.state.label() }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use atlas_duck_ipc::proto::{AgentNameSource, ClientKind};
+
+    use super::*;
+
+    fn hello(build_id: &str) -> Hello {
+        Hello {
+            build_id: build_id.to_owned(),
+            client_kind: ClientKind::Cli,
+            agent_name: None,
+            agent_name_source: AgentNameSource::None,
+            cwd_basename: String::new(),
+        }
+    }
+
+    fn server_build(env: &Envelope) -> Option<&Value> {
+        env.error.as_ref()?.details.as_ref()?.get("server_build")
+    }
+
+    /// PD-129 (b): the build-id comparison is one function over an expected value; the answer
+    /// and the mismatch details carry that value.
+    #[test]
+    fn check_build_compares_and_answers_with_the_expected_id() {
+        let reply = check_build(&hello("other"), "other");
+        assert_eq!(reply.map(|r| r.build_id).ok().as_deref(), Some("other"));
+        let mismatch = check_build(&hello(BUILD_ID), "other").err();
+        assert_eq!(
+            mismatch.as_ref().and_then(server_build),
+            Some(&Value::String("other".into()))
+        );
+    }
+
+    /// Without the feature the plain path compares against `BUILD_ID` and nothing can change it
+    /// (the override item does not exist in this build).
+    #[cfg(not(feature = "testing"))]
+    #[test]
+    fn test_server_build_id_only_with_testing() {
+        assert_eq!(expected_build_id(), BUILD_ID);
+        assert!(hello_check(&hello(BUILD_ID)).is_ok());
+        let mismatch = hello_check(&hello("x")).err();
+        assert_eq!(
+            mismatch.as_ref().and_then(server_build),
+            Some(&Value::String(BUILD_ID.into()))
+        );
+    }
+
+    /// With the feature and no override set the check still uses `BUILD_ID`. The override itself
+    /// is process-global and set once, so it is exercised through `check_build` above and by the
+    /// `mcp_flows` I-41 case, never set here.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn test_server_build_id_only_with_testing() {
+        assert_eq!(expected_build_id(), BUILD_ID);
+        assert!(hello_check(&hello(BUILD_ID)).is_ok());
+        assert!(hello_check(&hello("x")).is_err());
     }
 }

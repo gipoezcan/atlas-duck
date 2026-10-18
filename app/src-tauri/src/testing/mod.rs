@@ -48,14 +48,32 @@ pub fn test_home_problem(
     (!honoured).then_some(MSG_NO_TEST_HOME)
 }
 
+/// PD-129 (b): the build id this test build answers `hello` with instead of its own. Read from the
+/// app's own environment at start, so it only takes effect when the harness starts the app
+/// itself: it is not on the launch allowlist and `cli/test-env` does not forward it.
+pub const ENV_TEST_SERVER_BUILD_ID: &str = "ATLAS_DUCK_TEST_SERVER_BUILD_ID";
+
+/// The override value of [`ENV_TEST_SERVER_BUILD_ID`]: a non-empty UTF-8 value, else none.
+pub fn server_build_id_override(env: Option<&OsStr>) -> Option<String> {
+    env.and_then(OsStr::to_str)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+}
+
 /// Called first thing in `run_gui`, before the startup gate reads any pinned file: ends the
-/// process with a non-zero status unless the test home is really in effect.
+/// process with a non-zero status unless the test home is really in effect. Also installs the
+/// PD-129 (b) server build-id override, before any `hello` can be served.
 pub fn require_test_home() {
     let env = std::env::var_os(ENV_TEST_HOME);
     let home = atlas_duck_ipc::paths::base_dirs().ok().map(|b| b.home);
     if let Some(msg) = test_home_problem(env.as_deref(), home.as_deref()) {
         eprintln!("{msg}");
         std::process::exit(2);
+    }
+    if let Some(id) =
+        server_build_id_override(std::env::var_os(ENV_TEST_SERVER_BUILD_ID).as_deref())
+    {
+        atlas_duck_core::gate::set_test_server_build_id(&id);
     }
 }
 
@@ -135,6 +153,17 @@ pub fn spawn(app: &AppHandle, data: &LocalDataDir) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_build_id_override_reads_a_non_empty_value() {
+        assert_eq!(ENV_TEST_SERVER_BUILD_ID, "ATLAS_DUCK_TEST_SERVER_BUILD_ID");
+        assert_eq!(server_build_id_override(None), None);
+        assert_eq!(server_build_id_override(Some(OsStr::new(""))), None);
+        assert_eq!(
+            server_build_id_override(Some(OsStr::new("other-build"))).as_deref(),
+            Some("other-build")
+        );
+    }
 
     #[test]
     fn the_test_build_refuses_unless_the_test_home_is_in_effect() {

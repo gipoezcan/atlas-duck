@@ -11,9 +11,11 @@ use std::time::Duration;
 
 use atlas_duck_core::testing::ScriptedApprover;
 use atlas_duck_core::{
-    CandidateRev, Core, DecisionApi, DecisionError, DenyDetails, QueueItem, UiEvent, UiSink,
+    CandidateRev, Core, DecisionApi, DecisionError, DenyDetails, DropScope, QueueItem, RedactionOp,
+    UiEvent, UiSink,
 };
 use tauri::{AppHandle, Manager};
+use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
@@ -36,12 +38,17 @@ pub const LOG_EVENT_APPROVER_ERROR: &str = "scripted_approver_error";
 pub const LOG_EVENT_APPROVER_GAVE_UP: &str = "scripted_approver_gave_up";
 
 /// What a reason asks the approver to do. Anything that is not a known directive is `Hold`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Directive {
     /// A read or a script (both are release-gated): open + release.
     Release,
     /// A read with an upstream error: §5.2 step 6 "Release status only".
     ReleaseStatusOnly,
+    /// PD-129 (a): a read: open, drop the field at `path` (`DropField`, per item), open the
+    /// redacted revision and release it. `atlas-test:release-redacted fields.description`.
+    ReleaseRedacted { path: String },
+    /// PD-129 (a): the expiry path (`Core::expire_now`) of a pending item of any class.
+    Expire,
     /// Open + deny with [`DENY_REASON`].
     Deny,
     /// Open + deny with `DenyDetails::UpstreamHttp { include_messages: true }` where the item
@@ -67,8 +74,17 @@ pub fn directive(reason_excerpt: Option<&str>) -> Directive {
     else {
         return Directive::Hold;
     };
-    match rest.split(char::is_whitespace).next().unwrap_or_default() {
+    let mut words = rest.split(char::is_whitespace);
+    match words.next().unwrap_or_default() {
         "release" => Directive::Release,
+        // The path is the next word; without one the directive is a plain hold.
+        "release-redacted" => match words.find(|w| !w.is_empty()) {
+            Some(path) => Directive::ReleaseRedacted {
+                path: path.to_owned(),
+            },
+            None => Directive::Hold,
+        },
+        "expire" => Directive::Expire,
         "release-status-only" => Directive::ReleaseStatusOnly,
         "deny" => Directive::Deny,
         "deny-details" => Directive::DenyDetails,
@@ -105,8 +121,30 @@ pub fn ui_tee() -> Arc<dyn UiSink> {
     app_wake()
 }
 
-/// Where the approver finds the decision API; `None` while no `Core` serves.
-pub type DecisionSource = Arc<dyn Fn() -> Option<Arc<dyn DecisionApi>> + Send + Sync>;
+/// What the approver acts through while a `Core` serves.
+#[derive(Clone)]
+pub struct Served {
+    pub decisions: Arc<dyn DecisionApi>,
+    /// PD-129 (a): the expiry path of a request now (`Core::expire_now`); `false` if it did not
+    /// end. Called on the blocking tick thread, so it may `block_on` an async call.
+    pub expire: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+}
+
+impl Served {
+    /// The approver's view of `core`. Call it inside the runtime: the expiry path runs on that
+    /// runtime's handle.
+    pub fn of_core(core: Arc<Core>) -> Served {
+        let decisions = core.decisions();
+        let handle = Handle::current();
+        Served {
+            decisions,
+            expire: Arc::new(move |id| handle.block_on(core.expire_now(id))),
+        }
+    }
+}
+
+/// Where the approver finds what it acts through; `None` while no `Core` serves.
+pub type DecisionSource = Arc<dyn Fn() -> Option<Served> + Send + Sync>;
 
 /// The approver task.
 pub struct ScriptedApp;
@@ -114,8 +152,7 @@ pub struct ScriptedApp;
 impl ScriptedApp {
     /// The approver over one core, woken by `wake`.
     pub fn spawn(core: Arc<Core>, wake: Arc<Wake>) -> JoinHandle<()> {
-        let decisions = core.decisions();
-        ScriptedApp::spawn_with(Arc::new(move || Some(decisions.clone())), wake)
+        ScriptedApp::spawn_with(Arc::new(move || Some(Served::of_core(core.clone()))), wake)
     }
 
     /// The approver of the app: the core is the one the managed `ServeSlot` serves, whenever
@@ -128,7 +165,7 @@ impl ScriptedApp {
         let source: DecisionSource = Arc::new(move || {
             let slot = app.try_state::<ServeSlot>()?;
             let core = slot.get()?.core.get()?.clone();
-            Some(core.decisions())
+            Some(Served::of_core(core))
         });
         tauri::async_runtime::spawn(run(source, app_wake(), Some(control_dir)));
     }
@@ -216,10 +253,10 @@ async fn run(source: DecisionSource, wake: Arc<Wake>, mirror: Option<PathBuf>) {
             () = wake.notify.notified() => {}
             () = tokio::time::sleep(TICK) => {}
         }
-        let Some(api) = source() else { continue };
+        let Some(served) = source() else { continue };
         let dir = mirror.clone();
         let ticked = tokio::task::spawn_blocking(move || {
-            tick(api, &mut memory, dir.as_deref());
+            tick(&served, &mut memory, dir.as_deref());
             memory
         })
         .await;
@@ -230,20 +267,20 @@ async fn run(source: DecisionSource, wake: Arc<Wake>, mirror: Option<PathBuf>) {
 }
 
 /// One pass over the queue.
-fn tick(api: Arc<dyn DecisionApi>, memory: &mut Memory, mirror: Option<&Path>) {
-    let items = api.queue_list();
+fn tick(served: &Served, memory: &mut Memory, mirror: Option<&Path>) {
+    let items = served.decisions.queue_list();
     memory.keep_only(&items);
     if let Some(dir) = mirror {
         memory.mirror(dir, &items);
     }
-    let approver = ScriptedApprover::new(api);
+    let approver = ScriptedApprover::new(served.decisions.clone());
     for item in &items {
         let d = directive(item.reason_excerpt.as_deref());
         let (id, rev) = (item.request_id.as_str(), item.candidate_rev);
-        if !fits(d, item) || !memory.due(id, rev) {
+        if !fits(&d, item) || !memory.due(id, rev) {
             continue;
         }
-        match act(&approver, d, item) {
+        match act(&approver, served.expire.as_ref(), &d, item) {
             Ok(()) => memory.succeeded(id, rev),
             // Retried on the next tick; after `Stale` that tick sees the new revision.
             Err(e) => {
@@ -259,16 +296,19 @@ fn tick(api: Arc<dyn DecisionApi>, memory: &mut Memory, mirror: Option<&Path>) {
 /// Whether the directive applies to the item now. A release or an approve waits while the item
 /// is not approvable (the core would refuse it and log a `DECISION_INVALID` every tick); a
 /// directive for another class is a hold.
-fn fits(d: Directive, item: &QueueItem) -> bool {
+fn fits(d: &Directive, item: &QueueItem) -> bool {
     fits_class(d, item.class, item.approvable)
 }
 
 /// [`fits`] over the two fields it reads. A script item is release-gated like a read (core's
 /// `decide` answers an approve for a script `NotDecidable`), so `Release` fits it; the
 /// status-only preset is a read-outcome card and does not.
-fn fits_class(d: Directive, class: &str, approvable: bool) -> bool {
+fn fits_class(d: &Directive, class: &str, approvable: bool) -> bool {
     match d {
         Directive::Hold => false,
+        // Any class: an item in the queue is pending, a decided one is not in it.
+        Directive::Expire => true,
+        Directive::ReleaseRedacted { .. } => class == "read" && approvable,
         Directive::Release => matches!(class, "read" | "script") && approvable,
         Directive::ReleaseStatusOnly => class == "read" && approvable,
         Directive::Approve | Directive::EditPreadded => class == "write" && approvable,
@@ -276,9 +316,24 @@ fn fits_class(d: Directive, class: &str, approvable: bool) -> bool {
     }
 }
 
-fn act(approver: &ScriptedApprover, d: Directive, item: &QueueItem) -> Result<(), DecisionError> {
+fn act(
+    approver: &ScriptedApprover,
+    expire: &(dyn Fn(&str) -> bool + Send + Sync),
+    d: &Directive,
+    item: &QueueItem,
+) -> Result<(), DecisionError> {
     let id = item.request_id.as_str();
     match d {
+        Directive::ReleaseRedacted { path } => {
+            let op = RedactionOp::DropField {
+                path: path.clone(),
+                scope: DropScope::PerItem,
+            };
+            approver.release_redacted(id, vec![op]).map(drop)
+        }
+        // A request whose phase cannot expire yet is retried on the next tick.
+        Directive::Expire if expire(id) => Ok(()),
+        Directive::Expire => Err(DecisionError::NotDecidable),
         Directive::Release => approver.release(id).map(drop),
         Directive::ReleaseStatusOnly => approver.release_status_only(id).map(drop),
         Directive::Deny => approver.deny(id, DENY_REASON).map(drop),
@@ -363,6 +418,7 @@ mod tests {
 
     #[test]
     fn directive_parsing_table() {
+        let redacted = |path: &str| Directive::ReleaseRedacted { path: path.into() };
         let table: &[(Option<&str>, Directive)] = &[
             (Some("atlas-test:release"), Directive::Release),
             (
@@ -379,6 +435,21 @@ mod tests {
             (Some("atlas-test:edit-preadded2"), Directive::Hold),
             (Some("atlas-test:approve\nsecond line"), Directive::Approve),
             (Some("atlas-test:hold"), Directive::Hold),
+            (Some("atlas-test:expire"), Directive::Expire),
+            (Some("atlas-test:expire now"), Directive::Expire),
+            (Some("atlas-test:expire2"), Directive::Hold),
+            (
+                Some("atlas-test:release-redacted fields.description"),
+                redacted("fields.description"),
+            ),
+            (
+                Some("atlas-test:release-redacted   fields.description trailing"),
+                redacted("fields.description"),
+            ),
+            // No path: a plain hold.
+            (Some("atlas-test:release-redacted"), Directive::Hold),
+            (Some("atlas-test:release-redacted "), Directive::Hold),
+            (Some("atlas-test:release-redactedx a"), Directive::Hold),
             (Some("  atlas-test:release"), Directive::Release),
             // Unknown directive, no prefix, no reason: hold.
             (Some("atlas-test:launch-missiles"), Directive::Hold),
@@ -392,7 +463,7 @@ mod tests {
             (None, Directive::Hold),
         ];
         for (reason, want) in table {
-            assert_eq!(directive(*reason), *want, "{reason:?}");
+            assert_eq!(&directive(*reason), want, "{reason:?}");
         }
         // Every directive fits the 60-character excerpt.
         for name in [
@@ -404,9 +475,13 @@ mod tests {
             "edit-preadded",
             "deny-hint",
             "hold",
+            "expire",
         ] {
             assert!(DIRECTIVE_PREFIX.len() + name.len() <= 60, "{name}");
         }
+        // The path directive too, with the longest path the flows use.
+        let reason = "atlas-test:release-redacted fields.description";
+        assert!(reason.len() <= 60, "{reason}");
     }
 
     /// M8 T26: a release decides a read or a script, an approve a write only (core refuses an
@@ -431,12 +506,28 @@ mod tests {
             (Directive::DenyHint, "write", true),
         ];
         for (d, class, want) in table {
-            assert_eq!(fits_class(*d, class, true), *want, "{d:?} on {class}");
+            assert_eq!(fits_class(d, class, true), *want, "{d:?} on {class}");
         }
         // Not approvable yet: a release or an approve waits; a deny does not.
-        assert!(!fits_class(Directive::Release, "script", false));
-        assert!(!fits_class(Directive::Approve, "write", false));
-        assert!(fits_class(Directive::Deny, "script", false));
+        assert!(!fits_class(&Directive::Release, "script", false));
+        assert!(!fits_class(&Directive::Approve, "write", false));
+        assert!(fits_class(&Directive::Deny, "script", false));
+    }
+
+    /// PD-129 (a): an expire fits every class while the item is pending (a decided item is not in
+    /// the queue the approver reads; `expire_directive_expires_pending_read` pins that).
+    #[test]
+    fn expire_fits_pending_items_of_every_class() {
+        for class in ["read", "write", "script"] {
+            for approvable in [true, false] {
+                assert!(fits_class(&Directive::Expire, class, approvable), "{class}");
+            }
+        }
+        // A redacted release is a read-only directive and waits for an approvable item.
+        let redacted = Directive::ReleaseRedacted { path: "a".into() };
+        assert!(fits_class(&redacted, "read", true));
+        assert!(!fits_class(&redacted, "read", false));
+        assert!(!fits_class(&redacted, "write", true));
     }
 
     #[test]
@@ -520,7 +611,15 @@ mod tests {
         mock.jira_server_info("9.12.0").await;
         let wake = Arc::new(Wake::default());
         let decisions = h.decisions();
-        let app = ScriptedApp::spawn_with(Arc::new(move || Some(decisions.clone())), wake);
+        let app = ScriptedApp::spawn_with(
+            Arc::new(move || {
+                Some(Served {
+                    decisions: decisions.clone(),
+                    expire: Arc::new(|_| false),
+                })
+            }),
+            wake,
+        );
 
         // A held read first: it must stay pending while the others are decided.
         let held = submit(
@@ -660,6 +759,123 @@ mod tests {
         Ok(())
     }
 
+    /// The approver over a started harness, with the expiry path of its core.
+    fn approver_over(h: &Arc<Harness>) -> JoinHandle<()> {
+        let h = h.clone();
+        ScriptedApp::spawn_with(
+            Arc::new(move || {
+                let core = h.clone();
+                let handle = Handle::current();
+                Some(Served {
+                    decisions: h.decisions(),
+                    expire: Arc::new(move |id| handle.block_on(core.expire_now(id))),
+                })
+            }),
+            Arc::new(Wake::default()),
+        )
+    }
+
+    /// PD-129 (a): `atlas-test:expire` runs the expiry path of a pending read: it ends `expired`
+    /// with an `EXPIRED` record and leaves the queue. Every wait is bounded, so a regression
+    /// fails by assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn expire_directive_expires_pending_read() -> TestResult {
+        let h = Arc::new(Harness::jira().await?);
+        let mock = h.mock("jira-main").ok_or("no jira mock")?;
+        mock.json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
+            .await;
+        let app = approver_over(&h);
+        let held = submit(
+            &h,
+            "jira.issue.get",
+            json!({ "key": "ABC-1" }),
+            "atlas-test:hold",
+        )
+        .await?;
+        let id = submit(
+            &h,
+            "jira.issue.get",
+            json!({ "key": "ABC-1" }),
+            "atlas-test:expire",
+        )
+        .await?;
+        let env = h.await_(&id, 15_000).await;
+        assert_eq!(env.status, Status::Expired, "{}", env.to_json_line());
+        assert!(
+            h.event_types(&id)
+                .await?
+                .contains(&atlas_duck_audit::EventType::EXPIRED)
+        );
+        assert!(
+            h.approver().item(&id).is_none(),
+            "an expired item left the queue"
+        );
+        // A held request is untouched.
+        assert_eq!(h.status(&held).await.status, Status::Pending);
+        app.abort();
+        Ok(())
+    }
+
+    /// PD-129 (a): `atlas-test:release-redacted <path>` drops the field at the path and releases
+    /// the redacted revision.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn release_redacted_directive_redacts() -> TestResult {
+        let h = Arc::new(Harness::jira().await?);
+        let mock = h.mock("jira-main").ok_or("no jira mock")?;
+        mock.json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
+            .await;
+        let app = approver_over(&h);
+        let id = submit(
+            &h,
+            "jira.issue.get",
+            json!({ "key": "ABC-1" }),
+            "atlas-test:release-redacted fields.description",
+        )
+        .await?;
+        let env = h.await_(&id, 15_000).await;
+        assert_eq!(env.status, Status::Released, "{}", env.to_json_line());
+        assert!(env.redacted, "{}", env.to_json_line());
+        let text = env.to_json_line();
+        assert!(
+            !text.contains("Steps to reproduce"),
+            "description survived: {text}"
+        );
+        assert!(
+            text.contains("Login page times out"),
+            "only the path is dropped: {text}"
+        );
+        let value = serde_json::to_value(&env)?;
+        let dropped = value["meta"]["redactions"]["fields_dropped"]
+            .as_array()
+            .ok_or_else(|| format!("no fields_dropped: {text}"))?;
+        assert!(!dropped.is_empty(), "{text}");
+        app.abort();
+        Ok(())
+    }
+
+    /// A missing path is a plain hold: the item stays pending and unopened.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn release_redacted_without_a_path_holds() -> TestResult {
+        let h = Arc::new(Harness::jira().await?);
+        let mock = h.mock("jira-main").ok_or("no jira mock")?;
+        mock.json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
+            .await;
+        let app = approver_over(&h);
+        let id = submit(
+            &h,
+            "jira.issue.get",
+            json!({ "key": "ABC-1" }),
+            "atlas-test:release-redacted",
+        )
+        .await?;
+        h.queued(&id, 10_000).await.ok_or("never queued")?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(h.status(&id).await.status, Status::Pending);
+        let item = h.approver().item(&id).ok_or("item left the queue")?;
+        assert!(!item.opened);
+        app.abort();
+        Ok(())
+    }
     fn rev(counter: u64) -> CandidateRev {
         CandidateRev {
             counter,

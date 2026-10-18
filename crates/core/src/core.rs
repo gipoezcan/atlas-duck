@@ -614,6 +614,13 @@ impl Core {
         &self.engine
     }
 
+    /// PD-129 (a), tests only: runs the expiry path of `request_id` now (the scripted approver's
+    /// `expire` directive); `false` if the request is not pending.
+    #[cfg(feature = "testing")]
+    pub async fn expire_now(&self, request_id: &str) -> bool {
+        self.engine.expire_now(request_id).await
+    }
+
     /// The one §2.5 shutdown path (I-40): (1) from now on every `submit` / `submit_script` is
     /// refused `app_shutting_down` and every `InstanceAdmin` and writing `SettingsAdmin` call
     /// `ShuttingDown` (other methods keep working until the app exits); (2, 3) every request
