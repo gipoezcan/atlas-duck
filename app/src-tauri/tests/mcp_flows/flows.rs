@@ -351,7 +351,7 @@ async fn i04_e2e_heartbeat_timeout_cancel() -> Result<()> {
     let heartbeats = progress
         .iter()
         .skip(1)
-        .filter(|n| n["params"].get("message").is_none())
+        .filter(|n| n["params"]["message"].is_null())
         .count();
     assert_eq!(
         heartbeats,
@@ -418,7 +418,7 @@ async fn i04_e2e_heartbeat_timeout_cancel() -> Result<()> {
 
 /// I-16 over MCP (§4.4): `request_status` answers at once with `isError: false` for a known id in
 /// every state: `pending` (held), `released`, `denied` (with details), a read released after an
-/// upstream error (`release-status-only`: decided, `released` or `failed`), and a `failed` write
+/// upstream error (`release-status-only`: `failed`, `upstream_http`), and a `failed` write
 /// (the mock refuses the comment). Each answer takes under 2 s, carries the id, no data and no
 /// meta, and an error part is only the fixed "use await for details" (nothing is revealed).
 ///
@@ -516,11 +516,14 @@ async fn i16_mcp_request_status_immediate() -> Result<()> {
             "pending" => assert_eq!(status_of(env), "pending", "{env}"),
             "released" => assert_eq!(status_of(env), "released", "{env}"),
             "denied" => assert_eq!(status_of(env), "denied", "{env}"),
-            "upstream" => assert!(
-                matches!(status_of(env), "released" | "failed"),
-                "upstream-error read: {env}"
-            ),
-            _ => assert_eq!(status_of(env), "failed", "{env}"),
+            // A read released after an upstream error is `failed` (`record_status`).
+            _ => assert_eq!(status_of(env), "failed", "{label}: {env}"),
+        }
+        if matches!(*label, "pending" | "released") {
+            assert!(env["error"].is_null(), "{label}: {env}");
+        } else {
+            assert_eq!(error_code(env), "upstream_http", "{label}: {env}");
+            assert_eq!(env["error"]["retryable"], false, "{label}: {env}");
         }
         if !env["error"].is_null() {
             assert_eq!(
@@ -682,7 +685,7 @@ async fn i41_mcp_app_restart_rehandshake() -> Result<()> {
     };
 
     // The app is running again: either the call above launched it, or (an error answer) the test
-    // starts it; a launch that was still under way is waited for rather than raced.
+    // starts it; with the endpoint gone after a clean quit, a launch under way is waited for.
     if !relaunched {
         match wait_for_endpoint(&world, Duration::from_secs(10)).await {
             Ok(()) => {}
@@ -746,16 +749,13 @@ async fn i41_mcp_app_build_changed_is_error_then_rehandshake() -> Result<()> {
     let mismatch = release_get(&mut mcp).await?;
     assert_restart_error(&mcp, &mismatch);
     let env = mismatch.structured();
-    match error_code(env) {
-        "protocol_mismatch" => {
-            assert_eq!(
-                env["error"]["details"]["server_build"], OTHER_BUILD,
-                "{env}"
-            );
-            assert!(env["error"]["details"]["client_build"].is_string(), "{env}");
-        }
-        _ => assert_eq!(error_reason(env), "app_upgraded", "{env}"),
-    }
+    // The override is newer than the client, so this is never `app_upgraded`.
+    assert_eq!(error_code(env), "protocol_mismatch", "{env}");
+    assert_eq!(
+        env["error"]["details"]["server_build"], OTHER_BUILD,
+        "{env}"
+    );
+    assert!(env["error"]["details"]["client_build"].is_string(), "{env}");
     assert!(env["request_id"].is_null(), "{env}");
 
     // The app comes back at the client's build: the same server process recovers.
@@ -911,8 +911,18 @@ async fn pending_recovered_with_request_list_not_resubmitted() -> Result<()> {
             .filter(|req| req.url.path().ends_with("/issue/ABC-1"))
             .count())
     };
+    // The app fetches the read before it holds for approval: wait until the mock has seen it, so
+    // the kill cannot race the fetch and the count below is not vacuous.
+    let fetch_deadline = Instant::now() + Duration::from_secs(15);
+    while reads(&world).await? < 1 {
+        if Instant::now() > fetch_deadline {
+            return Err(format!("the app never fetched ABC-1\n{}", mcp.transcript()).into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     app.kill_hard()?;
     let reads_at_kill = reads(&world).await?;
+    assert_eq!(reads_at_kill, 1, "one fetch before the kill");
 
     // The wait ends with the id kept and nothing cancelled.
     let lost = mcp.wait_call(call_id, Duration::from_secs(45)).await?;
@@ -945,6 +955,7 @@ async fn pending_recovered_with_request_list_not_resubmitted() -> Result<()> {
         "{}",
         listed.structured()
     );
+    assert_eq!(rows[0]["status"], "abandoned", "{}", listed.structured());
 
     let awaited = mcp
         .call("request_await", json!({"request_id": id}), None)
