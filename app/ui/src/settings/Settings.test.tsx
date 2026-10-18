@@ -387,8 +387,185 @@ describe('Settings', () => {
     expect(screen.getByText('not met: scripts are off')).toBeTruthy();
     expect(screen.getByText(/connect_loopback/)).toBeTruthy();
     second.unmount();
-    await show({ ...BARE, confinement: { state: 'pending', failed: [], mode: 'n/a', extra_layers: [] } });
+    await show({
+      ...BARE,
+      confinement: {
+        state: 'pending',
+        failed: [],
+        mode: 'n/a',
+        extra_layers: [],
+        scripts: 'disabled',
+        degraded_allowed: false,
+      },
+    });
     expect(screen.getByText('the startup probe has not finished')).toBeTruthy();
+  });
+
+  /** FULL with the confinement and the degraded setting replaced, and no read-only banner. */
+  const scriptsView = (
+    confinement: Partial<SettingsGet['confinement']>,
+    allow: boolean,
+    readOnly = false,
+  ): SettingsGet =>
+    plain(
+      {},
+      {
+        confinement: { ...FULL.confinement, ...confinement },
+        settings: {
+          ...FULL.settings,
+          config_read_only: readOnly ? { kind: 'read_only', text: 'newer config' } : null,
+          restart_pending: [],
+          allow_degraded_scripts: allow,
+        },
+      },
+    );
+  const NOT_MET: Partial<SettingsGet['confinement']> = {
+    state: 'not_met',
+    failed: ['cred_read'],
+    mode: 'lpac',
+  };
+
+  it('confinement_scripts_state_rendered', async () => {
+    const states: [Partial<SettingsGet['confinement']>, string][] = [
+      [{}, 'Scripts are enabled'],
+      [{ ...NOT_MET, scripts: 'disabled' }, 'Scripts are disabled'],
+      [{ ...NOT_MET, scripts: 'degraded', degraded_allowed: true }, 'Scripts are enabled with degraded confinement'],
+      [{ state: 'pending', failed: [], mode: 'n/a', extra_layers: [], scripts: 'disabled' }, 'Scripts are disabled'],
+    ];
+    for (const [confinement, text] of states) {
+      const { unmount } = await show(scriptsView(confinement, false));
+      const region = screen.getByRole('region', { name: 'Script confinement' });
+      expect(within(region).getByText(text)).toBeTruthy();
+      // Exactly one of the three state lines is shown.
+      for (const other of ['Scripts are enabled', 'Scripts are disabled', 'Scripts are enabled with degraded confinement']) {
+        expect(within(region).queryAllByText(other).length).toBe(other === text ? 1 : 0);
+      }
+      unmount();
+    }
+  });
+
+  it('degraded_toggle_shows_persistent_warning', async () => {
+    const caution = 'scripts run with degraded confinement';
+    const toggle = () => screen.getByLabelText('Allow scripts with degraded confinement') as HTMLInputElement;
+    // Off: unchecked, no caution.
+    const off = await show(scriptsView({ ...NOT_MET, scripts: 'disabled' }, false));
+    expect(toggle().checked).toBe(false);
+    expect(screen.queryByText(caution)).toBeNull();
+
+    // Click: one settings_apply change; Rust confirms natively, a cancel is text and the box stays off.
+    vi.mocked(settingsApply).mockRejectedValue({ kind: 'settings', error: { kind: 'cancelled' } });
+    fireEvent.click(toggle());
+    await flush();
+    expect(settingsApply).toHaveBeenLastCalledWith([{ key: 'allow_degraded_scripts', value: true }]);
+    expect(screen.getByText('Cancelled: nothing was changed')).toBeTruthy();
+    expect(toggle().checked).toBe(false);
+    expect(screen.queryByText(caution)).toBeNull();
+    off.unmount();
+
+    // On and the floor not met: checked, the caution stays (a re-read does not remove it, it has no
+    // dismiss), and turning it off is the same command with false.
+    const on_ = await show(scriptsView({ ...NOT_MET, scripts: 'degraded', degraded_allowed: true }, true));
+    expect(toggle().checked).toBe(true);
+    expect(screen.getByText(caution)).toBeTruthy();
+    vi.mocked(settingsGet).mockResolvedValue(
+      scriptsView({ ...NOT_MET, scripts: 'degraded', degraded_allowed: true }, true),
+    );
+    await emitChanged();
+    expect(screen.getByText(caution)).toBeTruthy();
+    vi.mocked(settingsApply).mockReset().mockResolvedValue(FULL.settings);
+    fireEvent.click(toggle());
+    await flush();
+    expect(settingsApply).toHaveBeenLastCalledWith([{ key: 'allow_degraded_scripts', value: false }]);
+    on_.unmount();
+
+    // On while the floor is met: nothing runs degraded, so no caution, and the note says why.
+    const met = await show(scriptsView({}, true));
+    expect(toggle().checked).toBe(true);
+    expect(screen.queryByText(caution)).toBeNull();
+    expect(screen.getByText('Allowed, but not in use: the confinement floor is met.')).toBeTruthy();
+    met.unmount();
+
+    // The toggle is audit-authoritative, not a config.toml key: a read-only config leaves it on.
+    await show(scriptsView({ ...NOT_MET, scripts: 'disabled' }, false, true));
+    expect(toggle().matches(':disabled')).toBe(false);
+  });
+
+  it('script_limits_inputs_and_rust_errors', async () => {
+    const LABELS = [
+      ['timeout_s', 'Script timeout (s)', '120'],
+      ['heap_mb', 'Script heap limit (MiB)', '256'],
+      ['process_mb', 'Script process limit (MiB)', '512'],
+      ['max_calls', 'Script call limit', '200'],
+      ['max_fetch_mb', 'Script fetch limit (MiB)', '50'],
+      ['max_call_result_mb', 'Script call result limit (MiB)', '16'],
+      ['max_result_mb', 'Script result limit (MiB)', '16'],
+      ['max_concurrent_calls', 'Script concurrent calls', '4'],
+    ] as const;
+    // Configured values (not the defaults) fill the inputs; the default is the hint beside each.
+    const configured = { ...FULL.settings.limits.script, timeout_s: 90, max_calls: 150 };
+    await show(
+      plain({}, { settings: { ...FULL.settings, config_read_only: null, limits: { ...FULL.settings.limits, script: configured } } }),
+    );
+    const region = screen.getByRole('region', { name: 'Script limits' });
+    expect(within(region).getAllByRole('textbox').length).toBe(8);
+    for (const [key, label, dflt] of LABELS) {
+      const input = within(region).getByLabelText(label) as HTMLInputElement;
+      expect(input.value).toBe(String(configured[key]));
+      const field = input.closest('.field') as HTMLElement;
+      expect(field.textContent).toContain(`default ${dflt}`);
+      // Script limits apply to the next run at once: no restart marker.
+      expect(field.textContent).not.toContain('applies after restart');
+    }
+    const apply = () => fireEvent.click(within(region).getByRole('button', { name: 'Apply' }));
+
+    // Nothing edited: nothing sent. A non-number is refused locally.
+    apply();
+    await flush();
+    expect(settingsApply).not.toHaveBeenCalled();
+    fireEvent.change(within(region).getByLabelText('Script call limit'), { target: { value: 'abc' } });
+    apply();
+    await flush();
+    expect(settingsApply).not.toHaveBeenCalled();
+    expect(within(region).getByRole('alert').textContent).toBe('Enter a whole number');
+
+    // Only the changed keys go, in one script_limits change; Rust's refusal is text and the typed
+    // value stays.
+    fireEvent.change(within(region).getByLabelText('Script call limit'), { target: { value: '150' } });
+    fireEvent.change(within(region).getByLabelText('Script heap limit (MiB)'), { target: { value: '9000' } });
+    fireEvent.change(within(region).getByLabelText('Script result limit (MiB)'), { target: { value: '17' } });
+    vi.mocked(settingsApply).mockRejectedValue({ kind: 'settings', error: { kind: 'invalid', key: 'heap_mb' } });
+    apply();
+    await flush();
+    expect(settingsApply).toHaveBeenLastCalledWith([
+      { key: 'script_limits', value: { heap_mb: 9000, max_result_mb: 17 } },
+    ]);
+    expect(within(region).getByRole('alert').textContent).toBe('Check the value of Script heap limit (MiB)');
+    expect((within(region).getByLabelText('Script heap limit (MiB)') as HTMLInputElement).value).toBe('9000');
+
+    // Rust's own bound refusal names the limit (the argument's field), also as text.
+    vi.mocked(settingsApply).mockRejectedValue({ kind: 'invalid_argument', field: 'max_result_mb' });
+    apply();
+    await flush();
+    expect(within(region).getByRole('alert').textContent).toBe('Check the value of Script result limit (MiB)');
+
+    // A raise is confirmed natively by Rust: a cancel is text; an applied change clears the drafts.
+    vi.mocked(settingsApply).mockRejectedValue({ kind: 'settings', error: { kind: 'cancelled' } });
+    apply();
+    await flush();
+    expect(within(region).getByRole('alert').textContent).toBe('Cancelled: nothing was changed');
+    vi.mocked(settingsApply).mockResolvedValue(FULL.settings);
+    apply();
+    await flush();
+    expect(within(region).getByRole('status').textContent).toBe('Applied');
+    expect(within(region).queryByRole('alert')).toBeNull();
+  });
+
+  it('script limits are off under a read-only config', async () => {
+    await show(scriptsView({}, false, true));
+    const region = screen.getByRole('region', { name: 'Script limits' });
+    for (const input of within(region).getAllByRole('textbox')) {
+      expect(input.matches(':disabled')).toBe(true);
+    }
   });
 
   it('the CLI button follows cli_installed and calls the matching command with no arguments', async () => {
@@ -621,7 +798,14 @@ describe('Settings', () => {
           state: evil,
         },
       ],
-      confinement: { state: 'not_met', mode: evil, failed: [evil], extra_layers: [{ name: evil, on: true }] },
+      confinement: {
+        state: 'not_met',
+        mode: evil,
+        failed: [evil],
+        extra_layers: [{ name: evil, on: true }],
+        scripts: 'disabled',
+        degraded_allowed: false,
+      },
     };
     const { container } = await show(data);
     expect(container.querySelector('img, b, script, iframe, a')).toBeNull();

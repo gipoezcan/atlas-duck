@@ -3,6 +3,7 @@
     "cli_installed": true,
     "cli_removable": true,
     "confinement": {
+      "degraded_allowed": true,
       "extra_layers": [
         {
           "name": "landlock",
@@ -11,6 +12,7 @@
       ],
       "failed": [],
       "mode": "lpac",
+      "scripts": "enabled",
       "state": "met"
     },
     "instances": [
@@ -44,6 +46,7 @@
       }
     ],
     "settings": {
+      "allow_degraded_scripts": true,
       "anchor_dir": "anchors",
       "attention_mode": "badge_only",
       "config_read_only": {
@@ -67,7 +70,17 @@
         "candidate_cache_mb": 256,
         "expiry_hours": 24,
         "jira_comments_cap": 50,
-        "max_pending_bytes_mb": 512
+        "max_pending_bytes_mb": 512,
+        "script": {
+          "heap_mb": 512,
+          "max_call_result_mb": 8,
+          "max_calls": 400,
+          "max_concurrent_calls": 2,
+          "max_fetch_mb": 100,
+          "max_result_mb": 12,
+          "process_mb": 1024,
+          "timeout_s": 300
+        }
       },
       "restart_pending": [
         "candidate_cache_mb"
@@ -79,12 +92,14 @@
     "cli_installed": false,
     "cli_removable": true,
     "confinement": {
+      "degraded_allowed": false,
       "extra_layers": [],
       "failed": [
         "connect_loopback",
         "cred_read"
       ],
       "mode": "appcontainer",
+      "scripts": "disabled",
       "state": "not_met"
     },
     "instances": [
@@ -104,6 +119,7 @@
       }
     ],
     "settings": {
+      "allow_degraded_scripts": false,
       "anchor_dir": null,
       "attention_mode": "show_without_activating",
       "config_read_only": null,
@@ -124,7 +140,17 @@
         "candidate_cache_mb": 256,
         "expiry_hours": 24,
         "jira_comments_cap": 50,
-        "max_pending_bytes_mb": null
+        "max_pending_bytes_mb": null,
+        "script": {
+          "heap_mb": 256,
+          "max_call_result_mb": 16,
+          "max_calls": 200,
+          "max_concurrent_calls": 4,
+          "max_fetch_mb": 50,
+          "max_result_mb": 16,
+          "process_mb": 512,
+          "timeout_s": 120
+        }
       },
       "restart_pending": [],
       "retention_days": 100
@@ -134,13 +160,16 @@
     "cli_installed": true,
     "cli_removable": false,
     "confinement": {
+      "degraded_allowed": false,
       "extra_layers": [],
       "failed": [],
       "mode": "n/a",
+      "scripts": "disabled",
       "state": "pending"
     },
     "instances": [],
     "settings": {
+      "allow_degraded_scripts": false,
       "anchor_dir": null,
       "attention_mode": "show_without_activating",
       "config_read_only": null,
@@ -161,10 +190,77 @@
         "candidate_cache_mb": 256,
         "expiry_hours": 24,
         "jira_comments_cap": 50,
-        "max_pending_bytes_mb": null
+        "max_pending_bytes_mb": null,
+        "script": {
+          "heap_mb": 256,
+          "max_call_result_mb": 16,
+          "max_calls": 200,
+          "max_concurrent_calls": 4,
+          "max_fetch_mb": 50,
+          "max_result_mb": 16,
+          "process_mb": 512,
+          "timeout_s": 120
+        }
       },
       "restart_pending": [],
       "retention_days": 100
+    }
+  },
+  {
+    "cli_installed": true,
+    "cli_removable": true,
+    "confinement": {
+      "degraded_allowed": true,
+      "extra_layers": [],
+      "failed": [
+        "open_process_vm_read"
+      ],
+      "mode": "n/a",
+      "scripts": "degraded",
+      "state": "not_met"
+    },
+    "instances": [],
+    "settings": {
+      "allow_degraded_scripts": true,
+      "anchor_dir": "anchors",
+      "attention_mode": "badge_only",
+      "config_read_only": {
+        "kind": "read_only",
+        "text": "config written by v9.9.0; settings read-only until you upgrade"
+      },
+      "health": {
+        "anchor_thread_dead": false,
+        "anchor_write_failing": false,
+        "anchors_blocked": false,
+        "last_prune_failed": false,
+        "open_incidents": 0,
+        "prune_backlog": "pruning is 12 days behind",
+        "prune_backlog_days": 12,
+        "settings_unreadable": false,
+        "shred_checkpoint_pending": false,
+        "storage_low": true
+      },
+      "legal_hold": true,
+      "limits": {
+        "candidate_cache_mb": 256,
+        "expiry_hours": 24,
+        "jira_comments_cap": 50,
+        "max_pending_bytes_mb": 512,
+        "script": {
+          "heap_mb": 512,
+          "max_call_result_mb": 8,
+          "max_calls": 400,
+          "max_concurrent_calls": 2,
+          "max_fetch_mb": 100,
+          "max_result_mb": 12,
+          "process_mb": 1024,
+          "timeout_s": 300
+        }
+      },
+      "restart_pending": [
+        "candidate_cache_mb"
+      ],
+      "retention_days": 365
     }
   }
 ]

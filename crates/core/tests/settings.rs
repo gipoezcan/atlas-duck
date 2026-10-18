@@ -705,8 +705,12 @@ async fn view_reports_store_health_and_settings() -> TestResult {
     assert_eq!(json["attention_mode"], "show_without_activating");
     // The script limits in force (M8 Δ6): the eight §9.4 keys at their defaults.
     assert_eq!(v.limits.script, ScriptLimits::default());
-    // Not on the wire until the Settings UI task widens its closed validator and fixture.
-    assert!(json["limits"].get("script").is_none());
+    // On the wire since M8 Task 23 (the Settings window shows the limits and the degraded setting).
+    assert_eq!(
+        json["limits"]["script"],
+        serde_json::to_value(ScriptLimits::default())?
+    );
+    assert_eq!(json["allow_degraded_scripts"], false);
     Ok(())
 }
 

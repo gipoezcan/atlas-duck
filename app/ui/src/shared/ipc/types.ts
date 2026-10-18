@@ -297,6 +297,18 @@ export interface ConfigBanner {
   text: string;
 }
 
+/** The eight §9.4 script limits (M8 Δ6, PD-139), the values in force. */
+export interface ScriptLimits {
+  timeout_s: number;
+  heap_mb: number;
+  process_mb: number;
+  max_calls: number;
+  max_fetch_mb: number;
+  max_call_result_mb: number;
+  max_result_mb: number;
+  max_concurrent_calls: number;
+}
+
 export interface SettingsView {
   limits: {
     jira_comments_cap: number;
@@ -304,12 +316,15 @@ export interface SettingsView {
     /** `null`: off. */
     max_pending_bytes_mb: number | null;
     expiry_hours: number;
+    script: ScriptLimits;
   };
   attention_mode: AttentionMode;
   retention_days: number;
   legal_hold: boolean;
   /** Display only. */
   anchor_dir: string | null;
+  /** "Allow scripts with degraded confinement" as the audit settings hold it (PD-141). */
+  allow_degraded_scripts: boolean;
   health: {
     storage_low: boolean;
     anchor_write_failing: boolean;
@@ -335,6 +350,10 @@ export interface Confinement {
   failed: string[];
   mode: string;
   extra_layers: { name: string; on: boolean }[];
+  /** Whether scripts run (Δ8): `degraded` under an unmet floor with degraded confinement allowed. */
+  scripts: 'enabled' | 'disabled' | 'degraded';
+  /** Core's run policy as it holds the degraded setting now. */
+  degraded_allowed: boolean;
 }
 
 /** `settings_get`'s answer. */
@@ -355,7 +374,10 @@ export type SettingChange =
   | { key: 'expiry_hours'; value: number }
   | { key: 'attention_mode'; value: AttentionMode }
   | { key: 'retention_days'; value: number }
-  | { key: 'legal_hold'; value: boolean };
+  | { key: 'legal_hold'; value: boolean }
+  /** The keys to change only; the others stay (Rust confirms a raise natively). */
+  | { key: 'script_limits'; value: Partial<ScriptLimits> }
+  | { key: 'allow_degraded_scripts'; value: boolean };
 
 /** `instance_add`: no CA bytes or path ever (`use_custom_ca` makes Rust open its own file dialog). */
 export interface InstanceAddArgs {

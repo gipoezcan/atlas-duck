@@ -285,12 +285,8 @@ pub struct LimitsView {
     pub max_pending_bytes_mb: Option<u64>,
     pub expiry_hours: u32,
     /// The configured script limits in force (§9.4, M8 Δ6): a Settings change applies at once, a
-    /// file edit at the next start (then `restart_pending` names `script_limits`).
-    ///
-    /// Not on the wire yet: the UI's `settings_get` validator and fixture are closed over the four
-    /// keys above, so the Settings UI task (Δ6 DTO, Task 24) removes this `skip_serializing`
-    /// together with its fixture regeneration and the TS type.
-    #[serde(skip_serializing)]
+    /// file edit at the next start (then `restart_pending` names `script_limits`). On the wire
+    /// since M8 Task 23 (the Settings window shows them).
     pub script: ScriptLimits,
 }
 
@@ -330,11 +326,7 @@ pub struct SettingsView {
     /// Display only (M10 changes it).
     pub anchor_dir: Option<String>,
     /// "Allow scripts with degraded confinement" as the audit settings hold it (M8 Δ6, PD-141).
-    ///
-    /// Not on the wire yet, like `limits.script`: the `settings_get` fixture is closed over the
-    /// keys above, so the Settings UI task (Task 24) removes this `skip_serializing` together with
-    /// its fixture regeneration and the TS type.
-    #[serde(skip_serializing)]
+    /// On the wire since M8 Task 23, like `limits.script`.
     pub allow_degraded_scripts: bool,
     pub health: StoreHealthView,
     pub config_read_only: Option<ConfigBanner>,

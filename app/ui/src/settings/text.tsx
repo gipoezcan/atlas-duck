@@ -27,8 +27,12 @@ export function errorText(e: unknown): string {
   if (typeof e !== 'object' || e === null || !('kind' in e)) return t.errors.internal ?? '';
   const err = e as { kind: string; field?: unknown; error?: { kind?: unknown; key?: unknown } };
   if (err.kind === 'invalid_argument') {
-    // Only the argument names Rust is known to report get a label; the wire name is not shown.
-    const label = typeof err.field === 'string' ? own(t.invalid_arguments, err.field) : undefined;
+    // Only the argument names Rust is known to report get a label (an out-of-bound script limit
+    // is reported by the limit's own name); the wire name is not shown.
+    const label =
+      typeof err.field === 'string'
+        ? (own(t.invalid_arguments, err.field) ?? own(t.limit_labels, err.field))
+        : undefined;
     return t.invalid_field(label ?? 'a field');
   }
   if (err.kind === 'admin' || err.kind === 'settings') {

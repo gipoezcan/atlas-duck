@@ -980,7 +980,17 @@ fn settings_views() -> Vec<SettingsView> {
                 candidate_cache_mb: 256,
                 max_pending_bytes_mb: Some(512),
                 expiry_hours: 24,
-                script: ScriptLimits::default(),
+                // M8 T23: every limit off its default, inside its PD-139 bound and both invariants.
+                script: ScriptLimits {
+                    timeout_s: 300,
+                    heap_mb: 512,
+                    process_mb: 1024,
+                    max_calls: 400,
+                    max_fetch_mb: 100,
+                    max_call_result_mb: 8,
+                    max_result_mb: 12,
+                    max_concurrent_calls: 2,
+                },
             },
             attention_mode: AttentionMode::BadgeOnly,
             retention_days: 365,
@@ -1028,9 +1038,19 @@ fn settings_gets() -> Vec<SettingsGet> {
             name: "landlock".into(),
             on: true,
         }],
-        // Not on the wire until the Settings UI task (`skip_serializing`): the fixtures stay.
+        // Floor met with the degraded setting on (`allow_degraded_scripts` of the first view):
+        // scripts run confined, the setting is not in use.
         scripts: "enabled",
-        degraded_allowed: false,
+        degraded_allowed: true,
+    };
+    // Floor not met with the setting on: scripts run degraded (the persistent caution).
+    let degraded = ConfinementDto {
+        state: "not_met",
+        failed: vec!["open_process_vm_read"],
+        mode: "n/a",
+        extra_layers: vec![],
+        scripts: "degraded",
+        degraded_allowed: true,
     };
     let not_met = ConfinementDto {
         state: "not_met",
@@ -1062,6 +1082,14 @@ fn settings_gets() -> Vec<SettingsGet> {
             confinement: ConfinementDto::pending(),
             cli_installed: true,
             cli_removable: false,
+        },
+        // The degraded state: the setting on (the first view) and an unmet floor.
+        SettingsGet {
+            settings: settings_views().remove(0),
+            instances: vec![],
+            confinement: degraded,
+            cli_installed: true,
+            cli_removable: true,
         },
     ]
 }

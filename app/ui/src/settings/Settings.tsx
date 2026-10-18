@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { on } from '../shared/ipc/events';
 import { settingsGet } from '../shared/ipc/invoke';
-import type { Confinement, SettingsGet } from '../shared/ipc/types';
+import type { Confinement, SettingsGet, SettingsView } from '../shared/ipc/types';
 import { SETTINGS_TEXT as T, WINDOW_TITLES } from '../shared/strings';
 import { InstanceForm } from './InstanceForm';
 import { Cli } from './Cli';
@@ -10,6 +10,7 @@ import { Instances } from './Instances';
 import { Limits } from './Limits';
 import { Removal } from './Removal';
 import { Retention } from './Retention';
+import { DegradedToggle, ScriptLimitsForm } from './Scripts';
 import { Cfg } from './text';
 import { useWindowBusy, WindowBusyContext } from './useAction';
 
@@ -103,8 +104,9 @@ export function Settings() {
       <Instances instances={instances} onChanged={reload} readOnly={readOnly} />
       <InstanceForm onAdded={reload} readOnly={readOnly} />
       <Limits view={settings} onChanged={reload} readOnly={readOnly} />
+      <ScriptLimitsForm view={settings} onChanged={reload} readOnly={readOnly} />
       <Retention view={settings} onChanged={reload} readOnly={readOnly} />
-      <ConfinementStatus confinement={confinement} />
+      <ConfinementStatus confinement={confinement} view={settings} onChanged={reload} />
       <Cli installed={cliInstalled} removable={cliRemovable} onChanged={reload} />
       <Removal onChanged={reload} />
     </main>
@@ -112,7 +114,15 @@ export function Settings() {
   );
 }
 
-function ConfinementStatus({ confinement }: { confinement: Confinement }) {
+function ConfinementStatus({
+  confinement,
+  view,
+  onChanged,
+}: {
+  confinement: Confinement;
+  view: SettingsView;
+  onChanged: () => void;
+}) {
   const verdict =
     confinement.state === 'met'
       ? T.confinement_met
@@ -123,6 +133,7 @@ function ConfinementStatus({ confinement }: { confinement: Confinement }) {
     <section aria-label={T.confinement}>
       <h2>{T.confinement}</h2>
       <p>{verdict}</p>
+      <p>{T.scripts_states[confinement.scripts]}</p>
       {confinement.state === 'pending' ? null : (
         <p>
           {T.confinement_mode}: <Cfg value={confinement.mode} />
@@ -150,6 +161,7 @@ function ConfinementStatus({ confinement }: { confinement: Confinement }) {
           ))}
         </p>
       )}
+      <DegradedToggle view={view} confinement={confinement} onChanged={onChanged} />
     </section>
   );
 }

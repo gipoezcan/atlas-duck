@@ -375,6 +375,21 @@ export const IDENTITY_HEADER_HINT =
 export const PAC_HINT =
   "your system uses a proxy auto-config script, which atlas-duck does not evaluate: set this instance's proxy (host:port or direct) in Settings";
 
+/**
+ * M8 T23 (spec 9.4, PD-139): the labels of the eight script limits. They are also the names Rust's
+ * refusals carry (`invalid` key, `invalid_argument` field), so `errorText` finds them by the wire key.
+ */
+const SCRIPT_LIMIT_LABELS = {
+  timeout_s: 'Script timeout (s)',
+  heap_mb: 'Script heap limit (MiB)',
+  process_mb: 'Script process limit (MiB)',
+  max_calls: 'Script call limit',
+  max_fetch_mb: 'Script fetch limit (MiB)',
+  max_call_result_mb: 'Script call result limit (MiB)',
+  max_result_mb: 'Script result limit (MiB)',
+  max_concurrent_calls: 'Script concurrent calls',
+} as const;
+
 /** spec 7.1 and plan text (Task 26, PD-76, PD-84): the Settings window. */
 export const SETTINGS_TEXT = {
   loading: 'Loading the settings',
@@ -458,7 +473,13 @@ export const SETTINGS_TEXT = {
     candidate_cache_mb: 'Candidate cache (MB)',
     max_pending_bytes_mb: 'Pending bytes cap (MB, empty = off)',
     expiry_hours: 'Request expiry (hours)',
+    ...SCRIPT_LIMIT_LABELS,
   } as Readonly<Record<string, string>>,
+  script_limits: 'Script limits',
+  script_limit_labels: SCRIPT_LIMIT_LABELS,
+  /** The spec default (§9.4) beside a script limit's input. */
+  script_default: (n: number) => `default ${n}`,
+  script_limits_note: 'A change applies to scripts submitted afterwards. Raising a limit is confirmed in a native dialog.',
   /** plan text (PD-76). */
   restart_marker: 'applies after restart',
   restart_waiting: 'a changed value is waiting for the next start',
@@ -501,6 +522,17 @@ export const SETTINGS_TEXT = {
   confinement_mode: 'Mode',
   confinement_failed: 'Failed probes',
   confinement_layers: 'Extra layers',
+  /** M8 T23 (Δ8): whether scripts run, by `confinement.scripts`. */
+  scripts_states: {
+    enabled: 'Scripts are enabled',
+    disabled: 'Scripts are disabled',
+    degraded: 'Scripts are enabled with degraded confinement',
+  } as const,
+  degraded_toggle: 'Allow scripts with degraded confinement',
+  /** plan text (PD-141): the persistent caution while scripts run degraded. */
+  scripts_degraded_caution: 'scripts run with degraded confinement',
+  degraded_inactive: 'Allowed, but not in use: the confinement floor is met.',
+  degraded_note: 'Turning this on is confirmed in a native dialog. A compromised script worker could then act as your user.',
   layer_on: 'on',
   layer_off: 'off',
   cli: 'Command line',

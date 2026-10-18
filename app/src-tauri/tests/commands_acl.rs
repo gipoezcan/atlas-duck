@@ -2571,6 +2571,117 @@ mod settings_commands {
         Ok(())
     }
 
+    /// M8 T23 (Δ6, PD-139): the script limits are bounded where the webview's arguments are parsed,
+    /// before any core call. Every value is a whole number in `1..=bound` (the two result limits at
+    /// most 16, the concurrent calls 1 to 16, the other five at most 4 x the spec default); the
+    /// refused field is the limit's own name; an empty change is fine (core ignores it).
+    #[test]
+    fn settings_apply_script_limits_bounds_rejected_before_core() -> TestResult {
+        let refused = |key: &str, v: Value| {
+            changes(json!([{"key": "script_limits", "value": { key: v }}])).err()
+        };
+        // (key, the largest accepted value)
+        let tops = [
+            ("timeout_s", 480),
+            ("heap_mb", 1024),
+            ("process_mb", 2048),
+            ("max_calls", 800),
+            ("max_fetch_mb", 200),
+            ("max_call_result_mb", 16),
+            ("max_result_mb", 16),
+            ("max_concurrent_calls", 16),
+        ];
+        for (key, top) in tops {
+            for ok in [1, top] {
+                assert!(
+                    refused(key, json!(ok)).is_none(),
+                    "{key} = {ok} is inside its bound"
+                );
+            }
+            for bad in [json!(0), json!(top + 1), json!(u32::MAX)] {
+                let err = refused(key, bad.clone()).ok_or(format!("{key} = {bad} accepted"))?;
+                // The helper turns the parse error into text; the field is what `parse` named.
+                let named = err.to_string();
+                assert!(named.contains(key), "{key} = {bad}: {named}");
+            }
+            // Not a whole number of `u32`: refused as a malformed `changes`.
+            for bad in [json!(-1), json!("5"), json!(1.5), json!(u64::MAX)] {
+                assert!(
+                    refused(key, bad.clone()).is_some(),
+                    "{key} = {bad} accepted"
+                );
+            }
+        }
+        // Nothing to change, several keys at once, and a bound in a later change of the call.
+        assert!(changes(json!([{"key": "script_limits", "value": {}}])).is_ok());
+        assert!(
+            changes(
+                json!([{"key": "script_limits", "value": {"timeout_s": 60, "max_calls": 100}}])
+            )
+            .is_ok()
+        );
+        assert!(
+            changes(json!([
+                {"key": "jira_comments_cap", "value": 10},
+                {"key": "script_limits", "value": {"timeout_s": 60, "heap_mb": 4096}}
+            ]))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    /// T21 review I-2, through `settings_apply`'s own ending: the answer is followed by
+    /// `settings_changed` always and by `status_banner` (no line named, the header re-reads
+    /// `app_status`) exactly when "allow scripts with degraded confinement" flipped, whatever the
+    /// answer was (core can commit and then fail).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settings_apply_announces_a_degraded_flip_as_status_banner() -> TestResult {
+        use atlas_duck_app_lib::commands;
+        use atlas_duck_app_lib::commands::settings::conclude_settings_apply;
+        use atlas_duck_core::testing::capture::Channel;
+
+        let app = mock_builder().build(tauri::test::mock_context(tauri::test::noop_assets()))?;
+        let cap = commands::capture::bounded();
+        assert!(commands::capture::install(app.handle(), cap.clone()));
+        let names =
+            |cap: &atlas_duck_core::testing::capture::Capture| -> Result<Vec<Value>, Boxed> {
+                cap.on(Channel::TauriEvent)
+                    .iter()
+                    .map(|e| Ok(serde_json::from_str::<Value>(&e.json)?))
+                    .collect()
+            };
+        let settings_changed = json!({"event": "settings_changed", "payload": null});
+        let status_banner = json!({"event": "status_banner", "payload": {"line_ids": []}});
+
+        // No flip: the windows re-read the settings, nothing about the status.
+        let h = Harness::jira().await?;
+        let view = h.core().settings().view();
+        let answered = conclude_settings_apply(app.handle(), Ok(view.clone()), false);
+        assert_eq!(answered, Ok(view.clone()));
+        assert_eq!(names(&cap)?, std::slice::from_ref(&settings_changed));
+
+        // A flip: both, in that order, for an answer and for an error alike.
+        let answered = conclude_settings_apply(app.handle(), Ok(view.clone()), true);
+        assert_eq!(answered, Ok(view));
+        assert_eq!(
+            names(&cap)?[1..],
+            [settings_changed.clone(), status_banner.clone()]
+        );
+        let err = Err(CommandError::Settings(SettingsError::ConfigWrite));
+        assert_eq!(
+            conclude_settings_apply(app.handle(), err.clone(), true),
+            err
+        );
+        assert_eq!(names(&cap)?[3..], [settings_changed.clone(), status_banner]);
+        let err = Err(CommandError::Settings(SettingsError::Cancelled));
+        assert_eq!(
+            conclude_settings_apply(app.handle(), err.clone(), false),
+            err
+        );
+        assert_eq!(names(&cap)?[5..], [settings_changed]);
+        Ok(())
+    }
+
     /// I-31 through the commands for the two gates of an instance `config.toml` proposed:
     /// `instance_confirm_config` (an instance added in `config.toml`) and
     /// `instance_accept_url_change` (a URL change `config.toml` asked for). A `Cancel` is
@@ -2741,7 +2852,9 @@ mod settings_commands {
                 wire["failed"],
                 json!(["task_for_pid", "open_process_vm_read"])
             );
-            assert!(wire.get("scripts").is_none() && wire.get("degraded_allowed").is_none());
+            // On the wire since M8 T23: the Settings window renders the state and the policy.
+            assert_eq!(wire["scripts"], scripts);
+            assert_eq!(wire["degraded_allowed"], allowed);
         }
         Ok(())
     }

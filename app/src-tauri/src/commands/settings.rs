@@ -19,11 +19,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use atlas_duck_core::config::instances::MAX_ALIAS_CHARS;
+use atlas_duck_core::config::scripts::{SCRIPT_KEYS, bound as script_bound};
 use atlas_duck_core::proxy::ProxySetting;
-use atlas_duck_core::settings::MAX_CHANGES;
+use atlas_duck_core::settings::{KEY_SCRIPT_LIMITS, MAX_CHANGES};
 use atlas_duck_core::{
-    AddInstance, AdminError, InstanceAdmin, InstanceView, Product, PruneReport, SettingChangeReq,
-    SettingsAdmin, SettingsError, SettingsView,
+    AddInstance, AdminError, InstanceAdmin, InstanceView, Product, PruneReport, ScriptLimitsReq,
+    SettingChangeReq, SettingsAdmin, SettingsError, SettingsView,
 };
 use atlas_duck_sandbox_host::probe::{FloorVerdict, ProbeReport};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -178,9 +179,27 @@ impl<'de> Deserialize<'de> for PatPurposeDto {
 }
 
 /// `changes`: one to [`MAX_CHANGES`] `{key, value}` settings in `SettingChangeReq`'s own closed
-/// form. Ranges are core's to check (`SettingsError::Invalid {key}`, before anything happens).
+/// form. Ranges are core's to check (`SettingsError::Invalid {key}`, before anything happens),
+/// except the eight script limits (M8 Δ6, PD-139): each is bounded here too, before core is called,
+/// and a refused one is `InvalidArgument` naming the limit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingChanges(pub Vec<SettingChangeReq>);
+
+/// The name of the first limit of `req` outside its PD-139 bound (core's own table). A limit is
+/// found by the wire key `ScriptLimitsReq` serializes, which skips the unchanged ones.
+fn script_limit_out_of_bounds(req: &ScriptLimitsReq) -> Option<&'static str> {
+    let Ok(Value::Object(set)) = serde_json::to_value(req) else {
+        return Some(KEY_SCRIPT_LIMITS);
+    };
+    SCRIPT_KEYS.into_iter().find(|key| {
+        set.get(*key).is_some_and(|v| {
+            !v.as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .zip(script_bound(key))
+                .is_some_and(|(n, bound)| bound.contains(&n))
+        })
+    })
+}
 
 impl<'de> Deserialize<'de> for SettingChanges {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -191,11 +210,18 @@ impl<'de> Deserialize<'de> for SettingChanges {
         if !(1..=MAX_CHANGES).contains(&items.len()) {
             return Err(bad());
         }
-        items
+        let changes = items
             .into_iter()
             .map(|v| SettingChangeReq::deserialize(v).map_err(|_| bad()))
-            .collect::<Result<Vec<_>, _>>()
-            .map(SettingChanges)
+            .collect::<Result<Vec<_>, _>>()?;
+        for change in &changes {
+            if let SettingChangeReq::ScriptLimits(req) = change
+                && let Some(key) = script_limit_out_of_bounds(req)
+            {
+                return Err(refuse(key));
+            }
+        }
+        Ok(SettingChanges(changes))
     }
 }
 
@@ -351,15 +377,8 @@ pub struct ConfinementDto {
     pub extra_layers: Vec<ExtraLayerDto>,
     /// Whether scripts run (Δ8, PD-141): `enabled` under a met floor, `degraded` under an unmet one
     /// with degraded confinement allowed, `disabled` otherwise and while the probe is pending.
-    ///
-    /// Not on the wire yet: the UI's `settings_get` validator and fixture are closed over the keys
-    /// above, so the Settings UI task (Task 23) removes this `skip_serializing` together with its
-    /// fixture regeneration and the TS type (the `SettingsView.allow_degraded_scripts` precedent).
-    #[serde(skip_serializing)]
     pub scripts: &'static str,
     /// "Allow scripts with degraded confinement" as core's run policy holds it now (Δ8).
-    /// Not on the wire yet, like `scripts`.
-    #[serde(skip_serializing)]
     pub degraded_allowed: bool,
 }
 
@@ -838,12 +857,24 @@ pub async fn settings_apply<R: Runtime>(
         }
         Err(e) => Err(e),
     };
+    conclude_settings_apply(&app, response, flipped)
+}
+
+/// The end of `settings_apply`: logs a failure by kind, tells the windows that settings changed
+/// (whatever core answered: it can commit and then fail) and, when "allow scripts with degraded
+/// confinement" flipped, that the status changed (`status_banner`, T21 review I-2: the header's
+/// `scripts_degraded` line follows that setting), then answers.
+pub fn conclude_settings_apply<R: Runtime>(
+    app: &AppHandle<R>,
+    response: Result<SettingsView, CommandError>,
+    flipped: bool,
+) -> Result<SettingsView, CommandError> {
     note_failure(&response);
-    emit_settings_changed(&app);
+    emit_settings_changed(app);
     if flipped {
-        crate::ui_sink::emit_status_changed(&app);
+        crate::ui_sink::emit_status_changed(app);
     }
-    finish(&app, response)
+    finish(app, response)
 }
 
 /// Rust's file dialog for the custom CA, then [`read_ca_bounded`]. Blocks until the user answers:
@@ -1656,13 +1687,19 @@ mod tests {
         let pending = ConfinementDto::pending();
         assert_eq!(
             serde_json::to_value(&pending).unwrap_or_default(),
-            json!({"state": "pending", "failed": [], "mode": "n/a", "extra_layers": []})
+            json!({
+                "state": "pending", "failed": [], "mode": "n/a", "extra_layers": [],
+                "scripts": "disabled", "degraded_allowed": false
+            })
         );
-        // Δ8: `scripts` and `degraded_allowed` are not on the wire until the Settings UI task.
+        // Δ8 (on the wire since M8 T23): the scripts state and the policy the core runs under.
         let degraded = ConfinementDto::of_probe(None, true);
         assert_eq!(
             serde_json::to_value(&degraded).unwrap_or_default(),
-            serde_json::to_value(&pending).unwrap_or_default()
+            json!({
+                "state": "pending", "failed": [], "mode": "n/a", "extra_layers": [],
+                "scripts": "disabled", "degraded_allowed": true
+            })
         );
         let retest = RetestOutcome::Failed(connection_failure(
             &atlas_duck_core::ConnectionFailure::OtherUser,

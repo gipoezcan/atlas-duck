@@ -258,6 +258,19 @@ describe('fixtures validate against their TS types', () => {
     const confinement = settingsGet.map((g) => g.confinement.state);
     expect(new Set(confinement)).toEqual(new Set(['met', 'not_met', 'pending']));
     expect(isSettingsGet({ ...full, confinement: { ...full?.confinement, state: 'maybe' } })).toBe(false);
+    // M8 T23 (Δ6, Δ8): the script limits, the degraded setting and the scripts state are on the
+    // wire. All three scripts states are in the fixtures; the state set is closed.
+    expect(new Set(settingsGet.map((g) => g.confinement.scripts))).toEqual(
+      new Set(['enabled', 'disabled', 'degraded']),
+    );
+    expect(new Set(settingsGet.map((g) => g.settings.allow_degraded_scripts))).toEqual(new Set([true, false]));
+    expect(new Set(settingsGet.map((g) => g.confinement.degraded_allowed))).toEqual(new Set([true, false]));
+    expect(isSettingsGet({ ...full, confinement: { ...full?.confinement, scripts: 'maybe' } })).toBe(false);
+    expect(isSettingsGet({ ...full, confinement: { ...full?.confinement, degraded_allowed: 1 } })).toBe(false);
+    expect(isSettingsGet({ ...full, settings: { ...full?.settings, allow_degraded_scripts: 'on' } })).toBe(false);
+    const script = full?.settings.limits.script;
+    expect(isSettingsGet({ ...full, settings: { ...full?.settings, limits: { ...full?.settings.limits, script: { ...script, heap_mb: '256' } } } })).toBe(false);
+    expect(isSettingsGet({ ...full, settings: { ...full?.settings, limits: { ...full?.settings.limits, script: undefined } } })).toBe(false);
     expect(isSettingsGet({ ...full, cli_installed: 'yes' })).toBe(false);
     // `cli_removable` is always on the wire as a bool: both values are in the fixtures, anything
     // else (absent, null, a string) is refused.

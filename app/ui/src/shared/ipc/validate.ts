@@ -295,12 +295,25 @@ export const isInstanceView = (v: unknown): v is InstanceView =>
     days_left: numOrNull,
   });
 
+const isScriptLimits = (v: unknown): boolean =>
+  fields(v, {
+    timeout_s: isNum,
+    heap_mb: isNum,
+    process_mb: isNum,
+    max_calls: isNum,
+    max_fetch_mb: isNum,
+    max_call_result_mb: isNum,
+    max_result_mb: isNum,
+    max_concurrent_calls: isNum,
+  });
+
 const isLimits = (v: unknown): boolean =>
   fields(v, {
     jira_comments_cap: isNum,
     candidate_cache_mb: isNum,
     max_pending_bytes_mb: numOrNull,
     expiry_hours: isNum,
+    script: isScriptLimits,
   });
 
 const isHealth = (v: unknown): boolean =>
@@ -324,6 +337,7 @@ export const isSettingsView = (v: unknown): v is SettingsView =>
     retention_days: isNum,
     legal_hold: isBool,
     anchor_dir: strOrNull,
+    allow_degraded_scripts: isBool,
     health: isHealth,
     config_read_only: (b) => b === null || isConfigBanner(b),
     restart_pending: arrayOf(isStr),
@@ -337,6 +351,8 @@ const isConfinement = (v: unknown): v is Confinement =>
     extra_layers: arrayOf((l): l is { name: string; on: boolean } =>
       fields(l, { name: isStr, on: isBool }),
     ),
+    scripts: oneOf('enabled', 'disabled', 'degraded'),
+    degraded_allowed: isBool,
   });
 
 export const isSettingsGet = (v: unknown): v is SettingsGet =>
