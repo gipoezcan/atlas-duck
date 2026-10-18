@@ -20,8 +20,10 @@ use std::time::{Duration, Instant};
 
 use atlas_duck_app_lib::testing::ENV_TEST_SERVER_BUILD_ID;
 use atlas_duck_app_lib::testing::control::{DELAY_STARTUP_FILE, QUIT_FILE};
+use atlas_duck_atlassian::testing::MockDc;
 use atlas_duck_atlassian::testing::fixtures::{self, JIRA_COMMENT};
-use atlas_duck_audit::EventType;
+use atlas_duck_audit::request_set::requests_from_json;
+use atlas_duck_audit::{EventType, RequestRecord};
 use atlas_duck_ipc::envelope::Status;
 use atlas_duck_ipc::paths::ENDPOINT_FILE;
 use atlas_duck_registry::Product;
@@ -54,6 +56,17 @@ const SHUTDOWN_PROBE_WITHIN: Duration = Duration::from_secs(8);
 const ERR_404_BODY: &str = r#"{"errorMessages":["Issue does not exist"],"errors":{}}"#;
 const ERR_500_BODY: &str = r#"{"errorMessages":["Server error"],"errors":{}}"#;
 const COMMENT_PARAMS: &str = r#"{"key":"ABC-1","body":"Seen on staging.","body_format":"wiki"}"#;
+/// X-05 data canaries. `X05_SEARCH` and `X05_KEPT` sit in a `summary` the approver releases;
+/// `X05_DROPPED` sits in the `description` it drops; `X05_CONTROL` sits in the `description` of an
+/// issue released whole (the positive control: that field does reach released bytes).
+const X05_SEARCH: &str = "CANARY-X05-SEARCH-6b1d9e40";
+const X05_KEPT: &str = "CANARY-X05-KEPT-2f87c3a5";
+const X05_DROPPED: &str = "CANARY-X05-DROPPED-91c4d7e8";
+const X05_CONTROL: &str = "CANARY-X05-CONTROL-0a53b6f2";
+/// The scripted approver's drop of the redacted read (`atlas-test:release-redacted <path>`).
+const X05_REDACT_REASON: &str = "atlas-test:release-redacted fields.description";
+/// The field list of the app's start fill of the field-name cache (as `jira_flows`).
+const X05_FIELDS: &str = r#"[{"id":"summary","name":"Summary","custom":false,"schema":{"type":"string","system":"summary"}},{"id":"customfield_10200","name":"Team","custom":true,"schema":{"type":"option","custom":"com.atlassian.jira.plugin.system.customfieldtypes:select","customId":10200}}]"#;
 
 // ---- helpers -----------------------------------------------------------------------------------
 
@@ -984,5 +997,446 @@ async fn pending_recovered_with_request_list_not_resubmitted() -> Result<()> {
         .filter(|(event, _)| *event == EventType::REQUEST_RECEIVED)
         .count();
     assert_eq!(received, 1, "REQUEST_RECEIVED records");
+    Ok(())
+}
+
+// ---- X-05: the SC1 walk, Jira half ----------------------------------------------------------------------
+
+/// A Jira issue of the standard fixture under `key`, with its `summary` and `description` replaced.
+fn x05_issue(key: &str, summary: &str, description: &str) -> Result<String> {
+    let mut issue: Value = serde_json::from_str(fixtures::JIRA_ISSUE)?;
+    issue["key"] = json!(key);
+    issue["fields"]["summary"] = json!(summary);
+    issue["fields"]["description"] = json!(description);
+    Ok(serde_json::to_string(&issue)?)
+}
+
+/// The standard search page with `X05_SEARCH` in the summary of its first issue.
+fn x05_search_page() -> Result<String> {
+    let mut page: Value = serde_json::from_str(fixtures::JIRA_SEARCH_PAGE)?;
+    page["issues"][0]["fields"]["summary"] = json!(format!("Login page times out {X05_SEARCH}"));
+    Ok(serde_json::to_string(&page)?)
+}
+
+/// The mock answers of the walk: the canary issues `ABC-7` (summary `X05_KEPT`, description
+/// `X05_DROPPED`) and `ABC-8` (description `X05_CONTROL`), the search page, the field list, the
+/// enrichment and the `201` of a create and the declared `204` of an edit.
+async fn x05_mount(mock: &MockDc) -> Result<()> {
+    mock.json("/rest/api/2/field", 200, X05_FIELDS).await;
+    mock.json(
+        "/rest/api/2/issue/ABC-7",
+        200,
+        &x05_issue(
+            "ABC-7",
+            &format!("Seven {X05_KEPT}"),
+            &format!("Private notes {X05_DROPPED}"),
+        )?,
+    )
+    .await;
+    mock.json(
+        "/rest/api/2/issue/ABC-8",
+        200,
+        &x05_issue("ABC-8", "Eight", &format!("Public notes {X05_CONTROL}"))?,
+    )
+    .await;
+    // The provisioning already answers the search path: this one goes ahead of it.
+    mock.json_first("/rest/api/2/search", 200, &x05_search_page()?)
+        .await;
+    mock.json("/rest/api/2/project", 200, fixtures::JIRA_PROJECTS)
+        .await;
+    mock.json(
+        "/rest/api/2/issue/createmeta/ABC/issuetypes",
+        200,
+        fixtures::JIRA_CREATEMETA_ISSUETYPES,
+    )
+    .await;
+    mock.json(
+        "/rest/api/2/issue/createmeta/ABC/issuetypes/10002",
+        200,
+        fixtures::JIRA_CREATEMETA_FIELDS,
+    )
+    .await;
+    mock.json("/rest/api/2/issue", 201, fixtures::JIRA_ISSUE_CREATED)
+        .await;
+    mock.empty_for("PUT", "/rest/api/2/issue/ABC-1", 204).await;
+    Ok(())
+}
+
+/// The front end a walk goes through. `Cli` keeps every byte of stdout and stderr of every run in
+/// `seen` (name, text) for the canary sweep; the MCP child keeps its own wire.
+enum Front<'a> {
+    Cli {
+        world: &'a World,
+        seen: &'a mut Vec<(String, String)>,
+    },
+    Mcp(&'a mut McpChild),
+}
+
+impl Front<'_> {
+    /// One op through this front end and its envelope. `ok` says which end of the outcome is
+    /// expected: a success (`released`, `succeeded`: exit 0, no `isError`) or a refusal (`denied`:
+    /// exit 3, `isError`).
+    async fn run(&mut self, cli: &[&str], tool: &str, args: Value, ok: bool) -> Result<Value> {
+        match self {
+            Front::Cli { world, seen } => {
+                let r = world.cli(cli).await?;
+                seen.push((format!("atlas-duck {cli:?} stdout"), r.stdout.clone()));
+                seen.push((format!("atlas-duck {cli:?} stderr"), r.stderr.clone()));
+                let want = if ok { 0 } else { 3 };
+                if r.exit != want {
+                    return Err(format!(
+                        "atlas-duck {cli:?}: exit {} not {want}\n{}\n{}",
+                        r.exit, r.stdout, r.stderr
+                    )
+                    .into());
+                }
+                let env: Value = serde_json::from_str(r.stdout.trim()).map_err(|e| {
+                    format!(
+                        "atlas-duck {cli:?}: stdout is no envelope ({e}): {}",
+                        r.stdout
+                    )
+                })?;
+                Ok(env)
+            }
+            Front::Mcp(mcp) => {
+                let out = mcp.call(tool, args, None).await?;
+                if out.is_error() == ok {
+                    return Err(format!(
+                        "{tool}: isError is {} but {} was expected\n{}",
+                        out.is_error(),
+                        if ok { "a success" } else { "a refusal" },
+                        mcp.transcript()
+                    )
+                    .into());
+                }
+                Ok(out.structured().clone())
+            }
+        }
+    }
+}
+
+/// The writes the mock received so far, in arrival order: every request that is neither a `GET`
+/// nor the read-only search `POST`, as (method, path, body bytes).
+async fn x05_writes(mock: &MockDc) -> Vec<(String, String, Vec<u8>)> {
+    let search = mock.path("/rest/api/2/search");
+    mock.received()
+        .await
+        .into_iter()
+        .filter(|r| r.method.as_str() != "GET" && r.url.path() != search)
+        .map(|r| {
+            (
+                r.method.as_str().to_owned(),
+                r.url.path().to_owned(),
+                r.body,
+            )
+        })
+        .collect()
+}
+
+/// The three reads, two approved writes and two denied writes of one front end. `who` (`cli` or
+/// `mcp`) is part of every written summary, so the bytes the mock received name their origin.
+async fn x05_walk(front: &mut Front<'_>, mock: &MockDc, who: &str) -> Result<()> {
+    // jira.search, released: the summary canary is in the released bytes.
+    let env = front
+        .run(
+            &[
+                "jira",
+                "search",
+                "project = ABC",
+                "--reason",
+                "atlas-test:release",
+            ],
+            "jira_search",
+            json!({"jql": "project = ABC", "reason": "atlas-test:release"}),
+            true,
+        )
+        .await?;
+    assert_eq!(status_of(&env), "released", "{who} search: {env}");
+    assert!(
+        env.to_string().contains(X05_SEARCH),
+        "{who} search: the released canary is missing: {env}"
+    );
+
+    // jira.issue.get, released redacted: the dropped field is gone, the rest is there.
+    let env = front
+        .run(
+            &[
+                "jira",
+                "issue",
+                "get",
+                "ABC-7",
+                "--reason",
+                X05_REDACT_REASON,
+            ],
+            "jira_issue_get",
+            json!({"key": "ABC-7", "reason": X05_REDACT_REASON}),
+            true,
+        )
+        .await?;
+    assert_eq!(status_of(&env), "released", "{who} redacted get: {env}");
+    assert_eq!(env["redacted"], json!(true), "{who} redacted get: {env}");
+    assert!(
+        env["data"]["result"]["fields"]["description"].is_null(),
+        "{who} redacted get: the dropped field is still there: {env}"
+    );
+    assert!(
+        env.to_string().contains(X05_KEPT),
+        "{who} redacted get: the released canary is missing: {env}"
+    );
+    assert!(
+        !env.to_string().contains(X05_DROPPED),
+        "{who} redacted get: the dropped canary is in the envelope: {env}"
+    );
+
+    // Positive control: an issue released whole carries its description canary.
+    let env = front
+        .run(
+            &[
+                "jira",
+                "issue",
+                "get",
+                "ABC-8",
+                "--reason",
+                "atlas-test:release",
+            ],
+            "jira_issue_get",
+            json!({"key": "ABC-8", "reason": "atlas-test:release"}),
+            true,
+        )
+        .await?;
+    assert_eq!(status_of(&env), "released", "{who} control get: {env}");
+    assert!(
+        env.to_string().contains(X05_CONTROL),
+        "{who} control get: the description canary did not reach the released bytes: {env}"
+    );
+
+    // Two approved writes: each reaches the mock exactly once, at its own endpoint.
+    let summary = format!("x05 {who} create");
+    let before = x05_writes(mock).await.len();
+    let env = front
+        .run(
+            &[
+                "jira",
+                "issue",
+                "create",
+                "--project",
+                "ABC",
+                "--type",
+                "Bug",
+                "--summary",
+                &summary,
+                "--reason",
+                "atlas-test:approve",
+            ],
+            "jira_issue_create",
+            json!({"project": "ABC", "issuetype": "Bug", "summary": summary,
+                   "reason": "atlas-test:approve"}),
+            true,
+        )
+        .await?;
+    assert_eq!(status_of(&env), "succeeded", "{who} create: {env}");
+    let writes = x05_writes(mock).await;
+    assert_eq!(writes.len(), before + 1, "{who} create: {writes:?}");
+    assert_eq!(
+        writes[before].0, "POST",
+        "{who} create: the mock saw {writes:?}"
+    );
+    assert_eq!(
+        writes[before].1,
+        mock.path("/rest/api/2/issue"),
+        "{who} create"
+    );
+
+    let summary = format!("x05 {who} edit");
+    let field = format!("summary=\"{summary}\"");
+    let before = writes.len();
+    let env = front
+        .run(
+            &[
+                "jira",
+                "issue",
+                "edit",
+                "ABC-1",
+                "--field",
+                &field,
+                "--reason",
+                "atlas-test:approve",
+            ],
+            "jira_issue_edit",
+            json!({"key": "ABC-1", "fields": {"summary": summary},
+                   "reason": "atlas-test:approve"}),
+            true,
+        )
+        .await?;
+    assert_eq!(status_of(&env), "succeeded", "{who} edit: {env}");
+    let writes = x05_writes(mock).await;
+    assert_eq!(writes.len(), before + 1, "{who} edit: {writes:?}");
+    assert_eq!(
+        writes[before].0, "PUT",
+        "{who} edit: the mock saw {writes:?}"
+    );
+    assert_eq!(
+        writes[before].1,
+        mock.path("/rest/api/2/issue/ABC-1"),
+        "{who} edit"
+    );
+
+    // Two denied writes: refused, and the mock hears nothing.
+    let before = writes.len();
+    let env = front
+        .run(
+            &[
+                "jira",
+                "issue",
+                "create",
+                "--project",
+                "ABC",
+                "--type",
+                "Bug",
+                "--summary",
+                "x05 denied create",
+                "--reason",
+                "atlas-test:deny",
+            ],
+            "jira_issue_create",
+            json!({"project": "ABC", "issuetype": "Bug", "summary": "x05 denied create",
+                   "reason": "atlas-test:deny"}),
+            false,
+        )
+        .await?;
+    assert_eq!(status_of(&env), "denied", "{who} denied create: {env}");
+    let env = front
+        .run(
+            &[
+                "jira",
+                "issue",
+                "edit",
+                "ABC-1",
+                "--field",
+                "summary=\"x05 denied edit\"",
+                "--reason",
+                "atlas-test:deny",
+            ],
+            "jira_issue_edit",
+            json!({"key": "ABC-1", "fields": {"summary": "x05 denied edit"},
+                   "reason": "atlas-test:deny"}),
+            false,
+        )
+        .await?;
+    assert_eq!(status_of(&env), "denied", "{who} denied edit: {env}");
+    assert_eq!(
+        x05_writes(mock).await.len(),
+        before,
+        "{who}: a denied write reached the mock"
+    );
+    Ok(())
+}
+
+/// The requests of every `WRITE_APPROVED` record, in log order.
+fn x05_approved(records: &[(EventType, Value)]) -> Result<Vec<RequestRecord>> {
+    let mut all = Vec::new();
+    for (kind, payload) in records {
+        if *kind == EventType::WRITE_APPROVED {
+            let set = requests_from_json(&payload["requests"])
+                .map_err(|e| format!("WRITE_APPROVED requests: {e:?}"))?;
+            all.extend(set);
+        }
+    }
+    Ok(all)
+}
+
+/// X-05, Jira half (SC1, §13 canary sweep), through the CLI and through MCP against the same app
+/// and the same mock Jira. Each front end runs the same walk: `jira.search` released, `jira.issue.get`
+/// released with `fields.description` dropped by the approver, `jira.issue.create` and
+/// `jira.issue.edit` approved, and one denied create and one denied edit.
+///
+/// What it proves: (1) the canary of the dropped field is in no stdout byte, no MCP message and no
+/// stderr line of either front end, while the canaries of the released fields are in the released
+/// bytes and a control issue's description canary is too (so the absence is not vacuous); (2) the
+/// mock received exactly the approved bytes: its writes, in order, are the `requests` of the
+/// `WRITE_APPROVED` records (method, URL, body), and there are no others; (3) a denied write sends
+/// nothing to the mock (checked per write, and by the final count of writes).
+///
+/// Source: `jira_flows` (`md_comment_sent_as_wiki`, `i36_edit_conflict_denied_exit3`), `cli_flows`
+/// `i03_write_approve_flow`, the approver directives of `testing/approver.rs`, audit
+/// `request_set.rs` (`requests_to_json`). The app is started first, so both front ends use one
+/// app; the audit log is read after the app quit. Confluence and script legs are Task 24.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn x05_sc1_walk_jira_cli_and_mcp() -> Result<()> {
+    if !opted_in("x05_sc1_walk_jira_cli_and_mcp") {
+        return Ok(());
+    }
+    let world = jira_world().await?;
+    let mock = jira(&world)?;
+    x05_mount(mock).await?;
+    let _app = world.start_app().await?;
+
+    // The CLI half.
+    let mut seen: Vec<(String, String)> = Vec::new();
+    {
+        let mut cli = Front::Cli {
+            world: &world,
+            seen: &mut seen,
+        };
+        x05_walk(&mut cli, mock, "cli").await?;
+    }
+
+    // The MCP half, the same walk.
+    let mut mcp = mcp_client(&world, "mcp-flows-x05", "30").await?;
+    x05_walk(&mut Front::Mcp(&mut mcp), mock, "mcp").await?;
+    mcp.close_stdin();
+    let exit = mcp.wait_exit().await?;
+    assert!(exit.success(), "{exit}\n{}", mcp.transcript());
+    // The stderr drain of the driver reads until the pipe ends: let it finish.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for (n, line) in mcp.raw_stdout_lines().into_iter().enumerate() {
+        seen.push((format!("atlas-duck mcp stdout line {n}"), line));
+    }
+    seen.push(("atlas-duck mcp stderr".into(), mcp.stderr_text()));
+
+    // The canary sweep: nothing the dropped field held, and no PAT, on any channel.
+    assert!(
+        seen.len() > 20,
+        "the sweep saw only {} channels",
+        seen.len()
+    );
+    for (name, text) in &seen {
+        assert!(
+            !text.contains(X05_DROPPED),
+            "the dropped canary is in {name}: {text}"
+        );
+        assert!(!text.contains(PAT_CANARY), "the PAT canary is in {name}");
+    }
+
+    // The mock received exactly what the approvals covered.
+    let sent = x05_writes(mock).await;
+    quit_app(&world).await?;
+    let records = world.audit_records()?;
+    let approved = x05_approved(&records)?;
+    assert_eq!(approved.len(), 4, "approved request sets: {approved:?}");
+    assert_eq!(sent.len(), 4, "the mock received {} writes", sent.len());
+    let origins = ["cli create", "cli edit", "mcp create", "mcp edit"];
+    for ((request, (method, path, body)), origin) in approved.iter().zip(&sent).zip(origins) {
+        assert_eq!(&request.method, method, "{origin}");
+        assert!(
+            request.resolved_url.ends_with(path.as_str()),
+            "{origin}: approved {} but the mock saw {path}",
+            request.resolved_url
+        );
+        assert_eq!(
+            &request.body_bytes, body,
+            "{origin}: the bytes on the wire are not the approved bytes"
+        );
+        assert!(
+            String::from_utf8_lossy(body).contains(&format!("x05 {origin}")),
+            "{origin}: the written body is {:?}",
+            String::from_utf8_lossy(body)
+        );
+    }
+    let denied = records
+        .iter()
+        .filter(|(kind, _)| *kind == EventType::WRITE_DENIED)
+        .count();
+    assert_eq!(denied, 4, "WRITE_DENIED records");
     Ok(())
 }

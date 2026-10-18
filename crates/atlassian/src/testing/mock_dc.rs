@@ -211,6 +211,17 @@ impl MockDc {
         self.mount_any(p, t).await;
     }
 
+    /// Any method on `p`: `status` with a JSON body, ahead of every mount of the default priority
+    /// (the provisioning's fixture answer of the same path stays behind it): for a test that needs
+    /// its own body on a path the fixture set already answers (`/search`).
+    pub async fn json_first(&self, p: &str, status: u16, body: &str) {
+        Mock::given(path(self.path(p)))
+            .respond_with(self.response(status).set_body_raw(body, "application/json"))
+            .with_priority(1)
+            .mount(&self.server)
+            .await;
+    }
+
     /// Any method on `p`: `status` with a JSON body, for the first request only; later requests
     /// get whatever is mounted after it (a default a test can still replace).
     pub async fn json_once(&self, p: &str, status: u16, body: &str) {
