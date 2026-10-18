@@ -2181,15 +2181,33 @@ async fn p01_script(rig: &Rig) -> Result<()> {
     };
     let started = Instant::now();
     wd.click(&open).await?;
-    let text = first_preview_text(wd, Duration::from_secs(10), None).await?;
+    // The clock stops on the first `tr` of the frame, found by one cheap `find` per poll: no element
+    // list and no frame text inside the measured interval (200 handles + 1,200 cells per poll made the
+    // harness itself cost ~100-250 ms here).
+    let probe = first_row_cheap(wd, Duration::from_secs(10), started).await?;
     let took = started.elapsed();
     println!("P01 script_200_rows {} ms", took.as_millis());
+    // The old probe (all rows + the whole frame text), once, after the clock stopped: its cost is the
+    // harness share of the earlier 1,067 / 1,107 ms readings.
+    let old_started = Instant::now();
+    let old_ok = old_probe_once(wd).await.is_ok();
+    let old_probe_ms = old_started.elapsed().as_millis();
+    let poll_ms: Vec<String> = probe.poll_ms.iter().map(u128::to_string).collect();
+    println!(
+        "P01 script breakdown first_row_ms={} old_probe_ms={} polls={} poll_ms=[{}] old_probe_ok={}",
+        probe.first_row.as_millis(),
+        old_probe_ms,
+        probe.poll_ms.len(),
+        poll_ms.join(","),
+        old_ok
+    );
     // Completeness: the first screen may be the header facts table; the last result row arrives
     // when the document is parsed (bounded wait, after the budget was taken).
     let full = preview_text_containing(wd, "Issue 199", WAIT).await;
     ensure!(
         full.is_ok(),
-        "the card does not show the last row (Issue 199): first screen: {text}"
+        "the card does not show the last row (Issue 199): {:?}",
+        full.err()
     );
     ensure!(
         took <= P01_BUDGET,
@@ -2197,6 +2215,65 @@ async fn p01_script(rig: &Rig) -> Result<()> {
         took.as_millis()
     );
     Ok(())
+}
+
+/// What [`first_row_cheap`] measured, relative to `started` (the click).
+struct RowProbe {
+    /// When the first `tr` was found in the frame.
+    first_row: Duration,
+    /// The duration of every poll, in order (the last one found the row).
+    poll_ms: Vec<u128>,
+}
+
+/// Like [`first_preview_text`] but cheap: one `find("tr")` in the frame per poll, no row list and no
+/// text. Still ends in the Approvals document. Bounded by `within`.
+async fn first_row_cheap(wd: &WebDriver, within: Duration, started: Instant) -> Result<RowProbe> {
+    let pressed = std::cell::Cell::new(false);
+    let polls = std::cell::RefCell::new(Vec::new());
+    let found = wait_for("a table row in the preview frame", within, || async {
+        let poll = Instant::now();
+        let frames = wd.find_all("iframe[title='Preview']").await?;
+        let Some(frame) = frames.first() else {
+            if !pressed.get()
+                && let Ok(b) = wd
+                    .find_xpath("//article//button[normalize-space()='Open preview']")
+                    .await
+            {
+                pressed.set(true);
+                wd.click(&b).await?;
+            }
+            polls.borrow_mut().push(poll.elapsed().as_millis());
+            return Ok(None);
+        };
+        // A frame that is reloading (new srcdoc) answers "no such frame": look again.
+        if wd.switch_to_frame(frame).await.is_err() {
+            polls.borrow_mut().push(poll.elapsed().as_millis());
+            return Ok(None);
+        }
+        let row = wd.find("tr").await.ok().map(|_| started.elapsed());
+        back_to_top(wd).await?;
+        polls.borrow_mut().push(poll.elapsed().as_millis());
+        Ok(row)
+    })
+    .await?;
+    Ok(RowProbe {
+        first_row: found,
+        poll_ms: polls.into_inner(),
+    })
+}
+
+/// One poll of the old probe of [`first_preview_text`] (frame, all rows, whole frame text), for timing.
+async fn old_probe_once(wd: &WebDriver) -> Result<()> {
+    let frames = wd.find_all("iframe[title='Preview']").await?;
+    let frame = frames.first().ok_or("no preview frame")?;
+    wd.switch_to_frame(frame).await?;
+    let rows = wd.find_all("tr").await;
+    let text = match &rows {
+        Ok(r) if !r.is_empty() => Some(body_text(wd).await),
+        _ => None,
+    };
+    back_to_top(wd).await?;
+    text.ok_or("no rows")?.map(|_| ())
 }
 
 /// Waits (bounded) until the preview frame's text contains `needle`.
