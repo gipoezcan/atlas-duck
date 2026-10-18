@@ -1,0 +1,2570 @@
+[
+  {
+    "name": "jira_myself",
+    "description": "jira.myself (read; approval: release). Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {}
+      ],
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_project_list",
+    "description": "jira.project.list (read; approval: release). Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {}
+      ],
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_project_get",
+    "description": "jira.project.get (read; approval: release). Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "key": "ABC"
+        }
+      ],
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "key": {
+          "pattern": "^[A-Za-z0-9_-]+$",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_issue_get",
+    "description": "jira.issue.get (read; approval: release). Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "key": "ABC-123"
+        }
+      ],
+      "properties": {
+        "changelog": {
+          "default": false,
+          "type": "boolean"
+        },
+        "comments": {
+          "default": false,
+          "type": "boolean"
+        },
+        "expand": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 8,
+          "type": "array"
+        },
+        "fields": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 200,
+          "type": "array"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "key": {
+          "pattern": "^[A-Z][A-Z0-9_]*-[0-9]+$",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "rendered": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_search",
+    "description": "jira.search (read; approval: release). Paginated: continue only from meta.page.next_start. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "jql": "project = ABC AND status = Open ORDER BY updated DESC"
+        }
+      ],
+      "properties": {
+        "expand": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 8,
+          "type": "array"
+        },
+        "fields": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 200,
+          "type": "array"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "jql": {
+          "maxLength": 20000,
+          "minLength": 1,
+          "type": "string"
+        },
+        "max": {
+          "default": 50,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "start": {
+          "default": 0,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "jql"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_comment_list",
+    "description": "jira.comment.list (read; approval: release). Paginated: continue only from meta.page.next_start. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "key": "ABC-123"
+        }
+      ],
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "key": {
+          "pattern": "^[A-Z][A-Z0-9_]*-[0-9]+$",
+          "type": "string"
+        },
+        "max": {
+          "default": 50,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "start": {
+          "default": 0,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_worklog_list",
+    "description": "jira.worklog.list (read; approval: release). Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "key": "ABC-123"
+        }
+      ],
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "key": {
+          "pattern": "^[A-Z][A-Z0-9_]*-[0-9]+$",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_transition_list",
+    "description": "jira.transition.list (read; approval: release). Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "key": "ABC-123"
+        }
+      ],
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "key": {
+          "pattern": "^[A-Z][A-Z0-9_]*-[0-9]+$",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_issue_editmeta",
+    "description": "jira.issue.editmeta (read; approval: release). Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "key": "ABC-123"
+        }
+      ],
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "key": {
+          "pattern": "^[A-Z][A-Z0-9_]*-[0-9]+$",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_createmeta_issuetypes",
+    "description": "jira.createmeta.issuetypes (read; approval: release). Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "project": "ABC"
+        }
+      ],
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "project": {
+          "pattern": "^[A-Za-z0-9_-]+$",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_createmeta_fields",
+    "description": "jira.createmeta.fields (read; approval: release). Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "project": "ABC",
+          "typeId": "10004"
+        }
+      ],
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "project": {
+          "pattern": "^[A-Za-z0-9_-]+$",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "typeId": {
+          "pattern": "^[0-9]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project",
+        "typeId"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_field_list",
+    "description": "jira.field.list (read; approval: release). Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {}
+      ],
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_issuelinktype_list",
+    "description": "jira.issuelinktype.list (read; approval: release). Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {}
+      ],
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_attachment_meta",
+    "description": "jira.attachment.meta (read; approval: release). Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "id": "12000"
+        }
+      ],
+      "properties": {
+        "id": {
+          "pattern": "^[0-9]+$",
+          "type": "string"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_user_assignable",
+    "description": "jira.user.assignable (read; approval: release). Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "project": "ABC",
+          "username": "jdoe"
+        }
+      ],
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "issueKey": {
+          "pattern": "^[A-Z][A-Z0-9_]*-[0-9]+$",
+          "type": "string"
+        },
+        "max": {
+          "default": 50,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "project": {
+          "pattern": "^[A-Za-z0-9_-]+$",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "username": {
+          "maxLength": 255,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "username"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_board_list",
+    "description": "jira.board.list (read; approval: release). Paginated: continue only from meta.page.next_start. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "name": "ABC board"
+        }
+      ],
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "max": {
+          "default": 50,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "name": {
+          "maxLength": 255,
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "start": {
+          "default": 0,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_sprint_list",
+    "description": "jira.sprint.list (read; approval: release). Paginated: continue only from meta.page.next_start. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "id": 42,
+          "state": "active"
+        }
+      ],
+      "properties": {
+        "id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "max": {
+          "default": 50,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "start": {
+          "default": 0,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "state": {
+          "enum": [
+            "future",
+            "active",
+            "closed"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_sprint_issues",
+    "description": "jira.sprint.issues (read; approval: release). Paginated: continue only from meta.page.next_start. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "id": 42
+        }
+      ],
+      "properties": {
+        "fields": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 200,
+          "type": "array"
+        },
+        "id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "jql": {
+          "maxLength": 20000,
+          "minLength": 1,
+          "type": "string"
+        },
+        "max": {
+          "default": 50,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "start": {
+          "default": 0,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_backlog_issues",
+    "description": "jira.backlog.issues (read; approval: release). Paginated: continue only from meta.page.next_start. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "id": 42
+        }
+      ],
+      "properties": {
+        "fields": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 200,
+          "type": "array"
+        },
+        "id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "jql": {
+          "maxLength": 20000,
+          "minLength": 1,
+          "type": "string"
+        },
+        "max": {
+          "default": 50,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "start": {
+          "default": 0,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_issue_create",
+    "description": "jira.issue.create (write; approval: approve). Submit human names (project, issue type, transition, user, link type, parent page); the app resolves and validates them. Do not pre-read createmeta, transitions or assignable users; if you need metadata, fetch it in one script. Text in `fields`, `update` and `comment` is sent as Jira wiki markup unchanged; only `description`/`body` with `body_format=markdown` are converted. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "description": "Steps to reproduce: ...",
+          "fields": {
+            "customfield_10200": {
+              "value": "Platform"
+            }
+          },
+          "issuetype": "Bug",
+          "project": "ABC",
+          "summary": "Login fails after password reset"
+        }
+      ],
+      "properties": {
+        "body_format": {
+          "default": "markdown",
+          "enum": [
+            "markdown",
+            "wiki"
+          ],
+          "type": "string"
+        },
+        "description": {
+          "maxLength": 32768,
+          "type": "string"
+        },
+        "fields": {
+          "description": "Extra Jira fields in REST shape, keyed by system field id or customfield_N; a key that duplicates a dedicated param is rejected.",
+          "propertyNames": {
+            "pattern": "^([a-z][A-Za-z0-9_]*|customfield_[0-9]+)$"
+          },
+          "type": "object"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "issuetype": {
+          "maxLength": 255,
+          "minLength": 1,
+          "type": "string"
+        },
+        "project": {
+          "maxLength": 255,
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 255,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "project",
+        "issuetype",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_issue_edit",
+    "description": "jira.issue.edit (write; approval: approve). Submit human names (project, issue type, transition, user, link type, parent page); the app resolves and validates them. Do not pre-read createmeta, transitions or assignable users; if you need metadata, fetch it in one script. Text in `fields`, `update` and `comment` is sent as Jira wiki markup unchanged; only `description`/`body` with `body_format=markdown` are converted. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "expected": {
+            "summary": "Login fails after password reset"
+          },
+          "fields": {
+            "summary": "Login fails after reset"
+          },
+          "key": "ABC-123"
+        }
+      ],
+      "properties": {
+        "expected": {
+          "description": "{field id: value as read}; a mismatch at enrichment puts the request in the conflict state. Recommended for every edited field, especially description.",
+          "type": "object"
+        },
+        "fields": {
+          "propertyNames": {
+            "pattern": "^([a-z][A-Za-z0-9_]*|customfield_[0-9]+)$"
+          },
+          "type": "object"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "key": {
+          "pattern": "^[A-Z][A-Z0-9_]*-[0-9]+$",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "update": {
+          "description": "Jira update operations, e.g. {\"labels\":[{\"add\":\"x\"}]}.",
+          "propertyNames": {
+            "pattern": "^([a-z][A-Za-z0-9_]*|customfield_[0-9]+)$"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_comment_add",
+    "description": "jira.comment.add (write; approval: approve). Submit human names (project, issue type, transition, user, link type, parent page); the app resolves and validates them. Do not pre-read createmeta, transitions or assignable users; if you need metadata, fetch it in one script. Text in `fields`, `update` and `comment` is sent as Jira wiki markup unchanged; only `description`/`body` with `body_format=markdown` are converted. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "body": "Fixed in 1.4.",
+          "key": "ABC-123"
+        }
+      ],
+      "properties": {
+        "body": {
+          "maxLength": 32768,
+          "minLength": 1,
+          "type": "string"
+        },
+        "body_format": {
+          "default": "markdown",
+          "enum": [
+            "markdown",
+            "wiki"
+          ],
+          "type": "string"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "key": {
+          "pattern": "^[A-Z][A-Z0-9_]*-[0-9]+$",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "visibility": {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "enum": [
+                "group",
+                "role"
+              ],
+              "type": "string"
+            },
+            "value": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "value"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "key",
+        "body"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_issue_transition",
+    "description": "jira.issue.transition (write; approval: approve). Submit human names (project, issue type, transition, user, link type, parent page); the app resolves and validates them. Do not pre-read createmeta, transitions or assignable users; if you need metadata, fetch it in one script. Text in `fields`, `update` and `comment` is sent as Jira wiki markup unchanged; only `description`/`body` with `body_format=markdown` are converted. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "key": "ABC-123",
+          "transition": "In Progress"
+        }
+      ],
+      "properties": {
+        "comment": {
+          "maxLength": 32768,
+          "minLength": 1,
+          "type": "string"
+        },
+        "fields": {
+          "propertyNames": {
+            "pattern": "^([a-z][A-Za-z0-9_]*|customfield_[0-9]+)$"
+          },
+          "type": "object"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "key": {
+          "pattern": "^[A-Z][A-Z0-9_]*-[0-9]+$",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "transition": {
+          "description": "Transition name or id; the app resolves it.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "transition"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_issue_assign",
+    "description": "jira.issue.assign (write; approval: approve). Submit human names (project, issue type, transition, user, link type, parent page); the app resolves and validates them. Do not pre-read createmeta, transitions or assignable users; if you need metadata, fetch it in one script. Text in `fields`, `update` and `comment` is sent as Jira wiki markup unchanged; only `description`/`body` with `body_format=markdown` are converted. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "assignee": "jdoe",
+          "key": "ABC-123"
+        }
+      ],
+      "properties": {
+        "assignee": {
+          "description": "Username, or null to unassign.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "key": {
+          "pattern": "^[A-Z][A-Z0-9_]*-[0-9]+$",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "assignee"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_worklog_add",
+    "description": "jira.worklog.add (write; approval: approve). Submit human names (project, issue type, transition, user, link type, parent page); the app resolves and validates them. Do not pre-read createmeta, transitions or assignable users; if you need metadata, fetch it in one script. Text in `fields`, `update` and `comment` is sent as Jira wiki markup unchanged; only `description`/`body` with `body_format=markdown` are converted. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "comment": "Investigation",
+          "key": "ABC-123",
+          "time_spent": "2h"
+        }
+      ],
+      "properties": {
+        "comment": {
+          "description": "Plain text or Jira wiki markup, sent as written (not converted from Markdown). The preview lists its macros, mentions and links.",
+          "maxLength": 32768,
+          "type": "string"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "key": {
+          "pattern": "^[A-Z][A-Z0-9_]*-[0-9]+$",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "started": {
+          "description": "Jira timestamp yyyy-MM-dd'T'HH:mm:ss.SSSZ with the zone as +hhmm, e.g. 2026-09-02T09:00:00.000+0200. Exactly 3 millisecond digits, a zone of +hhmm or -hhmm up to 1400 (not Z, not +hh:mm), year 2000 or later; the date is not checked against any clock, the preview shows the UTC instant. Omitted: Jira uses the time the worklog is created.",
+          "type": "string"
+        },
+        "time_spent": {
+          "description": "Time as Jira reads timeSpent: amounts of w, d, h, m separated by single spaces, largest first, each unit once (1w 2d 3h 30m). Each amount has 1 to 4 digits. More than zero, at most 4w (160h, 9600m). w and d are working time (Jira default 1d = 8h, 1w = 5d; the instance decides). No seconds, no decimals, no 2h30m.",
+          "pattern": "^[0-9]+[wdhm]( [0-9]+[wdhm])*$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "time_spent"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_issuelink_create",
+    "description": "jira.issuelink.create (write; approval: approve). Submit human names (project, issue type, transition, user, link type, parent page); the app resolves and validates them. Do not pre-read createmeta, transitions or assignable users; if you need metadata, fetch it in one script. Text in `fields`, `update` and `comment` is sent as Jira wiki markup unchanged; only `description`/`body` with `body_format=markdown` are converted. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "inward": "ABC-124",
+          "outward": "ABC-123",
+          "type": "Blocks"
+        }
+      ],
+      "properties": {
+        "comment": {
+          "maxLength": 32768,
+          "minLength": 1,
+          "type": "string"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "inward": {
+          "description": "Issue the link starts from (sent as inwardIssue): it gets the type's outward phrase, e.g. with type Blocks this issue blocks outward.",
+          "pattern": "^[A-Z][A-Z0-9_]*-[0-9]+$",
+          "type": "string"
+        },
+        "outward": {
+          "description": "Issue the outward phrase points at (sent as outwardIssue), e.g. with type Blocks this issue is blocked by inward.",
+          "pattern": "^[A-Z][A-Z0-9_]*-[0-9]+$",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "type": {
+          "description": "Link type name (or id, or one of its phrases); the app resolves it. A phrase never changes the direction: the link always reads from inward to outward with the type's outward phrase.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "inward",
+        "outward"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_sprint_move_issues",
+    "description": "jira.sprint.move_issues (write; approval: approve). Submit human names (project, issue type, transition, user, link type, parent page); the app resolves and validates them. Do not pre-read createmeta, transitions or assignable users; if you need metadata, fetch it in one script. Text in `fields`, `update` and `comment` is sent as Jira wiki markup unchanged; only `description`/`body` with `body_format=markdown` are converted. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "id": 7,
+          "issues": [
+            "ABC-123",
+            "ABC-124"
+          ]
+        }
+      ],
+      "properties": {
+        "id": {
+          "description": "Sprint id (as jira.sprint.list lists it). The app reads the sprint first: the move can be approved only into a future or active sprint; a closed sprint holds it (deny only).",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "issues": {
+          "description": "Issue keys to move, 1 to 50, each listed once (ABC-01 and ABC-1 are one issue), at most 255 characters each. More than 50 is refused: split into requests of ≤ 50 issues; moves of disjoint issues can be batch-approved.",
+          "items": {
+            "pattern": "^[A-Z][A-Z0-9_]*-[0-9]+$",
+            "type": "string"
+          },
+          "maxItems": 50,
+          "minItems": 1,
+          "type": "array"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "issues"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "jira_backlog_move_issues",
+    "description": "jira.backlog.move_issues (write; approval: approve). Submit human names (project, issue type, transition, user, link type, parent page); the app resolves and validates them. Do not pre-read createmeta, transitions or assignable users; if you need metadata, fetch it in one script. Text in `fields`, `update` and `comment` is sent as Jira wiki markup unchanged; only `description`/`body` with `body_format=markdown` are converted. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "issues": [
+            "ABC-123"
+          ]
+        }
+      ],
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "issues": {
+          "description": "Issue keys to move to the backlog (each issue leaves its future and active sprints), 1 to 50, each listed once (ABC-01 and ABC-1 are one issue), at most 255 characters each. More than 50 is refused: split into requests of ≤ 50 issues; moves of disjoint issues can be batch-approved.",
+          "items": {
+            "pattern": "^[A-Z][A-Z0-9_]*-[0-9]+$",
+            "type": "string"
+          },
+          "maxItems": 50,
+          "minItems": 1,
+          "type": "array"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "issues"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "confluence_user_current",
+    "description": "confluence.user.current (read; approval: release). Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {}
+      ],
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "confluence_space_list",
+    "description": "confluence.space.list (read; approval: release). Paginated: continue only from meta.page.next_start. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "type": "global"
+        }
+      ],
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "max": {
+          "default": 25,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "start": {
+          "default": 0,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "type": {
+          "enum": [
+            "global",
+            "personal"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "confluence_space_get",
+    "description": "confluence.space.get (read; approval: release). Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "key": "ABC"
+        }
+      ],
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "key": {
+          "maxLength": 255,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9_~.@-]+$",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "confluence_page_get",
+    "description": "confluence.page.get (read; approval: release). Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "id": "123456"
+        }
+      ],
+      "properties": {
+        "format": {
+          "default": "markdown",
+          "enum": [
+            "markdown",
+            "storage",
+            "view"
+          ],
+          "type": "string"
+        },
+        "id": {
+          "pattern": "^[0-9]+$",
+          "type": "string"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "confluence_page_find",
+    "description": "confluence.page.find (read; approval: release). Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "space": "ABC",
+          "title": "Release notes"
+        }
+      ],
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "space": {
+          "maxLength": 255,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9_~.@-]+$",
+          "type": "string"
+        },
+        "title": {
+          "maxLength": 255,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "space",
+        "title"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "confluence_search",
+    "description": "confluence.search (read; approval: release). The CQL is sent as `(<your CQL>) AND type in (page,blogpost,comment,attachment)` plus your trailing ORDER BY; an ORDER BY elsewhere, an unterminated quote, a backslash outside a quoted string, unbalanced parentheses or parentheses nested deeper than 64 levels are rejected. Paginated: continue only from meta.page.next_start. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "cql": "space = ABC AND type = page AND title ~ \"Release\""
+        }
+      ],
+      "properties": {
+        "cql": {
+          "maxLength": 20000,
+          "minLength": 1,
+          "type": "string"
+        },
+        "excerpt": {
+          "default": "none",
+          "enum": [
+            "none",
+            "indexed"
+          ],
+          "type": "string"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "max": {
+          "default": 25,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "start": {
+          "default": 0,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cql"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "confluence_page_children",
+    "description": "confluence.page.children (read; approval: release). Paginated: continue only from meta.page.next_start. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "id": "123456"
+        }
+      ],
+      "properties": {
+        "id": {
+          "pattern": "^[0-9]+$",
+          "type": "string"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "max": {
+          "default": 25,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "start": {
+          "default": 0,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "confluence_comment_list",
+    "description": "confluence.comment.list (read; approval: release). Paginated: continue only from meta.page.next_start. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "id": "123456"
+        }
+      ],
+      "properties": {
+        "id": {
+          "pattern": "^[0-9]+$",
+          "type": "string"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "max": {
+          "default": 25,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "start": {
+          "default": 0,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "confluence_label_list",
+    "description": "confluence.label.list (read; approval: release). Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "id": "123456"
+        }
+      ],
+      "properties": {
+        "id": {
+          "pattern": "^[0-9]+$",
+          "type": "string"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "confluence_attachment_list",
+    "description": "confluence.attachment.list (read; approval: release). Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "id": "123456"
+        }
+      ],
+      "properties": {
+        "id": {
+          "pattern": "^[0-9]+$",
+          "type": "string"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "confluence_page_history",
+    "description": "confluence.page.history (read; approval: release). Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "id": "123456"
+        }
+      ],
+      "properties": {
+        "format": {
+          "default": "markdown",
+          "enum": [
+            "markdown",
+            "storage",
+            "view"
+          ],
+          "type": "string"
+        },
+        "id": {
+          "pattern": "^[0-9]+$",
+          "type": "string"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "version": {
+          "description": "Fetch this historical version (body included) instead of the history summary.",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "confluence_page_create",
+    "description": "confluence.page.create (write; approval: approve). Submit human names (project, issue type, transition, user, link type, parent page); the app resolves and validates them. Do not pre-read createmeta, transitions or assignable users; if you need metadata, fetch it in one script. A Markdown body that still contains `page get` placeholders (`[macro: …]`, `confluence:` links or images, `@user:<key>`) is rejected with `markdown_placeholders`: fetch with `--format storage` and submit `body_format=storage`. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "body": "Release 1.5 fixes the login.",
+          "parent": "123400",
+          "space": "ABC",
+          "title": "Release notes 1.5"
+        }
+      ],
+      "properties": {
+        "body": {
+          "maxLength": 1048576,
+          "type": "string"
+        },
+        "body_format": {
+          "default": "markdown",
+          "enum": [
+            "markdown",
+            "storage"
+          ],
+          "type": "string"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "parent": {
+          "description": "Parent page id or title (same space); a value of digits only is always a page id.",
+          "maxLength": 255,
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "space": {
+          "maxLength": 255,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9_~.@-]+$",
+          "type": "string"
+        },
+        "title": {
+          "maxLength": 255,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "space",
+        "title",
+        "body"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "confluence_page_update",
+    "description": "confluence.page.update (write; approval: approve). Submit human names (project, issue type, transition, user, link type, parent page); the app resolves and validates them. Do not pre-read createmeta, transitions or assignable users; if you need metadata, fetch it in one script. A Markdown body that still contains `page get` placeholders (`[macro: …]`, `confluence:` links or images, `@user:<key>`) is rejected with `markdown_placeholders`: fetch with `--format storage` and submit `body_format=storage`. If `page get` reported `meta.conversion.lossy = true`, edit with `body_format=storage`; a Markdown update that would remove macros (task lists included), images or links (mentions included) is flagged to the approver. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "base_version": 3,
+          "body": "Release 1.4 fixes the login and the reset flow.",
+          "id": "123456"
+        }
+      ],
+      "properties": {
+        "base_version": {
+          "description": "The version number you read; the app sends base_version + 1 and flags a newer server version as a conflict.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "body": {
+          "maxLength": 1048576,
+          "type": "string"
+        },
+        "body_format": {
+          "default": "markdown",
+          "enum": [
+            "markdown",
+            "storage"
+          ],
+          "type": "string"
+        },
+        "id": {
+          "pattern": "^[0-9]+$",
+          "type": "string"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "title": {
+          "maxLength": 255,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "base_version",
+        "body"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "confluence_page_move",
+    "description": "confluence.page.move (write; approval: approve). Submit human names (project, issue type, transition, user, link type, parent page); the app resolves and validates them. Do not pre-read createmeta, transitions or assignable users; if you need metadata, fetch it in one script. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "id": "123456",
+          "parent": "123400"
+        }
+      ],
+      "properties": {
+        "id": {
+          "pattern": "^[0-9]+$",
+          "type": "string"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "parent": {
+          "description": "Parent page id or title (same space); a value of digits only is always a page id.",
+          "maxLength": 255,
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "parent"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "confluence_comment_add",
+    "description": "confluence.comment.add (write; approval: approve). Submit human names (project, issue type, transition, user, link type, parent page); the app resolves and validates them. Do not pre-read createmeta, transitions or assignable users; if you need metadata, fetch it in one script. A Markdown body that still contains `page get` placeholders (`[macro: …]`, `confluence:` links or images, `@user:<key>`) is rejected with `markdown_placeholders`: fetch with `--format storage` and submit `body_format=storage`. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "body": "Looks good.",
+          "content_id": "123456"
+        }
+      ],
+      "properties": {
+        "body": {
+          "maxLength": 32768,
+          "minLength": 1,
+          "type": "string"
+        },
+        "body_format": {
+          "default": "markdown",
+          "enum": [
+            "markdown",
+            "storage"
+          ],
+          "type": "string"
+        },
+        "content_id": {
+          "pattern": "^[0-9]+$",
+          "type": "string"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "reply_to": {
+          "description": "Comment id to reply to.",
+          "pattern": "^[0-9]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "content_id",
+        "body"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "confluence_label_add",
+    "description": "confluence.label.add (write; approval: approve). Submit human names (project, issue type, transition, user, link type, parent page); the app resolves and validates them. Do not pre-read createmeta, transitions or assignable users; if you need metadata, fetch it in one script. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "id": "123456",
+          "labels": [
+            "release",
+            "docs"
+          ]
+        }
+      ],
+      "properties": {
+        "id": {
+          "pattern": "^[0-9]+$",
+          "type": "string"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "labels": {
+          "items": {
+            "maxLength": 255,
+            "pattern": "^[A-Za-z0-9_.:-]+$",
+            "type": "string"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "labels"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "confluence_label_remove",
+    "description": "confluence.label.remove (write; approval: approve). Submit human names (project, issue type, transition, user, link type, parent page); the app resolves and validates them. Do not pre-read createmeta, transitions or assignable users; if you need metadata, fetch it in one script. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "id": "123456",
+          "label": "release"
+        }
+      ],
+      "properties": {
+        "id": {
+          "pattern": "^[0-9]+$",
+          "type": "string"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "label": {
+          "maxLength": 255,
+          "pattern": "^[A-Za-z0-9_.:-]+$",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "confluence_attachment_upload",
+    "description": "confluence.attachment.upload (write; approval: approve). Submit human names (project, issue type, transition, user, link type, parent page); the app resolves and validates them. Do not pre-read createmeta, transitions or assignable users; if you need metadata, fetch it in one script. Result shapes: ops_describe.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "examples": [
+        {
+          "comment": "Meeting notes",
+          "content_base64": "aGVsbG8gd29ybGQ=",
+          "filename": "notes.txt",
+          "id": "123456"
+        }
+      ],
+      "properties": {
+        "comment": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "content_base64": {
+          "maxLength": 13981016,
+          "pattern": "^[A-Za-z0-9+/]*={0,2}$",
+          "type": "string"
+        },
+        "filename": {
+          "maxLength": 255,
+          "minLength": 1,
+          "pattern": "^[^/\\\\]+$",
+          "type": "string"
+        },
+        "id": {
+          "pattern": "^[0-9]+$",
+          "type": "string"
+        },
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "replace": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "filename",
+        "content_base64"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "script_run",
+    "description": "Run a read-only script in the sandbox; the user approves only the final result. Run every new or changed script with dry_run sparse and dry_run full first (no approval needed; results come from documented examples, meta.dry_run: true), then run it for real once. Default limits: heap_mb=256, max_call_result_mb=16, max_calls=200, max_concurrent_calls=4, max_fetch_mb=50, max_result_mb=16, process_mb=512, timeout_s=120; the effective limits for an instance: ops_describe with op_id and instance (field script_limits).",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {},
+        "dry_run": {
+          "enum": [
+            "full",
+            "sparse"
+          ]
+        },
+        "limits": {
+          "additionalProperties": false,
+          "properties": {
+            "heap_mb": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "max_call_result_mb": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "max_calls": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "max_concurrent_calls": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "max_fetch_mb": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "max_result_mb": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "process_mb": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "timeout_s": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "request_await",
+    "description": "Wait for a request's decision (up to ATLAS_DUCK_MCP_TIMEOUT). Never resubmit a pending request.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "pattern": "^req_[A-Za-z0-9_-]{20,64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "request_id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "request_status",
+    "description": "Report where a request stands. Never blocks and never returns data.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "pattern": "^req_[A-Za-z0-9_-]{20,64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "request_id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "request_cancel",
+    "description": "Cancel a request by id. Only this tool cancels: dropping or cancelling a tool call never does.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "pattern": "^req_[A-Za-z0-9_-]{20,64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "request_id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "request_list",
+    "description": "List pending or recent requests. Metadata only; recover a lost id with match_params.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "match_params": {
+          "additionalProperties": false,
+          "properties": {
+            "instance": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "op_id": {
+              "enum": [
+                "jira.myself",
+                "jira.project.list",
+                "jira.project.get",
+                "jira.issue.get",
+                "jira.search",
+                "jira.comment.list",
+                "jira.worklog.list",
+                "jira.transition.list",
+                "jira.issue.editmeta",
+                "jira.createmeta.issuetypes",
+                "jira.createmeta.fields",
+                "jira.field.list",
+                "jira.issuelinktype.list",
+                "jira.attachment.meta",
+                "jira.user.assignable",
+                "jira.board.list",
+                "jira.sprint.list",
+                "jira.sprint.issues",
+                "jira.backlog.issues",
+                "jira.issue.create",
+                "jira.issue.edit",
+                "jira.comment.add",
+                "jira.issue.transition",
+                "jira.issue.assign",
+                "jira.worklog.add",
+                "jira.issuelink.create",
+                "jira.sprint.move_issues",
+                "jira.backlog.move_issues",
+                "confluence.user.current",
+                "confluence.space.list",
+                "confluence.space.get",
+                "confluence.page.get",
+                "confluence.page.find",
+                "confluence.search",
+                "confluence.page.children",
+                "confluence.comment.list",
+                "confluence.label.list",
+                "confluence.attachment.list",
+                "confluence.page.history",
+                "confluence.page.create",
+                "confluence.page.update",
+                "confluence.page.move",
+                "confluence.comment.add",
+                "confluence.label.add",
+                "confluence.label.remove",
+                "confluence.attachment.upload"
+              ],
+              "type": "string"
+            },
+            "params": {
+              "type": "object"
+            }
+          },
+          "required": [
+            "op_id",
+            "params"
+          ],
+          "type": "object"
+        },
+        "state": {
+          "enum": [
+            "pending",
+            "recent"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "ops_list",
+    "description": "List the operations with class, approval and description.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "ops_describe",
+    "description": "Describe one operation: params schema, result shapes, caps and script_limits (effective with an instance).",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "op_id": {
+          "enum": [
+            "jira.myself",
+            "jira.project.list",
+            "jira.project.get",
+            "jira.issue.get",
+            "jira.search",
+            "jira.comment.list",
+            "jira.worklog.list",
+            "jira.transition.list",
+            "jira.issue.editmeta",
+            "jira.createmeta.issuetypes",
+            "jira.createmeta.fields",
+            "jira.field.list",
+            "jira.issuelinktype.list",
+            "jira.attachment.meta",
+            "jira.user.assignable",
+            "jira.board.list",
+            "jira.sprint.list",
+            "jira.sprint.issues",
+            "jira.backlog.issues",
+            "jira.issue.create",
+            "jira.issue.edit",
+            "jira.comment.add",
+            "jira.issue.transition",
+            "jira.issue.assign",
+            "jira.worklog.add",
+            "jira.issuelink.create",
+            "jira.sprint.move_issues",
+            "jira.backlog.move_issues",
+            "confluence.user.current",
+            "confluence.space.list",
+            "confluence.space.get",
+            "confluence.page.get",
+            "confluence.page.find",
+            "confluence.search",
+            "confluence.page.children",
+            "confluence.comment.list",
+            "confluence.label.list",
+            "confluence.attachment.list",
+            "confluence.page.history",
+            "confluence.page.create",
+            "confluence.page.update",
+            "confluence.page.move",
+            "confluence.comment.add",
+            "confluence.label.add",
+            "confluence.label.remove",
+            "confluence.attachment.upload"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "op_id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "instances_list",
+    "description": "List the configured instances.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  }
+]

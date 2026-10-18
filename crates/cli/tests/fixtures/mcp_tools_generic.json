@@ -1,0 +1,426 @@
+[
+  {
+    "name": "call",
+    "description": "Submit any registry operation by id with its params (ops_list, ops_describe). A write needs the user's approval. Never resubmit a pending request.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "op_id": {
+          "enum": [
+            "jira.myself",
+            "jira.project.list",
+            "jira.project.get",
+            "jira.issue.get",
+            "jira.search",
+            "jira.comment.list",
+            "jira.worklog.list",
+            "jira.transition.list",
+            "jira.issue.editmeta",
+            "jira.createmeta.issuetypes",
+            "jira.createmeta.fields",
+            "jira.field.list",
+            "jira.issuelinktype.list",
+            "jira.attachment.meta",
+            "jira.user.assignable",
+            "jira.board.list",
+            "jira.sprint.list",
+            "jira.sprint.issues",
+            "jira.backlog.issues",
+            "jira.issue.create",
+            "jira.issue.edit",
+            "jira.comment.add",
+            "jira.issue.transition",
+            "jira.issue.assign",
+            "jira.worklog.add",
+            "jira.issuelink.create",
+            "jira.sprint.move_issues",
+            "jira.backlog.move_issues",
+            "confluence.user.current",
+            "confluence.space.list",
+            "confluence.space.get",
+            "confluence.page.get",
+            "confluence.page.find",
+            "confluence.search",
+            "confluence.page.children",
+            "confluence.comment.list",
+            "confluence.label.list",
+            "confluence.attachment.list",
+            "confluence.page.history",
+            "confluence.page.create",
+            "confluence.page.update",
+            "confluence.page.move",
+            "confluence.comment.add",
+            "confluence.label.add",
+            "confluence.label.remove",
+            "confluence.attachment.upload"
+          ],
+          "type": "string"
+        },
+        "params": {
+          "type": "object"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "op_id",
+        "params"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "script_run",
+    "description": "Run a read-only script in the sandbox; the user approves only the final result. Run every new or changed script with dry_run sparse and dry_run full first (no approval needed; results come from documented examples, meta.dry_run: true), then run it for real once. Default limits: heap_mb=256, max_call_result_mb=16, max_calls=200, max_concurrent_calls=4, max_fetch_mb=50, max_result_mb=16, process_mb=512, timeout_s=120; the effective limits for an instance: ops_describe with op_id and instance (field script_limits).",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {},
+        "dry_run": {
+          "enum": [
+            "full",
+            "sparse"
+          ]
+        },
+        "limits": {
+          "additionalProperties": false,
+          "properties": {
+            "heap_mb": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "max_call_result_mb": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "max_calls": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "max_concurrent_calls": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "max_fetch_mb": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "max_result_mb": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "process_mb": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "timeout_s": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "reason": {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "request_await",
+    "description": "Wait for a request's decision (up to ATLAS_DUCK_MCP_TIMEOUT). Never resubmit a pending request.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "pattern": "^req_[A-Za-z0-9_-]{20,64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "request_id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "request_status",
+    "description": "Report where a request stands. Never blocks and never returns data.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "pattern": "^req_[A-Za-z0-9_-]{20,64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "request_id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "request_cancel",
+    "description": "Cancel a request by id. Only this tool cancels: dropping or cancelling a tool call never does.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "pattern": "^req_[A-Za-z0-9_-]{20,64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "request_id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "request_list",
+    "description": "List pending or recent requests. Metadata only; recover a lost id with match_params.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "match_params": {
+          "additionalProperties": false,
+          "properties": {
+            "instance": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "op_id": {
+              "enum": [
+                "jira.myself",
+                "jira.project.list",
+                "jira.project.get",
+                "jira.issue.get",
+                "jira.search",
+                "jira.comment.list",
+                "jira.worklog.list",
+                "jira.transition.list",
+                "jira.issue.editmeta",
+                "jira.createmeta.issuetypes",
+                "jira.createmeta.fields",
+                "jira.field.list",
+                "jira.issuelinktype.list",
+                "jira.attachment.meta",
+                "jira.user.assignable",
+                "jira.board.list",
+                "jira.sprint.list",
+                "jira.sprint.issues",
+                "jira.backlog.issues",
+                "jira.issue.create",
+                "jira.issue.edit",
+                "jira.comment.add",
+                "jira.issue.transition",
+                "jira.issue.assign",
+                "jira.worklog.add",
+                "jira.issuelink.create",
+                "jira.sprint.move_issues",
+                "jira.backlog.move_issues",
+                "confluence.user.current",
+                "confluence.space.list",
+                "confluence.space.get",
+                "confluence.page.get",
+                "confluence.page.find",
+                "confluence.search",
+                "confluence.page.children",
+                "confluence.comment.list",
+                "confluence.label.list",
+                "confluence.attachment.list",
+                "confluence.page.history",
+                "confluence.page.create",
+                "confluence.page.update",
+                "confluence.page.move",
+                "confluence.comment.add",
+                "confluence.label.add",
+                "confluence.label.remove",
+                "confluence.attachment.upload"
+              ],
+              "type": "string"
+            },
+            "params": {
+              "type": "object"
+            }
+          },
+          "required": [
+            "op_id",
+            "params"
+          ],
+          "type": "object"
+        },
+        "state": {
+          "enum": [
+            "pending",
+            "recent"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "ops_list",
+    "description": "List the operations with class, approval and description.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "ops_describe",
+    "description": "Describe one operation: params schema, result shapes, caps and script_limits (effective with an instance).",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "instance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "op_id": {
+          "enum": [
+            "jira.myself",
+            "jira.project.list",
+            "jira.project.get",
+            "jira.issue.get",
+            "jira.search",
+            "jira.comment.list",
+            "jira.worklog.list",
+            "jira.transition.list",
+            "jira.issue.editmeta",
+            "jira.createmeta.issuetypes",
+            "jira.createmeta.fields",
+            "jira.field.list",
+            "jira.issuelinktype.list",
+            "jira.attachment.meta",
+            "jira.user.assignable",
+            "jira.board.list",
+            "jira.sprint.list",
+            "jira.sprint.issues",
+            "jira.backlog.issues",
+            "jira.issue.create",
+            "jira.issue.edit",
+            "jira.comment.add",
+            "jira.issue.transition",
+            "jira.issue.assign",
+            "jira.worklog.add",
+            "jira.issuelink.create",
+            "jira.sprint.move_issues",
+            "jira.backlog.move_issues",
+            "confluence.user.current",
+            "confluence.space.list",
+            "confluence.space.get",
+            "confluence.page.get",
+            "confluence.page.find",
+            "confluence.search",
+            "confluence.page.children",
+            "confluence.comment.list",
+            "confluence.label.list",
+            "confluence.attachment.list",
+            "confluence.page.history",
+            "confluence.page.create",
+            "confluence.page.update",
+            "confluence.page.move",
+            "confluence.comment.add",
+            "confluence.label.add",
+            "confluence.label.remove",
+            "confluence.attachment.upload"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "op_id"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "instances_list",
+    "description": "List the configured instances.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  }
+]
