@@ -122,14 +122,30 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN: "1"
         run: cargo tauri build --ci --debug --features scripted-approver --target "$TARGET" --bundles rpm,appimage -- --locked
 
-      - name: Stage the artifact (rpm, AppImage)
+      # M8 plan Task 28 (CI-04 script step, CI-07): the packaged apps start in the first-run state and
+      # no shell step can provision a store, so a test executable does it (app/src-tauri/tests/
+      # script_fixture.rs: store + one Jira instance + PAT in the wizard's order, written to a fresh
+      # test home). It is built here, in the debug scripted-approver profile of the bundles above, and
+      # shipped in the artifact (fixture/script_fixture) for appimage-smoke.sh --m8. Never run here.
+      - name: Build the script_fixture test executable (not run)
+        run: |
+          set -euo pipefail
+          cargo test -p atlas-duck-app --features scripted-approver --locked --target "$TARGET" --test script_fixture --no-run --message-format=json > "$RUNNER_TEMP/fixture-build.json"
+          exe="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "script_fixture" and .executable != null) | .executable' "$RUNNER_TEMP/fixture-build.json" | tail -n 1)"
+          test -n "$exe" && test -x "$exe"
+          mkdir -p "$RUNNER_TEMP/fixture"
+          cp "$exe" "$RUNNER_TEMP/fixture/script_fixture"
+          ls -l "$RUNNER_TEMP/fixture"
+
+      - name: Stage the artifact (rpm, AppImage, script_fixture)
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/e2e-bundle"
           bundle="target/$TARGET/debug/bundle"
-          mkdir -p "$out/rpm" "$out/appimage"
+          mkdir -p "$out/rpm" "$out/appimage" "$out/fixture"
           cp "$bundle"/rpm/*.rpm "$out/rpm/"
           cp "$bundle"/appimage/*.AppImage "$out/appimage/"
+          cp "$RUNNER_TEMP/fixture/script_fixture" "$out/fixture/"
           ls -lR "$out"
 
       - name: Upload bundle-linux-e2e
@@ -224,7 +240,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libfuse2 xvfb xauth dbus-x11 gnome-keyring libsecret-tools x11-utils python3 \
-            libayatana-appindicator3-1 librsvg2-2 libwebkit2gtk-4.1-0
+            libayatana-appindicator3-1 librsvg2-2 libwebkit2gtk-4.1-0 libxdo3 libssl3
           command -v xwininfo
           ldconfig -p | grep -F 'libEGL.so.1 '
 

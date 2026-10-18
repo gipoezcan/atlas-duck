@@ -200,13 +200,14 @@ m6_outer() {
 #      path) and the app is still alive. A run whose app lived in the CLI's mount would have been
 #      cut off when the CLI's mount went away.
 # Steps 1, 3 and 4 need a serving core: a store with one Jira instance, provisioned in the wizard's
-# order. No shell step can do that (the wizard is driver-free-unreachable, M6 CI ruling, and the
-# provisioning is in-process Rust: tests/cli_flows harness), so the caller names a provisioned test
-# home with ATLAS_DUCK_M8_PROVISIONED=1, ATLAS_DUCK_M8_HOME and ATLAS_DUCK_M8_KEYSTORE. Without it
-# the section runs on a first-run store: the CLI answers `script run` with not_configured
-# {first_run}, exit 9, and the section prints M8_SCRIPT_RUN=NOT_PROVEN (it never passes as proof).
+# order. No shell step can do that (the wizard is unreachable without a driver, M6 CI ruling; the
+# provisioning is in-process Rust), so the bundle job builds the test executable `script_fixture`
+# (app/src-tauri/tests/script_fixture.rs) and ships it as <e2e-artifact-dir>/fixture/script_fixture.
+# The section runs it once (under Xvfb: the harness wants a display), reads the `home=` and `keys=`
+# lines it writes to ATLAS_DUCK_FIXTURE_OUT and starts the app on that test home. A missing fixture
+# or a failed provisioning fails the section: it never skips.
 # ATLAS_DUCK_M8_CI07=1 (the CI-07 step of e2e-bundle.yml, off until M10) adds the scripts-enabled
-# matrix step (ci/script-matrix-step.sh debug) and requires the provisioned mode.
+# matrix step (ci/script-matrix-step.sh debug).
 
 # m8_mounts: the AppImage mount points that are live now, one per line.
 m8_mounts() {
@@ -245,30 +246,21 @@ m8_inner() {
   fi
   echo "M8 CLI exited: script run returned with exit $code"
 
-  if [ "${ATLAS_DUCK_M8_PROVISIONED:-}" = 1 ]; then
-    [ "$code" -eq 4 ] || m4_fail "script run --timeout 0 exited $code, expected 4 (pending); stdout: $(cat "$work/run.json")"
-    status="$(m4_json_field "$work/run.json" status)" || m4_fail "script run printed no envelope: $(cat "$work/run.json")"
-    [ "$status" = pending ] || m4_fail "script run status is '$status', expected pending: $(cat "$work/run.json")"
-    id="$(m4_json_field "$work/run.json" request_id)" || m4_fail "script run has no request_id: $(cat "$work/run.json")"
-    # (3, 4) the scripted approver releases the run on its own (the reason is the directive);
-    # `await` from a fresh CLI process delivers it.
-    set +e
-    timeout 240 "$appimage" __cli await "$id" --timeout 180 >"$work/await.json" 2>"$work/await.err"
-    code=$?
-    set -e
-    [ "$code" -eq 0 ] || { cat "$work/await.json" "$work/await.err" >&2 || true; m4_fail "await $id exited $code, expected 0"; }
-    status="$(m4_json_field "$work/await.json" status)" || m4_fail "await printed no envelope: $(cat "$work/await.json")"
-    [ "$status" = released ] || m4_fail "await status is '$status', expected released: $(cat "$work/await.json")"
-    [ "$(m4_json_field "$work/await.json" data.result.n)" = 2 ] || m4_fail "await delivered another result than {n: 2}: $(cat "$work/await.json")"
-    echo "M8 script run: submitted pending, released by the scripted approver, await delivered released (exit 0)"
-  else
-    [ "$code" -eq 9 ] || m4_fail "script run on a first-run store exited $code, expected 9 (not_configured); stdout: $(cat "$work/run.json")"
-    grep -qF '"code":"not_configured"' "$work/run.json" || m4_fail "script run envelope lacks code not_configured: $(cat "$work/run.json")"
-    grep -qF 'first_run' "$work/run.json" || m4_fail "script run envelope lacks first_run: $(cat "$work/run.json")"
-    echo "M8 script run: exit 9 not_configured first_run (no provisioned store)"
-    echo "M8_SCRIPT_RUN=NOT_PROVEN reason=no_provisioned_store (set ATLAS_DUCK_M8_PROVISIONED=1 with a provisioned ATLAS_DUCK_M8_HOME)"
-    [ "${ATLAS_DUCK_M8_CI07:-}" != 1 ] || m4_fail "the CI-07 step needs a provisioned core (ATLAS_DUCK_M8_PROVISIONED=1)"
-  fi
+  [ "$code" -eq 4 ] || m4_fail "script run --timeout 0 exited $code, expected 4 (pending); stdout: $(cat "$work/run.json")"
+  status="$(m4_json_field "$work/run.json" status)" || m4_fail "script run printed no envelope: $(cat "$work/run.json")"
+  [ "$status" = pending ] || m4_fail "script run status is '$status', expected pending: $(cat "$work/run.json")"
+  id="$(m4_json_field "$work/run.json" request_id)" || m4_fail "script run has no request_id: $(cat "$work/run.json")"
+  # (3, 4) the scripted approver releases the run on its own (the reason is the directive);
+  # `await` from a fresh CLI process delivers it.
+  set +e
+  timeout 240 "$appimage" __cli await "$id" --timeout 180 >"$work/await.json" 2>"$work/await.err"
+  code=$?
+  set -e
+  [ "$code" -eq 0 ] || { cat "$work/await.json" "$work/await.err" >&2 || true; m4_fail "await $id exited $code, expected 0"; }
+  status="$(m4_json_field "$work/await.json" status)" || m4_fail "await printed no envelope: $(cat "$work/await.json")"
+  [ "$status" = released ] || m4_fail "await status is '$status', expected released: $(cat "$work/await.json")"
+  [ "$(m4_json_field "$work/await.json" data.result.n)" = 2 ] || m4_fail "await delivered another result than {n: 2}: $(cat "$work/await.json")"
+  echo "M8 script run: submitted pending, released by the scripted approver, await delivered released (exit 0)"
 
   # (5) the app is not under the CLI's mount.
   pid="$(pgrep -f -x -- "$appimage --background" | head -n 1 || true)"
@@ -298,7 +290,7 @@ m8_inner() {
 # appimage-smoke.sh --m8 <e2e-artifact-dir>: the M8 section alone, CI only, on the downloaded
 # bundle-linux-e2e artifact, with the packages of the M6 job (`appimage-m6` of e2e-bundle.yml).
 m8_outer() {
-  local e2e_dist work m8_dir m8_code self_path home keys
+  local e2e_dist work m8_dir m8_code self_path home keys fixture_src fixture_code
   e2e_dist="$(realpath "${1:?usage: appimage-smoke.sh --m8 <e2e-artifact-dir>}")"
   self_path="$(realpath "$0")"
   [ "${CI:-}" = true ] || m4_fail "the M8 AppImage section runs only with CI=true"
@@ -309,15 +301,28 @@ m8_outer() {
   work="$(mktemp -d)"
   trap "m6_save_diag \"$work\"; pkill -x atlas-duck-app || true; rm -rf \"$work\"" EXIT
   m8_dir="$work/m8"
-  mkdir -p "$m8_dir/home" "$m8_dir/keys" "$m8_dir/out"
+  mkdir -p "$m8_dir/out"
   cp "${e2e_images[0]}" "$m8_dir/atlas-duck-e2e.AppImage"
   chmod +x "$m8_dir/atlas-duck-e2e.AppImage"
-  home="$m8_dir/home"
-  keys="$m8_dir/keys"
-  if [ "${ATLAS_DUCK_M8_PROVISIONED:-}" = 1 ]; then
-    home="${ATLAS_DUCK_M8_HOME:?ATLAS_DUCK_M8_PROVISIONED=1 needs ATLAS_DUCK_M8_HOME}"
-    keys="${ATLAS_DUCK_M8_KEYSTORE:?ATLAS_DUCK_M8_PROVISIONED=1 needs ATLAS_DUCK_M8_KEYSTORE}"
-  fi
+  # The provisioned test home (a store with one Jira instance): the fixture test executable the
+  # bundle job built, run once under Xvfb. Bounded, and a missing file or a failure fails the section.
+  fixture_src="$e2e_dist/fixture/script_fixture"
+  [ -f "$fixture_src" ] || m4_fail "$fixture_src is missing (the bundle-linux-e2e job builds and ships it)"
+  cp "$fixture_src" "$m8_dir/script_fixture"
+  chmod +x "$m8_dir/script_fixture"
+  set +e
+  env ATLAS_DUCK_FIXTURE_OUT="$m8_dir/fixture.txt" \
+    timeout 240 xvfb-run -a dbus-run-session -- "$m8_dir/script_fixture" --ignored --exact provision_script_fixture --nocapture --test-threads=1 >"$m8_dir/fixture.log" 2>&1
+  fixture_code=$?
+  set -e
+  cat "$m8_dir/fixture.log"
+  [ "$fixture_code" -eq 0 ] || m4_fail "script_fixture exited $fixture_code"
+  grep -qE '^test result: ok\. 1 passed; 0 failed' "$m8_dir/fixture.log" || m4_fail "script_fixture did not run exactly once"
+  home="$(sed -n 's/^home=//p' "$m8_dir/fixture.txt" | head -n 1)"
+  keys="$(sed -n 's/^keys=//p' "$m8_dir/fixture.txt" | head -n 1)"
+  [ -n "$home" ] && [ -d "$home" ] || m4_fail "the fixture's home '$home' is not a directory"
+  [ -n "$keys" ] && [ -d "$keys" ] || m4_fail "the fixture's keystore '$keys' is not a directory"
+  trap "m6_save_diag \"$work\"; pkill -x atlas-duck-app || true; rm -rf \"$work\" \"$home\"" EXIT
   set +e
   env ATLAS_DUCK_TEST_HOME="$home" ATLAS_DUCK_TEST_KEYSTORE="$keys" \
     timeout 900 xvfb-run -a dbus-run-session -- bash "$self_path" --m8-inner "$m8_dir/atlas-duck-e2e.AppImage" "$(dirname "$self_path")" "$m8_dir/out"
