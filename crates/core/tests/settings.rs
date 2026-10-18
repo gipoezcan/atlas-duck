@@ -983,8 +983,8 @@ async fn invariants_enforced_in_settings() -> TestResult {
     // Raising the heap alone breaks it against the unchanged process limit (512 < 513 + 88).
     let r = apply(&s, vec![script_req(|r| r.heap_mb = Some(513))]).await?;
     assert_eq!(r.err(), Some(SettingsError::Invalid { key: "process_mb" }));
-    // Invariant 1 (PD-140, k = 8): heap_mb >= 8 x max_call_result_mb (default 16: 128).
-    let r = apply(&s, vec![script_req(|r| r.heap_mb = Some(127))]).await?;
+    // Invariant 1 (PD-140, k = 15, V16): heap_mb >= 15 x max_call_result_mb (default 16: 240).
+    let r = apply(&s, vec![script_req(|r| r.heap_mb = Some(239))]).await?;
     assert_eq!(r.err(), Some(SettingsError::Invalid { key: "heap_mb" }));
     // Nothing happened: no dialog, no record, no file key, the view unchanged.
     assert!(h.confirmer().texts().is_empty());
@@ -993,21 +993,21 @@ async fn invariants_enforced_in_settings() -> TestResult {
     assert_eq!(view(&s).await?.limits.script, ScriptLimits::default());
 
     // The boundaries are accepted, and the check is on the set the call leaves behind.
-    let v = apply(&s, vec![script_req(|r| r.heap_mb = Some(128))]).await??;
-    assert_eq!(v.limits.script.heap_mb, 128);
-    let v = apply(&s, vec![script_req(|r| r.process_mb = Some(216))]).await??;
-    assert_eq!(v.limits.script.process_mb, 216);
+    let v = apply(&s, vec![script_req(|r| r.heap_mb = Some(240))]).await??;
+    assert_eq!(v.limits.script.heap_mb, 240);
+    let v = apply(&s, vec![script_req(|r| r.process_mb = Some(328))]).await??;
+    assert_eq!(v.limits.script.process_mb, 328);
     let v = apply(
         &s,
         vec![script_req(|r| {
-            r.heap_mb = Some(64);
+            r.heap_mb = Some(120);
             r.max_call_result_mb = Some(8);
         })],
     )
     .await??;
     assert_eq!(
         (v.limits.script.heap_mb, v.limits.script.max_call_result_mb),
-        (64, 8)
+        (120, 8)
     );
     // Raising the call result back needs the heap to follow in the same call.
     let r = apply(&s, vec![script_req(|r| r.max_call_result_mb = Some(16))]).await?;

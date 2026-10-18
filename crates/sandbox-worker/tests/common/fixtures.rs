@@ -477,3 +477,332 @@ fn search_of(
     let count = issues.len();
     json!({ "startAt": 0, "maxResults": count, "total": count, "issues": issues })
 }
+
+// Confluence (M8 Task 33, V16 closure). A page is a list of blocks (headings, paragraphs with
+// links, lists, tables, macros, code, images) rendered as storage-format XHTML, the string
+// `body.storage.value` carries, or as the Markdown the host's conversion returns. Pages of about
+// 5,000 words are tens of KiB each; a search or page list holds many of them.
+
+/// One block of a page; `storage` and `markdown` render the same content.
+enum Block {
+    Heading(String),
+    Para {
+        text: String,
+        label: String,
+        id: usize,
+    },
+    Bullets(Vec<String>),
+    Numbered(Vec<String>),
+    Table(Vec<Vec<String>>),
+    Info(String),
+    Code(Vec<String>),
+    Image(usize),
+    Toc,
+}
+
+fn blocks(rng: &mut Rng, mix: TextMix, words: usize) -> Vec<Block> {
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    while used < words {
+        let roll = rng.below(100);
+        out.push(match roll {
+            0..=7 => {
+                let n = rng.between(2, 6);
+                used += n;
+                Block::Heading(text(rng, mix, n))
+            }
+            8..=47 => {
+                let n = rng.between(40, 120);
+                used += n + 4;
+                Block::Para {
+                    text: text(rng, mix, n),
+                    label: text(rng, mix, 2),
+                    id: rng.below(900_000),
+                }
+            }
+            48..=67 => {
+                let items: Vec<String> = (0..rng.between(3, 9))
+                    .map(|_| {
+                        let n = rng.between(4, 14);
+                        used += n;
+                        text(rng, mix, n)
+                    })
+                    .collect();
+                if roll < 60 {
+                    Block::Bullets(items)
+                } else {
+                    Block::Numbered(items)
+                }
+            }
+            68..=79 => {
+                let cols = rng.between(3, 5);
+                let rows = rng.between(3, 8);
+                Block::Table(
+                    (0..rows)
+                        .map(|_| {
+                            (0..cols)
+                                .map(|_| {
+                                    let n = rng.between(1, 8);
+                                    used += n;
+                                    text(rng, mix, n)
+                                })
+                                .collect()
+                        })
+                        .collect(),
+                )
+            }
+            80..=87 => {
+                let n = rng.between(15, 50);
+                used += n;
+                Block::Info(text(rng, mix, n))
+            }
+            88..=92 => {
+                // Code is ASCII whatever the mix.
+                let lines = (0..rng.between(3, 10))
+                    .map(|i| {
+                        format!(
+                            "String v{i} = service.call(\"{}\", {});",
+                            rng.pick(ASCII_WORDS),
+                            rng.below(1000)
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                used += lines.len() * 5;
+                Block::Code(lines)
+            }
+            93..=96 => Block::Image(rng.below(100)),
+            _ => Block::Toc,
+        });
+    }
+    out
+}
+
+/// A deterministic macro id (the shape Confluence writes: a UUID).
+fn macro_id(n: usize) -> String {
+    let n = n as u64;
+    format!(
+        "{:08x}-4e1c-4b7a-9d3f-{:012x}",
+        n * 2_654_435_761 % 0xffff_ffff,
+        n * 7919
+    )
+}
+
+impl Block {
+    fn storage(&self, n: usize) -> String {
+        match self {
+            Block::Heading(t) => format!("<h2>{t}</h2>"),
+            Block::Para { text, label, id } => format!(
+                "<p><strong>{label}</strong> {text} <a href=\"https://confluence.example.invalid/confluence/pages/viewpage.action?pageId={id}\">{label}</a> \
+                 <ac:link><ri:page ri:content-title=\"{label}\" ri:space-key=\"KB\" /><ac:plain-text-link-body><![CDATA[{label}]]></ac:plain-text-link-body></ac:link>.</p>"
+            ),
+            Block::Bullets(items) => list_storage("ul", items),
+            Block::Numbered(items) => list_storage("ol", items),
+            Block::Table(rows) => {
+                let cols = rows.first().map_or(0, Vec::len);
+                let mut s = String::from("<table data-layout=\"default\"><colgroup>");
+                s.push_str(&"<col />".repeat(cols));
+                s.push_str("</colgroup><tbody>");
+                for (i, row) in rows.iter().enumerate() {
+                    let tag = if i == 0 { "th" } else { "td" };
+                    s.push_str("<tr>");
+                    for cell in row {
+                        s.push_str(&format!("<{tag}><p>{cell}</p></{tag}>"));
+                    }
+                    s.push_str("</tr>");
+                }
+                s.push_str("</tbody></table>");
+                s
+            }
+            Block::Info(t) => format!(
+                "<ac:structured-macro ac:name=\"info\" ac:schema-version=\"1\" ac:macro-id=\"{}\"><ac:rich-text-body><p>{t}</p></ac:rich-text-body></ac:structured-macro>",
+                macro_id(n)
+            ),
+            Block::Code(lines) => format!(
+                "<ac:structured-macro ac:name=\"code\" ac:schema-version=\"1\" ac:macro-id=\"{}\"><ac:parameter ac:name=\"language\">java</ac:parameter><ac:plain-text-body><![CDATA[{}]]></ac:plain-text-body></ac:structured-macro>",
+                macro_id(n),
+                lines.join("\n")
+            ),
+            Block::Image(i) => format!(
+                "<p><ac:image ac:width=\"600\" ac:alt=\"diagram-{i}\"><ri:attachment ri:filename=\"diagram-{i}.png\" /></ac:image></p>"
+            ),
+            Block::Toc => format!(
+                "<p><ac:structured-macro ac:name=\"toc\" ac:schema-version=\"1\" ac:macro-id=\"{}\"><ac:parameter ac:name=\"maxLevel\">3</ac:parameter></ac:structured-macro></p>",
+                macro_id(n)
+            ),
+        }
+    }
+
+    fn markdown(&self) -> String {
+        match self {
+            Block::Heading(t) => format!("## {t}"),
+            Block::Para { text, label, id } => format!(
+                "**{label}** {text} [{label}](https://confluence.example.invalid/confluence/pages/viewpage.action?pageId={id}) [{label}](confluence:KB/{label})."
+            ),
+            Block::Bullets(items) => items
+                .iter()
+                .map(|i| format!("- {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Block::Numbered(items) => items
+                .iter()
+                .enumerate()
+                .map(|(i, t)| format!("{}. {t}", i + 1))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Block::Table(rows) => {
+                let cols = rows.first().map_or(0, Vec::len);
+                let mut lines = Vec::new();
+                for (i, row) in rows.iter().enumerate() {
+                    lines.push(format!("| {} |", row.join(" | ")));
+                    if i == 0 {
+                        lines.push(format!("|{}", " --- |".repeat(cols)));
+                    }
+                }
+                lines.join("\n")
+            }
+            Block::Info(t) => format!("> **Info:** {t}"),
+            Block::Code(lines) => format!("```java\n{}\n```", lines.join("\n")),
+            Block::Image(i) => format!("![diagram-{i}](attachments/diagram-{i}.png)"),
+            Block::Toc => "[TOC]".to_owned(),
+        }
+    }
+}
+
+fn list_storage(tag: &str, items: &[String]) -> String {
+    let inner: String = items
+        .iter()
+        .map(|i| format!("<li><p>{i}</p></li>"))
+        .collect();
+    format!("<{tag}>{inner}</{tag}>")
+}
+
+/// How a page's content is carried.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Form {
+    /// `body.storage.value`: what `confluence.page.get` returns for `body_format = storage`.
+    Storage,
+    /// The page after the host's storage-to-Markdown conversion.
+    Markdown,
+}
+
+fn confluence_user(rng: &mut Rng, mix: TextMix, n: usize) -> Value {
+    json!({
+        "type": "known",
+        "username": format!("user{n}"),
+        "userKey": format!("8a7f{:012x}", n),
+        "profilePicture": { "path": "/confluence/images/icons/profilepics/default.svg", "width": 48,
+                            "height": 48, "isDefault": true },
+        "displayName": text(rng, mix, 2),
+    })
+}
+
+/// One page: metadata of an expanded `content` object plus the body in `form`.
+fn confluence_page(rng: &mut Rng, mix: TextMix, n: usize, words: usize, form: Form) -> Value {
+    let id = (100_000 + n).to_string();
+    let page_blocks = blocks(rng, mix, words);
+    let body = match form {
+        Form::Storage => {
+            let value: String = page_blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| b.storage(i))
+                .collect();
+            json!({ "storage": { "value": value, "representation": "storage",
+                                 "_expandable": { "content": format!("/rest/api/content/{id}") } },
+                    "_expandable": { "editor": "", "view": "", "export_view": "", "styled_view": "" } })
+        }
+        Form::Markdown => {
+            let value = page_blocks
+                .iter()
+                .map(Block::markdown)
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            json!({ "markdown": value })
+        }
+    };
+    let labels: Vec<Value> = (0..rng.between(0, 4))
+        .map(|j| json!({ "prefix": "global", "name": rng.pick(ASCII_WORDS), "id": (5000 + j).to_string() }))
+        .collect();
+    let ancestors: Vec<Value> = (0..rng.between(1, 3))
+        .map(|j| {
+            json!({ "id": (90_000 + j).to_string(), "type": "page", "status": "current",
+                         "title": text(rng, mix, 3) })
+        })
+        .collect();
+    json!({
+        "id": id,
+        "type": "page",
+        "status": "current",
+        "title": text(rng, mix, 5),
+        "space": { "id": 65_538, "key": "KB", "name": text(rng, mix, 2), "type": "global",
+                   "status": "current", "_links": { "webui": "/spaces/KB" } },
+        "history": { "latest": true, "createdBy": confluence_user(rng, mix, n % 9),
+                     "createdDate": "2026-03-02T09:12:45.321+01:00" },
+        "version": { "by": confluence_user(rng, mix, (n + 1) % 9), "when": "2026-10-05T16:40:21.987+02:00",
+                     "message": text(rng, mix, 3), "number": 1 + n % 40, "minorEdit": false,
+                     "hidden": false },
+        "ancestors": ancestors,
+        "metadata": { "labels": { "results": labels, "size": 0, "start": 0, "limit": 200 } },
+        "body": body,
+        "_links": { "webui": format!("/spaces/KB/pages/{id}"), "tinyui": "/x/AbCdEf",
+                    "self": format!("https://confluence.example.invalid/confluence/rest/api/content/{id}"),
+                    "edit": format!("/pages/resumedraft.action?draftId={id}") },
+        "_expandable": { "container": "/rest/api/space/KB", "operations": "", "children": "",
+                         "restrictions": "", "descendants": "" },
+    })
+}
+
+/// A page list answer's envelope around `results`.
+fn confluence_envelope(results: Vec<Value>) -> Value {
+    let count = results.len();
+    json!({ "results": results, "start": 0, "limit": count, "size": count,
+            "_links": { "base": "https://confluence.example.invalid/confluence", "context": "/confluence",
+                        "self": "https://confluence.example.invalid/confluence/rest/api/content?limit=25" } })
+}
+
+/// The `page.get` answer of one page of about 5,000 words, storage body.
+pub fn confluence_page_get(seed: u64, mix: TextMix) -> Value {
+    let mut rng = Rng(seed ^ 0xc0_ffee ^ ((mix as u64) << 56));
+    confluence_page(&mut rng, mix, 0, 5000, Form::Storage)
+}
+
+/// A page list of `pages` pages of about 5,000 words each, storage bodies (25 for the plan's list).
+pub fn confluence_page_list(seed: u64, mix: TextMix, pages: usize) -> Value {
+    let mut rng = Rng(seed ^ 0xc0_ffee_1157 ^ ((mix as u64) << 56));
+    confluence_envelope(
+        (0..pages)
+            .map(|n| confluence_page(&mut rng, mix, n, 5000, Form::Storage))
+            .collect(),
+    )
+}
+
+/// A page list of storage-body pages whose JSON text is at most `target_bytes` long and within one
+/// page of it.
+pub fn confluence_storage_search(seed: u64, mix: TextMix, target_bytes: usize) -> Value {
+    confluence_sized(seed ^ 0x5702, mix, target_bytes, Form::Storage)
+}
+
+/// The same pages after conversion: the Markdown form, sized the same way.
+pub fn confluence_markdown_search(seed: u64, mix: TextMix, target_bytes: usize) -> Value {
+    confluence_sized(seed ^ 0x3d, mix, target_bytes, Form::Markdown)
+}
+
+fn confluence_sized(seed: u64, mix: TextMix, target_bytes: usize, form: Form) -> Value {
+    let mut rng = Rng(seed ^ ((mix as u64) << 56));
+    let envelope = confluence_envelope(Vec::new()).to_string().len();
+    let mut pages: Vec<Value> = Vec::new();
+    let mut body = 0usize;
+    loop {
+        let words = rng.between(4500, 5500);
+        let next = confluence_page(&mut rng, mix, pages.len(), words, form);
+        let next_len = next.to_string().len();
+        let comma = usize::from(!pages.is_empty());
+        // Digits of limit and size grow with the count; eight spare bytes cover them.
+        if envelope + 8 + body + comma + next_len > target_bytes {
+            break;
+        }
+        body += comma + next_len;
+        pages.push(next);
+    }
+    confluence_envelope(pages)
+}

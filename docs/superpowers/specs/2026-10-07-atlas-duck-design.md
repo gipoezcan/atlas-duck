@@ -992,7 +992,7 @@ return byAssignee;
 Defaults configurable in Settings. Agents may request **lower** values via `--limits`; unknown keys or values above the configured default → exit 2, nothing queued.
 
 **Memory invariants** (enforced in Settings and on agent `--limits`; violation → rejected in Settings, exit 2 for `--limits`). A JSON result expands several-fold when materialized as QuickJS objects, so:
-- `heap_mb ≥ k × max_call_result_mb`, with `k = 8` provisionally; M8 measures the real factor on Jira `*all` search and Confluence storage-body fixtures and fixes `k` (§14, §15);
+- `heap_mb ≥ k × max_call_result_mb`, with `k = 15`: M8 measured the real factor on Jira `*all` search and Confluence storage-body fixtures (largest peak factor 11.24, dense Jira issues) and fixed `k = ⌈1.25 × 11.24⌉` (§14, §15 V16; `docs/m8/script-sandbox-evidence.md`);
 - `process_mb ≥ heap_mb + 24 MiB (max host→worker frame) + 64 MiB margin`.
 
 Known gap: with `max_concurrent_calls = 4`, up to four call results can be live at once, while the first invariant covers one.

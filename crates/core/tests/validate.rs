@@ -606,9 +606,9 @@ fn script_submit_limits() -> TestResult {
         Some(&json!("agents may only lower limits"))
     );
 
-    // 128 = k (8) x the default `max_call_result_mb` (16): the lowest heap the invariant allows.
-    let lowered = validate_script_submit("1", &args, &json!({"heap_mb": 128}))?;
-    assert_eq!(lowered.heap_mb, 128);
+    // 240 = k (15) x the default `max_call_result_mb` (16): the lowest heap the invariant allows.
+    let lowered = validate_script_submit("1", &args, &json!({"heap_mb": 240}))?;
+    assert_eq!(lowered.heap_mb, 240);
     assert_eq!(lowered.timeout_s, 120);
 
     // At the default is "not above".
@@ -647,10 +647,10 @@ fn script_limits_process_must_hold_the_heap() -> TestResult {
     assert_eq!(param(&e), Some("limits.process_mb"));
     // Lowering heap together with process is fine; heap alone only helps.
     assert!(
-        validate_script_submit("1", &args, &json!({"heap_mb": 128, "process_mb": 216}))?.heap_mb
-            == 128
+        validate_script_submit("1", &args, &json!({"heap_mb": 240, "process_mb": 328}))?.heap_mb
+            == 240
     );
-    let e = validate_script_submit("1", &args, &json!({"heap_mb": 128, "process_mb": 215}))
+    let e = validate_script_submit("1", &args, &json!({"heap_mb": 240, "process_mb": 327}))
         .err()
         .ok_or("accepted")?;
     assert_eq!(param(&e), Some("limits.process_mb"));
@@ -688,14 +688,17 @@ fn limits_above_configured_default_rejected_exit2() -> TestResult {
 
 #[test]
 fn heap_k_invariant_on_limits_exit2() -> TestResult {
-    assert_eq!(SCRIPT_HEAP_K, 8, "provisional until M8 measures it");
+    assert_eq!(
+        SCRIPT_HEAP_K, 15,
+        "measured in M8 (V16), see the evidence file"
+    );
     let args = json!({});
     // heap_mb >= k x max_call_result_mb on the effective set (default call result: 16).
     assert_eq!(
-        validate_script_submit("1", &args, &json!({"heap_mb": 128}))?.heap_mb,
-        128
+        validate_script_submit("1", &args, &json!({"heap_mb": 240}))?.heap_mb,
+        240
     );
-    let e = validate_script_submit("1", &args, &json!({"heap_mb": 127}))
+    let e = validate_script_submit("1", &args, &json!({"heap_mb": 239}))
         .err()
         .ok_or("accepted")?;
     assert_eq!(e.code, ErrorCode::Validation);
@@ -703,25 +706,82 @@ fn heap_k_invariant_on_limits_exit2() -> TestResult {
     assert_eq!(
         e.details.get("message"),
         Some(&json!(
-            "heap_mb must be at least k × max_call_result_mb (k = 8)"
+            "heap_mb must be at least k × max_call_result_mb (k = 15)"
         ))
     );
     // Lowering the call result lowers the heap the run needs.
-    let ok = validate_script_submit("1", &args, &json!({"heap_mb": 64, "max_call_result_mb": 8}))?;
-    assert_eq!((ok.heap_mb, ok.max_call_result_mb), (64, 8));
-    let e = validate_script_submit("1", &args, &json!({"heap_mb": 63, "max_call_result_mb": 8}))
-        .err()
-        .ok_or("accepted")?;
+    let ok = validate_script_submit(
+        "1",
+        &args,
+        &json!({"heap_mb": 120, "max_call_result_mb": 8}),
+    )?;
+    assert_eq!((ok.heap_mb, ok.max_call_result_mb), (120, 8));
+    let e = validate_script_submit(
+        "1",
+        &args,
+        &json!({"heap_mb": 119, "max_call_result_mb": 8}),
+    )
+    .err()
+    .ok_or("accepted")?;
     assert_eq!(param(&e), Some("limits.heap_mb"));
     // Against a configured set: a raised call result is above the ceiling, a lowered one is not.
     let ceiling = ScriptLimits {
-        heap_mb: 64,
+        heap_mb: 120,
         max_call_result_mb: 8,
         ..ScriptLimits::default()
     };
     assert!(
         validate_script_submit_with("1", &args, &json!({"max_call_result_mb": 4}), &ceiling)
             .is_ok()
+    );
+    Ok(())
+}
+
+/// The constant is the value the evidence file's V16 section records, and that value follows the
+/// rule from the table next to it: `k = ceil(1.25 x max k_peak)` over every fixture row (plan M8
+/// Task 33, PD-140). New CI rows (16 MiB) in the table change the expected value.
+#[test]
+fn heap_k_constant_matches_evidence() -> TestResult {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/m8/script-sandbox-evidence.md"
+    );
+    let text = std::fs::read_to_string(path)?;
+    let recorded: u32 = text
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("SCRIPT_HEAP_K = ")?
+                .trim()
+                .parse()
+                .ok()
+        })
+        .ok_or("no `SCRIPT_HEAP_K = <n>` line in the evidence file")?;
+    assert_eq!(SCRIPT_HEAP_K, recorded);
+    // Table rows: `| fixture | bytes | heap_peak | k_peak | k_retained |`.
+    let mut rows = 0usize;
+    let mut max_peak = 0f64;
+    for line in text.lines() {
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        if cells.len() == 7
+            && (cells[1].starts_with("jira-") || cells[1].starts_with("confluence-"))
+        {
+            max_peak = max_peak.max(cells[4].parse::<f64>()?);
+            rows += 1;
+        }
+    }
+    // Both products, four mixes, 1 and 4 MiB, at least.
+    assert!(rows >= 40, "{rows} table rows");
+    assert_eq!(
+        (max_peak * 1.25).ceil() as u32,
+        recorded,
+        "max k_peak {max_peak}"
+    );
+    // The spec defaults (heap 256, call result 16) satisfy invariant 1 at this k (R13).
+    let defaults = ScriptLimits::default();
+    assert!(
+        u64::from(defaults.heap_mb)
+            >= u64::from(SCRIPT_HEAP_K) * u64::from(defaults.max_call_result_mb)
     );
     Ok(())
 }

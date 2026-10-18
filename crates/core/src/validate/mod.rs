@@ -36,10 +36,11 @@ pub const MAX_SCRIPT_ARGS_BYTES: usize = 1024 * 1024;
 /// §9.4: `process_mb >= heap_mb + 24 MiB (host frame) + 64 MiB margin`.
 const PROCESS_OVER_HEAP_MB: u64 = 88;
 
-/// §9.4 memory invariant 1: `heap_mb >= k x max_call_result_mb`. Provisional until M8 measures
-/// the real peak factor on Jira `*all` search and Confluence storage-body fixtures (Tasks 25, 33;
-/// PD-140). Task 33 replaces the constant with the measured value after the spec is amended.
-pub const SCRIPT_HEAP_K: u32 = 8;
+/// §9.4 memory invariant 1: `heap_mb >= k x max_call_result_mb`. Measured by M8 on Jira `*all`
+/// search and Confluence storage-body fixtures (Tasks 25, 33; PD-140, V16): `ceil(1.25 x` the
+/// largest `k_peak`, 11.24 on dense Jira issues). The evidence file's V16 section records the
+/// table and the same value (`heap_k_constant_matches_evidence`).
+pub const SCRIPT_HEAP_K: u32 = 15;
 
 /// At most this many characters of an agent string are echoed in an error.
 const ECHO_MAX_CHARS: usize = 64;
@@ -330,7 +331,7 @@ impl ScriptInvariant {
     pub fn message(self) -> &'static str {
         match self {
             Self::ProcessOverHeap => "process_mb must be at least heap_mb + 88",
-            Self::HeapOverCallResult => "heap_mb must be at least k × max_call_result_mb (k = 8)",
+            Self::HeapOverCallResult => "heap_mb must be at least k × max_call_result_mb (k = 15)",
         }
     }
 }

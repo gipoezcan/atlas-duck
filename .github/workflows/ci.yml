@@ -645,20 +645,25 @@ jobs:
       # `fields=*all` search answer, in process through Engine::deliver. The 1 and 4 MiB sizes
       # run in every cargo test; this step adds the ignored 16 MiB size (and the small ones again,
       # for their `K` lines) on the Linux leg only. The test asserts k_retained > 1 and k_peak - k_retained >= 0.5.
-      - name: M8 k measurement (Jira *all search, 1/4/16 MiB; §9.4 k, V16)
+      # M8 plan Task 33 added the Confluence storage-body and Markdown fixtures (every Confluence
+      # test also asserts k_peak <= the fixed k that docs/m8/script-sandbox-evidence.md records).
+      - name: M8 k measurement (Jira *all search, Confluence storage bodies, 1/4/16 MiB; §9.4 k, V16)
         if: runner.os == 'Linux'
         timeout-minutes: 20
         run: |
           set -euo pipefail
           cargo test -p atlas-duck-sandbox-worker --test k_factor --locked -- --include-ignored --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/k-factor.log"
-          # 2 shapes (all, dense) x 4 text mixes x 3 sizes: one `K` line each, the 16 MiB ones among
-          # them. libtest prints `test <name> ... ` before a test's own output, so a line may follow
-          # it on the same line.
-          [ "$(grep -cE '(^|[[:space:]])K fixture=jira-(all|dense)-[a-z]+ bytes=[0-9]+ heap_peak=[0-9]+ k_peak=[0-9.]+ k_retained=[0-9.]+$' "$RUNNER_TEMP/k-factor.log")" -ge 24 ] || { echo "::error::fewer than 24 K lines"; exit 1; }
-          grep -E '(^|[[:space:]])K fixture=jira-(all|dense)-[a-z]+ bytes=1[5-6][0-9]{6} ' "$RUNNER_TEMP/k-factor.log" || { echo "::error::no 16 MiB K line"; exit 1; }
-          grep -E '^test result: ok\. 7 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/k-factor.log" || { echo "::error::k_factor did not run all seven tests"; exit 1; }
+          # Jira: 2 shapes (all, dense) x 4 text mixes x 3 sizes = 24 `K` lines, the 16 MiB ones
+          # among them. Confluence: (storage, markdown) x 4 mixes x 3 sizes, plus one page and a
+          # 25-page list per mix at the small sizes = 32. libtest prints `test <name> ... ` before
+          # a test's own output, so a line may follow it on the same line.
+          [ "$(grep -cE '(^|[[:space:]])K fixture=jira-(all|dense)-[a-z]+ bytes=[0-9]+ heap_peak=[0-9]+ k_peak=[0-9.]+ k_retained=[0-9.]+$' "$RUNNER_TEMP/k-factor.log")" -ge 24 ] || { echo "::error::fewer than 24 Jira K lines"; exit 1; }
+          [ "$(grep -cE '(^|[[:space:]])K fixture=confluence-(page|list25|storage|markdown)-[a-z]+ bytes=[0-9]+ heap_peak=[0-9]+ k_peak=[0-9.]+ k_retained=[0-9.]+$' "$RUNNER_TEMP/k-factor.log")" -ge 32 ] || { echo "::error::fewer than 32 Confluence K lines"; exit 1; }
+          grep -E '(^|[[:space:]])K fixture=jira-(all|dense)-[a-z]+ bytes=1[5-6][0-9]{6} ' "$RUNNER_TEMP/k-factor.log" || { echo "::error::no 16 MiB Jira K line"; exit 1; }
+          grep -E '(^|[[:space:]])K fixture=confluence-(storage|markdown)-[a-z]+ bytes=1[5-6][0-9]{6} ' "$RUNNER_TEMP/k-factor.log" || { echo "::error::no 16 MiB Confluence K line"; exit 1; }
+          grep -E '^test result: ok\. 10 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/k-factor.log" || { echo "::error::k_factor did not run all ten tests"; exit 1; }
           {
-            echo '### M8 k measurement (Jira *all search)'
+            echo '### M8 k measurement (Jira *all search, Confluence storage bodies)'
             echo '```'
             grep -oE 'K fixture=.*' "$RUNNER_TEMP/k-factor.log" || true
             echo '```'

@@ -1,4 +1,6 @@
-//! Heap expansion factor `k`, Jira half (plan M8 Task 25; spec §9.4 `k`, §15 V16; PD-131, PD-140).
+//! Heap expansion factor `k`, Jira half (plan M8 Task 25; spec §9.4 `k`, §15 V16; PD-131, PD-140)
+//! and Confluence half (Task 33: storage bodies and their Markdown form; each Confluence run also
+//! asserts `k_peak` is within the fixed `k` of `docs/m8/script-sandbox-evidence.md`).
 //!
 //! In process, through the real `Engine::deliver` path: a run makes one `atlas.all` call and holds
 //! the answer; the host's frame text (the whole of it is a QuickJS string while `JSON.parse`
@@ -19,7 +21,10 @@ use std::io;
 use atlas_duck_ipc::sandbox::script::{InstanceInfo, WorkerInit, encode_response};
 use atlas_duck_ipc::sandbox::{HostCall, HostCallResult, ScriptLimits};
 use atlas_duck_sandbox_worker::script::{Engine, HostPort, Settled};
-use fixtures::{MIB, TextMix, jira_dense_search, jira_star_all_search};
+use fixtures::{
+    MIB, TextMix, confluence_markdown_search, confluence_page_get, confluence_page_list,
+    confluence_storage_search, jira_dense_search, jira_star_all_search,
+};
 use serde_json::{Value, json};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -91,12 +96,29 @@ fn k_line(m: &Measured) -> String {
 const HOLD: &str = "globalThis.held = await atlas.all('jira.search', { jql: 'project = KFAC', fields: ['*all'] });\n\
                     return 1;";
 
+/// The Confluence runs: a page list through `atlas.all`, one page through `atlas.call`.
+const HOLD_CONFLUENCE_ALL: &str = "globalThis.held = await atlas.all('confluence.search', { cql: 'space = KB' });\n\
+                                   return 1;";
+const HOLD_CONFLUENCE_PAGE: &str = "globalThis.held = await atlas.call('confluence.page.get', { id: '100000', body_format: 'storage' });\n\
+                                    return 1;";
+
 /// Delivers `value` as the answer of the run's one `atlas.all` call and measures the heap.
 fn measure(fixture: &str, value: &Value) -> Result<Measured, String> {
+    measure_run(fixture, value, HOLD, "jira.search", "jira")
+}
+
+/// The same for a run that makes one call of `op` (id 1) on a `product` instance.
+fn measure_run(
+    fixture: &str,
+    value: &Value,
+    source: &str,
+    op: &str,
+    product: &str,
+) -> Result<Measured, String> {
     let bytes = serde_json::to_string(value).map_err(e)?.len();
     let frame =
         String::from_utf8(encode_response(1, &HostCallResult::Ok(value.clone()))).map_err(e)?;
-    let mut engine = Engine::new(&init(HOLD), NullHost).map_err(e)?;
+    let mut engine = Engine::new(&init(source, op, product), NullHost).map_err(e)?;
     engine.start().map_err(e)?;
     match engine.drain_jobs() {
         Settled::Pending { outstanding: 1 } => {}
@@ -122,7 +144,7 @@ fn measure(fixture: &str, value: &Value) -> Result<Measured, String> {
     })
 }
 
-fn init(source: &str) -> WorkerInit {
+fn init(source: &str, op: &str, product: &str) -> WorkerInit {
     WorkerInit {
         source: source.to_owned(),
         args: json!({}),
@@ -131,10 +153,10 @@ fn init(source: &str) -> WorkerInit {
             heap_mb: 4096,
             ..ScriptLimits::default()
         },
-        read_op_ids: vec!["jira.search".to_owned()],
+        read_op_ids: vec![op.to_owned()],
         instances: vec![InstanceInfo {
             alias: "prod".to_owned(),
-            product: "jira".to_owned(),
+            product: product.to_owned(),
             is_default: true,
         }],
     }
@@ -297,6 +319,169 @@ fn k_dense_fixture_is_dense_and_sized() {
         text,
         serde_json::to_string(&jira_dense_search(7, TextMix::Mixed, target)).unwrap_or_default()
     );
+}
+
+/// The fixed `k` the evidence file's V16 section records (`SCRIPT_HEAP_K = <n>`; plan M8 Task 33).
+fn evidence_k() -> Result<f64, String> {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/m8/script-sandbox-evidence.md"
+    );
+    let text = std::fs::read_to_string(path).map_err(|err| format!("{path}: {err}"))?;
+    text.lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("SCRIPT_HEAP_K = ")?
+                .trim()
+                .parse()
+                .ok()
+        })
+        .ok_or_else(|| format!("{path}: no `SCRIPT_HEAP_K = <n>` line"))
+}
+
+/// Prints the `K` line and refuses a measurement whose peak lacks the host frame or exceeds `k`.
+fn report(m: &Measured, k: f64) -> Result<(), String> {
+    println!("{}", k_line(m));
+    if !whole_frame_live(m) {
+        return Err(k_line(m));
+    }
+    if m.k_peak() > k {
+        return Err(format!("above the fixed k = {k}: {}", k_line(m)));
+    }
+    Ok(())
+}
+
+/// The Confluence fixtures: with `singles`, one 5,000-word `page.get` answer and a list of 25
+/// such pages; at every size in `mibs`, a page list of storage bodies and the same pages as
+/// Markdown after conversion, in every text mix. Every peak must be within the fixed `k`.
+fn run_confluence(mibs: &'static [usize], singles: bool) -> TestResult {
+    let k = evidence_k()?;
+    big_stack(move || {
+        for mix in TextMix::ALL {
+            let name = |shape: &str| format!("confluence-{shape}-{}", mix.name());
+            if singles {
+                let page = confluence_page_get(0x5eed, mix);
+                let m = measure_run(
+                    &name("page"),
+                    &page,
+                    HOLD_CONFLUENCE_PAGE,
+                    "confluence.page.get",
+                    "confluence",
+                )?;
+                report(&m, k)?;
+                let list = confluence_page_list(0x5eed, mix, 25);
+                let m = measure_run(
+                    &name("list25"),
+                    &list,
+                    HOLD_CONFLUENCE_ALL,
+                    "confluence.search",
+                    "confluence",
+                )?;
+                report(&m, k)?;
+            }
+            for &mib in mibs {
+                for (shape, make) in [
+                    (
+                        "storage",
+                        confluence_storage_search as fn(u64, TextMix, usize) -> Value,
+                    ),
+                    ("markdown", confluence_markdown_search),
+                ] {
+                    let value = make(0x5eed, mix, mib * MIB);
+                    let m = measure_run(
+                        &name(shape),
+                        &value,
+                        HOLD_CONFLUENCE_ALL,
+                        "confluence.search",
+                        "confluence",
+                    )?;
+                    report(&m, k)?;
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn k_confluence_storage_body_1_and_4_mib() -> TestResult {
+    run_confluence(&[1, 4], true)
+}
+
+#[test]
+#[ignore = "CI step M8 k measurement"]
+fn k_confluence_storage_body_16_mib() -> TestResult {
+    run_confluence(&[16], false)
+}
+
+#[test]
+fn k_confluence_fixture_shapes() {
+    let target = MIB;
+    let storage = confluence_storage_search(7, TextMix::Mixed, target);
+    let text = serde_json::to_string(&storage).unwrap_or_default();
+    assert!(
+        text.len() <= target && text.len() > target - 128 * 1024,
+        "{}",
+        text.len()
+    );
+    let page = &storage["results"][0];
+    let body = page["body"]["storage"]["value"]
+        .as_str()
+        .unwrap_or_default();
+    // A ~5,000-word page with the markup the converter sees: macros, tables, lists, links.
+    let words = body.split_whitespace().count();
+    assert!((4500..=9000).contains(&words), "{words}");
+    for marker in [
+        "<h2>",
+        "<ac:structured-macro ac:name=\"info\"",
+        "<ac:structured-macro ac:name=\"code\"",
+        "<table",
+        "<ul>",
+        "<ol>",
+        "<a href=\"https://",
+        "<ac:link>",
+        "<ri:attachment",
+    ] {
+        assert!(
+            storage["results"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|p| p["body"]["storage"]["value"]
+                    .as_str()
+                    .is_some_and(|b| b.contains(marker))),
+            "no {marker}"
+        );
+    }
+    assert_eq!(
+        storage["results"].as_array().map(Vec::len),
+        storage["size"].as_u64().map(|n| n as usize)
+    );
+    // Non-Latin-1 text (CJK, a surrogate pair, umlauts) and determinism; the ASCII mix is ASCII.
+    assert!(text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)));
+    assert!(text.chars().any(|c| c > '\u{ffff}'));
+    assert!(text.chars().any(|c| matches!(c, 'ä' | 'ö' | 'ü')));
+    assert_eq!(
+        text,
+        serde_json::to_string(&confluence_storage_search(7, TextMix::Mixed, target))
+            .unwrap_or_default()
+    );
+    let ascii = serde_json::to_string(&confluence_storage_search(7, TextMix::Ascii, target))
+        .unwrap_or_default();
+    assert!(ascii.is_ascii());
+    // The Markdown form carries the same kind of content without the XHTML.
+    let md = confluence_markdown_search(7, TextMix::Mixed, target);
+    let md_text = md["results"][0]["body"]["markdown"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(md_text.contains("## ") && md_text.contains("| --- |") && md_text.contains("```java"));
+    assert!(!md_text.contains("<ac:"));
+    // One page and the plan's list of 25 pages, each of about 5,000 words.
+    let one = confluence_page_get(7, TextMix::Mixed);
+    assert!(one["body"]["storage"]["value"].is_string());
+    let list = confluence_page_list(7, TextMix::Mixed, 25);
+    assert_eq!(list["results"].as_array().map(Vec::len), Some(25));
+    assert_eq!(list["size"], json!(25));
 }
 
 /// The whole-frame assertion bites: a measurement whose peak is only what stays (a delivery that
