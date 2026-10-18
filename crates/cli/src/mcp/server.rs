@@ -22,6 +22,7 @@ use serde_json::{Map, Value};
 
 use super::config::{McpConfig, ToolSet};
 use super::result::{ToolKind, to_tool_result};
+use super::session::Session;
 use super::tools::{CALL_TOOL, FIXED_TOOLS, catalog, op_for_tool, validate_fixed_args};
 use crate::argv::clip;
 use crate::connected::Connector;
@@ -38,13 +39,15 @@ const MSG_NOT_YET: &str = "this tool is not available in this build yet";
 pub(crate) type SendFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// What the server holds for every tool call.
-// `connector` and `heartbeat_every` are read by the session and the tool bodies (Tasks 7-9).
+// `connector`, `heartbeat_every` and `session` are read by the tool bodies (Tasks 8-9).
 #[allow(dead_code)]
 pub(crate) struct Shared {
     pub cfg: McpConfig,
     pub connector: Arc<dyn Connector>,
     /// `HEARTBEAT_EVERY` in production.
     pub heartbeat_every: Duration,
+    /// The one IPC connection of this server (PD-115, PD-128).
+    pub session: Session,
 }
 
 /// One connected tool call, its arguments already checked (fixed tools and `call`: PD-118).
@@ -111,6 +114,7 @@ impl AtlasMcp {
     ) -> AtlasMcp {
         AtlasMcp {
             shared: Arc::new(Shared {
+                session: Session::new(&cfg, connector.clone()),
                 cfg,
                 connector,
                 heartbeat_every,

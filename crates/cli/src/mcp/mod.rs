@@ -8,6 +8,7 @@
 pub(crate) mod config;
 pub(crate) mod result;
 pub(crate) mod server;
+pub(crate) mod session;
 pub(crate) mod tools;
 
 #[cfg(test)]

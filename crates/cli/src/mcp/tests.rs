@@ -10,24 +10,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use atlas_duck_ipc::build_info::APP_VERSION;
-use atlas_duck_ipc::client::{ClientError, ConnectError};
+use atlas_duck_ipc::client::{ClientError, ConnectError, SharedClient};
 use atlas_duck_ipc::envelope::{Envelope, ErrorCode, Status};
 use atlas_duck_ipc::proto::{
-    AwaitParams, ClientKind, ProgressNotification, SubmitParams, SubmitReply,
+    AgentNameSource, AwaitParams, ClientKind, ProgressNotification, SubmitParams, SubmitReply,
 };
 use atlas_duck_ipc::rpc::{IdParams, method};
 use rmcp::ServiceError;
 use rmcp::model::{ErrorCode as McpErrorCode, ProtocolVersion, RequestMetaObject};
-use serde_json::{Map, Value, json};
-
 use rmcp::service::ClientLifecycleMode;
+use serde_json::{Map, Value, json};
 
 use super::config::{McpConfig, ToolSet};
 use super::rig::{RIG_BUILD, RIG_HEARTBEAT, Rig, RigApp, RigOpts};
 use super::server::{AtlasMcp, SendFuture, Shared, ToolBodies, ToolCall};
+use super::session::{Session, hello_of};
 use super::tools::catalog;
 use super::{run_on, run_on_with, serve_with};
-use crate::connected::Connector;
+use crate::connected::{Connector, cwd_basename};
+use crate::deadline::Deadline;
 use crate::local;
 use crate::test_support::{AwaitScript, HelloMode, Kind, REQ_ID, TestConnector, WAIT};
 
@@ -760,5 +761,342 @@ async fn rig_restart_server_repoints_connector() -> TestResult {
     app.drop_connections().await;
     assert_eq!(app.fake.build(), "2.0.0+x");
     let _again = app.ipc_client().await?;
+    Ok(())
+}
+
+// ---------- the session (Task 7): `Session::client` against the rig's app ----------
+
+fn deadline_in(limit: Duration) -> Deadline {
+    Deadline::new(Instant::now(), Some(limit))
+}
+
+fn session_of(app: &RigApp, cfg: &McpConfig) -> Arc<Session> {
+    let connector: Arc<dyn Connector> = app.connector.clone();
+    Arc::new(Session::new(cfg, connector))
+}
+
+/// `Session::client` within `WAIT`, its refusal as a test error.
+async fn connect(session: &Session, client_name: Option<&str>) -> Result<SharedClient, String> {
+    session
+        .client(&deadline_in(WAIT), client_name)
+        .await
+        .map_err(|env| format!("refused: {env:?}"))
+}
+
+/// One `request.status` over `client`.
+async fn status_over(client: &SharedClient) -> Result<Envelope, String> {
+    let params = IdParams {
+        request_id: REQ_ID.to_owned(),
+    };
+    let sent = client
+        .call::<Envelope>(method::REQUEST_STATUS, params, Some(Instant::now() + WAIT))
+        .await;
+    sent.result.map_err(|e| format!("request.status: {e:?}"))
+}
+
+/// Polls until `client` reports its connection closed (the reader sees the EOF on its own
+/// schedule); fails the test after `WAIT`.
+async fn wait_closed(client: &SharedClient) {
+    let until = Instant::now() + WAIT;
+    while !client.is_closed() {
+        assert!(Instant::now() < until, "the old connection never closed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn reason_of(env: &Envelope) -> Option<String> {
+    let env = serde_json::to_value(env).ok()?;
+    detail(&env, "reason")?.as_str().map(str::to_owned)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hello_is_mcp_with_client_info_name() -> TestResult {
+    let app = RigApp::new(RigOpts::default().fake, true);
+    let session = session_of(&app, &RigOpts::default().config());
+    connect(&session, Some("desk")).await?;
+    let seen = app.fake.hellos();
+    assert_eq!(seen.len(), 1);
+    let hello = &seen.first().ok_or("no hello")?.hello;
+    assert_eq!(hello.client_kind, ClientKind::Mcp);
+    assert_eq!(hello.agent_name.as_deref(), Some("desk"));
+    assert_eq!(hello.agent_name_source, AgentNameSource::McpClientInfo);
+    assert_eq!(hello.cwd_basename, cwd_basename());
+    Ok(())
+}
+
+/// The configuration argv and `ATLAS_DUCK_AGENT` make for `args`.
+fn mcp_config(args: &[&str], env_agent: Option<&str>) -> McpConfig {
+    let args: Vec<std::ffi::OsString> = args.iter().map(Into::into).collect();
+    let env = |k: &str| {
+        (k == "ATLAS_DUCK_AGENT")
+            .then(|| env_agent.map(std::ffi::OsString::from))
+            .flatten()
+    };
+    let parsed = crate::argv::parse(
+        &args,
+        &env,
+        &mut crate::input::Inputs::new(std::io::empty()),
+    );
+    let (opts, cmd) = parsed.unwrap_or_else(|e| panic!("{args:?}: {}", e.message));
+    let crate::argv::Command::Mcp {
+        tools,
+        instance,
+        agent_given,
+    } = cmd
+    else {
+        panic!("{args:?}: not mcp: {cmd:?}");
+    };
+    McpConfig::from_env(&opts, tools, instance, agent_given, &env)
+        .unwrap_or_else(|e| panic!("{args:?}: {}", e.message))
+}
+
+/// PD-122 / L158: `--agent` > `ATLAS_DUCK_AGENT` > `clientInfo.name` > none; `--agent ""` is no
+/// agent at all (neither the environment nor `clientInfo` fills it); an empty
+/// `ATLAS_DUCK_AGENT` or `clientInfo.name` counts as absent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_flag_and_env_override_client_info() -> TestResult {
+    use AgentNameSource as Src;
+    // `ATLAS_DUCK_AGENT=e`; `clientInfo.name` "desk".
+    const E: Option<&str> = Some("e");
+    const D: Option<&str> = Some("desk");
+    // (argv, ATLAS_DUCK_AGENT, clientInfo.name) -> (agent name, its source)
+    type Row<'a> = (
+        &'a [&'a str],
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a str>,
+        Src,
+    );
+    let table: [Row; 9] = [
+        (&["mcp", "--agent", "a"], E, D, Some("a"), Src::Flag),
+        (&["mcp", "--agent", "a"], None, None, Some("a"), Src::Flag),
+        (&["mcp"], E, D, Some("e"), Src::Env),
+        (&["mcp", "--agent", ""], E, D, None, Src::None),
+        (&["mcp", "--agent="], None, D, None, Src::None),
+        (&["mcp"], Some(""), D, D, Src::McpClientInfo),
+        (&["mcp"], None, D, D, Src::McpClientInfo),
+        (&["mcp"], None, Some(""), None, Src::None),
+        (&["mcp"], None, None, None, Src::None),
+    ];
+    for (args, env, client, name, source) in table {
+        let hello = hello_of(&mcp_config(args, env), client);
+        let row = format!("{args:?} env={env:?} clientInfo={client:?}");
+        assert_eq!(hello.client_kind, ClientKind::Mcp, "{row}");
+        assert_eq!(hello.agent_name.as_deref(), name, "{row}");
+        assert_eq!(hello.agent_name_source, source, "{row}");
+    }
+
+    // The `--agent ""` row end to end: the app's hello carries no agent.
+    let app = RigApp::new(RigOpts::default().fake, true);
+    let session = session_of(&app, &mcp_config(&["mcp", "--agent", ""], Some("e")));
+    connect(&session, Some("desk")).await?;
+    let seen = app.fake.hellos();
+    let hello = &seen.first().ok_or("no hello")?.hello;
+    assert_eq!(hello.agent_name, None);
+    assert_eq!(hello.agent_name_source, Src::None);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_connects_lazily() -> TestResult {
+    let app = RigApp::new(RigOpts::default().fake, true);
+    let session = session_of(&app, &RigOpts::default().config());
+    assert_eq!(app.connector.discover_count(), 0);
+    assert_eq!(app.connector.connect_count(), 0);
+    assert!(app.fake.hellos().is_empty());
+
+    let first = connect(&session, None).await?;
+    let second = connect(&session, None).await?;
+    assert_eq!(app.connector.connect_count(), 1);
+    assert_eq!(app.fake.hellos().len(), 1);
+    status_over(&first).await?;
+    status_over(&second).await?;
+    assert_eq!(app.fake.count(Kind::Status), 2);
+    assert_eq!(app.fake.hellos().len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_session_clients_share_one_connection() -> TestResult {
+    let app = RigApp::new(RigOpts::default().fake, true);
+    let session = session_of(&app, &RigOpts::default().config());
+    let calls: Vec<_> = (0..8)
+        .map(|_| {
+            let session = session.clone();
+            tokio::spawn(async move {
+                let client = connect(&session, Some("desk")).await?;
+                status_over(&client).await
+            })
+        })
+        .collect();
+    for call in calls {
+        let env = tokio::time::timeout(WAIT, call).await???;
+        assert_eq!(env.status, Status::Succeeded);
+    }
+    assert_eq!(app.fake.count(Kind::Status), 8);
+    assert_eq!(app.fake.hellos().len(), 1, "one hello, one connection_id");
+    assert_eq!(app.connector.connect_count(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_flight_reconnect() -> TestResult {
+    let app = RigApp::new(RigOpts::default().fake, true);
+    let session = session_of(&app, &RigOpts::default().config());
+    let old = connect(&session, None).await?;
+    // An app restart (same build) closes the connection.
+    app.drop_connections().await;
+    wait_closed(&old).await;
+
+    let calls: Vec<_> = (0..5)
+        .map(|_| {
+            let session = session.clone();
+            tokio::spawn(async move {
+                let client = connect(&session, None).await?;
+                status_over(&client).await?;
+                Ok::<SharedClient, String>(client)
+            })
+        })
+        .collect();
+    for call in calls {
+        let client = tokio::time::timeout(WAIT, call).await???;
+        assert!(!client.is_closed());
+    }
+    let seen = app.fake.hellos();
+    assert_eq!(seen.len(), 2, "exactly one new hello");
+    assert_eq!(app.connector.connect_count(), 2);
+    let ids: Vec<&str> = seen.iter().map(|h| h.connection_id.as_str()).collect();
+    assert_ne!(ids.first(), ids.get(1));
+    assert!(old.is_closed());
+    Ok(())
+}
+
+/// R1: `mark_closed` never drops an open connection, also when a call that held the old client
+/// reports its loss after another call already reconnected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mark_closed_never_drops_a_live_connection() -> TestResult {
+    let app = RigApp::new(RigOpts::default().fake, true);
+    let session = session_of(&app, &RigOpts::default().config());
+    let first = connect(&session, None).await?;
+    session.mark_closed();
+    connect(&session, None).await?;
+    assert_eq!(app.fake.hellos().len(), 1, "marked closed while open");
+
+    app.drop_connections().await;
+    wait_closed(&first).await;
+    connect(&session, None).await?;
+    assert_eq!(app.fake.hellos().len(), 2);
+    // A late report about `first`.
+    session.mark_closed();
+    let still = connect(&session, None).await?;
+    status_over(&still).await?;
+    assert_eq!(app.fake.hellos().len(), 2, "a stale report reconnected");
+    assert_eq!(app.connector.connect_count(), 2);
+    Ok(())
+}
+
+/// PD-128: a failed attempt answers that call only and caches nothing; the next call retries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_reach_leaves_state_unchanged() -> TestResult {
+    let app = RigApp::new(RigOpts::default().fake, true);
+    let session = session_of(&app, &RigOpts::default().config());
+    app.fake.set_hello_mode(HelloMode::Refuse(reason_envelope(
+        ErrorCode::Unreachable,
+        "app_shutting_down",
+    )));
+    let refused = connect(&session, None).await.err().ok_or("connected")?;
+    assert!(refused.contains("app_shutting_down"), "{refused}");
+    let refused = session
+        .client(&deadline_in(WAIT), None)
+        .await
+        .err()
+        .ok_or("connected")?;
+    assert_eq!(reason_of(&refused).as_deref(), Some("app_shutting_down"));
+    app.fake.set_hello_mode(HelloMode::Exact);
+    let client = connect(&session, None).await?;
+    status_over(&client).await?;
+    assert_eq!(app.fake.hellos().len(), 3);
+
+    // From a closed connection: the app comes back as another build (refused), then as this
+    // server's build again.
+    app.restart_server("2.0.0+x").await;
+    wait_closed(&client).await;
+    let mismatch = session
+        .client(&deadline_in(WAIT), None)
+        .await
+        .err()
+        .ok_or("connected to another build")?;
+    let mismatch = serde_json::to_value(&mismatch)?;
+    assert_eq!(code(&mismatch), Some("protocol_mismatch"));
+    assert_eq!(detail(&mismatch, "server_build"), Some(&json!("2.0.0+x")));
+    app.restart_server(RIG_BUILD).await;
+    let back = connect(&session, None).await?;
+    status_over(&back).await?;
+    assert_eq!(app.fake.hellos().len(), 5);
+    Ok(())
+}
+
+/// The launch poll inside `client` stops at the caller's deadline (real clock).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_reach_capped_by_deadline() -> TestResult {
+    let app = RigApp::new(RigOpts::default().fake, false);
+    let session = session_of(&app, &RigOpts::default().config());
+    let start = Instant::now();
+    let refused = session
+        .client(&deadline_in(Duration::from_secs(1)), None)
+        .await
+        .err()
+        .ok_or("connected without an app")?;
+    let took = start.elapsed();
+    assert_eq!(reason_of(&refused).as_deref(), Some("launch_timeout"));
+    // The poll ran (no instant `app_not_found`) and ended at the deadline.
+    assert!(took >= Duration::from_millis(900), "{took:?}");
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    assert!(app.connector.discover_count() >= 1);
+    assert_eq!(app.connector.connect_count(), 0);
+    Ok(())
+}
+
+/// A call that waits for another call's attempt is bounded by its own deadline: it answers
+/// `launch_timeout` with nothing queued while the other attempt is still polling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn waiting_for_another_reach_is_bounded_by_own_deadline() -> TestResult {
+    let app = RigApp::new(RigOpts::default().fake, false);
+    let session = session_of(&app, &RigOpts::default().config());
+    let first = {
+        let session = session.clone();
+        tokio::spawn(async move {
+            session
+                .client(&deadline_in(Duration::from_secs(3)), None)
+                .await
+                .err()
+        })
+    };
+    // The first call holds the attempt (its launch poll runs).
+    let until = Instant::now() + WAIT;
+    while app.connector.discover_count() == 0 {
+        assert!(Instant::now() < until, "the first attempt never started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let start = Instant::now();
+    let refused = session
+        .client(&deadline_in(Duration::from_millis(500)), None)
+        .await
+        .err()
+        .ok_or("connected without an app")?;
+    let took = start.elapsed();
+    assert_eq!(reason_of(&refused).as_deref(), Some("launch_timeout"));
+    assert!(took < Duration::from_millis(1500), "{took:?}");
+    assert!(!first.is_finished(), "the first attempt ended early");
+    assert_eq!(
+        app.connector.discover_count(),
+        1,
+        "the waiter made its own attempt"
+    );
+    let first = tokio::time::timeout(WAIT, first).await??;
+    assert_eq!(
+        first.as_ref().and_then(reason_of).as_deref(),
+        Some("launch_timeout")
+    );
     Ok(())
 }

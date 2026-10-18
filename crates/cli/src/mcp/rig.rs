@@ -38,6 +38,7 @@ use super::config::{McpConfig, ToolSet};
 use super::serve_with;
 use super::server::{AtlasMcp, ToolBodies};
 use crate::connected::Connector;
+use crate::discover::AppLocation;
 use crate::test_support::{
     Fake, HelloMode, Mode, Running, TestConnector, WAIT, local, location_named, serve_at,
 };
@@ -137,6 +138,11 @@ impl RigApp {
         let running = serve_at(&fake, &data, location.clone());
         let mut connector = TestConnector::new(data.clone(), Mode::Server(location));
         connector.present = present;
+        if !present {
+            // An app file to launch, so reaching the app runs the launch poll (the double never
+            // spawns anything) instead of answering `app_not_found`.
+            connector.discovery.app = AppLocation::Found(tmp.path().join("atlas-duck-app"));
+        }
         connector.set_hello_build(RIG_BUILD);
         RigApp {
             fake,

@@ -186,17 +186,21 @@ fn bound(deadline: &Deadline) -> Instant {
 
 /// The CLI's `hello` (the MCP server builds its own).
 pub(crate) fn hello_for(opts: &GlobalOpts) -> Hello {
-    let cwd_basename = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_default();
     Hello {
         build_id: BUILD_ID.to_owned(),
         client_kind: ClientKind::Cli,
         agent_name: opts.agent.clone(),
         agent_name_source: opts.agent_source,
-        cwd_basename,
+        cwd_basename: cwd_basename(),
     }
+}
+
+/// The last component of the process's working directory (empty when it has none).
+pub(crate) fn cwd_basename() -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_default()
 }
 
 /// Runs a connected command and returns the envelope to print.
