@@ -162,8 +162,8 @@ Evidence lines (printed by `confined_scripts`, Task 5, commit 6fcd397):
 - `V02 eval_required=true` (the engine child: a context without Eval refuses the wrapper with
   `eval is not supported`; `new_context` evaluates it to a function).
 - First confined-suite run, CI 34d3b74: `V02 eval_required=true` on all legs (progress.md:16).
-- Run 39115702067 (SHA 16eede3): the V02 line values are not recorded in the ledger. The Linux,
-  ARM and Rosetta rust legs are green (progress.md:338). The line is not copied here.
+- Run 39115702067 (SHA 16eede3), from the CI logs: `V02 eval_required=true` on Linux, ARM
+  (aarch64-apple-darwin), Rosetta (x86_64-apple-darwin) and Windows (x86_64-pc-windows-msvc).
 - Local: Task 3 `v02_host_side_eval_still_needs_eval` (`crates/sandbox-worker`, M1 counterpart
   `v02_host_side_eval_needs_the_eval_intrinsic`).
 
@@ -191,8 +191,17 @@ Evidence lines, run 39012497462 (commit c77a8d0; Task 9, task-09-report.md:110-1
 - Windows: not recorded. The Windows rust leg of run 39012497462 failed in the `sandbox-host`
   `bridge_fuzz` test `s10_malformed_oversize_out_of_order_frames_end_in_violation` (heap leak slack;
   progress.md:68). The ledger does not say whether the `sandbox_runs` step ran.
-- Run 39115702067 (SHA 16eede3): the V10 line values are not recorded in the ledger. All rust legs,
-  Windows included, show `completed success` (checked with `ci_run.ps1`, 2026-10-18).
+- Run 39115702067 (SHA 16eede3), from the CI logs:
+  - Linux: `V10 heap_limit os=linux verdict=heap_mb elapsed_ms=1185 diag=[]`
+  - Linux: `V10 linux_rlimit_as verdict=process_mb via=exit_103 sigsys=false`
+  - ARM: `V10 heap_limit os=macos verdict=heap_mb elapsed_ms=1393 diag=[]`
+  - ARM: `V10 watchdog_kill verdict=process_mb spawn_to_reap_ms=8872 arch=aarch64`
+  - Rosetta: `V10 heap_limit os=macos verdict=heap_mb elapsed_ms=2554 diag=[]`
+  - Rosetta: `V10 watchdog_kill verdict=process_mb spawn_to_reap_ms=14658 arch=x86_64`
+  - ARM and Rosetta: `rlimit_as_enforced=false`
+  - Windows: `V10 heap_limit os=windows verdict=heap_mb elapsed_ms=9694 diag=[]`
+  - Windows: `V10 windows_job_memory_limit verdict=process_mb job_message=true diag=["sandbox_job_memory_limit"]`
+  - Windows: `M8 windows_terminate_job exit=Code(1)`
 
 Caveats:
 
@@ -226,8 +235,15 @@ limit). That was a mis-sized test, and it was fixed later (progress.md:16).
 The PDEATHSIG line comes from Task 6 `v11_pdeathsig_spawner_thread_survives` in `sandbox_runs.rs`,
 not from this suite: the host spawner sets `PR_SET_PDEATHSIG`, not the worker.
 
-Run values for 39115702067 (SHA 16eede3): not recorded in the ledger. The Linux, ARM and Rosetta rust
-legs are green (progress.md:338).
+Run values for 39115702067 (SHA 16eede3), from the CI logs:
+
+- Linux: `V11 os=linux confined=true`, `V11 corpus=19 passed=19 killed_by_sigsys=0`,
+  `V11 pdeathsig_survives_short_thread=true (Allowed)`, `M8 linux_pidfd_kill uses_pidfd=true exit=Signal(9) reap_fallbacks=0`
+- ARM: `V11 os=macos confined=true`, `V11 corpus=19 passed=19 killed_by_sigsys=0`,
+  `M8 macos_kill_before_reap_only exit=Signal(9) reaper=waitpid_wnohang_locked`
+- Rosetta: `V11 os=macos confined=true`, `V11 corpus=19 passed=19 killed_by_sigsys=0`,
+  `M8 macos_kill_before_reap_only exit=Signal(9) reaper=waitpid_wnohang_locked`
+- Windows: `V11 os=windows confined=false`, `V11 corpus=19 passed=19 killed_by_sigsys=0`
 
 Run URLs: 34d3b74 (first run, not recorded here); 39115702067 as above.
 
@@ -250,7 +266,18 @@ Expected evidence lines (task-08-report.md:44):
   `Blocked` for the high inheritable event (`HandleSentinel`).
 - `M8 s10_run_and_probe_share_the_spawn_routine result=42`.
 
-Observed values for run 39115702067: not recorded in the ledger. Earlier history (progress.md:72):
+Observed values for run 39115702067 (SHA 16eede3), from the CI logs:
+
+- Linux: `M8 s10_env_names os=linux names=["MALLOC_ARENA_MAX", "TZ"]`, `M8 s10_handles os=linux fds=[0, 1, 2]`,
+  `M8 s10_run_and_probe_share_the_spawn_routine result=42 mechanism=seccomp+landlock`
+- ARM: `M8 s10_env_names os=macos names=["TZ"]`, `M8 s10_handles os=macos fds=[0, 1, 2]`,
+  `M8 s10_run_and_probe_share_the_spawn_routine result=42 mechanism=seatbelt`
+- Rosetta: same three lines as ARM (`names=["TZ"]`, `fds=[0, 1, 2]`, `result=42 mechanism=seatbelt`).
+- Windows: `M8 s10_env_names os=windows names=["LOCALAPPDATA", "SystemRoot", "TEMP", "TMP", "TZ"]`,
+  `M8 s10_handles os=windows sentinel=0x804 STATUS_INVALID_HANDLE`,
+  `M8 s10_run_and_probe_share_the_spawn_routine result=42 mechanism=appcontainer`
+
+Earlier history (progress.md:72):
 in run 39012497462 the Linux test printed the descriptors as a set (`fds={0, 1, 2}`) and the CI gate,
 which greps `fds=[0, 1, 2]`, failed; macOS printed a list. The Linux print was then changed to a list
 (a lead fix, de4db6e). The `fds=[0, 1, 2]` value on Linux is therefore what the gate requires, not an
@@ -276,8 +303,11 @@ Runs:
 
 - Windows rust leg of run 39110067115 (commit e0b0074, progress.md:334): green. The `elapsed_ms` value
   is not recorded.
-- Run 39115702067 (SHA 16eede3): the Windows rust leg is `completed success` (checked with
-  `ci_run.ps1`, 2026-10-18). Its `elapsed_ms` value is not recorded.
+- Run 39115702067 (SHA 16eede3), from the CI logs, `M8 s10_four_calls_and_1mib_log`:
+  - Linux: `elapsed_ms=569 peak_in_flight=4 logs=1024`
+  - ARM: `elapsed_ms=546 peak_in_flight=4 logs=1024`
+  - Rosetta: `elapsed_ms=742 peak_in_flight=4 logs=1024`
+  - Windows: `elapsed_ms=546 peak_in_flight=4 logs=1024`
 
 Run URLs: https://github.com/gipoezcan/atlas-duck/actions/runs/39110067115 (URL derived from the git
 remote, not fetched); 39115702067 as above.
@@ -300,8 +330,13 @@ Evidence, run 39012497462 (commit c77a8d0; progress.md:72, 74):
   `app_bundle_rename_over via=file_id`; all four detected.
 - Windows: not recorded. The Windows rust leg of that run failed in `bridge_fuzz` (progress.md:68).
 
-Run 39115702067 (SHA 16eede3): the V21 line values are not recorded in the ledger. The rust legs are
-green (progress.md:338).
+Run 39115702067 (SHA 16eede3), from the CI logs:
+
+- Linux: `V21 os=linux case=copy_over detected=true via=size`, `V21 os=linux case=rename_over detected=true via=file_id`
+- ARM and Rosetta (identical lines): `V21 os=macos case=copy_over detected=true via=size`,
+  `case=rename_over detected=true via=file_id`, `case=app_bundle_copy_over detected=true via=size`,
+  `case=app_bundle_rename_over detected=true via=file_id`
+- Windows: `V21 os=windows case=copy_over detected=true via=size`, `V21 os=windows case=rename_over detected=true via=file_id`
 
 Run URLs: https://github.com/gipoezcan/atlas-duck/actions/runs/39012497462 (URL derived from the git
 remote, not fetched); 39115702067 as above.
@@ -312,7 +347,7 @@ The spec's §3.4 worker environment on Windows is not what the worker sees. The 
 `LOCALAPPDATA`, `SystemRoot` and `TZ`; the OS adds `TEMP` and `TMP`; the worker therefore sees five
 names (`WORKER_ENV_OBSERVED` in `crates/sandbox-host`; the `s10_env_names` line on Windows). This is
 a deviation from the allowlist that the spec describes, recorded here as R5. The Linux and macOS
-workers are unaffected. Observed names for run 39115702067: not recorded.
+workers are unaffected. Observed names for run 39115702067 (Windows leg): `M8 s10_env_names os=windows names=["LOCALAPPDATA", "SystemRoot", "TEMP", "TMP", "TZ"]`.
 
 ## Degraded Windows worker environment (Task 11)
 
@@ -321,8 +356,14 @@ worker `SystemRoot` and `TZ=UTC0` only; there is no `LOCALAPPDATA`, `TEMP` or `T
 directory is System32 (task-11-report.md:35, 84). The CI check
 `M8 windows_degraded env_names=[..]` line (sorted names, Debug format) is printed by
 `app/src-tauri/tests/sandbox_runs/degraded.rs:183` (CI only) and asserted equal to
-`WORKER_ENV_NAMES`; the expected names are `SystemRoot` and `TZ` (task-11-report.md). The observed
-value is not recorded in the ledger. `ci.yml` has no gate for these lines yet (task-11-report.md:155).
+`WORKER_ENV_NAMES`; the expected names are `SystemRoot` and `TZ` (task-11-report.md). Observed in run
+39115702067 (Windows leg), from the CI log:
+
+- `M8 windows_degraded env_names=["SystemRoot", "TZ"]`
+- `M8 windows_degraded_spawner mechanism=lockdown_token applied=false integrity_rid=0x0 restricting=["S-1-0-0"] thread_token=none job_same_as_floor=true result=42 diag=[]`
+- `M8 windows_degraded_refused_without_accept_unconfined=true`
+
+`ci.yml` now gates these lines in the `sandbox_runs` step (the task-11-report.md:155 note that it had no gate is out of date).
 
 ## R4: time zone and the `Date` prelude (PD-151)
 
@@ -383,7 +424,8 @@ them in `go-no-go.md`; this file does not edit that record.
 - Run 39115702067 (SHA 16eede3): https://github.com/gipoezcan/atlas-duck/actions/runs/39115702067
   (URL derived from the git remote, not fetched). All 12 jobs showed `completed success` when checked
   with `ci_run.ps1` on 2026-10-18, including the Windows rust leg (it was still running when the K
-  step was first read). Per-line values from that run are not recorded here.
+  step was first read). The per-line values of V02, V10, V11, V12, V15 and V21 and the
+  Windows degraded lines are quoted in their sections above, taken from the run's CI logs.
 - Earlier runs cited: 39012497462 (c77a8d0, V10/V21 values); 39110067115 (e0b0074, Windows rust leg
   green; Linux `cli_flows` x08 flake, later not recurring in 39115702067).
 
