@@ -25,10 +25,6 @@ on:
   push:
     branches:
       - master
-      # REMOVE AT MERGE: TEMPORARY trigger for the M8 branch (as m6-* was for M6). push runs the copy
-      # of this file on the pushed ref, so the AppImage M8 script step (CI-04) and the CI-07 steps
-      # (dry self-test) run before the merge; workflow_dispatch needs the file on the default branch.
-      - "m8-*"
     tags:
       - "v*"
   workflow_dispatch:
