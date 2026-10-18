@@ -16,6 +16,7 @@ use atlas_duck_core::{Core, CoreDeps, KeychainCredentials, NativeConfirmer, Star
 use atlas_duck_sandbox_worker::engine::ENGINE_VERSION;
 use serde_json::{Map, Value};
 
+use crate::sandbox_probe::{ProbeHolder, app_start_confinement};
 use crate::script_glue::{ScriptGlue, ScriptInputs};
 use crate::tray_host::TrayHost;
 
@@ -35,9 +36,11 @@ pub struct CoreInputs {
     pub scripts: ScriptInputs,
 }
 
-/// PD-34: the app's part of the `APP_START` payload. The probe report and the sandbox binary
-/// identity are M8's (the probe finishes after `APP_START`).
-fn app_start_extra(tray_host: Option<TrayHost>) -> Map<String, Value> {
+/// PD-34: the app's part of the `APP_START` payload. `confinement` (M8 Task 21, R1, S-05) is the
+/// startup probe's result if its report is in the holder now (`serve` waits for it at most 5 s from
+/// the probe's start before it composes this), else `{state: "pending"}`: the probe never blocks
+/// startup, and Settings shows the live result either way.
+fn app_start_extra(tray_host: Option<TrayHost>, probe: &ProbeHolder) -> Map<String, Value> {
     let mut extra = Map::new();
     if let Some(t) = tray_host {
         extra.insert("tray_host".to_owned(), Value::String(t.as_str().to_owned()));
@@ -46,6 +49,7 @@ fn app_start_extra(tray_host: Option<TrayHost>) -> Map<String, Value> {
         "engine_version".to_owned(),
         Value::String(ENGINE_VERSION.to_owned()),
     );
+    extra.insert("confinement".to_owned(), app_start_confinement(probe));
     extra
 }
 
@@ -80,7 +84,7 @@ pub fn core_deps(i: CoreInputs) -> io::Result<CoreDeps> {
         config,
         config_path: Some(config_path),
         http,
-        app_start_extra: app_start_extra(i.tray_host),
+        app_start_extra: app_start_extra(i.tray_host, &i.scripts.probe),
         pats_deleted: i.pats_deleted,
         // C.0: the real `ScriptRunner` (M8 Task 20). It creates no spawner until a script runs.
         scripts: Some(Arc::new(ScriptGlue::new(i.scripts))),
@@ -401,6 +405,166 @@ mod tests {
         assert_eq!(admitted.mode, ConfinementMode::Floor);
         assert_eq!(admitted.worker_version, "v1");
         assert_eq!(admitted.probe_report, Some(report));
+        deps.audit.shutdown();
+        Ok(())
+    }
+
+    /// A probe report for the `app_start_*` tests: the identity of this crate's `Cargo.toml`
+    /// (`with_identity`), an extra layer, one memory-read record.
+    fn probe_report(
+        floor: atlas_duck_sandbox_host::probe::FloorVerdict,
+        memory: atlas_duck_ipc::sandbox::probe::ProbeOutcome,
+        with_identity: bool,
+    ) -> Result<atlas_duck_sandbox_host::probe::ProbeReport, Box<dyn std::error::Error>> {
+        use atlas_duck_ipc::sandbox::probe::ProbeId;
+        use atlas_duck_sandbox_host::identity::{SandboxBinaryIdentity, file_identity};
+        use atlas_duck_sandbox_host::probe::{Evidence, ProbeRecord, ProbeReport};
+
+        let identity = if with_identity {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+            let (file_id, size, mtime) = file_identity(&path)?;
+            Some(SandboxBinaryIdentity {
+                file_id,
+                size,
+                mtime,
+                embedded_version: "v1".to_owned(),
+            })
+        } else {
+            None
+        };
+        Ok(ProbeReport {
+            worker_version: identity.as_ref().map(|_| "v1".to_owned()),
+            engine_version: None,
+            identity,
+            confinement: None,
+            threads: None,
+            records: vec![ProbeRecord {
+                probe: ProbeId::OpenProcessVmRead,
+                outcome: memory,
+                evidence: Evidence::Reported { os_error: None },
+            }],
+            floor,
+            extra_layers: vec![("landlock".to_owned(), true)],
+            control: None,
+            lpac_failed: None,
+        })
+    }
+
+    /// R1: `APP_START` carries the probe's result when its report is in the holder: floor, failed
+    /// probes, extra layers, mode, the S-05 memory-read verdict and the sandbox binary identity, as
+    /// fixed words and numbers (no path).
+    #[test]
+    fn app_start_records_probe_when_ready() -> TestResult {
+        use atlas_duck_ipc::sandbox::probe::{ProbeId, ProbeOutcome};
+        use atlas_duck_sandbox_host::probe::FloorVerdict;
+        use serde_json::json;
+
+        let holder = ProbeHolder::default();
+        let report = probe_report(FloorVerdict::Met, ProbeOutcome::Blocked, true)?;
+        let identity = report.identity.clone().ok_or("no identity")?;
+        assert!(holder.set(report));
+        let extra = app_start_extra(None, &holder);
+        let got = extra.get("confinement").ok_or("no confinement key")?;
+        let binary = &got["sandbox_binary"];
+        let mut keys: Vec<&str> = binary
+            .as_object()
+            .ok_or("sandbox_binary is not an object")?
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["embedded_version", "file_id", "mtime", "size"]);
+        assert_eq!(binary["embedded_version"], json!("v1"));
+        assert_eq!(binary["size"], json!(identity.size));
+        let file_id = binary["file_id"].as_str().ok_or("file_id is not text")?;
+        assert!(
+            file_id.starts_with("dev_ino:") || file_id.starts_with("file_index:"),
+            "{file_id}"
+        );
+        assert!(binary["mtime"].is_u64(), "{binary}");
+        let mut without = got.clone();
+        without
+            .as_object_mut()
+            .ok_or("confinement is not an object")?
+            .remove("sandbox_binary");
+        assert_eq!(
+            without,
+            json!({
+                "floor": "met",
+                "failed": [],
+                "extra_layers": [{"name": "landlock", "on": true}],
+                "mode": "n/a",
+                "memory_read": "blocked",
+            })
+        );
+        // Metadata only: nothing of the path the identity was read from.
+        let text = got.to_string();
+        assert!(!text.contains("Cargo.toml"), "{text}");
+        assert!(!text.contains(env!("CARGO_MANIFEST_DIR")), "{text}");
+
+        // S-05: a failed memory read and a floor that is not met are recorded as such.
+        let failed = ProbeHolder::default();
+        assert!(failed.set(probe_report(
+            FloorVerdict::NotMet {
+                failed: vec![ProbeId::OpenProcessVmRead],
+            },
+            ProbeOutcome::Allowed,
+            false,
+        )?));
+        let extra = app_start_extra(Some(TrayHost::Present), &failed);
+        assert_eq!(
+            extra.get("confinement"),
+            Some(&json!({
+                "floor": "not_met",
+                "failed": ["open_process_vm_read"],
+                "extra_layers": [{"name": "landlock", "on": true}],
+                "mode": "n/a",
+                "memory_read": "allowed",
+                "sandbox_binary": {"state": "unavailable"},
+            }))
+        );
+        // The rest of the payload is unchanged.
+        assert_eq!(
+            extra.get("tray_host"),
+            Some(&Value::String("present".to_owned()))
+        );
+        assert_eq!(
+            extra.get("engine_version"),
+            Some(&Value::String(ENGINE_VERSION.to_owned()))
+        );
+        Ok(())
+    }
+
+    /// R1: with no report in the holder (the probe is late, or none runs) `APP_START` carries
+    /// `{state: "pending"}`, never an invented verdict; a report that lands afterwards changes
+    /// nothing already composed. The same through `core_deps`, the path `Core::start` takes.
+    #[test]
+    fn app_start_records_pending_when_probe_late() -> TestResult {
+        use atlas_duck_ipc::sandbox::probe::ProbeOutcome;
+        use atlas_duck_sandbox_host::probe::FloorVerdict;
+        use serde_json::json;
+
+        let pending = json!({"state": "pending"});
+        let holder = ProbeHolder::default();
+        let extra = app_start_extra(None, &holder);
+        assert_eq!(extra.get("confinement"), Some(&pending));
+
+        let (_dir, _lock, mut inputs) = temp_inputs(None)?;
+        let scripts = ScriptInputs::default();
+        inputs.scripts = scripts.clone();
+        let deps = core_deps(inputs)?;
+        assert_eq!(deps.app_start_extra.get("confinement"), Some(&pending));
+        // The report arrives after the payload was composed: it was a snapshot.
+        assert!(scripts.probe.set(probe_report(
+            FloorVerdict::Met,
+            ProbeOutcome::Blocked,
+            true
+        )?));
+        assert_eq!(deps.app_start_extra.get("confinement"), Some(&pending));
+        assert_ne!(
+            app_start_extra(None, &scripts.probe).get("confinement"),
+            Some(&pending)
+        );
         deps.audit.shutdown();
         Ok(())
     }

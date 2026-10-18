@@ -104,13 +104,15 @@ impl MenuEntry {
 }
 
 /// The PD-90 status lines the tray shows (the others need the core and live in the Approvals
-/// header): `locked_refused`, `setup_refused`, `waiting_keyring`, `store_newer`,
-/// `ipc_not_accepting`, `keychain_prompt`. Their text is `status::lines`' (§2.5 verbatim for the
-/// first three).
-pub const TRAY_LINE_IDS: [&str; 6] = [
+/// header): `locked_refused`, `setup_refused`, `waiting_keyring`, `updated_restart` (the glue's
+/// flag lives in `AppState`, M8 Task 21), `store_newer`, `ipc_not_accepting`, `keychain_prompt`.
+/// Their text is `status::lines`' (§2.5 verbatim for the first three). `scripts_degraded` is not
+/// here: it needs the core's setting, and the menu is built on the main thread without a core call.
+pub const TRAY_LINE_IDS: [&str; 7] = [
     "locked_refused",
     "setup_refused",
     "waiting_keyring",
+    "updated_restart",
     "store_newer",
     "ipc_not_accepting",
     "keychain_prompt",
@@ -736,13 +738,22 @@ mod tests {
             ),
             [status::TEXT_STORE_NEWER]
         );
-        // Needs-attention and the like need the core: not in the tray.
+        // Needs-attention, the degraded-scripts caution and the like need the core: not in the tray.
         let busy = StatusInputs {
             needs_attention: 3,
-            update_pending: true,
+            scripts_degraded: true,
             ..StatusInputs::default()
         };
         assert!(status_lines(&AppSnapshot::Serving, &busy).is_empty());
+        // §12.2 / PD-133: the update flag is app state, no core call: the tray carries it.
+        let updated = StatusInputs {
+            update_pending: true,
+            ..StatusInputs::default()
+        };
+        assert_eq!(
+            status_lines(&AppSnapshot::Serving, &updated),
+            [status::TEXT_UPDATED_RESTART]
+        );
         // The error states show their own text, whatever else is set.
         assert_eq!(
             status_lines(&AppSnapshot::StoreUnavailable, &waiting),

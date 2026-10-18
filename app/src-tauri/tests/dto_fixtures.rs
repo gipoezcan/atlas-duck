@@ -1028,12 +1028,17 @@ fn settings_gets() -> Vec<SettingsGet> {
             name: "landlock".into(),
             on: true,
         }],
+        // Not on the wire until the Settings UI task (`skip_serializing`): the fixtures stay.
+        scripts: "enabled",
+        degraded_allowed: false,
     };
     let not_met = ConfinementDto {
         state: "not_met",
         failed: vec!["connect_loopback", "cred_read"],
         mode: "appcontainer",
         extra_layers: vec![],
+        scripts: "disabled",
+        degraded_allowed: false,
     };
     vec![
         SettingsGet {

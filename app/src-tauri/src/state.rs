@@ -10,6 +10,7 @@ use atlas_duck_sandbox_host::probe::{FloorVerdict, ProbeReport};
 use tauri::async_runtime::JoinHandle;
 
 use crate::sandbox_probe::{ProbeHolder, canonical_worker};
+use crate::script_glue::{InstanceSource, ScriptInputs};
 use crate::serve::{ServeState, ShutdownOutcome};
 use crate::tray_host::TrayHost;
 
@@ -59,7 +60,7 @@ pub struct AppState {
     pub probe: Arc<ProbeHolder>,
     /// PD-133: the script glue found the sandbox binary replaced since the probe (an upgrade
     /// under the running app): scripts stay refused until restart, and the status line
-    /// `updated_restart` is due (M8 Task 21 wires the line).
+    /// `updated_restart` is due (`status::gather_app_state`).
     update_pending: Arc<AtomicBool>,
     /// The startup error text (`startup::startup_message`) of the four data-dir error states,
     /// re-shown on a GUI relaunch (§2.5, PD-85).
@@ -131,6 +132,18 @@ impl AppState {
     /// The sandbox binary was replaced under the running app (PD-133).
     pub fn update_pending(&self) -> bool {
         self.update_pending.load(Ordering::SeqCst)
+    }
+
+    /// What the script glue of every core takes from this state: the startup probe's holder and
+    /// the update flag (the same `Arc`s [`AppState::probe_report`] and [`AppState::update_pending`]
+    /// read, so the status line and the Settings DTO see what the glue sees). The instance list is
+    /// the core's own, set once it started.
+    pub fn script_inputs(&self) -> ScriptInputs {
+        ScriptInputs {
+            probe: self.probe.clone(),
+            update_pending: self.update_pending_flag(),
+            instances: InstanceSource::default(),
+        }
     }
 }
 

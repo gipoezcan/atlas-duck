@@ -423,6 +423,83 @@ async fn ready_store_serves_core() -> TestResult {
     stop(&state).await
 }
 
+/// S-05 (M8 Task 21): a startup probe whose memory-read probes got through never stops the app:
+/// the core starts and serves IPC, and `APP_START` carries the failure (`floor: not_met`, the failed
+/// probes by name, `memory_read: allowed`). The report is injected through the holder the serving
+/// start hands its glue (`ServeHooks::scripts`), as `AppState::script_inputs` does in the app.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s05_failed_memory_read_probe_recorded_and_app_starts() -> TestResult {
+    use atlas_duck_app_lib::script_glue::ScriptInputs;
+    use atlas_duck_ipc::sandbox::probe::{ProbeId, ProbeOutcome};
+    use atlas_duck_sandbox_host::probe::{Evidence, FloorVerdict, ProbeRecord, ProbeReport};
+
+    let w = World::new()?;
+    let ring = MemKeyring::new();
+    let install_id = w.provision(&ring)?;
+    let keys = MemKeys::new(ring, true);
+    let record = |probe| ProbeRecord {
+        probe,
+        outcome: ProbeOutcome::Allowed,
+        evidence: Evidence::Reported { os_error: None },
+    };
+    let scripts = ScriptInputs::default();
+    assert!(scripts.probe.set(ProbeReport {
+        worker_version: None,
+        engine_version: None,
+        identity: None,
+        confinement: None,
+        threads: None,
+        records: vec![
+            record(ProbeId::OpenProcessVmRead),
+            record(ProbeId::TaskForPid)
+        ],
+        floor: FloorVerdict::NotMet {
+            failed: vec![ProbeId::TaskForPid, ProbeId::OpenProcessVmRead],
+        },
+        extra_layers: vec![("landlock".to_owned(), true)],
+        control: None,
+        lpac_failed: None,
+    }));
+    let mut inputs = w.inputs(Some(install_id), keys);
+    inputs.hooks.scripts = scripts;
+    let state = start_with(inputs).await.map_err(|e| format!("{e:?}"))?;
+    assert!(state.core.get().is_some(), "the core started");
+
+    // The app serves IPC.
+    let mut c = w.connect().await?;
+    let instances: Envelope = c.call("instances.list", json!({})).await?;
+    assert_eq!(instances.status, Status::Succeeded, "{instances:?}");
+
+    // `APP_START` carries the failure.
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| "poisoned")?
+        .clone()
+        .ok_or("no store")?;
+    let mut headers = store.recent_headers(Duration::from_secs(60 * 60))?;
+    headers.sort_by_key(|h| h.seq);
+    let start = headers
+        .iter()
+        .rev()
+        .find(|h| h.event_type == EventType::APP_START)
+        .ok_or("no APP_START record")?;
+    let payload: Value = serde_json::from_slice(&store.read_payload(start.seq)?)?;
+    assert_eq!(
+        payload["confinement"],
+        json!({
+            "floor": "not_met",
+            "failed": ["task_for_pid", "open_process_vm_read"],
+            "extra_layers": [{"name": "landlock", "on": true}],
+            "mode": "n/a",
+            "memory_read": "allowed",
+            "sandbox_binary": {"state": "unavailable"},
+        }),
+        "{payload}"
+    );
+    stop(&state).await
+}
+
 /// PD-41: without a pinned install id the store's own id (read-only) builds the keystore.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ready_store_without_pinned_id_uses_the_store_id() -> TestResult {

@@ -40,7 +40,7 @@ use crate::credential::{self, PatOpenError};
 use crate::removal::{
     self, BackupAnswer, Choice, FinishAnswer, PluginAutostart, RemovalDto, RemovalState, Retention,
 };
-use crate::sandbox_probe::{floor_label, mode_label, probe_id_name};
+use crate::sandbox_probe::{floor_label, mode_label, probe_id_name, scripts_state};
 use crate::state::{AppState, ServeSlot};
 use crate::ui_sink::emit_settings_changed;
 use crate::windows::WindowError;
@@ -349,19 +349,45 @@ pub struct ConfinementDto {
     pub failed: Vec<&'static str>,
     pub mode: &'static str,
     pub extra_layers: Vec<ExtraLayerDto>,
+    /// Whether scripts run (Δ8, PD-141): `enabled` under a met floor, `degraded` under an unmet one
+    /// with degraded confinement allowed, `disabled` otherwise and while the probe is pending.
+    ///
+    /// Not on the wire yet: the UI's `settings_get` validator and fixture are closed over the keys
+    /// above, so the Settings UI task (Task 23) removes this `skip_serializing` together with its
+    /// fixture regeneration and the TS type (the `SettingsView.allow_degraded_scripts` precedent).
+    #[serde(skip_serializing)]
+    pub scripts: &'static str,
+    /// "Allow scripts with degraded confinement" as core's run policy holds it now (Δ8).
+    /// Not on the wire yet, like `scripts`.
+    #[serde(skip_serializing)]
+    pub degraded_allowed: bool,
 }
 
 impl ConfinementDto {
     pub fn pending() -> ConfinementDto {
-        ConfinementDto {
-            state: "pending",
-            failed: Vec::new(),
-            mode: "n/a",
-            extra_layers: Vec::new(),
-        }
+        ConfinementDto::of_probe(None, false)
     }
 
+    /// The report as Settings shows it, degraded confinement not allowed.
     pub fn of(report: &ProbeReport) -> ConfinementDto {
+        ConfinementDto::of_probe(Some(report), false)
+    }
+
+    /// What `settings_get` answers: the startup probe's report (`None` while it is pending) and
+    /// the degraded-confinement setting (Δ8). `failed` names every failed floor probe, so a memory
+    /// read that got through (S-05: `open_process_vm_read`, `task_for_pid`, ...) is shown here.
+    pub fn of_probe(report: Option<&ProbeReport>, degraded_allowed: bool) -> ConfinementDto {
+        let scripts = scripts_state(report, degraded_allowed);
+        let Some(report) = report else {
+            return ConfinementDto {
+                state: "pending",
+                failed: Vec::new(),
+                mode: "n/a",
+                extra_layers: Vec::new(),
+                scripts,
+                degraded_allowed,
+            };
+        };
         let failed = match &report.floor {
             FloorVerdict::Met => Vec::new(),
             FloorVerdict::NotMet { failed } => failed.iter().map(|p| probe_id_name(*p)).collect(),
@@ -378,6 +404,8 @@ impl ConfinementDto {
                     on: *on,
                 })
                 .collect(),
+            scripts,
+            degraded_allowed,
         }
     }
 }
@@ -745,16 +773,20 @@ pub async fn settings_get<R: Runtime>(
     args: Args<SettingsGetArgs>,
 ) -> Result<SettingsGet, CommandError> {
     let Args(SettingsGetArgs {}) = args;
-    let confinement = app
+    // The report is set once and never changes: a copy is the verdict at this call (pending while
+    // the probe has not finished, or without an `AppState`).
+    let report = app
         .try_state::<AppState>()
-        .and_then(|s| s.probe_report().map(ConfinementDto::of))
-        .unwrap_or_else(ConfinementDto::pending);
+        .and_then(|s| s.probe_report().cloned());
     let response = match core(&app) {
         Ok(core) => {
             let (settings, instances) = (core.settings(), core.instances());
-            // Reads the registry or the file system: the blocking pool.
+            // Reads the registry or the file system, and the settings view: the blocking pool.
             blocking(move || {
                 let (installed, removable) = cli_state();
+                // Δ8: the setting is core's run policy as the glue reads it at each call.
+                let confinement =
+                    ConfinementDto::of_probe(report.as_ref(), core.script_policy().allow_degraded);
                 Ok(settings_get_dto(
                     &*settings,
                     &*instances,
@@ -1521,6 +1553,50 @@ mod tests {
         assert_eq!(class(CommandError::NotReady), None);
     }
 
+    /// Δ8 / PD-141: `scripts` is `enabled` only under a met floor, `degraded` only under an unmet
+    /// one with the setting on, `disabled` otherwise (and while the probe is pending); the setting
+    /// is passed through; the failed probes are named (S-05).
+    #[test]
+    fn confinement_dto_scripts_follow_the_floor_and_the_setting() {
+        use atlas_duck_ipc::sandbox::probe::ProbeId;
+
+        let report = |floor| ProbeReport {
+            worker_version: None,
+            engine_version: None,
+            identity: None,
+            confinement: None,
+            threads: None,
+            records: Vec::new(),
+            floor,
+            extra_layers: Vec::new(),
+            control: None,
+            lpac_failed: None,
+        };
+        let met = report(FloorVerdict::Met);
+        let unmet = report(FloorVerdict::NotMet {
+            failed: vec![ProbeId::TaskForPid],
+        });
+        let got = |r: Option<&ProbeReport>, allowed: bool| {
+            let dto = ConfinementDto::of_probe(r, allowed);
+            (dto.state, dto.scripts, dto.degraded_allowed, dto.failed)
+        };
+        assert_eq!(got(None, false), ("pending", "disabled", false, vec![]));
+        assert_eq!(got(None, true), ("pending", "disabled", true, vec![]));
+        assert_eq!(got(Some(&met), false), ("met", "enabled", false, vec![]));
+        assert_eq!(got(Some(&met), true), ("met", "enabled", true, vec![]));
+        assert_eq!(
+            got(Some(&unmet), false),
+            ("not_met", "disabled", false, vec!["task_for_pid"])
+        );
+        assert_eq!(
+            got(Some(&unmet), true),
+            ("not_met", "degraded", true, vec!["task_for_pid"])
+        );
+        // The old constructors: no degraded confinement allowed.
+        assert_eq!(ConfinementDto::of(&unmet).scripts, "disabled");
+        assert_eq!(ConfinementDto::pending().scripts, "disabled");
+    }
+
     #[test]
     fn the_cli_state_and_confinement_have_stable_shapes() {
         assert_eq!(
@@ -1534,6 +1610,12 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&pending).unwrap_or_default(),
             json!({"state": "pending", "failed": [], "mode": "n/a", "extra_layers": []})
+        );
+        // Δ8: `scripts` and `degraded_allowed` are not on the wire until the Settings UI task.
+        let degraded = ConfinementDto::of_probe(None, true);
+        assert_eq!(
+            serde_json::to_value(&degraded).unwrap_or_default(),
+            serde_json::to_value(&pending).unwrap_or_default()
         );
         let retest = RetestOutcome::Failed(connection_failure(
             &atlas_duck_core::ConnectionFailure::OtherUser,

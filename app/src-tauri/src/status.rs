@@ -7,19 +7,21 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use atlas_duck_core::reconcile::LINE_CHECK_TARGET;
-use atlas_duck_core::{ConfigBanner, Core, GateState, StoreHealthView};
+use atlas_duck_core::{ConfigBanner, Core, GateState, RunPolicy, StoreHealthView};
 use atlas_duck_preview::invisible::escape_for_display;
 use tauri::{AppHandle, Manager, Runtime};
 
 use crate::commands::dto::{StatusLevel, StatusLineDto};
-use crate::state::ServeSlot;
+use crate::sandbox_probe::{SCRIPTS_DEGRADED, scripts_state};
+use crate::state::{AppState, ServeSlot};
 
 /// Every line id in the order [`lines`] emits them (PD-90).
-pub const IDS: [&str; 16] = [
+pub const IDS: [&str; 17] = [
     "locked_refused",
     "setup_refused",
     "waiting_keyring",
     "updated_restart",
+    "scripts_degraded",
     "store_newer",
     "needs_attention",
     "token_expiry",
@@ -36,8 +38,12 @@ pub const IDS: [&str; 16] = [
 
 /// §8.7 (verbatim).
 pub const TEXT_WAITING_KEYRING: &str = "Waiting for keyring";
-/// §12.2 (verbatim); the trigger is M8's (`StatusInputs::update_pending`).
+/// §12.2 (verbatim); the trigger is the script glue's identity check (`StatusInputs::update_pending`,
+/// PD-133).
 pub const TEXT_UPDATED_RESTART: &str = "Updated — restart to apply";
+/// plan text (PD-141, M8 Task 21): `scripts_degraded`, a caution while the sandbox floor is not met
+/// and the user allowed degraded confinement, so scripts do run.
+pub const TEXT_SCRIPTS_DEGRADED: &str = "scripts run with degraded confinement";
 /// plan text (PD-90): `ipc_not_accepting` (M4 T19 bind failure).
 pub const TEXT_IPC_NOT_ACCEPTING: &str = "not accepting agent requests; see doctor";
 /// plan text (PD-90, L78): `keychain_prompt`.
@@ -89,8 +95,13 @@ pub struct StatusInputs {
     /// `open` has waited on a keychain authorization prompt past 10 s (L78): `serve` sets the
     /// flag the `ServeSlot` holds while a first or retried `open` blocks that long.
     pub keychain_prompt: bool,
-    /// The installed app was replaced under the running one (§12.2); M8 sets it.
+    /// The installed app was replaced under the running one (§12.2): the script glue found the
+    /// sandbox binary changed since the probe (PD-133); `AppState` holds the flag.
     pub update_pending: bool,
+    /// Scripts run with degraded confinement (PD-141): the startup probe did not meet the floor and
+    /// the user allowed degraded confinement. Needs the core (the setting), so only [`gather`]
+    /// fills it; false means nothing is degraded or it is not known.
+    pub scripts_degraded: bool,
 }
 
 impl Default for StatusInputs {
@@ -108,6 +119,7 @@ impl Default for StatusInputs {
             ipc_accepting: true,
             keychain_prompt: false,
             update_pending: false,
+            scripts_degraded: false,
         }
     }
 }
@@ -178,6 +190,13 @@ pub fn lines(i: &StatusInputs) -> Vec<StatusLineDto> {
             "updated_restart",
             Info,
             TEXT_UPDATED_RESTART.to_owned(),
+        ));
+    }
+    if i.scripts_degraded {
+        out.push(line(
+            "scripts_degraded",
+            Caution,
+            TEXT_SCRIPTS_DEGRADED.to_owned(),
         ));
     }
     if i.gate == Some(GateState::StoreNewer) {
@@ -262,8 +281,27 @@ pub fn gather<R: Runtime>(app: &AppHandle<R>) -> StatusInputs {
     });
     if let Some(core) = core {
         gather_core(&mut i, &core);
+        if let Some(state) = app.try_state::<AppState>() {
+            // Reads the core's settings view: [`gather`] runs on the blocking pool.
+            gather_scripts(&mut i, &state, core.script_policy());
+        }
     }
     i
+}
+
+/// The part of [`gather_gate`] that reads `AppState`: the flag the script glue sets when it finds
+/// the sandbox binary replaced since the probe (PD-133, `updated_restart`). A flag, no core.
+pub fn gather_app_state(i: &mut StatusInputs, state: &AppState) {
+    i.update_pending = state.update_pending();
+}
+
+/// `scripts_degraded` (PD-141): the startup probe's report is `NotMet` and the run policy allows
+/// degraded confinement, the two things the glue admits a degraded run on ([`gather`] passes
+/// `Core::script_policy`, the very read the runner takes at each call). No report yet is not
+/// degraded: scripts are refused then.
+pub fn gather_scripts(i: &mut StatusInputs, state: &AppState, policy: RunPolicy) {
+    i.scripts_degraded =
+        scripts_state(state.probe_report(), policy.allow_degraded) == SCRIPTS_DEGRADED;
 }
 
 /// The half of [`gather`] that reads no `Core`: the gate, its refused count, the retry, the
@@ -271,6 +309,10 @@ pub fn gather<R: Runtime>(app: &AppHandle<R>) -> StatusInputs {
 /// the main thread, M6 T22) can call it.
 pub fn gather_gate<R: Runtime>(app: &AppHandle<R>) -> StatusInputs {
     let mut i = StatusInputs::default();
+    // PD-133: the glue's flag lives in `AppState`, not in the serving state.
+    if let Some(state) = app.try_state::<AppState>() {
+        gather_app_state(&mut i, &state);
+    }
     let Some(slot) = app.try_state::<ServeSlot>() else {
         return i;
     };
@@ -399,6 +441,17 @@ mod tests {
                     ..StatusInputs::default()
                 },
                 vec![("updated_restart", "Updated — restart to apply", Info)],
+            ),
+            (
+                StatusInputs {
+                    scripts_degraded: true,
+                    ..StatusInputs::default()
+                },
+                vec![(
+                    "scripts_degraded",
+                    "scripts run with degraded confinement",
+                    Caution,
+                )],
             ),
             (
                 StatusInputs {
@@ -638,6 +691,7 @@ mod tests {
             ipc_accepting: false,
             keychain_prompt: true,
             update_pending: true,
+            scripts_degraded: true,
         };
         let ids: Vec<&str> = only(all).into_iter().map(|l| l.0).collect();
         let positions: Vec<usize> = ids
@@ -646,6 +700,175 @@ mod tests {
             .collect();
         assert_eq!(positions.len(), ids.len());
         assert!(positions.windows(2).all(|w| w[0] <= w[1]), "{ids:?}");
+    }
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// A probe report with the given floor and no identity.
+    fn bare_report(
+        floor: atlas_duck_sandbox_host::probe::FloorVerdict,
+    ) -> atlas_duck_sandbox_host::probe::ProbeReport {
+        atlas_duck_sandbox_host::probe::ProbeReport {
+            worker_version: None,
+            engine_version: None,
+            identity: None,
+            confinement: None,
+            threads: None,
+            records: Vec::new(),
+            floor,
+            extra_layers: Vec::new(),
+            control: None,
+            lpac_failed: None,
+        }
+    }
+
+    /// PD-133, §12.2: after the glue found the sandbox binary replaced since the probe, the status
+    /// line `updated_restart` is due, through the flag the glue and the state share (not before,
+    /// and it stays). The glue is the real one over the state's own script inputs; the binary is a
+    /// scratch file the probe's identity was read from, so nothing is spawned.
+    #[tokio::test]
+    async fn updated_restart_after_identity_mismatch() -> TestResult {
+        use atlas_duck_core::ScriptRunner;
+        use atlas_duck_sandbox_host::identity::{SandboxBinaryIdentity, file_identity};
+        use atlas_duck_sandbox_host::probe::FloorVerdict;
+
+        use std::sync::Arc;
+
+        use crate::script_glue::{HostBridge, ScriptGlue};
+        use crate::state::StartupSummary;
+
+        let dir = tempfile::tempdir()?;
+        let worker = dir.path().join("atlas-duck-sandbox");
+        std::fs::write(&worker, b"worker, first build")?;
+        let (file_id, size, mtime) = file_identity(&worker)?;
+        let state = AppState::new(StartupSummary::Ready, None);
+        assert!(
+            state
+                .probe
+                .set(atlas_duck_sandbox_host::probe::ProbeReport {
+                    identity: Some(SandboxBinaryIdentity {
+                        file_id,
+                        size,
+                        mtime,
+                        embedded_version: "v1".to_owned(),
+                    }),
+                    ..bare_report(FloorVerdict::Met)
+                })
+        );
+        let glue = ScriptGlue::with_port(
+            Arc::new(HostBridge::default()),
+            Some(worker.clone()),
+            state.script_inputs(),
+        );
+        let due = |state: &AppState| {
+            let mut i = StatusInputs::default();
+            gather_app_state(&mut i, state);
+            only(i)
+        };
+        let bound = std::time::Duration::from_secs(60);
+
+        // The binary is the probe's: scripts are admitted and no line is due.
+        assert!(
+            tokio::time::timeout(bound, glue.check_available(RunPolicy::default()))
+                .await?
+                .is_ok()
+        );
+        assert!(!state.update_pending());
+        assert!(due(&state).is_empty());
+
+        // An upgrade replaced the binary: the run is refused and the line is due.
+        std::fs::write(&worker, b"worker, the build of an upgrade")?;
+        assert!(
+            tokio::time::timeout(bound, glue.check_available(RunPolicy::default()))
+                .await?
+                .is_err()
+        );
+        assert!(state.update_pending());
+        assert_eq!(
+            due(&state),
+            [(
+                "updated_restart",
+                "Updated \u{2014} restart to apply".to_owned(),
+                StatusLevel::Info
+            )]
+        );
+        // Sticky: refused until restart, the line stays.
+        assert!(
+            tokio::time::timeout(bound, glue.check_available(RunPolicy::default()))
+                .await?
+                .is_err()
+        );
+        assert_eq!(due(&state).len(), 1);
+        Ok(())
+    }
+
+    /// PD-141: `scripts_degraded` only while the probe's floor is not met AND degraded confinement
+    /// is allowed: each alone, a met floor, or no report yet shows nothing.
+    #[test]
+    fn status_scripts_degraded_line() {
+        use atlas_duck_ipc::sandbox::probe::ProbeId;
+        use atlas_duck_sandbox_host::probe::FloorVerdict;
+
+        use crate::state::StartupSummary;
+
+        let unmet = || FloorVerdict::NotMet {
+            failed: vec![ProbeId::FileInProfile],
+        };
+        let allowed = RunPolicy {
+            allow_degraded: true,
+        };
+        let refused = RunPolicy {
+            allow_degraded: false,
+        };
+        let ids = |floor: Option<FloorVerdict>, policy: RunPolicy| {
+            let state = AppState::new(StartupSummary::Ready, None);
+            if let Some(floor) = floor {
+                assert!(state.probe.set(bare_report(floor)));
+            }
+            let mut i = StatusInputs::default();
+            gather_scripts(&mut i, &state, policy);
+            only(i)
+        };
+        assert_eq!(
+            ids(Some(unmet()), allowed),
+            [(
+                "scripts_degraded",
+                TEXT_SCRIPTS_DEGRADED.to_owned(),
+                StatusLevel::Caution
+            )]
+        );
+        assert_eq!(
+            TEXT_SCRIPTS_DEGRADED,
+            "scripts run with degraded confinement"
+        );
+        assert!(ids(Some(unmet()), refused).is_empty());
+        assert!(ids(Some(FloorVerdict::Met), allowed).is_empty());
+        assert!(ids(Some(FloorVerdict::Met), refused).is_empty());
+        assert!(ids(None, allowed).is_empty());
+        assert!(ids(None, refused).is_empty());
+    }
+
+    /// `update_pending` and `scripts_degraded` are separate lines in id order, and neither needs
+    /// the other.
+    #[test]
+    fn the_script_lines_are_independent_and_ordered() {
+        let both = only(StatusInputs {
+            update_pending: true,
+            scripts_degraded: true,
+            ..StatusInputs::default()
+        });
+        assert_eq!(
+            both.iter().map(|l| l.0).collect::<Vec<_>>(),
+            ["updated_restart", "scripts_degraded"]
+        );
+        assert_eq!(
+            only(StatusInputs {
+                update_pending: true,
+                ..StatusInputs::default()
+            })
+            .len(),
+            1
+        );
     }
 
     #[test]

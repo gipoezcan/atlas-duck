@@ -60,6 +60,30 @@ fn invoke_app_status_round_trips() -> TestResult {
     Ok(())
 }
 
+/// PD-133 / §12.2 (M8 Task 21): `app_status` carries `updated_restart` once the script glue flagged
+/// the sandbox binary as replaced (the flag `AppState` shares with it), and not before.
+#[test]
+fn app_status_carries_updated_restart_after_the_glue_flagged_the_binary() -> TestResult {
+    use atlas_duck_app_lib::state::{AppState, StartupSummary};
+
+    let app = app()?;
+    let state = AppState::new(StartupSummary::Ready, None);
+    let flag = state.update_pending_flag();
+    app.manage(state);
+    let w = window(&app, "approvals")?;
+    assert_eq!(invoke(&w, "app_status", json!({})), Ok(json!([])));
+    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        invoke(&w, "app_status", json!({})),
+        Ok(json!([{
+            "id": "updated_restart",
+            "text": "Updated \u{2014} restart to apply",
+            "level": "info"
+        }]))
+    );
+    Ok(())
+}
+
 /// The V34-adjacent answer for Task 31: under the mock runtime, with the generated context, the
 /// ACL is enforced for app commands per window label. `app_status` is granted to `approvals` and
 /// `settings` (Δ1) and to no other window.
@@ -2660,6 +2684,65 @@ mod settings_commands {
                 .await?;
         assert!(got.cli_installed);
         assert!(!got.cli_removable);
+        Ok(())
+    }
+
+    /// S-05 (M8 Task 21): a startup probe whose memory-read probes got through (`OpenProcessVmRead`,
+    /// `TaskForPid`) neither stops the core nor hides: Settings names the failed probes, the floor
+    /// is not met and scripts are disabled (or degraded where the user allowed it). Nothing of
+    /// `scripts` / `degraded_allowed` is on the wire before the Settings UI task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn s05_settings_shows_failed_memory_read_probe() -> TestResult {
+        use atlas_duck_app_lib::state::{AppState, StartupSummary};
+        use atlas_duck_ipc::sandbox::probe::{ProbeId, ProbeOutcome};
+        use atlas_duck_sandbox_host::probe::{Evidence, FloorVerdict, ProbeRecord, ProbeReport};
+
+        let h = Harness::jira().await?;
+        let state = AppState::new(StartupSummary::Ready, None);
+        assert!(state.probe_report().is_none());
+        let record = |probe| ProbeRecord {
+            probe,
+            outcome: ProbeOutcome::Allowed,
+            evidence: Evidence::Reported { os_error: None },
+        };
+        assert!(state.probe.set(ProbeReport {
+            worker_version: None,
+            engine_version: None,
+            identity: None,
+            confinement: None,
+            threads: None,
+            records: vec![
+                record(ProbeId::OpenProcessVmRead),
+                record(ProbeId::TaskForPid)
+            ],
+            floor: FloorVerdict::NotMet {
+                failed: vec![ProbeId::TaskForPid, ProbeId::OpenProcessVmRead],
+            },
+            extra_layers: Vec::new(),
+            control: None,
+            lpac_failed: None,
+        }));
+        for (allowed, scripts) in [(false, "disabled"), (true, "degraded")] {
+            let confinement = ConfinementDto::of_probe(state.probe_report(), allowed);
+            let (s, i) = (h.core().settings(), h.instances());
+            let got =
+                blocking(move || settings_get_dto(&*s, &*i, confinement, false, true)).await?;
+            // The core started and answers while the probe says the memory read got through.
+            assert_eq!(got.settings, h.core().settings().view());
+            assert_eq!(got.confinement.state, "not_met");
+            assert_eq!(
+                got.confinement.failed,
+                ["task_for_pid", "open_process_vm_read"]
+            );
+            assert_eq!(got.confinement.scripts, scripts);
+            assert_eq!(got.confinement.degraded_allowed, allowed);
+            let wire = serde_json::to_value(&got.confinement)?;
+            assert_eq!(
+                wire["failed"],
+                json!(["task_for_pid", "open_process_vm_read"])
+            );
+            assert!(wire.get("scripts").is_none() && wire.get("degraded_allowed").is_none());
+        }
         Ok(())
     }
 

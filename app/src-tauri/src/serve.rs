@@ -1351,11 +1351,7 @@ pub fn start(
     // M8 Task 20: the glue awaits the report of the probe `setup` started, through `AppState`.
     let scripts = app
         .try_state::<AppState>()
-        .map(|s| ScriptInputs {
-            probe: s.probe.clone(),
-            update_pending: s.update_pending_flag(),
-            instances: InstanceSource::default(),
-        })
+        .map(|s| s.script_inputs())
         .unwrap_or_default();
     let hooks = ServeHooks {
         watcher: Some(Arc::new(AppWatcher::new(app.clone()))),
@@ -1766,6 +1762,11 @@ impl CoreStarter {
             shutdown_store(store).await;
             return Err(StoreFailure::CoreStart);
         }
+        // R1 (PD-138): `APP_START` is appended inside `Core::start`, so the probe report is awaited
+        // here, for at most what is left of 5 s counted from the probe's start (it ran while the
+        // store was opened and verified). A report still missing is `pending` in `APP_START`; the
+        // probe never blocks startup beyond this bound.
+        self.scripts.probe.wait_for_app_start().await;
         // The glue of this core reads this core's instances (`atlas.instances()`), once it runs.
         let instances = InstanceSource::default();
         let inputs = CoreInputs {
@@ -2298,6 +2299,151 @@ mod tests {
         assert!(read_endpoint_file(&data)?.is_none(), "endpoint file gone");
         assert!(!wal.exists(), "the store was shut down");
         assert_eq!(gate_label(&state).await, "shutting_down");
+        Ok(())
+    }
+
+    struct NoConfirm;
+    impl NativeConfirmer for NoConfirm {
+        fn confirm(&self, _: &str) -> Confirm {
+            Confirm::Cancel
+        }
+    }
+
+    type StoreParts = (Store, Arc<dyn KeyStore>, InstanceLock);
+
+    /// A first-run store in `dir` (a fresh data dir), with its keys and instance lock.
+    fn first_run_store(dir: &std::path::Path) -> Result<StoreParts, Box<dyn std::error::Error>> {
+        use atlas_duck_audit::testing::{FreeSpaceStub, MemKeyStore, MemKeyring};
+        use atlas_duck_audit::{create_new_store, new_ids};
+        use atlas_duck_ipc::paths::{DataDirResolution, check_data_dir};
+
+        let dir = dir.join("data");
+        std::fs::create_dir(&dir)?;
+        let DataDirResolution::Local(data) = check_data_dir(&dir)? else {
+            return Err("the temp dir is not a local data dir".into());
+        };
+        let lock = InstanceLock::acquire(&data, "thishost")?;
+        let (install_id, chain_id) = new_ids()?;
+        let keys: Arc<dyn KeyStore> = Arc::new(MemKeyStore::new(MemKeyring::new(), &install_id));
+        let mut cfg = OpenConfig::new(Arc::new(SystemClock::new()), keys.clone());
+        cfg.free_space = Some(FreeSpaceStub::new(u64::MAX));
+        let pass = "correct horse battery";
+        let store = create_new_store(
+            &data,
+            &lock,
+            cfg,
+            FirstRunInput {
+                install_id,
+                chain_id,
+                passphrase: SecretString::from(pass.to_owned()),
+                passphrase_confirm: SecretString::from(pass.to_owned()),
+                archived_db: None,
+            },
+        )?;
+        Ok((store, keys, lock))
+    }
+
+    /// The `confinement` key of the newest `APP_START` record in `store`.
+    fn app_start_confinement_in(
+        store: &Store,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        use atlas_duck_audit::EventType;
+
+        let mut headers = store.recent_headers(Duration::from_secs(3600))?;
+        headers.sort_by_key(|h| h.seq);
+        let start = headers
+            .iter()
+            .rev()
+            .find(|h| h.event_type == EventType::APP_START)
+            .ok_or("no APP_START record")?;
+        let payload: serde_json::Value = serde_json::from_slice(&store.read_payload(start.seq)?)?;
+        Ok(payload["confinement"].clone())
+    }
+
+    fn met_report() -> atlas_duck_sandbox_host::probe::ProbeReport {
+        atlas_duck_sandbox_host::probe::ProbeReport {
+            worker_version: None,
+            engine_version: None,
+            identity: None,
+            confinement: None,
+            threads: None,
+            records: Vec::new(),
+            floor: atlas_duck_sandbox_host::probe::FloorVerdict::Met,
+            extra_layers: Vec::new(),
+            control: None,
+            lpac_failed: None,
+        }
+    }
+
+    /// R1 (PD-138), the lifecycle step: `Core::start` appends `APP_START`, so the starter awaits the
+    /// probe report before it, counted from the probe's start. A report that lands while the core
+    /// starts is in the record; one that is still missing when the 5 s (from the probe's start) are
+    /// over leaves `{state: "pending"}` and the core starts all the same.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn core_start_awaits_the_probe_report_before_app_start()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let bound = Duration::from_secs(120);
+        let starter_for = |probe: &Arc<crate::sandbox_probe::ProbeHolder>,
+                           root: &std::path::Path| CoreStarter {
+            config_dir: root.to_owned(),
+            ui: Arc::new(NoUi),
+            confirmer: Arc::new(NoConfirm),
+            tray_host: None,
+            scripts: ScriptInputs {
+                probe: probe.clone(),
+                ..ScriptInputs::default()
+            },
+            fail_next: None,
+        };
+
+        // The probe started just now and reports 1.2 s later, while the core is starting.
+        let root = tmp.path().join("ready");
+        std::fs::create_dir(&root)?;
+        let (store, keys, _lock) = first_run_store(&root)?;
+        let probe = Arc::new(crate::sandbox_probe::ProbeHolder::default());
+        probe.mark_started(std::time::Instant::now());
+        let late = probe.clone();
+        let setting = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1_200)).await;
+            late.set(met_report())
+        });
+        let core = tokio::time::timeout(
+            bound,
+            starter_for(&probe, &root).start(store.clone(), keys, Vec::new()),
+        )
+        .await?
+        .map_err(|_| "the core did not start")?;
+        let confinement = app_start_confinement_in(&store)?;
+        assert_eq!(
+            confinement["floor"],
+            serde_json::json!("met"),
+            "{confinement}"
+        );
+        assert!(setting.await?);
+        let _ = abandon(Some(core), Some(store)).await;
+
+        // The probe started 4.7 s ago and never reports: at most the remaining 0.3 s are waited.
+        let Some(started) = std::time::Instant::now().checked_sub(Duration::from_millis(4_700))
+        else {
+            return Ok(());
+        };
+        let root = tmp.path().join("pending");
+        std::fs::create_dir(&root)?;
+        let (store, keys, _lock) = first_run_store(&root)?;
+        let probe = Arc::new(crate::sandbox_probe::ProbeHolder::default());
+        probe.mark_started(started);
+        let core = tokio::time::timeout(
+            bound,
+            starter_for(&probe, &root).start(store.clone(), keys, Vec::new()),
+        )
+        .await?
+        .map_err(|_| "the core did not start without a probe report")?;
+        assert_eq!(
+            app_start_confinement_in(&store)?,
+            serde_json::json!({"state": "pending"})
+        );
+        let _ = abandon(Some(core), Some(store)).await;
         Ok(())
     }
 
