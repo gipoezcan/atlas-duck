@@ -4,7 +4,8 @@ use proptest::prelude::*;
 
 use atlas_duck_preview::PREVIEW_BUILDER_VERSION;
 use atlas_duck_preview::invisible::{
-    MAX_RGI_EMOJI_CHARS, count, escape_for_display, flags, is_bidi_control, is_flagged, strip,
+    MAX_RGI_EMOJI_CHARS, count, escape_for_display, flags, flags_and_sequences, is_bidi_control,
+    is_flagged, strip,
 };
 use atlas_duck_preview::mixed_script::is_mixed_script;
 use icu_properties::props::{DefaultIgnorableCodePoint, GeneralCategory, Script};
@@ -538,4 +539,43 @@ proptest! {
         prop_assert!(!removed_again);
         prop_assert_eq!(count(&once), (0, 0));
     }
+
+    /// `flags_and_sequences`: the flags are `flags`, every unflagged ZWJ or variation selector is
+    /// in one of the sequences (each holding one), and a cut anywhere but strictly inside a
+    /// sequence keeps the flags of the prefix (the renderer's byte-share cuts rely on it).
+    #[test]
+    fn a_cut_outside_the_sequences_keeps_the_flags(s in mixed_input()) {
+        let (all, sequences) = flags_and_sequences(&s);
+        prop_assert_eq!(&all, &flags(&s));
+        let inside = |b: usize| sequences.iter().any(|r| r.start < b && b < r.end);
+        for (k, (b, c)) in s.char_indices().enumerate() {
+            let exempt = is_flagged(c) && !all[k];
+            let in_sequence = sequences.iter().any(|r| r.contains(&b));
+            prop_assert_eq!(
+                exempt,
+                in_sequence && matches!(c, '\u{200D}' | '\u{FE0E}' | '\u{FE0F}')
+            );
+            if !inside(b) {
+                prop_assert_eq!(&flags(&s[..b])[..], &all[..k], "cut at {}", b);
+            }
+        }
+        for r in &sequences {
+            let unflags = s[r.clone()].contains(['\u{200D}', '\u{FE0E}', '\u{FE0F}']);
+            prop_assert!(unflags, "{:?}", r);
+        }
+    }
+}
+
+#[test]
+fn a_cut_inside_a_sequence_changes_the_flags() {
+    // The M8 S-06 seed: 👩‍💻 cut before the 💻 leaves a U+200D that the prefix flags.
+    let s = "x👩\u{200D}💻y";
+    let (all, sequences) = flags_and_sequences(s);
+    assert_eq!(sequences.len(), 1);
+    assert_eq!(sequences[0], 1..12);
+    assert_eq!(all, [false; 5]);
+    assert_eq!(flags(&s[..8]), [false, false, true]);
+    // A sequence that unflags nothing (no ZWJ or variation selector) is not one of them.
+    assert!(flags_and_sequences("👍\u{1F3FD}\u{200D}").1.is_empty());
+    assert!(flags_and_sequences("abc").1.is_empty());
 }

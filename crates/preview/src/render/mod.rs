@@ -371,15 +371,30 @@ fn escape_len(rest: &str) -> Option<usize> {
 /// Writes display text `s` HTML-escaped with every `⟨…⟩` escape (and every flagged character
 /// still raw, escaped here) in a `<mark>`, until `out` reaches `limit` bytes. Returns the bytes of
 /// `s` left out (0 when all of it fits).
+///
+/// The flags are those of the whole of `s`, so the cut never splits an emoji sequence that
+/// unflags a character (a 👩‍💻 cut before the 💻 left a raw U+200D that the written text flags,
+/// M8 S-06 proptest seed): it moves back to the sequence's start. What is written is then
+/// classified as it would be on its own, and every byte not written is counted.
 fn push_marked(out: &mut String, s: &str, limit: usize) -> u64 {
-    let flags = invisible::flags(s);
+    let (flags, sequences) = invisible::flags_and_sequences(s);
+    let mut sequences = sequences.iter().peekable();
+    // The last place a cut keeps every sequence whole: a byte of `s`, and the length of `out`
+    // there.
+    let mut whole = (0, out.len());
     let mut skip_to = 0;
     for ((i, c), flagged) in s.char_indices().zip(flags) {
         if i < skip_to {
             continue;
         }
+        while sequences.next_if(|r| r.end <= i).is_some() {}
+        if sequences.peek().is_none_or(|r| r.start >= i) {
+            whole = (i, out.len());
+        }
         if out.len() >= limit {
-            return len_u64(s.len() - i);
+            let (at, len) = whole;
+            out.truncate(len);
+            return len_u64(s.len() - at);
         }
         if flagged {
             out.push_str("<mark>");

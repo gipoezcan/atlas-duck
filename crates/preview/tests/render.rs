@@ -2473,50 +2473,142 @@ proptest! {
         long_first in any::<bool>(),
     ) {
         let platform = if windows { Platform::Windows } else { Platform::MacOsLinux };
-        let mut p = arbitrary_preview(18, &strings);
-        let s = |i: usize| strings[i % strings.len()].as_str();
-        // Each text long enough to cross its share whatever the strings are (they may be empty),
-        // with markup, a lone `⟨` and a bidi control between them.
-        let long = |i: usize, bytes: usize| {
-            let mut t = String::new();
-            let mut k = i;
-            while t.len() < bytes {
-                t.push_str(s(k));
-                t.push_str("<b>⟨\u{202E}");
-                k += 1;
-            }
-            t
-        };
-        if let PreviewBody::Script { source, provenance, logs, stderr, .. } = &mut p.body {
-            *source = (0..20_000).map(|i| format!("{}\n", s(i))).collect::<String>()
-                + &long(0, DOC_SCRIPT_SOURCE_BYTES);
-            *provenance = (0..=DOC_MAX_ROWS as u64)
-                .map(|i| ProvenanceRow {
-                    call_id: i,
-                    op_id: s(i as usize).into(),
-                    instance: s(i as usize + 1).into(),
-                    target_display: s(i as usize + 2).into(),
-                    outcome: s(i as usize + 3).into(),
-                })
-                .collect();
-            provenance.push(ProvenanceRow {
-                call_id: 0,
-                op_id: long(4, DOC_SCRIPT_CALLS_BYTES),
-                instance: s(5).into(),
-                target_display: s(6).into(),
-                outcome: s(7).into(),
-            });
-            *logs = (0..=DOC_MAX_ROWS).map(|i| s(i).to_owned()).collect();
-            logs.push(long(8, DOC_SCRIPT_LOG_BYTES));
-            if long_first {
-                provenance.rotate_right(1);
-                logs.rotate_right(1);
-            }
-            *stderr = long(11, DOC_SCRIPT_STDERR_BYTES);
-        }
-        let d = render::document(&p, platform);
+        let d = render::document(&script_caps_preview(&strings, long_first), platform);
         prop_assert!(d.matches(IN_RECORD).count() >= 4);
         assert_inert(&d, platform);
+    }
+}
+
+/// The script item of `s06_script_caps_have_no_active_content`: every section past its row cap
+/// or its byte share, built from `strings` (12 of them).
+fn script_caps_preview(strings: &[String], long_first: bool) -> Preview {
+    let mut p = arbitrary_preview(18, strings);
+    let s = |i: usize| strings[i % strings.len()].as_str();
+    // Each text long enough to cross its share whatever the strings are (they may be empty), with
+    // markup, a lone `⟨` and a bidi control between them.
+    let long = |i: usize, bytes: usize| {
+        let mut t = String::new();
+        let mut k = i;
+        while t.len() < bytes {
+            t.push_str(s(k));
+            t.push_str("<b>⟨\u{202E}");
+            k += 1;
+        }
+        t
+    };
+    if let PreviewBody::Script {
+        source,
+        provenance,
+        logs,
+        stderr,
+        ..
+    } = &mut p.body
+    {
+        *source = (0..20_000)
+            .map(|i| format!("{}\n", s(i)))
+            .collect::<String>()
+            + &long(0, DOC_SCRIPT_SOURCE_BYTES);
+        *provenance = (0..=DOC_MAX_ROWS as u64)
+            .map(|i| ProvenanceRow {
+                call_id: i,
+                op_id: s(i as usize).into(),
+                instance: s(i as usize + 1).into(),
+                target_display: s(i as usize + 2).into(),
+                outcome: s(i as usize + 3).into(),
+            })
+            .collect();
+        provenance.push(ProvenanceRow {
+            call_id: 0,
+            op_id: long(4, DOC_SCRIPT_CALLS_BYTES),
+            instance: s(5).into(),
+            target_display: s(6).into(),
+            outcome: s(7).into(),
+        });
+        *logs = (0..=DOC_MAX_ROWS).map(|i| s(i).to_owned()).collect();
+        logs.push(long(8, DOC_SCRIPT_LOG_BYTES));
+        if long_first {
+            provenance.rotate_right(1);
+            logs.rotate_right(1);
+        }
+        *stderr = long(11, DOC_SCRIPT_STDERR_BYTES);
+    }
+    p
+}
+
+/// The CI seed of `s06_script_caps_have_no_active_content` (Rosetta leg, cc 1bf87d9a…): a byte
+/// share cut the "Host calls" text between 👩 U+200D and 💻, so the emitted text ended in a raw
+/// U+200D that the emitted text flags (it was exempt only inside the whole sequence).
+#[test]
+fn s06_script_caps_seed_cut_inside_an_emoji_sequence() {
+    let strings: Vec<String> = [
+        "<pre>\nx</pre>\t",
+        "\0\0\u{10004}",
+        "👩\u{200d}💻\u{ee1d2}\u{25d5a}\u{468}",
+        "\u{3cf10}\u{1de35}{",
+        "<pre>\nx</pre>\u{48286}={\r",
+        "</bdi>\u{52c41}B</bdi>",
+        "<iframe src=//x></iframe>M",
+        "\r\n",
+        "<form action=//x><input></form>&#8203;3",
+        "",
+        "",
+        "",
+    ]
+    .map(String::from)
+    .into();
+    for long_first in [true, false] {
+        let d = render::document(
+            &script_caps_preview(&strings, long_first),
+            Platform::Windows,
+        );
+        assert!(d.matches(IN_RECORD).count() >= 4);
+        assert_inert(&d, Platform::Windows);
+    }
+}
+
+/// A byte share's cut never splits an emoji sequence whose U+200D or U+FE0F it unflags: the cut
+/// moves back to the sequence's start, the text shown is a prefix of the value that its own
+/// classification leaves unflagged, and the note counts exactly the bytes not shown. Every cut
+/// position across the sequences (`pad`), for ZWJ and VS16 sequences.
+#[test]
+fn a_cut_never_splits_an_unflagging_emoji_sequence() {
+    for seq in [
+        "👩\u{200D}💻",
+        "👨\u{200D}👩\u{200D}👧",
+        "🏳\u{FE0F}\u{200D}🌈",
+        "#\u{FE0F}\u{20E3}",
+    ] {
+        for pad in 0..24 {
+            let stderr = "e".repeat(DOC_SCRIPT_STDERR_BYTES - 16 - pad) + &seq.repeat(4);
+            let mut p = script_preview(ScriptItemKind::Result);
+            if let PreviewBody::Script { stderr: s, .. } = &mut p.body {
+                s.clone_from(&stderr);
+            }
+            let d = doc(&p);
+            assert_inert(&d, Platform::MacOsLinux);
+            let section = script_section(&d, "stderr");
+            let shown = section
+                .strip_prefix("<h2>stderr</h2><pre><code><bdi>")
+                .and_then(|s| s.split_once("…</bdi></code></pre><p>"))
+                .map(|(shown, _)| shown)
+                .unwrap_or_else(|| panic!("{seq:?} {pad}: not cut"));
+            let note = format!(
+                "…</bdi></code></pre><p>{} more bytes {IN_RECORD}</p>",
+                stderr.len() - shown.len()
+            );
+            assert!(section.ends_with(&note), "{seq:?} {pad}: {note}");
+            let rest = stderr
+                .strip_prefix(shown)
+                .unwrap_or_else(|| panic!("{seq:?} {pad}: not a prefix"));
+            assert!(
+                rest.is_empty() || rest.starts_with(seq) || shown.ends_with('e'),
+                "{seq:?} {pad}: cut inside the sequence"
+            );
+            assert!(
+                !invisible::flags(shown).contains(&true),
+                "{seq:?} {pad}: a raw flagged char"
+            );
+        }
     }
 }
 

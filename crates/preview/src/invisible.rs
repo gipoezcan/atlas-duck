@@ -4,6 +4,8 @@
 //! Character data comes from `icu_properties` compiled data and RGI emoji sequences from the
 //! `emojis` table; both versions are part of [`crate::PREVIEW_BUILDER_VERSION`] (V31).
 
+use std::ops::Range;
+
 use icu_properties::props::{
     BidiControl, DefaultIgnorableCodePoint, ExtendedPictographic, GeneralCategory,
 };
@@ -52,12 +54,21 @@ pub fn is_bidi_control(c: char) -> bool {
 /// minimally-qualified and unqualified spellings to their fully-qualified entry, so the match
 /// compares `as_str()`. U+FE0E is never part of a fully-qualified emoji and so is never exempt.
 pub fn flags(s: &str) -> Vec<bool> {
+    flags_and_sequences(s).0
+}
+
+/// [`flags`], and the byte ranges of the RGI emoji sequences that unflag a character (in order,
+/// disjoint). A cut of `s` strictly inside one of them would change the flags of what is kept
+/// (the U+200D of a 👩‍💻 cut before the 💻 is flagged); a cut anywhere else keeps them: the
+/// flags of the prefix are the prefix of the flags (M8 S-06 proptest seed).
+pub fn flags_and_sequences(s: &str) -> (Vec<bool>, Vec<Range<usize>>) {
     let mut out: Vec<bool> = s.chars().map(is_flagged).collect();
+    let mut sequences = Vec::new();
     // Only ZWJ and the variation selectors can be unflagged: without them the sequence pass
     // changes nothing, and its index (16 bytes a char, 256 MiB for a 16 MiB candidate string,
     // I-37) is not built.
     if !s.contains([ZWJ, VS15, VS16]) {
-        return out;
+        return (out, sequences);
     }
     let chars: Vec<(usize, char)> = s.char_indices().collect();
     // Byte offset where char `k` starts (`s.len()` past the end): candidates are slices of `s`.
@@ -98,10 +109,15 @@ pub fn flags(s: &str) -> Vec<bool> {
             }
             match matched {
                 Some(end) => {
+                    let mut unflags = false;
                     for k in j..end {
                         if matches!(chars[k].1, ZWJ | VS15 | VS16) {
                             out[k] = false;
+                            unflags = true;
                         }
+                    }
+                    if unflags {
+                        sequences.push(byte_at(j)..byte_at(end));
                     }
                     j = end;
                 }
@@ -109,7 +125,7 @@ pub fn flags(s: &str) -> Vec<bool> {
             }
         }
     }
-    out
+    (out, sequences)
 }
 
 fn can_start_emoji(c: char) -> bool {
