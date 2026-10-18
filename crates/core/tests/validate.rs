@@ -199,8 +199,14 @@ fn schema_error_message_is_cut_on_a_boundary() -> TestResult {
             .strip_prefix("params/")
             .and_then(|m| m.strip_suffix(": additionalProperties"))
             .ok_or_else(|| format!("{lead}: {}", e.message))?;
-        let kept = path.strip_suffix('…').ok_or("a long path ends in an ellipsis")?;
-        assert_eq!(kept.matches('⟨').count(), kept.matches("⟨U+202E⟩").count(), "{lead}");
+        let kept = path
+            .strip_suffix('…')
+            .ok_or("a long path ends in an ellipsis")?;
+        assert_eq!(
+            kept.matches('⟨').count(),
+            kept.matches("⟨U+202E⟩").count(),
+            "{lead}"
+        );
         assert!(kept.ends_with('⟩') || !kept.contains('⟨'), "{lead}: {kept}");
         assert!(!kept.contains('\u{202E}'));
     }
