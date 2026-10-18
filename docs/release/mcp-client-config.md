@@ -23,11 +23,11 @@ Plan text: the wait includes app launch polling, reconnect and the `hello` hands
 
 ## Pending approvals
 
-> "On timeout: non-error result with `structuredContent` = the §4.2 envelope (`status: pending`) and the text `Approval pending. Call request_await with request_id=<id>. Do not resubmit.` (§4.6)
+> On timeout: non-error result with `structuredContent` = the §4.2 envelope (`status: pending`) and the text "Approval pending. Call request_await with request_id=<id>. Do not resubmit." (§4.6)
 
 > "**never resubmit a pending request — if the id was lost, find it with `requests list --match-params-file <same params>` and `await` it**" (§12.4)
 
-Plan text: to recover a lost request id through MCP, call `request_list` with `match_params` set to the same parameters, then `request_await` the id that comes back. Never submit the same operation again while its request is pending.
+Plan text: to recover a lost request id through MCP, call `request_list` with `match_params` set to `{op_id, params, instance?}`, where `op_id` is the operation and `params` are the same parameters. If `instance` is omitted, the `--instance` default of this MCP server applies to `match_params` (PD-124). The result is metadata only (request ids and status), so `request_await` the id that comes back. Never submit the same operation again while its request is pending.
 
 > "`notifications/cancelled` for a tool call stops waiting only; it never cancels the queued request (only `request_cancel` does)." (§4.6)
 
@@ -35,21 +35,23 @@ Plan text: to recover a lost request id through MCP, call `request_list` with `m
 
 > "Agent name = MCP `clientInfo.name` (unverified), overridable by `--agent`. `--instance X` sets the default instance for this MCP server." (§4.6)
 
-Plan text: the approver sees the agent name, so set `--agent` to a value that tells sessions apart. The spec's example pattern is `<tool>-<repo>`, for example `claude-code-billing-api`. The same pattern is used for `ATLAS_DUCK_AGENT` in the CLI:
+Plan text: the approver sees the agent name, so set `--agent` to a value that tells sessions apart. The spec's example pattern is `<tool>-<repo>`, for example `claude-code-billing-api`. Precedence (PD-122): `--agent` > `ATLAS_DUCK_AGENT` > MCP `clientInfo.name` > none. So `ATLAS_DUCK_AGENT` also applies inside the MCP server and overrides `clientInfo.name`. `--agent ""` counts as given: it means no agent, with no fallback to the env var or `clientInfo.name`. An empty `ATLAS_DUCK_AGENT` or an empty `clientInfo.name` counts as absent. The name is read once, at the first connect after `initialize`; a later reconnect reuses it. The `--agent ""` row is the plan's reading of lead ruling R2 and is pending lead confirmation (plan review m-7).
+
+Spec text for the CLI variable:
 
 > "set `ATLAS_DUCK_AGENT=<tool>-<repo>` once per session (e.g. `claude-code-billing-api`) and always pass `--reason`, so the approver can tell sessions apart" (§12.4)
 
 ## Restarts and upgrades
 
-> "after an atlas-duck upgrade, restart the MCP server" (§4.6)
+> "after an atlas-duck upgrade, restart the MCP server" (§12.4, l.1172)
 
-Plan text: the server keeps answering after an app restart and re-runs the handshake on the next tool call. Restart the MCP server anyway after an upgrade. The server reports the same instruction in its error text.
+Plan text: the server keeps answering after an app restart and re-runs the handshake on the next tool call. Restart the MCP server anyway after an upgrade. In these error results the server gives the same restart instruction: `protocol_mismatch`, every `unreachable` reason, and `pending` with `connection_lost`. Not `store_unavailable` and not `server_identity`, which carry no restart text (PD-123).
 
 > "atlas-duck was restarted or upgraded; restart this MCP server (or your MCP client) if this persists" (§4.6)
 
-## Reading list results
+## Several pending requests
 
-Use `request_list` with `match_params` to find pending or decided requests for the same operation. `request_status` never blocks and never returns data (§4.4, §12.4).
+Use `request_list` with `agent` and `state` (`pending` or `recent`) and `match_params` to find pending or decided requests for the same operation. The MCP form of `requests list --agent <name>` is `request_list {agent}`. `request_status` never blocks and never returns data (§4.4, §12.4).
 
 > "with several pending ids, use `requests list --agent <name>` to see which are decided, `await` only those, and do other work in between; `status` never blocks and never returns data" (§12.4)
 
