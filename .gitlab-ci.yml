@@ -75,6 +75,8 @@ rust:test:
     # to that point (signal reset, xauth/xvfb, pass-count) by the GitLab run of 94459e5..507d6b6.
     # M5 jira_flows run on GitHub only, for the same reason as cli_flows (ci.yml: every OS leg).
     # M7 confluence_flows run on GitHub only, for the same reason as cli_flows (ci.yml: every OS leg).
+    # M9 mcp_flows (it spawns `atlas-duck mcp` and the app), its S-02 MCP cases and the TypeScript
+    # conformance run (npm ci, spawns binaries) run on GitHub only, for the same reason as cli_flows.
     # M4 plan Task 26 (T26b): the M4 suite with the test-only features, the app's startup tests (the S-02 cases
     # run on GitHub: they need the cli_flows harness; no sudo in this image, so no S-01
     # other-user step; no second account on a container runner).

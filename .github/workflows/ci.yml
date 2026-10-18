@@ -344,6 +344,66 @@ jobs:
           node ci/check-no-skips.mjs $log $list $ignored script_flows
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # M9 plan Task 17: the MCP flows (app/src-tauri/tests/mcp_flows.rs: flows.rs, security.rs, the
+      # driver_* self-tests and conformance.rs) on the same harness. The pass-count minimum is
+      # derived from the target's own `--list` minus `--list --ignored`, never a literal: the pure
+      # driver_* and security.rs helper tests run without the opt-in and count as real passes, the
+      # #[ignore]d i05_ts_sdk_conformance (its own step below) and s02_app_survives_mcp_tree_kill
+      # (S-02 step) are excluded from the minimum, and a test added later raises it by itself.
+      - name: M9 mcp_flows (Linux, Xvfb + private session bus)
+        if: runner.os == 'Linux'
+        env:
+          CLI_FLOWS_TEST: mcp_flows
+        run: bash ci/cli-flows-linux.sh
+
+      - name: M9 mcp_flows (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          export ATLAS_DUCK_CLI_FLOWS=1
+          args=(test -p atlas-duck-app --features scripted-approver --locked --test mcp_flows)
+          cargo "${args[@]}" -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/mcp-flows.log"
+          cargo "${args[@]}" -- --list 2>/dev/null > "$RUNNER_TEMP/mcp-flows.list"
+          cargo "${args[@]}" -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/mcp-flows.ignored"
+          node ci/check-no-skips.mjs "$RUNNER_TEMP/mcp-flows.log" "$RUNNER_TEMP/mcp-flows.list" "$RUNNER_TEMP/mcp-flows.ignored" mcp_flows
+
+      - name: M9 mcp_flows (Windows, pwsh)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $env:ATLAS_DUCK_CLI_FLOWS = '1'
+          $a = @('test', '-p', 'atlas-duck-app', '--features', 'scripted-approver', '--locked', '--test', 'mcp_flows')
+          $log = Join-Path $env:RUNNER_TEMP 'mcp-flows.log'
+          $list = Join-Path $env:RUNNER_TEMP 'mcp-flows.list'
+          $ignored = Join-Path $env:RUNNER_TEMP 'mcp-flows.ignored'
+          cargo @a -- --nocapture --test-threads=2 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo @a -- --list 2>$null | Set-Content -Path $list -Encoding utf8
+          cargo @a -- --list --ignored 2>$null | Set-Content -Path $ignored -Encoding utf8
+          node ci/check-no-skips.mjs $log $list $ignored mcp_flows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # M9 plan Task 17 (plan review I-4): the official TypeScript SDK client against the real
+      # `atlas-duck mcp` (Task 15). Linux only; Node 22 comes from the setup-node step at the top of
+      # this job. `npm ci --ignore-scripts` installs only the lockfile's packages. The script runs
+      # the one #[ignore]d test (extra arguments: it skips its pass-count minimum but still fails on
+      # any "skipped:" line); the list file holding exactly that test makes check-no-skips fail
+      # unless it ran and passed (an empty ignored list, so nothing is subtracted).
+      - name: M9 TypeScript SDK conformance (Linux, #[ignore]d i05_ts_sdk_conformance)
+        if: runner.os == 'Linux'
+        env:
+          ATLAS_DUCK_MCP_CONFORMANCE: "1"
+          CLI_FLOWS_TEST: mcp_flows
+        run: |
+          set -euo pipefail
+          export TMPDIR="$PWD/.ci-tmp"
+          npm ci --ignore-scripts --prefix ci/mcp-conformance
+          bash ci/cli-flows-linux.sh --ignored --exact i05_ts_sdk_conformance
+          printf 'i05_ts_sdk_conformance: test\n' > "$RUNNER_TEMP/mcp-conformance.list"
+          : > "$RUNNER_TEMP/mcp-conformance.none"
+          node ci/check-no-skips.mjs "$TMPDIR/mcp_flows.log" "$RUNNER_TEMP/mcp-conformance.list" "$RUNNER_TEMP/mcp-conformance.none" mcp_flows
+
       - name: Core PAT keychain test (Windows Credential Manager, RF-3a, #[ignore]d)
         if: runner.os == 'Windows'
         run: cargo test -p atlas-duck-core --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked --test keychain_windows -- --ignored --test-threads=1 --nocapture
@@ -565,6 +625,30 @@ jobs:
           cargo @a -- --list --ignored s02_ 2>$null | Set-Content -Path $list -Encoding utf8
           Set-Content -Path $none -Value '' -Encoding utf8
           node ci/check-no-skips.mjs $log $list $none
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Select-String -Path $log -Pattern '(^|\s)V13 '
+
+      # M9 plan Task 17 (§13 S-02, V13, L28): the one #[ignore]d mcp_flows case,
+      # s02_app_survives_mcp_tree_kill (taskkill /T /F of `atlas-duck mcp`; refuses without
+      # CI=true). Same rules as the step above: an empty ignored list, no skip, and the `V13
+      # mcp_tree_kill_case=` evidence line echoed.
+      - name: M9 S-02 MCP launch survival (#[ignore]d, Windows; mcp tree kill)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ATLAS_DUCK_CLI_FLOWS: "1"
+          CI: "true"
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $a = @('test', '-p', 'atlas-duck-app', '--features', 'scripted-approver', '--locked', '--test', 'mcp_flows')
+          $log = Join-Path $env:RUNNER_TEMP 's02-mcp.log'
+          $list = Join-Path $env:RUNNER_TEMP 's02-mcp.list'
+          $none = Join-Path $env:RUNNER_TEMP 's02-mcp.none'
+          cargo @a -- --ignored s02_ --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo @a -- --list --ignored s02_ 2>$null | Set-Content -Path $list -Encoding utf8
+          Set-Content -Path $none -Value '' -Encoding utf8
+          node ci/check-no-skips.mjs $log $list $none mcp_flows
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Select-String -Path $log -Pattern '(^|\s)V13 '
 
@@ -1077,6 +1161,17 @@ jobs:
           cargo "${args[@]}" -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/script-flows.ignored"
           node ci/check-no-skips.mjs "$RUNNER_TEMP/script-flows.log" "$RUNNER_TEMP/script-flows.list" "$RUNNER_TEMP/script-flows.ignored" script_flows
 
+      # M9 plan Task 17: the mcp_flows target, x86_64 under Rosetta, as the jira_flows above.
+      - name: M9 mcp_flows x86_64-apple-darwin (no skips, pass-count minimum)
+        run: |
+          set -euo pipefail
+          export ATLAS_DUCK_CLI_FLOWS=1
+          args=(test -p atlas-duck-app --features scripted-approver --locked --target x86_64-apple-darwin --test mcp_flows)
+          cargo "${args[@]}" -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/mcp-flows.log"
+          cargo "${args[@]}" -- --list 2>/dev/null > "$RUNNER_TEMP/mcp-flows.list"
+          cargo "${args[@]}" -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/mcp-flows.ignored"
+          node ci/check-no-skips.mjs "$RUNNER_TEMP/mcp-flows.log" "$RUNNER_TEMP/mcp-flows.list" "$RUNNER_TEMP/mcp-flows.ignored" mcp_flows
+
       # M8 plan Task 6: the same sandbox_runs step as the native legs, x86_64 under Rosetta.
       - name: M8 sandbox_runs x86_64-apple-darwin (kill handles and reaper; §3.4, PD-137)
         env:
@@ -1568,6 +1663,34 @@ jobs:
 
       - name: cargo audit
         run: cargo audit
+
+      # M9 plan Task 17 (lead ruling R8): ADVISORY. The TypeScript conformance project is a test
+      # dependency only (CI, never shipped), so a finding is reported in the step summary and never
+      # fails the build; the Rust steps above stay blocking. `npm audit` reads only the lockfile (no
+      # `npm ci`). This job has no Node of its own, hence the pinned setup-node step first.
+      - name: Set up Node.js (for the advisory npm audit)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: MCP conformance npm audit (advisory)
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          status=0
+          npm audit --prefix ci/mcp-conformance --audit-level=high > "$RUNNER_TEMP/mcp-npm-audit.txt" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/mcp-npm-audit.txt"
+          {
+            echo "### MCP conformance npm audit (advisory)"
+            echo
+            echo "exit status: $status"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/mcp-npm-audit.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
 
       # M4 plan Task 26 (T26a). NOT the plan's `cargo tree ... --release` (cargo tree has no --release
       # flag, so that check errored into a vacuous pass) and not `-e features` (it hides root-enabled
