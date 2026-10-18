@@ -7,6 +7,7 @@
 
 pub(crate) mod call;
 pub(crate) mod config;
+pub(crate) mod progress;
 pub(crate) mod result;
 pub(crate) mod server;
 pub(crate) mod session;
@@ -31,7 +32,8 @@ use tokio::sync::Notify;
 pub(crate) use config::{McpConfig, ToolSet};
 
 use crate::connected::{Connector, OsConnector};
-use server::{AtlasMcp, HEARTBEAT_EVERY};
+use progress::HEARTBEAT_EVERY;
+use server::AtlasMcp;
 
 /// Tokio workers of the server: tool calls are mostly waits; the launch poll runs on a blocking
 /// thread of its own.

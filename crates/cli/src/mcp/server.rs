@@ -31,8 +31,6 @@ use crate::local;
 
 /// `serverInfo.name`.
 pub(crate) const SERVER_NAME: &str = "atlas-duck";
-/// PD-125: the heartbeat period of a waiting tool call (the rig sets a short one).
-pub(crate) const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
 
 /// A boxed `Send` future (rmcp runs every handler on its own task).
 pub(crate) type SendFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -40,9 +38,7 @@ pub(crate) type SendFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>
 /// What the server holds for every tool call.
 pub(crate) struct Shared {
     pub cfg: McpConfig,
-    /// `HEARTBEAT_EVERY` in production.
-    // Task 9's heartbeats read it.
-    #[allow(dead_code)]
+    /// `progress::HEARTBEAT_EVERY` in production (PD-125; only the rig sets a short one).
     pub heartbeat_every: Duration,
     /// The one IPC connection of this server (PD-115, PD-128).
     pub session: Session,
@@ -63,8 +59,6 @@ pub(crate) struct ToolCall {
 
 impl ToolCall {
     /// `_meta.progressToken` of the call (PD-125: no token, no notifications).
-    // Task 9's progress relay reads it.
-    #[allow(dead_code)]
     pub(crate) fn progress_token(&self) -> Option<ProgressToken> {
         self.context.meta.get_progress_token()
     }

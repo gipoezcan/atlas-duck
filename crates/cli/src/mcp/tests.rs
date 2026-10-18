@@ -18,7 +18,9 @@ use atlas_duck_ipc::proto::{
 };
 use atlas_duck_ipc::rpc::{IdParams, method};
 use rmcp::ServiceError;
-use rmcp::model::{ErrorCode as McpErrorCode, ProtocolVersion, RequestMetaObject};
+use rmcp::model::{
+    ErrorCode as McpErrorCode, ProgressToken, ProtocolVersion, RequestId, RequestMetaObject,
+};
 use rmcp::service::ClientLifecycleMode;
 use serde_json::{Map, Value, json};
 
@@ -2111,5 +2113,449 @@ async fn zero_timeout_returns_pending_at_once() -> TestResult {
     let awaits = rig.fake().awaits.lock().unwrap().clone();
     assert_eq!(awaits.len(), 1);
     assert_eq!(awaits.first().and_then(|a| a.timeout_ms), Some(0));
+    Ok(())
+}
+
+// ---------- progress, heartbeats, cancellation (Task 9) ----------
+
+/// One `notifications/progress` line as the server wrote it.
+struct Note {
+    /// Its place among every line the server wrote.
+    line: usize,
+    at: Instant,
+    params: Map<String, Value>,
+}
+
+impl Note {
+    fn message(&self) -> Option<&str> {
+        self.params.get("message").and_then(Value::as_str)
+    }
+
+    fn progress(&self) -> Option<f64> {
+        self.params.get("progress").and_then(Value::as_f64)
+    }
+
+    fn is_heartbeat(&self) -> bool {
+        !self.params.contains_key("message")
+    }
+}
+
+/// Every progress notification the server wrote, in wire order; for `token` only if given.
+fn notes_of(rig: &Rig, token: Option<&ProgressToken>) -> Vec<Note> {
+    let token = token.map(|t| serde_json::to_value(t).unwrap());
+    rig.timed_lines()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(line, (at, text))| {
+            let msg: Value = serde_json::from_str(&text).ok()?;
+            if msg["method"] != "notifications/progress" {
+                return None;
+            }
+            if let Some(token) = &token
+                && &msg["params"]["progressToken"] != token
+            {
+                return None;
+            }
+            Some(Note {
+                line,
+                at,
+                params: msg["params"].as_object()?.clone(),
+            })
+        })
+        .collect()
+}
+
+fn notes(rig: &Rig, token: &ProgressToken) -> Vec<Note> {
+    notes_of(rig, Some(token))
+}
+
+/// The status-change messages among `notes`.
+fn changes(notes: &[Note]) -> Vec<String> {
+    notes
+        .iter()
+        .filter_map(Note::message)
+        .filter(|m| m.starts_with("request_id="))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// PD-125: `progress` starts at 1 and strictly increases in wire order.
+fn assert_counter_from_one(notes: &[Note]) {
+    let counters: Vec<f64> = notes.iter().filter_map(Note::progress).collect();
+    assert_eq!(counters.len(), notes.len(), "a note without progress");
+    assert_eq!(counters.first(), Some(&1.0), "{counters:?}");
+    assert!(
+        counters.windows(2).all(|w| w[0] < w[1]),
+        "not strictly increasing: {counters:?}"
+    );
+}
+
+/// The place of the server's response to `id` among its lines, if it wrote one.
+fn response_line(rig: &Rig, id: &RequestId) -> Option<usize> {
+    let id = serde_json::to_value(id).unwrap();
+    rig.lines().iter().position(|text| {
+        serde_json::from_str::<Value>(text).is_ok_and(|msg| {
+            msg.get("id") == Some(&id)
+                && (msg.get("result").is_some() || msg.get("error").is_some())
+        })
+    })
+}
+
+/// An await script: status changes at offsets (ms), then optionally a decision (ms).
+fn script(progress: &[(u64, Status)], decision: Option<(u64, Envelope)>) -> AwaitScript {
+    AwaitScript {
+        progress: progress
+            .iter()
+            .map(|(ms, status)| (Duration::from_millis(*ms), *status))
+            .collect(),
+        decision: decision.map(|(ms, env)| (Duration::from_millis(ms), env)),
+    }
+}
+
+fn change_text(status: &str) -> String {
+    format!("request_id={REQ_ID} status={status}")
+}
+
+/// §4.6: a notification right after the submit names the id; it is the first one (before any
+/// heartbeat) and carries `progress: 1`; every notification precedes the result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i04_progress_right_after_submit_names_request_id() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    rig.fake()
+        .set_await_script(Some(script(&[], Some((600, released(json!({})))))));
+    let call = rig
+        .start("jira_issue_get", json!({"key": "A-1"}), true)
+        .await;
+    let (id, token) = (call.id.clone(), call.token.clone());
+    let called = rig.finish(call).await;
+    assert_eq!(called.envelope()["status"], "released");
+    let notes = notes(&rig, &token);
+    let first = notes.first().ok_or("no progress notification")?;
+    assert_eq!(
+        first.message(),
+        Some(format!("submitted request_id={REQ_ID} status=pending").as_str())
+    );
+    assert_eq!(first.progress(), Some(1.0));
+    // The wait lasted three heartbeat periods: the submit notice came before all of them.
+    assert!(notes.iter().skip(1).any(Note::is_heartbeat));
+    assert!(notes.iter().skip(1).all(|n| n.message().is_none()));
+    assert_counter_from_one(&notes);
+    let answered = response_line(&rig, &id).ok_or("no response line")?;
+    assert!(
+        notes.iter().all(|n| n.line < answered),
+        "a notification after the result"
+    );
+    Ok(())
+}
+
+/// PD-125 / §4.5: heartbeats come on the fixed timer from receipt, whatever the app sends: over
+/// about 1.1 s with status changes at irregular offsets, at least 4 heartbeats at least 150 ms
+/// apart; every change is relayed; the counter rises across all of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i04_heartbeat_period_independent_of_app_events() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    rig.fake().set_await_script(Some(script(
+        &[
+            (90, Status::Executing),
+            (130, Status::Pending),
+            (470, Status::Executing),
+            (530, Status::Pending),
+            (810, Status::Executing),
+        ],
+        Some((1_150, released(json!({})))),
+    )));
+    let call = rig
+        .start("jira_issue_get", json!({"key": "A-1"}), true)
+        .await;
+    let token = call.token.clone();
+    let called = rig.finish(call).await;
+    assert_eq!(called.envelope()["status"], "released");
+    let notes = notes(&rig, &token);
+    let beats: Vec<&Note> = notes.iter().filter(|n| n.is_heartbeat()).collect();
+    assert!(beats.len() >= 4, "{} heartbeats", beats.len());
+    for pair in beats.windows(2) {
+        let gap = pair[1].at.saturating_duration_since(pair[0].at);
+        assert!(
+            gap >= Duration::from_millis(150),
+            "heartbeats {gap:?} apart"
+        );
+    }
+    assert_eq!(
+        changes(&notes),
+        [
+            change_text("executing"),
+            change_text("pending"),
+            change_text("executing"),
+            change_text("pending"),
+            change_text("executing"),
+        ]
+    );
+    assert_counter_from_one(&notes);
+    Ok(())
+}
+
+/// PD-125: without `_meta.progressToken` nothing is sent, not even heartbeats.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_notifications_without_progress_token() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    rig.fake().set_await_script(Some(script(
+        &[(100, Status::Executing), (300, Status::Pending)],
+        Some((700, released(json!({})))),
+    )));
+    let op = rig
+        .call("jira_issue_get", json!({"key": "A-1"}), false)
+        .await;
+    assert_eq!(op.envelope()["status"], "released");
+    let awaited = rig
+        .call("request_await", json!({"request_id": REQ_ID}), false)
+        .await;
+    assert_eq!(awaited.envelope()["status"], "released");
+    assert_eq!(rig.fake().count(Kind::AwaitStart), 2);
+    assert!(notes_of(&rig, None).is_empty());
+    assert!(rig.all_progress().is_empty());
+    Ok(())
+}
+
+/// PD-125 "relayed once" per tool call: a status the app sends twice is one notification, and
+/// two `request_await` calls of the same id (each receiving both server copies, Δ1) relay it
+/// once each. `request_await` sends no submit notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i04_status_change_relayed_once() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    rig.fake().set_await_script(Some(script(
+        &[(100, Status::Executing), (300, Status::Executing)],
+        Some((500, released(json!({})))),
+    )));
+    let call = rig
+        .start("jira_issue_get", json!({"key": "A-1"}), true)
+        .await;
+    let token = call.token.clone();
+    rig.finish(call).await;
+    assert_eq!(changes(&notes(&rig, &token)), [change_text("executing")]);
+
+    rig.fake().set_await_script(Some(script(
+        &[(100, Status::Executing)],
+        Some((600, released(json!({})))),
+    )));
+    let a = rig
+        .start("request_await", json!({"request_id": REQ_ID}), true)
+        .await;
+    let b = rig
+        .start("request_await", json!({"request_id": REQ_ID}), true)
+        .await;
+    let (ta, tb) = (a.token.clone(), b.token.clone());
+    let (ra, rb) = tokio::join!(rig.finish(a), rig.finish(b));
+    assert_eq!(ra.envelope()["status"], "released");
+    assert_eq!(rb.envelope()["status"], "released");
+    assert_eq!(rig.fake().count(Kind::AwaitStart), 3);
+    for token in [ta, tb] {
+        let notes = notes(&rig, &token);
+        assert_eq!(changes(&notes), [change_text("executing")], "{token:?}");
+        assert!(
+            notes
+                .iter()
+                .filter_map(Note::message)
+                .all(|m| !m.starts_with("submitted")),
+            "{token:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A `request_id` as PD-118's pattern has it.
+fn is_request_id(id: &str) -> bool {
+    id.strip_prefix("req_").is_some_and(|rest| {
+        (20..=64).contains(&rest.len())
+            && rest
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    })
+}
+
+/// One of PD-125's two message shapes.
+fn is_progress_message(m: &str) -> bool {
+    if let Some(rest) = m.strip_prefix("submitted request_id=") {
+        return rest
+            .strip_suffix(" status=pending")
+            .is_some_and(is_request_id);
+    }
+    m.strip_prefix("request_id=")
+        .and_then(|rest| rest.split_once(" status="))
+        .is_some_and(|(id, status)| {
+            is_request_id(id) && serde_json::from_value::<Status>(Value::from(status)).is_ok()
+        })
+}
+
+/// §4.5 opacity: a notification's params are exactly `progressToken`, `progress` and an
+/// optional `message` of one of the two PD-125 shapes; nothing else (no `total`, no `_meta`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i04_progress_carries_only_request_id_and_status() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    rig.fake().set_await_script(Some(script(
+        &[(100, Status::Executing), (350, Status::Pending)],
+        Some((700, released(json!({"secret": "data"})))),
+    )));
+    rig.call("jira_issue_get", json!({"key": "A-1"}), true)
+        .await;
+    rig.call("request_await", json!({"request_id": REQ_ID}), true)
+        .await;
+    let notes = notes_of(&rig, None);
+    assert!(notes.iter().any(Note::is_heartbeat));
+    assert!(notes.iter().any(|n| {
+        n.message()
+            .is_some_and(|m| m.starts_with("submitted request_id="))
+    }));
+    assert!(!changes(&notes).is_empty());
+    for note in &notes {
+        let mut keys: Vec<&str> = note.params.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let allowed = if note.is_heartbeat() {
+            vec!["progress", "progressToken"]
+        } else {
+            vec!["message", "progress", "progressToken"]
+        };
+        assert_eq!(keys, allowed, "{:?}", note.params);
+        if let Some(m) = note.message() {
+            assert!(is_progress_message(m), "{m}");
+        }
+    }
+    Ok(())
+}
+
+/// §4.6: an await that ends undecided at `ATLAS_DUCK_MCP_TIMEOUT` is `pending`, not an error,
+/// and its first text block is the timeout sentence with the id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i04_timeout_result_is_pending_non_error_with_text() -> TestResult {
+    let rig = Rig::new(RigOpts {
+        timeout: Some(Duration::from_secs(2)),
+        ..RigOpts::default()
+    })
+    .await;
+    // No decision: the app answers `pending` at the await's `timeout_ms`.
+    rig.fake().set_await_script(Some(AwaitScript::default()));
+    let start = Instant::now();
+    let called = rig
+        .call("jira_issue_get", json!({"key": "A-1"}), true)
+        .await;
+    let took = start.elapsed();
+    let env = called.envelope();
+    assert_eq!(env["status"], "pending");
+    assert_eq!(env["request_id"], REQ_ID);
+    assert!(!called.is_error(), "{:?}", called.texts());
+    assert_eq!(
+        called.texts().first().map(String::as_str),
+        Some(
+            format!(
+                "Approval pending. Call request_await with request_id={REQ_ID}. Do not resubmit."
+            )
+            .as_str()
+        )
+    );
+    assert!(
+        took >= Duration::from_millis(1_500) && took < Duration::from_secs(5),
+        "{took:?}"
+    );
+    Ok(())
+}
+
+/// PD-126 / §4.6: `notifications/cancelled` stops the wait only: no `request.cancel`, no
+/// response for that id, no more heartbeats; the request lives on and `request_await` still
+/// gets its decision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i04_cancelled_notification_stops_waiting_never_cancels() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    // The app holds the await until its `timeout_ms` (5 s).
+    rig.fake().set_await_script(Some(AwaitScript::default()));
+    let call = rig
+        .start("jira_issue_get", json!({"key": "A-1"}), true)
+        .await;
+    let (id, token) = (call.id.clone(), call.token.clone());
+    rig.fake().wait_for(Kind::AwaitStart, 1).await;
+    until("a heartbeat", || {
+        notes(&rig, &token).iter().any(Note::is_heartbeat)
+    })
+    .await;
+    call.cancel().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let settled = notes(&rig, &token).len();
+    // Two seconds after the cancel: nothing more for that call, and the app cancelled nothing.
+    tokio::time::sleep(Duration::from_millis(1_700)).await;
+    assert_eq!(notes(&rig, &token).len(), settled, "the wait went on");
+    assert_eq!(
+        response_line(&rig, &id),
+        None,
+        "a response to a cancelled call"
+    );
+    assert_eq!(rig.fake().count(Kind::Cancel), 0);
+
+    rig.fake()
+        .set_await_script(Some(script(&[], Some((100, released(json!({"n": 1})))))));
+    let again = rig
+        .call("request_await", json!({"request_id": REQ_ID}), true)
+        .await;
+    assert_eq!(again.envelope()["status"], "released");
+    assert_eq!(rig.fake().count(Kind::Cancel), 0);
+    Ok(())
+}
+
+/// PD-126: a cancel that arrives while the submit is in flight lets it complete (exactly one
+/// submit, never resent); its answer is discarded: no response, no notification, no wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_during_submit_completes_submit() -> TestResult {
+    let mut fake = RigOpts::default().fake;
+    fake.submit_delay = Duration::from_millis(500);
+    let rig = Rig::new(RigOpts {
+        fake,
+        ..RigOpts::default()
+    })
+    .await;
+    let call = rig
+        .start("jira_issue_get", json!({"key": "A-1"}), true)
+        .await;
+    let (id, token) = (call.id.clone(), call.token.clone());
+    // The Fake records the submit event on arrival and the submit itself after the delay.
+    rig.fake().wait_for(Kind::Submit, 1).await;
+    assert!(
+        submits(&rig).is_empty(),
+        "the submit answered before the cancel"
+    );
+    call.cancel().await;
+    until("the submit completed", || submits(&rig).len() == 1).await;
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert_eq!(rig.fake().count(Kind::Submit), 1);
+    assert_eq!(submits(&rig).len(), 1);
+    assert_eq!(
+        response_line(&rig, &id),
+        None,
+        "a response to a cancelled call"
+    );
+    assert!(
+        notes(&rig, &token).is_empty(),
+        "a notification after the cancel"
+    );
+    assert_eq!(rig.fake().count(Kind::AwaitStart), 0);
+    assert_eq!(rig.fake().count(Kind::Cancel), 0);
+    Ok(())
+}
+
+/// PD-115 / PD-126 (the cancelled-call clause moved from Task 7): a cancelled tool call keeps
+/// the shared connection; the next call uses it, with no new hello.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_tool_call_keeps_the_connection() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    rig.fake().set_await_script(Some(AwaitScript::default()));
+    let call = rig
+        .start("request_await", json!({"request_id": REQ_ID}), true)
+        .await;
+    rig.fake().wait_for(Kind::AwaitStart, 1).await;
+    call.cancel().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let status = rig
+        .call("request_status", json!({"request_id": REQ_ID}), false)
+        .await;
+    assert!(!status.is_error(), "{:?}", status.texts());
+    assert_eq!(rig.fake().count(Kind::Status), 1);
+    assert_eq!(rig.fake().hellos().len(), 1);
+    assert_eq!(rig.fake().count(Kind::Cancel), 0);
     Ok(())
 }

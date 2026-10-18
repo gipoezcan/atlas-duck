@@ -280,7 +280,8 @@ pub(crate) struct Rig {
     pub app: RigApp,
     client: RunningService<RoleClient, RigClient>,
     progress: Arc<Mutex<Vec<ProgressNotificationParam>>>,
-    lines: Arc<Mutex<Vec<String>>>,
+    /// Every line the server wrote, in wire order, with the time the pump read it.
+    lines: Arc<Mutex<Vec<(Instant, String)>>>,
     close: Arc<Notify>,
     serve: Mutex<Option<JoinHandle<io::Result<()>>>>,
 }
@@ -444,6 +445,15 @@ impl Rig {
 
     /// Every line the server wrote so far, without its `\n`.
     pub(crate) fn lines(&self) -> Vec<String> {
+        self.timed_lines()
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect()
+    }
+
+    /// [`Rig::lines`] with the time each line arrived. Wire order: rmcp's client handles each
+    /// notification on a task of its own, so only these lines show the order the server sent.
+    pub(crate) fn timed_lines(&self) -> Vec<(Instant, String)> {
         self.lines.lock().unwrap().clone()
     }
 
@@ -495,8 +505,8 @@ where
     let _ = to.shutdown().await;
 }
 
-/// Server to client: whole lines, each recorded.
-async fn pump_down<R, W>(from: R, mut to: W, lines: Arc<Mutex<Vec<String>>>)
+/// Server to client: whole lines, each recorded with its arrival time.
+async fn pump_down<R, W>(from: R, mut to: W, lines: Arc<Mutex<Vec<(Instant, String)>>>)
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -512,7 +522,7 @@ where
                 lines
                     .lock()
                     .unwrap()
-                    .push(text.trim_end_matches('\n').to_owned());
+                    .push((Instant::now(), text.trim_end_matches('\n').to_owned()));
                 if to.write_all(&line).await.is_err() || to.flush().await.is_err() {
                     break;
                 }

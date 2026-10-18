@@ -9,15 +9,15 @@
 //! still written) stops a body the way an interrupt stops the CLI, so the answer is true either
 //! way: before anything was sent it is `launch_timeout` (nothing queued), a submit runs to its
 //! answer (PD-126), and a wait ends with the request still `pending`. Only `request_cancel`
-//! sends `request.cancel`.
+//! sends `request.cancel`. A call with a progress token hears "submitted", the status changes
+//! and heartbeats while it waits (PD-125, `progress`); a short call hears nothing.
 
 use std::future::Future;
+use std::sync::Arc;
 
 use atlas_duck_ipc::client::{ClientError, SharedClient};
 use atlas_duck_ipc::envelope::{Envelope, Status};
-use atlas_duck_ipc::proto::{
-    AwaitParams, MatchParams, ProgressNotification, SubmitParams, SubmitReply,
-};
+use atlas_duck_ipc::proto::{AwaitParams, MatchParams, SubmitParams, SubmitReply};
 use atlas_duck_ipc::rpc::{
     EmptyParams, IdParams, OpsDescribeParams, OpsListParams, RequestsListParams, method,
 };
@@ -25,6 +25,7 @@ use atlas_duck_registry::SCRIPT_RUN;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
+use super::progress::{Progress, ProgressPeer, wait_with_progress};
 use super::server::{SendFuture, Shared, ToolBodies, ToolCall, unknown_tool};
 use super::tools::{CALL_TOOL, op_for_tool, split_op_args};
 use crate::argv::DryRun;
@@ -36,29 +37,17 @@ use crate::flow::{
 };
 use crate::launch;
 
-/// What a waiting tool call tells its client while it waits (Task 9: progress notifications).
-pub(crate) trait Relay: Send {
-    /// The submit was answered `pending` with this id.
-    fn submitted(&mut self, request_id: &str);
-    /// The app relayed a status change of the awaited request.
-    fn status(&mut self, n: &ProgressNotification);
-}
-
-/// Tells nothing.
-pub(crate) struct NoRelay;
-
-impl Relay for NoRelay {
-    fn submitted(&mut self, _request_id: &str) {}
-
-    fn status(&mut self, _n: &ProgressNotification) {}
-}
-
 /// The tool bodies the server runs.
 pub(crate) struct Bodies;
 
 impl ToolBodies for Bodies {
     fn call<'a>(&'a self, shared: &'a Shared, call: ToolCall) -> SendFuture<'a, Envelope> {
-        Box::pin(async move { Body::new(shared, call).run(&mut NoRelay).await })
+        Box::pin(async move {
+            // PD-125: only the waiting tools use it; a short call sends nothing.
+            let peer: Arc<dyn ProgressPeer> = Arc::new(call.context.peer.clone());
+            let mut progress = Progress::new(call.progress_token(), peer);
+            Body::new(shared, call).run(&mut progress).await
+        })
     }
 }
 
@@ -81,17 +70,17 @@ impl<'a> Body<'a> {
         }
     }
 
-    async fn run(&self, relay: &mut dyn Relay) -> Envelope {
+    async fn run(&self, progress: &mut Progress) -> Envelope {
         let args = &self.call.args;
         let id = || IdParams {
             request_id: string_arg(args, "request_id").unwrap_or_default(),
         };
         match self.call.name.as_str() {
-            "script_run" => self.script_run(relay).await,
-            CALL_TOOL => self.generic_call(relay).await,
+            "script_run" => self.script_run(progress).await,
+            CALL_TOOL => self.generic_call(progress).await,
             "request_await" => {
                 let id = id().request_id;
-                self.await_tool(&id, relay).await
+                self.await_tool(&id, progress).await
             }
             "request_status" => self.short(method::REQUEST_STATUS, id()).await,
             "request_cancel" => self.short(method::REQUEST_CANCEL, id()).await,
@@ -112,7 +101,7 @@ impl<'a> Body<'a> {
             }
             "instances_list" => self.short(method::INSTANCES_LIST, EmptyParams {}).await,
             name => match op_for_tool(name) {
-                Some(spec) => self.op_tool(spec.id, relay).await,
+                Some(spec) => self.op_tool(spec.id, progress).await,
                 None => unknown_tool(name),
             },
         }
@@ -120,7 +109,7 @@ impl<'a> Body<'a> {
 
     // ---- the tools ----
 
-    async fn op_tool(&self, op_id: &str, relay: &mut dyn Relay) -> Envelope {
+    async fn op_tool(&self, op_id: &str, progress: &mut Progress) -> Envelope {
         let (params, reason, instance) = match split_op_args(self.call.args.clone()) {
             Ok(split) => split,
             Err(env) => return env,
@@ -131,11 +120,11 @@ impl<'a> Body<'a> {
             instance: self.or_default_instance(instance),
             reason,
         };
-        self.submit_and_wait(method::REQUEST_SUBMIT, sp, relay)
+        self.submit_and_wait(method::REQUEST_SUBMIT, sp, progress)
             .await
     }
 
-    async fn generic_call(&self, relay: &mut dyn Relay) -> Envelope {
+    async fn generic_call(&self, progress: &mut Progress) -> Envelope {
         let args = &self.call.args;
         let sp = SubmitParams {
             op_id: string_arg(args, "op_id").unwrap_or_default(),
@@ -146,12 +135,12 @@ impl<'a> Body<'a> {
             instance: self.or_default_instance(string_arg(args, "instance")),
             reason: string_arg(args, "reason"),
         };
-        self.submit_and_wait(method::REQUEST_SUBMIT, sp, relay)
+        self.submit_and_wait(method::REQUEST_SUBMIT, sp, progress)
             .await
     }
 
     /// §9.1: `{source, args, limits?, dry_run?}`; §4.4 + PD-124: a script names no instance.
-    async fn script_run(&self, relay: &mut dyn Relay) -> Envelope {
+    async fn script_run(&self, progress: &mut Progress) -> Envelope {
         let args = &self.call.args;
         let source = string_arg(args, "source").unwrap_or_default();
         let script_args = args
@@ -169,16 +158,18 @@ impl<'a> Body<'a> {
             instance: None,
             reason: string_arg(args, "reason"),
         };
-        self.submit_and_wait(method::SCRIPT_SUBMIT, sp, relay).await
+        self.submit_and_wait(method::SCRIPT_SUBMIT, sp, progress)
+            .await
     }
 
-    async fn await_tool(&self, request_id: &str, relay: &mut dyn Relay) -> Envelope {
+    async fn await_tool(&self, request_id: &str, progress: &mut Progress) -> Envelope {
         let client = match self.connect().await {
             Ok(client) => client,
             Err(env) => return env,
         };
         let base = pending_for(request_id, None);
-        self.await_request(&client, request_id, &base, relay).await
+        self.await_request(&client, request_id, &base, progress)
+            .await
     }
 
     /// L66: the agent filter only from the tool's own `agent` argument; PD-124: a match without
@@ -229,7 +220,7 @@ impl<'a> Body<'a> {
         &self,
         name: &str,
         sp: SubmitParams,
-        relay: &mut dyn Relay,
+        progress: &mut Progress,
     ) -> Envelope {
         let client = match self.connect().await {
             Ok(client) => client,
@@ -261,13 +252,16 @@ impl<'a> Body<'a> {
         let Some(request_id) = envelope.request_id.clone() else {
             return protocol_failure();
         };
-        // PD-127: no stderr notice in MCP mode; the id reaches the agent through the relay and
-        // the result.
-        relay.submitted(&request_id);
+        // PD-127: no stderr notice in MCP mode; the id reaches the agent through the "submitted"
+        // notification (PD-125) and the result. A call the client cancelled meanwhile hears
+        // nothing more (PD-126).
+        if !self.call.context.ct.is_cancelled() {
+            progress.submitted(&request_id).await;
+        }
         if self.zero_timeout() {
             return envelope;
         }
-        self.await_request(&client, &request_id, &envelope, relay)
+        self.await_request(&client, &request_id, &envelope, progress)
             .await
     }
 
@@ -278,7 +272,7 @@ impl<'a> Body<'a> {
         client: &SharedClient,
         id: &str,
         base: &Envelope,
-        relay: &mut dyn Relay,
+        progress: &mut Progress,
     ) -> Envelope {
         let zero = self.zero_timeout();
         let params = AwaitParams {
@@ -292,16 +286,27 @@ impl<'a> Body<'a> {
         } else {
             at.checked_add(AWAIT_SLACK).unwrap_or(at)
         };
-        let mut on_progress = |n: ProgressNotification| relay.status(&n);
+        let mut on_progress = progress.relay();
         let waiting = client.call_with_progress::<Envelope>(
             method::REQUEST_AWAIT,
             params,
             Some(at),
             &mut on_progress,
         );
-        // Cancelled: stop waiting only (PD-126). The dropped call never tears the stream, and
-        // the request lives on.
-        let Some(sent) = self.unless_cancelled(waiting).await else {
+        // PD-125: status changes and heartbeats from the receipt while it waits. Cancelled:
+        // stop waiting only (PD-126). The dropped call never tears the stream, and the request
+        // lives on; rmcp drops this answer after a client's cancel and writes it at stdin EOF,
+        // so it says what is true either way: still pending.
+        let receipt = tokio::time::Instant::from_std(self.call.receipt);
+        let Some(sent) = wait_with_progress(
+            waiting,
+            progress,
+            receipt,
+            self.shared.heartbeat_every,
+            self.call.context.ct.cancelled(),
+        )
+        .await
+        else {
             return base.clone();
         };
         match sent.result {
