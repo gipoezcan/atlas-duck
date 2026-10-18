@@ -19,7 +19,7 @@ use std::io;
 use atlas_duck_ipc::sandbox::script::{InstanceInfo, WorkerInit, encode_response};
 use atlas_duck_ipc::sandbox::{HostCall, HostCallResult, ScriptLimits};
 use atlas_duck_sandbox_worker::script::{Engine, HostPort, Settled};
-use fixtures::{MIB, TextMix, jira_star_all_search};
+use fixtures::{MIB, TextMix, jira_dense_search, jira_star_all_search};
 use serde_json::{Value, json};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -140,22 +140,38 @@ fn init(source: &str) -> WorkerInit {
     }
 }
 
-/// Every text mix at every size, one `K` line each; asserts only `k_peak >= k_retained > 1`.
+/// Every shape (text-heavy `all`, small-object `dense`) and text mix at every size, one `K` line
+/// each. Asserts `k_retained > 1` (the held answer is in the tree) and `k_peak - k_retained >=
+/// 0.5`: the peak is a running maximum, so only the gap proves that the host frame's text was
+/// live next to the tree at the peak (PD-131; the ascii mix measures about 1.0, one frame).
 fn run_sizes(mibs: &'static [usize]) -> TestResult {
     big_stack(move || {
         for &mib in mibs {
-            for mix in TextMix::ALL {
-                let value = jira_star_all_search(0x5eed, mix, mib * MIB);
-                let name = format!("jira-all-{}", mix.name());
-                let m = measure(&name, &value)?;
-                println!("{}", k_line(&m));
-                if !(m.k_peak() >= m.k_retained() && m.k_retained() > 1.0) {
-                    return Err(format!("{}: {}", name, k_line(&m)));
+            for (shape, make) in [
+                (
+                    "all",
+                    jira_star_all_search as fn(u64, TextMix, usize) -> Value,
+                ),
+                ("dense", jira_dense_search),
+            ] {
+                for mix in TextMix::ALL {
+                    let value = make(0x5eed, mix, mib * MIB);
+                    let name = format!("jira-{shape}-{}", mix.name());
+                    let m = measure(&name, &value)?;
+                    println!("{}", k_line(&m));
+                    if !whole_frame_live(&m) {
+                        return Err(format!("{}: {}", name, k_line(&m)));
+                    }
                 }
             }
         }
         Ok(())
     })
+}
+
+/// `k_retained > 1` and the peak exceeds what stays by at least half the result's size.
+fn whole_frame_live(m: &Measured) -> bool {
+    m.k_retained() > 1.0 && m.k_peak() - m.k_retained() >= 0.5
 }
 
 #[test]
@@ -217,4 +233,84 @@ fn k_fixture_has_non_latin1_text() {
     let ascii =
         serde_json::to_string(&jira_star_all_search(7, TextMix::Ascii, target)).unwrap_or_default();
     assert!(!ascii.is_empty() && ascii.is_ascii());
+    // Sparse and wide frames really hold non-Latin-1 text, in both shapes; ascii never does.
+    for make in [jira_star_all_search, jira_dense_search] {
+        for mix in [TextMix::Sparse, TextMix::Wide] {
+            let text = serde_json::to_string(&make(7, mix, target)).unwrap_or_default();
+            assert!(
+                text.chars().any(|c| c > '\u{ff}'),
+                "{} has no non-Latin-1 text",
+                mix.name()
+            );
+        }
+        let ascii = serde_json::to_string(&make(7, TextMix::Ascii, target)).unwrap_or_default();
+        assert!(ascii.is_ascii());
+    }
+}
+
+#[test]
+fn k_sparse_texts_each_have_a_wide_character() {
+    // Every long string of the sparse fixture (descriptions and comment bodies, 40+ words) is
+    // 16-bit in QuickJS, not 98 % of them.
+    let value = jira_star_all_search(7, TextMix::Sparse, MIB);
+    let mut long = 0;
+    for issue in value["issues"].as_array().into_iter().flatten() {
+        let mut texts = vec![issue["fields"]["description"].as_str()];
+        for c in issue["fields"]["comment"]["comments"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            texts.push(c["body"].as_str());
+        }
+        for t in texts {
+            let t = t.unwrap_or_default();
+            assert!(t.split(' ').count() >= 40);
+            assert!(t.chars().any(|c| c > '\u{ff}'), "8-bit text: {t}");
+            long += 1;
+        }
+    }
+    assert!(long > 20, "{long}");
+}
+
+#[test]
+fn k_dense_fixture_is_dense_and_sized() {
+    let target = MIB;
+    let value = jira_dense_search(7, TextMix::Mixed, target);
+    let text = serde_json::to_string(&value).unwrap_or_default();
+    assert!(
+        text.len() <= target && text.len() > target - 64 * 1024,
+        "{}",
+        text.len()
+    );
+    let issue = &value["issues"][0];
+    assert!(issue["changelog"]["histories"][0]["items"][0]["field"].is_string());
+    assert!(issue["fields"]["issuelinks"][0]["outwardIssue"]["key"].is_string());
+    assert!(issue["fields"]["worklog"]["worklogs"][0]["timeSpentSeconds"].is_u64());
+    assert_eq!(
+        issue["fields"]["watcherIds"].as_array().map(Vec::len),
+        Some(100)
+    );
+    // Null-heavy, and the same seed gives the same text.
+    assert!(text.matches("null").count() > 500);
+    assert_eq!(
+        text,
+        serde_json::to_string(&jira_dense_search(7, TextMix::Mixed, target)).unwrap_or_default()
+    );
+}
+
+/// The whole-frame assertion bites: a measurement whose peak is only what stays (a delivery that
+/// parsed from a Rust buffer or freed the text early) is refused, a frame-sized gap is accepted.
+#[test]
+fn k_whole_frame_assertion_bites() {
+    let m = |heap_peak, retained| Measured {
+        fixture: "x".to_owned(),
+        bytes: 1000,
+        heap_peak,
+        retained,
+    };
+    assert!(whole_frame_live(&m(3500, 2500)));
+    assert!(!whole_frame_live(&m(2500, 2500)));
+    assert!(!whole_frame_live(&m(2900, 2500)));
+    assert!(!whole_frame_live(&m(900, 800)));
 }

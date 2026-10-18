@@ -23,8 +23,10 @@ pub enum TextMix {
     Ascii,
     /// Mostly ASCII with umlauts, CJK and emoji: the realistic mix.
     Mixed,
-    /// ASCII with a few non-Latin-1 characters per text: nearly every long string and the whole
-    /// frame become 16-bit although the text is almost all ASCII (the worst case for `k`).
+    /// ASCII with about 2 % of the words non-Latin-1, and at least one wide character in every
+    /// text (every string `text` builds, short or long): those strings and the whole frame become
+    /// 16-bit although the text is almost all ASCII. Fixed strings (URLs, dates, ids, labels) stay
+    /// 8-bit.
     Sparse,
     /// Mostly CJK, the worst case for 16-bit strings.
     Wide,
@@ -153,6 +155,13 @@ fn text(rng: &mut Rng, mix: TextMix, words: usize) -> String {
             rng.pick(EMOJI)
         };
         out.push_str(word);
+    }
+    // The sparse mix promises a character above U+00FF in every text, however short or lucky.
+    if mix == TextMix::Sparse && !out.chars().any(|c| c > '\u{ff}') {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(rng.pick(CJK_WORDS));
     }
     out
 }
@@ -317,6 +326,115 @@ fn issue(rng: &mut Rng, mix: TextMix, n: usize) -> Value {
     })
 }
 
+/// A compact user reference, as changelog and worklog entries carry it.
+fn small_user(rng: &mut Rng, mix: TextMix, n: usize) -> Value {
+    json!({ "name": format!("user{n}"), "key": format!("JIRAUSER{}", 10000 + n),
+            "displayName": text(rng, mix, 2), "active": true })
+}
+
+/// One changelog history: a few `{field, from, to, ..}` items, some with null sides.
+fn history(rng: &mut Rng, mix: TextMix, n: usize) -> Value {
+    const FIELDS: &[&str] = &[
+        "status",
+        "assignee",
+        "priority",
+        "resolution",
+        "Sprint",
+        "labels",
+    ];
+    let items: Vec<Value> = (0..rng.between(1, 3))
+        .map(|_| {
+            let field = FIELDS[rng.below(FIELDS.len())];
+            let (from, to) = (rng.below(12), rng.below(12));
+            let null_side = rng.below(4);
+            json!({
+                "field": field,
+                "fieldtype": "jira",
+                "from": if null_side == 0 { Value::Null } else { json!(from.to_string()) },
+                "fromString": if null_side == 0 { Value::Null } else { json!(rng.pick(ASCII_WORDS)) },
+                "to": if null_side == 1 { Value::Null } else { json!(to.to_string()) },
+                "toString": if null_side == 1 { Value::Null } else { json!(text(rng, mix, 1)) },
+            })
+        })
+        .collect();
+    json!({ "id": (700_000 + n).to_string(), "author": small_user(rng, mix, n % 9),
+            "created": "2026-09-30T10:11:12.131+0200", "items": items })
+}
+
+/// A Jira issue of many small values: a long changelog, issuelinks, worklogs, arrays of ids and
+/// small numbers, and null-heavy custom fields. Little long text, many tiny strings and numbers.
+fn dense_issue(rng: &mut Rng, mix: TextMix, n: usize) -> Value {
+    let histories: Vec<Value> = (0..rng.between(30, 80))
+        .map(|j| history(rng, mix, j))
+        .collect();
+    let history_count = histories.len();
+    let links: Vec<Value> = (0..rng.between(5, 15))
+        .map(|j| {
+            json!({
+                "id": (800_000 + n * 20 + j).to_string(),
+                "type": { "id": "10003", "name": "Relates", "inward": "relates to", "outward": "relates to" },
+                "outwardIssue": {
+                    "id": (20_000 + j).to_string(), "key": format!("KFAC-{}", 900 + j),
+                    "self": format!("https://jira.example.invalid/rest/api/2/issue/{}", 20_000 + j),
+                    "fields": { "summary": text(rng, mix, 4),
+                                "status": { "id": "3", "name": "In Progress" },
+                                "priority": { "id": "3", "name": "Medium" } },
+                },
+            })
+        })
+        .collect();
+    let worklogs: Vec<Value> = (0..rng.between(10, 30))
+        .map(|j| {
+            let seconds = 900 * rng.between(1, 16);
+            json!({
+                "id": (900_000 + n * 40 + j).to_string(), "author": small_user(rng, mix, j % 9),
+                "started": "2026-10-02T08:00:00.000+0200", "timeSpent": format!("{}m", seconds / 60),
+                "timeSpentSeconds": seconds, "comment": text(rng, mix, 3),
+            })
+        })
+        .collect();
+    let ids = |rng: &mut Rng, count: usize, range: usize| -> Vec<Value> {
+        (0..count).map(|_| json!(rng.below(range))).collect()
+    };
+    let mut fields = Map::new();
+    fields.insert("summary".into(), json!(text(rng, mix, 6)));
+    fields.insert(
+        "status".into(),
+        json!({ "id": "3", "name": "In Progress", "statusCategory": { "id": 4, "key": "indeterminate" } }),
+    );
+    fields.insert("issuelinks".into(), Value::Array(links));
+    fields.insert(
+        "worklog".into(),
+        json!({ "startAt": 0, "maxResults": worklogs.len(), "total": worklogs.len(), "worklogs": worklogs }),
+    );
+    fields.insert("fixVersionIds".into(), Value::Array(ids(rng, 60, 500)));
+    fields.insert("watcherIds".into(), Value::Array(ids(rng, 100, 10)));
+    fields.insert(
+        "estimates".into(),
+        Value::Array((0..120).map(|_| json!(rng.below(9) as f64 / 2.0)).collect()),
+    );
+    fields.insert(
+        "idStrings".into(),
+        Value::Array((0..80).map(|_| json!(rng.below(100).to_string())).collect()),
+    );
+    // Null-heavy: three in four custom fields are null, the rest small numbers or booleans.
+    for i in 0..60 {
+        let value = match rng.below(8) {
+            0 => json!(rng.below(10)),
+            1 => json!(rng.below(2) == 0),
+            _ => Value::Null,
+        };
+        fields.insert(format!("customfield_{}", 10000 + i), value);
+    }
+    json!({
+        "id": (10000 + n).to_string(),
+        "key": format!("KFAC-{}", n + 1),
+        "fields": Value::Object(fields),
+        "changelog": { "startAt": 0, "maxResults": history_count, "total": history_count,
+                       "histories": histories },
+    })
+}
+
 /// The envelope without issues, as `total` and `maxResults` of `count` issues serialize.
 fn envelope_len(count: usize) -> usize {
     json!({ "startAt": 0, "maxResults": count, "total": count, "issues": [] })
@@ -327,12 +445,27 @@ fn envelope_len(count: usize) -> usize {
 /// A `fields=*all` search answer whose JSON text is at most `target_bytes` long and within one
 /// issue of it. The same `(seed, mix, target_bytes)` always gives the same value.
 pub fn jira_star_all_search(seed: u64, mix: TextMix, target_bytes: usize) -> Value {
+    search_of(seed, mix, target_bytes, issue)
+}
+
+/// The same envelope around dense small-object issues (`expand=changelog`, issuelinks, worklogs,
+/// numeric and id arrays, nulls): the shapes with the most QuickJS values per JSON byte.
+pub fn jira_dense_search(seed: u64, mix: TextMix, target_bytes: usize) -> Value {
+    search_of(seed ^ 0xd3_45e, mix, target_bytes, dense_issue)
+}
+
+fn search_of(
+    seed: u64,
+    mix: TextMix,
+    target_bytes: usize,
+    make: fn(&mut Rng, TextMix, usize) -> Value,
+) -> Value {
     let mut rng = Rng(seed ^ ((mix as u64) << 56));
     let mut issues: Vec<Value> = Vec::new();
     // The issues' own text, plus one comma between neighbours.
     let mut body = 0usize;
     loop {
-        let next = issue(&mut rng, mix, issues.len());
+        let next = make(&mut rng, mix, issues.len());
         let next_len = next.to_string().len();
         let comma = usize::from(!issues.is_empty());
         if envelope_len(issues.len() + 1) + body + comma + next_len > target_bytes {

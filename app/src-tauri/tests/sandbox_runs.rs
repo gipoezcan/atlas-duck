@@ -823,13 +823,16 @@ mod s10 {
             process_mb: 256,
             ..limits
         };
-        let outcome = run_all_search(&rt, spawner.as_ref(), tight, fixture)?;
-        let completed = outcome.host == HostVerdict::None
-            && result_text(&outcome) == Some(issues.to_string().as_str());
-        let end: String = format!("{:?} {:?}", outcome.host, outcome.end)
-            .chars()
-            .take(160)
-            .collect();
+        // Data only: a refused start, a handshake kill or the timeout is recorded, never a failure.
+        let (completed, end) = match run_all_search(&rt, spawner.as_ref(), tight, fixture) {
+            Ok(outcome) => (
+                outcome.host == HostVerdict::None
+                    && result_text(&outcome) == Some(issues.to_string().as_str()),
+                format!("{:?} {:?}", outcome.host, outcome.end),
+            ),
+            Err(err) => (false, format!("run failed: {err}")),
+        };
+        let end: String = end.replace(['\n', '\r'], " ").chars().take(160).collect();
         println!(
             "M8 i21_r13 heap_mb={} process_mb={} bytes={bytes} completed={completed} end={end}",
             tight.heap_mb, tight.process_mb
