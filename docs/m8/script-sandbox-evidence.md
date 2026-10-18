@@ -26,6 +26,10 @@ Fixtures (seeded, in `crates/sandbox-worker/tests/common/fixtures.rs`):
 - `confluence-markdown-*`: the same pages after conversion to Markdown.
 - `confluence-page-*`: one `page.get` answer of 5,000 words; `confluence-list25-*`: a list of 25
   such pages.
+- `confluence-meta-*`: a search answer of body-less results with many expansions (labels,
+  ancestors, children, attachments, descendants, restrictions, contributors: 20-60 small objects
+  per array, nulls, numeric ids and sizes), the Confluence analogue of `jira-dense-*`. It peaks at
+  8.9 per byte, below the Jira dense shape (11.2), so the maximum and `k` do not change.
 
 | fixture | bytes | heap_peak | k_peak | k_retained |
 | --- | --- | --- | --- | --- |
@@ -69,13 +73,25 @@ Fixtures (seeded, in `crates/sandbox-worker/tests/common/fixtures.rs`):
 | confluence-markdown-wide | 975754 | 3786912 | 3.88 | 1.14 |
 | confluence-storage-wide | 4125742 | 18043208 | 4.37 | 1.28 |
 | confluence-markdown-wide | 4179244 | 16163048 | 3.87 | 1.15 |
+| confluence-meta-ascii | 961446 | 4692992 | 4.88 | 3.88 |
+| confluence-meta-mixed | 981595 | 8698912 | 8.86 | 3.89 |
+| confluence-meta-sparse | 992136 | 8730760 | 8.80 | 3.89 |
+| confluence-meta-wide | 1031707 | 9018664 | 8.74 | 3.89 |
+| confluence-meta-ascii | 4134512 | 20240488 | 4.90 | 3.89 |
+| confluence-meta-mixed | 4115220 | 36539904 | 8.88 | 3.91 |
+| confluence-meta-sparse | 4153040 | 36470744 | 8.78 | 3.87 |
+| confluence-meta-wide | 4187219 | 36539792 | 8.73 | 3.88 |
 
-Pending: the 16 MiB rows (Jira `all` and `dense`, Confluence `storage` and `markdown`, four mixes
-each) from the CI step "M8 k measurement". Compare each with its 4 MiB row: the factor is flat
-between 1 and 4 MiB (Jira dense-mixed 11.22 and 11.24). A 16 MiB `k_peak` above 12.00 makes the
-rule below give a `k` above 15, and one above 12.80 a `k` above 16 (R13: stop, the lead rules).
-Add the rows to the table; `heap_k_constant_matches_evidence` (`crates/core/tests/validate.rs`)
-then names the value the constant must have.
+Pending: the 16 MiB rows (Jira `all` and `dense`, Confluence `storage`, `markdown` and `meta`,
+four mixes each) from the CI step "M8 k measurement". Compare each with its 4 MiB row: the factor
+is flat between 1 and 4 MiB (Jira dense-mixed 11.22 and 11.24). The stop rule is mechanical: that
+CI step fails with "STOP for R13" when any 16 MiB `K` line has `k_peak` above `SCRIPT_HEAP_K / 1.25`
+(12.00 at 15; the constant is read from `crates/core/src/validate/mod.rs`), which is where the rule
+below would give a larger `k`; above 12.80 the `k` would exceed 16 (R13: stop, the lead rules).
+Every `k_factor` test, Jira and Confluence, also fails by itself when a run's `k_peak` is above
+the `SCRIPT_HEAP_K` of this file. Add the rows to the table; `heap_k_constant_matches_evidence`
+(`crates/core/tests/validate.rs`) names the value the constant must have, and fails when a table
+row's `k_peak` exceeds `SCRIPT_HEAP_K / 1.25`. The rule uses the table's two-decimal values.
 
 ### The fixed `k`
 

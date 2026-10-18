@@ -1,6 +1,7 @@
 //! Heap expansion factor `k`, Jira half (plan M8 Task 25; spec §9.4 `k`, §15 V16; PD-131, PD-140)
-//! and Confluence half (Task 33: storage bodies and their Markdown form; each Confluence run also
-//! asserts `k_peak` is within the fixed `k` of `docs/m8/script-sandbox-evidence.md`).
+//! and Confluence half (Task 33: storage bodies, their Markdown form and a body-less shape of many
+//! small expansion objects; every run, Jira and Confluence, also asserts `k_peak` is within the
+//! fixed `k` of `docs/m8/script-sandbox-evidence.md`).
 //!
 //! In process, through the real `Engine::deliver` path: a run makes one `atlas.all` call and holds
 //! the answer; the host's frame text (the whole of it is a QuickJS string while `JSON.parse`
@@ -22,8 +23,8 @@ use atlas_duck_ipc::sandbox::script::{InstanceInfo, WorkerInit, encode_response}
 use atlas_duck_ipc::sandbox::{HostCall, HostCallResult, ScriptLimits};
 use atlas_duck_sandbox_worker::script::{Engine, HostPort, Settled};
 use fixtures::{
-    MIB, TextMix, confluence_markdown_search, confluence_page_get, confluence_page_list,
-    confluence_storage_search, jira_dense_search, jira_star_all_search,
+    MIB, TextMix, confluence_markdown_search, confluence_meta_search, confluence_page_get,
+    confluence_page_list, confluence_storage_search, jira_dense_search, jira_star_all_search,
 };
 use serde_json::{Value, json};
 
@@ -163,10 +164,11 @@ fn init(source: &str, op: &str, product: &str) -> WorkerInit {
 }
 
 /// Every shape (text-heavy `all`, small-object `dense`) and text mix at every size, one `K` line
-/// each. Asserts `k_retained > 1` (the held answer is in the tree) and `k_peak - k_retained >=
+/// each. Every peak must be within the fixed `k` (`report`). Asserts `k_retained > 1` (the held answer is in the tree) and `k_peak - k_retained >=
 /// 0.5`: the peak is a running maximum, so only the gap proves that the host frame's text was
 /// live next to the tree at the peak (PD-131; the ascii mix measures about 1.0, one frame).
 fn run_sizes(mibs: &'static [usize]) -> TestResult {
+    let k = evidence_k()?;
     big_stack(move || {
         for &mib in mibs {
             for (shape, make) in [
@@ -180,10 +182,7 @@ fn run_sizes(mibs: &'static [usize]) -> TestResult {
                     let value = make(0x5eed, mix, mib * MIB);
                     let name = format!("jira-{shape}-{}", mix.name());
                     let m = measure(&name, &value)?;
-                    println!("{}", k_line(&m));
-                    if !whole_frame_live(&m) {
-                        return Err(format!("{}: {}", name, k_line(&m)));
-                    }
+                    report(&m, k)?;
                 }
             }
         }
@@ -386,6 +385,7 @@ fn run_confluence(mibs: &'static [usize], singles: bool) -> TestResult {
                         confluence_storage_search as fn(u64, TextMix, usize) -> Value,
                     ),
                     ("markdown", confluence_markdown_search),
+                    ("meta", confluence_meta_search),
                 ] {
                     let value = make(0x5eed, mix, mib * MIB);
                     let m = measure_run(
@@ -469,6 +469,34 @@ fn k_confluence_fixture_shapes() {
     let ascii = serde_json::to_string(&confluence_storage_search(7, TextMix::Ascii, target))
         .unwrap_or_default();
     assert!(ascii.is_ascii());
+    // The body-less shape of many small expansion objects, sized like the others.
+    let meta = confluence_meta_search(7, TextMix::Mixed, target);
+    let meta_text = serde_json::to_string(&meta).unwrap_or_default();
+    assert!(
+        meta_text.len() <= target && meta_text.len() > target - 128 * 1024,
+        "{}",
+        meta_text.len()
+    );
+    let result = &meta["results"][0];
+    assert!(result["body"].is_null());
+    for path in [
+        &result["metadata"]["labels"]["results"],
+        &result["ancestors"],
+        &result["children"]["page"]["results"],
+        &result["children"]["attachment"]["results"],
+        &result["descendants"]["page"]["results"],
+        &result["history"]["contributors"]["publishers"]["users"],
+        &result["restrictions"]["read"]["restrictions"]["user"]["results"],
+    ] {
+        assert!(path.as_array().is_some_and(|a| !a.is_empty()), "{path}");
+    }
+    assert!(result["children"]["attachment"]["results"][0]["extensions"]["fileSize"].is_u64());
+    assert!(meta_text.matches("null").count() > 100);
+    assert_eq!(
+        meta_text,
+        serde_json::to_string(&confluence_meta_search(7, TextMix::Mixed, target))
+            .unwrap_or_default()
+    );
     // The Markdown form carries the same kind of content without the XHTML.
     let md = confluence_markdown_search(7, TextMix::Mixed, target);
     let md_text = md["results"][0]["body"]["markdown"]

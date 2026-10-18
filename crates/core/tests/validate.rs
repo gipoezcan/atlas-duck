@@ -771,7 +771,12 @@ fn heap_k_constant_matches_evidence() -> TestResult {
         }
     }
     // Both products, four mixes, 1 and 4 MiB, at least.
-    assert!(rows >= 40, "{rows} table rows");
+    assert!(rows >= 48, "{rows} table rows");
+    // No row above the constant's own bound (a row the rule would not cover).
+    assert!(
+        max_peak * 1.25 <= f64::from(SCRIPT_HEAP_K),
+        "a table row has k_peak {max_peak} > {SCRIPT_HEAP_K} / 1.25"
+    );
     assert_eq!(
         (max_peak * 1.25).ceil() as u32,
         recorded,

@@ -1237,7 +1237,7 @@ async fn s11_containment_corpus() -> Result<()> {
             "--reason",
             RELEASE,
             "--limits",
-            r#"{"heap_mb":32,"max_call_result_mb":4,"process_mb":160,"timeout_s":30}"#,
+            r#"{"heap_mb":64,"max_call_result_mb":4,"process_mb":160,"timeout_s":30}"#,
             "--timeout",
             LONG_WAIT,
         ],

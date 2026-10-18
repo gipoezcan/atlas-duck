@@ -752,6 +752,108 @@ fn confluence_page(rng: &mut Rng, mix: TextMix, n: usize, words: usize, form: Fo
     })
 }
 
+/// A short entry of a page's `children` / `descendants` expansion.
+fn confluence_child(rng: &mut Rng, mix: TextMix, id: usize, position: usize) -> Value {
+    json!({
+        "id": id.to_string(), "type": "page", "status": "current", "title": text(rng, mix, 3),
+        "position": position,
+        "extensions": { "position": position },
+        "_links": { "webui": format!("/spaces/KB/pages/{id}"), "self": format!("https://confluence.example.invalid/confluence/rest/api/content/{id}") },
+        "_expandable": { "container": "/rest/api/space/KB", "metadata": "", "operations": "",
+                         "children": "", "history": "", "ancestors": "", "body": "", "version": "",
+                         "descendants": "", "space": "KB" },
+    })
+}
+
+/// A short entry of the `children.attachment` expansion (null comments, numeric sizes).
+fn confluence_attachment(rng: &mut Rng, mix: TextMix, id: usize) -> Value {
+    let name = format!("{}-{}.png", rng.pick(ASCII_WORDS), id % 1000);
+    json!({
+        "id": format!("att{id}"), "type": "attachment", "status": "current", "title": name,
+        "metadata": { "mediaType": "image/png", "comment": null,
+                      "labels": { "results": [], "size": 0, "start": 0, "limit": 200 } },
+        "extensions": { "mediaType": "image/png", "fileSize": rng.below(900_000) + 1000,
+                        "comment": null, "mediaTypeDescription": "PNG Image",
+                        "fileId": macro_id(id) },
+        "version": { "by": null, "when": "2026-08-14T08:00:12.000+02:00", "number": 1 + id % 5,
+                     "message": null, "minorEdit": false, "hidden": false },
+        "_links": { "webui": format!("/pages/viewpageattachments.action?pageId={id}"),
+                    "download": format!("/download/attachments/{id}/{name}?version=1&api=v2"),
+                    "thumbnail": format!("/download/thumbnails/{id}/{name}") },
+        "_expandable": { "container": "", "operations": "", "children": "", "restrictions": "",
+                         "history": "", "ancestors": "", "body": "", "descendants": "", "space": "KB" },
+        "description": text(rng, mix, 2),
+    })
+}
+
+/// A restrictions entry: lists of users and groups for one operation.
+fn confluence_restriction(rng: &mut Rng, mix: TextMix, op: &str, n: usize) -> Value {
+    let users: Vec<Value> = (0..rng.between(3, 10))
+        .map(|j| confluence_user(rng, mix, n + j))
+        .collect();
+    let groups: Vec<Value> = (0..rng.between(1, 4))
+        .map(|j| json!({ "type": "group", "name": format!("{}-{j}", rng.pick(ASCII_WORDS)),
+                         "_links": { "self": format!("https://confluence.example.invalid/confluence/rest/api/group/g{j}") } }))
+        .collect();
+    json!({ "operation": op,
+            "restrictions": { "user": { "results": users, "start": 0, "limit": 200, "size": 0 },
+                              "group": { "results": groups, "start": 0, "limit": 200, "size": 0 } },
+            "_expandable": { "content": "/rest/api/content/100000" } })
+}
+
+/// One search result with many expansions and no body (`expand=version,ancestors,
+/// metadata.labels,children.page,children.attachment,descendants.page,restrictions.read.
+/// restrictions.user,history.contributors.publishers.users`): arrays of small objects, nulls and
+/// numeric ids, the Confluence analogue of the dense Jira shape.
+fn confluence_meta_page(rng: &mut Rng, mix: TextMix, n: usize) -> Value {
+    let id = 100_000 + n * 1000;
+    let labels: Vec<Value> = (0..rng.between(10, 30))
+        .map(|j| {
+            json!({ "prefix": "global", "name": format!("{}-{j}", rng.pick(ASCII_WORDS)),
+                         "id": (5000 + j).to_string(), "label": rng.pick(ASCII_WORDS) })
+        })
+        .collect();
+    let ancestors: Vec<Value> = (0..rng.between(3, 8))
+        .map(|j| confluence_child(rng, mix, 90_000 + j, j))
+        .collect();
+    let children: Vec<Value> = (0..rng.between(20, 60))
+        .map(|j| confluence_child(rng, mix, id + j + 1, j))
+        .collect();
+    let descendants: Vec<Value> = (0..rng.between(20, 60))
+        .map(|j| confluence_child(rng, mix, id + 500 + j, j))
+        .collect();
+    let attachments: Vec<Value> = (0..rng.between(20, 60))
+        .map(|j| confluence_attachment(rng, mix, id + j))
+        .collect();
+    let publishers: Vec<Value> = (0..rng.between(5, 15))
+        .map(|j| confluence_user(rng, mix, n + j))
+        .collect();
+    json!({
+        "id": id.to_string(), "type": "page", "status": "current", "title": text(rng, mix, 5),
+        "space": { "id": 65_538, "key": "KB", "name": text(rng, mix, 2), "type": "global",
+                   "status": "current", "description": null, "homepage": null,
+                   "_links": { "webui": "/spaces/KB" } },
+        "history": { "latest": true, "createdBy": confluence_user(rng, mix, n % 9),
+                     "createdDate": "2026-03-02T09:12:45.321+01:00", "lastUpdated": null,
+                     "previousVersion": null, "nextVersion": null,
+                     "contributors": { "publishers": { "users": publishers, "userKeys": [] } } },
+        "version": { "by": confluence_user(rng, mix, (n + 1) % 9), "when": "2026-10-05T16:40:21.987+02:00",
+                     "message": text(rng, mix, 3), "number": 1 + n % 40, "minorEdit": false,
+                     "hidden": false, "syncRev": null, "confRev": null },
+        "ancestors": ancestors,
+        "metadata": { "labels": { "results": labels, "size": 0, "start": 0, "limit": 200 },
+                      "currentuser": {}, "properties": {}, "frontend": {}, "simple": null },
+        "children": { "page": { "results": children, "start": 0, "limit": 200, "size": 0 },
+                      "attachment": { "results": attachments, "start": 0, "limit": 200, "size": 0 } },
+        "descendants": { "page": { "results": descendants, "start": 0, "limit": 200, "size": 0 } },
+        "restrictions": { "read": confluence_restriction(rng, mix, "read", n),
+                          "update": confluence_restriction(rng, mix, "update", n + 50) },
+        "_links": { "webui": format!("/spaces/KB/pages/{id}"), "tinyui": "/x/AbCdEf",
+                    "self": format!("https://confluence.example.invalid/confluence/rest/api/content/{id}") },
+        "_expandable": { "container": "/rest/api/space/KB", "operations": "", "body": "" },
+    })
+}
+
 /// A page list answer's envelope around `results`.
 fn confluence_envelope(results: Vec<Value>) -> Value {
     let count = results.len();
@@ -785,6 +887,26 @@ pub fn confluence_storage_search(seed: u64, mix: TextMix, target_bytes: usize) -
 /// The same pages after conversion: the Markdown form, sized the same way.
 pub fn confluence_markdown_search(seed: u64, mix: TextMix, target_bytes: usize) -> Value {
     confluence_sized(seed ^ 0x3d, mix, target_bytes, Form::Markdown)
+}
+
+/// A search answer of body-less results with many expansions (labels, ancestors, children,
+/// attachments, descendants, restrictions, contributors), sized like the others.
+pub fn confluence_meta_search(seed: u64, mix: TextMix, target_bytes: usize) -> Value {
+    let mut rng = Rng(seed ^ 0x3e7a ^ ((mix as u64) << 56));
+    let envelope = confluence_envelope(Vec::new()).to_string().len();
+    let mut pages: Vec<Value> = Vec::new();
+    let mut body = 0usize;
+    loop {
+        let next = confluence_meta_page(&mut rng, mix, pages.len());
+        let next_len = next.to_string().len();
+        let comma = usize::from(!pages.is_empty());
+        if envelope + 8 + body + comma + next_len > target_bytes {
+            break;
+        }
+        body += comma + next_len;
+        pages.push(next);
+    }
+    confluence_envelope(pages)
 }
 
 fn confluence_sized(seed: u64, mix: TextMix, target_bytes: usize, form: Form) -> Value {

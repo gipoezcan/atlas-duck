@@ -654,13 +654,24 @@ jobs:
           set -euo pipefail
           cargo test -p atlas-duck-sandbox-worker --test k_factor --locked -- --include-ignored --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/k-factor.log"
           # Jira: 2 shapes (all, dense) x 4 text mixes x 3 sizes = 24 `K` lines, the 16 MiB ones
-          # among them. Confluence: (storage, markdown) x 4 mixes x 3 sizes, plus one page and a
-          # 25-page list per mix at the small sizes = 32. libtest prints `test <name> ... ` before
-          # a test's own output, so a line may follow it on the same line.
+          # among them. Confluence: (storage, markdown, meta) x 4 mixes x 3 sizes, plus one page
+          # and a 25-page list per mix at the small sizes = 44. libtest prints `test <name> ... `
+          # before a test's own output, so a line may follow it on the same line.
           [ "$(grep -cE '(^|[[:space:]])K fixture=jira-(all|dense)-[a-z]+ bytes=[0-9]+ heap_peak=[0-9]+ k_peak=[0-9.]+ k_retained=[0-9.]+$' "$RUNNER_TEMP/k-factor.log")" -ge 24 ] || { echo "::error::fewer than 24 Jira K lines"; exit 1; }
-          [ "$(grep -cE '(^|[[:space:]])K fixture=confluence-(page|list25|storage|markdown)-[a-z]+ bytes=[0-9]+ heap_peak=[0-9]+ k_peak=[0-9.]+ k_retained=[0-9.]+$' "$RUNNER_TEMP/k-factor.log")" -ge 32 ] || { echo "::error::fewer than 32 Confluence K lines"; exit 1; }
+          [ "$(grep -cE '(^|[[:space:]])K fixture=confluence-(page|list25|storage|markdown|meta)-[a-z]+ bytes=[0-9]+ heap_peak=[0-9]+ k_peak=[0-9.]+ k_retained=[0-9.]+$' "$RUNNER_TEMP/k-factor.log")" -ge 44 ] || { echo "::error::fewer than 44 Confluence K lines"; exit 1; }
           grep -E '(^|[[:space:]])K fixture=jira-(all|dense)-[a-z]+ bytes=1[5-6][0-9]{6} ' "$RUNNER_TEMP/k-factor.log" || { echo "::error::no 16 MiB Jira K line"; exit 1; }
-          grep -E '(^|[[:space:]])K fixture=confluence-(storage|markdown)-[a-z]+ bytes=1[5-6][0-9]{6} ' "$RUNNER_TEMP/k-factor.log" || { echo "::error::no 16 MiB Confluence K line"; exit 1; }
+          grep -E '(^|[[:space:]])K fixture=confluence-(storage|markdown|meta)-[a-z]+ bytes=1[5-6][0-9]{6} ' "$RUNNER_TEMP/k-factor.log" || { echo "::error::no 16 MiB Confluence K line"; exit 1; }
+          # The R13 stop rule, mechanical: k = ceil(1.25 x max k_peak), so a 16 MiB k_peak above
+          # SCRIPT_HEAP_K / 1.25 (12.00 at k = 15) means the constant is too small. Fail and print
+          # the lines; if the new k would exceed 16 the defaults break invariant 1 (R13).
+          k="$(sed -nE 's/^pub const SCRIPT_HEAP_K: u32 = ([0-9]+);.*/\1/p' crates/core/src/validate/mod.rs)"
+          case "$k" in ''|*[!0-9]*) echo "::error::cannot read SCRIPT_HEAP_K from crates/core/src/validate/mod.rs"; exit 1;; esac
+          over="$(grep -E '(^|[[:space:]])K fixture=(jira|confluence)-[a-z0-9]+-[a-z]+ bytes=1[5-6][0-9]{6} ' "$RUNNER_TEMP/k-factor.log" | sed -E 's/^.*(K fixture=)/\1/' | awk -v k="$k" '{ for (i = 1; i <= NF; i++) if ($i ~ /^k_peak=/) { v = substr($i, 8) + 0; if (v * 1.25 > k) print } }')"
+          if [ -n "$over" ]; then
+            echo "$over"
+            echo "::error::STOP for R13: a 16 MiB k_peak is above SCRIPT_HEAP_K ($k) / 1.25; update the evidence table (docs/m8/script-sandbox-evidence.md) and the constant, or if the new k exceeds 16, the lead rules (R13)"
+            exit 1
+          fi
           grep -E '^test result: ok\. 10 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/k-factor.log" || { echo "::error::k_factor did not run all ten tests"; exit 1; }
           {
             echo '### M8 k measurement (Jira *all search, Confluence storage bodies)'
@@ -706,7 +717,7 @@ jobs:
           # heap limits (the test asserts it; this line is the record), and the R13 line is data
           # (`completed=true|false`): only its presence is required here, never its value.
           grep -E '(^|[[:space:]])M8 i21_all_result_at_cap heap_mb=[0-9]+ process_mb=[0-9]+ bytes=[0-9]+ issues=[0-9]+ completed=true([^[:alnum:]_]|$)' "$log" || { echo "::error::M8 i21_all_result_at_cap completed=true evidence missing"; exit 1; }
-          grep -E '(^|[[:space:]])M8 i21_r13 heap_mb=128 process_mb=256 bytes=[0-9]+ completed=(true|false) ' "$log" || { echo "::error::M8 i21_r13 evidence missing"; exit 1; }
+          grep -E '(^|[[:space:]])M8 i21_r13 heap_mb=240 process_mb=328bytes=[0-9]+ completed=(true|false) ' "$log" || { echo "::error::M8 i21_r13 evidence missing"; exit 1; }
           # M8 T9 (V10, PD-134): host-measured memory limits. The tests assert their verdicts;
           # these gates make a missing evidence line fail too.
           grep -E "(^|[[:space:]])V10 heap_limit os=$os verdict=heap_mb " "$log" || { echo "::error::V10 heap_limit os=$os evidence missing"; exit 1; }
@@ -1087,7 +1098,7 @@ jobs:
           grep -F -- 'M8 s10_handles os=macos fds=[0, 1, 2]' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::S-10 worker held descriptors other than 0, 1, 2"; exit 1; }
           # M8 T25 (I-21, R13): as on the native legs (the R13 line is data, only its presence is required).
           grep -E '(^|[[:space:]])M8 i21_all_result_at_cap heap_mb=[0-9]+ process_mb=[0-9]+ bytes=[0-9]+ issues=[0-9]+ completed=true([^[:alnum:]_]|$)' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::M8 i21_all_result_at_cap completed=true evidence missing"; exit 1; }
-          grep -E '(^|[[:space:]])M8 i21_r13 heap_mb=128 process_mb=256 bytes=[0-9]+ completed=(true|false) ' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::M8 i21_r13 evidence missing"; exit 1; }
+          grep -E '(^|[[:space:]])M8 i21_r13 heap_mb=240 process_mb=328bytes=[0-9]+ completed=(true|false) ' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::M8 i21_r13 evidence missing"; exit 1; }
           # M8 T9 (V10, PD-134): the heap limit and the footprint watchdog under Rosetta.
           grep -E '(^|[[:space:]])V10 heap_limit os=macos verdict=heap_mb ' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::V10 heap_limit os=macos evidence missing"; exit 1; }
           grep -E '(^|[[:space:]])V10 watchdog_kill verdict=process_mb spawn_to_reap_ms=[0-9]+ arch=x86_64([^[:alnum:]_]|$)' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::V10 watchdog_kill evidence missing"; exit 1; }

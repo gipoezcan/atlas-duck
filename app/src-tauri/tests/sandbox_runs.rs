@@ -789,9 +789,9 @@ mod s10 {
     /// I-21 (M8 Task 25; spec §13 I-21, §9.4 `k`, R13): a real worker with the default limits
     /// (`heap_mb` 256, `process_mb` 512) runs `atlas.all` on a Jira `fields=*all` search whose
     /// concatenated answer is just under `max_call_result_mb` (16 MiB), the largest the host
-    /// allows, and completes. The second run is data only: the same answer under `heap_mb` 128
-    /// (the provisional k = 8 boundary, below the fixed k = 15 x 16 = 240) and a matching
-    /// `process_mb` 256; whether it completes is recorded, not asserted.
+    /// allows, and completes. The second run is data only: the same answer under `heap_mb` 240
+    /// (the lowest legal heap for the fixed k = 15 x 16 MiB, invariant 1) and the lowest legal
+    /// `process_mb` 328 (invariant 2: 240 + 88); whether it completes is recorded, not asserted.
     #[test]
     fn i21_all_result_at_cap_within_default_heap() -> TestResult {
         if !harness::opted_in("i21_all_result_at_cap_within_default_heap") {
@@ -819,8 +819,8 @@ mod s10 {
         );
 
         let tight = ScriptLimits {
-            heap_mb: 128,
-            process_mb: 256,
+            heap_mb: 240,
+            process_mb: 328,
             ..limits
         };
         // Data only: a refused start, a handshake kill or the timeout is recorded, never a failure.
