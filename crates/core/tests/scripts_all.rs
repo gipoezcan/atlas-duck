@@ -1004,3 +1004,158 @@ async fn all_rejected_after_committed_pages_is_one_rejected_row() -> TestResult 
     }
     Ok(())
 }
+
+// ---- §13 I-22, Confluence half: `atlas.all` under a context path (Task 34) ---------------------
+
+/// `atlas.all("confluence.space.list", {max: 50})`.
+fn space_all(id: u64) -> HostCall {
+    let mut call = host_call(id, "confluence.space.list", json!({ "max": 50 }));
+    call.all = true;
+    call
+}
+
+async fn confluence_harness(
+    plans: Vec<ScriptPlan>,
+) -> Result<(Harness, Arc<FakeScriptRunner>), TestError> {
+    let runner = FakeScriptRunner::new(plans);
+    let h = Harness::builder()
+        .confluence("wiki")
+        .scripts(runner.clone())
+        .start()
+        .await?;
+    Ok((h, runner))
+}
+
+/// Mounts `GET <context>/rest/api/space`: `total` spaces, the server clamping every page to 25.
+/// Every page but the last carries the stale `_links.next` without the context path
+/// (`/rest/api/space?limit=25&start=25`, §13 I-22). Returns the `start` of each request.
+async fn mount_spaces(
+    h: &Harness,
+    total: u64,
+) -> Result<Arc<Mutex<Vec<Option<String>>>>, TestError> {
+    let mock = h.mock("wiki").ok_or("no wiki mock")?;
+    let ok = mock.response(200);
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let seen = starts.clone();
+    Mock::given(method("GET"))
+        .and(path(mock.path("/rest/api/space")))
+        .respond_with(move |req: &Request| {
+            let start = req
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "start")
+                .map(|(_, v)| v.into_owned());
+            let at = start
+                .as_deref()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0u64);
+            seen.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(start);
+            let size = 25u64.min(total.saturating_sub(at));
+            let next = (at + size < total).then_some("/rest/api/space?limit=25&start=25");
+            ok.clone().set_body_raw(
+                fixtures::confluence_space_page(at, 25, size, next),
+                "application/json",
+            )
+        })
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    Ok(starts)
+}
+
+fn space_keys(result: &Value) -> Vec<String> {
+    result["results"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s["key"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `atlas.all` over a Confluence instance whose server answers `_links.next` without the context
+/// path: page 2 is requested at `<context>/rest/api/space` with `start=25`, every request of the
+/// run (the identity GET included) stays under the context path, and the script gets all pages.
+/// The harness's Confluence context path is `/wiki`; the rule is the same for any path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i22_all_confluence_context_path_page2_inside_base() -> TestResult {
+    let (h, runner) = confluence_harness(vec![ScriptPlan::new(
+        vec![space_all(1)],
+        result_end(json!(1)),
+    )])
+    .await?;
+    let starts = mount_spaces(&h, 50).await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let mock = h.mock("wiki").ok_or("no wiki mock")?;
+    let all = mock.received().await;
+    let urls: Vec<String> = all.iter().map(|r| r.url.to_string()).collect();
+    assert!(
+        all.iter().all(|r| r.url.path().starts_with("/wiki/")),
+        "{urls:?}"
+    );
+    assert_eq!(
+        starts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone(),
+        [Some("0".to_owned()), Some("25".to_owned())],
+        "{urls:?}"
+    );
+    let space_gets: Vec<&str> = all
+        .iter()
+        .filter(|r| r.url.path().ends_with("/rest/api/space"))
+        .map(|r| r.url.path())
+        .collect();
+    assert_eq!(space_gets, ["/wiki/rest/api/space"; 2], "{urls:?}");
+    let result = match runner.results().as_slice() {
+        [HostCallResult::Ok(v)] => v.clone(),
+        other => return Err(format!("unexpected answers: {:?}", outline(other)).into()),
+    };
+    let want: Vec<String> = (1..=50).map(|n| format!("S{n}")).collect();
+    assert_eq!(space_keys(&result), want);
+    let calls = script_calls(&h, &id).await?;
+    assert_eq!(
+        calls.iter().map(|c| c["page"].clone()).collect::<Vec<_>>(),
+        [json!(0), json!(1)]
+    );
+    Ok(())
+}
+
+/// A full last page without `_links.next` ends the paging (§7.2): 25 of 25 asked, and only the
+/// missing `next` says it is the last one, so a second request is a failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i22_all_confluence_absent_next_ends_paging() -> TestResult {
+    let (h, runner) = confluence_harness(vec![ScriptPlan::new(
+        vec![space_all(1)],
+        result_end(json!(1)),
+    )])
+    .await?;
+    let starts = mount_spaces(&h, 25).await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    assert_eq!(
+        starts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone(),
+        [Some("0".to_owned())]
+    );
+    let result = match runner.results().as_slice() {
+        [HostCallResult::Ok(v)] => v.clone(),
+        other => return Err(format!("unexpected answers: {:?}", outline(other)).into()),
+    };
+    assert_eq!(space_keys(&result).len(), 25);
+    assert_eq!(script_calls(&h, &id).await?.len(), 1);
+    let mock = h.mock("wiki").ok_or("no wiki mock")?;
+    assert!(
+        mock.received()
+            .await
+            .iter()
+            .all(|r| r.url.path().starts_with("/wiki/"))
+    );
+    Ok(())
+}
