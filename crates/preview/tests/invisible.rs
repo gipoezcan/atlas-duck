@@ -4,8 +4,8 @@ use proptest::prelude::*;
 
 use atlas_duck_preview::PREVIEW_BUILDER_VERSION;
 use atlas_duck_preview::invisible::{
-    MAX_RGI_EMOJI_CHARS, count, escape_for_display, flags, flags_and_sequences, is_bidi_control,
-    is_flagged, strip,
+    MAX_RGI_EMOJI_CHARS, count, cut_boundary, escape_for_display, flags, flags_and_sequences,
+    is_bidi_control, is_flagged, strip,
 };
 use atlas_duck_preview::mixed_script::is_mixed_script;
 use icu_properties::props::{DefaultIgnorableCodePoint, GeneralCategory, Script};
@@ -578,4 +578,98 @@ fn a_cut_inside_a_sequence_changes_the_flags() {
     // A sequence that unflags nothing (no ZWJ or variation selector) is not one of them.
     assert!(flags_and_sequences("👍\u{1F3FD}\u{200D}").1.is_empty());
     assert!(flags_and_sequences("abc").1.is_empty());
+}
+
+/// The byte ranges of the `⟨U+XXXX⟩` escapes in `s` (4 to 6 upper-case hex digits), found
+/// independently of the code under test.
+fn escapes(s: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    for (i, _) in s.match_indices('⟨') {
+        let Some(inner) = s[i..].strip_prefix("⟨U+") else {
+            continue;
+        };
+        let hex = inner
+            .bytes()
+            .take_while(|b| matches!(b, b'0'..=b'9' | b'A'..=b'F'))
+            .count();
+        if (4..=6).contains(&hex) && inner[hex..].starts_with('⟩') {
+            out.push(i..i + "⟨U+".len() + hex + '⟩'.len_utf8());
+        }
+    }
+    out
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// `cut_boundary` (M8 ZWJ review I-2): the kept prefix is at most `max` bytes, ends on a char
+    /// boundary that is strictly inside no unflagging emoji sequence and no escape, is the
+    /// longest such prefix, and keeps the flags of the whole text. On display-escaped text the
+    /// kept text has no raw flagged char and every `⟨` in it starts a whole escape; on stripped
+    /// text it stays stripped.
+    #[test]
+    fn cut_boundary_keeps_sequences_and_escapes_whole(
+        raw in mixed_input(),
+        display in any::<bool>(),
+        maxes in prop::collection::vec(0usize..1200, 8),
+    ) {
+        // Raw text, or its display escape.
+        let s = if display { escape_for_display(&raw) } else { raw };
+        let (all, sequences) = flags_and_sequences(&s);
+        let escaped = escapes(&s);
+        if display {
+            prop_assert!(!all.contains(&true));
+            prop_assert_eq!(escaped.len(), s.matches('⟨').count());
+        }
+        let inside = |b: usize| {
+            sequences.iter().chain(&escaped).any(|r| r.start < b && b < r.end)
+        };
+        let stripped = strip(&s, true).0;
+        for max in maxes {
+            let max = max.min(s.len() + 2);
+            let cut = cut_boundary(&s, max);
+            prop_assert!(cut <= max.min(s.len()), "{} > {}", cut, max);
+            prop_assert!(s.is_char_boundary(cut));
+            prop_assert!(!inside(cut), "cut {} inside a sequence or escape", cut);
+            // The longest: every char boundary past the cut (up to `max`) is inside one.
+            for b in (cut + 1..=max.min(s.len())).filter(|&b| s.is_char_boundary(b)) {
+                prop_assert!(inside(b), "cut {} but {} was allowed", cut, b);
+            }
+            let kept = &s[..cut];
+            let k = kept.chars().count();
+            prop_assert_eq!(&flags(kept)[..], &all[..k], "cut at {}", cut);
+            // Display text (no raw flagged char, every `⟨` starts an escape) stays display text.
+            if !all.contains(&true) {
+                prop_assert!(!flags(kept).contains(&true), "raw flagged char at cut {}", cut);
+            }
+            if escaped.len() == s.matches('⟨').count() {
+                prop_assert_eq!(escapes(kept).len(), kept.matches('⟨').count(), "cut {}", cut);
+            }
+            let cut = cut_boundary(&stripped, max);
+            prop_assert_eq!(strip(&stripped[..cut], true).0, &stripped[..cut]);
+        }
+    }
+}
+
+#[test]
+fn cut_boundary_moves_back_to_a_sequence_or_escape_start() {
+    // 👩‍💻 at 1..12: a cut after 👩 (5) or after its U+200D (8) moves back to 1.
+    let s = "x👩\u{200D}💻y";
+    assert_eq!(cut_boundary(s, 5), 1);
+    assert_eq!(cut_boundary(s, 8), 1);
+    assert_eq!(cut_boundary(s, 10), 1);
+    assert_eq!(cut_boundary(s, 12), 12);
+    assert_eq!(cut_boundary(s, 13), 13);
+    assert_eq!(cut_boundary(s, 99), s.len());
+    // `⟨U+202E⟩` at 1..13: every cut inside it moves back to 1.
+    let e = escape_for_display("x\u{202E}y");
+    for max in 2..13 {
+        assert_eq!(cut_boundary(&e, max), 1, "{max}");
+    }
+    assert_eq!(cut_boundary(&e, 13), 13);
+    // A literal `⟨` far before the cut is no escape: raw text is not cut back to it.
+    let raw = format!("⟨{}", "a".repeat(40));
+    assert_eq!(cut_boundary(&raw, 30), 30);
+    // An escape-shaped run in raw text only moves the cut back before it.
+    assert_eq!(cut_boundary("ab⟨U+0041⟩", 8), 2);
 }

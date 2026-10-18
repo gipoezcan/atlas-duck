@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::diff::DiffLine;
 use crate::form::EditForm;
+use crate::invisible;
 use crate::json_tree::JsonNode;
 use crate::warning::{Warning, WarningId};
 
@@ -523,15 +524,13 @@ impl PreviewBody {
     }
 }
 
-/// Cuts `s` to at most [`ERROR_TEXT_CAP_BYTES`] bytes at a char boundary; a cut text ends in `…`.
+/// Cuts `s` to at most [`ERROR_TEXT_CAP_BYTES`] bytes where [`invisible::cut_boundary`] allows
+/// (never inside an emoji sequence or a `⟨U+XXXX⟩` escape); a cut text ends in `…`.
 pub fn cap_error_text(s: &str) -> String {
     if s.len() <= ERROR_TEXT_CAP_BYTES {
         return s.to_owned();
     }
-    let mut end = ERROR_TEXT_CAP_BYTES - '…'.len_utf8();
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = invisible::cut_boundary(s, ERROR_TEXT_CAP_BYTES - '…'.len_utf8());
     format!("{}…", &s[..end])
 }
 

@@ -214,6 +214,34 @@ fn upstream_error_text_is_capped_at_a_char_boundary() {
     }
 }
 
+/// M8 ZWJ review I-2 / M-7: the cap of a display-escaped error text (the Recent list, the
+/// upstream and enrichment error cards) never ends inside an emoji sequence (a raw U+200D the
+/// kept text flags) or inside a `⟨U+XXXX⟩` escape (unmarked half of one); it moves back to the
+/// start of either.
+#[test]
+fn error_text_cap_never_splits_a_sequence_or_an_escape() {
+    use atlas_duck_preview::invisible::{escape_for_display, flags};
+    let end = ERROR_TEXT_CAP_BYTES - '…'.len_utf8();
+    // The old cut fell right after the U+200D of 👩‍💻.
+    let seq = escape_for_display(&("x".repeat(end - 7) + "👩\u{200D}💻 tail"));
+    assert_eq!(&seq[end - 3..end], "\u{200D}");
+    let capped = cap_error_text(&seq);
+    assert_eq!(capped, "x".repeat(end - 7) + "…");
+    assert!(!flags(&capped).contains(&true), "{capped:?}");
+    // The old cut fell inside the escape of U+202E.
+    let esc = escape_for_display(&("x".repeat(end - 5) + "\u{202E}tail"));
+    assert_eq!(&esc[end - 5..end + 7], "⟨U+202E⟩");
+    assert_eq!(cap_error_text(&esc), "x".repeat(end - 5) + "…");
+    // A cut at the very end of a sequence or an escape keeps it.
+    let whole = "x".repeat(end - 11) + "👩\u{200D}💻 tail";
+    assert_eq!(
+        cap_error_text(&whole),
+        "x".repeat(end - 11) + "👩\u{200D}💻…"
+    );
+    let whole = escape_for_display(&("x".repeat(end - 12) + "\u{202E}tail"));
+    assert_eq!(cap_error_text(&whole), "x".repeat(end - 12) + "⟨U+202E⟩…");
+}
+
 #[test]
 fn raw_pager_pages() {
     assert_eq!(RawPager::for_total(0).page_count, 1);

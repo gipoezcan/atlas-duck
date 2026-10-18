@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use atlas_duck_audit::{AuditError, NewEvent};
 use atlas_duck_ipc::envelope::{ErrorCode, Status};
-use atlas_duck_preview::invisible::{escape_for_display, strip};
+use atlas_duck_preview::invisible::{cut_boundary, escape_for_display, strip};
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{
     CandidateRev, PREVIEW_BUILDER_VERSION, Preselect, Preview, RAW_PAGE_BYTES, RawPager,
@@ -1755,17 +1755,21 @@ const SERVER_TEXT_MAX_BYTES: usize = 1024;
 /// M5 M-8: server text in a deny hint (field ids and names, schema types, allowed-value labels,
 /// resolution candidates) is stripped like an agent string (§3.3), line breaks included, and cut
 /// to [`SERVER_TEXT_MAX_BYTES`] before it reaches the agent; upstream messages keep their line
-/// breaks (see `hint_for`).
+/// breaks (see `hint_for`). Cut first, then stripped (ZWJ review I-1): the strip classifies the
+/// text the agent gets, so a cut can never leave it a U+200D or U+FE0F of a split sequence.
 fn server_text(s: &str) -> String {
-    let s = strip(s, false).0;
     if s.len() <= SERVER_TEXT_MAX_BYTES {
-        return s;
+        return strip(s, false).0;
     }
-    let mut end = SERVER_TEXT_MAX_BYTES - '…'.len_utf8();
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &s[..end])
+    let end = cut_boundary(s, SERVER_TEXT_MAX_BYTES - '…'.len_utf8());
+    strip(&format!("{}…", &s[..end]), false).0
+}
+
+/// An `upstream_http` deny hint's `error_messages`: one line per upstream message
+/// (`read::error_text` joins them with `\n`), stripped like the human's own reason, line breaks
+/// kept; capped first, then stripped, as [`server_text`].
+fn upstream_messages(text: &str) -> String {
+    strip(&cap_error_text(text), true).0
 }
 
 fn json_len(v: &Value) -> usize {
@@ -1842,10 +1846,10 @@ fn hint_for(
             let mut d = serde_json::Map::new();
             d.insert("status".into(), serde_json::json!(card.status));
             if include_messages {
-                // One line per upstream message (`read::error_text` joins them with `\n`):
-                // stripped like the human's own reason, line breaks kept.
-                let text = cap_error_text(&strip(&card.text, true).0);
-                d.insert("error_messages".into(), Value::from(text));
+                d.insert(
+                    "error_messages".into(),
+                    Value::from(upstream_messages(&card.text)),
+                );
             }
             Ok(serde_json::json!({ "code": "upstream_http", "details": d }))
         }
@@ -2095,5 +2099,42 @@ impl DecisionApi for CoreDecisions {
 
     fn needs_attention(&self) -> Vec<String> {
         self.engine.needs_attention()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// §3.3 (ZWJ review I-1): an agent-bound string is a fixpoint of `strip`.
+    fn stripped(s: &str, keep_newlines: bool) -> bool {
+        strip(s, keep_newlines).0 == s
+    }
+
+    /// A deny hint's server text never ends in a raw U+200D left over from a cut emoji sequence.
+    #[test]
+    fn server_text_cut_keeps_the_strip() {
+        // The old cut (1021) fell right after the U+200D of 👩‍💻.
+        let s = server_text(&("x".repeat(1014) + "👩\u{200D}💻"));
+        assert!(
+            s.len() <= SERVER_TEXT_MAX_BYTES && s.ends_with('…'),
+            "{}",
+            s.len()
+        );
+        assert!(stripped(&s, false), "{:?}", &s[1000..]);
+        assert_eq!(s, "x".repeat(1014) + "…");
+        // Short text is only stripped.
+        assert_eq!(server_text("a\u{202E}b\nc"), "abc");
+    }
+
+    /// The `upstream_http` hint's messages: the same, line breaks kept.
+    #[test]
+    fn upstream_messages_cut_keeps_the_strip() {
+        let end = atlas_duck_preview::ERROR_TEXT_CAP_BYTES - '…'.len_utf8();
+        let m = upstream_messages(&("x".repeat(end - 7) + "👩\u{200D}💻"));
+        assert!(m.len() <= atlas_duck_preview::ERROR_TEXT_CAP_BYTES && m.ends_with('…'));
+        assert!(stripped(&m, true), "{:?}", &m[end - 20..]);
+        assert_eq!(m, "x".repeat(end - 7) + "…");
+        assert_eq!(upstream_messages("a\u{202E}b\nc"), "ab\nc");
     }
 }

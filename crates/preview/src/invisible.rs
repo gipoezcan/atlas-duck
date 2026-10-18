@@ -128,6 +128,57 @@ pub fn flags_and_sequences(s: &str) -> (Vec<bool>, Vec<Range<usize>>) {
     (out, sequences)
 }
 
+/// Where a cap of `s` at `max` bytes may cut (`s.len()` when it fits): the last char boundary at
+/// or before `max` that is strictly inside no sequence of [`flags_and_sequences`] (the kept text
+/// would flag its U+200D or U+FE0F, which display text shows raw and a stripped string must not
+/// hold) and no `⟨U+XXXX⟩` escape of [`escape_for_display`] (half of one is unmarked text that no
+/// longer names its char). The flags of `s[..cut]` are the prefix of the flags of `s`. In raw text
+/// an escape-shaped run only moves the cut back before it (M8 ZWJ review I-2).
+pub fn cut_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut cut = max;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    // Only ZWJ and the variation selectors are ever unflagged (see `flags_and_sequences`).
+    if s.contains([ZWJ, VS15, VS16])
+        && let Some(r) = flags_and_sequences(s)
+            .1
+            .into_iter()
+            .find(|r| r.start < cut && cut < r.end)
+    {
+        cut = r.start;
+    }
+    // An escape holds no `⟨` after its first char, so only the last `⟨` before the cut can open
+    // one around it, at most an escape's length back. Neither back-off can land inside the other
+    // kind: a sequence holds no `⟨`, and an escape's digits are never followed by U+FE0F.
+    let from = (cut.saturating_sub(MAX_ESCAPE_BYTES)..=cut)
+        .find(|&b| s.is_char_boundary(b))
+        .unwrap_or(cut);
+    if let Some(at) = s[from..cut].rfind('⟨').map(|i| from + i)
+        && escape_len(&s[at..]).is_some_and(|len| cut < at + len)
+    {
+        cut = at;
+    }
+    cut
+}
+
+/// Bytes of the longest `⟨U+XXXX⟩` escape (six hex digits).
+const MAX_ESCAPE_BYTES: usize = "⟨U+".len() + 6 + '⟩'.len_utf8();
+
+/// The byte length of the `⟨U+XXXX⟩` escape (4 to 6 upper-case hex digits) `rest` starts with.
+fn escape_len(rest: &str) -> Option<usize> {
+    let inner = rest.strip_prefix("⟨U+")?;
+    let hex = inner
+        .bytes()
+        .take_while(|b| matches!(b, b'0'..=b'9' | b'A'..=b'F'))
+        .count();
+    ((4..=6).contains(&hex) && inner[hex..].starts_with('⟩'))
+        .then(|| "⟨U+".len() + hex + '⟩'.len_utf8())
+}
+
 fn can_start_emoji(c: char) -> bool {
     !(matches!(c, ZWJ | VS15 | VS16 | '\u{20E3}')
         || ('\u{1F3FB}'..='\u{1F3FF}').contains(&c)

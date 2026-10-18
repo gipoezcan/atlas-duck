@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use atlas_duck_atlassian::{GetCall, HttpRequestSpec, PagedCall, SearchCall};
-use atlas_duck_preview::invisible::{self, escape_for_display};
+use atlas_duck_preview::invisible::{self, cut_boundary, escape_for_display};
 use atlas_duck_preview::mixed_script::is_mixed_script;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{
@@ -492,11 +492,15 @@ pub(crate) fn cut_at(s: &str, cap: usize) -> (&str, u64) {
     (&s[..end], u64::try_from(s.len() - end).unwrap_or(u64::MAX))
 }
 
-/// `s` cut to at most `cap` chars, and how many bytes were cut.
+/// `s` cut to at most `cap` chars, never inside an emoji sequence or a `⟨U+XXXX⟩` escape
+/// ([`cut_boundary`], ZWJ review M-7), and how many bytes were cut.
 pub(crate) fn cut_chars(s: &str, cap: usize) -> (&str, u64) {
     match s.char_indices().nth(cap) {
         None => (s, 0),
-        Some((at, _)) => (&s[..at], u64::try_from(s.len() - at).unwrap_or(u64::MAX)),
+        Some((at, _)) => {
+            let at = cut_boundary(s, at);
+            (&s[..at], u64::try_from(s.len() - at).unwrap_or(u64::MAX))
+        }
     }
 }
 

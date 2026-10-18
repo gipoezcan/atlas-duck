@@ -1116,19 +1116,67 @@ pub(crate) fn json_request(ctx: &ExecCtx<'_>, body: &Value) -> Result<ExecPlan, 
 /// The largest `EnrichVerdict::diff_text` (bytes, including the trailing ellipsis).
 pub const DIFF_TEXT_CAP_BYTES: usize = 16 * 1024;
 
-/// Cuts a conflict diff to [`DIFF_TEXT_CAP_BYTES`] at a char boundary; a cut text ends in `…`.
+/// Cuts a conflict diff (display-escaped) to [`DIFF_TEXT_CAP_BYTES`], never inside an emoji
+/// sequence or a `⟨U+XXXX⟩` escape (ZWJ review M-7); a cut text ends in `…`.
 pub(crate) fn cap_diff_text(s: &str) -> String {
     if s.len() <= DIFF_TEXT_CAP_BYTES {
         return s.to_owned();
     }
-    let mut end = DIFF_TEXT_CAP_BYTES - '…'.len_utf8();
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = atlas_duck_preview::invisible::cut_boundary(s, DIFF_TEXT_CAP_BYTES - '…'.len_utf8());
     format!("{}…", &s[..end])
 }
 
 /// A string param, or `""`.
 pub(crate) fn str_param<'a>(params: &'a Value, name: &str) -> &'a str {
     params.get(name).and_then(Value::as_str).unwrap_or("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atlas_duck_preview::invisible::flags;
+
+    const SEQ: &str = "👩\u{200D}💻";
+
+    /// ZWJ review M-7: the cuts of display-escaped preview text never end inside an emoji
+    /// sequence (a raw U+200D the kept text flags) or inside a `⟨U+XXXX⟩` escape (an unmarked
+    /// `⟨` in the document); they move back to its start.
+    #[test]
+    fn diff_text_cap_keeps_sequences_and_escapes_whole() {
+        let end = DIFF_TEXT_CAP_BYTES - '…'.len_utf8();
+        let s = cap_diff_text(&("x".repeat(end - 7) + SEQ));
+        assert_eq!(s, "x".repeat(end - 7) + "…");
+        let e = "x".repeat(end - 5) + "⟨U+202E⟩y";
+        assert_eq!(cap_diff_text(&e), "x".repeat(end - 5) + "…");
+    }
+
+    #[test]
+    fn capped_text_keeps_sequences_and_escapes_whole() {
+        // The escape of U+202E takes chars 9 to 16 of the escaped text.
+        assert_eq!(
+            generic::capped_text(&("a".repeat(9) + "\u{202E}"), 10),
+            ("a".repeat(9), 12)
+        );
+        // Raw chars 8 to 10 are 👩‍💻: the raw cut at 10 moves back to 8.
+        let (shown, cut) = generic::capped_text(&("a".repeat(8) + SEQ), 10);
+        assert_eq!((shown.as_str(), cut), ("aaaaaaaa", 11));
+        assert!(!flags(&shown).contains(&true));
+        // `cut_chars` on escaped text (an edit diff's field heading).
+        assert_eq!(generic::cut_chars("ab⟨U+202E⟩c", 4), ("ab", 13));
+        assert_eq!(generic::cut_chars("ab⟨U+202E⟩c", 10), ("ab⟨U+202E⟩", 1));
+    }
+
+    #[test]
+    fn escaped_prefix_keeps_sequences_whole() {
+        let s = format!("ab{SEQ}");
+        assert_eq!(jira::escaped_prefix(&s, 9), ("ab".to_owned(), 2));
+        assert_eq!(jira::escaped_prefix(&s, 12), ("ab".to_owned(), 2));
+        assert_eq!(jira::escaped_prefix(&s, 13), (s.clone(), s.len()));
+        // Escapes stay whole (as before).
+        assert_eq!(jira::escaped_prefix("a\u{202E}b", 5), ("a".to_owned(), 1));
+        assert_eq!(
+            jira::escaped_prefix("a\u{202E}b", 13),
+            ("a⟨U+202E⟩".to_owned(), 4)
+        );
+    }
 }

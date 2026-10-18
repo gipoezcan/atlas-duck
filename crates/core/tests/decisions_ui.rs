@@ -1155,6 +1155,46 @@ async fn recent_error_text_only_while_deliverable() -> TestResult {
     Ok(())
 }
 
+/// ZWJ review I-2: the Recent list shows the error text as it is (no second escaping in the UI),
+/// so its 2 KiB cap never ends inside an emoji sequence (a raw U+200D the shown text flags) or
+/// inside a `⟨U+XXXX⟩` escape (half of one); it moves back to the start of either. The raw
+/// messages fit the raw cap; only their display escape (each `⟨` is 12 bytes) crosses it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recent_error_text_cap_keeps_sequences_and_escapes_whole() -> TestResult {
+    use atlas_duck_preview::invisible::{escape_for_display, flags};
+    let end = atlas_duck_preview::ERROR_TEXT_CAP_BYTES - '…'.len_utf8();
+    let cases = [
+        // `⟨⟨⟨⟨` is 48 bytes escaped: the old cut falls right after the U+200D of 👩‍💻.
+        (
+            "⟨⟨⟨⟨".to_owned() + &"x".repeat(end - 48 - 7) + "👩\u{200D}💻" + &"y".repeat(20),
+            end - 7,
+            "👩\u{200D}",
+        ),
+        // One `⟨` (12 bytes escaped): the old cut falls inside the escape of U+202E.
+        (
+            "⟨".to_owned() + &"x".repeat(end - 12 - 5) + "\u{202E}tail",
+            end - 5,
+            "⟨U+",
+        ),
+    ];
+    for (message, keep, split) in cases {
+        assert!(message.len() <= atlas_duck_preview::ERROR_TEXT_CAP_BYTES);
+        let escaped = escape_for_display(&message);
+        assert!(escaped.len() > atlas_duck_preview::ERROR_TEXT_CAP_BYTES);
+        // What the old cut kept of the sequence or escape.
+        assert_eq!(&escaped[keep..end], split);
+        let h = Harness::jira().await?;
+        let mock = jira(&h)?;
+        identity_ok(mock).await;
+        mount_comment_post(mock, 400, &message).await;
+        let w = failed_write(&h, "one").await?;
+        let text = row(&h, &w)?.error_text.ok_or("no error text")?;
+        assert_eq!(text, format!("{}…", &escaped[..keep]));
+        assert!(!flags(&text).contains(&true), "{text:?}");
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stale_return_is_listed_until_decided() -> TestResult {
     // No `/myself` answer: the stale check cannot run and the approval returns to the queue

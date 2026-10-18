@@ -13,7 +13,7 @@ use atlas_duck_atlassian::{
     url_hash, username_matches,
 };
 use atlas_duck_audit::{AuditError, Confirmed, SettingChange, Settings, UtcInstant};
-use atlas_duck_preview::invisible::escape_for_display;
+use atlas_duck_preview::invisible::{cut_boundary, escape_for_display};
 use atlas_duck_preview::mixed_script::is_mixed_script;
 use atlas_duck_registry::Product;
 use sha2::{Digest, Sha256};
@@ -134,19 +134,24 @@ pub(crate) fn change_text(alias: &str, old: &NormalizedBaseUrl, new: &Normalized
 
 /// A server- or file-supplied name as a native dialog may show it (review I-6): every invisible
 /// or bidi character, and the line breaks and tabs the display escape keeps, as `⟨U+XXXX⟩`;
-/// capped; a mixed-script name is flagged (§6.4).
+/// capped at 200 chars, never inside an emoji sequence or an escape (ZWJ review I-2); a
+/// mixed-script name is flagged (§6.4).
 pub(crate) fn shown(s: &str) -> String {
     const CAP: usize = 200;
+    let escaped = escape_for_display(s);
+    let (kept, cut) = match escaped.char_indices().nth(CAP) {
+        Some((at, _)) => (&escaped[..cut_boundary(&escaped, at)], true),
+        None => (escaped.as_str(), false),
+    };
     let mut out = String::new();
-    for (n, c) in escape_for_display(s).chars().enumerate() {
-        if n == CAP {
-            out.push('…');
-            break;
-        }
+    for c in kept.chars() {
         match c {
             '\n' | '\r' | '\t' => out.push_str(&format!("⟨U+{:04X}⟩", c as u32)),
             _ => out.push(c),
         }
+    }
+    if cut {
+        out.push('…');
     }
     if is_mixed_script(s) {
         out.push_str(" [mixed scripts]");
@@ -1123,6 +1128,36 @@ mod tests {
         assert!(shown(&"a".repeat(500)).chars().count() <= 201);
         // Latin with a Cyrillic look-alike is flagged.
         assert!(shown("p\u{430}ypal").ends_with("[mixed scripts]"));
+    }
+
+    /// ZWJ review I-2: the 200-char cap never ends inside an emoji sequence (a raw U+200D the
+    /// dialog text flags) or inside an escape (half of `⟨U+202E⟩`): it moves back to its start.
+    #[test]
+    fn dialog_name_cap_keeps_sequences_and_escapes_whole() {
+        use atlas_duck_preview::invisible::flags;
+        // 198 + 👩 + U+200D are the first 200 chars.
+        let s = shown(&("a".repeat(198) + "👩\u{200D}💻"));
+        assert_eq!(s, "a".repeat(198) + "…");
+        assert!(!flags(&s).contains(&true), "{s:?}");
+        // The escape takes chars 197 to 204.
+        assert_eq!(
+            shown(&("a".repeat(196) + "\u{202E}")),
+            "a".repeat(196) + "…"
+        );
+        // A line break is escaped after the cap, whole (as before).
+        assert_eq!(
+            shown(&("a".repeat(196) + "\n")),
+            "a".repeat(196) + "⟨U+000A⟩"
+        );
+        // A sequence or an escape that ends at char 200 stays.
+        assert_eq!(
+            shown(&("a".repeat(197) + "👩\u{200D}💻b")),
+            "a".repeat(197) + "👩\u{200D}💻…"
+        );
+        assert_eq!(
+            shown(&("a".repeat(192) + "\u{202E}b")),
+            "a".repeat(192) + "⟨U+202E⟩…"
+        );
     }
 
     #[test]

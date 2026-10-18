@@ -118,6 +118,9 @@ pub(crate) struct Doc {
     pre: u32,
     /// Most bytes of `out`: the body budget, or the share of one part of it.
     limit: usize,
+    /// A text was cut here: nothing more is written, even when the cut moved back to a
+    /// sequence's start and left a few bytes of the budget (ZWJ review M-2).
+    exhausted: bool,
     /// A script's own section ([`Doc::record`]): its notes name the audit record.
     record: bool,
     /// Inside a section of the document (a script item's candidate view): headings one level
@@ -156,6 +159,7 @@ impl Doc {
             cut_text: 0,
             pre: 0,
             limit,
+            exhausted: false,
             record: false,
             nested: false,
         }
@@ -203,7 +207,7 @@ impl Doc {
 
     /// The byte budget of the body (or of this part) is used up.
     pub(crate) fn full(&self) -> bool {
-        self.out.len() >= self.limit
+        self.exhausted || self.out.len() >= self.limit
     }
 
     /// Bytes a cap left out.
@@ -307,8 +311,10 @@ impl Doc {
 
     fn bdi(&mut self, shown: &str) {
         self.open("bdi");
-        let left = push_marked(&mut self.out, shown, self.limit);
+        let limit = if self.exhausted { 0 } else { self.limit };
+        let left = push_marked(&mut self.out, shown, limit);
         if left > 0 {
+            self.exhausted = true;
             self.out.push('…');
             self.cut_text = self.cut_text.saturating_add(left);
             self.hide(left);
@@ -320,7 +326,7 @@ impl Doc {
     /// escaped and marked. Left out whole (and noted) when it does not fit the budget.
     pub(crate) fn html(&mut self, html: &str) {
         let clean = sanitize_html(html);
-        if self.out.len().saturating_add(clean.len()) > self.limit {
+        if self.exhausted || self.out.len().saturating_add(clean.len()) > self.limit {
             let n = len_u64(html.len());
             self.hide(n);
             self.open("p");

@@ -2604,12 +2604,75 @@ fn a_cut_never_splits_an_unflagging_emoji_sequence() {
                 rest.is_empty() || rest.starts_with(seq) || shown.ends_with('e'),
                 "{seq:?} {pad}: cut inside the sequence"
             );
+            // Where the cut lands (ZWJ review M-1): the share runs out at the first char of the
+            // sequences at or past byte `pad` of them; inside a sequence the cut moves back to
+            // its start, nowhere else.
+            let run = seq.repeat(4);
+            let old = (pad..=run.len())
+                .find(|&b| run.is_char_boundary(b))
+                .unwrap_or(run.len());
+            let e = stderr.len() - run.len();
+            assert_eq!(
+                shown.len(),
+                e + old - old % seq.len(),
+                "{seq:?} {pad}: cut not at the last sequence boundary"
+            );
             assert!(
                 !invisible::flags(shown).contains(&true),
                 "{seq:?} {pad}: a raw flagged char"
             );
         }
     }
+}
+
+/// ZWJ review M-2: a cut moved back to a sequence's start leaves its part full, so no later value
+/// shows after the `…` (here the same Host-calls row's `instance`, which fit the up to 31 bytes a
+/// kiss sequence gives back).
+#[test]
+fn a_cut_moved_back_leaves_no_room_for_later_values() {
+    // 35 bytes, char boundaries 0 4 8 11 14 17 20 24 27 31 35.
+    const KISS: &str =
+        "\u{1F469}\u{1F3FB}\u{200D}\u{2764}\u{FE0F}\u{200D}\u{1F48B}\u{200D}\u{1F468}\u{1F3FC}";
+    let sequences = invisible::flags_and_sequences(KISS).1;
+    assert_eq!(sequences.len(), 1);
+    assert_eq!(sequences[0], 0..35);
+    let with_row = |op_id: String| {
+        let mut p = script_preview(ScriptItemKind::Result);
+        if let PreviewBody::Script { provenance, .. } = &mut p.body {
+            *provenance = vec![ProvenanceRow {
+                call_id: 1,
+                op_id,
+                instance: "MARKER".into(),
+                target_display: "t".into(),
+                outcome: "o".into(),
+            }];
+        }
+        doc(&p)
+    };
+    let shown_op = |d: &str| -> usize {
+        let section = script_section(d, "Host calls");
+        let at = section
+            .find("<code><bdi>")
+            .map_or(0, |i| i + "<code><bdi>".len());
+        section[at..].find('…').unwrap_or(0)
+    };
+    // How many bytes of a plain `op_id` fit its share.
+    let fit = shown_op(&with_row("e".repeat(DOC_SCRIPT_CALLS_BYTES)));
+    assert!(fit > 1000, "{fit}");
+    // The share runs out at the kiss's last char (byte 31): the cut moves back 31 bytes.
+    let d = with_row("e".repeat(fit - 31) + KISS + "eeee");
+    assert_eq!(shown_op(&d), fit - 31);
+    let section = script_section(&d, "Host calls");
+    let tail = section
+        .char_indices()
+        .rev()
+        .nth(150)
+        .map_or(section, |(i, _)| &section[i..]);
+    assert!(!section.contains("<bdi>M"), "{tail}");
+    assert!(
+        section.contains("…</bdi></code></td><td><bdi>…</bdi></td>"),
+        "{tail}"
+    );
 }
 
 /// Changes a script body's source, provenance, logs and stderr.

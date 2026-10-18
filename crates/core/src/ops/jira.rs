@@ -6,7 +6,7 @@
 use atlas_duck_atlassian::GetCall;
 use atlas_duck_ipc::jcs::to_jcs_vec;
 use atlas_duck_preview::diff::{DiffOp, line_diff};
-use atlas_duck_preview::invisible::escape_for_display;
+use atlas_duck_preview::invisible::{cut_boundary, escape_for_display};
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use serde_json::{Map, Value, json};
 
@@ -762,15 +762,18 @@ pub(crate) fn pretty(v: &Value) -> String {
 }
 
 /// `s` display-escaped and cut to at most `budget` bytes of escaped text, never inside an
-/// escape: the escaped text kept and how many bytes of `s` it shows (T13 review M-6: a budget
-/// counts what is shown, and an escape widens a char up to 12 bytes).
+/// escape or an emoji sequence ([`cut_boundary`], ZWJ review M-7): the escaped text kept and how
+/// many bytes of `s` it shows (T13 review M-6: a budget counts what is shown, and an escape
+/// widens a char up to 12 bytes).
 pub(crate) fn escaped_prefix(s: &str, budget: usize) -> (String, usize) {
     let escaped = escape_for_display(s);
     if escaped.len() <= budget {
         return (escaped, s.len());
     }
+    let end = cut_boundary(&escaped, budget);
     // `escape_for_display` writes each char either as itself or as one `⟨U+XXXX⟩`, and every
-    // `⟨` it writes starts an escape (a literal `⟨` is escaped too).
+    // `⟨` it writes starts an escape (a literal `⟨` is escaped too); `end` is between two of
+    // those.
     let (mut shown, mut taken) = (0usize, 0usize);
     let mut rest = escaped.as_str();
     for c in s.chars() {
@@ -779,7 +782,7 @@ pub(crate) fn escaped_prefix(s: &str, budget: usize) -> (String, usize) {
         } else {
             rest.chars().next().map_or(0, char::len_utf8)
         };
-        if width == 0 || shown + width > budget {
+        if width == 0 || shown + width > end {
             break;
         }
         shown += width;
