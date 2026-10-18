@@ -949,6 +949,21 @@ fn test_hello() -> Hello {
     }
 }
 
+fn assert_send<F: std::future::Future + Send>(_: &F) {}
+
+/// The MCP server awaits `reach` inside rmcp's spawned handlers, so its future must be `Send`
+/// for any connector and any interrupt source (compile-time: the future is never polled).
+#[test]
+fn reach_future_is_send() {
+    let connector = TestConnector::failing(|| ConnectError::NotRunning);
+    let connector: &dyn Connector = &connector;
+    let hello = test_hello();
+    let deadline = within(1);
+    let mut intr: Box<dyn Interrupts> = Box::new(Never);
+    assert_send(&reach(connector, &hello, &deadline, &mut *intr));
+    assert_send(&reach(connector, &hello, &deadline, &mut Never));
+}
+
 /// The hook's check refuses a server that the production check accepts (stricter, never weaker):
 /// the same served endpoint, first with the current-user check (control: it connects), then with
 /// `NeverOwner` (`server_identity`, the client is dropped before the hello).

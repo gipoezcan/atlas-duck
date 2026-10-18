@@ -16,10 +16,13 @@ use std::pin::Pin;
 #[cfg(unix)]
 use std::time::Duration;
 
-pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+/// `Send`, so the connect path (`connected::reach`) can run on any task: the MCP server awaits it
+/// inside rmcp's spawned handlers.
+pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Where interrupts come from: the real `Guard`, a never-firing source, or a test double.
-pub(crate) trait Interrupts {
+/// `Send` for the same reason as [`BoxFuture`]: `reach` holds the source across its awaits.
+pub(crate) trait Interrupts: Send {
     /// Completes when the process was asked to stop (or stdout hung up). Cancel-safe.
     fn next(&mut self) -> BoxFuture<'_, ()>;
 }
