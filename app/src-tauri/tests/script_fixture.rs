@@ -29,7 +29,9 @@ const PROVISION_BOUND: Duration = Duration::from_secs(120);
 async fn provision_script_fixture() -> Result<()> {
     let out = std::env::var_os("ATLAS_DUCK_FIXTURE_OUT")
         .filter(|v| !v.is_empty())
-        .ok_or("ATLAS_DUCK_FIXTURE_OUT is not set: it names the file that receives home= and keys=")?;
+        .ok_or(
+            "ATLAS_DUCK_FIXTURE_OUT is not set: it names the file that receives home= and keys=",
+        )?;
     let mut world = World::new(WorldOpts::default())?;
     tokio::time::timeout(
         PROVISION_BOUND,
@@ -38,7 +40,11 @@ async fn provision_script_fixture() -> Result<()> {
     .await
     .map_err(|_| format!("provisioning did not finish within {PROVISION_BOUND:?}"))??;
     if world.instance_ids().len() != 1 {
-        return Err(format!("expected one provisioned instance, got {:?}", world.instance_ids()).into());
+        return Err(format!(
+            "expected one provisioned instance, got {:?}",
+            world.instance_ids()
+        )
+        .into());
     }
     let text = format!(
         "home={}\nkeys={}\n",
