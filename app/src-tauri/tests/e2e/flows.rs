@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use atlas_duck_atlassian::testing::fixtures;
 use atlas_duck_atlassian::testing::{MockDc, TEST_USER, TEST_USER_KEY, XAuser};
+use atlas_duck_audit::EventType;
 use atlas_duck_ipc::paths::ENDPOINT_FILE;
 use atlas_duck_preview::PREVIEW_CSS;
 use atlas_duck_registry::Product;
@@ -135,7 +136,7 @@ const WINDOWS_ONLY_FLOWS: [(&str, &str); 5] = [
 ];
 
 /// The flows that run on every OS the e2e job runs on (Windows and Linux).
-const COMMON_FLOWS: [&str; 8] = [
+const COMMON_FLOWS: [&str; 11] = [
     "ui06_create_approve_receipt_verify_now",
     "s06_payloads_inert_in_real_webview",
     "s08_preview_css_loads_inline_style_and_remote_image_blocked",
@@ -144,6 +145,9 @@ const COMMON_FLOWS: [&str; 8] = [
     "s09_main_frame_navigation_refused_in_every_window",
     "ui_chords_work_outside_the_preview_frame_and_stay_in_it",
     "p01_first_screen_under_1s",
+    "p01_script_first_screen_under_1s",
+    "s09_running_scripts_window_lists_live_run_and_kills",
+    "x11_kill_from_window_becomes_release_item",
 ];
 
 /// Strings an agent or a server could put into any text field: markup, handlers, URL schemes, a
@@ -1903,6 +1907,278 @@ async fn p01(rig: &Rig) -> Result<()> {
     ensure!(
         slow.is_empty(),
         "P-01 budget {P01_BUDGET:?} exceeded: {slow:?}"
+    );
+    Ok(())
+}
+
+// ---- Running scripts: P-01 (script result), S-09 (live window), X-11 (kill) --------------------------
+//
+// The scripts go in through the real CLI (`script run <file>`, the client has no execute-script call)
+// into the real app and its sandbox worker. The flows need the worker next to the app executable and
+// a sandbox the platform allows; without one the CLI answers `sandbox_unavailable`, which the flows
+// report with the CLI's own output instead of waiting out a window that will never list a run.
+
+/// A script that reads one issue. The mock holds the answer for [`SLOW_SINK`], so the run stays
+/// alive, with its host call in flight, until a flow kills it.
+const SLOW_SCRIPT: &str =
+    "const issue = await atlas.call('jira.issue.get', { key: 'ABC-1' });\nreturn issue;\n";
+/// How long the mock holds the issue answer: longer than any flow below waits for the listing.
+const SLOW_SINK: Duration = Duration::from_secs(120);
+/// P-01's script result: 200 issue summaries with 6 fields each (§1.4 SC3), built by the script
+/// itself (no host call: the webview half measures the card, not the fetch).
+const ROWS_SCRIPT: &str = "const rows = [];\n\
+    for (let i = 0; i < 200; i++) {\n\
+    rows.push({ key: 'ABC-' + (i + 1), summary: 'Issue ' + i + ': login page times out under load', \
+    status: 'In Progress', assignee: 'Jane Doe', priority: 'High', labels: 'web, perf' });\n\
+    }\n\
+    return rows;\n";
+/// The "Host calls" cell of the first row of the Running scripts table.
+const RUNNING_CALLS_CELL: &str = "table[aria-label='Running scripts'] tbody tr td:nth-child(6)";
+/// The Kill button of a row of the Running scripts table.
+const RUNNING_KILL_XPATH: &str = "//button[starts-with(@aria-label,'Kill the script ')]";
+
+/// [`jira_world`] whose mock holds the answer to `GET issue/ABC-1` for [`SLOW_SINK`] (the fixture
+/// set mounted a prompt one first, so start the mock over, as P-01 does).
+async fn slow_sink_world() -> Result<World> {
+    let world = jira_world().await?;
+    let mock = jira(&world)?;
+    mock.server().reset().await;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    mock.jira_server_info(fixtures::JIRA_9_12_VERSION).await;
+    mock.json_delayed(
+        "/rest/api/2/issue/ABC-1",
+        200,
+        fixtures::JIRA_ISSUE,
+        SLOW_SINK,
+    )
+    .await;
+    Ok(world)
+}
+
+/// `atlas-duck script run <file>` held for the flow: the scripted approver holds the release item
+/// (no `atlas-test:` reason).
+fn spawn_script(world: &World, name: &str, source: &str) -> Result<tokio::process::Child> {
+    let file = world.root().join(name);
+    std::fs::write(&file, source)?;
+    let file = file.to_string_lossy().into_owned();
+    world.cli_spawn(&[
+        "script",
+        "run",
+        &file,
+        "--reason",
+        BY_HAND,
+        "--timeout",
+        HOLD,
+    ])
+}
+
+/// What a CLI that ended says, for a failure text.
+async fn cli_ended(cli: tokio::process::Child, what: &str) -> Box<dyn std::error::Error> {
+    match cli.wait_with_output().await {
+        Ok(out) => format!(
+            "{what}: the script run ended first (exit {:?}), stdout: {}, stderr: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into(),
+        Err(e) => {
+            format!("{what}: the script run ended first and its output is unreadable ({e})").into()
+        }
+    }
+}
+
+/// Starts [`SLOW_SCRIPT`], opens the Running scripts window and waits (bounded by [`START_WAIT`])
+/// until its table lists the run with its one host call counted (the call is in flight: the mock
+/// holds the answer). Returns the held CLI; the driver stays in the Running scripts window.
+async fn live_script(rig: &Rig) -> Result<tokio::process::Child> {
+    let mut cli = spawn_script(&rig.world, "slow.js", SLOW_SCRIPT)?;
+    rig.open_window("Running scripts", "Running scripts")
+        .await?;
+    let wd = &rig.wd;
+    let started = Instant::now();
+    loop {
+        if cli.try_wait()?.is_some() {
+            return Err(cli_ended(
+                cli,
+                "waiting for the live run in the Running scripts window",
+            )
+            .await);
+        }
+        let cells = wd.find_all(RUNNING_CALLS_CELL).await?;
+        if let Some(cell) = cells.first()
+            && wd.text(cell).await.is_ok_and(|t| t.trim() == "1")
+        {
+            return Ok(cli);
+        }
+        if started.elapsed() > START_WAIT {
+            return Err(format!(
+                "timed out after {START_WAIT:?} waiting for the live run with one host call in the \
+                 Running scripts window: {}",
+                body_text(wd).await.unwrap_or_default()
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// The shared half of S-09 and X-11: the run is listed (and the window reports no policy
+/// violation), Approvals shows no item for it while it runs, Kill in the window answers "Kill
+/// requested", the list empties and the window still reports no violation and no alert, and the
+/// run's release item appears in Approvals. Returns the held CLI (its request is still undecided);
+/// the driver is in Approvals.
+async fn kill_from_window(rig: &Rig) -> Result<tokio::process::Child> {
+    let wd = &rig.wd;
+    let cli = live_script(rig).await?;
+    // The isolation origin's frame is up while the live run is listed: no CSP report so far.
+    no_alert_no_violation(wd, "Running scripts (live run)").await?;
+
+    // A run in progress is no release item yet: the item below is what the kill made.
+    rig.to_approvals().await?;
+    let early = wd.find_all("div.queue-item").await?;
+    let text = body_text(wd).await?;
+    ensure!(
+        early.is_empty() && !text.contains("script.run"),
+        "Approvals lists an item while the script still runs: {text}"
+    );
+
+    rig.open_window("Running scripts", "Running scripts")
+        .await?;
+    let kill = wd.wait_find_xpath(RUNNING_KILL_XPATH, WAIT).await?;
+    wd.click(&kill).await?;
+    wait_text(wd, "the kill answer and an empty list", WAIT, |t| {
+        t.contains("Kill requested") && t.contains("No scripts are running.")
+    })
+    .await?;
+    // After the kill and its answer (a failed kill is a `role=alert`): still no report.
+    no_alert_no_violation(wd, "Running scripts (after the kill)").await?;
+
+    rig.to_approvals().await?;
+    wd.wait_find_xpath(&row_open_xpath("script.run"), START_WAIT)
+        .await?;
+    Ok(cli)
+}
+
+/// S-09 (Running scripts): a script held on a slow sink (the mock delays the answer to its host
+/// call) is listed live in the Running scripts window; the window, behind the isolation pattern,
+/// reports no `securitypolicyviolation` (the isolation origin's frame) while the run is listed and
+/// after it is killed (`no_alert_no_violation`, the helper of [`s09`]); Kill answers and the
+/// run's item appears in Approvals.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s09_running_scripts_window_lists_live_run_and_kills() -> Result<()> {
+    if !opted_in("s09_running_scripts_window_lists_live_run_and_kills") {
+        return Ok(());
+    }
+    let world = slow_sink_world().await?;
+    let rig = Rig::approvals(world).await?;
+    let outcome = kill_from_window(&rig).await.map(|_cli| ());
+    rig.finish("s09_running", outcome).await
+}
+
+/// X-11: the kill from the window ends the run as `killed_by_user`, not direct, and the request
+/// becomes a release item: its card (still undecided, the CLI is still waiting) shows the script's
+/// source and the host call that was in flight, and after the app quits the audit log holds one
+/// `SCRIPT_FAILED {killed_by_user, direct: false}` and no release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn x11_kill_from_window_becomes_release_item() -> Result<()> {
+    if !opted_in("x11_kill_from_window_becomes_release_item") {
+        return Ok(());
+    }
+    let world = slow_sink_world().await?;
+    let rig = Rig::approvals(world).await?;
+    let outcome = x11(&rig).await;
+    rig.finish("x11", outcome).await
+}
+
+async fn x11(rig: &Rig) -> Result<()> {
+    let wd = &rig.wd;
+    let mut cli = kill_from_window(rig).await?;
+    open_row(wd, "script.run").await?;
+    let card = first_preview_text(wd, WAIT, None).await?;
+    ensure!(
+        card.contains("Script source") && card.contains("jira.issue.get"),
+        "the release item does not show the source and the host call: {card}"
+    );
+    ensure!(
+        cli.try_wait()?.is_none(),
+        "the request was decided without the user's release"
+    );
+
+    // The audit log says what happened: read after the app is gone.
+    rig.world.quit_app().await?;
+    let records = rig.world.audit_records()?;
+    let failed: Vec<&Value> = records
+        .iter()
+        .filter(|(t, _)| *t == EventType::SCRIPT_FAILED)
+        .map(|(_, p)| p)
+        .collect();
+    ensure_eq!(failed.len(), 1, "SCRIPT_FAILED records: {failed:?}");
+    ensure_eq!(failed[0]["reason"], "killed_by_user", "{:?}", failed[0]);
+    ensure_eq!(failed[0]["direct"], false, "{:?}", failed[0]);
+    ensure_eq!(
+        failed[0]["candidate"]["class"],
+        "killed_by_user",
+        "{:?}",
+        failed[0]
+    );
+    ensure!(
+        records
+            .iter()
+            .all(|(t, _)| *t != EventType::SCRIPT_RELEASED),
+        "the killed run was released"
+    );
+    Ok(())
+}
+
+/// P-01 (script scenario, webview half): a script result of 200 rows of 6 fields: from the click on
+/// the item's Open to the first table row inside the preview frame is at most one second (the
+/// driver's round trips included). Printed as `P01 script_200_rows <ms>` for the evidence table.
+/// The Rust half is `perf_sc3::p01_script_200_rows_preview_under_budget`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn p01_script_first_screen_under_1s() -> Result<()> {
+    if !opted_in("p01_script_first_screen_under_1s") {
+        return Ok(());
+    }
+    let world = jira_world().await?;
+    let rig = Rig::approvals(world).await?;
+    let outcome = p01_script(&rig).await;
+    rig.finish("p01_script", outcome).await
+}
+
+async fn p01_script(rig: &Rig) -> Result<()> {
+    let wd = &rig.wd;
+    // Held: killed on drop at the end of the flow.
+    let mut cli = spawn_script(&rig.world, "rows.js", ROWS_SCRIPT)?;
+    // The item exists (run, result, card built) before the clock starts.
+    let waiting = Instant::now();
+    let open = loop {
+        if cli.try_wait()?.is_some() {
+            return Err(cli_ended(cli, "waiting for the script result item").await);
+        }
+        if let Ok(open) = wd.find_xpath(&row_open_xpath("script.run")).await {
+            break open;
+        }
+        ensure!(
+            waiting.elapsed() < START_WAIT,
+            "timed out after {START_WAIT:?} waiting for the script result item"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let started = Instant::now();
+    wd.click(&open).await?;
+    let text = first_preview_text(wd, Duration::from_secs(10), None).await?;
+    let took = started.elapsed();
+    println!("P01 script_200_rows {} ms", took.as_millis());
+    ensure!(
+        text.contains("Issue 199"),
+        "the card does not show the last row: {text}"
+    );
+    ensure!(
+        took <= P01_BUDGET,
+        "P-01 budget {P01_BUDGET:?} exceeded: script_200_rows {} ms",
+        took.as_millis()
     );
     Ok(())
 }

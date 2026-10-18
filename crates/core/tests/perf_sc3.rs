@@ -12,7 +12,8 @@ mod common;
 use std::time::{Duration, Instant};
 
 use atlas_duck_atlassian::testing::{MockDc, fixtures};
-use atlas_duck_core::testing::Harness;
+use atlas_duck_core::RunEnd;
+use atlas_duck_core::testing::{FakeScriptRunner, Harness, ScriptPlan, host_call};
 use atlas_duck_preview::{Platform, Preview, render};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -129,6 +130,68 @@ async fn p01_rust_preview_build_and_document_under_budget() -> TestResult {
     )
     .await?;
     build_and_render(&h, &id, "jira.issue.create")?;
+    Ok(())
+}
+
+/// P-01 for scripts (§1.4 SC3, "a 200-row script result"): a script that read one Jira search page
+/// returns 200 issue summaries with 6 fields each, through the fake runner. The preview build and
+/// `render::document` are bounded like the other scenarios; the script does not need Confluence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p01_script_200_rows_preview_under_budget() -> TestResult {
+    let rows: Vec<Value> = (0..200)
+        .map(|n| {
+            json!({
+                "key": format!("ABC-{}", n + 1),
+                "summary": format!("Issue {n}: login page times out under load"),
+                "status": "In Progress",
+                "assignee": "Jane Doe",
+                "priority": "High",
+                "labels": "web, perf"
+            })
+        })
+        .collect();
+    let runner = FakeScriptRunner::new(vec![ScriptPlan::new(
+        vec![host_call(
+            1,
+            "jira.search",
+            json!({ "jql": "project = ABC", "max": 50 }),
+        )],
+        RunEnd::Result {
+            value: Value::Array(rows),
+            logs: Vec::new(),
+            stderr: String::new(),
+        },
+    )]);
+    let h = Harness::builder()
+        .jira("jira-main")
+        .scripts(runner)
+        .start()
+        .await?;
+    mount_search(jira(&h)?, 50, |n| {
+        json!({
+            "summary": format!("Issue {n}: login page times out under load"),
+            "status": {"id": "3", "name": "In Progress"},
+            "assignee": {"name": "jdoe", "key": "JIRAUSER1", "displayName": "Jane Doe"},
+            "labels": ["web", "perf"]
+        })
+    })
+    .await;
+
+    let env = h
+        .submit_script(json!({ "source": "return 1;", "args": {} }))
+        .await;
+    let id = request_id(&env)?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let p = build_and_render(&h, &id, "script 200 rows")?;
+    let doc = render::document(&p, Platform::current());
+    assert!(
+        doc.contains("Issue 0: login page times out"),
+        "the card shows the first row"
+    );
+    assert!(
+        doc.contains("Issue 199: login page times out"),
+        "the card shows the last row"
+    );
     Ok(())
 }
 
