@@ -3,7 +3,7 @@
 Status: partial (until a human signs; see the signature line at the end of this file). The 1, 4
 and 16 MiB rows are recorded from the CI step "M8 k measurement" (Linux leg) of run 39115702067
 (https://github.com/gipoezcan/atlas-duck/actions/runs/39115702067; URL derived from the git remote,
-not fetched); the 1 and 4 MiB rows are byte-identical to the earlier local runs. The run is at SHA
+not fetched); whether they match the earlier local runs is not recorded. The run is at SHA
 16eede3.
 
 Question: what is the factor `k` such that `heap_mb >= k x max_call_result_mb` (invariant 1)
@@ -350,7 +350,8 @@ The Windows rust leg of run 39115702067 prints, on every worker spawn, from
 
 - `job UI restrictions: applied 0xff, refused 0x100`
 
-Setting all UI limits at once fails on the hosted runner (it is itself inside a job). The spawner
+Setting all UI limits at once is refused on the hosted runner (the reason is not recorded; the
+likely one is that the runner is itself inside a job). The spawner
 then applies the bits one by one, keeps every accepted one (`applied 0xff`) and names the refused
 bit (`refused 0x100`); the job holds exactly the accepted bits. The run still ends green. The UI
 limit bit 0x100 is therefore not in force for the worker's job on the runner; the memory and
