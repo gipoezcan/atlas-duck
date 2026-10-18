@@ -93,8 +93,6 @@ impl Session {
     /// bounds the wait for another call's attempt as well as this call's own discover, launch
     /// poll, connect and `hello`. `Err` is the envelope to answer: nothing was queued.
     /// `client_name` is the tool call's `clientInfo.name`; only the first attempt reads it.
-    // Task 8's tool bodies call it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn client(
         &self,
         deadline: &Deadline,
@@ -136,8 +134,6 @@ impl Session {
     /// so a call holding an older client cannot drop a newer one (each needless reconnect splits
     /// the agent's approval session). Reconnecting does not depend on it: `client` treats a
     /// client that reports `is_closed()` as closed anyway.
-    // Task 8's tool bodies call it after `ConnectionLost`.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn mark_closed(&self) {
         let mut state = self.state();
         if let State::Connected(client) = &*state

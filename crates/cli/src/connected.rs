@@ -180,7 +180,7 @@ async fn guarded<T>(
 }
 
 /// The instant a pre-submission step or a short call must be done by.
-fn bound(deadline: &Deadline) -> Instant {
+pub(crate) fn bound(deadline: &Deadline) -> Instant {
     deadline.at().unwrap_or_else(|| Instant::now() + OWN_LIMIT)
 }
 
@@ -406,7 +406,7 @@ async fn run(
     }
 }
 
-fn list_state(s: &str) -> Option<ListState> {
+pub(crate) fn list_state(s: &str) -> Option<ListState> {
     match s {
         "pending" => Some(ListState::Pending),
         "recent" => Some(ListState::Recent),

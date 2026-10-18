@@ -26,8 +26,7 @@ pub(crate) enum ToolSet {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct McpConfig {
     pub tools: ToolSet,
-    // The default instance (PD-124) is read by the tool bodies (Task 8).
-    #[allow(dead_code)]
+    /// `--instance`: the default instance of the tool bodies (PD-124).
     pub instance: Option<String>,
     /// `--agent`, else a non-empty `ATLAS_DUCK_AGENT` (the session's hello, PD-122).
     pub agent: Option<String>,
@@ -35,8 +34,6 @@ pub(crate) struct McpConfig {
     /// `--agent` was passed, even as `""`: the `clientInfo.name` fallback does not apply (PD-122).
     pub agent_given: bool,
     /// How long a tool call waits for a decision; `None` = 0 = return `pending` at once.
-    // The tool bodies' deadline (Task 8).
-    #[allow(dead_code)]
     pub timeout: Option<Duration>,
 }
 

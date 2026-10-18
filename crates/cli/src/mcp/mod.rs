@@ -5,6 +5,7 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+pub(crate) mod call;
 pub(crate) mod config;
 pub(crate) mod result;
 pub(crate) mod server;

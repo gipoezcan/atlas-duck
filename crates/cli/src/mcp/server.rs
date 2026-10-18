@@ -20,6 +20,7 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use serde_json::{Map, Value};
 
+use super::call::Bodies;
 use super::config::{McpConfig, ToolSet};
 use super::result::{ToolKind, to_tool_result};
 use super::session::Session;
@@ -33,26 +34,21 @@ pub(crate) const SERVER_NAME: &str = "atlas-duck";
 /// PD-125: the heartbeat period of a waiting tool call (the rig sets a short one).
 pub(crate) const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
 
-const MSG_NOT_YET: &str = "this tool is not available in this build yet";
-
 /// A boxed `Send` future (rmcp runs every handler on its own task).
 pub(crate) type SendFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// What the server holds for every tool call.
-// `connector`, `heartbeat_every` and `session` are read by the tool bodies (Tasks 8-9).
-#[allow(dead_code)]
 pub(crate) struct Shared {
     pub cfg: McpConfig,
-    pub connector: Arc<dyn Connector>,
     /// `HEARTBEAT_EVERY` in production.
+    // Task 9's heartbeats read it.
+    #[allow(dead_code)]
     pub heartbeat_every: Duration,
     /// The one IPC connection of this server (PD-115, PD-128).
     pub session: Session,
 }
 
 /// One connected tool call, its arguments already checked (fixed tools and `call`: PD-118).
-// Everything but `name` is read by the tool bodies (Tasks 8-9).
-#[allow(dead_code)]
 pub(crate) struct ToolCall {
     pub name: String,
     pub args: Map<String, Value>,
@@ -76,27 +72,14 @@ impl ToolCall {
     /// `clientInfo.name` as the client sent it (PD-122 decides what an empty one means): from the
     /// request's own `_meta` when it carries one, else from `initialize`. Both lifecycles carry
     /// it, so a client that never sends `initialize` still names itself (T6 review I-1).
-    // Task 8's bodies hand it to the session.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn client_name(&self) -> Option<String> {
         self.context.client_info().map(|info| info.name)
     }
 }
 
-/// The connected tool bodies (Task 8 fills them).
+/// The connected tool bodies (`call::Bodies`; tests replace them).
 pub(crate) trait ToolBodies: Send + Sync {
     fn call<'a>(&'a self, shared: &'a Shared, call: ToolCall) -> SendFuture<'a, Envelope>;
-}
-
-/// Until the bodies exist: every connected tool answers `usage`.
-struct NotYet;
-
-impl ToolBodies for NotYet {
-    fn call<'a>(&'a self, _shared: &'a Shared, call: ToolCall) -> SendFuture<'a, Envelope> {
-        let mut details = Map::new();
-        details.insert("tool".to_owned(), Value::from(call.name));
-        Box::pin(std::future::ready(local::usage(MSG_NOT_YET, details)))
-    }
 }
 
 /// The handler rmcp serves.
@@ -114,12 +97,11 @@ impl AtlasMcp {
     ) -> AtlasMcp {
         AtlasMcp {
             shared: Arc::new(Shared {
-                session: Session::new(&cfg, connector.clone()),
+                session: Session::new(&cfg, connector),
                 cfg,
-                connector,
                 heartbeat_every,
             }),
-            bodies: Arc::new(NotYet),
+            bodies: Arc::new(Bodies),
         }
     }
 
@@ -179,7 +161,7 @@ impl AtlasMcp {
     }
 }
 
-fn unknown_tool(name: &str) -> Envelope {
+pub(crate) fn unknown_tool(name: &str) -> Envelope {
     let name = clip(name);
     let mut details = Map::new();
     details.insert("tool".to_owned(), Value::from(name.clone()));

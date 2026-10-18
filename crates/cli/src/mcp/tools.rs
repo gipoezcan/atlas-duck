@@ -83,8 +83,6 @@ pub(crate) fn op_for_tool(name: &str) -> Option<&'static OperationSpec> {
 /// The op tool's `reason`/`instance` split from its params: `(params, reason, instance)`. The
 /// params keep every other key unchanged; the app validates them. A wrong type is a `usage`
 /// envelope naming the argument.
-// The op tool bodies (Task 8) consume it.
-#[allow(dead_code)]
 pub(crate) fn split_op_args(
     mut args: Map<String, Value>,
 ) -> Result<(Value, Option<String>, Option<String>), Envelope> {

@@ -13,7 +13,8 @@ use atlas_duck_ipc::build_info::{APP_VERSION, BUILD_ID};
 use atlas_duck_ipc::client::{ClientError, ConnectError, SharedClient};
 use atlas_duck_ipc::envelope::{Envelope, ErrorCode, Status};
 use atlas_duck_ipc::proto::{
-    AgentNameSource, AwaitParams, ClientKind, ProgressNotification, SubmitParams, SubmitReply,
+    AgentNameSource, AwaitParams, ClientKind, ListState, ProgressNotification, SubmitParams,
+    SubmitReply,
 };
 use atlas_duck_ipc::rpc::{IdParams, method};
 use rmcp::ServiceError;
@@ -22,6 +23,7 @@ use rmcp::service::ClientLifecycleMode;
 use serde_json::{Map, Value, json};
 
 use super::config::{McpConfig, ToolSet};
+use super::result::RESTART_TEXT;
 use super::rig::{RIG_BUILD, RIG_HEARTBEAT, Rig, RigApp, RigOpts};
 use super::server::{AtlasMcp, SendFuture, Shared, ToolBodies, ToolCall};
 use super::session::{Session, hello_of};
@@ -29,6 +31,8 @@ use super::tools::catalog;
 use super::{run_on, run_on_with, serve_with};
 use crate::connected::{Connector, cwd_basename};
 use crate::deadline::Deadline;
+use crate::discover::AppLocation;
+use crate::flow::MSG_CONNECTION_LOST_NO_ID;
 use crate::local;
 use crate::test_support::{AwaitScript, HelloMode, Kind, REQ_ID, TestConnector, WAIT};
 
@@ -1145,5 +1149,935 @@ async fn unbounded_wait_for_another_reach_is_bounded_by_own_limit() -> TestResul
         "the waiter made an attempt"
     );
     tokio::time::timeout(WAIT, first).await??;
+    Ok(())
+}
+
+// ---------- the tool bodies (Task 8) ----------
+
+fn submits(rig: &Rig) -> Vec<SubmitParams> {
+    rig.fake().submits.lock().unwrap().clone()
+}
+
+fn submit(
+    op_id: &str,
+    params: Value,
+    instance: Option<&str>,
+    reason: Option<&str>,
+) -> SubmitParams {
+    SubmitParams {
+        op_id: op_id.to_owned(),
+        params,
+        instance: instance.map(str::to_owned),
+        reason: reason.map(str::to_owned),
+    }
+}
+
+/// A well-formed request id of its own.
+fn id_n(n: u32) -> String {
+    format!("req_{n:032}")
+}
+
+/// Polls until `done` holds; fails the test after `WAIT`.
+async fn until(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + WAIT;
+    while !done() {
+        assert!(Instant::now() < deadline, "never: {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The connection ids of every hello the Fake saw.
+fn connection_ids(rig: &Rig) -> Vec<String> {
+    rig.fake()
+        .hellos()
+        .into_iter()
+        .map(|h| h.connection_id)
+        .collect()
+}
+
+fn released(data: Value) -> Envelope {
+    let mut env = Envelope::failed(ErrorCode::Internal, false, "");
+    env.status = Status::Released;
+    env.error = None;
+    env.data = Some(data);
+    env
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn op_tool_submits_op_id_params_reason_instance() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    let called = rig
+        .call(
+            "jira_issue_get",
+            json!({"key": "A-1", "reason": "triage", "instance": "dc"}),
+            false,
+        )
+        .await;
+    assert!(!called.is_error(), "{:?}", called.texts());
+    assert_eq!(
+        submits(&rig),
+        [submit(
+            "jira.issue.get",
+            json!({"key": "A-1"}),
+            Some("dc"),
+            Some("triage")
+        )]
+    );
+    assert_eq!(rig.fake().count(Kind::Submit), 1);
+    // Then the wait: the Fake's await answer is the result, `timeout_ms` the time left.
+    let awaits = rig.fake().awaits.lock().unwrap().clone();
+    let first = awaits.first().ok_or("no request.await")?;
+    assert_eq!(first.request_id, REQ_ID);
+    let ms = first.timeout_ms.ok_or("no timeout_ms")?;
+    assert!(ms > 0 && ms <= 5_000, "{ms}");
+    assert_eq!(
+        called.envelope()["data"],
+        json!({"method": "request.await"})
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn call_tool_submits_like_op_tool() -> TestResult {
+    let rig = Rig::new(RigOpts {
+        tools: ToolSet::Generic,
+        ..RigOpts::default()
+    })
+    .await;
+    let called = rig
+        .call(
+            "call",
+            json!({
+                "op_id": "jira.issue.get",
+                "params": {"key": "A-1"},
+                "reason": "triage",
+                "instance": "dc",
+            }),
+            false,
+        )
+        .await;
+    assert!(!called.is_error(), "{:?}", called.texts());
+    assert_eq!(
+        submits(&rig),
+        [submit(
+            "jira.issue.get",
+            json!({"key": "A-1"}),
+            Some("dc"),
+            Some("triage")
+        )]
+    );
+    assert_eq!(rig.fake().count(Kind::Submit), 1);
+    Ok(())
+}
+
+/// §9.1/§9.5 `script.submit` params; §4.4 + PD-124: a script names no instance, not even the
+/// server's default one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn script_run_submits_script_params_without_instance() -> TestResult {
+    let rig = Rig::new(RigOpts {
+        instance: Some("dflt".to_owned()),
+        ..RigOpts::default()
+    })
+    .await;
+    let full = rig
+        .call(
+            "script_run",
+            json!({
+                "source": "return 1",
+                "args": {"a": [1, 2]},
+                "limits": {"timeout_s": 5},
+                "reason": "why",
+            }),
+            false,
+        )
+        .await;
+    assert!(!full.is_error(), "{:?}", full.texts());
+    let bare = rig
+        .call("script_run", json!({"source": "return 2"}), false)
+        .await;
+    assert!(!bare.is_error(), "{:?}", bare.texts());
+    assert_eq!(
+        submits(&rig),
+        [
+            submit(
+                "script.run",
+                json!({"source": "return 1", "args": {"a": [1, 2]}, "limits": {"timeout_s": 5}}),
+                None,
+                Some("why"),
+            ),
+            submit(
+                "script.run",
+                json!({"source": "return 2", "args": {}}),
+                None,
+                None
+            ),
+        ]
+    );
+    assert_eq!(rig.fake().count(Kind::ScriptSubmit), 2);
+    assert_eq!(rig.fake().count(Kind::Submit), 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn script_run_dry_run_values_full_and_sparse() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    for mode in ["full", "sparse"] {
+        let called = rig
+            .call(
+                "script_run",
+                json!({"source": "return 1", "dry_run": mode}),
+                false,
+            )
+            .await;
+        assert!(!called.is_error(), "{mode}: {:?}", called.texts());
+    }
+    let dry: Vec<Value> = submits(&rig)
+        .into_iter()
+        .map(|s| s.params["dry_run"].clone())
+        .collect();
+    assert_eq!(dry, [json!("full"), json!("sparse")]);
+    Ok(())
+}
+
+/// PD-124: `--instance` fills op tools, `call` and `request_list.match_params` without an
+/// instance; `ops_list`/`ops_describe` without one stay local; `script_run` names none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn default_instance_fills_op_and_match_params_not_ops_or_script() -> TestResult {
+    let full = Rig::new(RigOpts {
+        instance: Some("dflt".to_owned()),
+        ..RigOpts::default()
+    })
+    .await;
+    full.call("jira_issue_get", json!({"key": "A-1"}), false)
+        .await;
+    full.call(
+        "jira_issue_get",
+        json!({"key": "A-1", "instance": "x"}),
+        false,
+    )
+    .await;
+    full.call("script_run", json!({"source": "return 1"}), false)
+        .await;
+    let instances: Vec<Option<String>> = submits(&full).into_iter().map(|s| s.instance).collect();
+    assert_eq!(
+        instances,
+        [Some("dflt".to_owned()), Some("x".to_owned()), None]
+    );
+
+    let mp = json!({"op_id": "jira.issue.get", "params": {"key": "A-1"}});
+    full.call("request_list", json!({"match_params": mp}), false)
+        .await;
+    let mut mp_x = mp.clone();
+    mp_x["instance"] = json!("x");
+    full.call("request_list", json!({"match_params": mp_x}), false)
+        .await;
+    let listed: Vec<Option<String>> = full
+        .fake()
+        .lists
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, _, m)| m.as_ref().and_then(|m| m.instance.clone()))
+        .collect();
+    assert_eq!(listed, [Some("dflt".to_owned()), Some("x".to_owned())]);
+
+    // The app-free tools stay local: the default instance does not make them connect.
+    let list = full.call("ops_list", json!({}), false).await;
+    assert_eq!(list.envelope(), serde_json::to_value(local::ops_list())?);
+    full.call("ops_describe", json!({"op_id": "jira.issue.get"}), false)
+        .await;
+    assert_eq!(full.fake().count(Kind::OpsList), 0);
+    assert_eq!(full.fake().count(Kind::OpsDescribe), 0);
+
+    let generic = Rig::new(RigOpts {
+        tools: ToolSet::Generic,
+        instance: Some("dflt".to_owned()),
+        ..RigOpts::default()
+    })
+    .await;
+    generic
+        .call(
+            "call",
+            json!({"op_id": "jira.issue.get", "params": {"key": "A-1"}}),
+            false,
+        )
+        .await;
+    let instances: Vec<Option<String>> =
+        submits(&generic).into_iter().map(|s| s.instance).collect();
+    assert_eq!(instances, [Some("dflt".to_owned())]);
+    Ok(())
+}
+
+/// PD-118: a fixed tool's bad argument is answered before any connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fixed_tool_arguments_validated_locally() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    for (tool, args, arg) in [
+        (
+            "request_status",
+            json!({"request_id": "req_short"}),
+            "request_id",
+        ),
+        ("request_await", json!({"request_id": 7}), "request_id"),
+        (
+            "script_run",
+            json!({"source": "return 1", "dry_run": "maybe"}),
+            "dry_run",
+        ),
+    ] {
+        let called = rig.call(tool, args, false).await;
+        assert!(called.is_error(), "{tool}");
+        let env = called.envelope();
+        assert_eq!(code(&env), Some("usage"), "{tool}");
+        assert_eq!(detail(&env, "arg"), Some(&json!(arg)), "{tool}");
+    }
+    assert_eq!(rig.connector().connect_count(), 0);
+    assert_eq!(rig.connector().discover_count(), 0);
+    Ok(())
+}
+
+/// L131 through MCP: a `pending` submit reply without a request id is `protocol_error`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_pending_reply_without_id_is_protocol_error() -> TestResult {
+    let mut fake = RigOpts::default().fake;
+    fake.submit_null_id = true;
+    let rig = Rig::new(RigOpts {
+        fake,
+        ..RigOpts::default()
+    })
+    .await;
+    let called = rig
+        .call("jira_issue_get", json!({"key": "A-1"}), false)
+        .await;
+    assert!(called.is_error());
+    let env = called.envelope();
+    assert_eq!(env["status"], "failed");
+    assert_eq!(code(&env), Some("protocol_error"));
+    assert_eq!(env["request_id"], Value::Null);
+    assert_eq!(rig.fake().count(Kind::Submit), 1);
+    assert_eq!(
+        rig.fake().count(Kind::AwaitStart),
+        0,
+        "awaited without an id"
+    );
+    Ok(())
+}
+
+/// L131 through MCP: an await answer naming another request is `protocol_error`, after a submit
+/// and for `request_await`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_await_reply_naming_another_request_is_protocol_error() -> TestResult {
+    let mut fake = RigOpts::default().fake;
+    fake.await_reply_id = Some(OTHER_ID);
+    let rig = Rig::new(RigOpts {
+        fake,
+        ..RigOpts::default()
+    })
+    .await;
+    for (tool, args) in [
+        ("jira_issue_get", json!({"key": "A-1"})),
+        ("request_await", json!({"request_id": REQ_ID})),
+    ] {
+        let called = rig.call(tool, args, false).await;
+        assert!(called.is_error(), "{tool}");
+        let env = called.envelope();
+        assert_eq!(code(&env), Some("protocol_error"), "{tool}");
+        assert_eq!(env["request_id"], Value::Null, "{tool}");
+    }
+    assert_eq!(rig.fake().count(Kind::AwaitDone), 2);
+    Ok(())
+}
+
+/// I-16 / §4.4: `request_status` of a known id answers at once and is never an error, whatever
+/// the request's state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_of_known_id_is_not_error() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    let mut pending = released(Value::Null);
+    pending.status = Status::Pending;
+    pending.data = None;
+    let mut denied = Envelope::failed(ErrorCode::Denied, false, "denied by the user");
+    denied.status = Status::Denied;
+    if let Some(err) = denied.error.as_mut() {
+        let mut d = Map::new();
+        d.insert("hint".to_owned(), json!("use the sandbox project"));
+        err.details = Some(d);
+    }
+    let upstream = released(json!({"error": {"status": 404}}));
+    let mut failed_write = Envelope::failed(ErrorCode::UpstreamHttp, false, "HTTP 400");
+    failed_write.op_id = Some("jira.issue.create".to_owned());
+    let table = [
+        pending,
+        released(json!({"key": "A-1"})),
+        denied,
+        upstream,
+        failed_write,
+    ];
+    for (n, env) in table.into_iter().enumerate() {
+        let id = id_n(100 + u32::try_from(n)?);
+        rig.fake().set_status(&id, env.clone());
+        let called = rig
+            .call("request_status", json!({"request_id": id}), false)
+            .await;
+        assert!(!called.is_error(), "{id}: {:?}", called.texts());
+        let mut want = env;
+        want.request_id = Some(id.clone());
+        assert_eq!(called.envelope(), serde_json::to_value(want)?, "{id}");
+    }
+    assert_eq!(rig.fake().count(Kind::AwaitStart), 0);
+    Ok(())
+}
+
+/// I-04: `request_status` never waits (the Fake would hold an await for a minute).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i04_request_status_never_blocks() -> TestResult {
+    let mut fake = RigOpts::default().fake;
+    fake.await_delay = Duration::from_secs(60);
+    let rig = Rig::new(RigOpts {
+        fake,
+        ..RigOpts::default()
+    })
+    .await;
+    // Connect first, so the measured call is the status call alone.
+    rig.call("request_status", json!({"request_id": REQ_ID}), false)
+        .await;
+    let start = Instant::now();
+    let called = rig
+        .call("request_status", json!({"request_id": REQ_ID}), true)
+        .await;
+    let took = start.elapsed();
+    assert!(!called.is_error(), "{:?}", called.texts());
+    assert!(took < Duration::from_secs(1), "{took:?}");
+    assert_eq!(rig.fake().count(Kind::Status), 2);
+    assert_eq!(rig.fake().count(Kind::AwaitStart), 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i04_request_cancel_cancels() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    let called = rig
+        .call("request_cancel", json!({"request_id": OTHER_ID}), false)
+        .await;
+    assert_eq!(
+        called.envelope()["data"],
+        json!({"method": "request.cancel"})
+    );
+    let cancels = rig.fake().of(Kind::Cancel);
+    assert_eq!(cancels.len(), 1);
+    assert_eq!(
+        cancels.first().and_then(|e| e.detail.as_deref()),
+        Some(OTHER_ID)
+    );
+    assert_eq!(rig.fake().count(Kind::Submit), 0);
+    Ok(())
+}
+
+/// L66: the agent filter comes only from the tool's own `agent` argument, never from `--agent`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn request_list_agent_only_from_argument() -> TestResult {
+    let rig = Rig::new(RigOpts {
+        agent: Some("cfg-agent".to_owned()),
+        agent_source: AgentNameSource::Flag,
+        agent_given: true,
+        ..RigOpts::default()
+    })
+    .await;
+    rig.call("request_list", json!({}), false).await;
+    rig.call(
+        "request_list",
+        json!({"agent": "other", "state": "recent"}),
+        false,
+    )
+    .await;
+    let lists = rig.fake().lists.lock().unwrap().clone();
+    assert_eq!(
+        lists,
+        [
+            (None, None, None),
+            (Some("other".to_owned()), Some(ListState::Recent), None),
+        ]
+    );
+    Ok(())
+}
+
+/// RF-2: a `busy` answer passes through unchanged (`retry_after_s` included).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn busy_envelope_passes_through_unchanged() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    let mut busy = Envelope::failed(ErrorCode::Busy, true, "busy");
+    if let Some(err) = busy.error.as_mut() {
+        let mut d = Map::new();
+        d.insert("retry_after_s".to_owned(), json!(7));
+        err.details = Some(d);
+    }
+    rig.fake().set_submit_answer(Some(busy.clone()));
+    let called = rig
+        .call("jira_issue_get", json!({"key": "A-1"}), false)
+        .await;
+    assert!(called.is_error());
+    assert_eq!(called.envelope(), serde_json::to_value(&busy)?);
+    assert_eq!(rig.fake().count(Kind::AwaitStart), 0);
+    Ok(())
+}
+
+/// PD-16 / L63: the submit frame was written, then the connection dropped before the answer:
+/// `pending` with an unknown id (never `launch_timeout`), `isError` and the restart text (PD-121,
+/// PD-123).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_submit_lost_after_write_is_pending_unknown_id() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    rig.fake().set_submit_hold(true);
+    let started = rig
+        .start("jira_issue_get", json!({"key": "A-1"}), false)
+        .await;
+    until("the Fake recorded the submit", || submits(&rig).len() == 1).await;
+    rig.app.drop_connections().await;
+    let called = rig.finish(started).await;
+    let env = called.envelope();
+    assert_eq!(env["status"], "pending");
+    assert_eq!(env["request_id"], Value::Null);
+    assert_eq!(env["error"]["message"], MSG_CONNECTION_LOST_NO_ID);
+    assert_eq!(detail(&env, "reason"), Some(&json!("connection_lost")));
+    assert!(called.is_error());
+    assert_eq!(
+        called.texts().first().map(String::as_str),
+        Some(RESTART_TEXT)
+    );
+    Ok(())
+}
+
+/// B-1 / PD-16: a deadline that passes after the writer took the submit frame is
+/// `unknown_request_pending`, never `launch_timeout`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_submit_deadline_after_write_is_pending_not_launch_timeout() -> TestResult {
+    let rig = Rig::new(RigOpts {
+        timeout: Some(Duration::from_secs(1)),
+        ..RigOpts::default()
+    })
+    .await;
+    rig.fake().set_submit_hold(true);
+    let start = Instant::now();
+    let called = rig
+        .call("jira_issue_get", json!({"key": "A-1"}), false)
+        .await;
+    let took = start.elapsed();
+    assert_eq!(submits(&rig).len(), 1, "the Fake has the submit");
+    let env = called.envelope();
+    assert_eq!(env["status"], "pending");
+    assert_eq!(env["request_id"], Value::Null);
+    assert_eq!(detail(&env, "reason"), Some(&json!("connection_lost")));
+    assert!(took < Duration::from_secs(3), "{took:?}");
+    // The connection is intact: the next call reuses it.
+    rig.call("request_status", json!({"request_id": REQ_ID}), false)
+        .await;
+    assert_eq!(rig.fake().hellos().len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn instances_list_and_ops_with_instance_connect() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    let instances = rig.call("instances_list", json!({}), false).await;
+    assert!(!instances.is_error(), "{:?}", instances.texts());
+    assert_eq!(
+        instances.envelope()["data"],
+        json!({"method": "instances.list"})
+    );
+    let list = rig.call("ops_list", json!({"instance": "dc"}), false).await;
+    assert_eq!(list.envelope()["data"], json!({"method": "ops.list"}));
+    let describe = rig
+        .call(
+            "ops_describe",
+            json!({"op_id": "jira.issue.get", "instance": "dc"}),
+            false,
+        )
+        .await;
+    assert_eq!(
+        describe.envelope()["data"],
+        json!({"method": "ops.describe"})
+    );
+    let detail_of = |kind| {
+        rig.fake()
+            .of(kind)
+            .into_iter()
+            .map(|e| e.detail)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(detail_of(Kind::InstancesList), [None]);
+    assert_eq!(detail_of(Kind::OpsList), [Some("dc".to_owned())]);
+    assert_eq!(
+        detail_of(Kind::OpsDescribe),
+        [Some("jira.issue.get|dc".to_owned())]
+    );
+    assert_eq!(rig.connector().connect_count(), 1);
+    Ok(())
+}
+
+/// PD-121: an 8 MiB release reaches the client intact through rmcp's stdio codec, as
+/// `structuredContent` and as the JSON text block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_envelope_passes_through_intact() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    let blob = "x\"\u{e9}".repeat(8 * 1024 * 1024 / 4);
+    let decision = released(json!({"blob": blob}));
+    rig.fake().set_await_script(Some(AwaitScript {
+        progress: Vec::new(),
+        decision: Some((Duration::ZERO, decision.clone())),
+    }));
+    let started = rig
+        .start("request_await", json!({"request_id": REQ_ID}), false)
+        .await;
+    let called = rig.finish_within(started, Duration::from_secs(60)).await;
+    assert!(!called.is_error());
+    let mut want = decision;
+    want.request_id = Some(REQ_ID.to_owned());
+    let want = serde_json::to_value(want)?;
+    assert!(called.envelope() == want, "structuredContent differs");
+    let texts = called.texts();
+    let last: Value = serde_json::from_str(texts.last().ok_or("no text block")?)?;
+    assert!(last == want, "the JSON text block differs");
+    Ok(())
+}
+
+/// Moved from Task 7: nothing connects at `initialize` or `tools/list`; the first connected tool
+/// call connects once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lazy_connect_on_first_connected_tool_call() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    rig.list_tools().await;
+    assert_eq!(rig.connector().connect_count(), 0);
+    assert_eq!(rig.connector().discover_count(), 0);
+    assert!(rig.fake().hellos().is_empty());
+    rig.call("request_status", json!({"request_id": REQ_ID}), false)
+        .await;
+    rig.call("request_status", json!({"request_id": REQ_ID}), false)
+        .await;
+    assert_eq!(rig.connector().connect_count(), 1);
+    assert_eq!(rig.fake().hellos().len(), 1);
+    Ok(())
+}
+
+/// PD-115: concurrent tool calls share one connection (one hello, one `connection_id`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_tool_calls_share_one_connection() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    let mut started = Vec::new();
+    for _ in 0..8 {
+        started.push(
+            rig.start("request_status", json!({"request_id": REQ_ID}), false)
+                .await,
+        );
+    }
+    for call in started {
+        let called = rig.finish(call).await;
+        assert!(!called.is_error(), "{:?}", called.texts());
+    }
+    assert_eq!(rig.fake().count(Kind::Status), 8);
+    assert_eq!(rig.fake().hellos().len(), 1, "one hello, one connection_id");
+    assert_eq!(rig.connector().connect_count(), 1);
+    Ok(())
+}
+
+/// R1 / PD-115: an error answer, a reply the L131 checks refuse and a deadline that passes
+/// mid-await end only their own tool call; the next call uses the same connection (no new
+/// hello, no new approval session).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_call_error_keeps_the_connection() -> TestResult {
+    let mut fake = RigOpts::default().fake;
+    // Every `request.await` outlives the tool call's deadline.
+    fake.await_delay = Duration::from_secs(60);
+    let rig = Rig::new(RigOpts {
+        fake,
+        timeout: Some(Duration::from_secs(1)),
+        ..RigOpts::default()
+    })
+    .await;
+    rig.call("request_status", json!({"request_id": REQ_ID}), false)
+        .await;
+
+    // An error answer.
+    let mut invalid = Envelope::failed(ErrorCode::Validation, false, "invalid");
+    invalid.op_id = Some("jira.issue.get".to_owned());
+    rig.fake().set_submit_answer(Some(invalid));
+    let called = rig
+        .call("jira_issue_get", json!({"key": "A-1"}), false)
+        .await;
+    assert_eq!(code(&called.envelope()), Some("validation"));
+
+    // A reply the L131 check refuses (a per-call `protocol_error`).
+    let mut no_id = released(Value::Null);
+    no_id.status = Status::Pending;
+    no_id.data = None;
+    rig.fake().set_submit_answer(Some(no_id));
+    let called = rig
+        .call("jira_issue_get", json!({"key": "A-1"}), false)
+        .await;
+    assert_eq!(code(&called.envelope()), Some("protocol_error"));
+    rig.fake().set_submit_answer(None);
+
+    // A deadline that passes mid-await: the request lives on.
+    let called = rig
+        .call("request_await", json!({"request_id": REQ_ID}), false)
+        .await;
+    let env = called.envelope();
+    assert_eq!(env["status"], "pending");
+    assert_eq!(env["request_id"], REQ_ID);
+    assert!(!called.is_error(), "{:?}", called.texts());
+
+    rig.call("request_status", json!({"request_id": REQ_ID}), false)
+        .await;
+    let ids = connection_ids(&rig);
+    assert_eq!(ids.len(), 1, "a per-call error reconnected: {ids:?}");
+    assert_eq!(rig.connector().connect_count(), 1);
+    assert_eq!(rig.fake().count(Kind::Status), 2);
+    Ok(())
+}
+
+/// §4.6: `ATLAS_DUCK_MCP_TIMEOUT` counts from the tool call's receipt and covers the launch
+/// poll: an app that never comes up answers `launch_timeout` in time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deadline_from_tool_call_receipt_caps_launch_and_hello() -> TestResult {
+    let rig = Rig::new(RigOpts {
+        timeout: Some(Duration::from_secs(2)),
+        present: false,
+        ..RigOpts::default()
+    })
+    .await;
+    let start = Instant::now();
+    let called = rig
+        .call("jira_issue_get", json!({"key": "A-1"}), false)
+        .await;
+    let took = start.elapsed();
+    let env = called.envelope();
+    assert_eq!(code(&env), Some("unreachable"));
+    assert_eq!(detail(&env, "reason"), Some(&json!("launch_timeout")));
+    assert!(called.is_error());
+    assert_eq!(
+        called.texts().first().map(String::as_str),
+        Some(RESTART_TEXT)
+    );
+    assert!(
+        took >= Duration::from_millis(1800),
+        "the launch poll did not run: {took:?}"
+    );
+    assert!(took < Duration::from_secs(3), "{took:?}");
+    assert!(rig.connector().discover_count() >= 1);
+    assert!(submits(&rig).is_empty());
+    Ok(())
+}
+
+/// §4.3 / PD-16: a deadline that passes before the submit frame was taken is `launch_timeout`
+/// and the app never sees the submit: while the app does not come up, and while every one of
+/// the 48 slots of the shared connection is held by an await the app holds past every deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deadline_before_submit_is_launch_timeout_nothing_queued() -> TestResult {
+    let no_app = Rig::new(RigOpts {
+        timeout: Some(Duration::from_secs(1)),
+        present: false,
+        ..RigOpts::default()
+    })
+    .await;
+    let called = no_app
+        .call("jira_issue_get", json!({"key": "A-1"}), false)
+        .await;
+    assert_eq!(
+        detail(&called.envelope(), "reason"),
+        Some(&json!("launch_timeout"))
+    );
+    assert_eq!(no_app.connector().connect_count(), 0);
+    assert_eq!(no_app.fake().count(Kind::Submit), 0);
+
+    let mut fake = RigOpts::default().fake;
+    fake.await_delay = Duration::from_secs(60);
+    let full = Rig::new(RigOpts {
+        fake,
+        timeout: Some(Duration::from_secs(1)),
+        ..RigOpts::default()
+    })
+    .await;
+    let mut held = Vec::new();
+    for n in 0..48 {
+        let id = id_n(1000 + n);
+        held.push(
+            full.start("request_await", json!({"request_id": id}), false)
+                .await,
+        );
+    }
+    until("the app holds 48 awaits", || {
+        full.fake().count(Kind::AwaitStart) == 48
+    })
+    .await;
+    let called = full
+        .call("jira_issue_get", json!({"key": "A-1"}), false)
+        .await;
+    let env = called.envelope();
+    assert_eq!(code(&env), Some("unreachable"));
+    assert_eq!(detail(&env, "reason"), Some(&json!("launch_timeout")));
+    assert!(called.is_error());
+    assert_eq!(full.fake().count(Kind::Submit), 0, "a submit was queued");
+    assert!(submits(&full).is_empty());
+    drop(held);
+    Ok(())
+}
+
+/// §4.6: the server never exits because of the app: with the app gone every connected tool call
+/// is an error result, and `serve` runs until stdin closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_never_exits_because_of_the_app() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    let ok = rig
+        .call("request_status", json!({"request_id": REQ_ID}), false)
+        .await;
+    assert!(!ok.is_error());
+    rig.app.stop_server().await;
+    for tool in ["request_status", "request_await", "request_cancel"] {
+        let called = rig.call(tool, json!({"request_id": REQ_ID}), false).await;
+        assert!(called.is_error(), "{tool}");
+        assert_eq!(code(&called.envelope()), Some("unreachable"), "{tool}");
+    }
+    let called = rig
+        .call("jira_issue_get", json!({"key": "A-1"}), false)
+        .await;
+    assert!(called.is_error());
+    assert!(
+        rig.serve_result(Duration::from_millis(300)).await.is_none(),
+        "serve ended because of the app"
+    );
+    rig.close_stdin();
+    let served = rig.serve_result(WAIT).await.ok_or("still serving")?;
+    assert!(served.is_ok(), "{served:?}");
+    Ok(())
+}
+
+/// §4.6 "never cancel by accident": stdin EOF stops a waiting tool call at once and sends no
+/// `request.cancel`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stdin_eof_cancels_nothing() -> TestResult {
+    let rig = Rig::new(RigOpts::default()).await;
+    // The app holds the await until its `timeout_ms` (5 s).
+    rig.fake().set_await_script(Some(AwaitScript::default()));
+    let _waiting = rig
+        .start("request_await", json!({"request_id": REQ_ID}), true)
+        .await;
+    rig.fake().wait_for(Kind::AwaitStart, 1).await;
+    rig.close_stdin();
+    let served = rig
+        .serve_result(Duration::from_secs(2))
+        .await
+        .ok_or("serve still waits for the await")?;
+    assert!(served.is_ok(), "{served:?}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(rig.fake().count(Kind::Cancel), 0);
+    Ok(())
+}
+
+/// I-6: stdin closes while a tool call's launch poll sleeps on its blocking thread: `run_on`
+/// returns at once, not when the poll ends (20 s).
+#[test]
+fn run_exit_does_not_wait_for_blocking_launch() {
+    use tokio::io::AsyncWriteExt;
+
+    const CALL: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"request_status\",\"arguments\":{\"request_id\":\"req_00000000000000000000000000000001\"}}}\n";
+    let mut connector = TestConnector::failing(|| ConnectError::NotRunning);
+    connector.present = false;
+    let app_file = std::env::current_exe().expect("test binary path");
+    connector.discovery.app = AppLocation::Found(app_file);
+    let connector = Arc::new(connector);
+    let polling = connector.clone();
+    let (input, feed) = tokio::io::duplex(1 << 16);
+    // Feeds `initialize` and one tool call, closes stdin once the launch poll runs, and says
+    // when it closed.
+    let feeder = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("feeder runtime");
+        rt.block_on(async move {
+            let mut feed = feed;
+            feed.write_all(INIT).await.expect("write initialize");
+            feed.write_all(CALL).await.expect("write tools/call");
+            let until = Instant::now() + WAIT;
+            while polling.discover_count() == 0 && Instant::now() < until {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let polled = polling.discover_count() > 0;
+            // Into the poll's sleep.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(feed);
+            (polled, Instant::now())
+        })
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let cfg = McpConfig {
+            timeout: Some(Duration::from_secs(30)),
+            ..plain_config()
+        };
+        let code = run_on(cfg, connector, input, tokio::io::sink());
+        let _ = tx.send((code, Instant::now()));
+    });
+    let (code, ended) = rx.recv_timeout(WAIT * 2).expect("run_on returned");
+    let (polled, closed) = feeder.join().expect("feeder");
+    assert!(polled, "the launch poll never started");
+    assert_eq!(code, 0);
+    let took = ended.saturating_duration_since(closed);
+    assert!(took < Duration::from_secs(2), "{took:?}");
+}
+
+/// T7 review M-1 (lead ruling): the hello freezes the agent name at the first attempt to
+/// connect, so every connected tool body passes the call's `clientInfo.name`: whichever tool is
+/// called first, the hello names the agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_connected_tool_passes_the_client_name() -> TestResult {
+    let calls = [
+        (ToolSet::Full, "jira_issue_get", json!({"key": "A-1"})),
+        (
+            ToolSet::Generic,
+            "call",
+            json!({"op_id": "jira.issue.get", "params": {}}),
+        ),
+        (ToolSet::Full, "script_run", json!({"source": "return 1"})),
+        (
+            ToolSet::Full,
+            "request_await",
+            json!({"request_id": REQ_ID}),
+        ),
+        (
+            ToolSet::Full,
+            "request_status",
+            json!({"request_id": REQ_ID}),
+        ),
+        (
+            ToolSet::Full,
+            "request_cancel",
+            json!({"request_id": REQ_ID}),
+        ),
+        (ToolSet::Full, "request_list", json!({})),
+        (ToolSet::Full, "ops_list", json!({"instance": "dc"})),
+        (
+            ToolSet::Full,
+            "ops_describe",
+            json!({"op_id": "jira.issue.get", "instance": "dc"}),
+        ),
+        (ToolSet::Full, "instances_list", json!({})),
+    ];
+    for (tools, tool, args) in calls {
+        let rig = Rig::new(RigOpts {
+            tools,
+            client_name: "desk".to_owned(),
+            ..RigOpts::default()
+        })
+        .await;
+        rig.call(tool, args, false).await;
+        let seen = rig.fake().hellos();
+        let hello = &seen.first().ok_or(format!("{tool}: no hello"))?.hello;
+        assert_eq!(hello.agent_name.as_deref(), Some("desk"), "{tool}");
+        assert_eq!(
+            hello.agent_name_source,
+            AgentNameSource::McpClientInfo,
+            "{tool}"
+        );
+    }
     Ok(())
 }
