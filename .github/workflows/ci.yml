@@ -848,7 +848,8 @@ jobs:
   rust-macos-x86_64-rosetta:
     name: rust (x86_64-apple-darwin under Rosetta)
     runs-on: macos-15
-    timeout-minutes: 60
+    # The Rosetta leg hit the old 60 minute limit in the jira_flows step once M7 and M8 suites joined it.
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
