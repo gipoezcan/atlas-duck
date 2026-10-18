@@ -626,8 +626,21 @@ impl RunShared {
         lock(&self.inner).dispatched
     }
 
-    fn mark_dispatched(&self) {
-        lock(&self.inner).dispatched = true;
+    /// m-1: the run becomes *dispatched* right before `SCRIPT_CALL_SENT` is appended, in the same
+    /// lock that checks the run was neither ended nor killed. A run that `classify` read as not
+    /// dispatched therefore never commits `SCRIPT_CALL_SENT` afterwards. `false` = refused.
+    fn begin_dispatch(&self) -> bool {
+        let mut g = lock(&self.inner);
+        if g.ended || g.kill.is_some() {
+            return false;
+        }
+        g.dispatched = true;
+        true
+    }
+
+    /// The append after [`begin_dispatch`](Self::begin_dispatch) failed: nothing was recorded or sent.
+    fn clear_dispatched(&self) {
+        lock(&self.inner).dispatched = false;
     }
 
     fn set_audit_failed(&self) {
@@ -1131,7 +1144,18 @@ enum Appended {
 }
 
 async fn append_gated(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, ev: NewEvent) -> Appended {
-    append_gated_call(engine, entry, None, ev, |_| {}).await
+    append_gated_with(engine, entry, None, None, ev, |_| {}).await
+}
+
+/// [`append_gated`] for `SCRIPT_CALL_SENT`: under the gate, the run is marked dispatched only
+/// if it is neither ended nor killed (m-1), so the record cannot follow a direct classification.
+async fn append_gated_dispatch(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    shared: &Arc<RunShared>,
+    ev: NewEvent,
+) -> Appended {
+    append_gated_with(engine, entry, None, Some(shared.clone()), ev, |_| {}).await
 }
 
 /// [`append_gated`] for the record of host call `call.1`: the call leaves the run's in-flight
@@ -1148,10 +1172,26 @@ async fn append_gated_call(
     ev: NewEvent,
     on_done: impl FnOnce(&RequestEntry) + Send + 'static,
 ) -> Appended {
+    append_gated_with(engine, entry, call, None, ev, on_done).await
+}
+
+async fn append_gated_with(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    call: Option<(Arc<RunShared>, u64)>,
+    dispatch: Option<Arc<RunShared>>,
+    ev: NewEvent,
+    on_done: impl FnOnce(&RequestEntry) + Send + 'static,
+) -> Appended {
     let (engine, entry) = (engine.clone(), entry.clone());
     tokio::spawn(async move {
         let _gate = entry.gate.clone().lock_owned().await;
         if !matches!(entry.state().model.phase(), Phase::Running) {
+            return Appended::Ended;
+        }
+        if let Some(shared) = &dispatch
+            && !shared.begin_dispatch()
+        {
             return Appended::Ended;
         }
         if let Some((shared, id)) = &call
@@ -1257,14 +1297,14 @@ impl LiveBackend {
         }
         let ev =
             payloads::script_call_sent(&self.ctx_for(vc), call.id, &call.op_id, Some(&vc.alias));
-        match append_gated(&self.engine, &self.entry, ev).await {
+        match append_gated_dispatch(&self.engine, &self.entry, &self.shared, ev).await {
             Appended::Done => {
                 *sent = true;
-                self.shared.mark_dispatched();
                 Ok(())
             }
             Appended::Ended => Err(rejected_msg(ErrorCode::Cancelled, MSG_CALL_CANCELLED)),
             Appended::Failed => {
+                self.shared.clear_dispatched();
                 audit_failure(&self.engine, &self.entry, &self.shared).await;
                 Err(rejected_msg(ErrorCode::Internal, MSG_RUN_NOT_POSSIBLE))
             }
@@ -3445,6 +3485,12 @@ fn classify(ended: Ended, shared: &RunShared, ctx: &EventCtx, limits: &ScriptLim
         limit: false,
         details: None,
     };
+    // I-1: the user's kill is sticky. `kill_script` answered `Killed` for it, which stays true
+    // even when the worker had already returned (a result or an error) before the run was
+    // marked ended; nothing of such a run becomes a release item.
+    if shared.kill_reason() == Some(KillReason::User) {
+        return failed(REASON_KILLED_BY_USER, "the run was killed by the user");
+    }
     match end {
         RunEnd::Result {
             value,
@@ -4069,6 +4115,89 @@ mod tests {
         let ids: Vec<u64> = provenance.iter().map(|r| r.call_id).collect();
         assert_eq!(ids, [1, 2, 3]);
         Ok(())
+    }
+
+    fn ended(end: RunEnd) -> Ended {
+        Ended {
+            end,
+            cause: None,
+            queued: false,
+            elapsed: Duration::from_millis(5),
+            worker: None,
+        }
+    }
+
+    /// Final review I-1: a user kill that arrives after the worker returned (so the run was not
+    /// yet marked ended and `kill_script` answered `Killed`) never becomes a release item.
+    #[test]
+    fn classify_user_kill_is_sticky_over_result_and_error() {
+        let ends = [
+            RunEnd::Result {
+                value: json!({ "n": 1 }),
+                logs: Vec::new(),
+                stderr: String::new(),
+            },
+            RunEnd::Error {
+                class: "Error".to_owned(),
+                message: "boom".to_owned(),
+                stack: String::new(),
+                elapsed_ms: 1,
+                logs: Vec::new(),
+                stderr: String::new(),
+            },
+        ];
+        for end in ends {
+            let shared = RunShared::default();
+            assert!(shared.request_kill(KillReason::User));
+            let finish = classify(
+                ended(end),
+                &shared,
+                &EventCtx::default(),
+                &ScriptLimits::default(),
+            );
+            assert!(
+                matches!(
+                    &finish,
+                    Finish::Failed { reason, direct: false, candidate: Some(_), .. }
+                        if reason == REASON_KILLED_BY_USER
+                ),
+                "a killed run must be failed(killed_by_user), never an item or ignored"
+            );
+        }
+        // Negative control: without the kill the same result is a release item.
+        let shared = RunShared::default();
+        let finish = classify(
+            ended(RunEnd::Result {
+                value: json!(1),
+                logs: Vec::new(),
+                stderr: String::new(),
+            }),
+            &shared,
+            &EventCtx::default(),
+            &ScriptLimits::default(),
+        );
+        assert!(matches!(finish, Finish::Item { .. }));
+    }
+
+    /// Final review m-1: the dispatch record is refused for a run that ended or was killed, so a
+    /// run `classify` saw as not dispatched never commits `SCRIPT_CALL_SENT` afterwards.
+    #[test]
+    fn begin_dispatch_is_refused_after_the_end_or_a_kill() {
+        let killed = RunShared::default();
+        assert!(killed.request_kill(KillReason::Limit("timeout_s".to_owned())));
+        assert!(!killed.begin_dispatch());
+        assert!(!killed.dispatched());
+
+        let over = RunShared::default();
+        over.mark_ended();
+        assert!(!over.begin_dispatch());
+        assert!(!over.dispatched());
+
+        let live = RunShared::default();
+        assert!(live.begin_dispatch());
+        assert!(live.dispatched());
+        live.clear_dispatched();
+        assert!(!live.dispatched());
     }
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
