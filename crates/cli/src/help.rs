@@ -21,6 +21,31 @@ Global flags (accepted anywhere before `--`):
   --output json|text   json (default) is the agent contract; text renders data for people
   --help               show this help";
 
+/// `atlas-duck mcp --help` (PD-116): its own flags, not the generic block.
+const MCP_HELP: &str = "\
+Usage: atlas-duck mcp [--tools full|generic] [--instance ALIAS] [--agent NAME]
+
+Serve the operations as MCP tools on stdio. stdout carries only JSON-RPC frames.
+
+Flags:
+  --tools full|generic  full (default): one tool per operation, plus script_run, request_await,
+                        request_status, request_cancel, request_list, ops_list, ops_describe
+                        and instances_list; generic: only `call` plus those eight, for
+                        clients that limit the number of tools
+  --instance ALIAS      the Jira or Confluence instance to use when a tool call names none
+  --agent NAME          your agent name (or ATLAS_DUCK_AGENT); overrides the MCP client's name
+  --help                show this help
+
+Environment:
+  ATLAS_DUCK_MCP_TIMEOUT  seconds a tool call waits for a decision before it returns pending
+                          (default 50; 0 = submit and return pending at once)
+  ATLAS_DUCK_AGENT        your agent name when --agent is not given
+
+Pass `reason` in each tool call.
+
+After an atlas-duck upgrade, restart the MCP server.
+";
+
 /// JSON given on the command line or in a file is read by serde_json.
 const JSON_NOTE: &str = "JSON notes: an integer above 18446744073709551615 (u64::MAX) is rounded to a float, and when an
 object repeats a key the last one wins.
@@ -106,7 +131,12 @@ pub(crate) fn help_text(path: &[String]) -> Option<String> {
     if path.is_empty() || path == ["help"] {
         return Some(top_level());
     }
-    if let Some(name @ ("mcp" | "verify-export")) = first {
+    // Before the generic-command branch below, which would append `GLOBAL_FLAGS`: `--timeout`,
+    // `--reason` and `--output` are refused by `mcp` (PD-116).
+    if first == Some("mcp") {
+        return Some(MCP_HELP.to_owned());
+    }
+    if let Some(name @ "verify-export") = first {
         return Some(format!("{name}: not available in this build\n"));
     }
     let mut out = String::new();

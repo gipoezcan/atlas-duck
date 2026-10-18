@@ -11,6 +11,7 @@ use serde_json::{Map, Value, json};
 
 use crate::binding::{bind, find_op, flag_takes_value, is_noun_prefix, nearest_children};
 use crate::input::{Inputs, parse_json, read_arg_json, read_arg_source};
+use crate::mcp::ToolSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutputMode {
@@ -92,7 +93,14 @@ pub(crate) enum Command {
         match_params: Option<MatchParams>,
     },
     Doctor,
-    /// `mcp`, `verify-export` (M9, M10): a `usage` failure in this build.
+    /// `mcp` (PD-116): serves MCP on stdio. `--agent` and `--instance` are also in the
+    /// `GlobalOpts`; `agent_given` records `--agent ""`, which the environment must not fill.
+    Mcp {
+        tools: ToolSet,
+        instance: Option<String>,
+        agent_given: bool,
+    },
+    /// `verify-export` (M10): a `usage` failure in this build.
     NotInThisBuild(&'static str),
 }
 
@@ -104,6 +112,9 @@ pub(crate) struct ParseError {
     /// The `--timeout` deadline ran out while reading input: not a `usage` failure but exit 5
     /// `unreachable` / `launch_timeout` (§4.1: expiry before submission, nothing queued).
     pub deadline_expired: bool,
+    /// PD-117: the invocation is `atlas-duck mcp`, whose stdout carries only JSON-RPC: the
+    /// envelope goes to stderr.
+    pub stderr_only: bool,
 }
 
 impl ParseError {
@@ -112,6 +123,7 @@ impl ParseError {
             message: message.into(),
             details: Map::new(),
             deadline_expired: false,
+            stderr_only: false,
         }
     }
 
@@ -150,6 +162,7 @@ enum Kind {
     Cancel,
     RequestsList,
     Doctor,
+    Mcp,
     NotInBuild(&'static str),
     Op(&'static OperationSpec),
     /// A proper prefix of a command path (`jira issue`, `ops`).
@@ -169,7 +182,7 @@ fn classify(pos: &[String]) -> (Kind, usize) {
         Some("status") => return (Kind::Status, 1),
         Some("cancel") => return (Kind::Cancel, 1),
         Some("doctor") => return (Kind::Doctor, 1),
-        Some("mcp") => return (Kind::NotInBuild("mcp"), 1),
+        Some("mcp") => return (Kind::Mcp, 1),
         Some("verify-export") => return (Kind::NotInBuild("verify-export"), 1),
         Some("ops") => {
             return match word(1) {
@@ -209,12 +222,13 @@ fn classify(pos: &[String]) -> (Kind, usize) {
 enum Arity {
     Value,
     OptionalValue,
-    /// Accepted and ignored: `mcp`/`verify-export` fail anyway.
+    /// Accepted and ignored: `verify-export` fails anyway.
     Skip,
 }
 
 fn flag_arity(kind: Kind, flag: &str) -> Option<Arity> {
     match (kind, flag) {
+        (Kind::Mcp, "--tools") => Some(Arity::Value),
         (Kind::Call, "--params" | "--params-file") => Some(Arity::Value),
         (Kind::ScriptRun, "--args" | "--limits") => Some(Arity::Value),
         (Kind::ScriptRun, "--dry-run") => Some(Arity::OptionalValue),
@@ -266,6 +280,7 @@ struct Flags {
     dry_run: Option<DryRun>,
     state: Option<String>,
     match_params_file: Option<String>,
+    tools: Option<String>,
 }
 
 /// Stores a once-only flag value.
@@ -292,10 +307,39 @@ pub(crate) fn clip(s: &str) -> String {
     }
 }
 
+/// Records the first unknown flag with the number of positionals read when it appeared.
+fn note_unknown(
+    slot: &mut Option<(ParseError, usize)>,
+    seen: usize,
+    make: impl FnOnce() -> ParseError,
+) {
+    if slot.is_none() {
+        *slot = Some((make(), seen));
+    }
+}
+
 pub(crate) fn parse(
     args: &[OsString],
     env: &dyn Fn(&str) -> Option<OsString>,
     inputs: &mut Inputs<'_>,
+) -> Result<(GlobalOpts, Command), ParseError> {
+    let mut pos: Vec<String> = Vec::new();
+    parse_with(args, env, inputs, &mut pos).map_err(|mut e| {
+        // PD-117: once the positionals read before the failure classify as `mcp`, the error is
+        // for stderr (`pos` is cut back to what had been read when a deferred unknown flag
+        // appeared, so `--bogus mcp` stays an ordinary usage error on stdout).
+        if matches!(classify(&pos).0, Kind::Mcp) {
+            e.stderr_only = true;
+        }
+        e
+    })
+}
+
+fn parse_with(
+    args: &[OsString],
+    env: &dyn Fn(&str) -> Option<OsString>,
+    inputs: &mut Inputs<'_>,
+    pos: &mut Vec<String>,
 ) -> Result<(GlobalOpts, Command), ParseError> {
     check_utf8(args)?;
     let mut opts = GlobalOpts {
@@ -312,10 +356,9 @@ pub(crate) fn parse(
     let mut agent_flag: Option<String> = None;
     let mut agent_given = false;
     let mut output_flag: Option<OutputMode> = None;
-    let mut pos: Vec<String> = Vec::new();
     // The first unknown flag: reported after the loop unless `--help` is also present, so
     // `--help` wins over a bad flag wherever it appears.
-    let mut unknown: Option<ParseError> = None;
+    let mut unknown: Option<(ParseError, usize)> = None;
     // Op flags, re-spelled `--flag=value` for `binding::bind`.
     let mut op_flags: Vec<OsString> = Vec::new();
     let mut parser = lexopt::Parser::from_args(args.iter().cloned());
@@ -324,7 +367,7 @@ pub(crate) fn parse(
             lexopt::Arg::Value(v) => pos.push(text(v)?),
             lexopt::Arg::Short('h') => opts.help = true,
             lexopt::Arg::Short(c) => {
-                unknown.get_or_insert_with(|| {
+                note_unknown(&mut unknown, pos.len(), || {
                     ParseError::arg(format!("unknown flag: -{c}"), &format!("-{c}"))
                 });
             }
@@ -373,11 +416,11 @@ pub(crate) fn parse(
                         set_once(&mut output_flag, &flag, mode)?;
                     }
                     _ => {
-                        let (kind, _) = classify(&pos);
+                        let (kind, _) = classify(pos);
                         if let Kind::Op(spec) = kind {
                             match flag_takes_value(spec, &flag) {
                                 None => {
-                                    unknown.get_or_insert_with(|| unknown_flag(&flag));
+                                    note_unknown(&mut unknown, pos.len(), || unknown_flag(&flag));
                                     let _ = parser.optional_value();
                                 }
                                 Some(true) => {
@@ -394,7 +437,7 @@ pub(crate) fn parse(
                             continue;
                         }
                         let Some(arity) = flag_arity(kind, &flag) else {
-                            unknown.get_or_insert_with(|| unknown_flag(&flag));
+                            note_unknown(&mut unknown, pos.len(), || unknown_flag(&flag));
                             let _ = parser.optional_value();
                             continue;
                         };
@@ -410,6 +453,7 @@ pub(crate) fn parse(
                                     "--args" => set_once(&mut flags.args, &flag, v)?,
                                     "--limits" => set_once(&mut flags.limits, &flag, v)?,
                                     "--state" => set_once(&mut flags.state, &flag, v)?,
+                                    "--tools" => set_once(&mut flags.tools, &flag, v)?,
                                     _ => set_once(&mut flags.match_params_file, &flag, v)?,
                                 }
                             }
@@ -446,16 +490,17 @@ pub(crate) fn parse(
             opts.agent_source = AgentNameSource::Env;
         }
     }
-    let (kind, path_len) = classify(&pos);
+    let (kind, path_len) = classify(pos);
     if opts.help {
         let path = match kind {
             Kind::Help => pos.get(1..).unwrap_or_default().to_vec(),
-            Kind::Empty | Kind::Incomplete | Kind::Unknown => pos,
+            Kind::Empty | Kind::Incomplete | Kind::Unknown => pos.clone(),
             _ => pos.get(..path_len).unwrap_or_default().to_vec(),
         };
         return Ok((opts, Command::Help { path }));
     }
-    if let Some(e) = unknown {
+    if let Some((e, seen)) = unknown {
+        pos.truncate(seen);
         return Err(e);
     }
     inputs.set_timeout(opts.timeout);
@@ -463,9 +508,11 @@ pub(crate) fn parse(
     let ctx = Ctx {
         opts: &opts,
         explicit_agent: agent_flag.filter(|a| !a.is_empty()),
+        agent_given,
+        output_given: output_flag.is_some(),
         op_flags,
     };
-    let command = build(kind, &pos, rest, flags, ctx, inputs)?;
+    let command = build(kind, pos, rest, flags, ctx, inputs)?;
     Ok((opts, command))
 }
 
@@ -506,6 +553,9 @@ fn exactly<'a>(rest: &'a [String], names: &[&str]) -> Result<&'a [String], Parse
 struct Ctx<'a> {
     opts: &'a GlobalOpts,
     explicit_agent: Option<String>,
+    /// `--agent` was passed, even as `""`.
+    agent_given: bool,
+    output_given: bool,
     op_flags: Vec<OsString>,
 }
 
@@ -581,6 +631,8 @@ fn build(
     let Ctx {
         opts,
         explicit_agent,
+        agent_given,
+        output_given,
         op_flags,
     } = ctx;
     let id_of = |rest: &[String]| rest.first().cloned().unwrap_or_default();
@@ -609,6 +661,45 @@ fn build(
             path: rest.to_vec(),
         }),
         Kind::NotInBuild(name) => Ok(Command::NotInThisBuild(name)),
+        Kind::Mcp => {
+            exactly(rest, &[])?;
+            // PD-116: the other global flags have no meaning for a server.
+            for (given, flag, hint) in [
+                (
+                    opts.timeout.is_some(),
+                    "--timeout",
+                    "use ATLAS_DUCK_MCP_TIMEOUT",
+                ),
+                (
+                    opts.reason.is_some(),
+                    "--reason",
+                    "pass reason in each tool call",
+                ),
+                (output_given, "--output", "mcp always speaks JSON-RPC"),
+            ] {
+                if given {
+                    return Err(ParseError::arg(
+                        format!("mcp does not take {flag}: {hint}"),
+                        flag,
+                    ));
+                }
+            }
+            let tools = match flags.tools.as_deref() {
+                None | Some("full") => ToolSet::Full,
+                Some("generic") => ToolSet::Generic,
+                Some(_) => {
+                    return Err(ParseError::arg(
+                        "--tools must be full or generic",
+                        "--tools",
+                    ));
+                }
+            };
+            Ok(Command::Mcp {
+                tools,
+                instance: opts.instance.clone(),
+                agent_given,
+            })
+        }
         Kind::OpsList => {
             exactly(rest, &[])?;
             Ok(Command::OpsList {
@@ -1382,15 +1473,132 @@ mod tests {
     }
 
     #[test]
-    fn mcp_and_verify_export_parse_to_not_in_this_build() {
-        assert_eq!(
-            ok(&["mcp", "--tools", "full"]).1,
-            Command::NotInThisBuild("mcp")
-        );
+    fn verify_export_parses_to_not_in_this_build() {
         assert_eq!(
             ok(&["verify-export", "dir", "--anchor-dir", "x"]).1,
             Command::NotInThisBuild("verify-export")
         );
+    }
+
+    fn mcp(tools: ToolSet, instance: Option<&str>, agent_given: bool) -> Command {
+        Command::Mcp {
+            tools,
+            instance: instance.map(str::to_owned),
+            agent_given,
+        }
+    }
+
+    #[test]
+    fn mcp_flags_parse() {
+        assert_eq!(ok(&["mcp"]).1, mcp(ToolSet::Full, None, false));
+        assert_eq!(
+            ok(&["mcp", "--tools", "generic"]).1,
+            mcp(ToolSet::Generic, None, false)
+        );
+        assert_eq!(
+            ok(&["mcp", "--tools", "full"]).1,
+            mcp(ToolSet::Full, None, false)
+        );
+        for list in [
+            &["mcp", "--instance", "x", "--agent", "a"][..],
+            &["mcp", "--agent", "a", "--instance", "x"],
+            &["mcp", "--agent=a", "--instance=x"],
+        ] {
+            let (o, c) = ok(list);
+            assert_eq!(c, mcp(ToolSet::Full, Some("x"), true), "{list:?}");
+            assert_eq!(o.agent.as_deref(), Some("a"), "{list:?}");
+            assert_eq!(o.agent_source, AgentNameSource::Flag, "{list:?}");
+        }
+        let (o, c) = ok(&[
+            "mcp",
+            "--tools",
+            "generic",
+            "--agent",
+            "a",
+            "--instance",
+            "x",
+        ]);
+        assert_eq!(c, mcp(ToolSet::Generic, Some("x"), true));
+        assert_eq!(o.agent.as_deref(), Some("a"));
+        // `--agent ""` is no name, but it was given: the environment does not fill the gap.
+        let env = |k: &str| (k == "ATLAS_DUCK_AGENT").then(|| OsString::from("from-env"));
+        let (o, c) = ok_env(&["mcp", "--agent", ""], &env);
+        assert_eq!(o.agent, None);
+        assert_eq!(o.agent_source, AgentNameSource::None);
+        assert_eq!(c, mcp(ToolSet::Full, None, true));
+        // Without the flag the environment fallback applies.
+        let (o, c) = ok_env(&["mcp"], &env);
+        assert_eq!(o.agent.as_deref(), Some("from-env"));
+        assert_eq!(o.agent_source, AgentNameSource::Env);
+        assert_eq!(c, mcp(ToolSet::Full, None, false));
+    }
+
+    #[test]
+    fn mcp_refuses_timeout_reason_output() {
+        for (list, flag, hint) in [
+            (
+                &["mcp", "--timeout", "5"][..],
+                "--timeout",
+                "ATLAS_DUCK_MCP_TIMEOUT",
+            ),
+            (
+                &["--timeout", "5", "mcp"][..],
+                "--timeout",
+                "ATLAS_DUCK_MCP_TIMEOUT",
+            ),
+            (
+                &["mcp", "--reason", "why"][..],
+                "--reason",
+                "pass reason in each tool call",
+            ),
+            (&["mcp", "--output", "text"][..], "--output", "--output"),
+            (&["mcp", "--output", "json"][..], "--output", "--output"),
+        ] {
+            let e = err(list);
+            assert!(e.stderr_only, "{list:?}");
+            assert!(e.message.contains(hint), "{list:?}: {}", e.message);
+            assert_eq!(e.details.get("arg"), Some(&json!(flag)), "{list:?}");
+        }
+    }
+
+    #[test]
+    fn mcp_tools_value_must_be_full_or_generic() {
+        for value in ["x", "", "FULL", "full,generic"] {
+            let e = err(&["mcp", "--tools", value]);
+            assert!(e.stderr_only, "{value:?}");
+            assert_eq!(e.details.get("arg"), Some(&json!("--tools")), "{value:?}");
+        }
+        let e = err(&["mcp", "--tools"]);
+        assert!(e.stderr_only);
+        let e = err(&["mcp", "--tools", "full", "--tools", "generic"]);
+        assert!(e.stderr_only);
+        assert_eq!(e.details.get("arg"), Some(&json!("--tools")));
+    }
+
+    #[test]
+    fn mcp_other_usage_errors_are_stderr_only_but_earlier_ones_are_not() {
+        for list in [
+            &["mcp", "extra"][..],
+            &["mcp", "--bogus"],
+            &["mcp", "-x"],
+            &["mcp", "--help=x"],
+        ] {
+            assert!(err(list).stderr_only, "{list:?}");
+        }
+        // Raised before `mcp` was classified: an ordinary usage error.
+        assert!(!err(&["--bogus", "mcp"]).stderr_only);
+        assert!(!err(&["instances", "extra"]).stderr_only);
+        assert!(!err(&["ops", "list", "--tools", "x"]).stderr_only);
+    }
+
+    #[test]
+    fn mcp_help_wins_over_bad_flags() {
+        let help = Command::Help {
+            path: vec!["mcp".into()],
+        };
+        assert_eq!(ok(&["mcp", "--help"]).1, help);
+        assert_eq!(ok(&["mcp", "--bogus", "--help"]).1, help);
+        assert_eq!(ok(&["mcp", "--tools", "x", "-h"]).1, help);
     }
 
     #[test]

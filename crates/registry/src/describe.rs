@@ -224,6 +224,11 @@ pub const GENERIC_COMMANDS: &[GenericCommand] = &[
         summary: "Install and connectivity diagnostics",
     },
     GenericCommand {
+        path: &["mcp"],
+        usage: "atlas-duck mcp [--tools full|generic] [--instance ALIAS] [--agent NAME]",
+        summary: "Serve the operations as MCP tools on stdio",
+    },
+    GenericCommand {
         path: &["help"],
         usage: "atlas-duck help [command...]",
         summary: "Show this help",

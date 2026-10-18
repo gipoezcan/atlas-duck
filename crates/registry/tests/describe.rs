@@ -89,6 +89,23 @@ fn cli_block_and_examples_come_from_the_binding_and_schema() {
 }
 
 #[test]
+fn generic_commands_include_mcp() {
+    let rows: Vec<_> = GENERIC_COMMANDS
+        .iter()
+        .filter(|g| g.path == ["mcp"])
+        .collect();
+    assert_eq!(
+        rows.iter()
+            .map(|g| (g.usage, g.summary))
+            .collect::<Vec<_>>(),
+        [(
+            "atlas-duck mcp [--tools full|generic] [--instance ALIAS] [--agent NAME]",
+            "Serve the operations as MCP tools on stdio"
+        )]
+    );
+}
+
+#[test]
 fn registry_lookups_agree_with_all() {
     for spec in all() {
         assert_eq!(get(spec.id).map(|s| s.id), Some(spec.id));

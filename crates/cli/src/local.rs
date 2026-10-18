@@ -90,7 +90,12 @@ pub(crate) fn help(path: &[String]) -> Envelope {
     }
 }
 
-/// `mcp` and `verify-export` (M9, M10).
+/// What `execute` answers for a valid `mcp` invocation: `run` serves instead of printing it.
+pub(crate) fn mcp_serving() -> Envelope {
+    succeeded(Value::Null)
+}
+
+/// `verify-export` (M10).
 pub(crate) fn not_in_this_build(command: &str) -> Envelope {
     let mut details = serde_json::Map::new();
     details.insert("command".into(), json!(command));
@@ -150,12 +155,10 @@ mod tests {
     }
 
     #[test]
-    fn mcp_and_verify_export_not_in_this_build() {
-        for name in ["mcp", "verify-export"] {
-            let env = not_in_this_build(name);
-            let err = env.error.unwrap_or_else(|| panic!("error"));
-            assert_eq!(err.code, ErrorCode::Usage);
-            assert_eq!(err.message, "not available in this build");
-        }
+    fn verify_export_not_in_this_build() {
+        let env = not_in_this_build("verify-export");
+        let err = env.error.unwrap_or_else(|| panic!("error"));
+        assert_eq!(err.code, ErrorCode::Usage);
+        assert_eq!(err.message, "not available in this build");
     }
 }

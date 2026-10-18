@@ -546,8 +546,12 @@ async fn run(
             };
             short_call(client, method::OPS_DESCRIBE, params, deadline).await
         }
-        // `doctor` is answered by `doctor::execute` before the flow starts.
-        Command::Doctor | Command::Help { .. } | Command::NotInThisBuild(_) => {
+        // `doctor` is answered by `doctor::execute` before the flow starts; `mcp` is served by
+        // `run`.
+        Command::Doctor
+        | Command::Help { .. }
+        | Command::Mcp { .. }
+        | Command::NotInThisBuild(_) => {
             Envelope::failed(ErrorCode::Internal, false, MSG_NOT_CONNECTED)
         }
     }

@@ -4,9 +4,10 @@
 //! C.9: the crate exposes only `run`; everything else is `pub(crate)`.
 //!
 //! Local commands (argv errors, `--help`, `ops list`/`ops describe` without `--instance`,
-//! `mcp`/`verify-export` in this build) are answered here and never connect to the app or build
+//! `verify-export` in this build) are answered here and never connect to the app or build
 //! the tokio runtime (§4.1 "Local parsing"). Connected commands (`connected`) build a current-thread
-//! runtime of their own and reach the app through a `Connector`.
+//! runtime of their own and reach the app through a `Connector`. `mcp` is neither: `run` hands it
+//! to the `mcp` module once argv and the environment are valid.
 
 // §4.7: the launched app's test-only environment names exist only in test builds; a release build
 // must never carry them.
@@ -26,11 +27,13 @@ mod input;
 mod interrupt;
 mod launch;
 mod local;
+mod mcp;
 mod output;
 #[cfg(test)]
 mod test_support;
 
 use std::ffi::OsString;
+use std::io::Write;
 use std::time::Instant;
 
 use atlas_duck_ipc::build_info::BUILD_ID;
@@ -41,6 +44,7 @@ use crate::argv::{Command, GlobalOpts, OutputMode};
 use crate::connected::{Connector, OsConnector};
 use crate::deadline::Deadline;
 use crate::input::Inputs;
+use crate::mcp::McpConfig;
 
 /// What a run prints and returns.
 pub(crate) struct Outcome {
@@ -49,6 +53,10 @@ pub(crate) struct Outcome {
     pub exit: i32,
     /// The envelope is the CLI's own `help` answer (its text may print raw).
     pub cli_help: bool,
+    /// PD-117: print the envelope on stderr, stdout stays empty (a usage failure of `mcp`).
+    pub stderr_only: bool,
+    /// `mcp` with valid argv and environment: `run` serves it instead of printing `env`.
+    pub serve: Option<McpConfig>,
 }
 
 /// Parses `args` and runs the command; prints nothing.
@@ -63,10 +71,28 @@ pub(crate) fn execute(
     inputs.set_start(start);
     let (opts, command) = match argv::parse(args, env, inputs) {
         Ok(parsed) => parsed,
-        Err(e) => return failure(local::parse_error(e)),
+        Err(e) => {
+            let stderr_only = e.stderr_only;
+            return failure(local::parse_error(e), stderr_only);
+        }
     };
     let deadline = Deadline::from_timeout(start, opts.timeout);
+    let mut serve = None;
     let envelope = match &command {
+        Command::Mcp {
+            tools,
+            instance,
+            agent_given,
+        } => match McpConfig::from_env(&opts, *tools, instance.clone(), *agent_given, env) {
+            Ok(cfg) => {
+                serve = Some(cfg);
+                local::mcp_serving()
+            }
+            Err(e) => {
+                let stderr_only = e.stderr_only;
+                return failure(local::parse_error(e), stderr_only);
+            }
+        },
         Command::Help { path } => local::help(path),
         Command::OpsList { instance: None } => local::ops_list(),
         Command::OpsDescribe {
@@ -84,11 +110,13 @@ pub(crate) fn execute(
         opts,
         exit,
         cli_help,
+        stderr_only: false,
+        serve,
     }
 }
 
 /// An argv failure happens before the global flags are known to be valid: print as json.
-fn failure(env: Envelope) -> Outcome {
+fn failure(env: Envelope, stderr_only: bool) -> Outcome {
     let exit = atlas_duck_ipc::proto::exit_code(&env);
     Outcome {
         env,
@@ -103,7 +131,33 @@ fn failure(env: Envelope) -> Outcome {
         },
         exit,
         cli_help: false,
+        stderr_only,
+        serve: None,
     }
+}
+
+/// Prints an outcome's envelope: on `err` alone for a `stderr_only` failure, else as `output`
+/// says. Returns the exit code.
+fn print_outcome(out: &mut dyn Write, err: &mut dyn Write, outcome: &Outcome) -> i32 {
+    if outcome.stderr_only {
+        // The failure is json by construction; nothing may reach `out`.
+        return output::emit_to(
+            err,
+            &mut std::io::sink(),
+            &outcome.env,
+            &outcome.opts,
+            outcome.exit,
+            outcome.cli_help,
+        );
+    }
+    output::emit_to(
+        out,
+        err,
+        &outcome.env,
+        &outcome.opts,
+        outcome.exit,
+        outcome.cli_help,
+    )
 }
 
 /// Runs a connected command on a runtime built for it (local commands never get here).
@@ -146,14 +200,22 @@ pub fn run(args: Vec<OsString>) -> i32 {
     // §3.3: build_id is compiled into every binary (M4's `hello` sends it). black_box keeps the
     // constant referenced, so the linker cannot drop it from the executable.
     let _ = std::hint::black_box(BUILD_ID);
-    let outcome = execute(
+    let mut outcome = execute(
         start,
         &args,
         &|k| std::env::var_os(k),
         &mut Inputs::process(),
         &OsConnector,
     );
-    output::emit_with_exit(&outcome.env, &outcome.opts, outcome.exit, outcome.cli_help)
+    if let Some(cfg) = outcome.serve.take() {
+        // PD-117: nothing on stdout before serving.
+        return mcp::run(cfg);
+    }
+    print_outcome(
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr().lock(),
+        &outcome,
+    )
 }
 
 #[cfg(test)]
@@ -260,7 +322,7 @@ mod tests {
             &["ops", "describe", "jira.nope"],
             &["--help"],
             &["jira", "issue", "get", "--help"],
-            &["mcp"],
+            &["mcp", "--help"],
             &["verify-export", "dir"],
             &["bogus"],
             &["--timeout", "x", "instances"],
@@ -305,17 +367,108 @@ mod tests {
     }
 
     #[test]
-    fn mcp_and_verify_export_not_in_this_build() {
-        for args in [&["mcp"][..], &["verify-export", "dir"]] {
-            let (o, calls) = go(args);
-            assert_eq!(calls, 0);
-            assert_eq!(o.exit, 2);
-            assert_eq!(code(&o), Some(ErrorCode::Usage));
-            assert_eq!(
-                o.env.error.map(|e| e.message).as_deref(),
-                Some("not available in this build")
+    fn verify_export_not_in_this_build() {
+        let (o, calls) = go(&["verify-export", "dir"]);
+        assert_eq!(calls, 0);
+        assert_eq!(o.exit, 2);
+        assert_eq!(code(&o), Some(ErrorCode::Usage));
+        assert_eq!(
+            o.env.error.map(|e| e.message).as_deref(),
+            Some("not available in this build")
+        );
+    }
+
+    /// `execute` + `print_outcome` over captured writers: (outcome, stdout, stderr, exit).
+    fn printed(list: &[&str], timeout_env: Option<&str>) -> (Outcome, String, String, i32) {
+        let connector = double();
+        let args: Vec<OsString> = list.iter().map(OsString::from).collect();
+        let env = |k: &str| {
+            (k == "ATLAS_DUCK_MCP_TIMEOUT")
+                .then(|| timeout_env.map(OsString::from))
+                .flatten()
+        };
+        let o = execute(
+            Instant::now(),
+            &args,
+            &env,
+            &mut Inputs::new(std::io::empty()),
+            &connector,
+        );
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let exit = print_outcome(&mut out, &mut err, &o);
+        let text = |b: Vec<u8>| String::from_utf8(b).unwrap_or_default();
+        (o, text(out), text(err), exit)
+    }
+
+    #[test]
+    fn mcp_usage_error_goes_to_stderr_only() {
+        for (list, timeout_env) in [
+            (&["mcp", "--tools", "x"][..], None),
+            (&["mcp", "--timeout", "5"][..], None),
+            (&["mcp", "extra"][..], None),
+            (&["mcp"][..], Some("x")),
+            (&["mcp"][..], Some("")),
+            (&["mcp", "--output", "text"][..], None),
+        ] {
+            let (o, stdout, stderr, exit) = printed(list, timeout_env);
+            assert_eq!(exit, 2, "{list:?} {timeout_env:?}");
+            assert_eq!(code(&o), Some(ErrorCode::Usage), "{list:?}");
+            assert!(o.serve.is_none(), "{list:?}");
+            assert_eq!(stdout, "", "{list:?} {timeout_env:?}");
+            assert_eq!(stderr.lines().count(), 1, "{list:?}: {stderr:?}");
+            assert!(stderr.ends_with('\n'), "{list:?}: {stderr:?}");
+            let line: Value = serde_json::from_str(&stderr).unwrap_or(Value::Null);
+            assert_eq!(line["status"], "failed", "{stderr}");
+            assert_eq!(line["error"]["code"], "usage", "{stderr}");
+        }
+        // The variable is named in its own error.
+        let (_, _, stderr, _) = printed(&["mcp"], Some("1.5"));
+        assert!(stderr.contains("ATLAS_DUCK_MCP_TIMEOUT"), "{stderr}");
+        // Before `mcp` was classified it is an ordinary usage error, on stdout.
+        let (o, stdout, stderr, exit) = printed(&["--bogus", "mcp"], None);
+        assert_eq!(exit, 2);
+        assert_eq!(code(&o), Some(ErrorCode::Usage));
+        assert_eq!(stderr, "");
+        assert_eq!(stdout.lines().count(), 1, "{stdout:?}");
+        assert!(stdout.contains("unknown flag: --bogus"), "{stdout}");
+    }
+
+    #[test]
+    fn valid_mcp_hands_over_to_the_server_and_prints_nothing_itself() {
+        let (o, stdout, stderr, _) = printed(&["mcp", "--tools", "generic"], Some("7"));
+        assert_eq!(
+            o.serve,
+            Some(McpConfig {
+                tools: crate::mcp::ToolSet::Generic,
+                instance: None,
+                agent: None,
+                agent_source: AgentNameSource::None,
+                agent_given: false,
+                timeout: Some(std::time::Duration::from_secs(7)),
+            })
+        );
+        // `run` prints nothing for it; this guard only proves the placeholder is not an error.
+        assert_eq!(stderr, "");
+        assert!(!stdout.contains("usage"), "{stdout}");
+    }
+
+    #[test]
+    fn mcp_help_prints_help_on_stdout() {
+        let (o, stdout, stderr, exit) = printed(&["mcp", "--help"], None);
+        assert_eq!(exit, 0);
+        assert!(o.serve.is_none());
+        assert_eq!(stderr, "");
+        let line: Value = serde_json::from_str(&stdout).unwrap_or(Value::Null);
+        let help = line["data"]["help"].as_str().unwrap_or_default();
+        assert!(help.contains("atlas-duck mcp"), "{help}");
+        for banned in ["--timeout", "--reason", "--output"] {
+            assert!(
+                !help.lines().any(|l| l.trim_start().starts_with(banned)),
+                "{banned}: {help}"
             );
         }
+        assert!(help.contains("ATLAS_DUCK_MCP_TIMEOUT"), "{help}");
+        assert!(help.contains("restart the MCP server"), "{help}");
     }
 
     #[test]

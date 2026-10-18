@@ -12,18 +12,7 @@ use serde_json::Value;
 
 use crate::argv::{GlobalOpts, OutputMode};
 
-/// Prints `env` and returns `exit`, unless stdout cannot be written: then `exit::PENDING` (4).
-pub(crate) fn emit_with_exit(env: &Envelope, opts: &GlobalOpts, exit: i32, cli_help: bool) -> i32 {
-    emit_to(
-        &mut io::stdout().lock(),
-        &mut io::stderr().lock(),
-        env,
-        opts,
-        exit,
-        cli_help,
-    )
-}
-
+/// Prints `env` and returns `exit_code`, unless `out` cannot be written: then `exit::PENDING` (4).
 pub(crate) fn emit_to(
     out: &mut dyn Write,
     err: &mut dyn Write,
