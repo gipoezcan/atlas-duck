@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use atlas_duck_ipc::build_info::APP_VERSION;
+use atlas_duck_ipc::build_info::{APP_VERSION, BUILD_ID};
 use atlas_duck_ipc::client::{ClientError, ConnectError, SharedClient};
 use atlas_duck_ipc::envelope::{Envelope, ErrorCode, Status};
 use atlas_duck_ipc::proto::{
@@ -882,6 +882,8 @@ async fn agent_flag_and_env_override_client_info() -> TestResult {
         let hello = hello_of(&mcp_config(args, env), client);
         let row = format!("{args:?} env={env:?} clientInfo={client:?}");
         assert_eq!(hello.client_kind, ClientKind::Mcp, "{row}");
+        // L16: this build's id (the rig's connector replaces it on the wire, so only here).
+        assert_eq!(hello.build_id, BUILD_ID, "{row}");
         assert_eq!(hello.agent_name.as_deref(), name, "{row}");
         assert_eq!(hello.agent_name_source, source, "{row}");
     }
@@ -1098,5 +1100,50 @@ async fn waiting_for_another_reach_is_bounded_by_own_deadline() -> TestResult {
         first.as_ref().and_then(reason_of).as_deref(),
         Some("launch_timeout")
     );
+    Ok(())
+}
+
+/// T7 review M-2: with `ATLAS_DUCK_MCP_TIMEOUT=0` (no deadline) a call waiting for another call's
+/// attempt gives up after the session's own bound (`OWN_LIMIT`; shorter here) with
+/// `launch_timeout`, nothing queued, instead of queueing behind every earlier attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unbounded_wait_for_another_reach_is_bounded_by_own_limit() -> TestResult {
+    let app = RigApp::new(RigOpts::default().fake, false);
+    let connector: Arc<dyn Connector> = app.connector.clone();
+    let session = Arc::new(
+        Session::new(&RigOpts::default().config(), connector)
+            .with_lock_limit(Duration::from_millis(500)),
+    );
+    let first = {
+        let session = session.clone();
+        tokio::spawn(async move {
+            session
+                .client(&deadline_in(Duration::from_secs(3)), None)
+                .await
+                .err()
+        })
+    };
+    let until = Instant::now() + WAIT;
+    while app.connector.discover_count() == 0 {
+        assert!(Instant::now() < until, "the first attempt never started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let start = Instant::now();
+    let unbounded = Deadline::new(Instant::now(), None);
+    let refused = tokio::time::timeout(WAIT, session.client(&unbounded, None))
+        .await
+        .map_err(|_| "the unbounded waiter never gave up")?
+        .err()
+        .ok_or("connected without an app")?;
+    let took = start.elapsed();
+    assert_eq!(reason_of(&refused).as_deref(), Some("launch_timeout"));
+    assert!(took < Duration::from_millis(1500), "{took:?}");
+    assert!(!first.is_finished(), "the first attempt ended early");
+    assert_eq!(
+        app.connector.discover_count(),
+        1,
+        "the waiter made an attempt"
+    );
+    tokio::time::timeout(WAIT, first).await??;
     Ok(())
 }

@@ -15,6 +15,7 @@
 //! cached).
 
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use atlas_duck_ipc::build_info::BUILD_ID;
 use atlas_duck_ipc::client::SharedClient;
@@ -22,7 +23,7 @@ use atlas_duck_ipc::envelope::Envelope;
 use atlas_duck_ipc::proto::{AgentNameSource, ClientKind, Hello};
 
 use super::config::McpConfig;
-use crate::connected::{Connector, cwd_basename, reach};
+use crate::connected::{Connector, OWN_LIMIT, cwd_basename, reach};
 use crate::deadline::Deadline;
 use crate::interrupt::Never;
 use crate::launch;
@@ -64,6 +65,9 @@ pub(crate) struct Session {
     /// Built at the first attempt to connect and reused by every reconnect (PD-122: the agent
     /// name is read once).
     hello: OnceLock<Hello>,
+    /// Bound of the wait for another call's attempt when the deadline is unbounded
+    /// (`ATLAS_DUCK_MCP_TIMEOUT=0`): `OWN_LIMIT` (tests: shorter).
+    lock_limit: Duration,
 }
 
 impl Session {
@@ -74,7 +78,15 @@ impl Session {
             state: Mutex::new(State::Idle),
             connecting: tokio::sync::Mutex::new(()),
             hello: OnceLock::new(),
+            lock_limit: OWN_LIMIT,
         }
+    }
+
+    /// [`Session::new`] with another bound of the unbounded deadline's lock wait.
+    #[cfg(test)]
+    pub(crate) fn with_lock_limit(mut self, limit: Duration) -> Session {
+        self.lock_limit = limit;
+        self
     }
 
     /// The shared connection, reaching the app first if there is none or it closed. `deadline`
@@ -91,16 +103,17 @@ impl Session {
         if let Some(client) = self.live() {
             return Ok(client);
         }
-        let _flight = match deadline.at() {
-            Some(at) => {
-                let at = tokio::time::Instant::from_std(at);
-                match tokio::time::timeout_at(at, self.connecting.lock()).await {
-                    Ok(guard) => guard,
-                    Err(_) => return Err(*launch::launch_timeout()),
-                }
-            }
-            // `ATLAS_DUCK_MCP_TIMEOUT=0`: the other attempt is bounded by its own step limits.
-            None => self.connecting.lock().await,
+        // `ATLAS_DUCK_MCP_TIMEOUT=0`: each attempt is bounded by its own step limits, but attempts
+        // run one after another, so a waiter gives up after `lock_limit` instead of queueing
+        // behind every earlier failing attempt (T7 review M-2).
+        let at = deadline
+            .at()
+            .unwrap_or_else(|| std::time::Instant::now() + self.lock_limit);
+        let at = tokio::time::Instant::from_std(at);
+        let _flight = match tokio::time::timeout_at(at, self.connecting.lock()).await {
+            Ok(guard) => guard,
+            // Nothing was sent: nothing queued.
+            Err(_) => return Err(*launch::launch_timeout()),
         };
         // Another call may have connected while this one waited.
         if let Some(client) = self.live() {
