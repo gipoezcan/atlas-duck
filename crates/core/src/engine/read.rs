@@ -442,7 +442,10 @@ pub(super) fn identity_reserve(engine: &Engine) -> Duration {
 /// The most bytes of an identity answer received (a `user/current` object is about 1 KiB); a
 /// longer one is cut there (`too_large` in its record) and confirms nobody.
 pub(super) const MAX_IDENTITY_BYTES: u64 = 64 * 1024;
-/// The `READ_FETCHED`/`READ_FAILED` cause of a read whose answer is not attributed to the user.
+/// The `READ_FETCHED`/`READ_FAILED` cause of a read whose answer is not attributed to the user;
+/// for a script host call it is the `SCRIPT_CALL` `rejection` and `unavailable` value
+/// (`identity_check`), also for a confirmed token failure. Jira records the same token failure as
+/// `needs_token` (its header-check path has no cause).
 const IDENTITY_CAUSE: (&str, &str) = ("reason", "identity_check");
 
 /// The content of a direct read (the 32 MiB response cap), its lookups and its identity answer

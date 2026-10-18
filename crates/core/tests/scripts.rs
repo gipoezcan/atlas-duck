@@ -5702,6 +5702,227 @@ async fn confluence_all_identity_step_once_after_the_last_page() -> TestResult {
     Ok(())
 }
 
+/// T32 review I-1 (OQ1, accepted narrowing of §7.1 "script host call re-fetched once"): a rename
+/// found at a Confluence host call's identity step (same `userKey`, another username) rejects that
+/// call inside the script as `upstream_unavailable`, with no re-fetch. The page is audit-only in
+/// the `SCRIPT_CALL`, the `PREVIEW_FETCH {identity}` is committed before it, and the re-check has
+/// stored the new name, so the next call of the run matches and gets its page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn confluence_host_call_rename_at_the_identity_step_rejects_without_refetch() -> TestResult {
+    use common::confluence::{content_path, mount_page, page_with_storage};
+    let (h, runner) = wiki_harness(
+        vec![ScriptPlan::new(
+            vec![page_get(1, "65537", None), page_get(2, "65537", None)],
+            result_end(json!(1)),
+        )],
+        None,
+    )
+    .await?;
+    let mock = wiki(&h)?;
+    mount_page(
+        mock,
+        "65537",
+        &page_with_storage(&format!("<p>{QUARTERLY}: confidential.</p>")),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path(mock.path(WIKI_IDENTITY)))
+        .respond_with(mock.response(200).set_body_raw(
+            fixtures::confluence_user_current("jdoe2", TEST_USER_KEY),
+            "application/json",
+        ))
+        .mount(mock.server())
+        .await;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    match runner.results().as_slice() {
+        [
+            rejected @ HostCallResult::Rejected { class, .. },
+            HostCallResult::Ok(v),
+        ] => {
+            assert_eq!(class, "upstream_unavailable");
+            assert!(
+                !format!("{rejected:?}").contains(QUARTERLY),
+                "the page reached the script: {rejected:?}"
+            );
+            assert!(v.to_string().contains(QUARTERLY), "{v}");
+        }
+        other => return Err(format!("unexpected answers: {other:?}").into()),
+    }
+    // The identity record precedes the call it judged; the first page was fetched once.
+    assert_eq!(
+        fetch_trail(&h, &id).await?,
+        ["identity", "call1", "identity", "call2"]
+    );
+    let calls: Vec<Value> = h
+        .events(&id)
+        .await?
+        .into_iter()
+        .filter(|(t, _)| *t == EventType::SCRIPT_CALL)
+        .map(|(_, p)| p)
+        .collect();
+    let [first, second] = calls.as_slice() else {
+        return Err(format!("script calls: {calls:?}").into());
+    };
+    assert_eq!(first["unavailable"], "identity_check", "{first}");
+    assert!(first.to_string().contains(QUARTERLY), "{first}");
+    assert!(second.get("unavailable").is_none(), "{second}");
+    assert_eq!(renames(&h).await?, 1);
+    assert_eq!(instance_state(&h), "ok");
+    // Content and identity, the re-check, then the second call's content and identity.
+    let content = mock.path(&content_path("65537"));
+    let ident = mock.path(WIKI_IDENTITY);
+    assert_eq!(
+        wiki_paths(mock).await,
+        [
+            content.clone(),
+            ident.clone(),
+            ident.clone(),
+            content,
+            ident
+        ]
+    );
+    Ok(())
+}
+
+/// Mounts two `confluence.space.list` pages (25 and 10 spaces) for an `atlas.all` call; the second
+/// answers `second` when given (a JSON error) instead of the last page.
+async fn mount_two_space_pages(
+    mock: &atlas_duck_atlassian::testing::MockDc,
+    second: Option<ResponseTemplate>,
+) {
+    use wiremock::matchers::query_param;
+    let page = |start: &str| {
+        Mock::given(method("GET"))
+            .and(path(mock.path("/rest/api/space")))
+            .and(query_param("start", start))
+    };
+    page("0")
+        .respond_with(mock.response(200).set_body_raw(
+            fixtures::confluence_space_page(0, 25, 25, Some("/rest/api/space?limit=25&start=25")),
+            "application/json",
+        ))
+        .mount(mock.server())
+        .await;
+    let last = second.unwrap_or_else(|| {
+        mock.response(200).set_body_raw(
+            fixtures::confluence_space_page(25, 25, 10, None),
+            "application/json",
+        )
+    });
+    page("25").respond_with(last).mount(mock.server()).await;
+}
+
+/// An anonymous `user/current` answer for every identity GET (ahead of the harness default).
+async fn mount_anonymous_identity(mock: &atlas_duck_atlassian::testing::MockDc) {
+    Mock::given(method("GET"))
+        .and(path(mock.path(WIKI_IDENTITY)))
+        .respond_with(
+            mock.response(200)
+                .set_body_raw(fixtures::CONFLUENCE_USER_ANONYMOUS, "application/json"),
+        )
+        .mount(mock.server())
+        .await;
+}
+
+/// T32 review I-2: an `atlas.all` call whose identity step fails on the last page rejects the whole
+/// call (`needs_token` once the re-check confirmed it). The pages already concatenated are withheld
+/// from the script: the earlier page is committed as an ordinary `SCRIPT_CALL`, the last page
+/// only as `unavailable: identity_check`, and no space reaches the script.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn confluence_all_identity_failure_withholds_the_earlier_pages() -> TestResult {
+    let mut call = host_call(1, "confluence.space.list", json!({ "max": 25 }));
+    call.all = true;
+    let (h, runner) = wiki_harness(
+        vec![ScriptPlan::new(vec![call], result_end(json!(1)))],
+        None,
+    )
+    .await?;
+    let mock = wiki(&h)?;
+    mount_two_space_pages(mock, None).await;
+    mount_anonymous_identity(mock).await;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    match runner.results().as_slice() {
+        [rejected @ HostCallResult::Rejected { class, .. }] => {
+            assert_eq!(class, "needs_token");
+            assert!(
+                !format!("{rejected:?}").contains("Space "),
+                "a page reached the script: {rejected:?}"
+            );
+        }
+        other => return Err(format!("unexpected answers: {other:?}").into()),
+    }
+    let calls = script_calls(&h, &id).await?;
+    let [first, last] = calls.as_slice() else {
+        return Err(format!("script calls: {calls:?}").into());
+    };
+    assert_eq!(first["rejection"], Value::Null, "{first}");
+    assert!(first.to_string().contains("Space 25"), "{first}");
+    assert!(!first.to_string().contains("Space 26"), "{first}");
+    assert_eq!(last["unavailable"], "identity_check", "{last}");
+    assert!(last.to_string().contains("Space 26"), "{last}");
+    // Both pages, then the one identity step and the re-check it ran.
+    let space = mock.path("/rest/api/space");
+    let ident = mock.path(WIKI_IDENTITY);
+    assert_eq!(
+        wiki_paths(mock).await,
+        [space.clone(), space, ident.clone(), ident]
+    );
+    assert_eq!(fetch_trail(&h, &id).await?, ["call1", "identity", "call1"]);
+    assert_eq!(instance_state(&h), "needs_token");
+    Ok(())
+}
+
+/// T32 review I-2, the `UpstreamError` arm of `ends_with_content`: a JSON error on a later page of
+/// an `atlas.all` call is server content too, so it gets the identity step; under an anonymous
+/// answer the call is `needs_token` and the error text reaches the script nowhere but in the
+/// audit record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn confluence_all_json_error_page_gets_the_identity_step() -> TestResult {
+    let mut call = host_call(1, "confluence.space.list", json!({ "max": 25 }));
+    call.all = true;
+    let (h, runner) = wiki_harness(
+        vec![ScriptPlan::new(vec![call], result_end(json!(1)))],
+        None,
+    )
+    .await?;
+    let mock = wiki(&h)?;
+    let error = mock.response(404).set_body_raw(
+        format!(r#"{{"statusCode":404,"message":"{QUARTERLY} not found"}}"#),
+        "application/json",
+    );
+    mount_two_space_pages(mock, Some(error)).await;
+    mount_anonymous_identity(mock).await;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let space = mock.path("/rest/api/space");
+    let ident = mock.path(WIKI_IDENTITY);
+    assert_eq!(
+        wiki_paths(mock).await,
+        [space.clone(), space, ident.clone(), ident],
+        "the error page went without an identity step"
+    );
+    match runner.results().as_slice() {
+        [rejected @ HostCallResult::Rejected { class, .. }] => {
+            assert_eq!(class, "needs_token");
+            let seen = format!("{rejected:?}");
+            assert!(!seen.contains(QUARTERLY), "{seen}");
+            assert!(!seen.contains("Space "), "{seen}");
+        }
+        other => return Err(format!("unexpected answers: {other:?}").into()),
+    }
+    let calls = script_calls(&h, &id).await?;
+    let [first, last] = calls.as_slice() else {
+        return Err(format!("script calls: {calls:?}").into());
+    };
+    assert_eq!(first["rejection"], Value::Null, "{first}");
+    assert_eq!(last["unavailable"], "identity_check", "{last}");
+    assert!(last.to_string().contains(QUARTERLY), "{last}");
+    assert_eq!(fetch_trail(&h, &id).await?, ["call1", "identity", "call1"]);
+    Ok(())
+}
+
 /// R15, `confluence.user.current` as a host call: its own answer is the identity answer, judged
 /// without a second GET (PD-93). A known answer is the call's result; an anonymous one rejects it
 /// `needs_token` once the token re-check confirmed it.
