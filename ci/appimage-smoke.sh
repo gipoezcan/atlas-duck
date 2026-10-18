@@ -228,7 +228,7 @@ m8_mounts() {
 }
 
 m8_inner() {
-  local appimage="$1" here="$2" work="$3" code id status gate pid cmdline i mounts n
+  local appimage="$1" here="$2" work="$3" code id status ready cfg_unreadable jira_configured pid cmdline i mounts n
   unset APPIMAGE_EXTRACT_AND_RUN
   trap "m4_stop_app \"$appimage\" || true; pkill -x gnome-keyring-d || true" EXIT
   if command -v gnome-keyring-daemon >/dev/null; then
@@ -243,8 +243,27 @@ m8_inner() {
   code=$?
   set -e
   [ "$code" -eq 0 ] || { cat "$work/doctor.json" "$work/doctor.err" >&2 || true; m4_fail "<AppImage> __cli doctor (cold start) exited $code, expected 0"; }
-  gate="$(m4_json_field "$work/doctor.json" data.app.gate)" || m4_fail "doctor has no data.app.gate: $(cat "$work/doctor.json")"
-  echo "M8 cold start: doctor exit 0, gate=$gate"
+  # The provisioned home makes the app serve a configured core, whose `data.app` is NOT the first-run
+  # shape (`gate`, `ipc_accepting`, ...) but `instances`, `config_unreadable`, `pac_configured`,
+  # `tray_host`, `secret_service`, `ipc_accepting` (app/src-tauri/tests/cli_flows/flows2.rs APP_KEYS).
+  # Ready = config_unreadable false and the fixture's `jira` instance configured (python prints
+  # booleans as True/False). Bounded poll: the first doctor may still answer from a core that is
+  # starting.
+  ready=""
+  for i in $(seq 1 60); do
+    cfg_unreadable="$(m4_json_field "$work/doctor.json" data.app.config_unreadable 2>/dev/null || true)"
+    jira_configured="$(m4_json_field "$work/doctor.json" data.app.instances.jira.configured 2>/dev/null || true)"
+    if [ "$cfg_unreadable" = False ] && [ "$jira_configured" = True ]; then
+      ready=1
+      break
+    fi
+    sleep 1
+    set +e
+    timeout 60 "$appimage" __cli --timeout 30 doctor >"$work/doctor.json" 2>"$work/doctor.err"
+    set -e
+  done
+  [ -n "$ready" ] || { cat "$work/doctor.err" >&2 || true; m4_fail "the app did not serve the provisioned core within 60 polls (want data.app.config_unreadable=false and data.app.instances.jira.configured=true): $(cat "$work/doctor.json")"; }
+  echo "M8 cold start: doctor exit 0, serving core ready (config_unreadable=$cfg_unreadable, jira configured=$jira_configured)"
 
   # (1) submit without waiting, through the AppImage's CLI.
   set +e
