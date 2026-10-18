@@ -82,15 +82,6 @@ export function indexDependent(loc: Loc): boolean {
   return loc.some((s) => 'index' in s && s.ident === null);
 }
 
-/**
- * Whether `loc` continues past an element named by index. Rust checks a drop against the source
- * as well (`drop_field`/`drop_item`: naming nothing there blocks); on a revision whose drops
- * shortened that list, the rest of such a path is read on another source element than the one
- * shown (core `a_drop_past_a_shifted_index_is_checked_on_another_element`). A path that ends in
- * the index, or names elements by identity, reads the same element in both.
- */
-export const indexOnTheWay = (loc: Loc): boolean => indexDependent(loc.slice(0, -1));
-
 const isElement = (loc: Loc): boolean => {
   const last = loc[loc.length - 1];
   return last !== undefined && 'index' in last;

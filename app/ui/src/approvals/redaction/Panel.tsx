@@ -1,7 +1,13 @@
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode, type Ref } from 'react';
 
 import { own } from '../../shared/text/own';
-import type { RedactionContext, RedactionOp, RedactionPreset, UrlMode } from '../../shared/ipc/types';
+import type {
+  BlockReason,
+  RedactionContext,
+  RedactionOp,
+  RedactionPreset,
+  UrlMode,
+} from '../../shared/ipc/types';
 import { BLOCK_REASON_TEXT, REDACTION_TEXT } from '../../shared/strings';
 import { AgentText } from '../../shared/text/AgentText';
 import { escapeInvisible, unusual } from '../../shared/text/unusual';
@@ -15,7 +21,6 @@ import {
   dropItemOp,
   dropOf,
   firstUnaddressable,
-  indexOnTheWay,
   inItems,
   isDrop,
   isMask,
@@ -30,7 +35,7 @@ import {
   type Loc,
   type RoundOp,
 } from './paths';
-import { baseUrlMode, type CandidateState, type Draft, type ReportState } from './state';
+import { baseUrlMode, type CandidateState, type Draft, type FlaggedState, type ReportState } from './state';
 import { cut, Tree, TreeModel, type TreeNode } from './Tree';
 
 /** The selected value's text is shown up to this many code points. */
@@ -119,6 +124,10 @@ export interface PanelProps {
   upstreamError: boolean;
   /** The item is a script (preset "Keep error class only" for an error card). */
   script: boolean;
+  /** The 5.3 mirror check blocks this revision (M-11): its flagged entries can be dropped from the tree. */
+  mirrorBlocked: boolean;
+  /** Rust's flagged entries of a mirror-blocked revision, once asked (the caller checked the revision). */
+  flagged: FlaggedState | null;
   canRelease: boolean;
   onRelease: () => void;
   /** Text typed for a mask and not added yet: the decision path treats it as unsent. */
@@ -166,8 +175,6 @@ export function Panel(props: PanelProps) {
   // appended to a revision that holds one would move it (core
   // `a_later_drop_moves_a_revision_single_occurrence_mask`). Only "Remove all" is left for drops.
   const baseSingles = context.ops.some(isSingleMask);
-  // Review T17 I1: drops that may have shortened a list (presets and the URL choice remove keys only).
-  const baseShifts = context.ops.some((op) => 'drop_item' in op || 'drop_field' in op);
   // A repeat inside the round does nothing; across rounds only a location-free op does. A
   // location names what this revision shows: `fields.labels[0]` again is the next label.
   const inRound = new Set(round.map((r) => canonical(r.op)));
@@ -224,17 +231,14 @@ export function Panel(props: PanelProps) {
     const bad = firstUnaddressable(loc);
     const blockedDrops = roundSingles || baseSingles || removeAll;
     const already = droppedLoc(loc);
-    let shifted = false;
-    const dropButton = (label: string, op: RedactionOp | null, at: Loc) => {
-      // A field across all items names no index: Rust reads it on every element.
-      const past = baseShifts && indexOnTheWay(at) && !(op !== null && 'drop_field' in op && op.drop_field.scope === 'all_items');
-      shifted ||= past;
-      return (
-        <button type="button" disabled={blockedDrops || already || past || op === null} onClick={() => add(op, at)}>
-          {label}
-        </button>
-      );
-    };
+    // Since M8 T19c Rust resolves each op against the document the revision's ops left, which is
+    // the tree shown here, so an index names the same element after earlier drops (M6 T17 rule (b)
+    // is lifted); the round is ordered by `ordered()`.
+    const dropButton = (label: string, op: RedactionOp | null, at: Loc) => (
+      <button type="button" disabled={blockedDrops || already || op === null} onClick={() => add(op, at)}>
+        {label}
+      </button>
+    );
     let drops: ReactNode = null;
     if (bad >= 0) {
       const parent = loc.slice(0, bad);
@@ -265,7 +269,6 @@ export function Panel(props: PanelProps) {
           {already ? <span>{REDACTION_TEXT.already_dropped}</span> : null}
           {roundSingles ? <p>{REDACTION_TEXT.drops_need_no_singles}</p> : null}
           {baseSingles && drops !== null ? <p>{REDACTION_TEXT.drops_need_no_applied_singles}</p> : null}
-          {shifted && !blockedDrops ? <p>{REDACTION_TEXT.index_on_the_way}</p> : null}
         </div>
         {value === null ? null : (
           <div className="mask-form">
@@ -388,6 +391,41 @@ export function Panel(props: PanelProps) {
           </p>
         )}
         <p>{REDACTION_TEXT.released_bytes(r.released_bytes)}</p>
+      </div>
+    );
+  };
+
+  /**
+   * A mirror-blocked revision (M-11): the flagged entries as text, and one action that adds their
+   * drops to the round. Rust's `redaction_preview` still decides whether the drops clear them.
+   */
+  const flaggedView = (): ReactNode => {
+    const found = props.flagged;
+    if (found === null) return <p role="status">{REDACTION_TEXT.flagged_checking}</p>;
+    if ('failed' in found || found.flagged.length === 0) return <p role="alert">{REDACTION_TEXT.flagged_missing}</p>;
+    const plan = model === null ? null : flaggedRound(model, found.flagged);
+    const missing = plan === null ? [] : plan.round.filter((r) => !inRound.has(canonical(r.op)));
+    return (
+      <div className="redaction-flagged">
+        <strong>{REDACTION_TEXT.flagged_heading}</strong>
+        <ul>
+          {found.flagged.map((b, i) => (
+            <li key={i}>
+              {own(BLOCK_REASON_TEXT, b.reason) ?? b.reason}
+              {': '}
+              <Text value={b.path} />
+            </li>
+          ))}
+        </ul>
+        <button
+          type="button"
+          disabled={plan === null || plan.round.length === 0 || missing.length === 0 || roundSingles || removeAll}
+          onClick={() => onRound([...round, ...missing])}
+        >
+          {REDACTION_TEXT.drop_flagged}
+        </button>{' '}
+        <span>{REDACTION_TEXT.drop_flagged_note}</span>
+        {plan !== null && plan.unresolved ? <p role="alert">{REDACTION_TEXT.flagged_unresolved}</p> : null}
       </div>
     );
   };
@@ -522,6 +560,7 @@ export function Panel(props: PanelProps) {
           ))}
         </fieldset>
       ) : null}
+      {props.mirrorBlocked ? flaggedView() : null}
       {reportView()}
       <div className="redaction-release">
         <button
@@ -538,6 +577,40 @@ export function Panel(props: PanelProps) {
       {body()}
     </section>
   );
+}
+
+/**
+ * The drops that clear `flagged` (core `redact`: an entry the mirror check flags blocks until a drop
+ * removes it whole). An orphan is dropped as an item, by its identity where it has one; entries that
+ * cannot be matched are not fixed by dropping them (`mirrored()` refuses), so their whole list goes.
+ * Lists come first and anything under a dropped location is not named again (no op of a round
+ * addresses the child of an earlier drop). `unresolved`: a flagged entry that is not in the tree or
+ * cannot be dropped from here. The round's order is `ordered()`'s, not this list's.
+ */
+function flaggedRound(model: TreeModel, flagged: readonly BlockReason[]): { round: RoundOp[]; unresolved: boolean } {
+  const round: RoundOp[] = [];
+  const gone: Loc[] = [];
+  let unresolved = false;
+  const take = (op: RedactionOp | null, loc: Loc) => {
+    if (op === null) {
+      unresolved = true;
+    } else if (!gone.some((g) => within(loc, g))) {
+      round.push({ op, loc });
+      gone.push(loc);
+    }
+  };
+  const nodes = flagged.map((b) => ({ reason: b.reason, node: model.find(b.path) }));
+  for (const { reason, node } of nodes) {
+    if (reason === 'mirror_unmatchable' && node !== null) {
+      const list = node.loc.slice(0, -1);
+      take(dropOf(list), list);
+    }
+  }
+  for (const { reason, node } of nodes) {
+    if (node === null) unresolved = true;
+    else if (reason !== 'mirror_unmatchable') take(dropItemOp(node.loc), node.loc);
+  }
+  return { round, unresolved };
 }
 
 /** A script's error-details candidate `{script_error: {class, …}}` (§9.5): "Keep error class only" applies. */

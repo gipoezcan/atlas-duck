@@ -7,7 +7,6 @@ import {
   dropFieldOp,
   dropItemOp,
   firstUnaddressable,
-  indexOnTheWay,
   isPlain,
   isUrlField,
   maskOp,
@@ -108,12 +107,24 @@ describe('paths in the redaction grammar', () => {
     expect(singleMaskProblem('Falcon', 'Kite', false)).toBeNull();
   });
 
-  it('index_on_the_way_is_an_index_before_the_last_step', () => {
-    expect(indexOnTheWay([k('list'), i(0), k('author')])).toBe(true);
-    expect(indexOnTheWay([k('list'), i(0)])).toBe(false);
-    expect(indexOnTheWay([k('list'), i(0, 'a'), k('author')])).toBe(false);
-    expect(indexOnTheWay([k('list'), i(0, 'a'), k('labels'), i(2)])).toBe(false);
-    expect(indexOnTheWay([k('x'), i(1), i(2)])).toBe(true);
+  it('a_reported_path_finds_its_node_in_the_tree', () => {
+    const doc = { a: { list: [{ id: 'x', v: 1 }, { id: 'y', v: 2 }] }, 'b.c': 1, '': 2 };
+    const c = readCandidate(enc(JSON.stringify(doc)));
+    if (c === null) throw new Error('not read');
+    const model = new TreeModel(c);
+    const at = (path: string) => {
+      const node = model.find(path);
+      return node === null ? null : pathOf(node.loc);
+    };
+    expect(at('a.list[1].v')).toBe('a.list[id=y].v');
+    expect(at('a.list[0]')).toBe('a.list[id=x]');
+    expect(at('a')).toBe('a');
+    // Not in the tree, a malformed path, an index past the end, a key that cannot be told apart.
+    expect(at('a.nope')).toBeNull();
+    expect(at('a.list[2]')).toBeNull();
+    expect(at('a.list[')).toBeNull();
+    expect(at('a..list')).toBeNull();
+    expect(at('b.c')).toBeNull();
   });
 
   it('round_drops_by_index_go_first_in_reverse_document_order', () => {

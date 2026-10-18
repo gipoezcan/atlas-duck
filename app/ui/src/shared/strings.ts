@@ -257,8 +257,14 @@ export const REDACTION_TEXT = {
     'Drops cannot join a single-occurrence mask in one release: remove the single-occurrence masks, or release them first.',
   drops_need_no_applied_singles:
     'This revision masks a single occurrence, which is placed after every drop: a drop now would move that mask. Remove all redactions to drop items or fields.',
-  index_on_the_way:
-    'This location is named by position in a list this revision already shortened: drop the list element above it, or remove all redactions first.',
+  /** M8 T24 (M-11, L217): a candidate the 5.3 mirror check blocks shows its tree so the flagged entries can go. */
+  flagged_heading: 'These entries have no counterpart and block the release:',
+  drop_flagged: 'Drop the flagged items',
+  drop_flagged_note:
+    'Drops each flagged entry; where entries cannot be matched, their whole list is dropped. Release then makes a new revision.',
+  flagged_checking: 'Looking for the flagged items',
+  flagged_missing: 'Could not find the flagged items. Deny this request.',
+  flagged_unresolved: 'Some flagged entries are not in the tree: drop them there, or deny this request.',
   single_bracket: 'Only this occurrence is not offered for a text with [ or ]: mask every occurrence.',
   single_repeated:
     'This value holds the text more than once and Rust masks the first: mask every occurrence, or select more text.',
@@ -322,6 +328,10 @@ export const REQUEST_TEXT = {
   no_reason: 'no reason given',
   instance: 'Instance',
   op: 'Operation',
+  /** M8 T24: a script's target (what the queue row shows) and the limits it asked for. */
+  target: 'Target',
+  limits: 'Limits',
+  limits_default: 'configured limits',
   submitted_at: 'Submitted',
   age: 'Age',
   connection: 'Connection',

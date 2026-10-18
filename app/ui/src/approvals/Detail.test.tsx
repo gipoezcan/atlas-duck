@@ -302,6 +302,69 @@ describe('Detail', () => {
     expect(screen.getByText('Nothing to redact in this request')).toBeTruthy();
   });
 
+  it('script_document_rendered_in_iframe_only', async () => {
+    // A script item's source, logs and stderr are untrusted text that only the approver sees: they
+    // reach the screen inside the sandboxed preview document (Rust's `srcdoc`), and nowhere else.
+    const hostile = ['<img src=x onerror=alert(1)>', '<script>window.__x=1</script>', '<b>cut</b>', '<i>err</i>'];
+    const base = previews.find((p) => p.body.kind === 'script');
+    if (base === undefined) throw new Error('no script fixture');
+    const body = {
+      ...base.body,
+      source: hostile[0],
+      logs: [hostile[1]],
+      logs_note: hostile[2],
+      stderr: hostile[3],
+    };
+    const { container } = await opened('script', { body });
+    const frames = container.querySelectorAll('iframe');
+    expect(frames).toHaveLength(1);
+    expect((frames[0] as HTMLIFrameElement).getAttribute('srcdoc')).toBe('<!doctype html><p>preview</p>');
+    for (const tab of ['Preview', 'Structured']) {
+      fireEvent.click(screen.getByRole('tab', { name: tab }));
+      expect(container.querySelector('img, script, b, i')).toBeNull();
+      for (const s of [...hostile, 'onerror', '__x']) expect(container.textContent).not.toContain(s);
+    }
+  });
+
+  it('request_tab_shows_script_target_and_limits_as_text', async () => {
+    const hostile = '<b>PROJ-1</b>';
+    const limits = { timeout_s: 30, heap_mb: 64 };
+    const params = { source: '<img src=x onerror=alert(1)>', args: {}, limits };
+    const asked = (class_: string, p: unknown) =>
+      mockedQueueGet.mockResolvedValue({
+        item: { ...item, class: class_, target_display: hostile },
+        request: { ...detail.request, params: p },
+      });
+    asked('script', params);
+    const { container, unmount } = render(<Detail item={item} />);
+    fireEvent.click(screen.getByRole('tab', { name: 'Request' }));
+    await screen.findByText(detail.request.params_sha256);
+    expect(container.querySelector('img, b, script')).toBeNull();
+    const target = screen.getByText('Target');
+    expect(target.tagName).toBe('DT');
+    expect(within(target.nextElementSibling as HTMLElement).getByText(`“${hostile}”`).tagName).toBe('BDI');
+    const shown = screen.getByText('Limits');
+    expect(shown.tagName).toBe('DT');
+    expect((shown.nextElementSibling as HTMLElement).querySelector('pre')?.textContent).toBe(
+      JSON.stringify(limits, null, 2),
+    );
+    unmount();
+    // A script that sent no limits runs with the configured ones.
+    asked('script', { source: 'return 1', args: {} });
+    const again = render(<Detail item={item} />);
+    fireEvent.click(screen.getByRole('tab', { name: 'Request' }));
+    await screen.findByText(detail.request.params_sha256);
+    expect((screen.getByText('Limits').nextElementSibling as HTMLElement).textContent).toBe('configured limits');
+    again.unmount();
+    // Other classes have neither row.
+    asked('read', { key: 'ABC-1' });
+    render(<Detail item={item} />);
+    fireEvent.click(screen.getByRole('tab', { name: 'Request' }));
+    await screen.findByText(detail.request.params_sha256);
+    expect(screen.queryByText('Target')).toBeNull();
+    expect(screen.queryByText('Limits')).toBeNull();
+  });
+
   it('request_tab_all_text_nodes', async () => {
     const hostile = '<img src=x onerror=alert(1)>';
     mockedQueueGet.mockResolvedValue({

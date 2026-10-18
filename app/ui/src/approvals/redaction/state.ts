@@ -6,14 +6,17 @@ import { useEffect, useState } from 'react';
 
 import { rawPage, redactionPreview } from '../../shared/ipc/invoke';
 import type {
+  BlockReason,
   CandidateRev,
+  PreselectTag,
   RedactionContext,
   RedactionOp,
+  RedactionPreset,
   RedactionReport,
   UrlMode,
 } from '../../shared/ipc/types';
 import { CANDIDATE_MAX_BYTES, fromBase64, readCandidate, type Candidate } from './json';
-import { canonical, isMask, ordered, urlFieldOp, type RoundOp } from './paths';
+import { canonical, isMask, isSingleMask, ordered, presetOp, urlFieldOp, type RoundOp } from './paths';
 
 /** plan text (Task 17, T7 handoff): `redaction_preview` runs this long after the last change. */
 export const PREVIEW_DEBOUNCE_MS = 200;
@@ -61,6 +64,29 @@ export function draftOf(
   }
   const key = canonical(ops);
   return { ops, key, unsent: key !== canonical(base) };
+}
+
+/** The UI's own preset for each tag `Preview.preselect` can carry (Δ5): a tag never becomes a core type. */
+const PRESET_OF_TAG: Readonly<Record<PreselectTag, RedactionPreset>> = {
+  error_class_only: 'error_class_only',
+};
+
+/**
+ * The round a preview starts with when it pre-selects a redaction (spec 9.5: "Keep error class only"
+ * for the data-free limit outcome of a queued run). It is an ordinary unsent round the approver can
+ * Remove, so releasing it needs Rust's report for exactly these ops like any other. Nothing is
+ * pre-selected where the panel would not offer the preset: one the revision already holds, or a
+ * revision with a single-occurrence mask (Rust places those after every drop and preset).
+ */
+export function preselectedRound(
+  preselect: PreselectTag | null,
+  context: RedactionContext | null,
+): RoundOp[] {
+  if (preselect === null || context === null) return [];
+  const op = presetOp(PRESET_OF_TAG[preselect]);
+  const key = canonical(op);
+  if (context.ops.some((o) => isSingleMask(o) || canonical(o) === key)) return [];
+  return [{ op, loc: null }];
 }
 
 /** Rust's verdict on one set of ops of one revision, or that the check failed. */
@@ -126,6 +152,47 @@ export function useRedactionReport(
     };
   }, [requestId, counter, hash, key]);
   return state;
+}
+
+/** The entries the 5.3 mirror check flags on a mirror-blocked revision, or that the probe failed. */
+export type FlaggedState = { rev: string; flagged: BlockReason[] } | { rev: string; failed: true };
+
+const MIRROR_REASONS: readonly string[] = ['mirror_orphan', 'mirror_unmatchable'];
+
+/**
+ * The flagged entries of a mirror-blocked revision (M-11, L217): `redaction_preview` of the
+ * revision's own ops, whose `blocked` lists every flagged entry still in the shown candidate (core
+ * `check_redacted`), in document order and as `name[3]` paths into the tree the panel shows. Asked
+ * once per revision while `enabled`; each answer carries the revision it is for.
+ */
+export function useFlagged(
+  requestId: string,
+  rev: CandidateRev | null,
+  ops: readonly RedactionOp[],
+  enabled: boolean,
+): FlaggedState | null {
+  const [state, setState] = useState<FlaggedState | null>(null);
+  const counter = rev?.counter ?? 0;
+  const hash = rev?.candidate_hash ?? '';
+  const want = enabled && rev !== null;
+  const opsKey = canonical(ops);
+  useEffect(() => {
+    if (!want) return undefined;
+    let live = true;
+    const r = `${counter}:${hash}`;
+    redactionPreview(requestId, { counter, candidate_hash: hash }, JSON.parse(opsKey) as RedactionOp[]).then(
+      (report) => {
+        if (live) setState({ rev: r, flagged: report.blocked.filter((b) => MIRROR_REASONS.includes(b.reason)) });
+      },
+      () => {
+        if (live) setState({ rev: r, failed: true });
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, [want, requestId, counter, hash, opsKey]);
+  return want && state !== null && state.rev === `${counter}:${hash}` ? state : null;
 }
 
 export type CandidateState =

@@ -87,6 +87,29 @@ export class TreeModel {
     return out;
   }
 
+  /**
+   * The node a plain `name[3]` path names (the form Rust reports locations in), or null where the
+   * path is not in the tree or cannot be told apart (a key with `.`, `[` or `]`).
+   */
+  find(path: string): TreeNode | null {
+    const step = /\.?([^.[\]]+)|\[(\d+)\]/y;
+    let node: TreeNode = this.root;
+    for (let at = 0; at < path.length; ) {
+      step.lastIndex = at;
+      const m = step.exec(path);
+      if (m === null) return null;
+      at = step.lastIndex;
+      const next: TreeNode | undefined = this.children(node).find((c) => {
+        const last = c.loc[c.loc.length - 1];
+        if (last === undefined) return false;
+        return m[1] !== undefined ? 'key' in last && last.key === m[1] : 'index' in last && last.index === Number(m[2]);
+      });
+      if (next === undefined) return null;
+      node = next;
+    }
+    return node;
+  }
+
   /** Whether `node`'s members were read (its count is known). */
   read(node: TreeNode): boolean {
     return this.cache.has(node.id);

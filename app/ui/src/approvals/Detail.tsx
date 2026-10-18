@@ -22,9 +22,11 @@ import { Panel } from './redaction/Panel';
 import { canonical, type RoundOp } from './redaction/paths';
 import {
   draftOf,
+  preselectedRound,
   releaseReady,
   revKey,
   useCandidate,
+  useFlagged,
   useRedactionReport,
 } from './redaction/state';
 import { RequestTab } from './RequestTab';
@@ -179,6 +181,9 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
       (response) => {
         if (mine !== latest.current) return;
         setState({ kind: 'open', response });
+        // A preview can pre-select a redaction (spec 9.5): the round starts with it, an ordinary
+        // unsent round that the panel lists and the approver can remove.
+        setRound(preselectedRound(response.preview.preselect, response.redaction));
       },
       (e: unknown) => {
         if (mine !== latest.current) return;
@@ -217,8 +222,11 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
   // Reads and scripts (task 17): the redaction round and what Release would send. The revision
   // shows the source with its own ops applied; the round is built on what it shows.
   const context = shown?.redaction ?? null;
-  const redactable =
-    context !== null && shown !== null && releaseBlocked === null && !gone && shown.preview.body.kind !== 'outcome';
+  // M-11 (M8 T19c): a candidate the 5.3 mirror check blocks arrives with its banner and a redaction
+  // context (a candidate that cannot be rebuilt at all has no preview, so it is not this). Its tree is
+  // offered so the flagged entries can be dropped; only a release of those redactions is open.
+  const redactable = context !== null && shown !== null && !gone && shown.preview.body.kind !== 'outcome';
+  const mirrorBlocked = redactable && releaseBlocked !== null;
   const draft = redactable ? draftOf(context, round, urlChoice, removeAll) : null;
   /** Redactions the user built and has not released: every other positive control is off. */
   const unsentRedactions = (draft?.unsent ?? false) || pendingInput;
@@ -226,6 +234,12 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
   const shownRevKey = shownRev === null ? '' : revKey(shownRev);
   const report = useRedactionReport(item.request_id, redactable ? shownRev : null, draft);
   const candidate = useCandidate(item.request_id, redactable ? shownRev : null, redactable && tab === 'structured');
+  const flagged = useFlagged(
+    item.request_id,
+    mirrorBlocked ? shownRev : null,
+    context?.ops ?? [],
+    mirrorBlocked && tab === 'structured',
+  );
   const reportShown =
     report !== null && draft !== null && report.rev === shownRevKey && report.key === draft.key ? report : null;
   /** The redaction panel's Release (spec 5.3): the report for exactly these ops, nothing blocked, others confirmed. */
@@ -240,9 +254,11 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
     !unsentEdits &&
     !unsentRedactions &&
     !inert.approveInert;
+  // A mirror-blocked revision is not approvable: only a release of drops that clear the flagged
+  // entries (Rust's report for exactly those ops blocks nothing) goes through, never its own release.
   const panelReleaseEnabled =
     shown !== null &&
-    shown.preview.approvable &&
+    (shown.preview.approvable || (mirrorBlocked && draft !== null && draft.unsent)) &&
     !busy &&
     !denyOpen &&
     !inert.approveInert &&
@@ -259,6 +275,9 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
   const send = (args: DecisionArgs) => {
     if (inFlight.current || gone) return;
     const isEdit = args.decision === 'approve_edited';
+    // The one positive decision a mirror-blocked revision takes: the panel's redactions (checked below).
+    const mirrorSend =
+      mirrorBlocked && args.decision === 'release_redacted' && args.redactions !== undefined && draft !== null && draft.unsent;
     if (args.decision === 'deny') {
       if (!canDeny) return;
     } else if (isEdit) {
@@ -274,8 +293,8 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
       }
     } else if (
       shown === null ||
-      !shown.preview.approvable ||
-      releaseBlocked !== null ||
+      (!shown.preview.approvable && !mirrorSend) ||
+      (releaseBlocked !== null && !mirrorSend) ||
       denyOpen ||
       unsentEdits ||
       inert.approveInertNow()
@@ -489,6 +508,8 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
           onConfirm={(on) => setConfirmedKey(on ? draft.key : null)}
           upstreamError={shown.preview.body.kind === 'upstream_error'}
           script={shown.preview.header.class === 'script'}
+          mirrorBlocked={mirrorBlocked}
+          flagged={flagged}
           canRelease={panelReleaseEnabled}
           onRelease={releaseFromPanel}
           onPendingInput={setPendingInput}

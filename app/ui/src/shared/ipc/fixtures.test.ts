@@ -155,6 +155,35 @@ describe('fixtures validate against their TS types', () => {
     expect(isDenyCount({ denied: '3' })).toBe(false);
   });
 
+  // M8 T24 (Δ5): `preselect` is the closed tag `error_class_only` or null. The UI maps the tag to its
+  // own preset, so a value it does not know is refused instead of being passed on.
+  it('preselect_tag_validator_refuses_unknown_values', () => {
+    const [first] = preview;
+    expect(preview.some((p) => p.preselect === 'error_class_only')).toBe(true);
+    expect(isPreview({ ...first, preselect: null })).toBe(true);
+    expect(isPreview({ ...first, preselect: 'error_class_only' })).toBe(true);
+    for (const bad of [
+      'status_only',
+      'ErrorClassOnly',
+      'ERROR_CLASS_ONLY',
+      'error_class_only ',
+      '',
+      'constructor',
+      'toString',
+      0,
+      true,
+      ['error_class_only'],
+      { preset: 'error_class_only' },
+      undefined,
+    ]) {
+      expect(isPreview({ ...first, preselect: bad }), String(bad)).toBe(false);
+    }
+    // The key is always on the wire (Rust serializes `None` as null): absent is refused as well.
+    const without: Record<string, unknown> = { ...first };
+    delete without.preselect;
+    expect(isPreview(without)).toBe(false);
+  });
+
   it('queue_item: the Option<String> fields accept null and refuse a wrong type', () => {
     const nulls = queueItem.find((i) => i.agent_name === null);
     expect(nulls).toBeDefined();

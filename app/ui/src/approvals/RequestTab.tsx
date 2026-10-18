@@ -16,6 +16,12 @@ export function paramsText(params: unknown): string {
   return JSON.stringify(params, null, 2) ?? 'null';
 }
 
+/** The limits a script asked for (`script.run` params `limits`), or null when it sent none. */
+function limitsOf(params: unknown): unknown {
+  if (typeof params !== 'object' || params === null || !('limits' in params)) return null;
+  return (params as { limits?: unknown }).limits ?? null;
+}
+
 /**
  * The Request tab (spec 5.6): what the agent asked and who is asking. Everything is a text node:
  * agent strings go through `AgentText`, the rest (params, hashes, process paths, timestamps) are
@@ -45,6 +51,7 @@ export function RequestTab({ requestId }: RequestTabProps) {
   if (detail === null) return <p role="status">{REQUEST_TEXT.loading}</p>;
 
   const { item, request: r } = detail;
+  const limits = limitsOf(r.params);
   const text = (v: string | number | null) => (v === null || v === '' ? REQUEST_TEXT.none : String(v));
   return (
     <section className="request-tab" aria-label={REQUEST_TEXT.connection}>
@@ -53,6 +60,24 @@ export function RequestTab({ requestId }: RequestTabProps) {
         <dd>{item.op_id}</dd>
         <dt>{REQUEST_TEXT.instance}</dt>
         <dd>{item.instance_alias}</dd>
+        {item.class === 'script' ? (
+          <>
+            <dt>{REQUEST_TEXT.target}</dt>
+            <dd>
+              <AgentText value={item.target_display} unusual={item.unusual} />
+            </dd>
+            <dt>{REQUEST_TEXT.limits}</dt>
+            <dd>
+              {limits === null ? (
+                REQUEST_TEXT.limits_default
+              ) : (
+                <pre className="params-text" tabIndex={0}>
+                  {paramsText(limits)}
+                </pre>
+              )}
+            </dd>
+          </>
+        ) : null}
         <dt>{REQUEST_TEXT.reason}</dt>
         <dd>
           {r.reason === null || r.reason === '' ? (

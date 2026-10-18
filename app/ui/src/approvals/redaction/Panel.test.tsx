@@ -696,26 +696,49 @@ describe('ops that would not act on what the revision shows (review T17 C1, I1, 
     expect(sentRedactions()).toEqual([base, base]);
   });
 
-  it('a_drop_past_an_index_of_a_shortened_list_is_not_offered', async () => {
-    // The revision dropped list[0]: the shown list[0].author is the source's list[1].author, and
-    // Rust checks the path on the source's list[0] (core
-    // `a_drop_past_a_shifted_index_is_checked_on_another_element`).
+  it('index_drop_after_earlier_drops_enabled', async () => {
+    // The revision dropped list[0]: the shown list[0].author is the source's list[1].author. Since
+    // M8 T19c the engine resolves each op against the document the revision's ops left (core
+    // `a_drop_past_a_shifted_index_is_checked_on_another_element`), which is what the tree shows,
+    // so a drop past an index of the shortened list is offered again (M6 T17 rule (b) is gone).
     const base: RedactionOp = { drop_field: { field_loc: 'list[0]', scope: 'per_item' } };
     const doc = { list: [{ body: 'y', author: 'Ann' }, { body: 'z', author: 'Bo' }] };
     await openPanel(context([base], []), 'jira_issue', doc);
     expand('list');
     select('[0]');
-    // The element itself (the index is the path's end) is offered.
     expect(action('Drop item').disabled).toBe(false);
     expand('[0]');
     select('author');
-    expect(action('Drop field (this item)').disabled).toBe(true);
-    expect(within(panel()).getByText(/named by position in a list this revision already shortened/)).toBeTruthy();
-    // Across all items names no index: offered, and sent after the revision's drop.
+    expect(action('Drop field (this item)').disabled).toBe(false);
+    expect(within(panel()).queryByText(/already shortened/)).toBeNull();
+    fireEvent.click(action('Drop field (this item)'));
+    // Across all items stays offered too.
+    select('body');
     expect(action('Drop field (all items)').disabled).toBe(false);
-    fireEvent.click(action('Drop field (all items)'));
     await checked();
-    expect(lastReportOps()).toEqual([base, { drop_field: { field_loc: 'list[0].author', scope: 'all_items' } }]);
+    expect(lastReportOps()).toEqual([base, { drop_field: { field_loc: 'list[0].author', scope: 'per_item' } }]);
+    fireEvent.click(panelRelease());
+    await flush();
+    expect(sentRedactions()).toEqual([base, { drop_field: { field_loc: 'list[0].author', scope: 'per_item' } }]);
+  });
+
+  it('index_drops_after_earlier_drops_go_in_reverse_document_order', async () => {
+    // Two index drops in a round on a revision that already dropped: later element first, both
+    // after the revision's own ops (the engine never reorders a round).
+    const base: RedactionOp = { drop_field: { field_loc: 'list[0]', scope: 'per_item' } };
+    const doc = { list: [{ body: 'y' }, { body: 'z' }, { body: 'w' }] };
+    await openPanel(context([base], []), 'jira_issue', doc);
+    expand('list');
+    select('[0]');
+    fireEvent.click(action('Drop item'));
+    select('[1]');
+    fireEvent.click(action('Drop item'));
+    await checked();
+    expect(lastReportOps()).toEqual([
+      base,
+      { drop_field: { field_loc: 'list[1]', scope: 'per_item' } },
+      { drop_field: { field_loc: 'list[0]', scope: 'per_item' } },
+    ]);
   });
 
   it('a_drop_past_an_index_is_offered_when_no_drop_shortened_a_list', async () => {
@@ -843,6 +866,196 @@ describe('the selected value and the candidate read', () => {
     await flush();
     expect(within(panel()).queryByText('Could not read the candidate.')).toBeNull();
     expect(rowOf('fields')).toBeTruthy();
+  });
+});
+
+describe('script release items (M8 T24, spec 9.5)', () => {
+  const ERROR_CARD = { script_error: { class: 'TypeError', message: 'x is undefined' } };
+  const PRESET: RedactionOp = { preset: 'error_class_only' };
+
+  /** Opens a script's release item (`preselect` as the preview carries it) on the Structured tab. */
+  async function openScript(
+    preselect: 'error_class_only' | null,
+    ctx: RedactionContext = context([], []),
+    report: () => Promise<RedactionReport> = () => Promise.resolve(OK),
+  ) {
+    const script = { ...READ, class: 'script' };
+    mockWindow([script]);
+    serveCandidate(ERROR_CARD);
+    mockedPreview.mockResolvedValue(previewOf(script, 'script', { preselect }, ctx));
+    mockedReport.mockImplementation(report);
+    await renderWindow();
+    fireEvent.click(screen.getByRole('button', { name: `Open ${script.op_id} ${script.target_display}` }));
+    await flush();
+    advance(INERT_MS);
+    fireEvent.click(screen.getByRole('tab', { name: 'Structured' }));
+    await flush();
+  }
+
+  const roundList = () => within(panel()).getByText('Not yet released').parentElement as HTMLElement;
+
+  it('script_item_preset_preselected_from_preview', async () => {
+    await openScript('error_class_only');
+    // The round already holds the preset, named by the preview's tag: listed as unreleased, and
+    // Rust is asked about exactly it.
+    expect(within(roundList()).getByText('Keep error class only')).toBeTruthy();
+    await checked();
+    expect(lastReportOps()).toEqual([PRESET]);
+    // The user can take it back (Remove), and the round is empty again.
+    fireEvent.click(within(roundList()).getByRole('button', { name: 'Remove' }));
+    expect(within(panel()).queryByText('Not yet released')).toBeNull();
+  });
+
+  it('a_preview_without_a_preselect_starts_with_an_empty_round', async () => {
+    await openScript(null);
+    expect(within(panel()).queryByText('Not yet released')).toBeNull();
+    await checked();
+    expect(mockedReport).not.toHaveBeenCalled();
+  });
+
+  it('a_preselected_preset_the_revision_already_holds_is_not_added_again', async () => {
+    await openScript('error_class_only', context([PRESET], []));
+    expect(within(panel()).queryByText('Not yet released')).toBeNull();
+    await checked();
+    expect(mockedReport).not.toHaveBeenCalled();
+  });
+
+  it('release_with_preset_sends_error_class_only', async () => {
+    let answer: (r: RedactionReport) => void = () => undefined;
+    await openScript(
+      'error_class_only',
+      context([], []),
+      () =>
+        new Promise((resolve) => {
+          answer = resolve;
+        }),
+    );
+    // Unsent until Rust's report for exactly these ops arrives: Release is off, not a plain release.
+    expect(mockedReport).toHaveBeenCalledTimes(1);
+    expect(panelRelease().disabled).toBe(true);
+    fireEvent.click(panelRelease());
+    await flush();
+    expect(mockedDecide).not.toHaveBeenCalled();
+    answer(OK);
+    await flush();
+    expect(panelRelease().disabled).toBe(false);
+    fireEvent.click(panelRelease());
+    await flush();
+    expect(mockedDecide).toHaveBeenCalledTimes(1);
+    expect(mockedDecide.mock.calls[0]?.[0]).toMatchObject({
+      request_id: READ.request_id,
+      decision: 'release_redacted',
+      redactions: [PRESET],
+    });
+  });
+
+  it('a_removed_preselect_releases_the_item_as_it_is', async () => {
+    await openScript('error_class_only');
+    fireEvent.click(within(roundList()).getByRole('button', { name: 'Remove' }));
+    expect(panelRelease().disabled).toBe(false);
+    fireEvent.click(panelRelease());
+    await flush();
+    expect(mockedDecide.mock.calls[0]?.[0]).toMatchObject({ decision: 'release' });
+    expect(mockedDecide.mock.calls[0]?.[0].redactions).toBeUndefined();
+  });
+});
+
+describe('a mirror-blocked item (M8 T24, T19c M-11, L217)', () => {
+  const BANNER = 'release blocked: the candidate could not be built exactly (internal); deny it, or drop the flagged items';
+  const COMMENTS = 'renderedFields.comment.comments';
+  const DOC_MIRROR = {
+    key: 'ABC-3',
+    fields: { comment: { comments: [{ id: '7', body: 'plain' }] } },
+    renderedFields: {
+      comment: { comments: [{ id: '7', body: '<p>plain</p>' }, { id: '9', body: '<p>orphan</p>' }] },
+    },
+  };
+
+  /** Rust's answer for a mirror-blocked read: the banner, not approvable, with its redaction context. */
+  function blockedPreview(): PreviewFetchResponse {
+    const response = previewOf(READ, 'jira_issue', { approvable: false }, context([], []));
+    response.preview.header = { ...response.preview.header, release_blocked: BANNER };
+    return response;
+  }
+
+  /** Opens the blocked read; `redaction_preview` of no ops lists `flagged`, any ops list nothing. */
+  async function openBlocked(flagged: { reason: string; path: string }[]) {
+    serveCandidate(DOC_MIRROR);
+    mockedPreview.mockResolvedValue(blockedPreview());
+    mockedReport.mockImplementation((_id, _rev, ops) =>
+      Promise.resolve(ops.length === 0 ? { ...OK, blocked: flagged } : OK),
+    );
+    await renderWindow();
+    fireEvent.click(screen.getByRole('button', { name: `Open ${READ.op_id} ${READ.target_display}` }));
+    await flush();
+    advance(INERT_MS);
+    fireEvent.click(screen.getByRole('tab', { name: 'Structured' }));
+    await flush();
+  }
+
+  const dropFlagged = () => within(panel()).getByRole('button', { name: 'Drop the flagged items' }) as HTMLButtonElement;
+
+  it('mirror_blocked_item_offers_drop_flagged_items', async () => {
+    await openBlocked([{ reason: 'mirror_orphan', path: `${COMMENTS}[1]` }]);
+    // Rust's banner stays, the plain release stays off, and the tree is offered.
+    expect(screen.getByText(BANNER, { exact: false })).toBeTruthy();
+    expect(panelRelease().disabled).toBe(true);
+    // The flagged entry is named as text, from Rust's probe of the revision's own ops.
+    expect(mockedReport.mock.calls[0]?.[2]).toEqual([]);
+    expect(within(panel()).getByText(`“${COMMENTS}[1]”`)).toBeTruthy();
+    // "Drop the flagged items" drops the entry by its identity.
+    expect(dropFlagged().disabled).toBe(false);
+    fireEvent.click(dropFlagged());
+    await checked();
+    const drop: RedactionOp = { drop_item: { array_loc: COMMENTS, key: 'id', value: '9' } };
+    expect(lastReportOps()).toEqual([drop]);
+    // Release makes a new revision from the drop; nothing else of this item is releasable.
+    expect(panelRelease().disabled).toBe(false);
+    fireEvent.click(panelRelease());
+    await flush();
+    expect(mockedDecide).toHaveBeenCalledTimes(1);
+    expect(mockedDecide.mock.calls[0]?.[0]).toMatchObject({ decision: 'release_redacted', redactions: [drop] });
+  });
+
+  it('a_mirror_blocked_item_with_nothing_unsent_cannot_be_released', async () => {
+    await openBlocked([{ reason: 'mirror_orphan', path: `${COMMENTS}[1]` }]);
+    expect(panelRelease().disabled).toBe(true);
+    fireEvent.click(panelRelease());
+    await flush();
+    expect(mockedDecide).not.toHaveBeenCalled();
+    // Ops that do not clear the flag keep it off: the report's blocked list gates it.
+    mockedReport.mockResolvedValue({ ...OK, blocked: [{ reason: 'mirror_orphan', path: `${COMMENTS}[1]` }] });
+    expand('fields');
+    select('key');
+    fireEvent.click(action('Drop field (this item)'));
+    await checked();
+    expect(panelRelease().disabled).toBe(true);
+    expect(within(panel()).getByText('Release is blocked:')).toBeTruthy();
+  });
+
+  it('unmatchable_entries_are_cleared_by_dropping_their_whole_list', async () => {
+    await openBlocked([
+      { reason: 'mirror_unmatchable', path: `${COMMENTS}[0]` },
+      { reason: 'mirror_unmatchable', path: `${COMMENTS}[1]` },
+    ]);
+    fireEvent.click(dropFlagged());
+    await checked();
+    expect(lastReportOps()).toEqual([{ drop_field: { field_loc: COMMENTS, scope: 'per_item' } }]);
+  });
+
+  it('a_failed_probe_offers_no_drop_flagged_items', async () => {
+    serveCandidate(DOC_MIRROR);
+    mockedPreview.mockResolvedValue(blockedPreview());
+    mockedReport.mockRejectedValue({ kind: 'internal' });
+    await renderWindow();
+    fireEvent.click(screen.getByRole('button', { name: `Open ${READ.op_id} ${READ.target_display}` }));
+    await flush();
+    advance(INERT_MS);
+    fireEvent.click(screen.getByRole('tab', { name: 'Structured' }));
+    await flush();
+    expect(within(panel()).queryByRole('button', { name: 'Drop the flagged items' })).toBeNull();
+    expect(within(panel()).getByText(/Could not find the flagged items/)).toBeTruthy();
+    expect(panelRelease().disabled).toBe(true);
   });
 });
 
