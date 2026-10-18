@@ -603,6 +603,28 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # M8 plan Task 25 (§9.4 k, §15 V16 Jira half): the heap expansion factor of a Jira
+      # `fields=*all` search answer, in process through Engine::deliver. The 1 and 4 MiB sizes
+      # run in every cargo test; this step adds the ignored 16 MiB size (and the small ones again,
+      # for their `K` lines) on the Linux leg only. The test asserts k_peak >= k_retained > 1.
+      - name: M8 k measurement (Jira *all search, 1/4/16 MiB; §9.4 k, V16)
+        if: runner.os == 'Linux'
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          cargo test -p atlas-duck-sandbox-worker --test k_factor --locked -- --include-ignored --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/k-factor.log"
+          # 4 text mixes x 3 sizes: one `K` line each, the 16 MiB ones among them. libtest prints
+          # `test <name> ... ` before a test's own output, so a line may follow it on the same line.
+          [ "$(grep -cE '(^|[[:space:]])K fixture=jira-all-[a-z]+ bytes=[0-9]+ heap_peak=[0-9]+ k_peak=[0-9.]+ k_retained=[0-9.]+$' "$RUNNER_TEMP/k-factor.log")" -ge 12 ] || { echo "::error::fewer than 12 K lines"; exit 1; }
+          grep -E '(^|[[:space:]])K fixture=jira-all-[a-z]+ bytes=1[5-6][0-9]{6} ' "$RUNNER_TEMP/k-factor.log" || { echo "::error::no 16 MiB K line"; exit 1; }
+          grep -E '^test result: ok\. 4 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/k-factor.log" || { echo "::error::k_factor did not run all four tests"; exit 1; }
+          {
+            echo '### M8 k measurement (Jira *all search)'
+            echo '```'
+            grep -oE 'K fixture=.*' "$RUNNER_TEMP/k-factor.log" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # M8 plan Task 6 (Tasks 8-11 added; later tasks follow): the real worker through the platform spawner,
       # split into pipes, kill handle and reaper (app/src-tauri/tests/sandbox_runs.rs). Same rules
       # as jira_flows: ATLAS_DUCK_CLI_FLOWS=1, no "skipped:" line, pass count of at least

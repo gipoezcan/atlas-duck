@@ -265,6 +265,11 @@ mod macos {
 #[path = "sandbox_runs/v10.rs"]
 mod v10;
 
+/// The Jira `fields=*all` search generator of the worker's `k_factor` test (M8 Task 25): the same
+/// fixture drives `k` in process and I-21 on the real worker.
+#[path = "../../../crates/sandbox-worker/tests/common/fixtures.rs"]
+mod fixtures;
+
 /// V21 (M8 Task 10): a replaced worker binary is detected before the next spawn, per OS.
 #[path = "sandbox_runs/v21.rs"]
 mod v21;
@@ -737,6 +742,97 @@ mod s10 {
         println!(
             "M8 s10_run_and_probe_share_the_spawn_routine result=42 mechanism={}",
             outcome.confinement.mechanism
+        );
+        Ok(())
+    }
+
+    /// Answers every call with one fixed value (the `atlas.all` answer of I-21).
+    struct FixtureSink(serde_json::Value);
+
+    #[async_trait]
+    impl HostCallSink for FixtureSink {
+        async fn call(&self, _run_id: &str, _c: HostCall) -> HostCallResult {
+            HostCallResult::Ok(self.0.clone())
+        }
+
+        fn log(&self, _run_id: &str, _line: &str) {}
+    }
+
+    /// The I-21 run over `spawner` with the given limits and the worker's process limit.
+    fn run_all_search(
+        rt: &tokio::runtime::Runtime,
+        spawner: &dyn WorkerSpawner,
+        limits: ScriptLimits,
+        fixture: serde_json::Value,
+    ) -> Result<RunOutcome, Box<dyn std::error::Error>> {
+        let source = "const r = await atlas.all('jira.search', { jql: 'project = KFAC', fields: ['*all'] });\n\
+                      return r.issues.length;";
+        let spec = SpawnSpec {
+            exe: worker_exe(),
+            process_mb: limits.process_mb,
+        };
+        let mut init = init(source, limits);
+        init.read_op_ids = vec!["jira.search".to_owned()];
+        let handle = start_run(
+            spawner,
+            &spec,
+            &expected()?,
+            init,
+            Arc::new(FixtureSink(fixture)),
+            rt.handle().clone(),
+        )?;
+        Ok(rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(120), handle.wait()).await
+        })?)
+    }
+
+    /// I-21 (M8 Task 25; spec §13 I-21, §9.4 `k`, R13): a real worker with the default limits
+    /// (`heap_mb` 256, `process_mb` 512) runs `atlas.all` on a Jira `fields=*all` search whose
+    /// concatenated answer is just under `max_call_result_mb` (16 MiB), the largest the host
+    /// allows, and completes. The second run is data for R13 only: the same answer under
+    /// `heap_mb` 128 (8 x 16) and a matching `process_mb` 256; whether it completes is recorded,
+    /// not asserted.
+    #[test]
+    fn i21_all_result_at_cap_within_default_heap() -> TestResult {
+        if !harness::opted_in("i21_all_result_at_cap_within_default_heap") {
+            return Ok(());
+        }
+        let rt = runtime()?;
+        let spawner = spawner()?;
+        let limits = ScriptLimits::default();
+        let cap = limits.max_call_result_mb as usize * fixtures::MIB;
+        let fixture = fixtures::jira_star_all_search(0x5eed, fixtures::TextMix::Sparse, cap);
+        let bytes = serde_json::to_string(&fixture)?.len();
+        let issues = fixture["issues"].as_array().map_or(0, Vec::len);
+        assert!(bytes <= cap && bytes > cap - 64 * 1024, "{bytes} of {cap}");
+
+        let outcome = run_all_search(&rt, spawner.as_ref(), limits, fixture.clone())?;
+        assert_eq!(outcome.host, HostVerdict::None, "{outcome:?}");
+        assert_eq!(
+            result_text(&outcome),
+            Some(issues.to_string().as_str()),
+            "{outcome:?}"
+        );
+        println!(
+            "M8 i21_all_result_at_cap heap_mb={} process_mb={} bytes={bytes} issues={issues} completed=true",
+            limits.heap_mb, limits.process_mb
+        );
+
+        let tight = ScriptLimits {
+            heap_mb: 128,
+            process_mb: 256,
+            ..limits
+        };
+        let outcome = run_all_search(&rt, spawner.as_ref(), tight, fixture)?;
+        let completed = outcome.host == HostVerdict::None
+            && result_text(&outcome) == Some(issues.to_string().as_str());
+        let end: String = format!("{:?} {:?}", outcome.host, outcome.end)
+            .chars()
+            .take(160)
+            .collect();
+        println!(
+            "M8 i21_r13 heap_mb={} process_mb={} bytes={bytes} completed={completed} end={end}",
+            tight.heap_mb, tight.process_mb
         );
         Ok(())
     }

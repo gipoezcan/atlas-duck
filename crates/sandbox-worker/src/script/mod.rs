@@ -476,6 +476,12 @@ impl<H: HostPort + 'static> Engine<H> {
         self.rt.memory_usage()
     }
 
+    /// Runs QuickJS's cycle collector (Task 25 measures what stays after it). A run never calls
+    /// this: QuickJS collects by itself.
+    pub fn run_gc(&self) {
+        self.rt.run_gc();
+    }
+
     /// The host port.
     pub fn host(&self) -> Ref<'_, H> {
         self.shared.host.borrow()
