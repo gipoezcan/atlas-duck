@@ -564,6 +564,45 @@ async fn shared_client_null_id_error_closes() -> TestResult {
     Ok(())
 }
 
+/// A result of the wrong shape fails only its own call (`Protocol`): the client stays open and
+/// the next call on it gets its answer (M9 T8 review m-5: a per-call error never reconnects,
+/// which would start a new approval session, PD-115).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_client_wrong_shaped_answer_fails_only_its_call() -> TestResult {
+    let mut peer = RawPeer::start().await;
+    let client = peer.client().await?;
+
+    let first = status_call(&client, 1);
+    let request = peer.next().await?;
+    peer.send(Cmd::Write(json!({
+        "jsonrpc": "2.0",
+        "id": request["id"].clone(),
+        "result": "not an envelope",
+    })))?;
+    let sent = join(first).await?;
+    assert!(sent.written);
+    assert!(
+        matches!(sent.result, Err(ClientError::Protocol(_))),
+        "{:?}",
+        sent.result
+    );
+    assert!(!client.is_closed());
+
+    let second = status_call(&client, 2);
+    let request = peer.next().await?;
+    assert_eq!(request["params"]["request_id"], json!(rid(2)));
+    peer.send(Cmd::Write(json!({
+        "jsonrpc": "2.0",
+        "id": request["id"].clone(),
+        "result": serde_json::to_value(answer("request.status", Some(&rid(2))))?,
+    })))?;
+    let sent = join(second).await?;
+    assert!(sent.written);
+    assert_eq!(answered_id(&sent.result?), Some(rid(2)));
+    assert!(!client.is_closed());
+    Ok(())
+}
+
 /// The slot travels with the route: 48 awaits whose futures were dropped still hold their
 /// slots until the server answers them, so a 49th call waits for that answer (or its own
 /// deadline, unwritten) and the server never holds more than 48 requests from this client.

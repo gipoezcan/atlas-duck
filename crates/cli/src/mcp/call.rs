@@ -31,8 +31,8 @@ use crate::argv::DryRun;
 use crate::connected::{AWAIT_SLACK, bound, list_state};
 use crate::deadline::Deadline;
 use crate::flow::{
-    await_error, await_timeout_ms, check_await_reply, check_submit_reply, pending_for,
-    protocol_failure, script_params, short_error, submit_error,
+    Front, await_error, await_timeout_ms, check_await_reply, check_submit_reply, pending_for,
+    protocol_failure, script_params, short_error_for, submit_error_for,
 };
 use crate::launch;
 
@@ -235,10 +235,11 @@ impl<'a> Body<'a> {
             Ok(client) => client,
             Err(env) => return env,
         };
-        // Not cancellable (PD-126): a submit runs to its answer or its deadline, so a request
-        // the app took is never one the agent was told nothing about. A deadline that passes
-        // before the writer took the frame is `launch_timeout` (nothing queued); after it, the
-        // request may exist with an unknown id (PD-16, L63).
+        // Not cancellable (PD-126): a submit runs to its answer, its deadline or the end of the
+        // process, and whatever is answered is true. On a client's cancel rmcp drops the result,
+        // so the agent recovers the request with `request_list {match_params}` (L160). A
+        // deadline that passes before the writer took the frame is `launch_timeout` (nothing
+        // queued); after it, the request may exist with an unknown id (PD-16, L63).
         let sent = client
             .call::<SubmitReply>(name, &sp, Some(bound(&self.deadline)))
             .await;
@@ -246,7 +247,7 @@ impl<'a> Body<'a> {
             Ok(reply) => reply,
             Err(e) => {
                 self.note(&client, &e);
-                return submit_error(e, sent.written);
+                return submit_error_for(e, sent.written, Front::Mcp);
             }
         };
         // L131: a `pending` reply without an id is the app's protocol error.
@@ -326,7 +327,7 @@ impl<'a> Body<'a> {
             Ok(env) => env,
             Err(e) => {
                 self.note(&client, &e);
-                short_error(e)
+                short_error_for(e, Front::Mcp)
             }
         }
     }

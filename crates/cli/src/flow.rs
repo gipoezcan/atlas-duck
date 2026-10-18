@@ -28,10 +28,40 @@ pub(crate) const MSG_CONNECTION_LOST: &str = "use `await <id>`; the request may 
 /// PD-16 second half (ledger L63).
 pub(crate) const MSG_CONNECTION_LOST_NO_ID: &str =
     "the request may have been queued; recover it with requests list --match-params-file";
+/// [`MSG_CONNECTION_LOST_NO_ID`] for an MCP agent, which recovers through the tool (§4.4).
+pub(crate) const MSG_CONNECTION_LOST_NO_ID_MCP: &str =
+    "the request may have been queued; recover it with request_list match_params";
 const MSG_LOST_BEFORE_SUBMIT: &str =
     "the connection to the atlas-duck app was lost before an answer arrived";
 pub(crate) const MSG_DEADLINE_SHORT: &str =
     "the --timeout deadline expired before the atlas-duck app answered";
+/// [`MSG_DEADLINE_SHORT`] for an MCP agent, whose deadline is the variable (PD-116).
+pub(crate) const MSG_DEADLINE_SHORT_MCP: &str =
+    "the ATLAS_DUCK_MCP_TIMEOUT deadline expired before the atlas-duck app answered";
+
+/// The front end an envelope goes to: the two texts that tell the agent what to do next name
+/// that front end's own syntax (M9 T8 review m-3); everything else is the same for both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Front {
+    Cli,
+    Mcp,
+}
+
+impl Front {
+    fn connection_lost_no_id(self) -> &'static str {
+        match self {
+            Front::Cli => MSG_CONNECTION_LOST_NO_ID,
+            Front::Mcp => MSG_CONNECTION_LOST_NO_ID_MCP,
+        }
+    }
+
+    fn deadline_short(self) -> &'static str {
+        match self {
+            Front::Cli => MSG_DEADLINE_SHORT,
+            Front::Mcp => MSG_DEADLINE_SHORT_MCP,
+        }
+    }
+}
 const MSG_PROTOCOL: &str = "the atlas-duck app broke the protocol";
 const MSG_TOO_LARGE: &str = "the request is too large to send";
 pub(crate) const MSG_INTERNAL: &str = "the request could not be sent";
@@ -77,8 +107,14 @@ pub(crate) fn connection_lost_pending(request_id: &str, base: Option<&Envelope>)
 
 /// PD-16 / L63: the frame was written but no reply came (interrupt, loss, stuck app): the request
 /// may exist and its id is unknown. `pending`, `request_id: null`, exit 4.
+#[cfg(test)]
 pub(crate) fn unknown_request_pending() -> Envelope {
-    let mut env = Envelope::failed(ErrorCode::Unreachable, false, MSG_CONNECTION_LOST_NO_ID);
+    unknown_request_pending_for(Front::Cli)
+}
+
+/// [`unknown_request_pending`] for `front`.
+pub(crate) fn unknown_request_pending_for(front: Front) -> Envelope {
+    let mut env = Envelope::failed(ErrorCode::Unreachable, false, front.connection_lost_no_id());
     env.status = Status::Pending;
     with_details(env, reason(REASON_CONNECTION_LOST))
 }
@@ -167,12 +203,17 @@ pub(crate) fn connect_error(e: ConnectError) -> Envelope {
 
 /// A call that gave no answer, outside the submit-wait flow (nothing here echoes a request id).
 pub(crate) fn short_error(e: ClientError) -> Envelope {
+    short_error_for(e, Front::Cli)
+}
+
+/// [`short_error`] for `front`.
+pub(crate) fn short_error_for(e: ClientError, front: Front) -> Envelope {
     match e {
         ClientError::Rpc(rpc) => rpc.data.unwrap_or_else(protocol_failure),
         ClientError::ConnectionLost => lost_before_submit(),
         ClientError::Protocol(_) => protocol_failure(),
         ClientError::DeadlineExceeded => {
-            *launch::unreachable(launch::REASON_LAUNCH_TIMEOUT, MSG_DEADLINE_SHORT)
+            *launch::unreachable(launch::REASON_LAUNCH_TIMEOUT, front.deadline_short())
         }
         ClientError::Io(e) if e.kind() == io::ErrorKind::InvalidInput => {
             Envelope::failed(ErrorCode::Usage, false, MSG_TOO_LARGE)
@@ -183,8 +224,13 @@ pub(crate) fn short_error(e: ClientError) -> Envelope {
 
 /// What the agent gets when no reply to a submit arrived.
 pub(crate) fn no_reply(written: bool) -> Envelope {
+    no_reply_for(written, Front::Cli)
+}
+
+/// [`no_reply`] for `front`.
+pub(crate) fn no_reply_for(written: bool, front: Front) -> Envelope {
     if written {
-        unknown_request_pending()
+        unknown_request_pending_for(front)
     } else {
         *launch::launch_timeout()
     }
@@ -193,22 +239,28 @@ pub(crate) fn no_reply(written: bool) -> Envelope {
 /// A submit call that failed. An envelope from the app is its answer; any other failure after the
 /// frame was written leaves a request that may exist, whose id is unknown: pending, exit 4.
 pub(crate) fn submit_error(e: ClientError, written: bool) -> Envelope {
+    submit_error_for(e, written, Front::Cli)
+}
+
+/// [`submit_error`] for `front`.
+pub(crate) fn submit_error_for(e: ClientError, written: bool, front: Front) -> Envelope {
     match e {
         ClientError::Rpc(rpc) => match rpc.data {
             Some(env) => env,
-            None if written => unknown_request_pending(),
+            None if written => unknown_request_pending_for(front),
             None => protocol_failure(),
         },
-        ClientError::ConnectionLost if written => unknown_request_pending(),
+        ClientError::ConnectionLost if written => unknown_request_pending_for(front),
         ClientError::ConnectionLost => lost_before_submit(),
-        ClientError::DeadlineExceeded => no_reply(written),
-        _ if written => unknown_request_pending(),
-        other => short_error(other),
+        ClientError::DeadlineExceeded => no_reply_for(written, front),
+        _ if written => unknown_request_pending_for(front),
+        other => short_error_for(other, front),
     }
 }
 
 /// An `await` call that failed. An envelope from the app is its answer; any other failure means
 /// no answer came, and the request (its id is known) lives on: pending, exit 4, `await` again.
+/// Neither front end's syntax appears in these texts (`MSG_CONNECTION_LOST` is §4.3 verbatim).
 pub(crate) fn await_error(e: ClientError, id: &str, base: &Envelope) -> Envelope {
     match e {
         ClientError::Rpc(rpc) if rpc.data.is_some() => short_error(ClientError::Rpc(rpc)),
@@ -374,6 +426,71 @@ mod tests {
                 .and_then(|x| x.details.as_ref())
                 .and_then(|d| d.get("reason"));
             assert_eq!(reason, Some(&Value::from(launch::REASON_LAUNCH_TIMEOUT)));
+        }
+    }
+
+    fn message(env: &Envelope) -> Option<&str> {
+        env.error.as_ref().map(|e| e.message.as_str())
+    }
+
+    /// M9 T8 review m-3: the CLI keeps its texts; an MCP agent is told its own tool and variable,
+    /// never a CLI command or flag. Everything but the message is the same for both.
+    #[test]
+    fn next_step_texts_name_each_front_ends_own_syntax() {
+        let cli_lost =
+            "the request may have been queued; recover it with requests list --match-params-file";
+        let cli_deadline = "the --timeout deadline expired before the atlas-duck app answered";
+        let mcp_lost =
+            "the request may have been queued; recover it with request_list match_params";
+        let mcp_deadline =
+            "the ATLAS_DUCK_MCP_TIMEOUT deadline expired before the atlas-duck app answered";
+
+        let lost = |front| {
+            [
+                unknown_request_pending_for(front),
+                no_reply_for(true, front),
+                submit_error_for(ClientError::ConnectionLost, true, front),
+                submit_error_for(ClientError::DeadlineExceeded, true, front),
+                submit_error_for(ClientError::Protocol(String::new()), true, front),
+            ]
+        };
+        for env in lost(Front::Cli) {
+            assert_eq!(message(&env), Some(cli_lost), "{env:?}");
+        }
+        for (cli, mcp) in lost(Front::Cli).into_iter().zip(lost(Front::Mcp)) {
+            assert_eq!(message(&mcp), Some(mcp_lost), "{mcp:?}");
+            let mut same = mcp.clone();
+            if let Some(err) = same.error.as_mut() {
+                err.message = cli_lost.to_owned();
+            }
+            assert_eq!(same, cli);
+        }
+        // The CLI's own entry points keep the CLI text.
+        assert_eq!(message(&unknown_request_pending()), Some(cli_lost));
+        assert_eq!(message(&no_reply(true)), Some(cli_lost));
+        assert_eq!(
+            message(&submit_error(ClientError::ConnectionLost, true)),
+            Some(cli_lost)
+        );
+
+        let deadline = |front| short_error_for(ClientError::DeadlineExceeded, front);
+        assert_eq!(message(&deadline(Front::Cli)), Some(cli_deadline));
+        assert_eq!(
+            message(&short_error(ClientError::DeadlineExceeded)),
+            Some(cli_deadline)
+        );
+        assert_eq!(message(&deadline(Front::Mcp)), Some(mcp_deadline));
+        assert_eq!(
+            deadline(Front::Mcp).error.and_then(|e| e.details),
+            deadline(Front::Cli).error.and_then(|e| e.details)
+        );
+        // An unwritten submit names no deadline variable: nothing was queued, for both.
+        assert_eq!(
+            submit_error_for(ClientError::DeadlineExceeded, false, Front::Mcp),
+            submit_error(ClientError::DeadlineExceeded, false)
+        );
+        for text in [mcp_lost, mcp_deadline] {
+            assert!(!text.contains("--"), "{text}");
         }
     }
 

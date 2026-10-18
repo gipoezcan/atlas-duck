@@ -32,7 +32,7 @@ use super::{run_on, run_on_with, serve_with};
 use crate::connected::{Connector, cwd_basename};
 use crate::deadline::Deadline;
 use crate::discover::AppLocation;
-use crate::flow::MSG_CONNECTION_LOST_NO_ID;
+use crate::flow::MSG_CONNECTION_LOST_NO_ID_MCP;
 use crate::local;
 use crate::test_support::{AwaitScript, HelloMode, Kind, REQ_ID, TestConnector, WAIT};
 
@@ -1637,7 +1637,8 @@ async fn mcp_submit_lost_after_write_is_pending_unknown_id() -> TestResult {
     let env = called.envelope();
     assert_eq!(env["status"], "pending");
     assert_eq!(env["request_id"], Value::Null);
-    assert_eq!(env["error"]["message"], MSG_CONNECTION_LOST_NO_ID);
+    // The L63 message in its MCP form: it names the tool, not the CLI command (T8 review m-3).
+    assert_eq!(env["error"]["message"], MSG_CONNECTION_LOST_NO_ID_MCP);
     assert_eq!(detail(&env, "reason"), Some(&json!("connection_lost")));
     assert!(called.is_error());
     assert_eq!(
@@ -1667,6 +1668,7 @@ async fn mcp_submit_deadline_after_write_is_pending_not_launch_timeout() -> Test
     assert_eq!(env["status"], "pending");
     assert_eq!(env["request_id"], Value::Null);
     assert_eq!(detail(&env, "reason"), Some(&json!("connection_lost")));
+    assert_eq!(env["error"]["message"], MSG_CONNECTION_LOST_NO_ID_MCP);
     assert!(took < Duration::from_secs(3), "{took:?}");
     // The connection is intact: the next call reuses it.
     rig.call("request_status", json!({"request_id": REQ_ID}), false)
@@ -2079,5 +2081,35 @@ async fn every_connected_tool_passes_the_client_name() -> TestResult {
             "{tool}"
         );
     }
+    Ok(())
+}
+
+/// T8 review m-1 (PD-116, L67, R5): `ATLAS_DUCK_MCP_TIMEOUT=0` submits and returns `pending` at
+/// once, with no `request.await` (the Fake's await would answer `succeeded`); `request_await`
+/// asks the app with `timeout_ms: 0`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zero_timeout_returns_pending_at_once() -> TestResult {
+    let rig = Rig::new(RigOpts {
+        timeout: None,
+        ..RigOpts::default()
+    })
+    .await;
+    let called = rig
+        .call("jira_issue_get", json!({"key": "A-1"}), false)
+        .await;
+    assert!(!called.is_error(), "{:?}", called.texts());
+    let env = called.envelope();
+    assert_eq!(env["status"], "pending");
+    assert_eq!(env["request_id"], REQ_ID);
+    assert_eq!(submits(&rig).len(), 1);
+    assert_eq!(rig.fake().count(Kind::AwaitStart), 0);
+
+    let awaited = rig
+        .call("request_await", json!({"request_id": REQ_ID}), false)
+        .await;
+    assert!(!awaited.is_error(), "{:?}", awaited.texts());
+    let awaits = rig.fake().awaits.lock().unwrap().clone();
+    assert_eq!(awaits.len(), 1);
+    assert_eq!(awaits.first().and_then(|a| a.timeout_ms), Some(0));
     Ok(())
 }
