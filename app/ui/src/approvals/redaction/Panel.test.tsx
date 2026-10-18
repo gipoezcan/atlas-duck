@@ -1151,9 +1151,13 @@ describe('a mirror-blocked item (M8 T24, T19c M-11, L217)', () => {
     advance(INERT_MS);
     fireEvent.click(screen.getByRole('tab', { name: 'Structured' }));
     await flush();
-    expect(within(panel()).queryByRole('button', { name: 'Drop the flagged items' })).toBeNull();
-    expect(within(panel()).getByText(/Could not find the flagged items/)).toBeTruthy();
-    expect(panelRelease().disabled).toBe(true);
+    // Fail closed: no panel at all, so no drop offer and no panel Release; only the way out is said.
+    expect(screen.queryByRole('region', { name: 'Redact before releasing' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Drop the flagged items' })).toBeNull();
+    expect(screen.getByText(/Could not find the flagged items/)).toBeTruthy();
+    // The card's own Release stays off (the revision is blocked and not approvable).
+    const releases = screen.queryAllByRole('button', { name: 'Release' }) as HTMLButtonElement[];
+    expect(releases.every((b) => b.disabled)).toBe(true);
   });
 });
 

@@ -521,6 +521,8 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
         />
       );
     }
+    // A probe that failed fails closed: no panel (so no drop offer and no release path), only the way out.
+    if (mirrorProbe && flagged !== null && 'failed' in flagged) return <p role="alert">{REDACTION_TEXT.flagged_missing}</p>;
     return <p>{REDACTION_TEXT.nothing}</p>;
   };
 
