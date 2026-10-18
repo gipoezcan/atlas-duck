@@ -157,6 +157,19 @@ m6_save_diag() {
   done < <(find "$work" \( -name diag.log -o -name '*.log' -o -name 'doctor-*.json' -o -name 'doctor-*.err' -o -name doctor.json -o -name run.json -o -name run.err -o -name await.json -o -name await.err \) -type f 2>/dev/null)
 }
 
+# m8_save_home_diag <home>: the M8 section's provisioned test home lives outside <work> (the fixture
+# makes it under /tmp) and holds the app's diag.log, data/logs and test-control files; copies them to
+# $E2E_DIAG_DIR as home_* before the EXIT trap deletes the home. Never fails the trap.
+m8_save_home_diag() {
+  local home="$1" f
+  [ -n "${E2E_DIAG_DIR:-}" ] && [ -n "$home" ] && [ -d "$home" ] || return 0
+  mkdir -p "$E2E_DIAG_DIR" 2>/dev/null || return 0
+  while IFS= read -r f; do
+    cp "$f" "$E2E_DIAG_DIR/home_$(echo "${f#"$home"/}" | tr / _)" 2>/dev/null || true
+  done < <(find "$home" \( -name diag.log -o -name '*.log' -o -path '*/logs/*' -o -path '*/test-control/*' \) -type f 2>/dev/null)
+  return 0
+}
+
 # appimage-smoke.sh --m6 <e2e-artifact-dir>: the M6 section alone, CI only, on the downloaded
 # bundle-linux-e2e artifact (appimage/*.AppImage) with libfuse2, xvfb, dbus-x11, x11-utils
 # (xwininfo) and the host GL libraries the AppImage does not bundle (libEGL: the job installs
@@ -310,6 +323,15 @@ m8_outer() {
   [ -f "$fixture_src" ] || m4_fail "$fixture_src is missing (the bundle-linux-e2e job builds and ships it)"
   cp "$fixture_src" "$m8_dir/script_fixture"
   chmod +x "$m8_dir/script_fixture"
+  # The test executable links the whole app library (webkit2gtk, GTK, appindicator, xdo, ssl, dbus):
+  # list every missing host library at once instead of the loader's first error.
+  local missing
+  missing="$(ldd "$m8_dir/script_fixture" 2>&1 | grep 'not found' || true)"
+  if [ -n "$missing" ]; then
+    echo "$missing"
+    m4_fail "script_fixture has unresolved shared libraries (install the packages providing them on the appimage-m6 job):
+$missing"
+  fi
   set +e
   env ATLAS_DUCK_FIXTURE_OUT="$m8_dir/fixture.txt" \
     timeout 240 xvfb-run -a dbus-run-session -- "$m8_dir/script_fixture" --ignored --exact provision_script_fixture --nocapture --test-threads=1 >"$m8_dir/fixture.log" 2>&1
@@ -322,7 +344,9 @@ m8_outer() {
   keys="$(sed -n 's/^keys=//p' "$m8_dir/fixture.txt" | head -n 1)"
   [ -n "$home" ] && [ -d "$home" ] || m4_fail "the fixture's home '$home' is not a directory"
   [ -n "$keys" ] && [ -d "$keys" ] || m4_fail "the fixture's keystore '$keys' is not a directory"
-  trap "m6_save_diag \"$work\"; pkill -x atlas-duck-app || true; rm -rf \"$work\" \"$home\"" EXIT
+  # The app is stopped first (its logs are final), then the logs of <work> and of the provisioned home
+  # are saved, only then both are deleted (the home holds the app's diag.log).
+  trap "pkill -x atlas-duck-app || true; m6_save_diag \"$work\"; m8_save_home_diag \"$home\"; rm -rf \"$work\" \"$home\"" EXIT
   set +e
   env ATLAS_DUCK_TEST_HOME="$home" ATLAS_DUCK_TEST_KEYSTORE="$keys" \
     timeout 900 xvfb-run -a dbus-run-session -- bash "$self_path" --m8-inner "$m8_dir/atlas-duck-e2e.AppImage" "$(dirname "$self_path")" "$m8_dir/out"

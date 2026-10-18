@@ -235,6 +235,9 @@ jobs:
       # out by linuxdeploy's exclude list (libEGL and the mesa EGL driver among them; task cifix7, run
       # 38894075809: "libEGL.so.1: cannot open shared object file"). bundle.yml's appimage-smoke gets
       # them from the deb's Depends; cifix6 round 1 got them through webkit2gtk-driver.
+      # The M8 section's script_fixture test executable does link the host's webkit2gtk, GTK,
+      # appindicator, xdo and ssl: appimage-smoke.sh --m8 runs `ldd` on it first and fails listing
+      # every `not found` library, so a missing package shows up in one run.
       - name: Install libfuse2, Xvfb, D-Bus, a Secret Service, xwininfo and the host GL libraries
         run: |
           sudo apt-get update
