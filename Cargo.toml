@@ -112,6 +112,9 @@ rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "p
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
 # M3 candidate cache (Task 20, §5.2): an LRU whose bytes core accounts by hand.
 lru = "=0.18.5"
+# M9 MCP front end (§4.6): the official Rust SDK. No default features and no `macros`/`reqwest*`/
+# `auth*`/http transports (`reqwest`/`hyper` are banned for cli); each user names its features.
+rmcp = { version = "=3.5.0", default-features = false }
 
 # §7.7: release builds use panic = "abort". Profiles are workspace-wide, so this
 # covers atlas-duck-app, atlas-duck and atlas-duck-sandbox.
