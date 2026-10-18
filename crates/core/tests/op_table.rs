@@ -774,6 +774,18 @@ fn cql_nesting_at_the_cap_parses() -> TestResult {
     Ok(())
 }
 
+/// `ops describe confluence.search` names the nesting limit the tokenizer enforces (the registry
+/// cannot see `CQL_MAX_DEPTH`, so the number is checked here).
+#[test]
+fn cql_guidance_names_the_nesting_limit() {
+    let limit = format!("deeper than {} levels", confluence::CQL_MAX_DEPTH);
+    assert!(
+        atlas_duck_registry::CONFLUENCE_CQL_GUIDANCE.contains(&limit),
+        "{}",
+        atlas_duck_registry::CONFLUENCE_CQL_GUIDANCE
+    );
+}
+
 #[test]
 fn cql_quoted_parens_and_order_by_are_text() -> TestResult {
     assert_eq!(

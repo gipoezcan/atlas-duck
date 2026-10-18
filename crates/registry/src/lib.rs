@@ -31,8 +31,9 @@ pub const WRITE_GUIDANCE: &str = "Submit human names (project, issue type, trans
 pub const JIRA_VERBATIM_GUIDANCE: &str = "Text in `fields`, `update` and `comment` is sent as Jira wiki markup unchanged; only `description`/`body` with `body_format=markdown` are converted.";
 
 /// plan text (PD-112): the sentence `describe` adds to `confluence.search` (§7.4 "`ops describe`
-/// documents the rewrite").
-pub const CONFLUENCE_CQL_GUIDANCE: &str = "The CQL is sent as `(<your CQL>) AND type in (page,blogpost,comment,attachment)` plus your trailing ORDER BY; an ORDER BY elsewhere, an unterminated quote or unbalanced parentheses are rejected.";
+/// documents the rewrite"), with the nesting limit of core's CQL tokenizer (`CQL_MAX_DEPTH`, M7
+/// T30 review I-1; core's `op_table` test checks the number).
+pub const CONFLUENCE_CQL_GUIDANCE: &str = "The CQL is sent as `(<your CQL>) AND type in (page,blogpost,comment,attachment)` plus your trailing ORDER BY; an ORDER BY elsewhere, an unterminated quote, unbalanced parentheses or parentheses nested deeper than 64 levels are rejected.";
 
 /// plan text (PD-112; §12.4 onboarding sentence, verbatim): the sentence `describe` adds to the
 /// Confluence ops that take a Markdown body (§7.6 "`ops describe` for these ops documents the
