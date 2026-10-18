@@ -298,8 +298,9 @@ pub(crate) fn is_json(r: &atlas_duck_atlassian::UpstreamResponse) -> bool {
         .is_some_and(|ct| ct.to_ascii_lowercase().contains("json"))
 }
 
-/// The bytes of the answer a lookup received (what its record holds), for the byte rule.
-fn received_bytes(outcome: &FetchOutcome) -> u64 {
+/// The bytes of the answer a lookup received (what its record holds), for the byte rule; a host
+/// call's identity GET counts them toward `max_fetch_mb` the same way (M8 R15).
+pub(crate) fn received_bytes(outcome: &FetchOutcome) -> u64 {
     let n = match outcome {
         FetchOutcome::Response(r) => r.body.len(),
         FetchOutcome::Failed(f) => match f {
@@ -406,10 +407,9 @@ pub(crate) struct Resolved {
     pub puts: Puts,
 }
 
-/// The answers of a pass the cache keeps, stored only by [`Puts::apply`]: a direct read applies
-/// them once its identity GET matched (PD-93; lookups under the anonymous fallback answer for
-/// nobody, and a JSON 404 would hide a user for an hour), a host call right away (its identity
-/// step is M8's).
+/// The answers of a pass the cache keeps, stored only by [`Puts::apply`]: a direct read and a
+/// script's host call apply them once their identity GET matched (PD-93, M8 R15; lookups under
+/// the anonymous fallback answer for nobody, and a JSON 404 would hide a user for an hour).
 #[derive(Default)]
 pub(crate) struct Puts {
     /// The cache's generation when the pass began: a clear since then drops them all.

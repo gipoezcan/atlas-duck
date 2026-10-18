@@ -1008,30 +1008,6 @@ async fn i23_script_call_paths_real() -> Result<()> {
     )
     .await?;
     assert_eq!(envelope(&r)?.status, Status::Released, "{}", r.stdout);
-    let records = audit(&world).await?;
-    let rejections: Vec<&str> = payloads(&records, EventType::SCRIPT_CALL)
-        .iter()
-        .filter_map(|p| p["rejection"].as_str())
-        .collect();
-    for want in ["redirect_3xx", "non_json_2xx", "non_json_401"] {
-        assert!(rejections.contains(&want), "{want} not in {rejections:?}");
-    }
-    // A re-check commits two `SYSTEM_FETCH` records (`phase: start`, then `phase: result` per
-    // call): count by purpose and phase, `(starts, results)`.
-    let rechecks = |records: &[(EventType, Value)]| {
-        let phase = |want: &str| {
-            payloads(records, EventType::SYSTEM_FETCH)
-                .iter()
-                .filter(|p| p["purpose"] == json!("token_recheck") && p["phase"] == json!(want))
-                .count()
-        };
-        (phase("start"), phase("result"))
-    };
-    assert_eq!(
-        rechecks(&records),
-        (0, 0),
-        "a soft failure re-checked the token"
-    );
 
     // The JSON 401: the re-check passes (the fixture's `myself` answers).
     let hard = script_file(&world, "i23_hard.js", &classify("['J-1']"))?;
@@ -1078,9 +1054,34 @@ async fn i23_script_call_paths_real() -> Result<()> {
         "{}",
         r.stdout
     );
+    // The audit is read once, at the end: `audit` quits the app, and a quit app is not relaunched
+    // by the next CLI call here (it timed out with `launch_timeout`).
     let records = audit(&world).await?;
-    // One re-check per JSON 401: two starts, each with its one result.
-    assert_eq!(rechecks(&records), (2, 2), "one re-check per JSON 401");
+    let rejections: Vec<&str> = payloads(&records, EventType::SCRIPT_CALL)
+        .iter()
+        .filter_map(|p| p["rejection"].as_str())
+        .collect();
+    for want in ["redirect_3xx", "non_json_2xx", "non_json_401"] {
+        assert!(rejections.contains(&want), "{want} not in {rejections:?}");
+    }
+    // A re-check commits two `SYSTEM_FETCH` records (`phase: start`, then `phase: result` per
+    // call): count by purpose and phase, `(starts, results)`. One re-check per JSON 401 (the
+    // two `hard` runs): two starts, each with its one result, so the soft failures (redirect,
+    // HTML 200, HTML 401) re-checked nothing.
+    let rechecks = |records: &[(EventType, Value)]| {
+        let phase = |want: &str| {
+            payloads(records, EventType::SYSTEM_FETCH)
+                .iter()
+                .filter(|p| p["purpose"] == json!("token_recheck") && p["phase"] == json!(want))
+                .count()
+        };
+        (phase("start"), phase("result"))
+    };
+    assert_eq!(
+        rechecks(&records),
+        (2, 2),
+        "one re-check per JSON 401, none per soft failure"
+    );
     Ok(())
 }
 
@@ -1422,5 +1423,78 @@ async fn i41_replaced_sandbox_binary_is_app_upgraded() -> Result<()> {
             .any(|p| p["reason"] == json!("protocol_violation")),
         "{failed:?}"
     );
+    Ok(())
+}
+
+/// M8 Task 32 (R15, A1): a `confluence.page.get` host call over the real worker, against a store
+/// with one Confluence instance `wiki` (the fixture set: page `65537`, a known `user/current`).
+/// The script gets the page with its Markdown body, and the call ends with its identity GET:
+/// one `PREVIEW_FETCH {purpose: identity}` committed before the call's `SCRIPT_CALL`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confluence_page_get_in_script_real_worker() -> Result<()> {
+    if !opted_in("confluence_page_get_in_script_real_worker") {
+        return Ok(());
+    }
+    let mut world = World::new(WorldOpts::default())?;
+    world
+        .provision_store(&[("wiki", Product::Confluence)])
+        .await?;
+    let r = released(
+        &world,
+        "page_get.js",
+        "const p = await atlas.call('confluence.page.get', {id: '65537'});\n\
+         return {format: p.body.format, value: p.body.value, title: p.title};\n",
+    )
+    .await?;
+    let env = envelope(&r)?;
+    assert_eq!(r.exit, 0, "{}", r.stdout);
+    assert_eq!(env.status, Status::Released, "{}", r.stdout);
+    assert_eq!(
+        data_at(env, &["result", "format"]),
+        Some(&json!("markdown")),
+        "{}",
+        r.stdout
+    );
+    assert_eq!(
+        data_at(env, &["result", "title"]),
+        Some(&json!("Release checklist")),
+        "{}",
+        r.stdout
+    );
+    let value = data_at(env, &["result", "value"])
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(value.contains("Check the build."), "{}", r.stdout);
+    let mock = world.mock("wiki").ok_or("no mock for wiki")?;
+    assert_eq!(hits(mock, "/rest/api/content/65537").await, 1);
+    let identity_path = mock.path("/rest/api/user/current");
+
+    let records = audit(&world).await?;
+    // The provisioning's connection test is a `SYSTEM_FETCH`: every `PREVIEW_FETCH` is the run's.
+    let identity: Vec<usize> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, (t, p))| *t == EventType::PREVIEW_FETCH && p["purpose"] == json!("identity"))
+        .map(|(i, _)| i)
+        .collect();
+    let calls: Vec<usize> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, (t, _))| *t == EventType::SCRIPT_CALL)
+        .map(|(i, _)| i)
+        .collect();
+    let ([step], [call]) = (identity.as_slice(), calls.as_slice()) else {
+        return Err(format!("identity records {identity:?}, calls {calls:?}: {records:?}").into());
+    };
+    assert!(
+        step < call,
+        "the identity record follows the call: {records:?}"
+    );
+    let f = &records[*step].1;
+    assert_eq!(f["status"], json!(200), "{f}");
+    assert_eq!(f["path"], json!(identity_path), "{f}");
+    let c = &records[*call].1;
+    assert_eq!(c["rejection"], Value::Null, "{c}");
+    assert_eq!(c["op"], json!("confluence.page.get"), "{c}");
     Ok(())
 }

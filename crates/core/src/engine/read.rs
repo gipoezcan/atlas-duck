@@ -25,7 +25,8 @@ use std::time::Duration;
 
 use atlas_duck_atlassian::{
     AuditCover, BodyFailure, ConnClass, FetchControl, FetchFailure, FetchOutcome, InstanceClient,
-    PageEnd, PagedOutcome, PostSendKind, ReadBudget, UnavailableReason, UpstreamResponse,
+    PageEnd, PagedOutcome, PostSendKind, ReadBudget, StoredIdentity, UnavailableReason,
+    UpstreamResponse,
 };
 use atlas_duck_audit::NewEvent;
 use atlas_duck_convert::{
@@ -399,8 +400,8 @@ async fn with_users(
     }
 }
 
-/// What the identity step made of a read.
-enum Checked {
+/// What the identity step made of a read (or of a script's host call, M8 R15).
+pub(super) enum Checked {
     /// The read settles with this: its identity matched, or the step does not apply.
     Proceed(Classified),
     /// The step ended the read: its answer did not match or failed, or the request ended.
@@ -410,26 +411,27 @@ enum Checked {
     Refetch(Vec<UpstreamResponse>),
 }
 
-/// What [`with_identity`] needs from the fetch attempt it checks.
+/// What the identity step needs from the fetch attempt it checks.
 #[derive(Clone, Copy)]
-struct Attempt {
-    /// The identity epoch, read before the attempt's first GET.
-    seen: u64,
+pub(super) struct Attempt {
+    /// The identity epoch the step's re-check starts from: read before the attempt's first GET,
+    /// and again right before the identity GET ([`identity_verdict`]).
+    pub(super) seen: u64,
     /// The credential generation, read before the attempt's first GET (T13 review B-1).
-    cred_gen: u64,
+    pub(super) cred_gen: u64,
     /// The attempt is the re-fetch after a rename.
-    refetched: bool,
+    pub(super) refetched: bool,
 }
 
 /// The op whose answer is the identity answer itself (PD-93: judged, no second GET).
-const USER_CURRENT_OP: &str = "confluence.user.current";
+pub(super) const USER_CURRENT_OP: &str = "confluence.user.current";
 /// PD-93 (T13 review I-2): the read budget kept for the identity GET of a direct Confluence read.
 /// Its user lookups end this much before the read's deadline; the identity GET runs to the
 /// deadline.
 pub const IDENTITY_RESERVE: Duration = Duration::from_secs(10);
 
 /// [`IDENTITY_RESERVE`]; a test hook replaces it.
-fn identity_reserve(engine: &Engine) -> Duration {
+pub(super) fn identity_reserve(engine: &Engine) -> Duration {
     #[cfg(feature = "testing")]
     if let Some(r) = engine.hooks().identity_reserve {
         return r;
@@ -439,7 +441,7 @@ fn identity_reserve(engine: &Engine) -> Duration {
 }
 /// The most bytes of an identity answer received (a `user/current` object is about 1 KiB); a
 /// longer one is cut there (`too_large` in its record) and confirms nobody.
-const MAX_IDENTITY_BYTES: u64 = 64 * 1024;
+pub(super) const MAX_IDENTITY_BYTES: u64 = 64 * 1024;
 /// The `READ_FETCHED`/`READ_FAILED` cause of a read whose answer is not attributed to the user.
 const IDENTITY_CAUSE: (&str, &str) = ("reason", "identity_check");
 
@@ -493,53 +495,15 @@ async fn with_identity(
     deadline: Instant,
     attempt: Attempt,
 ) -> Checked {
-    let Attempt {
-        seen: seen_fetch,
-        cred_gen,
-        refetched,
-    } = attempt;
-    let credential_changed = || engine.credential_generation(&entry.instance_id) != cred_gen;
     let Classified::Item(rec) = classified else {
         return Checked::Proceed(classified);
     };
-    if entry.spec.product != Product::Confluence
-        || !matches!(rec.item, ReleaseItem::Result | ReleaseItem::UpstreamError)
-    {
+    if !identity_applies(entry.spec, &rec) {
         return Checked::Proceed(Classified::Item(rec));
     }
-    let stored = engine
-        .instances()
-        .by_id(&entry.instance_id)
-        .and_then(|i| i.identity.clone());
-    let judged = |r: &UpstreamResponse| {
-        stored.as_ref().map_or(RecheckResult::Inconclusive, |s| {
-            identity::judge_confluence_answer(r, s)
-        })
-    };
+    let stored = stored_identity(engine, &entry.instance_id);
     if entry.spec.id == USER_CURRENT_OP {
-        // Fetched under a PAT that may be gone: judged against nobody (B-1).
-        if credential_changed() {
-            return Checked::Ended(Classified::Direct(unconfirmed(rec.responses)));
-        }
-        // Only a 2xx is an identity answer; an upstream error confirms nobody (fail closed).
-        let verdict = match rec.responses.last() {
-            Some(r) if rec.item == ReleaseItem::Result => judged(r),
-            _ => RecheckResult::Inconclusive,
-        };
-        if verdict == RecheckResult::IdentityMatch {
-            return Checked::Proceed(Classified::Item(rec));
-        }
-        let effect = if refetched {
-            identity::Effect::HeaderCheckFailed
-        } else {
-            let result = identity::conclude(engine, &entry.instance_id, seen_fetch, verdict).await;
-            identity::effect(
-                identity::Path::DirectRead,
-                identity::Trigger::HeaderCheck,
-                &result,
-            )
-        };
-        return identity_effect(effect, rec.responses);
+        return judge_own_identity(engine, &entry.instance_id, rec, stored.as_ref(), attempt).await;
     }
     let cover = engine.covers().for_request(&entry.head.request_id).ok();
     let (Some(ctl), Some(cover)) = (entry.fetch_control(), cover) else {
@@ -550,7 +514,10 @@ async fn with_identity(
     let call = identity_call(Product::Confluence);
     let base = http.client.base();
     let purpose = PreviewFetchPurpose::Identity;
-    let seen = engine.identity_epoch(&entry.instance_id);
+    let attempt = Attempt {
+        seen: engine.identity_epoch(&entry.instance_id),
+        ..attempt
+    };
     entry.set_in_flight(Some(InFlight {
         purpose,
         path: call_path(base, &call),
@@ -579,33 +546,113 @@ async fn with_identity(
     if !engine.append_pending(entry, vec![record], None).await {
         return Checked::Ended(Classified::Cancelled);
     }
-    // The content and the identity answer may have been fetched under different PATs (B-1):
-    // whatever the answer says, it is not attributed to the content.
-    if credential_changed() {
-        return Checked::Ended(Classified::Direct(unconfirmed(rec.responses)));
-    }
-    let answer = match outcome {
-        FetchOutcome::Response(r) => r,
-        FetchOutcome::Failed(f) => {
-            return Checked::Ended(identity_failure(f, rec.responses, &http.proxy));
-        }
+    let answer = IdentityAnswer {
+        outcome,
+        stored: stored.as_ref(),
+        proxy: &http.proxy,
     };
-    if !users::is_json(&answer) {
+    identity_verdict(engine, &entry.instance_id, rec, answer, attempt).await
+}
+
+/// The identity step applies to `rec` (PD-93): a Confluence answer whose content arrived (a
+/// result, or a JSON upstream error, which is server content attributed to the user too).
+pub(super) fn identity_applies(spec: &OperationSpec, rec: &ItemRecord) -> bool {
+    spec.product == Product::Confluence
+        && matches!(rec.item, ReleaseItem::Result | ReleaseItem::UpstreamError)
+}
+
+/// The identity stored for `instance_id` when the step begins (judged against nobody if none).
+pub(super) fn stored_identity(engine: &Engine, instance_id: &str) -> Option<StoredIdentity> {
+    engine
+        .instances()
+        .by_id(instance_id)
+        .and_then(|i| i.identity.clone())
+}
+
+fn judged(stored: Option<&StoredIdentity>, r: &UpstreamResponse) -> RecheckResult {
+    stored.map_or(RecheckResult::Inconclusive, |s| {
+        identity::judge_confluence_answer(r, s)
+    })
+}
+
+/// `confluence.user.current` sends no second GET: its own answer `rec` is judged
+/// ([`identity::conclude`] applies a non-match like a re-check would). An answer fetched under a
+/// PAT that may be gone is judged against nobody (B-1).
+pub(super) async fn judge_own_identity(
+    engine: &Arc<Engine>,
+    instance_id: &str,
+    rec: ItemRecord,
+    stored: Option<&StoredIdentity>,
+    attempt: Attempt,
+) -> Checked {
+    if engine.credential_generation(instance_id) != attempt.cred_gen {
         return Checked::Ended(Classified::Direct(unconfirmed(rec.responses)));
     }
-    if judged(&answer) == RecheckResult::IdentityMatch {
+    // Only a 2xx is an identity answer; an upstream error confirms nobody (fail closed).
+    let verdict = match rec.responses.last() {
+        Some(r) if rec.item == ReleaseItem::Result => judged(stored, r),
+        _ => RecheckResult::Inconclusive,
+    };
+    if verdict == RecheckResult::IdentityMatch {
         return Checked::Proceed(Classified::Item(rec));
     }
-    let trigger = if answer.status == 401 {
+    let effect = if attempt.refetched {
+        identity::Effect::HeaderCheckFailed
+    } else {
+        let result = identity::conclude(engine, instance_id, attempt.seen, verdict).await;
+        identity::effect(
+            identity::Path::DirectRead,
+            identity::Trigger::HeaderCheck,
+            &result,
+        )
+    };
+    identity_effect(effect, rec.responses)
+}
+
+/// The identity GET's answer, recorded and committed, with what judging it needs.
+pub(super) struct IdentityAnswer<'a> {
+    pub(super) outcome: FetchOutcome,
+    /// The identity stored when the step began ([`stored_identity`]).
+    pub(super) stored: Option<&'a StoredIdentity>,
+    pub(super) proxy: &'a ResolvedProxy,
+}
+
+/// What a committed identity answer makes of the content `rec` (see [`with_identity`]):
+/// `attempt.seen` is the epoch read right before the identity GET.
+pub(super) async fn identity_verdict(
+    engine: &Arc<Engine>,
+    instance_id: &str,
+    rec: ItemRecord,
+    answer: IdentityAnswer<'_>,
+    attempt: Attempt,
+) -> Checked {
+    // The content and the identity answer may have been fetched under different PATs (B-1):
+    // whatever the answer says, it is not attributed to the content.
+    if engine.credential_generation(instance_id) != attempt.cred_gen {
+        return Checked::Ended(Classified::Direct(unconfirmed(rec.responses)));
+    }
+    let r = match answer.outcome {
+        FetchOutcome::Response(r) => r,
+        FetchOutcome::Failed(f) => {
+            return Checked::Ended(identity_failure(f, rec.responses, answer.proxy));
+        }
+    };
+    if !users::is_json(&r) {
+        return Checked::Ended(Classified::Direct(unconfirmed(rec.responses)));
+    }
+    if judged(answer.stored, &r) == RecheckResult::IdentityMatch {
+        return Checked::Proceed(Classified::Item(rec));
+    }
+    let trigger = if r.status == 401 {
         identity::Trigger::Json401
     } else {
         identity::Trigger::HeaderCheck
     };
     // A re-fetch whose identity fails again: `upstream_unavailable`, retryable (§7.1).
-    let effect = if refetched {
+    let effect = if attempt.refetched {
         identity::Effect::HeaderCheckFailed
     } else {
-        let result = identity::recheck(engine, &entry.instance_id, seen).await;
+        let result = identity::recheck(engine, instance_id, attempt.seen).await;
         identity::effect(identity::Path::DirectRead, trigger, &result)
     };
     identity_effect(effect, rec.responses)
@@ -634,7 +681,7 @@ fn identity_effect(effect: identity::Effect, responses: Vec<UpstreamResponse>) -
 
 /// `upstream_unavailable {reason: identity_check}` (retryable): the answer is not attributed to
 /// the token's user.
-fn unconfirmed(responses: Vec<UpstreamResponse>) -> Direct {
+pub(super) fn unconfirmed(responses: Vec<UpstreamResponse>) -> Direct {
     Direct {
         code: ErrorCode::UpstreamUnavailable,
         message: MSG_IDENTITY.to_owned(),

@@ -2039,7 +2039,8 @@ async fn page_get_script(
 async fn script_host_call_commits_user_resolutions() -> TestResult {
     let (h, runner, id) = page_get_script(Duration::ZERO, TestHooks::none()).await?;
     h.queued(&id, 20_000).await.ok_or("never queued")?;
-    // The lookups run under the run's cover, each recorded before the call's `SCRIPT_CALL`.
+    // The lookups run under the run's cover, each recorded before the call's `SCRIPT_CALL`, and
+    // the call's identity GET after them (R15).
     assert_eq!(
         h.event_types(&id).await?,
         [
@@ -2048,17 +2049,20 @@ async fn script_host_call_commits_user_resolutions() -> TestResult {
             EventType::SCRIPT_CALL_SENT,
             EventType::PREVIEW_FETCH,
             EventType::PREVIEW_FETCH,
+            EventType::PREVIEW_FETCH,
             EventType::SCRIPT_CALL,
             EventType::SCRIPT_FINISHED,
         ]
     );
-    for (_, p) in h
+    let fetches: Vec<Value> = h
         .events(&id)
         .await?
-        .iter()
+        .into_iter()
         .filter(|(t, _)| *t == EventType::PREVIEW_FETCH)
-    {
-        assert_eq!(p["purpose"], "resolve", "{p}");
+        .map(|(_, p)| p)
+        .collect();
+    for (p, purpose) in fetches.iter().zip(["resolve", "resolve", "identity"]) {
+        assert_eq!(p["purpose"], purpose, "{p}");
         assert_eq!(p["status"], 200);
     }
     let call = record(&h, &id, EventType::SCRIPT_CALL).await?;
@@ -2181,7 +2185,8 @@ async fn cancel_after_host_call_lookup_answered_records_it_once() -> TestResult 
 /// counter before the call returns; the call's `bytes` stay the content's), and no lookup starts
 /// once another full lookup answer could pass what is left of the limit. The second page leaves
 /// room for exactly one lookup answer (64 KiB); a cut answer holds `MAX_LOOKUP_BYTES + 1` bytes,
-/// so the rule asks for that much room (T11 fix review m-3). The first call's lookups count.
+/// so the rule asks for that much room (T11 fix review m-3). The first call's lookups and its
+/// identity answer (R15) count.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn host_call_lookup_bytes_count_toward_max_fetch_mb() -> TestResult {
     lookup_byte_rule(64 * 1024, false).await
@@ -2212,6 +2217,8 @@ async fn lookup_byte_rule(room: usize, looked_up: bool) -> TestResult {
     let s1 = first.to_string().len();
     let l1 =
         user("key-asmith", "asmith").to_string().len() + user("key-jdoe", "jdoe").to_string().len();
+    // R15: the first call's identity answer (the harness's known `user/current`) counts too.
+    let i1 = fixtures::confluence_user_current(TEST_USER, TEST_USER_KEY).len();
     mount_page(mock, "65537", &first).await;
     mount_users(
         mock,
@@ -2225,7 +2232,7 @@ async fn lookup_byte_rule(room: usize, looked_up: bool) -> TestResult {
     let mut second = page_with_storage(r#"<p><ri:user ri:userkey="key-third"/></p>"#);
     second["title"] = json!("");
     let base = second.to_string().len();
-    let s2 = FETCH_CAP - s1 - l1 - room;
+    let s2 = FETCH_CAP - s1 - l1 - i1 - room;
     second["title"] = json!("x".repeat(s2 - base));
     assert_eq!(second.to_string().len(), s2);
     mount_page(mock, "65538", &second).await;
@@ -5390,5 +5397,626 @@ async fn u29_script_release_redacted_keeps_upstream_null() -> TestResult {
             "nested": { "due": null }
         })
     );
+    Ok(())
+}
+
+// ---- Task 32 (R15, X-12, I-37): Confluence host calls -------------------------------------------
+
+/// The identity GET of a Confluence host call (§7.1), without the `/wiki` context path.
+const WIKI_IDENTITY: &str = "/rest/api/user/current";
+/// Page text that must reach no script when the identity is not confirmed.
+const QUARTERLY: &str = "Quarterly numbers";
+
+fn wiki(h: &Harness) -> Result<&atlas_duck_atlassian::testing::MockDc, TestError> {
+    h.mock("wiki").ok_or_else(|| "no wiki mock".into())
+}
+
+/// A Confluence harness (`wiki`, context path `/wiki`) running `plans`, with `limits` if given.
+async fn wiki_harness(
+    plans: Vec<ScriptPlan>,
+    limits: Option<atlas_duck_core::engine::queue::Limits>,
+) -> Result<(Harness, Arc<FakeScriptRunner>), TestError> {
+    let runner = FakeScriptRunner::new(plans);
+    let mut b = Harness::builder()
+        .confluence("wiki")
+        .scripts(runner.clone());
+    if let Some(l) = limits {
+        b = b.limits(l);
+    }
+    Ok((b.start().await?, runner))
+}
+
+/// `confluence.page.get` of page `id`, in `format` when given (Markdown otherwise).
+fn page_get(call: u64, id: &str, format: Option<&str>) -> HostCall {
+    let mut params = json!({ "id": id });
+    if let Some(f) = format {
+        params["format"] = json!(f);
+    }
+    host_call(call, "confluence.page.get", params)
+}
+
+/// The paths the wiki mock received, in order.
+async fn wiki_paths(mock: &atlas_duck_atlassian::testing::MockDc) -> Vec<String> {
+    mock.received()
+        .await
+        .iter()
+        .map(|r| r.url.path().to_owned())
+        .collect()
+}
+
+/// The `PREVIEW_FETCH` purposes and `SCRIPT_CALL`s (`call<call_id>`) of `id`, in log order.
+async fn fetch_trail(h: &Harness, id: &str) -> Result<Vec<String>, TestError> {
+    Ok(h.events(id)
+        .await?
+        .into_iter()
+        .filter_map(|(t, p)| match t {
+            EventType::PREVIEW_FETCH => p["purpose"].as_str().map(str::to_owned),
+            EventType::SCRIPT_CALL => Some(format!("call{}", p["call_id"])),
+            _ => None,
+        })
+        .collect())
+}
+
+/// The `PREVIEW_FETCH {purpose: identity}` records of `id`.
+async fn identity_records(h: &Harness, id: &str) -> Result<Vec<Value>, TestError> {
+    Ok(h.events(id)
+        .await?
+        .into_iter()
+        .filter(|(t, p)| *t == EventType::PREVIEW_FETCH && p["purpose"] == "identity")
+        .map(|(_, p)| p)
+        .collect())
+}
+
+/// X-12, Confluence half (A1): a host call whose page body converts lossy (an unknown macro)
+/// counts toward "N host calls returned truncated or lossy data"; the same page in storage format
+/// and a Markdown page that converts whole do not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn x12_lossy_count_includes_conversion_lossy() -> TestResult {
+    use common::confluence::{mount_page, page_with_storage};
+    const LOSSY: &str = r#"<p>Status of ABC-1:</p><ac:structured-macro ac:name="jira"><ac:parameter ac:name="key">ABC-1</ac:parameter></ac:structured-macro>"#;
+    const WHOLE: &str = "<p>Quarterly numbers: confidential.</p>";
+    let report = |s: &str| atlas_duck_convert::storage_to_markdown(s, &Default::default()).1;
+    assert!(report(LOSSY).lossy, "the fixture converts lossy");
+    assert!(!report(WHOLE).lossy, "the control converts whole");
+    let plans = [
+        page_get(1, "65537", None),
+        page_get(1, "65537", Some("storage")),
+        page_get(1, "65538", None),
+    ]
+    .into_iter()
+    .map(|c| ScriptPlan::new(vec![c], result_end(json!(1))))
+    .collect();
+    let (h, runner) = wiki_harness(plans, None).await?;
+    let mock = wiki(&h)?;
+    mount_page(mock, "65537", &page_with_storage(LOSSY)).await;
+    mount_page(mock, "65538", &page_with_storage(WHOLE)).await;
+    let mut warnings = Vec::new();
+    for _ in 0..3 {
+        let id = submit(&h, json!({ "source": SRC })).await?;
+        h.queued(&id, 20_000).await.ok_or("never queued")?;
+        let p = script_preview(&h, &id)?;
+        let lossy: Vec<String> = p
+            .warnings
+            .iter()
+            .filter(|w| w.id == WarningId::HostCallsLossy)
+            .map(|w| w.text.clone())
+            .collect();
+        warnings.push(lossy);
+    }
+    let results = runner.results();
+    assert!(
+        results.iter().all(|r| matches!(r, HostCallResult::Ok(_))),
+        "{results:?}"
+    );
+    assert_eq!(
+        warnings,
+        [
+            vec!["1 host calls returned truncated or lossy data".to_owned()],
+            Vec::new(),
+            Vec::new(),
+        ]
+    );
+    Ok(())
+}
+
+/// R15 (RF-5a for host calls, the M7 PD-93 handoff): every Confluence host call ends with one
+/// `GET /rest/api/user/current` under the run's cover, after its page and its user lookups,
+/// recorded `PREVIEW_FETCH {purpose: identity}` before the call's `SCRIPT_CALL`; the lookups'
+/// answers are cached only once it matched. An anonymous answer rejects the call inside the script
+/// with `needs_token` once the token re-check confirmed it: the page stays audit-only in the
+/// `SCRIPT_CALL`, the identity answer in its own record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn confluence_host_call_identity_step_per_call() -> TestResult {
+    use common::confluence::{content_path, mount_page, mount_users, page_with_storage, user_gets};
+    let mention =
+        |key: &str| format!(r#"<p>Owner <ri:user ri:userkey="{key}"/>. {QUARTERLY}.</p>"#);
+    let (h, runner) = wiki_harness(
+        vec![
+            ScriptPlan::new(
+                vec![
+                    page_get(1, "65537", None),
+                    page_get(2, "65537", Some("storage")),
+                ],
+                result_end(json!(1)),
+            ),
+            ScriptPlan::new(vec![page_get(1, "65538", None)], result_end(json!(1))),
+        ],
+        None,
+    )
+    .await?;
+    let mock = wiki(&h)?;
+    mount_page(mock, "65537", &page_with_storage(&mention("key-a"))).await;
+    mount_page(mock, "65538", &page_with_storage(&mention("key-b"))).await;
+    mount_users(mock, &[("key-a", Some("alice")), ("key-b", Some("bob"))]).await;
+
+    // A known identity: one identity GET per call, after the call's page and lookups.
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    assert_eq!(
+        fetch_trail(&h, &id).await?,
+        ["resolve", "identity", "call1", "identity", "call2"]
+    );
+    assert_eq!(
+        h.event_types(&id).await?,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::SCRIPT_STARTED,
+            EventType::SCRIPT_CALL_SENT,
+            EventType::PREVIEW_FETCH,
+            EventType::PREVIEW_FETCH,
+            EventType::SCRIPT_CALL,
+            EventType::PREVIEW_FETCH,
+            EventType::SCRIPT_CALL,
+            EventType::SCRIPT_FINISHED,
+        ]
+    );
+    for f in identity_records(&h, &id).await? {
+        assert_eq!(f["method"], "GET", "{f}");
+        assert_eq!(f["path"], "/wiki/rest/api/user/current", "{f}");
+        assert_eq!(f["status"], 200, "{f}");
+    }
+    let (content, user, ident) = (
+        mock.path(&content_path("65537")),
+        mock.path("/rest/api/user"),
+        mock.path(WIKI_IDENTITY),
+    );
+    assert_eq!(
+        wiki_paths(mock).await,
+        [content.clone(), user, ident.clone(), content, ident]
+    );
+    match runner.results().as_slice() {
+        [HostCallResult::Ok(_), HostCallResult::Ok(_)] => {}
+        other => return Err(format!("unexpected answers: {other:?}").into()),
+    }
+    assert_eq!(
+        h.user_cached("wiki", "key-a"),
+        Some(Some("alice".to_owned())),
+        "cached once the identity matched"
+    );
+
+    // An anonymous identity, the re-check's answer too: the token failure is confirmed.
+    Mock::given(method("GET"))
+        .and(path(mock.path(WIKI_IDENTITY)))
+        .respond_with(
+            mock.response(200)
+                .set_body_raw(fixtures::CONFLUENCE_USER_ANONYMOUS, "application/json"),
+        )
+        .mount(mock.server())
+        .await;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    assert_eq!(
+        fetch_trail(&h, &id).await?,
+        ["resolve", "identity", "call1"]
+    );
+    match runner.results().as_slice() {
+        [_, _, rejected @ HostCallResult::Rejected { class, .. }] => {
+            assert_eq!(class, "needs_token");
+            assert!(
+                !format!("{rejected:?}").contains(QUARTERLY),
+                "the page reached the script: {rejected:?}"
+            );
+        }
+        other => return Err(format!("unexpected answers: {other:?}").into()),
+    }
+    let call = record(&h, &id, EventType::SCRIPT_CALL).await?;
+    assert!(call.to_string().contains(QUARTERLY), "{call}");
+    assert_eq!(call["unavailable"], "identity_check", "{call}");
+    assert!(!call.to_string().contains("profilePicture"), "{call}");
+    match identity_records(&h, &id).await?.as_slice() {
+        [f] => {
+            assert_eq!(f["status"], 200, "{f}");
+            assert!(f.to_string().contains("profilePicture"), "{f}");
+        }
+        other => return Err(format!("identity records: {other:?}").into()),
+    }
+    assert_eq!(instance_state(&h), "needs_token");
+    let rechecks = h
+        .events_of(EventType::SYSTEM_FETCH)
+        .await?
+        .into_iter()
+        .filter(|p| p["purpose"] == "token_recheck" && p["phase"] == "start")
+        .count();
+    assert_eq!(rechecks, 1);
+    assert_eq!(
+        h.user_cached("wiki", "key-b"),
+        None,
+        "not cached without an identity match"
+    );
+    assert_eq!(user_gets(mock).await.len(), 2);
+    // Two steps of the first run, the step of the second and its re-check.
+    assert_eq!(gets_on(mock, WIKI_IDENTITY).await.len(), 4);
+    Ok(())
+}
+
+/// R15 for `atlas.all` (PD-144): the identity step runs once per host call, after the call's last
+/// page and before that page's `SCRIPT_CALL`, never once per page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn confluence_all_identity_step_once_after_the_last_page() -> TestResult {
+    use wiremock::matchers::query_param;
+    let mut call = host_call(1, "confluence.space.list", json!({ "max": 25 }));
+    call.all = true;
+    let (h, runner) = wiki_harness(
+        vec![ScriptPlan::new(vec![call], result_end(json!(1)))],
+        None,
+    )
+    .await?;
+    let mock = wiki(&h)?;
+    let pages = [
+        (0u64, 25u64, Some("/rest/api/space?limit=25&start=25")),
+        (25, 10, None),
+    ];
+    for (start, size, next) in pages {
+        Mock::given(method("GET"))
+            .and(path(mock.path("/rest/api/space")))
+            .and(query_param("start", start.to_string().as_str()))
+            .respond_with(mock.response(200).set_body_raw(
+                fixtures::confluence_space_page(start, 25, size, next),
+                "application/json",
+            ))
+            .mount(mock.server())
+            .await;
+    }
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    match runner.results().as_slice() {
+        [HostCallResult::Ok(v)] => {
+            assert_eq!(v["results"].as_array().map(Vec::len), Some(35), "{v}");
+        }
+        other => return Err(format!("unexpected answers: {other:?}").into()),
+    }
+    let space = mock.path("/rest/api/space");
+    assert_eq!(
+        wiki_paths(mock).await,
+        [space.clone(), space, mock.path(WIKI_IDENTITY)]
+    );
+    assert_eq!(fetch_trail(&h, &id).await?, ["call1", "identity", "call1"]);
+    let pages: Vec<Value> = h
+        .events(&id)
+        .await?
+        .into_iter()
+        .filter(|(t, _)| *t == EventType::SCRIPT_CALL)
+        .map(|(_, p)| p["page"].clone())
+        .collect();
+    assert_eq!(pages, [json!(0), json!(1)]);
+    Ok(())
+}
+
+/// R15, `confluence.user.current` as a host call: its own answer is the identity answer, judged
+/// without a second GET (PD-93). A known answer is the call's result; an anonymous one rejects it
+/// `needs_token` once the token re-check confirmed it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn confluence_user_current_host_call_judges_its_own_answer() -> TestResult {
+    let current = || host_call(1, "confluence.user.current", json!({}));
+    let (h, runner) = wiki_harness(
+        vec![
+            ScriptPlan::new(vec![current()], result_end(json!(1))),
+            ScriptPlan::new(vec![current()], result_end(json!(1))),
+        ],
+        None,
+    )
+    .await?;
+    let mock = wiki(&h)?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    assert_eq!(fetch_trail(&h, &id).await?, ["call1"]);
+    assert_eq!(gets_on(mock, WIKI_IDENTITY).await.len(), 1, "no second GET");
+    match runner.results().as_slice() {
+        [HostCallResult::Ok(v)] => assert_eq!(v["userKey"], TEST_USER_KEY, "{v}"),
+        other => return Err(format!("unexpected answers: {other:?}").into()),
+    }
+    Mock::given(method("GET"))
+        .and(path(mock.path(WIKI_IDENTITY)))
+        .respond_with(
+            mock.response(200)
+                .set_body_raw(fixtures::CONFLUENCE_USER_ANONYMOUS, "application/json"),
+        )
+        .mount(mock.server())
+        .await;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    assert_eq!(fetch_trail(&h, &id).await?, ["call1"]);
+    match runner.results().as_slice() {
+        [_, HostCallResult::Rejected { class, .. }] => assert_eq!(class, "needs_token"),
+        other => return Err(format!("unexpected answers: {other:?}").into()),
+    }
+    let call = record(&h, &id, EventType::SCRIPT_CALL).await?;
+    assert_eq!(call["unavailable"], "identity_check", "{call}");
+    assert!(call.to_string().contains("profilePicture"), "{call}");
+    assert_eq!(instance_state(&h), "needs_token");
+    // The op's own two GETs: its verdict is applied as the re-check's would be, without a call.
+    assert_eq!(gets_on(mock, WIKI_IDENTITY).await.len(), 2);
+    Ok(())
+}
+
+/// R15, T11 review I-1 order: a cancel while a host call's identity GET is in flight records it
+/// (`PREVIEW_FETCH {identity, cancelled_in_flight}`) and then the call with its content page,
+/// kept in the call's control for a storage-format page too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_during_host_call_identity_get_records_it_in_flight() -> TestResult {
+    use common::confluence::{mount_page, page_with_storage};
+    let (h, runner) = wiki_harness(
+        vec![ScriptPlan::new(
+            vec![page_get(1, "65537", Some("storage"))],
+            result_end(json!(1)),
+        )],
+        None,
+    )
+    .await?;
+    let mock = wiki(&h)?;
+    let storage = format!("<p>{QUARTERLY}: confidential.</p>");
+    mount_page(mock, "65537", &page_with_storage(&storage)).await;
+    Mock::given(method("GET"))
+        .and(path(mock.path(WIKI_IDENTITY)))
+        .respond_with(
+            mock.response(200)
+                .set_body_raw(
+                    fixtures::confluence_user_current(TEST_USER, TEST_USER_KEY),
+                    "application/json",
+                )
+                .set_delay(Duration::from_secs(30)),
+        )
+        .mount(mock.server())
+        .await;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    for _ in 0..2000 {
+        if !gets_on(mock, WIKI_IDENTITY).await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(gets_on(mock, WIKI_IDENTITY).await.len(), 1, "never sent");
+    // The GET has left; the answer is held by the mock.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let env = h.handler().cancel(&id).await;
+    assert_eq!(env.status, Status::Cancelled, "{}", env.to_json_line());
+    let events = h.events(&id).await?;
+    let types: Vec<EventType> = events.iter().map(|(t, _)| *t).collect();
+    assert_eq!(
+        types,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::SCRIPT_STARTED,
+            EventType::SCRIPT_CALL_SENT,
+            EventType::PREVIEW_FETCH,
+            EventType::SCRIPT_CALL,
+            EventType::SCRIPT_FAILED,
+            EventType::CANCELLED,
+        ]
+    );
+    let f = &events[3].1;
+    assert_eq!(f["purpose"], "identity", "{f}");
+    assert_eq!(f["outcome"], "cancelled_in_flight", "{f}");
+    assert_eq!(f["reason"], "by_client", "{f}");
+    assert_eq!(f["path"], "/wiki/rest/api/user/current", "{f}");
+    let call = &events[4].1;
+    assert_eq!(call["outcome"], "cancelled_in_flight", "{call}");
+    assert_eq!(call["pages"], 1, "{call}");
+    assert!(
+        call.to_string().contains(QUARTERLY),
+        "the page is recorded: {call}"
+    );
+    let results = format!("{:?}", runner.results());
+    assert!(!results.contains(QUARTERLY), "{results}");
+    Ok(())
+}
+
+/// R15: the identity GET runs inside the call's read budget. A budget spent during it ends the
+/// call as the budget does (an in-script rejection after the committed `SCRIPT_CALL`, its content
+/// audit-only), without waiting for the answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_call_identity_get_counts_in_the_call_read_budget() -> TestResult {
+    use common::confluence::{mount_page, page_with_storage};
+    let runner = FakeScriptRunner::new(vec![ScriptPlan::new(
+        vec![page_get(1, "65537", None)],
+        result_end(json!(1)),
+    )]);
+    let h = Harness::builder()
+        .confluence("wiki")
+        .scripts(runner.clone())
+        .hooks(TestHooks {
+            read_budget: Some(atlas_duck_atlassian::ReadBudget {
+                total: Duration::from_secs(2),
+                ..atlas_duck_atlassian::ReadBudget::default()
+            }),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    let mock = wiki(&h)?;
+    let storage = format!("<p>{QUARTERLY}: confidential.</p>");
+    mount_page(mock, "65537", &page_with_storage(&storage)).await;
+    Mock::given(method("GET"))
+        .and(path(mock.path(WIKI_IDENTITY)))
+        .respond_with(
+            mock.response(200)
+                .set_body_raw(
+                    fixtures::confluence_user_current(TEST_USER, TEST_USER_KEY),
+                    "application/json",
+                )
+                .set_delay(Duration::from_secs(10)),
+        )
+        .mount(mock.server())
+        .await;
+    let began = Instant::now();
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    assert!(
+        began.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        began.elapsed()
+    );
+    match runner.results().as_slice() {
+        [r @ HostCallResult::Rejected { .. }] => {
+            assert!(!format!("{r:?}").contains(QUARTERLY), "{r:?}");
+        }
+        other => return Err(format!("unexpected answers: {other:?}").into()),
+    }
+    let f = identity_records(&h, &id).await?;
+    assert_eq!(f.len(), 1, "{f:?}");
+    assert_eq!(f[0]["outcome"], "timeout", "{}", f[0]);
+    let call = record(&h, &id, EventType::SCRIPT_CALL).await?;
+    assert_eq!(call["outcome"], "timeout", "{call}");
+    assert!(call.to_string().contains(QUARTERLY), "{call}");
+    Ok(())
+}
+
+/// R15, T13 review B-1: a PAT stored while a host call is between its content and its identity
+/// GET. The identity GET runs under the new PAT, so its match says nothing about the content:
+/// `upstream_unavailable` inside the script, no re-check, nothing cached, the instance `ok`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_call_token_replaced_before_its_identity_get_is_upstream_unavailable() -> TestResult {
+    use common::confluence::{mount_page, mount_users, page_with_storage};
+    let pause = Pause::new();
+    let runner = FakeScriptRunner::new(vec![ScriptPlan::new(
+        vec![page_get(1, "65537", None)],
+        result_end(json!(1)),
+    )]);
+    let h = Harness::builder()
+        .confluence("wiki")
+        .scripts(runner.clone())
+        .hooks(TestHooks {
+            pause_after_lookups: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    let mock = wiki(&h)?;
+    let storage = format!(r#"<p>Owner <ri:user ri:userkey="key-gone"/>. {QUARTERLY}.</p>"#);
+    mount_page(mock, "65537", &page_with_storage(&storage)).await;
+    mount_users(mock, &[("key-gone", None)]).await;
+    // The connection test of `set_token` (its `user/current` is the harness's known answer).
+    mock.applinks_manifest("9.2.1").await;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    tokio::time::timeout(Duration::from_secs(20), pause.reached.notified())
+        .await
+        .map_err(|_| "the lookups never ended")?;
+    // The same user's fresh PAT, stored while the call holds after its lookups.
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        h.instances().set_token("wiki", secret("rotated-pat"), None),
+    )
+    .await
+    .map_err(|_| "set_token never returned")??;
+    pause.release.notify_one();
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    match runner.results().as_slice() {
+        [HostCallResult::Rejected { class, .. }] => assert_eq!(class, "upstream_unavailable"),
+        other => return Err(format!("unexpected answers: {other:?}").into()),
+    }
+    assert_eq!(
+        fetch_trail(&h, &id).await?,
+        ["resolve", "identity", "call1"]
+    );
+    let call = record(&h, &id, EventType::SCRIPT_CALL).await?;
+    assert_eq!(call["unavailable"], "identity_check", "{call}");
+    assert!(call.to_string().contains(QUARTERLY), "{call}");
+    let rechecks = h
+        .events_of(EventType::SYSTEM_FETCH)
+        .await?
+        .into_iter()
+        .filter(|p| p["purpose"] == "token_recheck")
+        .count();
+    assert_eq!(rechecks, 0);
+    assert_eq!(h.user_cached("wiki", "key-gone"), None);
+    assert_eq!(instance_state(&h), "ok");
+    Ok(())
+}
+
+/// I-37, scripts half (§7.6, §5.2): a script returns the converted page of a host call whose
+/// mentions were all user-cache hits. The call committed its map in its `SCRIPT_CALL`, its identity
+/// record before it. Evicted, the candidate rebuilds from the committed records to the same hash
+/// with no request, and a cache entry changed after the fetch changes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i37_script_confluence_markdown_candidate_rebuilds_from_committed_map() -> TestResult {
+    use atlas_duck_core::engine::queue::{Limits, MIB};
+    use common::confluence::{mount_page, page_with_storage, user_gets};
+    use common::test_hits;
+    let users = [
+        ("key-jdoe".to_owned(), Some("jdoe".to_owned())),
+        ("key-asmith".to_owned(), Some("asmith".to_owned())),
+    ]
+    .into_iter()
+    .collect();
+    let mut page = page_with_storage(TWO_USERS_STORAGE);
+    page["title"] = json!("x".repeat(2048));
+    let markdown = atlas_duck_convert::storage_to_markdown(TWO_USERS_STORAGE, &users).0;
+    assert!(markdown.contains("@jdoe"), "{markdown}");
+    let mut converted = page.clone();
+    converted["body"] = json!({ "format": "markdown", "value": markdown });
+    // A cache smaller than any candidate: every preview and the release rebuild from the record.
+    let limits = Limits {
+        candidate_cache_bytes: MIB / 1024,
+        ..Limits::default()
+    };
+    let (h, runner) = wiki_harness(
+        vec![ScriptPlan::new(
+            vec![page_get(1, "65537", None)],
+            result_end(converted.clone()),
+        )],
+        Some(limits),
+    )
+    .await?;
+    let mock = wiki(&h)?;
+    mount_page(mock, "65537", &page).await;
+    assert!(h.user_cache_set("wiki", "key-jdoe", Some("jdoe")));
+    assert!(h.user_cache_set("wiki", "key-asmith", Some("asmith")));
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    // The script returns exactly what its call got.
+    match runner.results().as_slice() {
+        [HostCallResult::Ok(v)] => assert_eq!(v, &converted),
+        other => return Err(format!("unexpected answers: {other:?}").into()),
+    }
+    assert!(
+        user_gets(mock).await.is_empty(),
+        "every mention a cache hit"
+    );
+    assert_eq!(fetch_trail(&h, &id).await?, ["identity", "call1"]);
+    assert_eq!(
+        record(&h, &id, EventType::SCRIPT_CALL).await?["user_resolutions"],
+        json!({ "key-jdoe": "jdoe", "key-asmith": "asmith" })
+    );
+    let rev = h.approver().item(&id).ok_or("not queued")?.candidate_rev;
+    assert!(!h.engine().candidates().contains(&id));
+    let hits = test_hits(mock).await.len();
+    // After the fetch the cache learns another name for the same key.
+    assert!(h.user_cache_set("wiki", "key-jdoe", Some("renamed")));
+    h.evict_candidate(&id);
+    let again = h.approver().open(&id).map_err(de)?.preview;
+    assert_eq!(test_hits(mock).await.len(), hits, "a rebuild makes no call");
+    assert_eq!(again.candidate_rev.candidate_hash, rev.candidate_hash);
+    assert!(again.approvable, "the rebuilt candidate matches its hash");
+    h.approver().release(&id).map_err(de)?;
+    let env = h.await_(&id, 5000).await;
+    assert_eq!(env.status, Status::Released, "{}", env.to_json_line());
+    let result = env.data.clone().ok_or("no data")?["result"].clone();
+    assert_eq!(result, converted);
+    let text = result["body"]["value"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("@jdoe") && !text.contains("renamed"),
+        "{text}"
+    );
+    assert_eq!(test_hits(mock).await.len(), hits);
     Ok(())
 }

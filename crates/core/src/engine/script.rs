@@ -40,7 +40,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use atlas_duck_atlassian::{
-    AuditCover, FetchControl, InstanceClient, PagedCall, ReadBudget, SearchCall,
+    AuditCover, FetchControl, FetchFailure, FetchOutcome, InstanceClient, PagedCall, ReadBudget,
+    SearchCall,
 };
 use atlas_duck_audit::{AuditError, NewEvent};
 use atlas_duck_ipc::envelope::{Envelope, ErrorCode};
@@ -62,6 +63,7 @@ use super::envelope::{self, OpenStatus};
 use super::handler::{CoreHandler, excerpt, internal_error};
 use super::queue::{AgentKey, Reservation};
 use super::read::{self, Classified};
+use super::write::{call_path, get_record, identity_call};
 use super::{
     Engine, InstanceHttp, NewEntry, OnAuditFailure, RequestEntry, RequestHead,
     audit_failure_retryable,
@@ -78,8 +80,8 @@ use crate::ops::{
     ExecError, ExecPlan, PreviewCtx, PreviewInput, PreviewModel, ReadPlan, ReadView, op_table,
 };
 use crate::payloads::{
-    self, EventCtx, FetchRecord, InFlightReason, OutcomeKind, ReadFetched, ScriptCallMeta,
-    ScriptErrorDetails, ScriptFailed,
+    self, EventCtx, FetchRecord, InFlightReason, OutcomeKind, PreviewFetchPurpose, ReadFetched,
+    ScriptCallMeta, ScriptErrorDetails, ScriptFailed,
 };
 use crate::redact::RedactionMeta;
 use crate::running::KillAnswer;
@@ -754,10 +756,10 @@ impl RunShared {
 
     /// The `SCRIPT_CALL {cancelled_in_flight}` records of the calls in flight (§9.5): each call
     /// is taken, its control cancelled and the bytes received recorded. A call whose request was
-    /// never written has nothing to record. A call in its user lookups (PD-99) first gets the
-    /// record of its last finished lookup (if not committed yet) and `PREVIEW_FETCH {resolve,
-    /// cancelled_in_flight}` for the lookup in flight; its `SCRIPT_CALL` then holds the content
-    /// page. Under the entry's gate only.
+    /// never written has nothing to record. A call in its user lookups (PD-99) or its identity
+    /// GET (R15) first gets the record of its last finished GET (if not committed yet) and
+    /// `PREVIEW_FETCH {resolve | identity, cancelled_in_flight}` for the GET in flight; its
+    /// `SCRIPT_CALL` then holds the content page. Under the entry's gate only.
     pub(crate) fn in_flight_records(
         &self,
         ctx: &EventCtx,
@@ -1325,7 +1327,17 @@ impl LiveBackend {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.engine.read_budget().total)
             .unwrap_or_else(tokio::time::Instant::now);
-        let (classified, http) = match self.fetch(&call, &vc, &ctl, None).await {
+        let (classified, http, attempt) = match self.fetch(&call, &vc, &ctl, None).await {
+            Ok(c) => c,
+            Err(result) => {
+                self.shared.finish_in_flight(call.id);
+                return result;
+            }
+        };
+        let (classified, puts) = match self
+            .with_users(&call, &vc, &ctl, &http, classified, deadline)
+            .await
+        {
             Ok(c) => c,
             Err(result) => {
                 self.shared.finish_in_flight(call.id);
@@ -1333,10 +1345,16 @@ impl LiveBackend {
             }
         };
         let classified = match self
-            .with_users(&call, &vc, &ctl, &http, classified, deadline)
+            .with_identity(call.id, &vc, &ctl, &http, classified, deadline, attempt)
             .await
         {
-            Ok(c) => c,
+            Ok((c, matched)) => {
+                // PD-93: the lookups' answers are cached only once the identity matched.
+                if matched {
+                    puts.apply(&self.engine, &vc.instance_id);
+                }
+                c
+            }
             Err(result) => {
                 self.shared.finish_in_flight(call.id);
                 return result;
@@ -1404,6 +1422,11 @@ impl LiveBackend {
             .and_then(Value::as_u64)
             .unwrap_or(0);
         let mut page: u32 = 0;
+        // R15: the call's identity step vouches for all its pages, so the credential generation
+        // is the one before its first page (T13 review B-1), and a rename re-fetch of any page
+        // counts as the call's.
+        let cred_gen = self.engine.credential_generation(&vc.instance_id);
+        let mut refetched = false;
         loop {
             let info = CallInfo {
                 call_id: call.id,
@@ -1426,14 +1449,19 @@ impl LiveBackend {
                 self.answer_row(call.id, &refused);
                 return refused;
             }
-            let classified = match self.fetch(&call, &vc, &ctl, Some((page, start))).await {
-                Ok((c, _)) => c,
+            let deadline = tokio::time::Instant::now()
+                .checked_add(self.engine.read_budget().total)
+                .unwrap_or_else(tokio::time::Instant::now);
+            let fetched = self.fetch(&call, &vc, &ctl, Some((page, start))).await;
+            let (classified, http, attempt) = match fetched {
+                Ok(f) => f,
                 Err(result) => {
                     self.shared.finish_in_flight(call.id);
                     self.answer_row(call.id, &result);
                     return result;
                 }
             };
+            refetched |= attempt.refetched;
             // R8: the first page went out asking for `renderedFields` (the later pages ask the
             // same).
             if page == 0
@@ -1446,6 +1474,27 @@ impl LiveBackend {
             let classified = match classified {
                 Classified::Direct(d) if page > 0 => read::gate_later(d, true),
                 c => c,
+            };
+            // R15: once per call, on the page that ends it with server content.
+            let classified = if ends_with_content(&classified) {
+                let attempt = read::Attempt {
+                    cred_gen,
+                    refetched,
+                    ..attempt
+                };
+                match self
+                    .with_identity(call.id, &vc, &ctl, &http, classified, deadline, attempt)
+                    .await
+                {
+                    Ok((c, _)) => c,
+                    Err(result) => {
+                        self.shared.finish_in_flight(call.id);
+                        self.answer_row(call.id, &result);
+                        return result;
+                    }
+                }
+            } else {
+                classified
             };
             let Some(settled) = self
                 .settle_page(&call, &vc, &info, classified, &mut all)
@@ -1575,10 +1624,13 @@ impl LiveBackend {
     /// call of the Markdown shape, as for a direct read (`read::with_users`): after the content
     /// answered, before the call's `SCRIPT_CALL`, which commits the map. They are part of the
     /// host call: they count toward the run's wall-clock limit, the call's read budget (the
-    /// 20 s reserve) and the run's `max_fetch_mb` (their bytes are added to the run's counter
+    /// 20 s reserve, and they end the identity GET's reserve before the call's deadline, as for
+    /// a direct read) and the run's `max_fetch_mb` (their bytes are added to the run's counter
     /// before the call returns; `SCRIPT_CALL.size` stays the content's), not as host calls
-    /// (`max_calls`). They run on the client of the call's fetch (T11 review m-4). `Err`: the run
-    /// ended meanwhile (the end of the run recorded the lookup in flight with the call).
+    /// (`max_calls`). They run on the client of the call's fetch (T11 review m-4). Their answers
+    /// come back beside the item, cached by the caller once the call's identity matched (PD-93,
+    /// R15). `Err`: the run ended meanwhile (the end of the run recorded the lookup in flight with
+    /// the call).
     async fn with_users(
         &self,
         call: &HostCall,
@@ -1587,13 +1639,14 @@ impl LiveBackend {
         http: &InstanceHttp,
         classified: Classified,
         deadline: tokio::time::Instant,
-    ) -> Result<Classified, HostCallResult> {
+    ) -> Result<(Classified, crate::users::Puts), HostCallResult> {
+        let none = crate::users::Puts::default;
         let Classified::Item(rec) = classified else {
-            return Ok(classified);
+            return Ok((classified, none()));
         };
         let shape = read::ReadShape::of(vc.spec, &vc.validated.params);
         if rec.item != ReleaseItem::Result || !shape.commits_user_resolutions() {
-            return Ok(Classified::Item(rec));
+            return Ok((Classified::Item(rec), none()));
         }
         let spec = vc.spec;
         let found = tokio::task::spawn_blocking(move || {
@@ -1605,7 +1658,7 @@ impl LiveBackend {
             return Err(rejected_msg(ErrorCode::Internal, MSG_RUN_NOT_POSSIBLE));
         };
         if keys.is_empty() {
-            return Ok(Classified::Item(rec));
+            return Ok((Classified::Item(rec), none()));
         }
         let cover = self
             .engine
@@ -1614,7 +1667,7 @@ impl LiveBackend {
             .ok();
         let Some(cover) = cover else {
             rec.users = Some(keys.into_iter().map(|k| (k, None)).collect());
-            return Ok(Classified::Item(rec));
+            return Ok((Classified::Item(rec), none()));
         };
         let fetch_cap = u64::from(self.limits.max_fetch_mb).saturating_mul(MIB);
         let max_bytes = fetch_cap
@@ -1633,17 +1686,18 @@ impl LiveBackend {
             client: &http.client,
             cover: &cover,
             ctl,
-            deadline,
+            // The identity GET that follows keeps its reserve (L141, T13 review I-2).
+            deadline: deadline
+                .checked_sub(read::identity_reserve(&self.engine))
+                .unwrap_or_else(tokio::time::Instant::now),
             max_bytes,
         };
         match crate::users::resolve_users(&pass, &keys).await {
             Ok(resolved) => {
                 // Seen by the next call's `max_fetch_mb` check (T11 review I-2).
                 self.shared.add_fetched(resolved.bytes);
-                // A host call has no identity step yet (PD-93: M8), so its answers are cached now.
-                resolved.puts.apply(&self.engine, &vc.instance_id);
                 rec.users = Some(resolved.users);
-                Ok(Classified::Item(rec))
+                Ok((Classified::Item(rec), resolved.puts))
             }
             Err(crate::users::Cancelled) => {
                 Err(rejected_msg(ErrorCode::Cancelled, MSG_CALL_CANCELLED))
@@ -1651,18 +1705,122 @@ impl LiveBackend {
         }
     }
 
+    /// R15 (RF-5a for host calls, the M7 PD-93 handoff, §7.2): a Confluence host call whose
+    /// content arrived (`read::identity_applies`) ends, after its pages and its user lookups, with
+    /// one `GET /rest/api/user/current` under the run's cover, recorded `PREVIEW_FETCH {purpose:
+    /// identity}` and committed before the call's `SCRIPT_CALL`, and judged as a direct read's
+    /// (`read::identity_verdict`). Once per host call: `atlas.all` runs it on the page that ends
+    /// the call. A non-match rejects the call inside the script, `needs_token` once the token
+    /// re-check confirmed it, else `upstream_unavailable`; the content stays audit-only in the
+    /// call's `SCRIPT_CALL`, the identity answer in its own record. A rename found by the re-check
+    /// is `upstream_unavailable` (retryable) here instead of the direct read's re-fetch: the
+    /// re-check stored the new name, so the script's next call matches. `confluence.user.current`
+    /// judges its own answer and sends no second GET.
+    ///
+    /// The GET runs on the call's control and is in flight, parked and committed like a user
+    /// lookup (`users::lookup`, T11 review I-1), so the end of the run records it once
+    /// (`cancelled_in_flight` while it runs) with the call's content. Its bytes count toward the
+    /// run's `max_fetch_mb` like the lookups' (`SCRIPT_CALL.bytes` stays the content's). The
+    /// answer is the classification the call settles with and whether the identity matched (or
+    /// the step does not apply), so the lookups' answers may be cached. `Err`: the run ended
+    /// meanwhile.
+    #[allow(clippy::too_many_arguments)]
+    async fn with_identity(
+        &self,
+        call_id: u64,
+        vc: &ValidatedCall,
+        ctl: &FetchControl,
+        http: &InstanceHttp,
+        classified: Classified,
+        deadline: tokio::time::Instant,
+        attempt: read::Attempt,
+    ) -> Result<(Classified, bool), HostCallResult> {
+        let Classified::Item(rec) = classified else {
+            return Ok((classified, true));
+        };
+        if !read::identity_applies(vc.spec, &rec) {
+            return Ok((Classified::Item(rec), true));
+        }
+        let stored = read::stored_identity(&self.engine, &vc.instance_id);
+        let checked = if vc.spec.id == read::USER_CURRENT_OP {
+            read::judge_own_identity(&self.engine, &vc.instance_id, rec, stored.as_ref(), attempt)
+                .await
+        } else {
+            let cover = self
+                .engine
+                .covers()
+                .for_request(&self.entry.head.request_id);
+            let Ok(cover) = cover else {
+                // Cannot happen after a fetch: fail closed.
+                let d = read::unconfirmed(rec.responses);
+                return Ok((Classified::Direct(d), false));
+            };
+            let call = identity_call(Product::Confluence);
+            let base = http.client.base();
+            let purpose = PreviewFetchPurpose::Identity;
+            let attempt = read::Attempt {
+                seen: self.engine.identity_epoch(&vc.instance_id),
+                ..attempt
+            };
+            let path = call_path(base, &call);
+            self.shared
+                .set_lookup(call_id, Some(super::InFlight { purpose, path }));
+            let outcome = http
+                .client
+                .get_bounded_ctl(&cover, &call, ctl, read::MAX_IDENTITY_BYTES, deadline)
+                .await;
+            if matches!(
+                outcome,
+                FetchOutcome::Failed(
+                    FetchFailure::CancelledInFlight { .. } | FetchFailure::CancelledBeforeSend
+                )
+            ) {
+                // The end of the run took the call and recorded this GET with it.
+                return Err(rejected_msg(ErrorCode::Cancelled, MSG_CALL_CANCELLED));
+            }
+            let record = get_record(&self.ctx_for(vc), purpose, base, &call, &outcome);
+            #[cfg(feature = "testing")]
+            if let Some(pause) = self.engine.hooks().pause_before_identity_park.clone() {
+                pause.hold().await;
+            }
+            // T11 review I-1: parked first, then the in-flight mark cleared, then committed.
+            self.shared.park_lookup(call_id, &record);
+            self.shared.set_lookup(call_id, None);
+            if !append_lookup(&self.engine, &self.entry, &self.shared, call_id).await {
+                return Err(rejected_msg(ErrorCode::Cancelled, MSG_CALL_CANCELLED));
+            }
+            self.shared
+                .add_fetched(crate::users::received_bytes(&outcome));
+            let answer = read::IdentityAnswer {
+                outcome,
+                stored: stored.as_ref(),
+                proxy: &http.proxy,
+            };
+            read::identity_verdict(&self.engine, &vc.instance_id, rec, answer, attempt).await
+        };
+        Ok(match checked {
+            read::Checked::Proceed(c) => (c, true),
+            read::Checked::Ended(c) => (c, false),
+            read::Checked::Refetch(responses) => {
+                (Classified::Direct(read::unconfirmed(responses)), false)
+            }
+        })
+    }
+
     /// The call's fetch under the request's cover, with the identity handling of Task 26
     /// (§7.1): a failed header check or a JSON 401 runs the token re-check, and a rename
     /// re-fetches once. `page = Some((n, start))`: page `n` of an `atlas.all` call, one request
     /// at `start` (PD-144). The instance's client comes back with the classification (the user
-    /// lookups run on it, T11 review m-4). `Err` = nothing was sent.
+    /// lookups and the identity step run on it, T11 review m-4), and so does the attempt the
+    /// classification came from (its epoch, its credential generation and whether it is the
+    /// re-fetch), which the identity step checks (R15). `Err` = nothing was sent.
     async fn fetch(
         &self,
         call: &HostCall,
         vc: &ValidatedCall,
         ctl: &FetchControl,
         page: Option<(u32, u64)>,
-    ) -> Result<(Classified, Arc<InstanceHttp>), HostCallResult> {
+    ) -> Result<(Classified, Arc<InstanceHttp>, read::Attempt), HostCallResult> {
         let internal = || rejected_msg(ErrorCode::Internal, MSG_RUN_NOT_POSSIBLE);
         let http = self
             .engine
@@ -1687,8 +1845,9 @@ impl LiveBackend {
             .get("start")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        // A Markdown page body is kept in the control: its user lookups follow under it (PD-99).
-        let keep = read::ReadShape::of(vc.spec, &vc.validated.params).commits_user_resolutions();
+        // A Confluence answer is kept in the control: its user lookups (PD-99) and its identity
+        // GET (R15) follow under it, and a cancel during them records it.
+        let keep = vc.spec.product == Product::Confluence;
         let plan = match page {
             None => CallPlan::Whole(plan, start, keep),
             Some((_, at)) => CallPlan::Page(PagePlan::of(plan).ok_or_else(internal)?, at),
@@ -1706,21 +1865,26 @@ impl LiveBackend {
         };
         let mut refetched = false;
         loop {
-            let seen = self.engine.identity_epoch(&vc.instance_id);
+            let attempt = read::Attempt {
+                seen: self.engine.identity_epoch(&vc.instance_id),
+                // Taken before the attempt's first GET (T13 review B-1).
+                cred_gen: self.engine.credential_generation(&vc.instance_id),
+                refetched,
+            };
             let fetched = plan.run(&http.client, &cover, &budget, ctl).await;
             let Some(trigger) = read::fetched_trigger(&fetched) else {
-                return Ok((read::classify_read(fetched, &http.proxy), http));
+                return Ok((read::classify_read(fetched, &http.proxy), http, attempt));
             };
             let effect = if refetched {
                 identity::Effect::HeaderCheckFailed
             } else {
-                let result = identity::recheck(&self.engine, &vc.instance_id, seen).await;
+                let result = identity::recheck(&self.engine, &vc.instance_id, attempt.seen).await;
                 identity::effect(identity::Path::DirectRead, trigger, &result)
             };
             match effect {
                 identity::Effect::Ordinary => {
                     let classified = read::classify_read(read::ordinary(fetched), &http.proxy);
-                    return Ok((classified, http));
+                    return Ok((classified, http, attempt));
                 }
                 identity::Effect::Refetch => {
                     let (earlier, answer) = read::split_answer(fetched);
@@ -1768,7 +1932,9 @@ impl LiveBackend {
                     ctl.clear_pages();
                     refetched = true;
                 }
-                other => return Ok((read::identity_classified(other, fetched), http)),
+                other => {
+                    return Ok((read::identity_classified(other, fetched), http, attempt));
+                }
             }
         }
     }
@@ -1943,19 +2109,37 @@ fn settle_result(
     let max_markdown = usize::try_from(max_result).unwrap_or(usize::MAX);
     match read::result_value(spec, shape, bodies, user_resolutions, max_markdown) {
         Err(read::Unnormalized::TooLarge) => too_large(),
-        Ok(read::Normalized { body, .. }) => {
+        Ok(read::Normalized {
+            body, conversion, ..
+        }) => {
             let len = serde_json::to_vec(&body).map_or(u64::MAX, |b| b.len() as u64);
             if len > max_result {
                 too_large()
             } else {
                 // `atlas.all` pages to the end; a single call that stopped early is lossy, and
-                // so are comments cut at the comments cap (which `atlas.all` keeps).
+                // so are comments cut at the comments cap (which `atlas.all` keeps) and a page
+                // body whose Markdown conversion reports `meta.conversion.lossy` (X-12, A1).
                 let lossy = (!all && rec.page.is_some_and(|p| p.next_start.is_some()))
-                    || rec.comments_truncated.is_some();
+                    || rec.comments_truncated.is_some()
+                    || conversion.is_some_and(|c| c.lossy);
                 (HostCallResult::Ok(body), None, lossy)
             }
         }
         Err(read::Unnormalized::Rebuild(_)) => unreadable(),
+    }
+}
+
+/// A page of an `atlas.all` call that ends the call with server content for the script: its last
+/// 2xx page, or an upstream error. The call's identity step runs there (R15), before the page's
+/// record.
+fn ends_with_content(c: &Classified) -> bool {
+    match c {
+        Classified::Item(rec) => match rec.item {
+            ReleaseItem::Result => rec.page.is_none_or(|p| p.next_start.is_none()),
+            ReleaseItem::UpstreamError => true,
+            _ => false,
+        },
+        Classified::Direct(_) | Classified::Cancelled => false,
     }
 }
 
