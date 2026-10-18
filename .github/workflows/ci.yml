@@ -306,6 +306,44 @@ jobs:
           node ci/check-no-skips.mjs $log $list $ignored confluence_flows
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # M8 plan Task 26: the script flows (app/src-tauri/tests/script_flows.rs, 9 flows): the real
+      # app, CLI and sandbox worker end to end. One test thread: a flow keeps worker processes
+      # busy on purpose. Same rules as the confluence_flows above.
+      - name: M8 script_flows (Linux, Xvfb + private session bus)
+        if: runner.os == 'Linux'
+        env:
+          CLI_FLOWS_TEST: script_flows
+          CLI_FLOWS_THREADS: "1"
+        run: bash ci/cli-flows-linux.sh
+
+      - name: M8 script_flows (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          export ATLAS_DUCK_CLI_FLOWS=1
+          args=(test -p atlas-duck-app --features scripted-approver --locked --test script_flows)
+          cargo "${args[@]}" -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/script-flows.log"
+          cargo "${args[@]}" -- --list 2>/dev/null > "$RUNNER_TEMP/script-flows.list"
+          cargo "${args[@]}" -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/script-flows.ignored"
+          node ci/check-no-skips.mjs "$RUNNER_TEMP/script-flows.log" "$RUNNER_TEMP/script-flows.list" "$RUNNER_TEMP/script-flows.ignored" script_flows
+
+      - name: M8 script_flows (Windows, pwsh)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $env:ATLAS_DUCK_CLI_FLOWS = '1'
+          $a = @('test', '-p', 'atlas-duck-app', '--features', 'scripted-approver', '--locked', '--test', 'script_flows')
+          $log = Join-Path $env:RUNNER_TEMP 'script-flows.log'
+          $list = Join-Path $env:RUNNER_TEMP 'script-flows.list'
+          $ignored = Join-Path $env:RUNNER_TEMP 'script-flows.ignored'
+          cargo @a -- --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo @a -- --list 2>$null | Set-Content -Path $list -Encoding utf8
+          cargo @a -- --list --ignored 2>$null | Set-Content -Path $ignored -Encoding utf8
+          node ci/check-no-skips.mjs $log $list $ignored script_flows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Core PAT keychain test (Windows Credential Manager, RF-3a, #[ignore]d)
         if: runner.os == 'Windows'
         run: cargo test -p atlas-duck-core --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked --test keychain_windows -- --ignored --test-threads=1 --nocapture
@@ -996,6 +1034,17 @@ jobs:
           cargo "${args[@]}" -- --list 2>/dev/null > "$RUNNER_TEMP/confluence-flows.list"
           cargo "${args[@]}" -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/confluence-flows.ignored"
           node ci/check-no-skips.mjs "$RUNNER_TEMP/confluence-flows.log" "$RUNNER_TEMP/confluence-flows.list" "$RUNNER_TEMP/confluence-flows.ignored" confluence_flows
+
+      # M8 plan Task 26: the script_flows target (9 flows), x86_64 under Rosetta.
+      - name: M8 script_flows x86_64-apple-darwin (no skips, pass-count minimum)
+        run: |
+          set -euo pipefail
+          export ATLAS_DUCK_CLI_FLOWS=1
+          args=(test -p atlas-duck-app --features scripted-approver --locked --target x86_64-apple-darwin --test script_flows)
+          cargo "${args[@]}" -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/script-flows.log"
+          cargo "${args[@]}" -- --list 2>/dev/null > "$RUNNER_TEMP/script-flows.list"
+          cargo "${args[@]}" -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/script-flows.ignored"
+          node ci/check-no-skips.mjs "$RUNNER_TEMP/script-flows.log" "$RUNNER_TEMP/script-flows.list" "$RUNNER_TEMP/script-flows.ignored" script_flows
 
       # M8 plan Task 6: the same sandbox_runs step as the native legs, x86_64 under Rosetta.
       - name: M8 sandbox_runs x86_64-apple-darwin (kill handles and reaper; §3.4, PD-137)

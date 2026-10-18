@@ -61,6 +61,7 @@ pub const ENV_TEST_KEYSTORE: &str = "ATLAS_DUCK_TEST_KEYSTORE";
 
 pub const CLI_EXE: &str = env!("CARGO_BIN_EXE_atlas-duck");
 pub const APP_EXE: &str = env!("CARGO_BIN_EXE_atlas-duck-app");
+pub const WORKER_EXE: &str = env!("CARGO_BIN_EXE_atlas-duck-sandbox");
 
 /// The PAT every provisioned instance stores. A flow that searches output, logs and the audit
 /// store for it proves the token never leaves the keychain (I-20).
@@ -208,6 +209,11 @@ pub struct WorldOpts {
     pub keystore: KeystoreKind,
     /// Extra variables for every spawned binary (they win over the pass-through).
     pub extra_env: Vec<(String, String)>,
+    /// Runs the CLI and the app from a copy of the three binaries under `<root>/install` (M8
+    /// Task 26): the CLI finds the app next to itself and the app finds its worker next to itself
+    /// (`canonical_worker`), so a test can replace the copied worker without touching the build
+    /// output.
+    pub copy_install: bool,
 }
 
 impl WorldOpts {
@@ -215,6 +221,56 @@ impl WorldOpts {
         self.extra_env.push((name.to_owned(), value.to_owned()));
         self
     }
+
+    pub fn with_copy_install(mut self) -> WorldOpts {
+        self.copy_install = true;
+        self
+    }
+}
+
+/// The binaries of a copied install dir ([`WorldOpts::copy_install`]).
+#[derive(Debug, Clone)]
+struct Install {
+    dir: PathBuf,
+    cli: PathBuf,
+    app: PathBuf,
+    worker: PathBuf,
+}
+
+/// Copies the CLI, the app and the sandbox worker into `<root>/install` (next to each other, as in
+/// a real install). On Windows every DLL next to the app goes along.
+fn copy_install(root: &Path) -> io::Result<Install> {
+    let dir = root.join("install");
+    create_private_dir(&dir)?;
+    let copy = |from: &Path| -> io::Result<PathBuf> {
+        let name = from
+            .file_name()
+            .ok_or_else(|| io::Error::other("a binary path has no file name"))?;
+        let to = dir.join(name);
+        fs::copy(from, &to)?;
+        Ok(to)
+    };
+    let cli = copy(Path::new(CLI_EXE))?;
+    let app = copy(Path::new(APP_EXE))?;
+    let worker = copy(Path::new(WORKER_EXE))?;
+    #[cfg(windows)]
+    if let Some(built) = Path::new(APP_EXE).parent() {
+        for entry in fs::read_dir(built)?.flatten() {
+            let path = entry.path();
+            if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("dll"))
+            {
+                copy(&path)?;
+            }
+        }
+    }
+    Ok(Install {
+        dir,
+        cli,
+        app,
+        worker,
+    })
 }
 
 /// One test home: its pinned file, data and config dirs, keystore, mocks and spawned processes.
@@ -227,6 +283,7 @@ pub struct World {
     keys_dir: PathBuf,
     install_id: String,
     opts: WorldOpts,
+    install: Option<Install>,
     mocks: Vec<(String, MockDc)>,
     instance_ids: Vec<String>,
 }
@@ -290,6 +347,11 @@ impl World {
         // M6 contract: the data dir exists before paths.toml is written.
         create_private_dir(&data)?;
         create_private_dir(&config)?;
+        let install = if opts.copy_install {
+            Some(copy_install(&root_path)?)
+        } else {
+            None
+        };
         let world = World {
             keys_dir: root_path.join("keys"),
             root,
@@ -299,6 +361,7 @@ impl World {
             config,
             install_id,
             opts,
+            install,
             mocks: Vec::new(),
             instance_ids: Vec::new(),
         };
@@ -349,6 +412,26 @@ impl World {
     pub fn control_dir(&self) -> PathBuf {
         self.data.join(CONTROL_DIR)
     }
+    /// The copied install dir ([`WorldOpts::copy_install`]).
+    pub fn install_dir(&self) -> Option<&Path> {
+        self.install.as_ref().map(|i| i.dir.as_path())
+    }
+    /// The sandbox worker next to the copied app ([`WorldOpts::copy_install`]).
+    pub fn installed_worker(&self) -> Option<&Path> {
+        self.install.as_ref().map(|i| i.worker.as_path())
+    }
+    /// The `atlas-duck` every CLI run of this world starts: the copy, else the build output.
+    fn cli_exe(&self) -> PathBuf {
+        self.install
+            .as_ref()
+            .map_or_else(|| PathBuf::from(CLI_EXE), |i| i.cli.clone())
+    }
+    /// The `atlas-duck-app` this world starts: the copy, else the build output.
+    fn app_exe(&self) -> PathBuf {
+        self.install
+            .as_ref()
+            .map_or_else(|| PathBuf::from(APP_EXE), |i| i.app.clone())
+    }
     /// The mock server of `alias` (provisioned instances only).
     pub fn mock(&self, alias: &str) -> Option<&MockDc> {
         self.mocks.iter().find(|(a, _)| a == alias).map(|(_, m)| m)
@@ -369,7 +452,10 @@ impl World {
         match self.opts.keystore {
             KeystoreKind::File => Ok(Arc::new(provision(&self.keys_dir, &self.install_id)?)),
             KeystoreKind::Os => Ok(Arc::new(ProxyKeyStore::spawn(
-                self.command(APP_EXE, &[os_keystore_proxy::MARKER, &self.install_id]),
+                self.command(
+                    self.app_exe(),
+                    &[os_keystore_proxy::MARKER, &self.install_id],
+                ),
                 &self.install_id,
             )?)),
         }
@@ -389,7 +475,7 @@ impl World {
         )
     }
 
-    fn command(&self, exe: &str, args: &[&str]) -> Command {
+    fn command(&self, exe: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> Command {
         let mut c = Command::new(exe);
         c.args(args).env_clear().current_dir(&self.base.home);
         for (k, v) in self.env() {
@@ -509,7 +595,7 @@ impl World {
     /// Runs `atlas-duck <args>` to its end (at most two minutes): stdout, stderr, exit code and
     /// the envelope when stdout holds one. A cold start launches the app through the test home.
     pub async fn cli(&self, args: &[&str]) -> Result<CliRun> {
-        let mut cmd = tokio::process::Command::from(self.command(CLI_EXE, args));
+        let mut cmd = tokio::process::Command::from(self.command(self.cli_exe(), args));
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -531,7 +617,7 @@ impl World {
     /// `atlas-duck <args>` still running, with piped stdout and stderr and no stdin (kill tests).
     /// The child is killed when dropped.
     pub fn cli_spawn(&self, args: &[&str]) -> Result<tokio::process::Child> {
-        let mut cmd = tokio::process::Command::from(self.command(CLI_EXE, args));
+        let mut cmd = tokio::process::Command::from(self.command(self.cli_exe(), args));
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -541,7 +627,7 @@ impl World {
 
     /// Spawns `atlas-duck-app --background` and waits (30 s) for `<data>/endpoint`.
     pub async fn start_app(&self) -> Result<AppProc> {
-        let mut cmd = self.command(APP_EXE, &["--background"]);
+        let mut cmd = self.command(self.app_exe(), &["--background"]);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());

@@ -35,7 +35,7 @@ pub const LOG_EVENT_APPROVER_GAVE_UP: &str = "scripted_approver_gave_up";
 /// What a reason asks the approver to do. Anything that is not a known directive is `Hold`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Directive {
-    /// A read: open + release.
+    /// A read or a script (both are release-gated): open + release.
     Release,
     /// A read with an upstream error: §5.2 step 6 "Release status only".
     ReleaseStatusOnly,
@@ -44,7 +44,7 @@ pub enum Directive {
     /// Open + deny with `DenyDetails::UpstreamHttp { include_messages: true }` where the item
     /// has the data for it, else a plain deny.
     DenyDetails,
-    /// A write or a script: open + approve.
+    /// A write: open + approve (a script item is released, never approved).
     Approve,
     /// A write with missing required fields (PD-49): open, fill every pre-added `fields.<id>`
     /// input with its first allowed value (else `"x"`), submit the edit, open the new revision
@@ -222,13 +222,18 @@ fn tick(api: Arc<dyn DecisionApi>, memory: &mut Memory) {
 /// is not approvable (the core would refuse it and log a `DECISION_INVALID` every tick); a
 /// directive for another class is a hold.
 fn fits(d: Directive, item: &QueueItem) -> bool {
+    fits_class(d, item.class, item.approvable)
+}
+
+/// [`fits`] over the two fields it reads. A script item is release-gated like a read (core's
+/// `decide` answers an approve for a script `NotDecidable`), so `Release` fits it; the
+/// status-only preset is a read-outcome card and does not.
+fn fits_class(d: Directive, class: &str, approvable: bool) -> bool {
     match d {
         Directive::Hold => false,
-        Directive::Release | Directive::ReleaseStatusOnly => {
-            item.class == "read" && item.approvable
-        }
-        Directive::Approve => matches!(item.class, "write" | "script") && item.approvable,
-        Directive::EditPreadded => item.class == "write" && item.approvable,
+        Directive::Release => matches!(class, "read" | "script") && approvable,
+        Directive::ReleaseStatusOnly => class == "read" && approvable,
+        Directive::Approve | Directive::EditPreadded => class == "write" && approvable,
         Directive::Deny | Directive::DenyDetails | Directive::DenyHint => true,
     }
 }
@@ -364,6 +369,36 @@ mod tests {
         ] {
             assert!(DIRECTIVE_PREFIX.len() + name.len() <= 60, "{name}");
         }
+    }
+
+    /// M8 T26: a release decides a read or a script, an approve a write only (core refuses an
+    /// approve of a script), a hold nothing, and a deny anything.
+    #[test]
+    fn directives_fit_the_classes_core_can_decide() {
+        let table: &[(Directive, &str, bool)] = &[
+            (Directive::Release, "read", true),
+            (Directive::Release, "script", true),
+            (Directive::Release, "write", false),
+            (Directive::ReleaseStatusOnly, "read", true),
+            (Directive::ReleaseStatusOnly, "script", false),
+            (Directive::Approve, "write", true),
+            (Directive::Approve, "script", false),
+            (Directive::Approve, "read", false),
+            (Directive::EditPreadded, "write", true),
+            (Directive::EditPreadded, "script", false),
+            (Directive::Hold, "read", false),
+            (Directive::Hold, "script", false),
+            (Directive::Deny, "script", true),
+            (Directive::DenyDetails, "read", true),
+            (Directive::DenyHint, "write", true),
+        ];
+        for (d, class, want) in table {
+            assert_eq!(fits_class(*d, class, true), *want, "{d:?} on {class}");
+        }
+        // Not approvable yet: a release or an approve waits; a deny does not.
+        assert!(!fits_class(Directive::Release, "script", false));
+        assert!(!fits_class(Directive::Approve, "write", false));
+        assert!(fits_class(Directive::Deny, "script", false));
     }
 
     #[test]

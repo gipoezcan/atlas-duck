@@ -56,9 +56,10 @@ cargo_args=(test -p atlas-duck-app --features scripted-approver --locked --test 
 # the default target keeps the log name its callers (S-02, I-42/I-44) read
 if [ "$target" = cli_flows ]; then log="$TMPDIR/cli-flows.log"; else log="$TMPDIR/$target.log"; fi
 
-# --test-threads=2: the flows start whole app instances (T22 handoff).
+# --test-threads=2: the flows start whole app instances (T22 handoff). CLI_FLOWS_THREADS=1 for
+# script_flows (M8 T26): its flows keep worker processes busy on purpose.
 set +e
-cargo "${cargo_args[@]}" -- --nocapture --test-threads=2 "$@" 2>&1 | tee "$log"
+cargo "${cargo_args[@]}" -- --nocapture --test-threads="${CLI_FLOWS_THREADS:-2}" "$@" 2>&1 | tee "$log"
 status="${PIPESTATUS[0]}"
 set -e
 if [ "$status" -ne 0 ]; then
