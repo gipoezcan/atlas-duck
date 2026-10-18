@@ -1551,8 +1551,16 @@ mod tests {
                 "--reason",
                 "pass reason in each tool call",
             ),
-            (&["mcp", "--output", "text"][..], "--output", "--output"),
-            (&["mcp", "--output", "json"][..], "--output", "--output"),
+            (
+                &["mcp", "--output", "text"][..],
+                "--output",
+                "mcp always speaks JSON-RPC",
+            ),
+            (
+                &["mcp", "--output", "json"][..],
+                "--output",
+                "mcp always speaks JSON-RPC",
+            ),
         ] {
             let e = err(list);
             assert!(e.stderr_only, "{list:?}");

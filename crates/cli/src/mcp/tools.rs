@@ -131,8 +131,10 @@ pub(crate) fn validate_fixed_args(tool: &str, args: &Map<String, Value>) -> Resu
 // ---- argument checks ------------------------------------------------------------------------
 
 fn arg_error(arg: &str, why: &str) -> Envelope {
+    // The key is caller text: cap what is echoed, like the CLI does for its own arguments.
+    let arg = crate::argv::clip(arg);
     let mut details = Map::new();
-    details.insert("arg".into(), Value::from(arg));
+    details.insert("arg".into(), Value::from(arg.as_str()));
     local::usage(&format!("{arg} {why}"), details)
 }
 
@@ -564,6 +566,50 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("script_limits"), "{text}");
+    }
+
+    #[test]
+    fn limit_keys_match_the_script_limits_fields() {
+        let limits = local::describe_env().script_limits;
+        let map = limits.as_object().expect("script_limits is an object");
+        let mut fields: Vec<&str> = map.keys().map(String::as_str).collect();
+        let mut keys = LIMIT_KEYS.to_vec();
+        fields.sort_unstable();
+        keys.sort_unstable();
+        assert_eq!(fields, keys, "LIMIT_KEYS is out of step with ScriptLimits");
+    }
+
+    #[test]
+    fn unknown_argument_keys_are_capped_in_the_error() {
+        // Multi-byte chars so a byte cut would land mid-character.
+        let key = "\u{e4}".repeat(5000);
+        let top = json!({ key.clone(): 1 });
+        let nested = json!({"source": "1", "limits": { key.clone(): 1 }});
+        let matched = json!({"match_params": { "op_id": "jira.issue.get", key.clone(): 1 }});
+        for (tool, args) in [
+            ("script_run", top.clone()),
+            ("script_run", nested),
+            ("request_list", matched),
+            ("ops_list", top),
+        ] {
+            let Value::Object(map) = args else {
+                panic!("object expected")
+            };
+            let Err(env) = validate_fixed_args(tool, &map) else {
+                panic!("{tool}: an unknown key must be refused");
+            };
+            let arg = env
+                .error
+                .as_ref()
+                .and_then(|e| e.details.as_ref())
+                .and_then(|d| d.get("arg"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let message = env.error.as_ref().map(|e| e.message.as_str()).unwrap_or("");
+            assert!(arg.contains('\u{e4}'), "{tool}: the key is echoed: {arg}");
+            assert!(arg.len() < 600, "{tool}: {}", arg.len());
+            assert!(message.len() < 700, "{tool}: {}", message.len());
+        }
     }
 
     fn rid() -> String {

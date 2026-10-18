@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn valid_mcp_hands_over_to_the_server_and_prints_nothing_itself() {
-        let (o, stdout, stderr, _) = printed(&["mcp", "--tools", "generic"], Some("7"));
+        let (o, stdout, stderr, exit) = printed(&["mcp", "--tools", "generic"], Some("7"));
         assert_eq!(
             o.serve,
             Some(McpConfig {
@@ -448,9 +448,14 @@ mod tests {
                 timeout: Some(std::time::Duration::from_secs(7)),
             })
         );
-        // `run` prints nothing for it; this guard only proves the placeholder is not an error.
+        // `run` takes `serve` before it prints, so this harness (which prints the outcome anyway)
+        // shows only what the placeholder would say if a caller bypassed `serve`: a success.
         assert_eq!(stderr, "");
-        assert!(!stdout.contains("usage"), "{stdout}");
+        assert!(!o.stderr_only);
+        assert_eq!(exit, 0, "{stdout}");
+        assert_eq!(o.exit, 0);
+        assert_eq!(o.env.status, atlas_duck_ipc::envelope::Status::Succeeded);
+        assert!(o.env.error.is_none(), "{:?}", o.env.error);
     }
 
     #[test]

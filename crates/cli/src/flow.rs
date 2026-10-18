@@ -1,7 +1,7 @@
 //! The envelope rules of the connected flow, shared by the CLI (`connected`) and the MCP server
 //! (§4.2, §4.3, §4.4): which envelope a connect failure, a lost connection, a submit that got no
-//! reply or an await that got a wrong one turns into (PD-16, L63, L131, PD-08). Pure: no IO, no
-//! deadline clock, so both front ends map results the same way and cannot drift.
+//! reply or an await that got a wrong one turns into (PD-16, L63, L131, PD-08). Pure: no IO, and
+//! the clock is read only by `await_timeout_ms` (through `Deadline::remaining`), so both front ends map results the same way and cannot drift.
 
 use std::io;
 
@@ -314,6 +314,17 @@ mod tests {
         assert!(
             matches!(check_submit_reply(reply), Ok((e, None)) if e.status == Status::Succeeded)
         );
+
+        // A final reply without an id passes too: only a pending one needs the id.
+        let mut failed = Envelope::failed(ErrorCode::Usage, false, "bad");
+        failed.request_id = None;
+        let reply = SubmitReply {
+            envelope: failed,
+            params_sha256: None,
+        };
+        assert!(
+            matches!(check_submit_reply(reply), Ok((e, None)) if e.status == Status::Failed && e.request_id.is_none())
+        );
     }
 
     #[test]
@@ -329,6 +340,12 @@ mod tests {
         let env = check_await_reply("req_1", same);
         assert_eq!(env.status, Status::Succeeded);
         assert_eq!(env.request_id.as_deref(), Some("req_1"));
+
+        // An answer without an id passes through: only a different id is refused.
+        let mut anon = Envelope::failed(ErrorCode::Usage, false, "bad");
+        anon.request_id = None;
+        let env = check_await_reply("req_1", anon);
+        assert_eq!(code(&env), Some(ErrorCode::Usage));
     }
 
     #[test]
@@ -344,8 +361,20 @@ mod tests {
             assert_eq!(code(&e), Some(ErrorCode::Unreachable), "{e:?}");
         }
         // Before the frame was taken nothing was queued: not pending.
-        let e = submit_error(ClientError::DeadlineExceeded, false);
-        assert_ne!(e.status, Status::Pending);
+        // The answer is `unreachable {launch_timeout}`.
+        for e in [
+            submit_error(ClientError::DeadlineExceeded, false),
+            no_reply(false),
+        ] {
+            assert_ne!(e.status, Status::Pending, "{e:?}");
+            assert_eq!(code(&e), Some(ErrorCode::Unreachable), "{e:?}");
+            let reason = e
+                .error
+                .as_ref()
+                .and_then(|x| x.details.as_ref())
+                .and_then(|d| d.get("reason"));
+            assert_eq!(reason, Some(&Value::from(launch::REASON_LAUNCH_TIMEOUT)));
+        }
     }
 
     #[test]
