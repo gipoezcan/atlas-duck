@@ -1513,8 +1513,8 @@ fn wiki_search_first_of_five() -> Result<String> {
 /// 3. `confluence_page_update` of a Markdown body with a `page get` placeholder: `failed` /
 ///    `markdown_placeholders`, `isError`, and nothing fetched or written.
 /// 4. `confluence_page_update` from base version 6 of a page at version 7, denied by the
-///    scripted approver (`deny-hint`: the first hint the hold takes, else a plain deny): `denied`,
-///    `isError`, no `PUT` at the mock.
+///    scripted approver (`atlas-test:deny`; the conflict hold takes no hint): `denied`, `isError`,
+///    exactly the two page GETs (the second `version=6&status=historical`), no `PUT` at the mock.
 ///
 /// Source: `confluence_flows` (`page_update_conflict_denied_exit3`, `placeholders_rejected_exit2`,
 /// `page_get_markdown_released_with_conversion_meta`, `cql_rewrite_on_the_wire`), `engine/read.rs`
@@ -1613,16 +1613,35 @@ async fn confluence_tools_end_to_end() -> Result<()> {
         .call(
             "confluence_page_update",
             json!({"id": WIKI_PAGE_ID, "base_version": 6, "body": "**done**",
-                   "reason": "atlas-test:deny-hint"}),
+                   "reason": "atlas-test:deny"}),
             None,
         )
         .await?;
     let env = out.structured();
     assert!(out.is_error(), "{env}\n{}", mcp.transcript());
     assert_eq!(status_of(env), "denied", "{env}");
-    let puts = mock
-        .received()
-        .await
+    // The log was cleared by the reset, so these are the update's own GETs: the current page
+    // (stage 1), then the base version (stage 2: `version=6&status=historical`).
+    let page_path = mock.path(WIKI_PAGE_PATH);
+    let received = mock.received().await;
+    let gets: Vec<Vec<(String, String)>> = received
+        .iter()
+        .filter(|r| r.method.as_str() == "GET" && r.url.path() == page_path)
+        .map(|r| {
+            r.url
+                .query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect()
+        })
+        .collect();
+    assert_eq!(gets.len(), 2, "{gets:?}");
+    let has = |q: &[(String, String)], name: &str, value: &str| {
+        q.iter().any(|(k, v)| k == name && v == value)
+    };
+    assert!(!has(&gets[0], "status", "historical"), "{gets:?}");
+    assert!(has(&gets[1], "version", "6"), "{gets:?}");
+    assert!(has(&gets[1], "status", "historical"), "{gets:?}");
+    let puts = received
         .iter()
         .filter(|r| r.method.as_str() == "PUT")
         .count();
