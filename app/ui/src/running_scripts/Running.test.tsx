@@ -153,6 +153,27 @@ describe('Running scripts shell', () => {
     expect(cells(2).slice(4, 7)).toEqual(['1 h 2 min', '4', '5.2 MiB']);
   });
 
+  it('bytes_unit_chosen_after_rounding: no "1024.0 KiB" or "1024.0 MiB" at the boundaries', async () => {
+    const GIB = 1024 ** 3;
+    const sizes: [number, string][] = [
+      [1_023, '1023 B'],
+      [1_024, '1.0 KiB'],
+      [1_048_525, '1.0 MiB'],
+      [1_048_575, '1.0 MiB'],
+      [1_048_576, '1.0 MiB'],
+      [GIB - 1, '1.0 GiB'],
+      [GIB, '1.0 GiB'],
+    ];
+    await show(
+      sizes.map(([bytes], i) =>
+        run({ request_id: `req_${String(i).padStart(20, '0')}`, bytes_fetched: bytes }),
+      ),
+    );
+    const rows = within(screen.getByRole('table')).getAllByRole('row').slice(1);
+    const texts = rows.map((r) => within(r).getAllByRole('cell')[6]?.textContent);
+    expect(texts).toEqual(sizes.map(([, text]) => text));
+  });
+
   it('kill_answers_texts: each of the three answers has its own text (PD-143)', async () => {
     const cases: [KillAnswer['answer'], string][] = [
       ['killed', 'Kill requested'],
@@ -182,11 +203,11 @@ describe('Running scripts shell', () => {
     try {
       visibility.mockReturnValue('visible');
       vi.mocked(runningList).mockResolvedValue([run()]);
-      render(<Running />);
+      const { unmount } = render(<Running />);
       await act(async () => {
         await vi.advanceTimersByTimeAsync(0);
       });
-      const base = vi.mocked(runningList).mock.calls.length;
+      const base =vi.mocked(runningList).mock.calls.length;
       expect(base).toBeGreaterThanOrEqual(1);
       await act(async () => {
         await vi.advanceTimersByTimeAsync(3_000);
@@ -212,8 +233,67 @@ describe('Running scripts shell', () => {
         await vi.advanceTimersByTimeAsync(1_000);
       });
       expect(vi.mocked(runningList).mock.calls.length).toBe(base + 6);
+      // Unmounted: the timer and the visibility listener are gone (fake timers stay on until here).
+      unmount();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3_000);
+      });
+      act(() => {
+        document.dispatchEvent(new Event('visibilitychange'));
+      });
+      await flush();
+      expect(vi.mocked(runningList).mock.calls.length).toBe(base + 6);
     } finally {
       Reflect.deleteProperty(document, 'visibilityState');
+      vi.useRealTimers();
+    }
+  });
+
+  it('coalesces_in_flight_lists: one list at a time, one trailing re-list for any triggers meanwhile', async () => {
+    vi.useFakeTimers();
+    try {
+      const settles: ((rows: RunningScriptView[]) => void)[] = [];
+      vi.mocked(runningList).mockImplementation(
+        () => new Promise<RunningScriptView[]>((resolve) => settles.push(resolve)),
+      );
+      const calls = () => vi.mocked(runningList).mock.calls.length;
+      const finish = async (i: number, rows: RunningScriptView[]) => {
+        await act(async () => {
+          settles[i]?.(rows);
+        });
+        await flush();
+      };
+      const { unmount } = render(<Running />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(calls()).toBe(1);
+      // Three timer ticks and an event while the first list is still pending: no new call.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3_000);
+      });
+      await emit('running_scripts_changed');
+      expect(calls()).toBe(1);
+      // It settles: exactly one trailing list, however many triggers came meanwhile.
+      await finish(0, []);
+      expect(calls()).toBe(2);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+      });
+      expect(calls()).toBe(2);
+      // The trailing list settles with a trigger behind it: one more, and the latest result wins.
+      await finish(1, []);
+      expect(calls()).toBe(3);
+      await finish(2, [run()]);
+      expect(calls()).toBe(3);
+      expect(killButtons()).toHaveLength(1);
+      // Nothing pending and nothing owed: the next tick reads again.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+      });
+      expect(calls()).toBe(4);
+      unmount();
+    } finally {
       vi.useRealTimers();
     }
   });

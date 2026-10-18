@@ -24,7 +24,8 @@ function bytesText(n: number): string {
   if (n < 1024) return `${n} B`;
   let value = n / 1024;
   let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
+  // Choose the unit after rounding: 1048575 B is "1.0 MiB", never "1024.0 KiB".
+  while (Math.round(value * 10) >= 10240 && unit < units.length - 1) {
     value /= 1024;
     unit += 1;
   }
@@ -50,25 +51,44 @@ export function Running() {
   const [killing, setKilling] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [nonce, setNonce] = useState(0);
-  const latest = useRef(0);
+  const listing = useRef(false);
+  const again = useRef(false);
   const inFlight = useRef(false);
   const live = useRef(true);
 
   const reload = useCallback(() => setNonce((n) => n + 1), []);
 
+  // One list in flight at most (a stalled backend must not pile up calls). A trigger that arrives
+  // meanwhile schedules exactly one trailing read after the running one settles, so the last
+  // read always started after the last trigger and its result is the one shown.
   const refresh = useCallback(() => {
-    const mine = ++latest.current;
-    runningList().then(
-      (list) => {
-        if (live.current && mine === latest.current) {
-          setRows(list);
-          setFailed(false);
-        }
-      },
-      () => {
-        if (live.current && mine === latest.current) setFailed(true);
-      },
-    );
+    if (listing.current) {
+      again.current = true;
+      return;
+    }
+    const start = () => {
+      listing.current = true;
+      const settle = () => {
+        listing.current = false;
+        const rerun = again.current;
+        again.current = false;
+        if (rerun && live.current) start();
+      };
+      runningList().then(
+        (list) => {
+          if (live.current) {
+            setRows(list);
+            setFailed(false);
+          }
+          settle();
+        },
+        () => {
+          if (live.current) setFailed(true);
+          settle();
+        },
+      );
+    };
+    start();
   }, []);
 
   useEffect(() => {

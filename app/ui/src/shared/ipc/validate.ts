@@ -425,7 +425,7 @@ export const isRunningScriptView = (v: unknown): v is RunningScriptView =>
     bytes_fetched: isNum,
   });
 
-export const isKillAnswer = (v: unknown): v is KillAnswer => 
+export const isKillAnswer = (v: unknown): v is KillAnswer =>
   closed(v, { answer: oneOf('killed', 'not_running', 'already_stopping') });
 
 export const isOnboardingText = (v: unknown): v is OnboardingText => closed(v, { text: isStr });
