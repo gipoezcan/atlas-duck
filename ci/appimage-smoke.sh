@@ -272,7 +272,18 @@ m8_inner() {
   set -e
 
   # (2) the CLI is gone (the call above returned; no `__cli script` process is left either).
-  if pgrep -f -- "$appimage __cli script" >/dev/null; then
+  # `pgrep -f` can match a process that is exiting at that very moment (CI run 39102121824: the match
+  # was gone by the time `ps` listed it), so poll for up to 10 s and only fail if it stays.
+  cli_left=1
+  for _ in $(seq 1 20); do
+    if pgrep -f -- "$appimage __cli script" >/dev/null; then
+      sleep 0.5
+    else
+      cli_left=0
+      break
+    fi
+  done
+  if [ "$cli_left" -ne 0 ]; then
     ps -eo pid,ppid,args | grep -F '__cli' >&2 || true
     m4_fail "a '__cli script' process is still running after script run returned"
   fi
