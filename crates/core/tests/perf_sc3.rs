@@ -192,6 +192,10 @@ async fn p01_script_200_rows_preview_under_budget() -> TestResult {
         doc.contains("Issue 199: login page times out"),
         "the card shows the last row"
     );
+    // All 6 fields reach the card, not just the key and the summary.
+    for field in ["ABC-200", "In Progress", "Jane Doe", "High", "web, perf"] {
+        assert!(doc.contains(field), "the card shows the field {field}");
+    }
     Ok(())
 }
 

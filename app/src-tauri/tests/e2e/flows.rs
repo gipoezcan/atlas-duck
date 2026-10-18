@@ -1922,8 +1922,13 @@ async fn p01(rig: &Rig) -> Result<()> {
 /// alive, with its host call in flight, until a flow kills it.
 const SLOW_SCRIPT: &str =
     "const issue = await atlas.call('jira.issue.get', { key: 'ABC-1' });\nreturn issue;\n";
-/// How long the mock holds the issue answer: longer than any flow below waits for the listing.
-const SLOW_SINK: Duration = Duration::from_secs(120);
+/// How long the mock holds the issue answer. The app's own per-call HTTP timeout (30 s) ends the
+/// call first; the flows kill within [`KILL_PATH_MAX`] of seeing the run live, so the delay only
+/// has to outlast that, and stays bounded so a leaked mock request cannot linger.
+const SLOW_SINK: Duration = Duration::from_secs(45);
+/// The longest the click on Kill may come after the run was seen live (the app's per-call timeout
+/// is 30 s: beyond this a "kill" could not be told from the run ending by itself).
+const KILL_PATH_MAX: Duration = Duration::from_secs(20);
 /// P-01's script result: 200 issue summaries with 6 fields each (§1.4 SC3), built by the script
 /// itself (no host call: the webview half measures the card, not the fetch).
 const ROWS_SCRIPT: &str = "const rows = [];\n\
@@ -2025,29 +2030,37 @@ async fn live_script(rig: &Rig) -> Result<tokio::process::Child> {
 }
 
 /// The shared half of S-09 and X-11: the run is listed (and the window reports no policy
-/// violation), Approvals shows no item for it while it runs, Kill in the window answers "Kill
-/// requested", the list empties and the window still reports no violation and no alert, and the
-/// run's release item appears in Approvals. Returns the held CLI (its request is still undecided);
+/// violation), Kill in the window is clicked at once (guarded: the run must still be listed, and the
+/// click must come well within the app's 30 s call timeout) and answers "Kill requested", the list
+/// empties and the window still reports no violation and no alert, and the run's release item
+/// appears in Approvals. Returns the held CLI (its request is still undecided);
 /// the driver is in Approvals.
 async fn kill_from_window(rig: &Rig) -> Result<tokio::process::Child> {
     let wd = &rig.wd;
     let cli = live_script(rig).await?;
-    // The isolation origin's frame is up while the live run is listed: no CSP report so far.
+    let listed = Instant::now();
+    // The shortest path to the kill: the app gives every host call 30 s, then the run ends by
+    // itself, so nothing but one window-local check sits between the listing and the click.
+    // No CSP report so far (the window's own counter, same window: one driver round trip).
     no_alert_no_violation(wd, "Running scripts (live run)").await?;
-
-    // A run in progress is no release item yet: the item below is what the kill made.
-    rig.to_approvals().await?;
-    let early = wd.find_all("div.queue-item").await?;
-    let text = body_text(wd).await?;
-    ensure!(
-        early.is_empty() && !text.contains("script.run"),
-        "Approvals lists an item while the script still runs: {text}"
-    );
-
-    rig.open_window("Running scripts", "Running scripts")
-        .await?;
-    let kill = wd.wait_find_xpath(RUNNING_KILL_XPATH, WAIT).await?;
+    // Structural guard: the run must still be listed (its Kill button there), else the slow
+    // sink did not hold the call long enough and the kill below would test nothing.
+    let Ok(kill) = wd.find_xpath(RUNNING_KILL_XPATH).await else {
+        return Err(format!(
+            "the run was no longer listed {:?} after it was seen live (its host call probably \
+             timed out): {}",
+            listed.elapsed(),
+            body_text(wd).await.unwrap_or_default()
+        )
+        .into());
+    };
     wd.click(&kill).await?;
+    ensure!(
+        listed.elapsed() < KILL_PATH_MAX,
+        "the kill came {:?} after the run was seen live: too close to the app's 30 s call \
+         timeout to tell a kill from a timeout",
+        listed.elapsed()
+    );
     wait_text(wd, "the kill answer and an empty list", WAIT, |t| {
         t.contains("Kill requested") && t.contains("No scripts are running.")
     })
@@ -2171,9 +2184,12 @@ async fn p01_script(rig: &Rig) -> Result<()> {
     let text = first_preview_text(wd, Duration::from_secs(10), None).await?;
     let took = started.elapsed();
     println!("P01 script_200_rows {} ms", took.as_millis());
+    // Completeness: the first screen may be the header facts table; the last result row arrives
+    // when the document is parsed (bounded wait, after the budget was taken).
+    let full = preview_text_containing(wd, "Issue 199", WAIT).await;
     ensure!(
-        text.contains("Issue 199"),
-        "the card does not show the last row: {text}"
+        full.is_ok(),
+        "the card does not show the last row (Issue 199): first screen: {text}"
     );
     ensure!(
         took <= P01_BUDGET,
@@ -2181,6 +2197,30 @@ async fn p01_script(rig: &Rig) -> Result<()> {
         took.as_millis()
     );
     Ok(())
+}
+
+/// Waits (bounded) until the preview frame's text contains `needle`.
+async fn preview_text_containing(wd: &WebDriver, needle: &str, within: Duration) -> Result<String> {
+    wait_for(
+        &format!("'{needle}' in the preview frame"),
+        within,
+        || async {
+            let frames = wd.find_all("iframe[title='Preview']").await?;
+            let Some(frame) = frames.first() else {
+                return Ok(None);
+            };
+            if wd.switch_to_frame(frame).await.is_err() {
+                return Ok(None);
+            }
+            let text = body_text(wd).await;
+            back_to_top(wd).await?;
+            Ok(match text {
+                Ok(t) if t.contains(needle) => Some(t),
+                _ => None,
+            })
+        },
+    )
+    .await
 }
 
 // ---- I-40 (Windows): WM_QUERYENDSESSION runs the shutdown path ----------------------------------------
