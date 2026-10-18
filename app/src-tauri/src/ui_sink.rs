@@ -65,6 +65,18 @@ pub fn emit_wizard_changed<R: Runtime>(app: &AppHandle<R>) {
     EventOut::emit(app, EVENT_WIZARD_CHANGED, Value::Null);
 }
 
+/// Tells every listening window that a status line may have changed (`status_banner`, no line
+/// named): the header reads `app_status` again. For the lines the app derives itself
+/// (`scripts_degraded` when the probe report lands or the degraded setting flips,
+/// `updated_restart` when the glue finds the sandbox binary replaced); core's own lines go through
+/// its `UiSink`.
+pub fn emit_status_changed(out: &dyn EventOut) {
+    let (name, payload) = wire(&UiEvent::StatusBanner {
+        line_ids: Vec::new(),
+    });
+    out.emit(name, payload);
+}
+
 /// The C.10 event name and payload of a core event.
 pub fn wire(e: &UiEvent) -> (&'static str, Value) {
     match e {
@@ -196,6 +208,19 @@ mod tests {
             v.push(UiEvent::Attention { kind, count: 2 });
         }
         v
+    }
+
+    /// The app's own status lines ask the header to re-read through the event it already
+    /// listens to, with no line named and nothing else in the payload.
+    #[test]
+    fn status_changed_is_the_status_banner_event_without_a_line() {
+        let out = Recorder::default();
+        emit_status_changed(&out);
+        let got = out.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(
+            got,
+            vec![("status_banner".to_owned(), json!({ "line_ids": [] }))]
+        );
     }
 
     #[test]

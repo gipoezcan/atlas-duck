@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use atlas_duck_app_lib::diag::{ALLOWED_FIELDS, Diag, LOG_DIR_NAME, fields, scan_logs_for};
-#[cfg(windows)]
 use atlas_duck_app_lib::sandbox_probe::AceEnsure;
 use atlas_duck_app_lib::sandbox_probe::{
     LOG_EVENT_SANDBOX_PROBE, PROBE_LOG_FIELDS, PROBE_THREAD_NAME, ace_label, extra_layers_label,
@@ -329,6 +328,66 @@ fn spawn_startup_probe_with_does_not_block_setup() {
         state.probe_report().map(|r| &r.floor),
         Some(&FloorVerdict::Met)
     );
+}
+
+/// T21 review I-2: the report landing is announced to the windows (`status_banner`), so the
+/// header's `scripts_degraded` line does not wait for an unrelated refresh.
+#[test]
+fn the_landing_report_asks_the_windows_to_refresh_the_status() {
+    use tauri::Listener;
+
+    let (seen_tx, seen_rx) = mpsc::channel::<String>();
+    let (handle_tx, handle_rx) = mpsc::channel();
+    let app = mock_app_with(move |app| {
+        app.listen("status_banner", move |event| {
+            let _ = seen_tx.send(event.payload().to_owned());
+        });
+        let handle = spawn_startup_probe_with(app, || {
+            (
+                empty_report(FloorVerdict::NotMet {
+                    failed: vec![ProbeId::FileInProfile],
+                }),
+                None,
+            )
+        })
+        .expect("spawn probe thread");
+        handle_tx.send(handle).unwrap();
+    });
+    handle_rx.recv().unwrap().join().unwrap();
+    let payload = seen_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("no status_banner after the report landed");
+    assert_eq!(payload, r#"{"line_ids":[]}"#);
+    assert!(app.state::<AppState>().probe_report().is_some());
+}
+
+/// T21 review I-4: a probe job that panics leaves no report and no start mark, and the waits for
+/// the report end at once instead of running out the 5 s.
+#[test]
+fn a_panicking_probe_job_abandons_the_wait() {
+    let (handle_tx, handle_rx) = mpsc::channel();
+    let app = mock_app_with(move |app| {
+        let handle = spawn_startup_probe_with(app, || -> (ProbeReport, Option<AceEnsure>) {
+            panic!("the probe job failed")
+        })
+        .expect("spawn probe thread");
+        handle_tx.send(handle).unwrap();
+    });
+    // Whether the thread unwinds past the job or ends cleanly is not what is asserted.
+    let _ = handle_rx.recv().unwrap().join();
+    let state = app.state::<AppState>();
+    assert!(state.probe_report().is_none());
+    assert!(
+        !state.probe.has_started(),
+        "a start with nothing to wait for"
+    );
+    let waited = tauri::async_runtime::block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            state.probe.wait(Duration::from_secs(30)).await.is_some()
+        })
+        .await
+    });
+    assert!(matches!(waited, Ok(false)), "the wait outlived the probe");
 }
 
 #[test]

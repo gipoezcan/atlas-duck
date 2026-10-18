@@ -6,8 +6,9 @@
 //! whether scripts are enabled.
 
 use std::io;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -71,11 +72,13 @@ pub struct ProbeHolder {
     /// ([`FallbackIdentity`]); `None`: none is recorded.
     worker: Option<PathBuf>,
     resolved: OnceLock<Resolved>,
-    /// Flipped to `true` right after `resolved` is set.
+    /// Flipped to `true` right after `resolved` is set, or by [`ProbeHolder::abandon`] (the waits
+    /// then end with the report still missing).
     ready: watch::Sender<bool>,
     /// When the probe thread was started (R1: the `APP_START` wait is measured from here); unset
-    /// where no probe is started (CLI paths, tests): there is nothing to wait for then.
-    started: OnceLock<Instant>,
+    /// where no probe is started (CLI paths, tests) or after the probe thread was lost: there is
+    /// nothing to wait for then.
+    started: Mutex<Option<Instant>>,
 }
 
 #[derive(Debug)]
@@ -130,13 +133,38 @@ impl ProbeHolder {
             worker,
             resolved: OnceLock::new(),
             ready: watch::channel(false).0,
-            started: OnceLock::new(),
+            started: Mutex::new(None),
         }
+    }
+
+    fn started_at(&self) -> Option<Instant> {
+        *self.started.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Records the instant the probe thread was started (the first call wins).
     pub fn mark_started(&self, at: Instant) {
-        let _ = self.started.set(at);
+        self.started
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(at);
+    }
+
+    /// Whether a start is recorded (a wait for the report is due).
+    pub fn has_started(&self) -> bool {
+        self.started_at().is_some()
+    }
+
+    /// How many [`ProbeHolder::wait`] calls are parked on the report right now.
+    #[cfg(test)]
+    pub(crate) fn waiters(&self) -> usize {
+        self.ready.receiver_count()
+    }
+
+    /// The probe thread ended without a report (it panicked): nothing is coming, so no wait is
+    /// due any more and the waits in progress end now. The report stays missing (fail closed).
+    pub fn abandon(&self) {
+        *self.started.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.ready.send_replace(true);
     }
 
     /// Waits for the report at most as long as `APP_START` may (R1, PD-138): [`APP_START_WAIT`]
@@ -144,7 +172,7 @@ impl ProbeHolder {
     /// the store verification that ran before it. Nothing is waited for when no probe was started or
     /// the report is there. Never fails: a report that is still missing is `pending` in `APP_START`.
     pub async fn wait_for_app_start(&self) {
-        let left = app_start_wait_left(self.started.get().copied(), Instant::now());
+        let left = app_start_wait_left(self.started_at(), Instant::now());
         if !left.is_zero() {
             let _ = self.wait(left).await;
         }
@@ -214,7 +242,7 @@ const MEMORY_READ_PROBES: [ProbeId; 4] = [
     ProbeId::OpenProcessVmRead,
 ];
 
-/// `memory_read` value: every memory-read probe was blocked.
+/// `memory_read` value: every memory-read probe of the OS was blocked.
 pub const MEMORY_READ_BLOCKED: &str = "blocked";
 /// `memory_read` value: a memory-read probe got through.
 pub const MEMORY_READ_ALLOWED: &str = "allowed";
@@ -223,9 +251,27 @@ pub const MEMORY_READ_ALLOWED: &str = "allowed";
 pub const MEMORY_READ_INCONCLUSIVE: &str = "inconclusive";
 
 /// The S-05 memory-read result of `report`, failing closed: `allowed` when any memory-read probe
-/// got through; `blocked` only when at least one was scored, every scored one was `Blocked` and the
-/// floor lists none of them as failed; `inconclusive` otherwise.
+/// got through; `blocked` only when every probe this OS runs ([`expected_memory_read_probes`]) has
+/// a `Blocked` record, no scored one is anything else and the floor lists none of them as failed;
+/// `inconclusive` otherwise (including a probe that was never scored).
 pub fn memory_read_label(report: &ProbeReport) -> &'static str {
+    memory_read_label_for(report, expected_memory_read_probes())
+}
+
+/// The memory-read probes the worker runs on this OS (§9.4): Linux `process_vm_readv` and
+/// `/proc/<app pid>/mem`, macOS `task_for_pid`, Windows `OpenProcess(PROCESS_VM_READ)`.
+pub fn expected_memory_read_probes() -> &'static [ProbeId] {
+    if cfg!(target_os = "linux") {
+        &[ProbeId::MemReadProcessVm, ProbeId::MemReadProcMem]
+    } else if cfg!(target_os = "macos") {
+        &[ProbeId::TaskForPid]
+    } else {
+        &[ProbeId::OpenProcessVmRead]
+    }
+}
+
+/// [`memory_read_label`] against an explicit set of `expected` probes.
+pub fn memory_read_label_for(report: &ProbeReport, expected: &[ProbeId]) -> &'static str {
     let mut scored = false;
     let mut all_blocked = true;
     for record in report
@@ -244,15 +290,28 @@ pub fn memory_read_label(report: &ProbeReport) -> &'static str {
         &report.floor,
         FloorVerdict::NotMet { failed } if failed.iter().any(|p| MEMORY_READ_PROBES.contains(p))
     );
-    if scored && all_blocked && !floor_failed {
+    // §9.4 runs every probe of the OS (Linux: two): one `Blocked` record among several is no
+    // evidence for the others.
+    let complete = !expected.is_empty()
+        && expected.iter().all(|p| {
+            report
+                .records
+                .iter()
+                .any(|r| r.probe == *p && matches!(r.outcome, ProbeOutcome::Blocked))
+        });
+    if scored && all_blocked && !floor_failed && complete {
         MEMORY_READ_BLOCKED
     } else {
         MEMORY_READ_INCONCLUSIVE
     }
 }
 
+/// The longest embedded version `APP_START` records as it is.
+pub const EMBEDDED_VERSION_MAX_CHARS: usize = 64;
+
 /// `{file_id, size, mtime, embedded_version}` of a recorded identity: constants and numbers only,
-/// no path. `file_id` is a string (`dev_ino:<dev>:<ino>`, `file_index:<volume>:<index>`: the ids
+/// no path. The embedded version is the probe worker's own text, so it is recorded only as a
+/// short printable-ASCII string; any other is `unrecognized:<byte length>`. `file_id` is a string (`dev_ino:<dev>:<ino>`, `file_index:<volume>:<index>`: the ids
 /// can exceed what a JSON number holds exactly), `mtime` whole seconds since the Unix epoch
 /// (`null` before it).
 fn identity_json(identity: &SandboxBinaryIdentity) -> Value {
@@ -272,8 +331,19 @@ fn identity_json(identity: &SandboxBinaryIdentity) -> Value {
         "file_id": file_id,
         "size": identity.size,
         "mtime": mtime,
-        "embedded_version": identity.embedded_version,
+        "embedded_version": bounded_version(&identity.embedded_version),
     })
+}
+
+/// `version` as it is when it is at most [`EMBEDDED_VERSION_MAX_CHARS`] printable ASCII bytes,
+/// else `unrecognized:<byte length>` (the length is the only thing taken from the text).
+fn bounded_version(version: &str) -> String {
+    let printable = version.bytes().all(|b| (0x20..=0x7e).contains(&b));
+    if printable && !version.is_empty() && version.len() <= EMBEDDED_VERSION_MAX_CHARS {
+        version.to_owned()
+    } else {
+        format!("unrecognized:{}", version.len())
+    }
 }
 
 /// The `confinement` key of `APP_START` (R1, S-05, §9.4 "results recorded in `APP_START`"): while
@@ -541,27 +611,52 @@ where
     F: FnOnce() -> (ProbeReport, Option<AceEnsure>) + Send + 'static,
 {
     let handle = app.clone();
-    // R1: the `APP_START` wait counts from here (before the thread exists, so it never undercounts).
-    if let Some(state) = app.try_state::<AppState>() {
-        state.probe.mark_started(Instant::now());
-    }
-    std::thread::Builder::new()
-        .name(PROBE_THREAD_NAME.to_owned())
-        .spawn(move || {
-            let (report, ace) = job();
-            log_probe_report(&report, ace.as_ref());
-            match handle.try_state::<AppState>() {
-                Some(state) => {
-                    // The report is set once per process (R10: one probe per start, which
-                    // the first script awaits through the same holder).
-                    let _ = state.probe.set(report);
+    let holder = app.try_state::<AppState>().map(|s| s.probe.clone());
+    spawn_marked(holder.as_deref(), || {
+        std::thread::Builder::new()
+            .name(PROBE_THREAD_NAME.to_owned())
+            .spawn(move || {
+                // A job that panics leaves no report: the waits for it end (fail closed) instead
+                // of running out the bound, and the log says so.
+                let Ok((report, ace)) = catch_unwind(AssertUnwindSafe(job)) else {
+                    tracing::error!(event = LOG_EVENT_SANDBOX_PROBE, reason = "probe_panicked");
+                    if let Some(state) = handle.try_state::<AppState>() {
+                        state.probe.abandon();
+                    }
+                    return;
+                };
+                log_probe_report(&report, ace.as_ref());
+                match handle.try_state::<AppState>() {
+                    Some(state) => {
+                        // The report is set once per process (R10: one probe per start, which
+                        // the first script awaits through the same holder).
+                        let _ = state.probe.set(report);
+                        // `scripts_degraded` is derived from the report: the header re-reads.
+                        crate::ui_sink::emit_status_changed(&handle);
+                    }
+                    None => tracing::warn!(
+                        event = LOG_EVENT_SANDBOX_PROBE,
+                        reason = "app_state_missing"
+                    ),
                 }
-                None => tracing::warn!(
-                    event = LOG_EVENT_SANDBOX_PROBE,
-                    reason = "app_state_missing"
-                ),
-            }
-        })
+            })
+    })
+}
+
+/// Runs `spawn` (which starts the probe thread) and records the start in `holder` once the thread
+/// exists. R1: the `APP_START` wait counts from the probe's start; a failed spawn leaves no start,
+/// so the first core start does not wait for a report that cannot come. The mark follows the spawn
+/// by a few instructions on the caller's thread, so it cannot be missed by a core start.
+fn spawn_marked(
+    holder: Option<&ProbeHolder>,
+    spawn: impl FnOnce() -> io::Result<JoinHandle<()>>,
+) -> io::Result<JoinHandle<()>> {
+    let started = Instant::now();
+    let thread = spawn()?;
+    if let Some(holder) = holder {
+        holder.mark_started(started);
+    }
+    Ok(thread)
 }
 
 /// `snake_case` name of a probe id, the same spelling serde gives it.
@@ -794,9 +889,27 @@ mod tests {
         let t = Instant::now();
         tokio::time::timeout(bound, pending.wait_for_app_start()).await?;
         let waited = t.elapsed();
-        assert!(waited >= Duration::from_millis(200), "{waited:?}");
         assert!(waited < Duration::from_secs(3), "{waited:?}");
         assert!(pending.get().is_none());
+
+        // Started 4 s ago: a wait is due. That it is made (not skipped) is shown by a report that
+        // lands while it is parked: the call returns with it, however long the scheduling took.
+        let Some(four) = ago(4.0) else {
+            return Ok(());
+        };
+        let due = Arc::new(ProbeHolder::default());
+        due.mark_started(four);
+        let parked = due.clone();
+        let late = tokio::spawn(async move {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while parked.waiters() == 0 && Instant::now() < deadline {
+                tokio::task::yield_now().await;
+            }
+            parked.set(report(FloorVerdict::Met, Vec::new()))
+        });
+        tokio::time::timeout(bound, due.wait_for_app_start()).await?;
+        assert!(due.get().is_some(), "the wait was skipped");
+        assert!(tokio::time::timeout(bound, late).await??);
 
         // Started now, the report lands after 100 ms: the wait ends then, not after 5 s.
         let holder = Arc::new(ProbeHolder::default());
@@ -918,8 +1031,157 @@ mod tests {
             ),
         ];
         for (r, want, why) in table {
-            assert_eq!(memory_read_label(&r), want, "{why}");
+            // The outcome rules, with the probes the report scored as the expected set.
+            let scored: Vec<ProbeId> = r
+                .records
+                .iter()
+                .map(|x| x.probe)
+                .filter(|p| MEMORY_READ_PROBES.contains(p))
+                .collect();
+            assert_eq!(memory_read_label_for(&r, &scored), want, "{why}");
         }
+    }
+
+    /// §9.4: Linux runs both `process_vm_readv` and `/proc/<pid>/mem`; `blocked` needs a `Blocked`
+    /// record from every probe the OS runs, so a missing record is `inconclusive`.
+    #[test]
+    fn memory_read_blocked_needs_every_probe_of_the_platform() {
+        use ProbeOutcome::Blocked;
+        let linux = [ProbeId::MemReadProcessVm, ProbeId::MemReadProcMem];
+        let both = report(
+            FloorVerdict::Met,
+            vec![
+                record(ProbeId::MemReadProcessVm, Blocked),
+                record(ProbeId::MemReadProcMem, Blocked),
+            ],
+        );
+        assert_eq!(memory_read_label_for(&both, &linux), MEMORY_READ_BLOCKED);
+        for (only, why) in [
+            (ProbeId::MemReadProcessVm, "process_vm_readv only"),
+            (ProbeId::MemReadProcMem, "/proc/<pid>/mem only"),
+        ] {
+            let r = report(FloorVerdict::Met, vec![record(only, Blocked)]);
+            assert_eq!(
+                memory_read_label_for(&r, &linux),
+                MEMORY_READ_INCONCLUSIVE,
+                "{why}"
+            );
+        }
+        let mac = report(
+            FloorVerdict::Met,
+            vec![record(ProbeId::TaskForPid, Blocked)],
+        );
+        assert_eq!(
+            memory_read_label_for(&mac, &[ProbeId::TaskForPid]),
+            MEMORY_READ_BLOCKED
+        );
+        // The probes of another OS do not stand in for this one's.
+        assert_eq!(
+            memory_read_label_for(&mac, &linux),
+            MEMORY_READ_INCONCLUSIVE
+        );
+        // No expected probe at all is no evidence.
+        assert_eq!(memory_read_label_for(&mac, &[]), MEMORY_READ_INCONCLUSIVE);
+        // This OS's own set is the one `memory_read_label` asks for.
+        let own: Vec<ProbeRecord> = expected_memory_read_probes()
+            .iter()
+            .map(|p| record(*p, Blocked))
+            .collect();
+        assert!(!own.is_empty());
+        assert_eq!(
+            memory_read_label(&report(FloorVerdict::Met, own)),
+            MEMORY_READ_BLOCKED
+        );
+    }
+
+    /// I-1: the embedded version is worker text (the probe worker's ready frame, up to 1 MiB): only
+    /// a short printable-ASCII one reaches `APP_START`; anything else is a marker and its length.
+    #[test]
+    fn identity_json_bounds_the_worker_version() {
+        let with = |version: String| {
+            identity_json(&SandboxBinaryIdentity {
+                file_id: FileId::DevIno { dev: 1, ino: 2 },
+                size: 3,
+                mtime: SystemTime::UNIX_EPOCH,
+                embedded_version: version,
+            })["embedded_version"]
+                .clone()
+        };
+        let edge = "v".repeat(EMBEDDED_VERSION_MAX_CHARS);
+        assert_eq!(with(edge.clone()), json!(edge));
+        assert_eq!(with("1.2.3-abc+4 (x)".to_owned()), json!("1.2.3-abc+4 (x)"));
+        let long = "v".repeat(1024 * 1024);
+        let got = with(long);
+        let text = got.as_str().unwrap_or_default();
+        assert_eq!(text, format!("unrecognized:{}", 1024 * 1024), "{got}");
+        assert!(text.len() <= EMBEDDED_VERSION_MAX_CHARS);
+        let over = "v".repeat(EMBEDDED_VERSION_MAX_CHARS + 1);
+        assert_eq!(
+            with(over),
+            json!(format!("unrecognized:{}", EMBEDDED_VERSION_MAX_CHARS + 1))
+        );
+        for hostile in [
+            "v1\nforged: line",
+            "v1\r\n",
+            "v\u{0}1",
+            "v1\u{1b}[31m",
+            "v1\u{7f}",
+            "v\u{202e}1",
+            "vé1",
+        ] {
+            assert_eq!(
+                with(hostile.to_owned()),
+                json!(format!("unrecognized:{}", hostile.len())),
+                "{hostile:?}"
+            );
+        }
+        assert_eq!(with(String::new()), json!("unrecognized:0"));
+    }
+
+    /// I-4: the start is recorded only for a probe thread that exists: a failed spawn leaves none,
+    /// so the first core start does not wait for a report that cannot come.
+    #[test]
+    fn a_failed_probe_thread_spawn_leaves_no_start_mark() -> TestResult {
+        let holder = ProbeHolder::default();
+        let failed = spawn_marked(Some(&holder), || Err(io::Error::other("no threads")));
+        assert!(failed.is_err());
+        assert!(!holder.has_started());
+
+        let handle = spawn_marked(Some(&holder), || Ok(std::thread::spawn(|| {})))?;
+        assert!(holder.has_started());
+        handle.join().map_err(|_| "the thread panicked")?;
+        // No holder (no `AppState`): nothing to record, and the thread still starts.
+        spawn_marked(None, || Ok(std::thread::spawn(|| {})))?
+            .join()
+            .map_err(|_| "the thread panicked")?;
+        Ok(())
+    }
+
+    /// I-4: a probe that ended without a report ends the waits and the start mark.
+    #[tokio::test]
+    async fn an_abandoned_probe_ends_the_wait_and_clears_the_start() -> TestResult {
+        let holder = Arc::new(ProbeHolder::default());
+        holder.mark_started(Instant::now());
+        let waiting = holder.clone();
+        let waiter = tokio::spawn(async move {
+            // A wait that is not ended by the abandon times out here, as an assertion below.
+            let bound = Duration::from_secs(5);
+            tokio::time::timeout(bound, async { waiting.wait(bound).await.is_some() }).await
+        });
+        // The waiter is parked on the report (structural, no sleep): then the probe dies.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while holder.waiters() == 0 && Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(holder.waiters(), 1, "the waiter never parked");
+        holder.abandon();
+        let ended = tokio::time::timeout(Duration::from_secs(30), waiter).await??;
+        assert!(matches!(ended, Ok(false)), "the wait outlived the probe");
+        assert!(!holder.has_started());
+        // A later start-time wait returns at once and the report stays missing.
+        tokio::time::timeout(Duration::from_secs(30), holder.wait_for_app_start()).await?;
+        assert!(holder.get().is_none());
+        Ok(())
     }
 
     /// `scripts` as the Settings DTO and the status line see it: only a `NotMet` floor with the

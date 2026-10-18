@@ -92,7 +92,45 @@ pub fn compile_deadline(limits: &ScriptLimits) -> Duration {
 pub struct ScriptInputs {
     pub probe: Arc<ProbeHolder>,
     pub update_pending: Arc<AtomicBool>,
+    /// Told when `update_pending` is set, so the status line `updated_restart` appears without
+    /// waiting for an unrelated refresh.
+    pub status: StatusPing,
     pub instances: InstanceSource,
+}
+
+/// The update flag with the status ping that goes with raising it.
+#[derive(Clone)]
+struct UpdateFlag {
+    flag: Arc<AtomicBool>,
+    ping: StatusPing,
+}
+
+impl UpdateFlag {
+    /// Sets the flag; the first time, the status refresh is asked for (the flag stays set).
+    fn raise(&self) {
+        if !self.flag.swap(true, Ordering::SeqCst) {
+            self.ping.fire();
+        }
+    }
+}
+
+/// A callback the app sets once (the header's status refresh); until then, and in tests that set
+/// none, firing it does nothing.
+#[derive(Clone, Default)]
+pub struct StatusPing(Arc<OnceLock<Box<dyn Fn() + Send + Sync>>>);
+
+impl StatusPing {
+    /// Sets the callback once; a later one is ignored.
+    pub fn set(&self, ping: impl Fn() + Send + Sync + 'static) {
+        let _ = self.0.set(Box::new(ping));
+    }
+
+    /// Calls the callback, if one is set.
+    pub fn fire(&self) {
+        if let Some(ping) = self.0.get() {
+            ping();
+        }
+    }
 }
 
 type InstanceList = dyn Fn() -> Vec<InstanceInfo> + Send + Sync;
@@ -348,6 +386,13 @@ impl ScriptGlue {
         self.inputs.update_pending.load(Ordering::SeqCst)
     }
 
+    fn update_flag(&self) -> UpdateFlag {
+        UpdateFlag {
+            flag: self.inputs.update_pending.clone(),
+            ping: self.inputs.status.clone(),
+        }
+    }
+
     /// What a spawn under `policy` is admitted under, and the worker to spawn: the update flag,
     /// the startup report (awaited, PD-138), the floor rule (PD-141) and the identity re-check of
     /// the binary on disk (PD-133), in that order.
@@ -394,7 +439,7 @@ impl ScriptGlue {
         match tokio::task::spawn_blocking(move || identity::recheck(&recorded, &path)).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(m)) => {
-                upgraded(&self.inputs.update_pending, m.what, request_id);
+                upgraded(&self.update_flag(), m.what, request_id);
                 Err(UnavailableReason::AppUpgraded)
             }
             Err(_) => {
@@ -407,13 +452,9 @@ impl ScriptGlue {
 
 /// Logs a bridge refusal (constants only), sets the update flag for an identity mismatch, and
 /// names the refusal in core's words.
-fn refused(
-    update_pending: &AtomicBool,
-    e: &StartRunError,
-    request_id: Option<&str>,
-) -> UnavailableReason {
+fn refused(update: &UpdateFlag, e: &StartRunError, request_id: Option<&str>) -> UnavailableReason {
     match e {
-        StartRunError::IdentityMismatch { what } => upgraded(update_pending, *what, request_id),
+        StartRunError::IdentityMismatch { what } => upgraded(update, *what, request_id),
         StartRunError::FloorNotMet => spawn_failed(REASON_FLOOR_NOT_MET, request_id),
         StartRunError::Spawn(kind) => {
             tracing::warn!(event = LOG_EVENT_SPAWN_FAILED, reason = ?kind, request_id);
@@ -459,11 +500,11 @@ impl ScriptRunner for ScriptGlue {
         // that comes after the deadline (creating the first spawner can take seconds) still sets
         // the update flag and is logged (T20 review m-3).
         let port = self.port.clone();
-        let update_pending = self.inputs.update_pending.clone();
+        let update = self.update_flag();
         let call = tokio::spawn(async move {
             let answer = port.compile(job).await;
             if let Err(e) = &answer {
-                refused(&update_pending, e, None);
+                refused(&update, e, None);
             }
             answer
         });
@@ -529,12 +570,12 @@ impl ScriptRunner for ScriptGlue {
             Ok(control) => Ok(Arc::new(RunHandleGlue {
                 control,
                 request_id,
-                update_pending: self.inputs.update_pending.clone(),
+                update: self.update_flag(),
                 end: tokio::sync::OnceCell::new(),
                 worker: OnceLock::new(),
             })),
             Err(e) => Err(map::runner_error(refused(
-                &self.inputs.update_pending,
+                &self.update_flag(),
                 &e,
                 Some(&request_id),
             ))),
@@ -564,7 +605,7 @@ impl HostCallSink for CallsSink {
 struct RunHandleGlue {
     control: Arc<dyn RunControl>,
     request_id: String,
-    update_pending: Arc<AtomicBool>,
+    update: UpdateFlag,
     /// The run's end, mapped once.
     end: tokio::sync::OnceCell<RunEnd>,
     /// The worker's own ready-frame report, known once `wait` returned.
@@ -581,7 +622,7 @@ impl RunHandleGlue {
             log_diag(&self.request_id, &outcome.diag);
             if let HostVerdict::NotSpawned(StartRunError::IdentityMismatch { what }) = outcome.host
             {
-                upgraded(&self.update_pending, what, Some(&self.request_id));
+                upgraded(&self.update, what, Some(&self.request_id));
             }
         }
         // Only a result needs the one parse (up to `max_result_mb`: CPU work, off the runtime
@@ -631,8 +672,8 @@ fn spawn_failed(reason: &'static str, request_id: Option<&str>) {
 
 /// PD-133: the binary was replaced (or could not be confirmed); the flag stays set until restart.
 /// The log line names the part that did not match ([`map::identity_reason`]).
-fn upgraded(update_pending: &AtomicBool, what: IdentityPart, request_id: Option<&str>) {
-    update_pending.store(true, Ordering::SeqCst);
+fn upgraded(update: &UpdateFlag, what: IdentityPart, request_id: Option<&str>) {
+    update.raise();
     tracing::warn!(
         event = LOG_EVENT_IDENTITY_MISMATCH,
         reason = map::identity_reason(what),

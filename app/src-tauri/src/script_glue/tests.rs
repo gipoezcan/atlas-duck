@@ -665,6 +665,47 @@ async fn maps_outcomes_to_run_end() -> TestResult {
     Ok(())
 }
 
+/// T21 review I-2: the mismatch that sets the update flag also tells the app (the header's status
+/// refresh), once: a flag that is already set is not announced again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn glue_pings_the_status_when_the_update_flag_is_set() -> TestResult {
+    bounded(async {
+        use std::sync::atomic::AtomicUsize;
+
+        let dir = Scratch::new("ping")?;
+        let worker = dir.file("atlas-duck-sandbox");
+        fs::write(&worker, b"worker")?;
+        let inputs = ScriptInputs::default();
+        let pings = Arc::new(AtomicUsize::new(0));
+        let counted = pings.clone();
+        inputs.status.set(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        let _ = inputs.probe.set(report_for(&worker, FloorVerdict::Met)?);
+        let g = ScriptGlue::with_port(FakePort::new(), Some(worker.clone()), inputs);
+        assert_eq!(g.check_available(off()).await, Ok(()));
+        assert_eq!(pings.load(Ordering::SeqCst), 0, "nothing flipped yet");
+        replace(&worker)?;
+        assert_eq!(
+            g.check_available(off()).await,
+            Err(unavailable(UnavailableReason::AppUpgraded))
+        );
+        assert!(g.update_pending());
+        assert_eq!(
+            pings.load(Ordering::SeqCst),
+            1,
+            "the flip was not announced"
+        );
+        assert_eq!(
+            g.check_available(off()).await,
+            Err(unavailable(UnavailableReason::AppUpgraded))
+        );
+        assert_eq!(pings.load(Ordering::SeqCst), 1, "announced twice");
+        Ok(())
+    })
+    .await
+}
+
 /// PD-133: the file identity is checked at submit and again before every spawn; a mismatch
 /// spawns nothing, answers `app_upgraded` and keeps every later script refused until restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

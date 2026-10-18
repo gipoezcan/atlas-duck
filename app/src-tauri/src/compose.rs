@@ -416,7 +416,7 @@ mod tests {
         memory: atlas_duck_ipc::sandbox::probe::ProbeOutcome,
         with_identity: bool,
     ) -> Result<atlas_duck_sandbox_host::probe::ProbeReport, Box<dyn std::error::Error>> {
-        use atlas_duck_ipc::sandbox::probe::ProbeId;
+        use crate::sandbox_probe::expected_memory_read_probes;
         use atlas_duck_sandbox_host::identity::{SandboxBinaryIdentity, file_identity};
         use atlas_duck_sandbox_host::probe::{Evidence, ProbeRecord, ProbeReport};
 
@@ -438,11 +438,15 @@ mod tests {
             identity,
             confinement: None,
             threads: None,
-            records: vec![ProbeRecord {
-                probe: ProbeId::OpenProcessVmRead,
-                outcome: memory,
-                evidence: Evidence::Reported { os_error: None },
-            }],
+            // Every memory-read probe this OS runs, with the same outcome.
+            records: expected_memory_read_probes()
+                .iter()
+                .map(|probe| ProbeRecord {
+                    probe: *probe,
+                    outcome: memory,
+                    evidence: Evidence::Reported { os_error: None },
+                })
+                .collect(),
             floor,
             extra_layers: vec![("landlock".to_owned(), true)],
             control: None,
@@ -455,7 +459,8 @@ mod tests {
     /// fixed words and numbers (no path).
     #[test]
     fn app_start_records_probe_when_ready() -> TestResult {
-        use atlas_duck_ipc::sandbox::probe::{ProbeId, ProbeOutcome};
+        use crate::sandbox_probe::{expected_memory_read_probes, probe_id_name};
+        use atlas_duck_ipc::sandbox::probe::ProbeOutcome;
         use atlas_duck_sandbox_host::probe::FloorVerdict;
         use serde_json::json;
 
@@ -504,19 +509,21 @@ mod tests {
 
         // S-05: a failed memory read and a floor that is not met are recorded as such.
         let failed = ProbeHolder::default();
+        let memory_probes = expected_memory_read_probes();
         assert!(failed.set(probe_report(
             FloorVerdict::NotMet {
-                failed: vec![ProbeId::OpenProcessVmRead],
+                failed: memory_probes.to_vec(),
             },
             ProbeOutcome::Allowed,
             false,
         )?));
         let extra = app_start_extra(Some(TrayHost::Present), &failed);
+        let names: Vec<&str> = memory_probes.iter().map(|p| probe_id_name(*p)).collect();
         assert_eq!(
             extra.get("confinement"),
             Some(&json!({
                 "floor": "not_met",
-                "failed": ["open_process_vm_read"],
+                "failed": names,
                 "extra_layers": [{"name": "landlock", "on": true}],
                 "mode": "n/a",
                 "memory_read": "allowed",
@@ -564,6 +571,38 @@ mod tests {
         assert_ne!(
             app_start_extra(None, &scripts.probe).get("confinement"),
             Some(&pending)
+        );
+        deps.audit.shutdown();
+        Ok(())
+    }
+
+    /// T21 review M-4: the ready twin of the test above, through `core_deps` (the path `Core::start`
+    /// takes): a report that is in the app's holder when the deps are composed is the one
+    /// `APP_START` carries, not `pending`.
+    #[test]
+    fn core_deps_records_the_probe_report_that_is_there() -> TestResult {
+        use atlas_duck_ipc::sandbox::probe::ProbeOutcome;
+        use atlas_duck_sandbox_host::probe::FloorVerdict;
+
+        let (_dir, _lock, mut inputs) = temp_inputs(None)?;
+        let scripts = ScriptInputs::default();
+        assert!(scripts.probe.set(probe_report(
+            FloorVerdict::Met,
+            ProbeOutcome::Blocked,
+            true
+        )?));
+        inputs.scripts = scripts.clone();
+        let deps = core_deps(inputs)?;
+        let got = deps
+            .app_start_extra
+            .get("confinement")
+            .ok_or("no confinement key")?;
+        assert_eq!(got["floor"], "met", "{got}");
+        assert_eq!(got["memory_read"], "blocked", "{got}");
+        assert!(got["sandbox_binary"]["file_id"].is_string(), "{got}");
+        assert_eq!(
+            Some(got),
+            app_start_extra(None, &scripts.probe).get("confinement")
         );
         deps.audit.shutdown();
         Ok(())

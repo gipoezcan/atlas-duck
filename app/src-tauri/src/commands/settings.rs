@@ -589,6 +589,15 @@ pub fn settings_apply_dto(
     Ok(settings.apply(changes.0)?)
 }
 
+/// Runs `apply` and says whether "allow scripts with degraded confinement" (as `read` reports it)
+/// differs after it. The header's `scripts_degraded` line follows that setting, so a flip must be
+/// announced (`status_banner`); a failed apply that changed nothing is not one.
+pub fn apply_noting_degraded<T>(read: impl Fn() -> bool, apply: impl FnOnce() -> T) -> (T, bool) {
+    let before = read();
+    let result = apply();
+    (result, read() != before)
+}
+
 /// The CA file as Rust read it: a regular file of 1 to [`CA_MAX_BYTES`] bytes. A file the user
 /// chose that is too large, empty, no regular file or unreadable is refused with `use_custom_ca`
 /// (the page says to choose another one); nothing is parsed here, core does and shows what it found.
@@ -810,15 +819,30 @@ pub async fn settings_apply<R: Runtime>(
     args: Args<SettingsApplyArgs>,
 ) -> Result<SettingsView, CommandError> {
     let Args(SettingsApplyArgs { changes }) = args;
+    let mut flipped = false;
     let response = match core(&app) {
         Ok(core) => {
             let settings = core.settings();
-            blocking(move || settings_apply_dto(&*settings, changes)).await
+            blocking(move || {
+                // The header's `scripts_degraded` line follows this setting (T21 review I-2).
+                Ok(apply_noting_degraded(
+                    || settings.view().allow_degraded_scripts,
+                    || settings_apply_dto(&*settings, changes),
+                ))
+            })
+            .await
+            .and_then(|(applied, flip)| {
+                flipped = flip;
+                applied
+            })
         }
         Err(e) => Err(e),
     };
     note_failure(&response);
     emit_settings_changed(&app);
+    if flipped {
+        crate::ui_sink::emit_status_changed(&app);
+    }
     finish(&app, response)
 }
 
@@ -1251,6 +1275,29 @@ mod tests {
                 || page.contains(&format!("\"{HTTPS_REQUIRED_HINT}\"")),
             "the page's copy differs"
         );
+    }
+
+    /// T21 review I-2: a change of the degraded-confinement setting is noted, in either direction;
+    /// a call that leaves it as it was (including one that failed) is not.
+    #[test]
+    fn a_flip_of_the_degraded_setting_is_noted() {
+        use std::cell::Cell;
+
+        let on = Cell::new(false);
+        let (answer, flipped) = apply_noting_degraded(
+            || on.get(),
+            || {
+                on.set(true);
+                7
+            },
+        );
+        assert_eq!((answer, flipped), (7, true), "turned on");
+        let (_, flipped) = apply_noting_degraded(|| on.get(), || on.set(true));
+        assert!(!flipped, "set again to the value it had");
+        let (_, flipped) = apply_noting_degraded(|| on.get(), || on.set(false));
+        assert!(flipped, "turned off");
+        let (_, flipped) = apply_noting_degraded(|| on.get(), || ());
+        assert!(!flipped, "nothing changed");
     }
 
     #[test]

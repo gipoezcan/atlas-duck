@@ -1353,6 +1353,11 @@ pub fn start(
         .try_state::<AppState>()
         .map(|s| s.script_inputs())
         .unwrap_or_default();
+    // The glue raising the update flag (`updated_restart`) asks the header to re-read the status.
+    let status_app = app.clone();
+    scripts
+        .status
+        .set(move || crate::ui_sink::emit_status_changed(&status_app));
     let hooks = ServeHooks {
         watcher: Some(Arc::new(AppWatcher::new(app.clone()))),
         keychain_prompt: slot
@@ -2397,7 +2402,8 @@ mod tests {
             fail_next: None,
         };
 
-        // The probe started just now and reports 1.2 s later, while the core is starting.
+        // The report lands once the starter is parked on it (no wall-clock delay): a starter that
+        // never waits leaves the setter spinning and `APP_START` `pending`.
         let root = tmp.path().join("ready");
         std::fs::create_dir(&root)?;
         let (store, keys, _lock) = first_run_store(&root)?;
@@ -2405,7 +2411,10 @@ mod tests {
         probe.mark_started(std::time::Instant::now());
         let late = probe.clone();
         let setting = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(1_200)).await;
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while late.waiters() == 0 && std::time::Instant::now() < deadline {
+                tokio::task::yield_now().await;
+            }
             late.set(met_report())
         });
         let core = tokio::time::timeout(
@@ -2423,22 +2432,40 @@ mod tests {
         assert!(setting.await?);
         let _ = abandon(Some(core), Some(store)).await;
 
-        // The probe started 4.7 s ago and never reports: at most the remaining 0.3 s are waited.
-        let Some(started) = std::time::Instant::now().checked_sub(Duration::from_millis(4_700))
-        else {
-            return Ok(());
-        };
+        // The probe started 4 s ago (the store is ready, so the start is measured from here) and
+        // never reports: the starter does wait for the 1 s that are left (seen as a waiter parked
+        // on the holder), and the core starts without a report when they are over.
         let root = tmp.path().join("pending");
         std::fs::create_dir(&root)?;
         let (store, keys, _lock) = first_run_store(&root)?;
         let probe = Arc::new(crate::sandbox_probe::ProbeHolder::default());
+        let Some(started) = std::time::Instant::now().checked_sub(Duration::from_secs(4)) else {
+            return Ok(());
+        };
         probe.mark_started(started);
+        let parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (spy_probe, spy_flag) = (probe.clone(), parked.clone());
+        let spy = tokio::spawn(async move {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while std::time::Instant::now() < deadline {
+                if spy_probe.waiters() > 0 {
+                    spy_flag.store(true, Ordering::SeqCst);
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
         let core = tokio::time::timeout(
             bound,
             starter_for(&probe, &root).start(store.clone(), keys, Vec::new()),
         )
         .await?
         .map_err(|_| "the core did not start without a probe report")?;
+        spy.abort();
+        assert!(
+            parked.load(Ordering::SeqCst),
+            "the starter did not wait for the probe"
+        );
         assert_eq!(
             app_start_confinement_in(&store)?,
             serde_json::json!({"state": "pending"})

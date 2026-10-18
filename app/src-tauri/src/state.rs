@@ -10,7 +10,7 @@ use atlas_duck_sandbox_host::probe::{FloorVerdict, ProbeReport};
 use tauri::async_runtime::JoinHandle;
 
 use crate::sandbox_probe::{ProbeHolder, canonical_worker};
-use crate::script_glue::{InstanceSource, ScriptInputs};
+use crate::script_glue::{InstanceSource, ScriptInputs, StatusPing};
 use crate::serve::{ServeState, ShutdownOutcome};
 use crate::tray_host::TrayHost;
 
@@ -142,6 +142,7 @@ impl AppState {
         ScriptInputs {
             probe: self.probe.clone(),
             update_pending: self.update_pending_flag(),
+            status: StatusPing::default(),
             instances: InstanceSource::default(),
         }
     }
