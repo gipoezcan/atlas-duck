@@ -10,7 +10,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
@@ -38,7 +38,8 @@ pub struct CallOutcome {
     /// The `result` object of the `tools/call` response (`content`, `structuredContent`,
     /// `isError`).
     pub result: Value,
-    /// Every notification (progress, cancelled, ...) that arrived while this call was awaited.
+    /// Every notification (progress, cancelled, ...) that arrived after this call was sent; older
+    /// untaken ones stay for `take_notifications`.
     pub notifications: Vec<Value>,
 }
 
@@ -99,8 +100,14 @@ pub struct Wire {
     next_id: u64,
     /// Responses read while another id was awaited.
     stash: HashMap<u64, Value>,
-    /// Notifications read since they were last taken.
-    notifications: Vec<Value>,
+    /// Ids whose response was handed out; a further response for one of them is an error.
+    consumed: HashSet<u64>,
+    /// Notifications read since they were last taken, with their arrival sequence number.
+    notifications: Vec<(usize, Value)>,
+    /// How many notifications were ever read (the next sequence number).
+    notes_seen: usize,
+    /// `notes_seen` when each request was sent: what "arrived during this call" starts at.
+    sent_at: HashMap<u64, usize>,
     eof: bool,
 }
 
@@ -114,7 +121,10 @@ impl Wire {
             log: Vec::new(),
             next_id: 1,
             stash: HashMap::new(),
+            consumed: HashSet::new(),
             notifications: Vec::new(),
+            notes_seen: 0,
+            sent_at: HashMap::new(),
             eof: false,
         }
     }
@@ -146,6 +156,7 @@ impl Wire {
     pub async fn send_request(&mut self, method: &str, params: Value) -> Result<u64> {
         let id = self.next_id;
         self.next_id += 1;
+        self.sent_at.insert(id, self.notes_seen);
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
             .await?;
         Ok(id)
@@ -159,14 +170,19 @@ impl Wire {
     /// Reads one stdout line (at most until `deadline`), keeps it, checks it is JSON-RPC 2.0 and
     /// files it: responses into the stash, notifications into the list; a request of the server
     /// is answered (`ping` with `{}`, anything else `-32601`).
-    async fn pump_one(&mut self, deadline: Instant) -> Result<()> {
+    ///
+    /// `Ok(true)`: a line was read and filed. `Ok(false)`: the deadline passed without a complete
+    /// line (the only non-error way a pump ends without progress); every other failure is an `Err`.
+    async fn pump_one(&mut self, deadline: Instant) -> Result<bool> {
         if self.eof {
             return Err(format!("stdout is closed\n{}", self.transcript()).into());
         }
         let left = deadline.saturating_duration_since(Instant::now());
-        let n = tokio::time::timeout(left, self.reader.read_until(b'\n', &mut self.partial))
-            .await
-            .map_err(|_| "timed out waiting for a stdout line")??;
+        let read = tokio::time::timeout(left, self.reader.read_until(b'\n', &mut self.partial));
+        let n = match read.await {
+            Ok(read) => read?,
+            Err(_) => return Ok(false),
+        };
         if n == 0 && self.partial.is_empty() {
             self.eof = true;
             return Err(format!("stdout closed\n{}", self.transcript()).into());
@@ -193,7 +209,10 @@ impl Wire {
             )
         })?;
         match kind {
-            Kind::Notification => self.notifications.push(value),
+            Kind::Notification => {
+                self.notifications.push((self.notes_seen, value));
+                self.notes_seen += 1;
+            }
             Kind::Request => {
                 let id = value["id"].clone();
                 let reply = if value["method"] == "ping" {
@@ -208,12 +227,12 @@ impl Wire {
                 let id = value["id"].as_u64().ok_or_else(|| {
                     format!("a response carries an id the driver never sent: {line:?}")
                 })?;
-                if self.stash.insert(id, value).is_some() {
+                if self.consumed.contains(&id) || self.stash.insert(id, value).is_some() {
                     return Err(format!("two responses for id {id}\n{}", self.transcript()).into());
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Waits for the response of `id` (the whole message, `result` or `error`).
@@ -221,14 +240,23 @@ impl Wire {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(v) = self.stash.remove(&id) {
+                self.consumed.insert(id);
                 return Ok(v);
             }
-            self.pump_one(deadline).await.map_err(|e| {
+            let pumped = self.pump_one(deadline).await.map_err(|e| {
                 format!(
                     "waiting for the response of id {id} ({timeout:?}): {e}\n{}",
                     self.transcript()
                 )
             })?;
+            if !pumped {
+                return Err(format!(
+                    "waiting for the response of id {id} ({timeout:?}): timed out waiting for a \
+                     stdout line\n{}",
+                    self.transcript()
+                )
+                .into());
+            }
         }
     }
 
@@ -240,10 +268,9 @@ impl Wire {
             if self.stash.contains_key(&id) {
                 return Err(format!("id {id} was answered\n{}", self.transcript()).into());
             }
-            match self.pump_one(deadline).await {
-                Ok(()) => {}
-                Err(_) if Instant::now() >= deadline => return Ok(()),
-                Err(e) => return Err(e),
+            // A deadline is `Ok(false)`; any error, also one found at the deadline, fails.
+            if !self.pump_one(deadline).await? {
+                return Ok(());
             }
         }
     }
@@ -251,6 +278,20 @@ impl Wire {
     /// Takes the notifications read so far.
     pub fn take_notifications(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.notifications)
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect()
+    }
+
+    /// Takes the notifications that arrived after the request `id` was sent; older untaken ones
+    /// stay for `take_notifications`.
+    pub fn take_notifications_since(&mut self, id: u64) -> Vec<Value> {
+        let start = self.sent_at.get(&id).copied().unwrap_or(0);
+        let (mine, older): (Vec<_>, Vec<_>) = std::mem::take(&mut self.notifications)
+            .into_iter()
+            .partition(|(seq, _)| *seq >= start);
+        self.notifications = older;
+        mine.into_iter().map(|(_, v)| v).collect()
     }
 
     /// A request/response round trip; a JSON-RPC `error` is an `Err`.
@@ -385,7 +426,7 @@ impl McpChild {
         }
         Ok(CallOutcome {
             result: response["result"].clone(),
-            notifications: self.wire.take_notifications(),
+            notifications: self.wire.take_notifications_since(id),
         })
     }
 
@@ -569,6 +610,93 @@ mod tests {
         let pong = read_request(&mut server_in).await?;
         assert_eq!(pong["id"], "p");
         assert!(pong["result"].is_object(), "{pong}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn driver_expect_no_response_reports_errors_at_the_deadline() -> TestResult {
+        // A quiet period passes.
+        let (mut wire, mut server_in, _server_out) = rig();
+        let id = wire.send_request("tools/call", json!({})).await?;
+        read_request(&mut server_in).await?;
+        wire.expect_no_response(id, Duration::from_millis(100))
+            .await?;
+
+        // A stdout log line that is already there when the period is up is not swallowed.
+        let (mut wire, mut server_in, mut server_out) = rig();
+        let id = wire.send_request("tools/call", json!({})).await?;
+        read_request(&mut server_in).await?;
+        server_out.write_all(b"oops, a log line\n").await?;
+        let err = wire.expect_no_response(id, Duration::ZERO).await;
+        let text = err.err().ok_or("an error at the deadline was swallowed")?;
+        assert!(text.to_string().contains("oops, a log line"), "{text}");
+
+        // A response that is already there when the period is up fails the check.
+        let (mut wire, mut server_in, mut server_out) = rig();
+        let id = wire.send_request("tools/call", json!({})).await?;
+        read_request(&mut server_in).await?;
+        let reply = json!({"jsonrpc": "2.0", "id": id, "result": {}});
+        server_out
+            .write_all(format!("{reply}\n").as_bytes())
+            .await?;
+        let err = wire.expect_no_response(id, Duration::ZERO).await;
+        assert!(err.is_err(), "an answered id passed expect_no_response");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn driver_scopes_notifications_per_call() -> TestResult {
+        let (mut wire, mut server_in, mut server_out) = rig();
+        let note = |n: u64| {
+            json!({"jsonrpc": "2.0", "method": "notifications/progress",
+                                   "params": {"progress": n}})
+        };
+        // A notification before the second call (e.g. while the first call was cancelled).
+        let first = wire.send_request("tools/call", json!({})).await?;
+        read_request(&mut server_in).await?;
+        server_out
+            .write_all(format!("{}\n", note(1)).as_bytes())
+            .await?;
+        wire.expect_no_response(first, Duration::from_millis(100))
+            .await?;
+
+        let second = wire.send_request("tools/call", json!({})).await?;
+        read_request(&mut server_in).await?;
+        let lines = [
+            note(2),
+            json!({"jsonrpc": "2.0", "id": second, "result": {}}),
+        ];
+        for line in &lines {
+            server_out.write_all(format!("{line}\n").as_bytes()).await?;
+        }
+        wire.wait_response(second, Duration::from_secs(5)).await?;
+        let mine = wire.take_notifications_since(second);
+        assert_eq!(mine.len(), 1, "{mine:?}");
+        assert_eq!(mine[0]["params"]["progress"], 2);
+        // The earlier one is still there for an explicit drain; every raw line is kept.
+        let older = wire.take_notifications();
+        assert_eq!(older.len(), 1, "{older:?}");
+        assert_eq!(older[0]["params"]["progress"], 1);
+        assert_eq!(wire.raw_stdout_lines().len(), 3);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn driver_rejects_a_duplicate_response_after_consumption() -> TestResult {
+        let (mut wire, mut server_in, mut server_out) = rig();
+        let first = wire.send_request("tools/call", json!({})).await?;
+        let second = wire.send_request("tools/call", json!({})).await?;
+        read_request(&mut server_in).await?;
+        read_request(&mut server_in).await?;
+        let reply = |id: u64| json!({"jsonrpc": "2.0", "id": id, "result": {}});
+        // The first id is answered, consumed, then answered a second time before the other id.
+        for line in [reply(first), reply(first), reply(second)] {
+            server_out.write_all(format!("{line}\n").as_bytes()).await?;
+        }
+        wire.wait_response(first, Duration::from_secs(5)).await?;
+        let err = wire.wait_response(second, Duration::from_secs(5)).await;
+        let text = err.err().ok_or("a duplicate response went unnoticed")?;
+        assert!(text.to_string().contains("two responses"), "{text}");
         Ok(())
     }
 }
