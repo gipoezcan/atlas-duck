@@ -40,6 +40,11 @@ if [ "${1:-}" = --inner ]; then
   here="$(cd "$(dirname "$0")" && pwd)"
   bash "$here/gui-no-driver.sh" fedora-no-tray-host /root/e2e-work /usr/bin/atlas-duck-app /usr/bin/atlas-duck
   echo "OK: Fedora 40 no-tray-host run (CI-03, driver-free)"
+  # CI-07 (M8 plan Task 28, PD-150), `if: false` in e2e-bundle.yml until M10: the dry run and the
+  # released real run through the rpm's CLI. The app must serve a configured core (M10 provisions it).
+  if [ "${ATLAS_DUCK_M8_CI07:-}" = 1 ]; then
+    bash "$here/script-matrix-step.sh" debug /root/e2e-work/ci07 /usr/bin/atlas-duck
+  fi
   exit 0
 fi
 

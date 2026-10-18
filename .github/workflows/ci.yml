@@ -379,12 +379,12 @@ jobs:
       # suite above, checks the results and prints the numbers). The `testing` features refuse to
       # compile without debug assertions, so the release profile gets them from the environment
       # here, never from a Cargo.toml (ci/check-workspace.mjs). A filter that matches nothing
-      # would pass with zero tests, so the log must show the four passes (M7 T23 added the Confluence
-      # scenarios) and the one ignored measurement test.
+      # would pass with zero tests, so the log must show the five passes (M7 T23 added the Confluence
+      # scenario, M8 T27 the 200-row script scenario) and the one ignored measurement test.
       - name: Core performance bounds (SC3 preview, 16 MiB paging, M-15 latency, release)
         run: |
           cargo test -p atlas-duck-core --release --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked --test perf_sc3 -- --nocapture --test-threads=1 | tee "$RUNNER_TEMP/perf-sc3.log"
-          grep -q 'test result: ok\. 4 passed; 0 failed; 1 ignored' "$RUNNER_TEMP/perf-sc3.log"
+          grep -q 'test result: ok\. 5 passed; 0 failed; 1 ignored' "$RUNNER_TEMP/perf-sc3.log"
         env:
           CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
           ATLAS_DUCK_PERF_ENFORCE: "1"
@@ -697,6 +697,11 @@ jobs:
           else
             grep -F -- "M8 s10_handles os=$os fds=[0, 1, 2]" "$log" || { echo "::error::S-10 worker held descriptors other than 0, 1, 2"; exit 1; }
           fi
+          # M8 T25 (I-21, R13): the largest allowed `atlas.all` answer completes under the default
+          # heap limits (the test asserts it; this line is the record), and the R13 line is data
+          # (`completed=true|false`): only its presence is required here, never its value.
+          grep -E '(^|[[:space:]])M8 i21_all_result_at_cap heap_mb=[0-9]+ process_mb=[0-9]+ bytes=[0-9]+ issues=[0-9]+ completed=true([^[:alnum:]_]|$)' "$log" || { echo "::error::M8 i21_all_result_at_cap completed=true evidence missing"; exit 1; }
+          grep -E '(^|[[:space:]])M8 i21_r13 heap_mb=128 process_mb=256 bytes=[0-9]+ completed=(true|false) ' "$log" || { echo "::error::M8 i21_r13 evidence missing"; exit 1; }
           # M8 T9 (V10, PD-134): host-measured memory limits. The tests assert their verdicts;
           # these gates make a missing evidence line fail too.
           grep -E "(^|[[:space:]])V10 heap_limit os=$os verdict=heap_mb " "$log" || { echo "::error::V10 heap_limit os=$os evidence missing"; exit 1; }
@@ -840,6 +845,16 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./ci/check-bin-linkage.ps1 -BinDir target/debug
+
+      # M8 plan Task 28 (CI-07 definition): the scripts-enabled matrix step is `if: false` in the
+      # package workflows until M10; this keeps its two scripts parsing and its assertions biting on
+      # every leg. The self-test starts no package and no app.
+      - name: CI-07 matrix step self-test (bash and PowerShell twins)
+        run: |
+          set -euo pipefail
+          bash -n ci/script-matrix-step.sh
+          bash ci/script-matrix-step.sh --self-test
+          pwsh -NoProfile -File ci/script-matrix-step.ps1 -SelfTest
 
       - name: Probe evidence (§9.4, go/no-go record)
         run: |
@@ -1065,6 +1080,9 @@ jobs:
           case "$ms" in ''|*[!0-9]*) echo "::error::S-10 elapsed_ms is not a number: $ms"; exit 1;; esac
           [ "$ms" -lt 10000 ] || { echo "::error::S-10 deadlock case took $ms ms"; exit 1; }
           grep -F -- 'M8 s10_handles os=macos fds=[0, 1, 2]' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::S-10 worker held descriptors other than 0, 1, 2"; exit 1; }
+          # M8 T25 (I-21, R13): as on the native legs (the R13 line is data, only its presence is required).
+          grep -E '(^|[[:space:]])M8 i21_all_result_at_cap heap_mb=[0-9]+ process_mb=[0-9]+ bytes=[0-9]+ issues=[0-9]+ completed=true([^[:alnum:]_]|$)' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::M8 i21_all_result_at_cap completed=true evidence missing"; exit 1; }
+          grep -E '(^|[[:space:]])M8 i21_r13 heap_mb=128 process_mb=256 bytes=[0-9]+ completed=(true|false) ' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::M8 i21_r13 evidence missing"; exit 1; }
           # M8 T9 (V10, PD-134): the heap limit and the footprint watchdog under Rosetta.
           grep -E '(^|[[:space:]])V10 heap_limit os=macos verdict=heap_mb ' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::V10 heap_limit os=macos evidence missing"; exit 1; }
           grep -E '(^|[[:space:]])V10 watchdog_kill verdict=process_mb spawn_to_reap_ms=[0-9]+ arch=x86_64([^[:alnum:]_]|$)' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::V10 watchdog_kill evidence missing"; exit 1; }
@@ -1483,6 +1501,9 @@ jobs:
             if (seen.size === 0) process.exit(1);
           ' "$RUNNER_TEMP/build.json" "$dir"
           ls -l "$dir"
+          # M8 Task 28 (CI-02): scripts_all (atlas.all, T13) is one of the executables copied above;
+          # a rename or a lost `testing` feature must not drop it silently.
+          ls "$dir"/core-scripts_all-* > /dev/null
 
       - name: Run the M3 suite on Fedora 40
         run: |
@@ -1498,7 +1519,12 @@ jobs:
               echo "== $t"
               "$t" --test-threads=4
             done
-          '
+          ' 2>&1 | tee "$RUNNER_TEMP/core-suite-fedora.log"
+          # M8 Task 28 (CI-02): the scripts_all section of the log must show a passing result with
+          # at least one test (the loop above stops at the first failing executable).
+          awk '/^== \/w\/core-scripts_all-/ { f = 1; next } /^== / { f = 0 } f' "$RUNNER_TEMP/core-suite-fedora.log" \
+            | grep -E '^test result: ok\. [1-9][0-9]* passed; 0 failed' \
+            || { echo "::error::scripts_all did not pass on Fedora 40"; exit 1; }
 
   supply-chain:
     name: supply-chain (cargo-deny, cargo-audit)

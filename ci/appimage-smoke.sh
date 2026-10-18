@@ -17,6 +17,8 @@
 #     directly started `<AppImage> --background` answers `doctor` with the same gate
 #   * (M6 plan Task 33, CI-04 M6 steps) `appimage-smoke.sh --m6 <e2e-artifact-dir>`: the driver-free
 #     M6 section on the debug scripted-approver AppImage (see m6_inner below)
+#   * (M8 plan Task 28, CI-04 script step) `appimage-smoke.sh --m8 <e2e-artifact-dir>`: one `script run`
+#     survives the launching CLI's exit (see the M8 section below)
 set -euo pipefail
 export LC_ALL=C
 
@@ -152,7 +154,7 @@ m6_save_diag() {
   mkdir -p "$E2E_DIAG_DIR" 2>/dev/null || return 0
   while IFS= read -r f; do
     cp "$f" "$E2E_DIAG_DIR/$(echo "${f#"$work"/}" | tr / _)" 2>/dev/null || true
-  done < <(find "$work" \( -name diag.log -o -name '*.log' -o -name 'doctor-*.json' -o -name 'doctor-*.err' \) -type f 2>/dev/null)
+  done < <(find "$work" \( -name diag.log -o -name '*.log' -o -name 'doctor-*.json' -o -name 'doctor-*.err' -o -name doctor.json -o -name run.json -o -name run.err -o -name await.json -o -name await.err \) -type f 2>/dev/null)
 }
 
 # appimage-smoke.sh --m6 <e2e-artifact-dir>: the M6 section alone, CI only, on the downloaded
@@ -185,8 +187,157 @@ m6_outer() {
   echo "OK: M6 AppImage section (driver-free: no tray host, Setup window, __cli doctor, forwarded launches, SIGTERM, clean next start)"
 }
 
+# --- M8 section (CI-04 script step) --------------------------------------------------------------
+# Runs against the same DEBUG `scripted-approver` AppImage as the M6 section (bundle-linux-e2e), in
+# its own xvfb-run + dbus-run-session + keyring, on a test home of its own. What CI-04 asks of the
+# script path: one `script run` succeeds AFTER the launching CLI has exited.
+#   1. `<AppImage> __cli script run <file> --reason atlas-test:release --timeout 0` (pending, exit 4);
+#   2. the CLI process is gone;
+#   3. the scripted approver releases the finished run (the directive is in --reason);
+#   4. `<AppImage> __cli await <id>` delivers `released`, exit 0;
+#   5. the app's executable is not under the CLI's mount: after the CLI exited, exactly one AppImage
+#      mount is left (the app's own, the command line of its runtime process names no /tmp/.mount_*
+#      path) and the app is still alive. A run whose app lived in the CLI's mount would have been
+#      cut off when the CLI's mount went away.
+# Steps 1, 3 and 4 need a serving core: a store with one Jira instance, provisioned in the wizard's
+# order. No shell step can do that (the wizard is driver-free-unreachable, M6 CI ruling, and the
+# provisioning is in-process Rust: tests/cli_flows harness), so the caller names a provisioned test
+# home with ATLAS_DUCK_M8_PROVISIONED=1, ATLAS_DUCK_M8_HOME and ATLAS_DUCK_M8_KEYSTORE. Without it
+# the section runs on a first-run store: the CLI answers `script run` with not_configured
+# {first_run}, exit 9, and the section prints M8_SCRIPT_RUN=NOT_PROVEN (it never passes as proof).
+# ATLAS_DUCK_M8_CI07=1 (the CI-07 step of e2e-bundle.yml, off until M10) adds the scripts-enabled
+# matrix step (ci/script-matrix-step.sh debug) and requires the provisioned mode.
+
+# m8_mounts: the AppImage mount points that are live now, one per line.
+m8_mounts() {
+  awk '$2 ~ /^\/tmp\/\.mount_/ { print $2 }' /proc/mounts | sort -u
+}
+
+m8_inner() {
+  local appimage="$1" here="$2" work="$3" code id status gate pid cmdline i mounts n
+  unset APPIMAGE_EXTRACT_AND_RUN
+  trap "m4_stop_app \"$appimage\" || true; pkill -x gnome-keyring-d || true" EXIT
+  if command -v gnome-keyring-daemon >/dev/null; then
+    printf 'atlas-duck-ci' | gnome-keyring-daemon --components=secrets --daemonize --unlock >/dev/null || echo "M8: keyring daemon did not start (continuing)"
+  fi
+  printf '%s\n' 'return {n: 1 + 1};' > "$work/m8.js"
+
+  # Warm start: the CLI cold-starts `<AppImage> --background` (as the M4 section), so the
+  # `--timeout 0` run below finds a serving app.
+  set +e
+  timeout 180 "$appimage" __cli --timeout 120 doctor >"$work/doctor.json" 2>"$work/doctor.err"
+  code=$?
+  set -e
+  [ "$code" -eq 0 ] || { cat "$work/doctor.json" "$work/doctor.err" >&2 || true; m4_fail "<AppImage> __cli doctor (cold start) exited $code, expected 0"; }
+  gate="$(m4_json_field "$work/doctor.json" data.app.gate)" || m4_fail "doctor has no data.app.gate: $(cat "$work/doctor.json")"
+  echo "M8 cold start: doctor exit 0, gate=$gate"
+
+  # (1) submit without waiting, through the AppImage's CLI.
+  set +e
+  timeout 180 "$appimage" __cli script run "$work/m8.js" --reason atlas-test:release --timeout 0 >"$work/run.json" 2>"$work/run.err"
+  code=$?
+  set -e
+
+  # (2) the CLI is gone (the call above returned; no `__cli script` process is left either).
+  if pgrep -f -- "$appimage __cli script" >/dev/null; then
+    ps -eo pid,ppid,args | grep -F '__cli' >&2 || true
+    m4_fail "a '__cli script' process is still running after script run returned"
+  fi
+  echo "M8 CLI exited: script run returned with exit $code"
+
+  if [ "${ATLAS_DUCK_M8_PROVISIONED:-}" = 1 ]; then
+    [ "$code" -eq 4 ] || m4_fail "script run --timeout 0 exited $code, expected 4 (pending); stdout: $(cat "$work/run.json")"
+    status="$(m4_json_field "$work/run.json" status)" || m4_fail "script run printed no envelope: $(cat "$work/run.json")"
+    [ "$status" = pending ] || m4_fail "script run status is '$status', expected pending: $(cat "$work/run.json")"
+    id="$(m4_json_field "$work/run.json" request_id)" || m4_fail "script run has no request_id: $(cat "$work/run.json")"
+    # (3, 4) the scripted approver releases the run on its own (the reason is the directive);
+    # `await` from a fresh CLI process delivers it.
+    set +e
+    timeout 240 "$appimage" __cli await "$id" --timeout 180 >"$work/await.json" 2>"$work/await.err"
+    code=$?
+    set -e
+    [ "$code" -eq 0 ] || { cat "$work/await.json" "$work/await.err" >&2 || true; m4_fail "await $id exited $code, expected 0"; }
+    status="$(m4_json_field "$work/await.json" status)" || m4_fail "await printed no envelope: $(cat "$work/await.json")"
+    [ "$status" = released ] || m4_fail "await status is '$status', expected released: $(cat "$work/await.json")"
+    [ "$(m4_json_field "$work/await.json" data.result.n)" = 2 ] || m4_fail "await delivered another result than {n: 2}: $(cat "$work/await.json")"
+    echo "M8 script run: submitted pending, released by the scripted approver, await delivered released (exit 0)"
+  else
+    [ "$code" -eq 9 ] || m4_fail "script run on a first-run store exited $code, expected 9 (not_configured); stdout: $(cat "$work/run.json")"
+    grep -qF '"code":"not_configured"' "$work/run.json" || m4_fail "script run envelope lacks code not_configured: $(cat "$work/run.json")"
+    grep -qF 'first_run' "$work/run.json" || m4_fail "script run envelope lacks first_run: $(cat "$work/run.json")"
+    echo "M8 script run: exit 9 not_configured first_run (no provisioned store)"
+    echo "M8_SCRIPT_RUN=NOT_PROVEN reason=no_provisioned_store (set ATLAS_DUCK_M8_PROVISIONED=1 with a provisioned ATLAS_DUCK_M8_HOME)"
+    [ "${ATLAS_DUCK_M8_CI07:-}" != 1 ] || m4_fail "the CI-07 step needs a provisioned core (ATLAS_DUCK_M8_PROVISIONED=1)"
+  fi
+
+  # (5) the app is not under the CLI's mount.
+  pid="$(pgrep -f -x -- "$appimage --background" | head -n 1 || true)"
+  [ -n "$pid" ] || m4_fail "no process with the command line '$appimage --background' after the CLI exited"
+  cmdline="$(tr '\0' ' ' </proc/"$pid"/cmdline | sed 's/ $//')"
+  case "$cmdline" in
+    /tmp/.mount_*) m4_fail "the app's runtime command line points into an AppImage mount ($cmdline)" ;;
+  esac
+  pgrep -x atlas-duck-app >/dev/null || m4_fail "the app is gone after the CLI exited"
+  # The CLI's own mounts go away with its processes: poll while they unmount.
+  for i in $(seq 1 100); do
+    mounts="$(m8_mounts)"
+    n="$(printf '%s' "$mounts" | grep -c . || true)"
+    [ "$n" -le 1 ] && break
+    sleep 0.1
+  done
+  echo "M8 mounts after the CLI exited: $n (${mounts:-none})"
+  [ "$n" -eq 1 ] || m4_fail "expected exactly one live AppImage mount (the app's) after the CLI exited, found $n: $mounts"
+  pgrep -x atlas-duck-app >/dev/null || m4_fail "the app died when the CLI's mount went away"
+  echo "M8 app executable is not under the CLI's mount: one mount ($mounts), app alive"
+
+  if [ "${ATLAS_DUCK_M8_CI07:-}" = 1 ]; then
+    bash "$here/script-matrix-step.sh" debug "$work/ci07" "$appimage" __cli
+  fi
+}
+
+# appimage-smoke.sh --m8 <e2e-artifact-dir>: the M8 section alone, CI only, on the downloaded
+# bundle-linux-e2e artifact, with the packages of the M6 job (`appimage-m6` of e2e-bundle.yml).
+m8_outer() {
+  local e2e_dist work m8_dir m8_code self_path home keys
+  e2e_dist="$(realpath "${1:?usage: appimage-smoke.sh --m8 <e2e-artifact-dir>}")"
+  self_path="$(realpath "$0")"
+  [ "${CI:-}" = true ] || m4_fail "the M8 AppImage section runs only with CI=true"
+  shopt -s nullglob
+  local e2e_images=("$e2e_dist"/appimage/*.AppImage)
+  shopt -u nullglob
+  [ "${#e2e_images[@]}" -eq 1 ] || m4_fail "expected one AppImage in $e2e_dist/appimage, found ${#e2e_images[@]}"
+  work="$(mktemp -d)"
+  trap "m6_save_diag \"$work\"; pkill -x atlas-duck-app || true; rm -rf \"$work\"" EXIT
+  m8_dir="$work/m8"
+  mkdir -p "$m8_dir/home" "$m8_dir/keys" "$m8_dir/out"
+  cp "${e2e_images[0]}" "$m8_dir/atlas-duck-e2e.AppImage"
+  chmod +x "$m8_dir/atlas-duck-e2e.AppImage"
+  home="$m8_dir/home"
+  keys="$m8_dir/keys"
+  if [ "${ATLAS_DUCK_M8_PROVISIONED:-}" = 1 ]; then
+    home="${ATLAS_DUCK_M8_HOME:?ATLAS_DUCK_M8_PROVISIONED=1 needs ATLAS_DUCK_M8_HOME}"
+    keys="${ATLAS_DUCK_M8_KEYSTORE:?ATLAS_DUCK_M8_PROVISIONED=1 needs ATLAS_DUCK_M8_KEYSTORE}"
+  fi
+  set +e
+  env ATLAS_DUCK_TEST_HOME="$home" ATLAS_DUCK_TEST_KEYSTORE="$keys" \
+    timeout 900 xvfb-run -a dbus-run-session -- bash "$self_path" --m8-inner "$m8_dir/atlas-duck-e2e.AppImage" "$(dirname "$self_path")" "$m8_dir/out"
+  m8_code=$?
+  set -e
+  [ "$m8_code" -eq 0 ] || m4_fail "the M8 AppImage section failed (exit $m8_code)"
+  echo "OK: M8 AppImage section (script run after the CLI exited, release, await, app not under the CLI's mount)"
+}
+
 if [ "${1:-}" = --m6 ]; then
   m6_outer "${2:-}"
+  exit 0
+fi
+if [ "${1:-}" = --m8 ]; then
+  m8_outer "${2:-}"
+  exit 0
+fi
+if [ "${1:-}" = --m8-inner ]; then
+  [ "$#" -eq 4 ] || m4_fail "usage: appimage-smoke.sh --m8-inner <appimage> <ci-dir> <work-dir>"
+  m8_inner "$2" "$3" "$4"
   exit 0
 fi
 if [ "${1:-}" = --m4-inner ]; then

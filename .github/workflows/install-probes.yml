@@ -26,8 +26,12 @@ name: install-probes
 # task_for_pid control, otherwise it prints FLOOR_INCONCLUSIVE and an INCONCLUSIVE line (the job
 # stays green, the log says it is not a proof). Linux: floor=met is asserted.
 #
-# The run of a script with "Allow scripts with degraded confinement" off is M8's half of the
-# matrix; the upgrade drain and the uninstall checks are M10.
+# The scripts-enabled matrix (CI-07, M8 plan Task 28): every package job has a CI-07 step
+# (ci/script-matrix-step.{sh,ps1} release), `if: false` until M10. On a release package it asserts
+# floor=met failed=none and the installed worker answering in probe mode through the app's spawner;
+# it runs no script (a fresh install is in the first-run state and serves no core). The dry run and
+# the released real run are on the debug scripted-approver bundles (e2e-bundle.yml). The upgrade
+# drain and the uninstall checks are M10.
 #
 # Security (workflow_run executes the scripts of the commit it follows): the token is read-only
 # (contents, actions), no secret is used, checkout does not persist credentials, the commit is the
@@ -133,6 +137,15 @@ jobs:
           INSTALL_PROBE_EVIDENCE: ${{ runner.temp }}\install-probe-evidence
         run: ./ci/install-probe-windows.ps1 -Mode CurrentUser -InstallerDir dist
 
+      # CI-07 (spec 13 Scripts-enabled matrix, PD-150, R6 option (a); M8 Task 28), switched on in M10.
+      # Asserts floor=met failed=none and that the installed worker answered in probe mode through the
+      # app's spawner (worker_version in the sandbox_probe line). No script run: a fresh release install
+      # is in the first-run state and serves no core.
+      - name: CI-07 scripts-enabled matrix, release package (off until M10)
+        if: false
+        shell: pwsh
+        run: ./ci/script-matrix-step.ps1 -Mode release -EvidenceDir "$env:RUNNER_TEMP\install-probe-evidence"
+
       - name: Upload the evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -216,6 +229,15 @@ jobs:
           INSTALL_PROBE_EVIDENCE: ${{ runner.temp }}\install-probe-evidence
         run: ./ci/install-probe-windows.ps1 -Mode AllUsers -InstallerDir dist
 
+      # CI-07 (spec 13 Scripts-enabled matrix, PD-150, R6 option (a); M8 Task 28), switched on in M10.
+      # Asserts floor=met failed=none and that the installed worker answered in probe mode through the
+      # app's spawner (worker_version in the sandbox_probe line). No script run: a fresh release install
+      # is in the first-run state and serves no core.
+      - name: CI-07 scripts-enabled matrix, release package (off until M10)
+        if: false
+        shell: pwsh
+        run: ./ci/script-matrix-step.ps1 -Mode release -EvidenceDir "$env:RUNNER_TEMP\install-probe-evidence"
+
       - name: Upload the evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -297,6 +319,14 @@ jobs:
         env:
           INSTALL_PROBE_EVIDENCE: ${{ runner.temp }}/install-probe-evidence
         run: /bin/bash ci/install-probe-macos.sh dist arm64
+
+      # CI-07 (spec 13 Scripts-enabled matrix, PD-150, R6 option (a); M8 Task 28), switched on in M10.
+      # Asserts floor=met failed=none and that the installed worker answered in probe mode through the
+      # app's spawner (worker_version in the sandbox_probe line). No script run: a fresh release install
+      # is in the first-run state and serves no core.
+      - name: CI-07 scripts-enabled matrix, release package (off until M10)
+        if: false
+        run: /bin/bash ci/script-matrix-step.sh release "$RUNNER_TEMP/install-probe-evidence"
 
       - name: Upload the evidence
         if: always()
@@ -402,6 +432,14 @@ jobs:
           INSTALL_PROBE_EVIDENCE: ${{ runner.temp }}/install-probe-evidence
         run: /bin/bash ci/install-probe-macos.sh dist x86_64
 
+      # CI-07 (spec 13 Scripts-enabled matrix, PD-150, R6 option (a); M8 Task 28), switched on in M10.
+      # Asserts floor=met failed=none and that the installed worker answered in probe mode through the
+      # app's spawner (worker_version in the sandbox_probe line). No script run: a fresh release install
+      # is in the first-run state and serves no core.
+      - name: CI-07 scripts-enabled matrix, release package (off until M10)
+        if: false
+        run: /bin/bash ci/script-matrix-step.sh release "$RUNNER_TEMP/install-probe-evidence"
+
       - name: Upload the evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -483,6 +521,14 @@ jobs:
           INSTALL_PROBE_EVIDENCE: ${{ runner.temp }}/install-probe-evidence
         run: bash ci/install-probe-linux.sh deb dist
 
+      # CI-07 (spec 13 Scripts-enabled matrix, PD-150, R6 option (a); M8 Task 28), switched on in M10.
+      # Asserts floor=met failed=none and that the installed worker answered in probe mode through the
+      # app's spawner (worker_version in the sandbox_probe line). No script run: a fresh release install
+      # is in the first-run state and serves no core.
+      - name: CI-07 scripts-enabled matrix, release package (off until M10)
+        if: false
+        run: bash ci/script-matrix-step.sh release "$RUNNER_TEMP/install-probe-evidence"
+
       - name: Upload the evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -563,6 +609,14 @@ jobs:
         env:
           INSTALL_PROBE_EVIDENCE: ${{ runner.temp }}/install-probe-evidence
         run: bash ci/install-probe-linux.sh appimage dist
+
+      # CI-07 (spec 13 Scripts-enabled matrix, PD-150, R6 option (a); M8 Task 28), switched on in M10.
+      # Asserts floor=met failed=none and that the installed worker answered in probe mode through the
+      # app's spawner (worker_version in the sandbox_probe line). No script run: a fresh release install
+      # is in the first-run state and serves no core.
+      - name: CI-07 scripts-enabled matrix, release package (off until M10)
+        if: false
+        run: bash ci/script-matrix-step.sh release "$RUNNER_TEMP/install-probe-evidence"
 
       - name: Upload the evidence
         if: always()
@@ -660,6 +714,14 @@ jobs:
             --workdir /work \
             fedora:40 \
             bash ci/install-probe-linux.sh rpm dist
+
+      # CI-07 (spec 13 Scripts-enabled matrix, PD-150, R6 option (a); M8 Task 28), switched on in M10.
+      # Asserts floor=met failed=none and that the installed worker answered in probe mode through the
+      # app's spawner (worker_version in the sandbox_probe line). No script run: a fresh release install
+      # is in the first-run state and serves no core.
+      - name: CI-07 scripts-enabled matrix, release package (off until M10)
+        if: false
+        run: bash ci/script-matrix-step.sh release "$RUNNER_TEMP/install-probe-evidence"
 
       - name: Upload the evidence
         if: always()

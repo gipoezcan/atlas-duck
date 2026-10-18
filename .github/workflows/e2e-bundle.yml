@@ -18,11 +18,17 @@ name: e2e-bundle
 #   bundle-linux-e2e      debug scripted-approver rpm + AppImage
 #   fedora-no-tray-host   CI-03: fedora:40 container, Xvfb, session bus without a StatusNotifierWatcher
 #   appimage-m6           CI-04 M6 steps: the AppImage through its FUSE runtime, no tray host, Setup window, doctor, forwarded launches, SIGTERM
+#                         and (M8 Task 28) the CI-04 script step: a `script run` that is released and delivered after the CLI exited.
+#                         The CI-07 steps (scripts-enabled matrix, debug bundles) sit in this job and in fedora-no-tray-host, `if: false` until M10.
 
 on:
   push:
     branches:
       - master
+      # REMOVE AT MERGE: TEMPORARY trigger for the M8 branch (as m6-* was for M6). push runs the copy
+      # of this file on the pushed ref, so the AppImage M8 script step (CI-04) and the CI-07 steps
+      # (dry self-test) run before the merge; workflow_dispatch needs the file on the default branch.
+      - "m8-*"
     tags:
       - "v*"
   workflow_dispatch:
@@ -160,6 +166,16 @@ jobs:
           docker run --rm --env CI --volume "$PWD:/work" --volume "$RUNNER_TEMP/fedora-root:/root" --workdir /work fedora:40 \
             bash ci/fedora-no-tray-host.sh dist
 
+      # CI-07 (PD-150, R6 option (a); M8 plan Task 28), switched on in M10: the same run again with
+      # the scripts-enabled matrix step (ci/script-matrix-step.sh debug) through the rpm's CLI.
+      - name: CI-07 scripts-enabled matrix, debug bundle (rpm; off until M10)
+        if: false
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/fedora-root"
+          docker run --rm --env CI --env ATLAS_DUCK_M8_CI07=1 --volume "$PWD:/work" --volume "$RUNNER_TEMP/fedora-root:/root" --workdir /work fedora:40 \
+            bash ci/fedora-no-tray-host.sh dist
+
       - name: Container logs (diagnostics)
         if: always()
         run: |
@@ -218,6 +234,25 @@ jobs:
           # trap deletes them.
           E2E_DIAG_DIR: ${{ runner.temp }}/e2e-diag-appimage
         run: CI=true bash ci/appimage-smoke.sh --m6 dist
+
+      # M8 plan Task 28 (CI-04 script step): one `script run --timeout 0` through `<AppImage> __cli`,
+      # the CLI exits, the scripted approver releases, `await` delivers, the app's executable is not
+      # under the CLI's mount. Needs the provisioned test home the section documents; without it the
+      # section checks the first-run answer and says that the released run is not proven.
+      - name: AppImage M8 section (script run survives the CLI's exit; CI-04)
+        env:
+          E2E_DIAG_DIR: ${{ runner.temp }}/e2e-diag-appimage
+        run: CI=true bash ci/appimage-smoke.sh --m8 dist
+
+      # CI-07 (PD-150, R6 option (a)), switched on in M10: the debug scripted-approver bundle of this
+      # commit runs `script run --dry-run=full` and a real run released by the scripted approver
+      # (ci/script-matrix-step.sh debug), degraded confinement off, against a provisioned core.
+      - name: CI-07 scripts-enabled matrix, debug bundle (AppImage; off until M10)
+        if: false
+        env:
+          E2E_DIAG_DIR: ${{ runner.temp }}/e2e-diag-appimage
+          ATLAS_DUCK_M8_CI07: "1"
+        run: CI=true bash ci/appimage-smoke.sh --m8 dist
 
       - name: AppImage diagnostics
         if: always()
