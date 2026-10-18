@@ -442,7 +442,7 @@ Master-plan Review Focus (copied; owners per the master plan):
 - **V21** (identity re-check per OS after an in-place upgrade: file index on Windows, inode on Linux, bundle replacement on macOS): Tasks 10, 26 (`v21_replaced_binary_detected_per_os`, `i41_replaced_sandbox_binary_is_app_upgraded`).
 - **V11 (closure)** (the seccomp allowlist under the full worker suite incl. local-time `Date`, `toLocale*`, every enabled intrinsic; every thread confined; `PR_SET_PDEATHSIG` survival): Task 5 on Ubuntu 22.04 and Fedora 40 (userland) for the corpus; the PDEATHSIG line the M1 record lacked comes from Task 6's `v11_pdeathsig_spawner_thread_survives` in `sandbox_runs.rs`, because the host spawner sets `PR_SET_PDEATHSIG`, not the worker.
 - **V12 (worker half)** (handles and descriptors a run worker inherits): Task 8 `s10_worker_sees_three_handles_and_allowlisted_env` through the run spawn path (the same spawner object and `SpawnSpec` as `start_run`, with `probe.run {EnvNames}` / `{HandleSentinel}` as the first frame).
-- **V02 (confirmation)** (the Eval intrinsic is required for host-side source evaluation): Task 5 `v02_wrapper_eval_needs_eval_intrinsic_confirmed` in a confined worker; Task 3 locally.
+- **V02 (confirmation)** (the Eval intrinsic is required for host-side source evaluation): Task 5, the `V02 eval_required=true` line printed by `crates/sandbox-worker/tests/confined_scripts.rs` in a confined worker; Task 3 locally, `v02_host_side_eval_still_needs_eval` (`crates/sandbox-worker/tests/script_engine.rs`).
 - **V10 (watchdog and `RLIMIT_AS` half)**: Task 9 (`ri_phys_footprint` watchdog, 100 ms, SIGKILL above `process_mb`; `RLIMIT_AS` no-op re-recorded), CI macOS arm64 and the Rosetta leg.
 
 **Ledger entries M8 depends on:**

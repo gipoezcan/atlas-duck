@@ -1,9 +1,10 @@
 ## V16: heap expansion factor `k` (spec §9.4, §15 V16; PD-140, R13, L180)
 
-Status: partial (until a human signs; see the signature line at the end of this file). The 1 and
-4 MiB rows are local runs; the 16 MiB rows are recorded from the CI step "M8 k measurement" (Linux
-leg) of run 39115702067 (https://github.com/gipoezcan/atlas-duck/actions/runs/39115702067; URL
-derived from the git remote, not fetched). The run is at SHA 16eede3.
+Status: partial (until a human signs; see the signature line at the end of this file). The 1, 4
+and 16 MiB rows are recorded from the CI step "M8 k measurement" (Linux leg) of run 39115702067
+(https://github.com/gipoezcan/atlas-duck/actions/runs/39115702067; URL derived from the git remote,
+not fetched); the 1 and 4 MiB rows are byte-identical to the earlier local runs. The run is at SHA
+16eede3.
 
 Question: what is the factor `k` such that `heap_mb >= k x max_call_result_mb` (invariant 1)
 keeps one host-call answer inside the QuickJS heap limit while the host frame's text and the
@@ -280,8 +281,8 @@ Observed values for run 39115702067 (SHA 16eede3), from the CI logs:
 Earlier history (progress.md:72):
 in run 39012497462 the Linux test printed the descriptors as a set (`fds={0, 1, 2}`) and the CI gate,
 which greps `fds=[0, 1, 2]`, failed; macOS printed a list. The Linux print was then changed to a list
-(a lead fix, de4db6e). The `fds=[0, 1, 2]` value on Linux is therefore what the gate requires, not an
-observed CI line recorded here.
+(a lead fix, de4db6e). The Linux line `M8 s10_handles os=linux fds=[0, 1, 2]` is an observed CI line
+of run 39115702067 (above), and it is what the gate requires.
 
 Run URLs: 39012497462 (Linux fd gate failure, progress.md:72); 39115702067 as above.
 
@@ -293,9 +294,10 @@ Question: does the single-threaded worker loop (`futures`) avoid a deadlock with
 calls and 1 MiB of `atlas.log` output?
 
 Test: `s10_four_calls_and_1mib_log_no_deadlock` (Task 8; task-08-report.md:25). Four calls with a
-200 ms sink, 1024 x 1023-byte `atlas.log` lines, `timeout_s = 60`. It asserts: host `None`, result 4,
-four calls in flight together, 1024 logs, no truncation, elapsed < 10 s. Evidence line
-`M8 s10_four_calls_and_1mib_log elapsed_ms=..`.
+500 ms sink, 1024 x 1023-byte `atlas.log` lines, `timeout_s = 60`. It asserts: host `None`, result 4,
+at least two calls in flight together (`peak >= 2`, a deliberately loose bound; the runs below
+print `peak_in_flight=4`), each answering 256 KiB, 1024 logs, no truncation, elapsed < 10 s. Evidence
+line `M8 s10_four_calls_and_1mib_log elapsed_ms=.. peak_in_flight=.. logs=..`.
 
 Worker loop: commit 9edee65 (Task 4, task-04-report.md:5).
 
@@ -340,6 +342,32 @@ Run 39115702067 (SHA 16eede3), from the CI logs:
 
 Run URLs: https://github.com/gipoezcan/atlas-duck/actions/runs/39012497462 (URL derived from the git
 remote, not fetched); 39115702067 as above.
+
+## Windows job UI restrictions: bit 0x100 is refused on the runner
+
+The Windows rust leg of run 39115702067 prints, on every worker spawn, from
+`crates/sandbox-host/src/windows/job.rs:162`:
+
+- `job UI restrictions: applied 0xff, refused 0x100`
+
+Setting all UI limits at once fails on the hosted runner (it is itself inside a job). The spawner
+then applies the bits one by one, keeps every accepted one (`applied 0xff`) and names the refused
+bit (`refused 0x100`); the job holds exactly the accepted bits. The run still ends green. The UI
+limit bit 0x100 is therefore not in force for the worker's job on the runner; the memory and
+process limits recorded in V10 are separate job limits.
+
+## macOS sandbox_probe lines of install-probes run 39121757703
+
+The `sandbox_probe` line the macOS install-probe jobs of run 39121757703
+(https://github.com/gipoezcan/atlas-duck/actions/runs/39121757703; fetched from the job logs)
+print after installing the dmg; both are at worker build `16eede3358d2`:
+
+- arm64 (macos-15): `... event=sandbox_probe floor=met failed=none extra_layers=none engine_version=0.16.2 worker_version=0.1.0+16eede3358d2 ace=n/a appcontainer_mode=n/a control_ok=n/a lpac_failed=n/a dropped_fields=0`, then
+  `PROBE_RECORD arch=arm64 floor=met failed=none ... task_for_pid_informative=true unconfined_kr=0 verdict=proven`
+- x86_64 under Rosetta 2 (macos-15): the same `sandbox_probe` fields and
+  `PROBE_RECORD arch=x86_64 floor=met failed=none ... task_for_pid_informative=true unconfined_kr=0 verdict=proven`
+
+The task_for_pid caveat below still applies: the control runs as root against a non-hardened child.
 
 ## Windows environment deviation (R5, spec §3.4)
 
@@ -410,13 +438,15 @@ them in `go-no-go.md`; this file does not edit that record.
   enforced on Darwin) is part of the macOS floor but belongs to M8." Closed by V10 above.
 - Line 323: "Windows degraded path (lockdown token plus job object, below the floor) and the job
   memory-limit enforcement test are M8." Closed by the degraded-path section above; the job
-  memory-limit test is not recorded (task-11-report.md:155).
+  memory-limit test is recorded in the V10 section above (`V10 windows_job_memory_limit
+  verdict=process_mb job_message=true`, run 39115702067).
 - Line 327: "The worker I/O loop design, the rquickjs `futures` decision, the sandbox binary identity
   re-check, limits and outcome classification are M8." Closed by V15 and V21 above and the limit
   bounds in the V16 section; outcome classification is in the M8 report set.
 - Line 330: "A successful script run with degraded confinement off is M8." Not closed by this file:
-  the Windows degraded run test (`windows_degraded_spawner_runs_with_lockdown_token`) has no recorded
-  CI output in the ledger.
+  the Windows degraded spawner run is recorded (the `M8 windows_degraded_spawner mechanism=lockdown_token ... result=42` line
+  of run 39115702067, quoted in the degraded section above), but it is a run below the floor, not a
+  successful script run with degraded confinement off.
 
 ## CI run and SHA
 
