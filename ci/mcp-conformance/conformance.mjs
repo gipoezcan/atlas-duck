@@ -26,6 +26,8 @@ if (childEnv === null || typeof childEnv !== "object" || Array.isArray(childEnv)
 const FULL_TOOL_COUNT = 54;
 const GENERIC_TOOL_COUNT = 9;
 const CALL_TIMEOUT_MS = 30_000;
+// Total time a scenario may spend in request_await rounds (plus at most one more call of CALL_TIMEOUT_MS).
+const AWAIT_BUDGET_MS = 120_000;
 
 const get = (key, reason) => ({ tool: "jira_issue_get", args: { key, reason: `atlas-test:${reason}` } });
 
@@ -62,7 +64,7 @@ const scenarios = [
   // A script that throws, released with its error: `released`, and an error result (exit 8,
   // PD-121); the SDK client must hand it back, not throw. The first script of an app waits for the
   // sandbox probe, which can outlast the 5 s timeout of this child: `wait` follows a `pending`
-  // answer with `request_await` (at most 12 times) until the run is decided.
+  // answer with `request_await` (within a 120 s budget) until the run is decided.
   {
     name: "script_error_released",
     tool: "script_run",
@@ -125,7 +127,10 @@ for (const tools of sets) {
       let result = await client.callTool({ name: s.tool, arguments: s.args }, undefined, {
         timeout: CALL_TIMEOUT_MS,
       });
-      for (let i = 0; s.wait && i < 12 && result.structuredContent?.status === "pending"; i++) {
+      // Bounded by a wall-clock deadline well under the Rust side's RUN_LIMIT (300 s), so a stalled
+      // server fails here with a clear line instead of the whole run being killed.
+      const awaitUntil = Date.now() + AWAIT_BUDGET_MS;
+      while (s.wait && result.structuredContent?.status === "pending" && Date.now() < awaitUntil) {
         const requestId = result.structuredContent.request_id;
         if (typeof requestId !== "string") break;
         result = await client.callTool({ name: "request_await", arguments: { request_id: requestId } }, undefined, {

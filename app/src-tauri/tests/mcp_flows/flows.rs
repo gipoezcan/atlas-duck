@@ -19,7 +19,7 @@
 use std::time::{Duration, Instant};
 
 use atlas_duck_app_lib::testing::ENV_TEST_SERVER_BUILD_ID;
-use atlas_duck_app_lib::testing::control::{DELAY_STARTUP_FILE, QUIT_FILE};
+use atlas_duck_app_lib::testing::control::{DELAY_STARTUP_FILE, QUEUE_FILE, QUIT_FILE};
 use atlas_duck_atlassian::testing::fixtures::{self, JIRA_COMMENT};
 use atlas_duck_atlassian::testing::{MockDc, TEST_USER, UserKind};
 use atlas_duck_audit::request_set::requests_from_json;
@@ -1660,7 +1660,8 @@ async fn confluence_tools_end_to_end() -> Result<()> {
 // ---- script_run (Task 23) --------------------------------------------------------------------------
 
 /// `ATLAS_DUCK_MCP_TIMEOUT` of the script flows that wait for a decision: the first script of an app
-/// waits for the sandbox probe (up to 60 s, counted toward the timeout), as `script_flows` waits 100 s.
+/// waits for the sandbox probe (its per-probe timeouts count toward the timeout), as `script_flows`
+/// waits 100 s.
 const SCRIPT_TIMEOUT: &str = "100";
 /// How long the driver waits for the answer of such a call (a little over [`SCRIPT_TIMEOUT`]).
 const SCRIPT_ANSWER_WITHIN: Duration = Duration::from_secs(130);
@@ -1718,6 +1719,62 @@ async fn wait_reached(mock: &MockDc, suffix: &str) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// The request ids on the scripted approver's queue mirror (`test-control/queue.json`): a script
+/// run is on it only once it has ended (its release item). Ported from `script_flows`.
+fn queued_ids(world: &World) -> Result<Vec<String>> {
+    let path = world.control_dir().join(QUEUE_FILE);
+    let mut last = None;
+    // A reader can meet the file while the app renames a new one over it (Windows): try again.
+    for _ in 0..10 {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let rows: Vec<Value> = serde_json::from_str(&text)?;
+                return Ok(rows
+                    .iter()
+                    .filter_map(|r| r["request_id"].as_str().map(str::to_owned))
+                    .collect());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                last = Some(e);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    Err(last.map_or_else(|| "no queue mirror".into(), Into::into))
+}
+
+/// Waits (at most [`SCRIPT_REACHED_WITHIN`]) until every id is on the approver's queue: each of
+/// those script runs has ended and waits on its release item.
+async fn wait_queued(world: &World, ids: &[&str]) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        let queued = queued_ids(world)?;
+        if ids.iter().all(|id| queued.iter().any(|q| q == id)) {
+            return Ok(());
+        }
+        if start.elapsed() > SCRIPT_REACHED_WITHIN {
+            return Err(format!(
+                "not all of {ids:?} reached the queue in {SCRIPT_REACHED_WITHIN:?}: {queued:?}"
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// (method, path) of every request the mock saw after the first `before`, except the field-name
+/// cache's start fill `GET /rest/api/2/field` (PD-46), the only request the app sends unprompted.
+async fn requests_after(mock: &MockDc, before: usize) -> Vec<(String, String)> {
+    mock.received()
+        .await
+        .iter()
+        .skip(before)
+        .map(|r| (r.method.to_string(), r.url.path().to_owned()))
+        .filter(|(method, path)| !(method == "GET" && path.ends_with("/rest/api/2/field")))
+        .collect()
 }
 
 /// The envelope of a cancel without what differs between two requests: their id, the `meta` clocks
@@ -1794,18 +1851,20 @@ async fn script_run_dry_run_full_and_sparse() -> Result<()> {
         assert!(env["data"]["result"].is_null(), "{mode}: {env}");
     }
 
-    // The mock heard nothing of any of the four runs.
-    let touched: Vec<String> = mock
-        .received()
-        .await
-        .iter()
-        .skip(before)
-        .map(|r| r.url.path().to_owned())
-        .filter(|p| p.contains("/issue") || p.contains("/search") || p.contains("/comment"))
-        .collect();
+    // The mock heard nothing of any of the four runs: the only request after the baseline is the
+    // field-name cache's start fill, `GET /rest/api/2/field` (PD-46), which no run asks for.
+    let touched = requests_after(mock, before).await;
     assert!(
         touched.is_empty(),
         "a dry run reached the upstream: {touched:?}"
+    );
+    // Positive control: the same filter sees a real read.
+    let control = release_get(&mut mcp).await?;
+    assert_released(&mcp, &control);
+    let seen = requests_after(mock, before).await;
+    assert!(
+        seen.iter().any(|(_, path)| path.ends_with(ISSUE_ABC_1)),
+        "the filter does not see a real read: {seen:?}"
     );
 
     mcp.close_stdin();
@@ -1818,7 +1877,12 @@ async fn script_run_dry_run_full_and_sparse() -> Result<()> {
         .filter(|(kind, _)| *kind == EventType::SCRIPT_DRY_RUN)
         .count();
     assert_eq!(dry, 4, "SCRIPT_DRY_RUN records");
-    for kind in [EventType::SCRIPT_STARTED, EventType::SCRIPT_CALL] {
+    for kind in [
+        EventType::SCRIPT_STARTED,
+        EventType::SCRIPT_CALL_SENT,
+        EventType::SCRIPT_CALL,
+        EventType::SCRIPT_RELEASED,
+    ] {
         let n = records.iter().filter(|(k, _)| *k == kind).count();
         assert_eq!(n, 0, "{kind:?} after dry runs only: {records:?}");
     }
@@ -1902,11 +1966,53 @@ async fn script_error_released_is_error_result() -> Result<()> {
     const CANARY: &str = "MCP-SCRIPT-ERROR-CANARY-4c81";
     let world = script_world(WorldOpts::default()).await?;
     let _app = world.start_app().await?;
-    let mut mcp = mcp_client(&world, "mcp-flows-script-error", SCRIPT_TIMEOUT).await?;
-
     let source = format!(
         "await atlas.call('jira.issue.get', {{key: 'ABC-1'}});\nthrow new Error('{CANARY}');\n"
     );
+
+    // The held twin: the same script, held. Once its run has ended (it is on the approver's
+    // queue) its error waits for a release; `script_run`, `request_status` and `request_await`
+    // all answer `pending` without data, and neither the message nor `script_error` is ever on
+    // the wire. (A short timeout, never 0: with 0 `request_await` waits without a limit.)
+    let mut held = mcp_client(&world, "mcp-flows-script-held", "2").await?;
+    let out = script_run(&mut held, &source, Some("atlas-test:hold"), None).await?;
+    let env = out.structured();
+    assert!(!out.is_error(), "{env}\n{}", held.transcript());
+    assert_eq!(status_of(env), "pending", "{env}\n{}", held.transcript());
+    assert!(env["data"].is_null(), "pending carries data: {env}");
+    let held_id = env["request_id"]
+        .as_str()
+        .ok_or_else(|| format!("no request id: {env}"))?
+        .to_owned();
+    wait_queued(&world, &[held_id.as_str()]).await?;
+    let status = held
+        .call("request_status", json!({"request_id": held_id}), None)
+        .await?;
+    let env = status.structured();
+    assert!(!status.is_error(), "{env}\n{}", held.transcript());
+    assert_eq!(status_of(env), "pending", "{env}\n{}", held.transcript());
+    assert!(env["data"].is_null(), "status carries data: {env}");
+    let awaited = held
+        .call("request_await", json!({"request_id": held_id}), None)
+        .await?;
+    let env = awaited.structured();
+    assert_eq!(status_of(env), "pending", "{env}\n{}", held.transcript());
+    assert!(env["data"].is_null(), "await carries data: {env}");
+    // Not `Error`: every result line carries `isError`.
+    for line in held.raw_stdout_lines() {
+        assert!(
+            !line.contains(CANARY) && !line.contains("script_error"),
+            "a held script error is on the wire: {line}"
+        );
+    }
+    // Clean up: the held item must not outlive the flow (its answer is not what this twin checks).
+    held.call("request_cancel", json!({"request_id": held_id}), None)
+        .await?;
+    held.close_stdin();
+    let exit = held.wait_exit().await?;
+    assert!(exit.success(), "{exit}\n{}", held.transcript());
+
+    let mut mcp = mcp_client(&world, "mcp-flows-script-error", SCRIPT_TIMEOUT).await?;
     let out = script_run(&mut mcp, &source, Some("atlas-test:release"), None).await?;
     let env = out.structured();
     assert!(out.is_error(), "{env}\n{}", mcp.transcript());
@@ -2116,6 +2222,11 @@ async fn i41_sandbox_replaced_is_error_with_retryable() -> Result<()> {
             !env.to_string().contains("protocol_violation"),
             "a protocol violation: {env}"
         );
+        // PD-123: `sandbox_unavailable` gets no restart sentence; the first text is the envelope.
+        assert!(
+            !out.result.to_string().contains(RESTART_TEXT),
+            "restart text on sandbox_unavailable: {env}"
+        );
     }
 
     // The rest of the product, and the server, are not affected.
@@ -2140,6 +2251,12 @@ async fn i41_sandbox_replaced_is_error_with_retryable() -> Result<()> {
                 && p["details"]["reason"] == json!("app_upgraded")
         }),
         "no app_upgraded failure in the audit: {failed:?}"
+    );
+    assert!(
+        !failed
+            .iter()
+            .any(|p| p["reason"] == json!("protocol_violation")),
+        "a protocol violation in the audit: {failed:?}"
     );
     Ok(())
 }
