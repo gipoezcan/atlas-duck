@@ -43,6 +43,9 @@ pub const RENDER_VERSIONS: &[(&str, u64)] = &[
     // M8 Task 18 (Δ5): the script result and error documents. Re-pinned in place while render5
     // was unmerged and unpushed: by the T18 review fix (the reserved script sections and the
     // view's h3 heading), then at the M7 merge (over the union of the M6, M7 and M8 goldens).
+    // render5's text is never cut inside a sequence: a cut never lands strictly inside an emoji
+    // sequence or a `⟨U+XXXX⟩` escape, and nothing is written after such a cut (`cut_boundary`;
+    // no golden cuts inside one, so only `tests/invisible.rs` notices a revert).
     ("render5", 0xc888_734b_35e9_df53),
 ];
 
