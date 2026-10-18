@@ -22,7 +22,7 @@ use atlas_duck_ipc::rpc::{EmptyParams, method};
 use serde_json::{Map, Value, json};
 
 use crate::argv::GlobalOpts;
-use crate::connected::{Connector, reach, short_call_guarded};
+use crate::connected::{Connector, hello_for, reach, short_call_guarded};
 use crate::deadline::Deadline;
 use crate::discover::{AppLocation, DataState, Discovery};
 use crate::interrupt::Interrupts;
@@ -418,7 +418,7 @@ async fn app_answer(
     if let DataState::Refused(env) = &d.data {
         return Err(env.clone());
     }
-    let mut client = reach(connector, opts, deadline, &mut *intr).await?;
+    let mut client = reach(connector, &hello_for(opts), deadline, &mut *intr).await?;
     // The handlers stay installed for the process lifetime once registered (tokio never restores
     // the default), so the call keeps listening or Ctrl-C would do nothing until the deadline.
     let env = short_call_guarded(

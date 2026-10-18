@@ -10,7 +10,28 @@ use crate::argv::Command;
 /// and is not `unknown_request`): the exit code answers "did the command work", the envelope
 /// says what happened to the request. Everything else follows the generic matrix.
 pub(crate) fn exit_for(cmd: &Command, env: &Envelope) -> i32 {
-    if matches!(cmd, Command::Status { .. })
+    let kind = match cmd {
+        Command::Op { .. } | Command::Call { .. } | Command::ScriptRun { .. } => CallKind::Submit,
+        Command::Await { .. } => CallKind::Await,
+        Command::Status { .. } => CallKind::Status,
+        _ => CallKind::Short,
+    };
+    exit_for_kind(kind, env)
+}
+
+/// The kinds of call whose exit code differs only for `status` (§4.4); MCP maps its results
+/// through this without building a `Command`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallKind {
+    Submit,
+    Await,
+    Status,
+    Short,
+}
+
+/// [`exit_for`] by kind of call.
+pub(crate) fn exit_for_kind(kind: CallKind, env: &Envelope) -> i32 {
+    if kind == CallKind::Status
         && env.request_id.is_some()
         && env.error.as_ref().map(|e| e.code) != Some(ErrorCode::UnknownRequest)
     {

@@ -8,13 +8,12 @@
 //! process start (PD-17); `--timeout 0` bounds the pre-submission steps by their own limits and
 //! skips the wait after submission.
 
-use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use atlas_duck_ipc::build_info::BUILD_ID;
-use atlas_duck_ipc::client::{ClientContext, ClientError, ConnectError, IpcClient, UNKNOWN_BUILD};
-use atlas_duck_ipc::envelope::{Envelope, EnvelopeError, ErrorCode, Status};
+use atlas_duck_ipc::client::{ClientContext, ConnectError, IpcClient};
+use atlas_duck_ipc::envelope::{Envelope, ErrorCode, Status};
 use atlas_duck_ipc::proto::{
     AwaitParams, ClientKind, Hello, ListState, MatchParams, SubmitParams, SubmitReply,
 };
@@ -22,14 +21,26 @@ use atlas_duck_ipc::rpc::{
     EmptyParams, IdParams, OpsDescribeParams, OpsListParams, RequestsListParams, method,
 };
 use serde::Serialize;
-use serde_json::{Map, Value, json};
+use serde_json::Value;
 
-use crate::argv::{Command, DryRun, GlobalOpts};
-use crate::busy::connect_busy;
+use crate::argv::{Command, GlobalOpts};
 use crate::deadline::Deadline;
 use crate::discover::{self, Discovery};
+pub(crate) use crate::flow::connect_error;
+use crate::flow::{
+    MSG_DEADLINE_SHORT, MSG_INTERNAL, await_error, await_timeout_ms, check_await_reply,
+    check_submit_reply, no_reply, not_running, pending_for, protocol_failure, script_params,
+    short_error, submit_error,
+};
 use crate::interrupt::{BoxFuture, Interrupts, Never};
 use crate::launch::{self, LaunchSys};
+
+// The CLI-side mapping helpers live in `flow` (shared with the MCP server); the exit-code matrix
+// tests and the flow tests reach them through this module.
+#[cfg(test)]
+pub(crate) use crate::flow::{
+    MSG_CONNECTION_LOST_NO_ID, build_mismatch, connection_lost_pending, unknown_request_pending,
+};
 
 /// Bound for connect + hello and for each call when the deadline is unbounded (`--timeout 0`):
 /// those steps have no limit of their own, and a hung app must not hang the CLI.
@@ -38,30 +49,11 @@ pub(crate) const OWN_LIMIT: Duration = Duration::from_secs(30);
 /// `request.await` before it prints the pending envelope itself.
 pub(crate) const AWAIT_SLACK: Duration = Duration::from_secs(2);
 
-pub(crate) const REASON_CONNECTION_LOST: &str = "connection_lost";
-pub(crate) const REASON_APP_UPGRADED: &str = "app_upgraded";
-const MSG_NOT_RUNNING: &str = "the atlas-duck app is not running";
-/// §3.2 (a).
-pub(crate) const MSG_SERVER_IDENTITY: &str = "the atlas-duck endpoint is not owned by this user";
-/// §3.3, verbatim.
-pub(crate) const MSG_APP_UPGRADED: &str = "atlas-duck was upgraded; restart the app";
-/// §4.3, verbatim (the `<id>` is literal: the id is in `request_id`).
-pub(crate) const MSG_CONNECTION_LOST: &str = "use `await <id>`; the request may be `abandoned`";
-/// PD-16 second half (ledger L63).
-pub(crate) const MSG_CONNECTION_LOST_NO_ID: &str =
-    "the request may have been queued; recover it with requests list --match-params-file";
-const MSG_LOST_BEFORE_SUBMIT: &str =
-    "the connection to the atlas-duck app was lost before an answer arrived";
-const MSG_DEADLINE_SHORT: &str =
-    "the --timeout deadline expired before the atlas-duck app answered";
-const MSG_PROTOCOL: &str = "the atlas-duck app broke the protocol";
-const MSG_TOO_LARGE: &str = "the request is too large to send";
-const MSG_INTERNAL: &str = "the request could not be sent";
 const MSG_NOT_CONNECTED: &str = "not a connected command";
 
 /// How a connected command reaches the app: every OS-facing step, so tests can inject doubles
 /// (the real one is `OsConnector`). Local commands never touch it.
-pub(crate) trait Connector: Sync {
+pub(crate) trait Connector: Send + Sync {
     /// What this machine says about the data dir and the app (§3.2). Cheap and synchronous.
     fn discover(&self) -> Discovery;
     /// The launch seam of `launch::ensure_running` (it blocks, so it runs on a blocking thread).
@@ -163,153 +155,6 @@ async fn connect_owner_mismatch(
     IpcClient::connect_at(&location, &ctx.data_dir, &ctx.hello, &NeverOwner, deadline).await
 }
 
-// ---------- envelopes the CLI builds itself ----------
-
-fn with_details(mut env: Envelope, details: Map<String, Value>) -> Envelope {
-    if let Some(err) = env.error.as_mut() {
-        err.details = Some(details);
-    }
-    env
-}
-
-fn reason(reason: &str) -> Map<String, Value> {
-    let mut d = Map::new();
-    d.insert("reason".to_owned(), Value::from(reason));
-    d
-}
-
-fn not_running() -> Envelope {
-    *launch::unreachable(discover::REASON_NOT_RUNNING, MSG_NOT_RUNNING)
-}
-
-fn lost_before_submit() -> Envelope {
-    *launch::unreachable(discover::REASON_NOT_RUNNING, MSG_LOST_BEFORE_SUBMIT)
-}
-
-/// A `failed` `protocol_error` (exit 1): the app broke the protocol. Never echoes a request id.
-fn protocol_failure() -> Envelope {
-    Envelope::failed(ErrorCode::ProtocolError, false, MSG_PROTOCOL)
-}
-
-/// §4.3 `pending` + `connection_lost`: the request exists (`request_id`), the connection dropped
-/// after submission. `retryable: false` (use `await`), exit 4.
-pub(crate) fn connection_lost_pending(request_id: &str, base: Option<&Envelope>) -> Envelope {
-    let mut env = pending_for(request_id, base);
-    env.error = Some(EnvelopeError {
-        code: ErrorCode::Unreachable,
-        retryable: false,
-        message: MSG_CONNECTION_LOST.to_owned(),
-        details: Some(reason(REASON_CONNECTION_LOST)),
-    });
-    env
-}
-
-/// PD-16 / L63: the frame was written but no reply came (interrupt, loss, stuck app): the request
-/// may exist and its id is unknown. `pending`, `request_id: null`, exit 4.
-pub(crate) fn unknown_request_pending() -> Envelope {
-    let mut env = Envelope::failed(ErrorCode::Unreachable, false, MSG_CONNECTION_LOST_NO_ID);
-    env.status = Status::Pending;
-    with_details(env, reason(REASON_CONNECTION_LOST))
-}
-
-/// The pending envelope of a known request: from the submit reply when there is one, else just
-/// the id.
-fn pending_for(request_id: &str, base: Option<&Envelope>) -> Envelope {
-    match base {
-        Some(b) => {
-            let mut env = b.clone();
-            env.status = Status::Pending;
-            env.request_id = Some(request_id.to_owned());
-            env
-        }
-        None => {
-            let mut env = Envelope::failed(ErrorCode::Internal, false, "");
-            env.status = Status::Pending;
-            env.error = None;
-            env.request_id = Some(request_id.to_owned());
-            env
-        }
-    }
-}
-
-/// PD-08 (§3.3): the two build-mismatch envelopes.
-pub(crate) fn build_mismatch(
-    client_newer: bool,
-    client_build: &str,
-    server_build: &str,
-) -> Envelope {
-    if client_newer {
-        return with_details(
-            Envelope::failed(ErrorCode::Unreachable, true, MSG_APP_UPGRADED),
-            reason(REASON_APP_UPGRADED),
-        );
-    }
-    let mut details = Map::new();
-    details.insert("client_build".to_owned(), Value::from(client_build));
-    details.insert("server_build".to_owned(), Value::from(server_build));
-    let message = format!(
-        "atlas-duck app ({}) differs from CLI ({}): quit and relaunch the app, or reinstall",
-        version_label(server_build),
-        version_label(client_build),
-    );
-    with_details(
-        Envelope::failed(ErrorCode::ProtocolMismatch, true, &message),
-        details,
-    )
-}
-
-/// `v<version half>` of a build id; a refusal that named no build prints "unknown version".
-fn version_label(build: &str) -> String {
-    let half = build.split_once('+').map_or(build, |(v, _)| v);
-    if half.is_empty() || half == UNKNOWN_BUILD {
-        "unknown version".to_owned()
-    } else {
-        format!("v{half}")
-    }
-}
-
-/// Every `ConnectError` that reaches the user (`NotRunning` only after the retry).
-pub(crate) fn connect_error(e: ConnectError) -> Envelope {
-    if let Some(busy) = connect_busy(&e) {
-        return busy;
-    }
-    match e {
-        ConnectError::NotRunning => not_running(),
-        ConnectError::ServerIdentity => {
-            Envelope::failed(ErrorCode::ServerIdentity, false, MSG_SERVER_IDENTITY)
-        }
-        ConnectError::DeadlineExceeded => *launch::launch_timeout(),
-        ConnectError::BuildMismatch {
-            client_newer,
-            client_build,
-            server_build,
-        } => build_mismatch(client_newer, &client_build, &server_build),
-        ConnectError::Hello(env) => env,
-        ConnectError::Protocol(_) => protocol_failure(),
-        ConnectError::Io(_) => Envelope::failed(ErrorCode::Internal, false, MSG_INTERNAL),
-        // `connect_busy` took these.
-        ConnectError::PipeBusy | ConnectError::Busy { .. } => {
-            Envelope::failed(ErrorCode::Busy, true, "busy")
-        }
-    }
-}
-
-/// A call that gave no answer, outside the submit-wait flow (nothing here echoes a request id).
-fn short_error(e: ClientError) -> Envelope {
-    match e {
-        ClientError::Rpc(rpc) => rpc.data.unwrap_or_else(protocol_failure),
-        ClientError::ConnectionLost => lost_before_submit(),
-        ClientError::Protocol(_) => protocol_failure(),
-        ClientError::DeadlineExceeded => {
-            *launch::unreachable(launch::REASON_LAUNCH_TIMEOUT, MSG_DEADLINE_SHORT)
-        }
-        ClientError::Io(e) if e.kind() == io::ErrorKind::InvalidInput => {
-            Envelope::failed(ErrorCode::Usage, false, MSG_TOO_LARGE)
-        }
-        ClientError::Io(_) => Envelope::failed(ErrorCode::Internal, false, MSG_INTERNAL),
-    }
-}
-
 // ---------- the flow ----------
 
 enum Wait<T> {
@@ -339,7 +184,8 @@ fn bound(deadline: &Deadline) -> Instant {
     deadline.at().unwrap_or_else(|| Instant::now() + OWN_LIMIT)
 }
 
-fn hello_for(opts: &GlobalOpts) -> Hello {
+/// The CLI's `hello` (the MCP server builds its own).
+pub(crate) fn hello_for(opts: &GlobalOpts) -> Hello {
     let cwd_basename = std::env::current_dir()
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -376,7 +222,7 @@ pub(crate) async fn execute(
     } else {
         Box::new(Never)
     };
-    let mut client = match reach(connector, opts, deadline, &mut *intr).await {
+    let mut client = match reach(connector, &hello_for(opts), deadline, &mut *intr).await {
         Ok(client) => client,
         Err(env) => return *env,
     };
@@ -386,11 +232,10 @@ pub(crate) async fn execute(
 /// Discover, launch if needed, connect. `Err` is the envelope to print: nothing was queued.
 pub(crate) async fn reach(
     connector: &dyn Connector,
-    opts: &GlobalOpts,
+    hello: &Hello,
     deadline: &Deadline,
     intr: &mut dyn Interrupts,
 ) -> Result<IpcClient, Box<Envelope>> {
-    let hello = hello_for(opts);
     // The endpoint can vanish between the launch step's check and the connect: one more round.
     for attempt in 0..2 {
         let d = connector.discover();
@@ -565,31 +410,6 @@ fn list_state(s: &str) -> Option<ListState> {
     }
 }
 
-/// `script.run` params: `{source, args, limits?, dry_run?}` (`dry_run` is `"full"`/`"sparse"`).
-fn script_params(
-    source: &str,
-    args: &Value,
-    limits: Option<&Value>,
-    dry_run: Option<DryRun>,
-) -> Value {
-    let mut params = json!({ "source": source, "args": args });
-    if let Some(map) = params.as_object_mut() {
-        if let Some(limits) = limits {
-            map.insert("limits".to_owned(), limits.clone());
-        }
-        match dry_run {
-            Some(DryRun::Full) => {
-                map.insert("dry_run".to_owned(), Value::from("full"));
-            }
-            Some(DryRun::Sparse) => {
-                map.insert("dry_run".to_owned(), Value::from("sparse"));
-            }
-            None => {}
-        }
-    }
-    params
-}
-
 pub(crate) async fn short_call<P: Serialize>(
     client: &mut IpcClient,
     name: &str,
@@ -634,57 +454,24 @@ async fn submit_wait(
         // request may exist and no id came back (PD-16).
         Wait::Interrupted | Wait::TimedOut => return no_reply(client.written_request()),
     };
-    let envelope = reply.envelope;
+    // L83: a `pending` reply names the request; one without an id cannot be awaited, noticed
+    // or recovered, so the app broke the protocol.
+    let (envelope, params_sha256) = match check_submit_reply(reply) {
+        Ok(checked) => checked,
+        Err(env) => return *env,
+    };
     if envelope.status != Status::Pending {
         return envelope;
     }
-    // L83: a `pending` reply names the request; one without an id cannot be awaited, noticed
-    // or recovered, so the app broke the protocol.
     let Some(request_id) = envelope.request_id.clone() else {
         return protocol_failure();
     };
     // PD-19: only from the returned reply, before any wait.
-    connector.notice(&request_id, reply.params_sha256.as_deref());
+    connector.notice(&request_id, params_sha256.as_deref());
     if opts.timeout == Some(0) {
         return envelope;
     }
     await_request(client, &request_id, &envelope, opts, deadline, intr).await
-}
-
-/// What the agent gets when no reply to a submit arrived.
-fn no_reply(written: bool) -> Envelope {
-    if written {
-        unknown_request_pending()
-    } else {
-        *launch::launch_timeout()
-    }
-}
-
-/// A submit call that failed. An envelope from the app is its answer; any other failure after the
-/// frame was written leaves a request that may exist, whose id is unknown: pending, exit 4.
-fn submit_error(e: ClientError, written: bool) -> Envelope {
-    match e {
-        ClientError::Rpc(rpc) => match rpc.data {
-            Some(env) => env,
-            None if written => unknown_request_pending(),
-            None => protocol_failure(),
-        },
-        ClientError::ConnectionLost if written => unknown_request_pending(),
-        ClientError::ConnectionLost => lost_before_submit(),
-        ClientError::DeadlineExceeded => no_reply(written),
-        _ if written => unknown_request_pending(),
-        other => short_error(other),
-    }
-}
-
-/// An `await` call that failed. An envelope from the app is its answer; any other failure means
-/// no answer came, and the request (its id is known) lives on: pending, exit 4, `await` again.
-fn await_error(e: ClientError, id: &str, base: &Envelope) -> Envelope {
-    match e {
-        ClientError::Rpc(rpc) if rpc.data.is_some() => short_error(ClientError::Rpc(rpc)),
-        ClientError::DeadlineExceeded => base.clone(),
-        _ => connection_lost_pending(id, Some(base)),
-    }
 }
 
 /// `request.await` for `id`; `base` is what to print when the wait ends undecided.
@@ -696,13 +483,9 @@ async fn await_request(
     deadline: &Deadline,
     intr: &mut dyn Interrupts,
 ) -> Envelope {
-    let timeout_ms = match (opts.timeout, deadline.remaining()) {
-        (Some(0), _) | (_, None) => 0,
-        (_, Some(left)) => u64::try_from(left.as_millis()).unwrap_or(u64::MAX),
-    };
     let params = AwaitParams {
         request_id: id.to_owned(),
-        timeout_ms: Some(timeout_ms),
+        timeout_ms: Some(await_timeout_ms(deadline, opts.timeout == Some(0))),
     };
     let at = bound(deadline);
     let at = if opts.timeout == Some(0) {
@@ -718,10 +501,7 @@ async fn await_request(
     .await
     {
         // L83: an answer naming another request is not the answer to this one.
-        Wait::Done(Ok(env)) if env.request_id.as_deref().is_some_and(|got| got != id) => {
-            protocol_failure()
-        }
-        Wait::Done(Ok(env)) => env,
+        Wait::Done(Ok(env)) => check_await_reply(id, env),
         Wait::Done(Err(e)) => await_error(e, id, base),
         // The wait ended undecided; the request lives on (`await` it again).
         Wait::Interrupted | Wait::TimedOut => base.clone(),

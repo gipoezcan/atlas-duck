@@ -9,7 +9,7 @@ use atlas_duck_ipc::proto::{AgentNameSource, ListState};
 use serde_json::{Value, json};
 
 use super::*;
-use crate::argv::{MatchParams as CliMatch, OutputMode};
+use crate::argv::{DryRun, MatchParams as CliMatch, OutputMode};
 use crate::exit::exit_for;
 use crate::test_support::{Fake, Kind, Mode, REQ_ID, Running, TestConnector, WAIT, serve};
 

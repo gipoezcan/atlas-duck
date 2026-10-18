@@ -22,6 +22,7 @@ mod deadline;
 mod discover;
 mod doctor;
 mod exit;
+mod flow;
 mod help;
 mod input;
 mod interrupt;
