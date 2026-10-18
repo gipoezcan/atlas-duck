@@ -173,6 +173,10 @@ static TEST_SERVER_BUILD_ID: std::sync::OnceLock<String> = std::sync::OnceLock::
 
 /// PD-129 (b): makes every later `hello` compare against and answer with `id` instead of
 /// `BUILD_ID`. The first call wins.
+///
+/// Process-global and never reset: a unit test must never call this, or every other test in
+/// its binary that handshakes with `BUILD_ID` passes or fails by test order. Exercise
+/// `check_build` with the id instead.
 #[cfg(feature = "testing")]
 pub fn set_test_server_build_id(id: &str) {
     let _ = TEST_SERVER_BUILD_ID.set(id.to_owned());

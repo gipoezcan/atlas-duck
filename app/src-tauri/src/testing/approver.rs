@@ -131,15 +131,15 @@ pub struct Served {
 }
 
 impl Served {
-    /// The approver's view of `core`. Call it inside the runtime: the expiry path runs on that
-    /// runtime's handle.
-    pub fn of_core(core: Arc<Core>) -> Served {
+    /// The approver's view of `core`, or `None` outside a runtime: the expiry path runs on the
+    /// handle of the runtime this is called in.
+    pub fn of_core(core: Arc<Core>) -> Option<Served> {
+        let handle = Handle::try_current().ok()?;
         let decisions = core.decisions();
-        let handle = Handle::current();
-        Served {
+        Some(Served {
             decisions,
             expire: Arc::new(move |id| handle.block_on(core.expire_now(id))),
-        }
+        })
     }
 }
 
@@ -152,7 +152,7 @@ pub struct ScriptedApp;
 impl ScriptedApp {
     /// The approver over one core, woken by `wake`.
     pub fn spawn(core: Arc<Core>, wake: Arc<Wake>) -> JoinHandle<()> {
-        ScriptedApp::spawn_with(Arc::new(move || Some(Served::of_core(core.clone()))), wake)
+        ScriptedApp::spawn_with(Arc::new(move || Served::of_core(core.clone())), wake)
     }
 
     /// The approver of the app: the core is the one the managed `ServeSlot` serves, whenever
@@ -165,7 +165,7 @@ impl ScriptedApp {
         let source: DecisionSource = Arc::new(move || {
             let slot = app.try_state::<ServeSlot>()?;
             let core = slot.get()?.core.get()?.clone();
-            Some(Served::of_core(core))
+            Served::of_core(core)
         });
         tauri::async_runtime::spawn(run(source, app_wake(), Some(control_dir)));
     }
