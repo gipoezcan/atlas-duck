@@ -254,10 +254,9 @@ impl<'a> Body<'a> {
         };
         // PD-127: no stderr notice in MCP mode; the id reaches the agent through the "submitted"
         // notification (PD-125) and the result. A call the client cancelled meanwhile hears
-        // nothing more (PD-126).
-        if !self.call.context.ct.is_cancelled() {
-            progress.submitted(&request_id).await;
-        }
+        // nothing more (PD-126); a cancel (or stdin EOF) during the send ends it too, so the
+        // handler is never parked in a notification rmcp no longer drives.
+        let _ = self.unless_cancelled(progress.submitted(&request_id)).await;
         if self.zero_timeout() {
             return envelope;
         }

@@ -49,7 +49,8 @@ fn detail<'a>(env: &'a Value, key: &str) -> Option<&'a Value> {
 }
 
 fn reason_envelope(code: ErrorCode, reason: &str) -> Envelope {
-    let mut env = Envelope::failed(code, false, "refused");
+    // §2.5: `unreachable {app_shutting_down}` is retryable (nothing was queued).
+    let mut env = Envelope::failed(code, true, "refused");
     if let Some(err) = env.error.as_mut() {
         let mut d = Map::new();
         d.insert("reason".to_owned(), Value::from(reason));
@@ -2273,13 +2274,23 @@ async fn i04_heartbeat_period_independent_of_app_events() -> TestResult {
     let notes = notes(&rig, &token);
     let beats: Vec<&Note> = notes.iter().filter(|n| n.is_heartbeat()).collect();
     assert!(beats.len() >= 4, "{} heartbeats", beats.len());
+    // The times are the pump's arrival times, so one late line moves one gap by the load's jitter.
+    // Single gaps therefore get only a loose floor (a beat fired by an app event would come far
+    // earlier than the 200 ms period); the period itself is checked over the whole span, where
+    // the jitter of the two end lines is all that is left.
     for pair in beats.windows(2) {
         let gap = pair[1].at.saturating_duration_since(pair[0].at);
-        assert!(
-            gap >= Duration::from_millis(150),
-            "heartbeats {gap:?} apart"
-        );
+        assert!(gap >= Duration::from_millis(50), "heartbeats {gap:?} apart");
     }
+    let span = beats[beats.len() - 1]
+        .at
+        .saturating_duration_since(beats[0].at);
+    let periods = u32::try_from(beats.len() - 1)?;
+    assert!(
+        span >= Duration::from_millis(200) * periods - Duration::from_millis(100),
+        "{} heartbeats over {span:?}",
+        beats.len()
+    );
     assert_eq!(
         changes(&notes),
         [
@@ -2578,6 +2589,9 @@ async fn i41_mcp_survives_server_restart_and_rehandshakes() -> TestResult {
     assert!(!first.is_error(), "{:?}", first.texts());
     assert_eq!(rig.fake().hellos().len(), 1);
 
+    // Assumes the session's SharedClient reader has seen EOF before the next call reaches
+    // `Session::live()`: the restart returns when the server side is done, the reader wakes
+    // separately (in practice it wins). If this ever flakes, expose a rig hook; do not loosen it.
     rig.app.restart_server(RIG_BUILD).await;
 
     let second = rig
@@ -2617,7 +2631,8 @@ async fn i41_build_mismatch_is_error_then_recovers() -> TestResult {
         .await;
     assert!(!ok.is_error(), "{:?}", ok.texts());
 
-    // The app is newer than this server (the client `1.0.0+test` is older).
+    // The app is newer than this server (the client `1.0.0+test` is older). Same assumption as
+    // in the restart test above: the session's reader has seen EOF before the next call.
     rig.app.restart_server("2.0.0+x").await;
     let called = rig
         .call("request_status", json!({"request_id": REQ_ID}), false)
@@ -2682,6 +2697,7 @@ async fn i41_connection_drop_mid_await_is_connection_lost() -> TestResult {
 
     let called = rig.finish_within(waiting, Duration::from_secs(3)).await;
     let env = called.envelope();
+    assert!(called.is_error(), "{env}");
     assert_eq!(env["status"], "pending", "{env}");
     assert_eq!(env["request_id"], REQ_ID, "{env}");
     assert_eq!(code(&env), Some("unreachable"));

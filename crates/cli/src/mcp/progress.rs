@@ -144,6 +144,8 @@ pub(crate) async fn wait_with_progress<F: Future>(
     tokio::pin!(fut);
     tokio::pin!(cancelled);
     let mut timer = progress.token.is_some().then(|| {
+        // `interval_at` panics on a zero period.
+        let every = every.max(Duration::from_millis(1));
         let mut timer = interval_at(receipt + every, every);
         timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
         timer
@@ -167,8 +169,12 @@ pub(crate) async fn wait_with_progress<F: Future>(
         }
     };
     drop(timer);
+    // A cancel (stdin EOF) during this relay stops it, but the output is still returned: rmcp
+    // writes it at EOF, and a send it no longer drives would otherwise park the handler.
     while let Ok(n) = progress.changes.try_recv() {
-        progress.status(n).await;
+        if !unless(&mut cancelled, progress.status(n)).await {
+            break;
+        }
     }
     Some(out)
 }
@@ -404,6 +410,79 @@ mod tests {
         assert_eq!(beats(&peer.sent(), receipt), [ms(5_000)]);
         tokio::time::sleep(Duration::from_secs(30)).await;
         assert_eq!(peer.sent().len(), 1);
+        Ok(())
+    }
+
+    /// A peer whose `notify` never completes: rmcp after its loop ended (stdin EOF).
+    struct Stuck;
+
+    impl ProgressPeer for Stuck {
+        fn notify(&self, _: ProgressNotificationParam) -> SendFuture<'_, ()> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// A change handed over with the answer is relayed after it; a cancel during that relay
+    /// must not park the call: the output is still returned.
+    #[tokio::test(start_paused = true)]
+    async fn cancel_during_the_final_relay_still_returns_the_output() -> TestResult {
+        let mut progress = Progress::new(Some(token()), Arc::new(Stuck));
+        let receipt = Instant::now();
+        let mut relay = progress.relay();
+        let answer = async move {
+            sleep_until(receipt + ms(1_000)).await;
+            relay(change(Status::Executing));
+            7
+        };
+        let out = bounded(wait_with_progress(
+            answer,
+            &mut progress,
+            receipt,
+            HEARTBEAT_EVERY,
+            sleep_until(receipt + ms(2_000)),
+        ))
+        .await;
+        assert_eq!(out, Some(7));
+        Ok(())
+    }
+
+    /// A cancel during a send that never completes ends the wait (`None`).
+    #[tokio::test(start_paused = true)]
+    async fn cancel_during_a_stuck_heartbeat_ends_the_wait() -> TestResult {
+        let mut progress = Progress::new(Some(token()), Arc::new(Stuck));
+        let receipt = Instant::now();
+        let out = bounded(wait_with_progress(
+            std::future::pending::<()>(),
+            &mut progress,
+            receipt,
+            HEARTBEAT_EVERY,
+            sleep_until(receipt + ms(7_000)),
+        ))
+        .await;
+        assert!(out.is_none());
+        Ok(())
+    }
+
+    /// A zero period is clamped instead of panicking in `interval_at`.
+    #[tokio::test(start_paused = true)]
+    async fn zero_heartbeat_period_does_not_panic() -> TestResult {
+        let peer = Arc::new(Recorder::default());
+        let mut progress = Progress::new(Some(token()), peer.clone());
+        let receipt = Instant::now();
+        let out = bounded(wait_with_progress(
+            sleep_until(receipt + ms(3)),
+            &mut progress,
+            receipt,
+            Duration::ZERO,
+            std::future::pending(),
+        ))
+        .await;
+        assert_eq!(out, Some(()));
+        assert!(
+            beats(&peer.sent(), receipt)
+                .first()
+                .is_some_and(|b| *b == ms(1))
+        );
         Ok(())
     }
 
