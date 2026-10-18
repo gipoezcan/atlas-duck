@@ -45,6 +45,11 @@ pub const SCRIPT_HEAP_K: u32 = 15;
 /// At most this many characters of an agent string are echoed in an error.
 const ECHO_MAX_CHARS: usize = 64;
 
+/// The most bytes of the escaped path in a schema error's message. With `params/`, the `…`, the
+/// keyword and its separator the message stays well under the 300 characters the approvals UI
+/// used to cut at.
+const PATH_CAP_BYTES: usize = 200;
+
 /// What validation may look at besides the params. There is no field that can carry fetched
 /// content: validation is static.
 #[derive(Debug, Clone, Copy)]
@@ -175,6 +180,18 @@ fn compile(spec: &OperationSpec) -> Result<Compiled, ()> {
     Ok(Compiled { validator })
 }
 
+/// The display-escaped path of a schema error cut to [`PATH_CAP_BYTES`] where
+/// [`invisible::cut_boundary`] allows (never inside an emoji sequence or a `⟨U+XXXX⟩` escape);
+/// a cut path ends in `…`. 64 echoed chars can escape to about 640, and the approvals UI shows
+/// the whole message, so the cut is made here and not on the escaped text by the UI.
+fn cap_path(path: String) -> String {
+    if path.len() <= PATH_CAP_BYTES {
+        return path;
+    }
+    let end = invisible::cut_boundary(&path, PATH_CAP_BYTES);
+    format!("{}…", &path[..end])
+}
+
 /// First schema violation as `params/<path>: <keyword>`; never the offending value.
 fn schema_error(compiled: &Compiled, params: &Value) -> Option<ValidationError> {
     let error = compiled.validator.validate(params).err()?;
@@ -194,11 +211,11 @@ fn schema_error(compiled: &Compiled, params: &Value) -> Option<ValidationError> 
         }
         _ => {}
     }
-    let path = if location.is_empty() {
+    let path = cap_path(if location.is_empty() {
         param.clone()
     } else {
         echo(location.trim_start_matches('/'))
-    };
+    });
     let mut details = Map::new();
     if !param.is_empty() {
         details.insert("param".to_owned(), Value::from(param));

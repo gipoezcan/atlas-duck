@@ -503,22 +503,16 @@ describe('write edit form (spec 5.4 step 4)', () => {
     const alert = screen.getByRole('alert');
     expect(alert.textContent).toContain(markup);
     expect(document.querySelector('img, b')).toBeNull();
-    // The message is bounded.
+    // The message is shown whole: Rust bounds it (`schema_error_message_is_cut_on_a_boundary`),
+    // so the UI never cuts escaped text.
+    const bounded = `params/${'m'.repeat(299)}😀…: additionalProperties`;
     mockedDecide.mockRejectedValueOnce({
       kind: 'decision',
-      error: { kind: 'edit_rejected', error: { message: 'm'.repeat(5_000) } },
+      error: { kind: 'edit_rejected', error: { message: bounded } },
     });
     fireEvent.click(editButton());
     await flush();
-    expect(screen.getByText(/^“m+…”$/).textContent?.length).toBeLessThan(400);
-    // Cut by code points: a pair at the cut is not split, and a short text has no ellipsis.
-    mockedDecide.mockRejectedValueOnce({
-      kind: 'decision',
-      error: { kind: 'edit_rejected', error: { message: `${'m'.repeat(299)}😀tail` } },
-    });
-    fireEvent.click(editButton());
-    await flush();
-    expect(screen.getByText(`“${'m'.repeat(299)}😀…”`)).toBeTruthy();
+    expect(screen.getByText(`“${bounded}”`)).toBeTruthy();
     mockedDecide.mockRejectedValueOnce({ kind: 'decision', error: { kind: 'edit_rejected', error: { message: 'short' } } });
     fireEvent.click(editButton());
     await flush();

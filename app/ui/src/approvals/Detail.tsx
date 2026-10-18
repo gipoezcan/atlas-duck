@@ -116,10 +116,9 @@ function editRejection(e: unknown): string | null {
   const core = (e as { error?: { kind?: unknown; error?: { message?: unknown } } }).error;
   if (core?.kind !== 'edit_rejected') return null;
   const message = core.error?.message;
-  if (typeof message !== 'string') return '';
-  // By code points, so a surrogate pair is never split; the ellipsis says the text was cut.
-  const points = Array.from(message);
-  return points.length > 300 ? `${points.slice(0, 300).join('')}…` : message;
+  // Shown whole: Rust cuts the escaped path on a boundary (`cap_path`), a cut here could split an
+  // escape or an emoji sequence.
+  return typeof message === 'string' ? message : '';
 }
 
 /**

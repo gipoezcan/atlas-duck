@@ -185,6 +185,43 @@ fn u33_echoed_values_are_bounded_and_escaped() -> TestResult {
     Ok(())
 }
 
+/// M8 final review m-7: the message of a schema error is bounded in Rust, and the cut never
+/// splits a `⟨U+XXXX⟩` escape or an emoji sequence (the UI shows the message whole).
+#[test]
+fn schema_error_message_is_cut_on_a_boundary() -> TestResult {
+    // 64 flagged chars escape to about 770 bytes; every prefix length moves the cut around.
+    for lead in 0..14 {
+        let key = format!("{}{}", "a".repeat(lead), "\u{202E}".repeat(64 - lead));
+        let e = rejected(check("jira.issue.get", json!({"key": "ABC-1", key: 1}))?)?;
+        assert!(e.message.chars().count() < 300, "{lead}: {}", e.message);
+        let path = e
+            .message
+            .strip_prefix("params/")
+            .and_then(|m| m.strip_suffix(": additionalProperties"))
+            .ok_or_else(|| format!("{lead}: {}", e.message))?;
+        let kept = path.strip_suffix('…').ok_or("a long path ends in an ellipsis")?;
+        assert_eq!(kept.matches('⟨').count(), kept.matches("⟨U+202E⟩").count(), "{lead}");
+        assert!(kept.ends_with('⟩') || !kept.contains('⟨'), "{lead}: {kept}");
+        assert!(!kept.contains('\u{202E}'));
+    }
+    // A family emoji (7 chars, 25 bytes) is kept whole or dropped, never left with a dangling
+    // joiner.
+    let key = "👨\u{200D}👩\u{200D}👧\u{200D}👦".repeat(10);
+    let e = rejected(check("jira.issue.get", json!({"key": "ABC-1", key: 1}))?)?;
+    let path = e
+        .message
+        .strip_prefix("params/")
+        .and_then(|m| m.strip_suffix("…: additionalProperties"))
+        .ok_or_else(|| e.message.clone())?;
+    assert!(!path.is_empty() && path.chars().count() % 7 == 0, "{path}");
+    assert!(!path.ends_with('\u{200D}'));
+    assert!(path.len() <= 200);
+    // A short path is untouched.
+    let e = rejected(check("jira.issue.get", json!({"key": "ABC-1", "foo": 1}))?)?;
+    assert_eq!(e.message, "params/foo: additionalProperties");
+    Ok(())
+}
+
 #[test]
 fn u33_expand_allowlist() -> TestResult {
     let r = check(
