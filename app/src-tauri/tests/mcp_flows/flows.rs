@@ -1388,17 +1388,20 @@ async fn x05_sc1_walk_jira_cli_and_mcp() -> Result<()> {
     mcp.close_stdin();
     let exit = mcp.wait_exit().await?;
     assert!(exit.success(), "{exit}\n{}", mcp.transcript());
-    // The stderr drain of the driver reads until the pipe ends: let it finish.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Read the rest of stdout up to its end, so a late line does not go unscanned.
+    mcp.wait_stdout_eof(Duration::from_secs(10)).await?;
     for (n, line) in mcp.raw_stdout_lines().into_iter().enumerate() {
         seen.push((format!("atlas-duck mcp stdout line {n}"), line));
     }
     seen.push(("atlas-duck mcp stderr".into(), mcp.stderr_text()));
 
     // The canary sweep: nothing the dropped field held, and no PAT, on any channel.
-    assert!(
-        seen.len() > 20,
-        "the sweep saw only {} channels",
+    // 14 CLI channels (7 calls, stdout and stderr each), 8 MCP stdout lines (the initialize
+    // response and 7 call responses) and the MCP stderr.
+    assert_eq!(
+        seen.len(),
+        14 + 8 + 1,
+        "the sweep saw {} channels",
         seen.len()
     );
     for (name, text) in &seen {
@@ -1416,13 +1419,20 @@ async fn x05_sc1_walk_jira_cli_and_mcp() -> Result<()> {
     let approved = x05_approved(&records)?;
     assert_eq!(approved.len(), 4, "approved request sets: {approved:?}");
     assert_eq!(sent.len(), 4, "the mock received {} writes", sent.len());
-    let origins = ["cli create", "cli edit", "mcp create", "mcp edit"];
-    for ((request, (method, path, body)), origin) in approved.iter().zip(&sent).zip(origins) {
+    let origins = [
+        ("cli create", "/rest/api/2/issue"),
+        ("cli edit", "/rest/api/2/issue/ABC-1"),
+        ("mcp create", "/rest/api/2/issue"),
+        ("mcp edit", "/rest/api/2/issue/ABC-1"),
+    ];
+    for ((request, (method, path, body)), (origin, endpoint)) in
+        approved.iter().zip(&sent).zip(origins)
+    {
         assert_eq!(&request.method, method, "{origin}");
-        assert!(
-            request.resolved_url.ends_with(path.as_str()),
-            "{origin}: approved {} but the mock saw {path}",
-            request.resolved_url
+        assert_eq!(
+            request.resolved_url,
+            format!("{}{endpoint}", mock.base_url()),
+            "{origin}: the approved URL; the mock saw {path}"
         );
         assert_eq!(
             &request.body_bytes, body,
