@@ -576,9 +576,37 @@ async fn decision_button(wd: &WebDriver) -> Result<Element> {
         .into());
     }
     if let Err(e) = wait_enabled(wd, &b, INERT_WAIT).await {
-        return Err(format!("{e} (the decision button): {}", detail_state(wd).await).into());
+        return Err(format!(
+            "{e} (the decision button): {}; {}",
+            button_facts(wd, &b).await,
+            detail_state(wd).await
+        )
+        .into());
     }
     Ok(b)
+}
+
+/// Booleans for a failure text, from the endpoints the client has (it runs no script, so no
+/// `document.hasFocus()`): the button's `disabled` and `aria-disabled` attributes and the
+/// driver's "enabled" answer, and which element holds the focus (the button's own tag name only:
+/// a lost-timer stuck state keeps `disabled` set while the heading or the button holds the focus,
+/// a focus loop does not). No page text.
+async fn button_facts(wd: &WebDriver, b: &Element) -> String {
+    let disabled = wd.attribute(b, "disabled").await.map(|v| v.is_some());
+    let aria = wd.attribute(b, "aria-disabled").await;
+    let enabled = wd.is_enabled(b).await;
+    let focus = match wd.active_element().await {
+        Ok(a) => wd.property(&a, "tagName").await,
+        Err(e) => Err(e),
+    };
+    let focus_on_button = match wd.active_element().await {
+        Ok(a) => Some(a.0 == b.0),
+        Err(_) => None,
+    };
+    format!(
+        "button facts: disabled attribute {disabled:?}, aria-disabled {aria:?}, driver enabled \
+         {enabled:?}, focused element tag {focus:?}, focus on the button {focus_on_button:?}"
+    )
 }
 
 /// What the opened card says, for a failure text: its status and alert lines and its own buttons

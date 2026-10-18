@@ -40,10 +40,13 @@ export const WindowInertContext = createContext<WindowInert>(NO_WINDOW);
 /**
  * Re-renders when `at` (`performance.now()` ms) passes, so a disabled control comes back on time. An
  * effect that runs late (a busy main thread) and finds `at` already past re-renders at once if the
- * last render was still before it.
+ * last render was still before it. A timer that fires a little early (its clock and
+ * `performance.now()` differ by rounding) re-renders with the clock still before `at`: the counter
+ * is an effect dependency so that render arms another timer for the rest, instead of leaving the
+ * control disabled until something else re-renders.
  */
 function useRenderAt(at: number): void {
-  const [, rerender] = useReducer((n: number) => n + 1, 0);
+  const [fired, rerender] = useReducer((n: number) => n + 1, 0);
   const renderedBefore = performance.now() < at;
   useEffect(() => {
     const left = at - performance.now();
@@ -53,7 +56,7 @@ function useRenderAt(at: number): void {
     }
     const id = setTimeout(rerender, left);
     return () => clearTimeout(id);
-  }, [at, renderedBefore]);
+  }, [at, renderedBefore, fired]);
 }
 
 /**
