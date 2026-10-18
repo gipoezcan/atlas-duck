@@ -105,8 +105,11 @@ pub(super) struct Core {
     gate: Option<Arc<Semaphore>>,
     /// Unit tests: runs when a call stopped waiting, before it looks at its frame and answer.
     #[cfg(test)]
-    after_wait: Option<Arc<dyn Fn(&Core) + Send + Sync>>,
+    after_wait: Option<AfterWait>,
 }
+
+#[cfg(test)]
+type AfterWait = Arc<dyn Fn(&Core) + Send + Sync>;
 
 #[derive(Default)]
 struct State {
