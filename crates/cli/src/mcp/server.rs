@@ -1,0 +1,237 @@
+//! The MCP `ServerHandler` (§4.6): `initialize` (tools capability only), `tools/list` from the
+//! registry without any connection (PD-118), and `tools/call`, which answers argument errors and
+//! the app-free `ops_list`/`ops_describe` locally and hands every other call to the tool bodies.
+//! Every answer is a tool result carrying the envelope (PD-121); `Err(McpError)` is left to rmcp
+//! for malformed JSON-RPC.
+
+use std::borrow::Cow;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
+use atlas_duck_ipc::build_info::APP_VERSION;
+use atlas_duck_ipc::envelope::Envelope;
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, Implementation, InitializeRequestParams,
+    InitializeResult, ListToolsResult, PaginatedRequestParams, ProgressToken, ProtocolVersion,
+    ServerCapabilities, ServerConfig,
+};
+use rmcp::service::RequestContext;
+use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
+use serde_json::{Map, Value};
+
+use super::config::{McpConfig, ToolSet};
+use super::result::{ToolKind, to_tool_result};
+use super::tools::{CALL_TOOL, FIXED_TOOLS, catalog, op_for_tool, validate_fixed_args};
+use crate::argv::clip;
+use crate::connected::Connector;
+use crate::local;
+
+/// `serverInfo.name`.
+pub(crate) const SERVER_NAME: &str = "atlas-duck";
+/// PD-125: the heartbeat period of a waiting tool call (the rig sets a short one).
+pub(crate) const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
+
+const MSG_NOT_YET: &str = "this tool is not available in this build yet";
+
+/// A boxed `Send` future (rmcp runs every handler on its own task).
+pub(crate) type SendFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// What the server holds for every tool call.
+// `connector`, `heartbeat_every` and `client_name` are read by the session and the tool bodies
+// (Tasks 7-9).
+#[allow(dead_code)]
+pub(crate) struct Shared {
+    pub cfg: McpConfig,
+    pub connector: Arc<dyn Connector>,
+    /// `HEARTBEAT_EVERY` in production.
+    pub heartbeat_every: Duration,
+    /// `clientInfo.name` from `initialize`, as the client sent it (PD-122 reads it at the first
+    /// connect).
+    pub client_name: OnceLock<String>,
+}
+
+/// One connected tool call, its arguments already checked (fixed tools and `call`: PD-118).
+// Everything but `name` is read by the tool bodies (Tasks 8-9).
+#[allow(dead_code)]
+pub(crate) struct ToolCall {
+    pub name: String,
+    pub args: Map<String, Value>,
+    /// Receipt of the tool call: the deadline and the heartbeat timer start here (§4.6, PD-125).
+    pub receipt: Instant,
+    /// rmcp's context of the call: `ct` is cancelled on `notifications/cancelled` for this call
+    /// and when the service ends (stdin EOF; `serve` cancels the service, and every handler's
+    /// token is a child of it): stop waiting, never cancel at the app (PD-126). `meta` carries
+    /// the progress token, `peer` sends the notifications.
+    pub context: RequestContext<RoleServer>,
+}
+
+impl ToolCall {
+    /// `_meta.progressToken` of the call (PD-125: no token, no notifications).
+    // Task 9's progress relay reads it.
+    #[allow(dead_code)]
+    pub(crate) fn progress_token(&self) -> Option<ProgressToken> {
+        self.context.meta.get_progress_token()
+    }
+}
+
+/// The connected tool bodies (Task 8 fills them).
+pub(crate) trait ToolBodies: Send + Sync {
+    fn call<'a>(&'a self, shared: &'a Shared, call: ToolCall) -> SendFuture<'a, Envelope>;
+}
+
+/// Until the bodies exist: every connected tool answers `usage`.
+struct NotYet;
+
+impl ToolBodies for NotYet {
+    fn call<'a>(&'a self, _shared: &'a Shared, call: ToolCall) -> SendFuture<'a, Envelope> {
+        let mut details = Map::new();
+        details.insert("tool".to_owned(), Value::from(call.name));
+        Box::pin(std::future::ready(local::usage(MSG_NOT_YET, details)))
+    }
+}
+
+/// The handler rmcp serves.
+#[derive(Clone)]
+pub(crate) struct AtlasMcp {
+    shared: Arc<Shared>,
+    bodies: Arc<dyn ToolBodies>,
+}
+
+impl AtlasMcp {
+    pub(crate) fn new(
+        cfg: McpConfig,
+        connector: Arc<dyn Connector>,
+        heartbeat_every: Duration,
+    ) -> AtlasMcp {
+        AtlasMcp {
+            shared: Arc::new(Shared {
+                cfg,
+                connector,
+                heartbeat_every,
+                client_name: OnceLock::new(),
+            }),
+            bodies: Arc::new(NotYet),
+        }
+    }
+
+    /// Replaces the tool bodies (tests: bodies that wait).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_bodies(mut self, bodies: Arc<dyn ToolBodies>) -> AtlasMcp {
+        self.bodies = bodies;
+        self
+    }
+
+    /// Whether the configured tool set has a tool of this name.
+    fn offers(&self, name: &str) -> bool {
+        FIXED_TOOLS.contains(&name)
+            || match self.shared.cfg.tools {
+                ToolSet::Full => op_for_tool(name).is_some(),
+                ToolSet::Generic => name == CALL_TOOL,
+            }
+    }
+
+    /// The envelope for one tool call.
+    async fn dispatch(
+        &self,
+        name: String,
+        args: Map<String, Value>,
+        receipt: Instant,
+        context: RequestContext<RoleServer>,
+    ) -> Envelope {
+        if !self.offers(&name) {
+            return unknown_tool(&name);
+        }
+        if (FIXED_TOOLS.contains(&name.as_str()) || name == CALL_TOOL)
+            && let Err(env) = validate_fixed_args(&name, &args)
+        {
+            return env;
+        }
+        // PD-118: without an instance these stay local and app-free, as in the CLI (PD-10).
+        if !args.contains_key("instance") {
+            match name.as_str() {
+                "ops_list" => return local::ops_list(),
+                "ops_describe" => {
+                    let op_id = args
+                        .get("op_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    return local::ops_describe(op_id);
+                }
+                _ => {}
+            }
+        }
+        let call = ToolCall {
+            name,
+            args,
+            receipt,
+            context,
+        };
+        self.bodies.call(&self.shared, call).await
+    }
+}
+
+fn unknown_tool(name: &str) -> Envelope {
+    let name = clip(name);
+    let mut details = Map::new();
+    details.insert("tool".to_owned(), Value::from(name.clone()));
+    local::usage(&format!("unknown tool: {name}"), details)
+}
+
+impl ServerHandler for AtlasMcp {
+    fn get_info(&self) -> ServerConfig {
+        let mut capabilities = ServerCapabilities::builder().enable_tools().build();
+        if let Some(tools) = capabilities.tools.as_mut() {
+            tools.list_changed = Some(false);
+        }
+        ServerConfig::new(capabilities)
+            .with_server_info(Implementation::new(SERVER_NAME, APP_VERSION))
+            .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
+    }
+
+    /// Only the revisions with an `initialize` handshake: the session (one IPC connection, the
+    /// agent name from `clientInfo`) starts there, and a request using the 2026-07-28 inline
+    /// lifecycle is refused with `unsupported_protocol_version`.
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(ProtocolVersion::known_up_to(
+            &ProtocolVersion::LATEST_WITH_INITIALIZE,
+        ))
+    }
+
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        let _ = self
+            .shared
+            .client_name
+            .set(request.client_info.name.clone());
+        context.peer.set_peer_info(request.clone());
+        self.negotiate_initialize(&request)
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult::with_all_items(catalog(
+            self.shared.cfg.tools,
+        )))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let receipt = Instant::now();
+        let name = request.name.into_owned();
+        let kind = ToolKind::of(&name);
+        let args = request.arguments.unwrap_or_default();
+        let env = self.dispatch(name, args, receipt, context).await;
+        Ok(to_tool_result(kind, &env).into())
+    }
+}

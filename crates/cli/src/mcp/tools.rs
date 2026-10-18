@@ -2,8 +2,6 @@
 //! connection and no app are needed for `tools/list`. Also the pure argument checks the server runs
 //! before any connection (rmcp does not validate `arguments` against `inputSchema`).
 
-// Consumed by the server from Task 6 on (and `validate_fixed_args` from Task 8).
-#![allow(dead_code)]
 // The plan's interface (T6, T8) returns the `usage` envelope itself as the error.
 #![allow(clippy::result_large_err)]
 
@@ -30,7 +28,7 @@ pub(crate) const FIXED_TOOLS: [&str; 8] = [
 ];
 
 /// The generic set's own tool.
-const CALL_TOOL: &str = "call";
+pub(crate) const CALL_TOOL: &str = "call";
 
 /// PD-119: the Write ops that change or remove existing state (`destructiveHint: true`). Every other
 /// Write op only adds something.
@@ -85,6 +83,8 @@ pub(crate) fn op_for_tool(name: &str) -> Option<&'static OperationSpec> {
 /// The op tool's `reason`/`instance` split from its params: `(params, reason, instance)`. The
 /// params keep every other key unchanged; the app validates them. A wrong type is a `usage`
 /// envelope naming the argument.
+// The op tool bodies (Task 8) consume it.
+#[allow(dead_code)]
 pub(crate) fn split_op_args(
     mut args: Map<String, Value>,
 ) -> Result<(Value, Option<String>, Option<String>), Envelope> {

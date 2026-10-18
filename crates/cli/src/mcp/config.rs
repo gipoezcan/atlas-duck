@@ -24,16 +24,22 @@ pub(crate) enum ToolSet {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-// Consumed by the server from Task 6 on.
-#[allow(dead_code)]
 pub(crate) struct McpConfig {
     pub tools: ToolSet,
+    // The default instance (PD-124) is read by the tool bodies (Task 8).
+    #[allow(dead_code)]
     pub instance: Option<String>,
+    // The agent fields make the session's hello (Task 7, PD-122).
+    #[allow(dead_code)]
     pub agent: Option<String>,
+    #[allow(dead_code)]
     pub agent_source: AgentNameSource,
     /// `--agent` was passed, even as `""`: the `clientInfo.name` fallback does not apply (PD-122).
+    #[allow(dead_code)]
     pub agent_given: bool,
     /// How long a tool call waits for a decision; `None` = 0 = return `pending` at once.
+    // The tool bodies' deadline (Task 8).
+    #[allow(dead_code)]
     pub timeout: Option<Duration>,
 }
 
