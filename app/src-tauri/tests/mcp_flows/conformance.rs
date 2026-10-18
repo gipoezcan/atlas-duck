@@ -45,6 +45,7 @@ const EXPECTED: &[(&str, bool, &str, Option<&str>)] = &[
     ("write", false, "succeeded", None),
     ("generic_call", false, "released", None),
     ("large_released", false, "released", None),
+    ("script_error_released", true, "released", None),
 ];
 
 fn project_dir() -> PathBuf {

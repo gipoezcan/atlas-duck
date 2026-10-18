@@ -59,6 +59,17 @@ const scenarios = [
     expect: { isError: false, status: "released" },
   },
   { name: "large_released", ...get("ABC-BIG", "release"), expect: { isError: false, status: "released", big: true } },
+  // A script that throws, released with its error: `released`, and an error result (exit 8,
+  // PD-121); the SDK client must hand it back, not throw. The first script of an app waits for the
+  // sandbox probe, which can outlast the 5 s timeout of this child: `wait` follows a `pending`
+  // answer with `request_await` (at most 12 times) until the run is decided.
+  {
+    name: "script_error_released",
+    tool: "script_run",
+    args: { source: "throw new Error('conformance script error');", reason: "atlas-test:release" },
+    wait: true,
+    expect: { isError: true, status: "released", scriptError: true },
+  },
 ];
 
 const wanted = process.env.ATLAS_DUCK_CONFORMANCE_SCENARIOS
@@ -111,9 +122,16 @@ for (const tools of sets) {
     for (const s of scenarios) {
       if ((s.tools ?? "full") !== tools || (wanted && !wanted.has(s.name))) continue;
       // An exception (timeout, protocol error, buffer limit) propagates: that is a failure.
-      const result = await client.callTool({ name: s.tool, arguments: s.args }, undefined, {
+      let result = await client.callTool({ name: s.tool, arguments: s.args }, undefined, {
         timeout: CALL_TIMEOUT_MS,
       });
+      for (let i = 0; s.wait && i < 12 && result.structuredContent?.status === "pending"; i++) {
+        const requestId = result.structuredContent.request_id;
+        if (typeof requestId !== "string") break;
+        result = await client.callTool({ name: "request_await", arguments: { request_id: requestId } }, undefined, {
+          timeout: CALL_TIMEOUT_MS,
+        });
+      }
       const env = result.structuredContent ?? {};
       const line = {
         scenario: s.name,
@@ -130,6 +148,7 @@ for (const tools of sets) {
       }
       if (e.redacted !== undefined && env.redacted !== e.redacted) fail(`${s.name}: redacted ${env.redacted}`);
       if (e.receipt && !env.data?.receipt) fail(`${s.name}: no receipt`);
+      if (e.scriptError && !env.data?.script_error) fail(`${s.name}: no data.script_error`);
       if (e.big && JSON.stringify(env).length < 1024 * 1024) fail(`${s.name}: the result is not large`);
     }
   } finally {

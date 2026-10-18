@@ -1637,3 +1637,490 @@ async fn confluence_tools_end_to_end() -> Result<()> {
     quit_app(&world).await?;
     Ok(())
 }
+
+// ---- script_run (Task 23) --------------------------------------------------------------------------
+
+/// `ATLAS_DUCK_MCP_TIMEOUT` of the script flows that wait for a decision: the first script of an app
+/// waits for the sandbox probe (up to 60 s, counted toward the timeout), as `script_flows` waits 100 s.
+const SCRIPT_TIMEOUT: &str = "100";
+/// How long the driver waits for the answer of such a call (a little over [`SCRIPT_TIMEOUT`]).
+const SCRIPT_ANSWER_WITHIN: Duration = Duration::from_secs(130);
+/// How long a poll of the mock waits for a script to reach its call.
+const SCRIPT_REACHED_WITHIN: Duration = Duration::from_secs(90);
+const ISSUE_ABC_1: &str = "/issue/ABC-1";
+const ISSUE_ABC_2: &str = "/issue/ABC-2";
+
+/// One Jira instance `jira-main` (as [`jira_world`]) in a world built with `opts`.
+async fn script_world(opts: WorldOpts) -> Result<World> {
+    let mut world = World::new(opts)?;
+    world
+        .provision_store(&[("jira-main", Product::Jira)])
+        .await?;
+    Ok(world)
+}
+
+/// `script_run {source, reason?, dry_run?}` to its answer (bounded by [`SCRIPT_ANSWER_WITHIN`]).
+async fn script_run(
+    mcp: &mut McpChild,
+    source: &str,
+    reason: Option<&str>,
+    dry_run: Option<&str>,
+) -> Result<CallOutcome> {
+    let mut args = json!({ "source": source });
+    if let Some(reason) = reason {
+        args["reason"] = json!(reason);
+    }
+    if let Some(mode) = dry_run {
+        args["dry_run"] = json!(mode);
+    }
+    let id = mcp.send_call("script_run", args, None).await?;
+    mcp.wait_call(id, SCRIPT_ANSWER_WITHIN).await
+}
+
+/// How many requests the mock saw whose path ends with `suffix` (any method).
+async fn reads_ending(mock: &MockDc, suffix: &str) -> usize {
+    mock.received()
+        .await
+        .iter()
+        .filter(|req| req.url.path().ends_with(suffix))
+        .count()
+}
+
+/// Polls (at most [`SCRIPT_REACHED_WITHIN`]) until the mock saw a request whose path ends with
+/// `suffix`: the script (or read) reached its call.
+async fn wait_reached(mock: &MockDc, suffix: &str) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        if reads_ending(mock, suffix).await >= 1 {
+            return Ok(());
+        }
+        if start.elapsed() > SCRIPT_REACHED_WITHIN {
+            return Err(format!("no request for {suffix} within {SCRIPT_REACHED_WITHIN:?}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The envelope of a cancel without what differs between two requests: their id, the `meta` clocks
+/// and the routing fields (a cancel answer echoes the request's `op_id` and `instance`).
+fn cancel_shape(env: &Value) -> Value {
+    let mut v = env.clone();
+    for key in ["request_id", "meta", "op_id", "instance"] {
+        v[key] = Value::Null;
+    }
+    v
+}
+
+/// The §9.5 dry run is a `succeeded` envelope with `meta.dry_run: true` (an error of the script
+/// is `data.script_error`, never a result).
+fn assert_dry_run(mcp: &McpChild, out: &CallOutcome, what: &str) {
+    let env = out.structured();
+    assert_eq!(
+        status_of(env),
+        "succeeded",
+        "{what}: {env}\n{}",
+        mcp.transcript()
+    );
+    assert_eq!(env["meta"]["dry_run"], json!(true), "{what}: {env}");
+    assert!(env["error"].is_null(), "{what}: {env}");
+}
+
+/// Task 23, U-03 over MCP: dry runs, full and sparse, need no approval and never reach the
+/// upstream. A script that reads answers `succeeded`, `meta.dry_run: true`, `isError: false`, with
+/// `data.result` and `data.logs`; a script that throws at runtime answers `succeeded` as well but
+/// with `data.script_error` (exit 8, so `isError: true`, PD-121) and no result. The mock saw no
+/// request for an issue, a search or a comment meanwhile.
+///
+/// Source: `script_flows` `u03_dry_run_no_http_real_worker` (the same sources, the same mock
+/// filter), `engine/envelope.rs` `dry_run_succeeded`, `mcp/result.rs` `is_error` (a `script_error`
+/// in `data` is exit 8). The app is started first and `instances_list` connects before the count,
+/// so whatever the app asks the mock at its start is behind the baseline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_run_dry_run_full_and_sparse() -> Result<()> {
+    if !opted_in("script_run_dry_run_full_and_sparse") {
+        return Ok(());
+    }
+    let world = script_world(WorldOpts::default()).await?;
+    let mock = jira(&world)?;
+    let _app = world.start_app().await?;
+    let mut mcp = mcp_client(&world, "mcp-flows-script-dry", SCRIPT_TIMEOUT).await?;
+    let warm = mcp.call("instances_list", json!({}), None).await?;
+    assert!(!warm.is_error(), "{}", mcp.transcript());
+    let before = mock.received().await.len();
+
+    let reads = "const one = await atlas.call('jira.issue.get', {key: 'DRY-1'});\n\
+                 const all = await atlas.all('jira.search', {jql: 'project = DRY', max: 10});\n\
+                 return {one: one !== undefined, all: all !== undefined};\n";
+    for mode in ["full", "sparse"] {
+        let out = script_run(&mut mcp, reads, None, Some(mode)).await?;
+        let env = out.structured();
+        assert!(!out.is_error(), "{mode}: {env}\n{}", mcp.transcript());
+        assert_dry_run(&mcp, &out, mode);
+        assert_eq!(
+            env["data"]["result"],
+            json!({"one": true, "all": true}),
+            "{mode}: {env}"
+        );
+        assert!(env["data"]["logs"].is_array(), "{mode}: {env}");
+        assert!(env["data"]["script_error"].is_null(), "{mode}: {env}");
+    }
+
+    let throws = "throw new Error('dry boom');\n";
+    for mode in ["full", "sparse"] {
+        let out = script_run(&mut mcp, throws, None, Some(mode)).await?;
+        let env = out.structured();
+        assert!(out.is_error(), "{mode}: {env}\n{}", mcp.transcript());
+        assert_dry_run(&mcp, &out, mode);
+        assert!(env["data"]["script_error"].is_object(), "{mode}: {env}");
+        assert!(env["data"]["result"].is_null(), "{mode}: {env}");
+    }
+
+    // The mock heard nothing of any of the four runs.
+    let touched: Vec<String> = mock
+        .received()
+        .await
+        .iter()
+        .skip(before)
+        .map(|r| r.url.path().to_owned())
+        .filter(|p| p.contains("/issue") || p.contains("/search") || p.contains("/comment"))
+        .collect();
+    assert!(
+        touched.is_empty(),
+        "a dry run reached the upstream: {touched:?}"
+    );
+
+    mcp.close_stdin();
+    let exit = mcp.wait_exit().await?;
+    assert!(exit.success(), "{exit}\n{}", mcp.transcript());
+    quit_app(&world).await?;
+    let records = world.audit_records()?;
+    let dry = records
+        .iter()
+        .filter(|(kind, _)| *kind == EventType::SCRIPT_DRY_RUN)
+        .count();
+    assert_eq!(dry, 4, "SCRIPT_DRY_RUN records");
+    for kind in [EventType::SCRIPT_STARTED, EventType::SCRIPT_CALL] {
+        let n = records.iter().filter(|(k, _)| *k == kind).count();
+        assert_eq!(n, 0, "{kind:?} after dry runs only: {records:?}");
+    }
+    Ok(())
+}
+
+/// Task 23: a real run of a multi-call read script ends in a release item the scripted approver
+/// releases (`atlas-test:release`): `released`, `isError: false`, `data.result` is what the script
+/// returned, no `meta.dry_run`, and the mock saw both reads. The audit has one run, one release.
+///
+/// Source: `script_flows` `script_flows_smoke` (the audit kinds), `engine/envelope.rs`
+/// `released_script` (`data {result}`), the approver directive `release` (it fits a `script` item).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_run_real_run_released() -> Result<()> {
+    if !opted_in("script_run_real_run_released") {
+        return Ok(());
+    }
+    let world = script_world(WorldOpts::default()).await?;
+    let mock = jira(&world)?;
+    mock.json("/rest/api/2/issue/ABC-2", 200, fixtures::JIRA_ISSUE)
+        .await;
+    let _app = world.start_app().await?;
+    let mut mcp = mcp_client(&world, "mcp-flows-script-real", SCRIPT_TIMEOUT).await?;
+
+    let source = "const a = await atlas.call('jira.issue.get', {key: 'ABC-1'});\n\
+                  const b = await atlas.call('jira.issue.get', {key: 'ABC-2'});\n\
+                  return {calls: 2, a: typeof a, b: typeof b};\n";
+    let out = script_run(&mut mcp, source, Some("atlas-test:release"), None).await?;
+    let env = out.structured();
+    assert!(!out.is_error(), "{env}\n{}", mcp.transcript());
+    assert_eq!(status_of(env), "released", "{env}\n{}", mcp.transcript());
+    assert_eq!(
+        env["data"]["result"],
+        json!({"calls": 2, "a": "object", "b": "object"}),
+        "{env}"
+    );
+    assert!(env["data"]["script_error"].is_null(), "{env}");
+    assert!(env["error"].is_null(), "{env}");
+    assert!(
+        env["meta"]["dry_run"].is_null() || env["meta"]["dry_run"] == json!(false),
+        "{env}"
+    );
+    assert!(
+        reads_ending(mock, ISSUE_ABC_1).await >= 1 && reads_ending(mock, ISSUE_ABC_2).await >= 1,
+        "the mock did not see both reads"
+    );
+    for line in mcp.raw_stdout_lines() {
+        assert!(!line.contains(PAT_CANARY), "the PAT canary is on stdout");
+    }
+
+    mcp.close_stdin();
+    let exit = mcp.wait_exit().await?;
+    assert!(exit.success(), "{exit}\n{}", mcp.transcript());
+    quit_app(&world).await?;
+    let records = world.audit_records()?;
+    for kind in [
+        EventType::SCRIPT_STARTED,
+        EventType::SCRIPT_FINISHED,
+        EventType::SCRIPT_RELEASED,
+    ] {
+        let n = records.iter().filter(|(k, _)| *k == kind).count();
+        assert_eq!(n, 1, "{kind:?} in {records:?}");
+    }
+    Ok(())
+}
+
+/// Task 23, PD-121: a script that read something and then threw is a release item like a result;
+/// the scripted approver releases it with its error details (`release`): the status is `released`
+/// and the result is an error (`isError: true`): `data.script_error` carries the message, there is
+/// no `data.result` and no `error` part. `request_status` of the id stays a plain answer (a known
+/// id is never an error, §4.4) without data.
+///
+/// Source: `script_flows` `s11_containment_corpus` (a thrown error released with `release` carries
+/// its message), `engine/envelope.rs` `released_script`, `ipc::proto::exit_code` (`released` with
+/// `data.script_error` is exit 8), `mcp/result.rs` `is_error`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_error_released_is_error_result() -> Result<()> {
+    if !opted_in("script_error_released_is_error_result") {
+        return Ok(());
+    }
+    const CANARY: &str = "MCP-SCRIPT-ERROR-CANARY-4c81";
+    let world = script_world(WorldOpts::default()).await?;
+    let _app = world.start_app().await?;
+    let mut mcp = mcp_client(&world, "mcp-flows-script-error", SCRIPT_TIMEOUT).await?;
+
+    let source = format!(
+        "await atlas.call('jira.issue.get', {{key: 'ABC-1'}});\nthrow new Error('{CANARY}');\n"
+    );
+    let out = script_run(&mut mcp, &source, Some("atlas-test:release"), None).await?;
+    let env = out.structured();
+    assert!(out.is_error(), "{env}\n{}", mcp.transcript());
+    assert_eq!(status_of(env), "released", "{env}\n{}", mcp.transcript());
+    assert!(env["error"].is_null(), "{env}");
+    assert!(env["data"]["result"].is_null(), "{env}");
+    assert!(env["data"]["script_error"].is_object(), "{env}");
+    assert!(
+        env["data"]["script_error"].to_string().contains(CANARY),
+        "the released error lacks its message: {env}"
+    );
+    let id = env["request_id"]
+        .as_str()
+        .ok_or_else(|| format!("no request id: {env}"))?
+        .to_owned();
+
+    let status = mcp
+        .call("request_status", json!({"request_id": id}), None)
+        .await?;
+    let env = status.structured();
+    assert!(!status.is_error(), "{env}\n{}", mcp.transcript());
+    assert_eq!(status_of(env), "released", "{env}");
+    assert!(env["data"].is_null(), "status carries data: {env}");
+
+    mcp.close_stdin();
+    let exit = mcp.wait_exit().await?;
+    assert!(exit.success(), "{exit}\n{}", mcp.transcript());
+    quit_app(&world).await?;
+    Ok(())
+}
+
+/// Task 23, I-10 over MCP: `request_cancel` of a script that is `Running` (it made its call and
+/// holds its slot busy) is the very envelope of a cancelled read: `cancelled`, `cancelled`,
+/// `retryable: false`, `details.reason: by_client`, `isError: true`, equal apart from the id, the
+/// `meta` clocks and the echoed `op_id`/`instance`. The cancelled script then reports `cancelled`
+/// to `request_status`.
+///
+/// `ATLAS_DUCK_MCP_TIMEOUT=0` returns each submit as `pending` at once. The script reaching its
+/// call is structural (the mock saw the request), not timed.
+///
+/// Source: `script_flows` `i10_cancel_identical_every_phase_real_worker` (`spinner`, `answer_shape`),
+/// `i04_e2e_heartbeat_timeout_cancel` (the read's cancel).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_cancel_running_identical_envelope() -> Result<()> {
+    if !opted_in("script_cancel_running_identical_envelope") {
+        return Ok(());
+    }
+    let world = script_world(WorldOpts::default()).await?;
+    let mock = jira(&world)?;
+    mock.json("/rest/api/2/issue/ABC-2", 200, fixtures::JIRA_ISSUE)
+        .await;
+    let _app = world.start_app().await?;
+    let mut mcp = mcp_client(&world, "mcp-flows-script-cancel", "0").await?;
+
+    // Reaches its call, then holds its slot busy for 100 s (under the 120 s default limit, so it
+    // never ends by itself or by a limit; the cancel ends it).
+    let spinner = "await atlas.call('jira.issue.get', {key: 'ABC-1'});\n\
+                   const end = Date.now() + 100000;\n\
+                   while (Date.now() < end) {}\n\
+                   return 'spun';\n";
+    let submitted = script_run(&mut mcp, spinner, Some("atlas-test:hold"), None).await?;
+    let env = submitted.structured();
+    assert!(!submitted.is_error(), "{env}\n{}", mcp.transcript());
+    assert_eq!(status_of(env), "pending", "{env}");
+    let script_id = env["request_id"]
+        .as_str()
+        .ok_or_else(|| format!("no request id: {env}"))?
+        .to_owned();
+    // A read the approver holds, for the comparison.
+    let read = mcp
+        .call(
+            "jira_issue_get",
+            json!({"key": "ABC-2", "reason": "atlas-test:hold"}),
+            None,
+        )
+        .await?;
+    let env = read.structured();
+    assert_eq!(status_of(env), "pending", "{env}");
+    let read_id = env["request_id"]
+        .as_str()
+        .ok_or_else(|| format!("no request id: {env}"))?
+        .to_owned();
+
+    // Both are in flight: the script made its call (it is `Running` from there on, spinning) and
+    // the read was fetched. The spinner has not ended: it is still open.
+    wait_reached(mock, ISSUE_ABC_1).await?;
+    wait_reached(mock, ISSUE_ABC_2).await?;
+    let open = mcp
+        .call("request_status", json!({"request_id": script_id}), None)
+        .await?;
+    assert!(
+        open_status(open.structured()),
+        "the script is not open: {}\n{}",
+        open.structured(),
+        mcp.transcript()
+    );
+
+    let mut shapes = Vec::new();
+    for (label, id) in [("script", &script_id), ("read", &read_id)] {
+        let out = mcp
+            .call("request_cancel", json!({"request_id": id}), None)
+            .await?;
+        let env = out.structured();
+        assert!(out.is_error(), "{label}: {env}\n{}", mcp.transcript());
+        assert_eq!(status_of(env), "cancelled", "{label}: {env}");
+        assert_eq!(env["request_id"], id.as_str(), "{label}: {env}");
+        assert_eq!(error_code(env), "cancelled", "{label}: {env}");
+        assert_eq!(env["error"]["retryable"], false, "{label}: {env}");
+        assert_eq!(error_reason(env), "by_client", "{label}: {env}");
+        shapes.push(cancel_shape(env));
+    }
+    assert_eq!(
+        shapes[0], shapes[1],
+        "the cancel of a running script differs from the cancel of a read"
+    );
+
+    let status = mcp
+        .call("request_status", json!({"request_id": script_id}), None)
+        .await?;
+    assert_eq!(
+        status_of(status.structured()),
+        "cancelled",
+        "{}\n{}",
+        status.structured(),
+        mcp.transcript()
+    );
+
+    mcp.close_stdin();
+    let exit = mcp.wait_exit().await?;
+    assert!(exit.success(), "{exit}\n{}", mcp.transcript());
+    quit_app(&world).await?;
+    let records = world.audit_records()?;
+    let released = records
+        .iter()
+        .filter(|(kind, _)| *kind == EventType::SCRIPT_RELEASED)
+        .count();
+    assert_eq!(released, 0, "a cancelled script was released: {records:?}");
+    Ok(())
+}
+
+/// Task 23, I-41 over MCP (§3.4, §9.1, L168): the sandbox worker binary replaced after the app's
+/// start is an app upgrade. Every later `script_run` (real or dry) is `failed` /
+/// `sandbox_unavailable` with `details.reason: app_upgraded`, `retryable: true` and `isError: true`
+/// (exit 8, PD-121), never a protocol violation, and the same `atlas-duck mcp` process keeps
+/// serving: a plain read is `released` afterwards.
+///
+/// The world is built with `WorldOpts::copy_install` (M8 Task 26): the CLI, the app and the worker
+/// run from a private copy and the flow replaces the copied worker, never the build output. The
+/// replacement is the one of `script_flows` `i41_replaced_sandbox_binary_is_app_upgraded` (the same
+/// bytes plus one, renamed over the worker, retried while Windows still holds it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn i41_sandbox_replaced_is_error_with_retryable() -> Result<()> {
+    if !opted_in("i41_sandbox_replaced_is_error_with_retryable") {
+        return Ok(());
+    }
+    let world = script_world(WorldOpts::default().with_copy_install()).await?;
+    let _app = world.start_app().await?;
+    let mut mcp = mcp_client(&world, "mcp-flows-i41-sandbox", SCRIPT_TIMEOUT).await?;
+
+    // The worker works, and the app has recorded its identity.
+    let source = "return 'before';";
+    let out = script_run(&mut mcp, source, Some("atlas-test:release"), None).await?;
+    assert_eq!(
+        status_of(out.structured()),
+        "released",
+        "{}\n{}",
+        out.structured(),
+        mcp.transcript()
+    );
+    assert!(!out.is_error(), "{}", mcp.transcript());
+    let out = script_run(&mut mcp, source, None, Some("full")).await?;
+    assert_dry_run(&mcp, &out, "before the replacement");
+    assert!(!out.is_error(), "{}", mcp.transcript());
+
+    // The replacement: the same bytes and one more, renamed over the copied worker.
+    let worker = world
+        .installed_worker()
+        .ok_or("no installed worker")?
+        .to_path_buf();
+    let mut bytes = std::fs::read(&worker)?;
+    bytes.push(0);
+    let next = worker.with_extension("new");
+    std::fs::write(&next, &bytes)?;
+    let mut renamed = false;
+    for _ in 0..40 {
+        if std::fs::rename(&next, &worker).is_ok() {
+            renamed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(renamed, "the worker could not be replaced");
+
+    for (reason, dry_run) in [
+        (Some("atlas-test:release"), None),
+        (Some("atlas-test:release"), None),
+        (None, Some("full")),
+    ] {
+        let out = script_run(&mut mcp, source, reason, dry_run).await?;
+        let env = out.structured();
+        assert!(out.is_error(), "{env}\n{}", mcp.transcript());
+        assert_eq!(status_of(env), "failed", "{env}\n{}", mcp.transcript());
+        assert_eq!(error_code(env), "sandbox_unavailable", "{env}");
+        assert_eq!(error_reason(env), "app_upgraded", "{env}");
+        assert_eq!(env["error"]["retryable"], true, "{env}");
+        assert!(
+            !env.to_string().contains("protocol_violation"),
+            "a protocol violation: {env}"
+        );
+    }
+
+    // The rest of the product, and the server, are not affected.
+    let read = release_get(&mut mcp).await?;
+    assert_released(&mcp, &read);
+    let listed = mcp.call("instances_list", json!({}), None).await?;
+    assert!(!listed.is_error(), "{}", mcp.transcript());
+
+    mcp.close_stdin();
+    let exit = mcp.wait_exit().await?;
+    assert!(exit.success(), "{exit}\n{}", mcp.transcript());
+    quit_app(&world).await?;
+    let records = world.audit_records()?;
+    let failed: Vec<&Value> = records
+        .iter()
+        .filter(|(kind, _)| *kind == EventType::SCRIPT_FAILED)
+        .map(|(_, payload)| payload)
+        .collect();
+    assert!(
+        failed.iter().any(|p| {
+            p["reason"] == json!("sandbox_unavailable")
+                && p["details"]["reason"] == json!("app_upgraded")
+        }),
+        "no app_upgraded failure in the audit: {failed:?}"
+    );
+    Ok(())
+}
