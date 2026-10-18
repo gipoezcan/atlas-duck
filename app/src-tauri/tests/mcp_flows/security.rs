@@ -235,11 +235,16 @@ async fn launch_session(
     Ok(mcp)
 }
 
-/// The end of a session: stdin closed, the server ends with success, the app is quit.
+/// The end of a session: stdin closed, stdout read to its end (what the server prints on its way
+/// out is checked like every other line), the server ends with success, the app is quit.
 async fn finish_session(world: &World, mut mcp: McpChild) -> Result<()> {
     mcp.close_stdin();
+    mcp.wait_stdout_eof(EXIT_WITHIN).await?;
     let exit = mcp.wait_exit().await?;
     assert!(exit.success(), "{exit}\n{}", mcp.transcript());
+    if let Err(why) = check_jsonrpc_lines(&mcp.raw_stdout_lines(), 2) {
+        panic!("stdout of atlas-duck mcp: {why}\n{}", mcp.transcript());
+    }
     world.quit_app().await?;
     Ok(())
 }
@@ -379,11 +384,12 @@ async fn s02_app_parent_is_not_mcp() -> Result<()> {
     {
         let _ = server;
         let chain = win::live_ancestors(app_pid)?;
+        let shell = win::shell_pid();
         let shown: Vec<String> = chain
             .iter()
             .map(|p| format!("{} {}", p.pid, p.exe))
             .collect();
-        println!("S02 live ancestors of the app {app_pid}: {shown:?}");
+        println!("S02 live ancestors of the app {app_pid}: {shown:?}; shell pid {shell:?}");
         assert!(
             !chain.iter().any(|p| p.pid == mcp_pid),
             "the MCP server {mcp_pid} is an ancestor of the app: {shown:?}"
@@ -391,6 +397,12 @@ async fn s02_app_parent_is_not_mcp() -> Result<()> {
         assert!(
             !chain.iter().any(|p| p.pid == test_pid),
             "the test process {test_pid} is an ancestor of the app: {shown:?}"
+        );
+        // The positive form (plan: "the shell or the stub's exited pid"): the nearest live
+        // ancestor is the shell process (step 1), or none is alive (step 2: the stub is gone).
+        assert!(
+            chain.is_empty() || Some(chain[0].pid) == shell,
+            "the app's nearest live ancestor is neither the shell {shell:?} nor absent: {shown:?}"
         );
     }
     // The server lived through the reads above.

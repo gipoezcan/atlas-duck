@@ -53,6 +53,16 @@ impl CallOutcome {
     }
 }
 
+/// What one look at stdout found.
+enum Step {
+    /// A line was read, checked and filed.
+    Line,
+    /// The deadline passed without a complete line.
+    Deadline,
+    /// The server closed stdout.
+    Eof,
+}
+
 /// The kind of one stdout line, once it is known to be JSON-RPC 2.0.
 #[derive(Debug, PartialEq)]
 enum Kind {
@@ -174,18 +184,28 @@ impl Wire {
     /// `Ok(true)`: a line was read and filed. `Ok(false)`: the deadline passed without a complete
     /// line (the only non-error way a pump ends without progress); every other failure is an `Err`.
     async fn pump_one(&mut self, deadline: Instant) -> Result<bool> {
+        match self.pump_step(deadline).await? {
+            Step::Line => Ok(true),
+            Step::Deadline => Ok(false),
+            Step::Eof => Err(format!("stdout closed\n{}", self.transcript()).into()),
+        }
+    }
+
+    /// One look at stdout, with the end of the stream as an outcome of its own: [`Self::pump_one`]
+    /// turns it into an error, [`Self::expect_eof`] into success.
+    async fn pump_step(&mut self, deadline: Instant) -> Result<Step> {
         if self.eof {
-            return Err(format!("stdout is closed\n{}", self.transcript()).into());
+            return Ok(Step::Eof);
         }
         let left = deadline.saturating_duration_since(Instant::now());
         let read = tokio::time::timeout(left, self.reader.read_until(b'\n', &mut self.partial));
         let n = match read.await {
             Ok(read) => read?,
-            Err(_) => return Ok(false),
+            Err(_) => return Ok(Step::Deadline),
         };
         if n == 0 && self.partial.is_empty() {
             self.eof = true;
-            return Err(format!("stdout closed\n{}", self.transcript()).into());
+            return Ok(Step::Eof);
         }
         if self.partial.last() != Some(&b'\n') {
             // EOF inside a line: the next read reports the close; this line is still checked.
@@ -232,7 +252,7 @@ impl Wire {
                 }
             }
         }
-        Ok(true)
+        Ok(Step::Line)
     }
 
     /// Waits for the response of `id` (the whole message, `result` or `error`).
@@ -284,9 +304,10 @@ impl Wire {
             if self.eof {
                 return Ok(());
             }
-            match self.pump_one(deadline).await {
-                Ok(true) => {}
-                Ok(false) => {
+            match self.pump_step(deadline).await? {
+                Step::Line => {}
+                Step::Eof => return Ok(()),
+                Step::Deadline => {
                     return Err(format!(
                         "stdout did not close within {timeout:?}: a process still holds its \
                          write end\n{}",
@@ -294,10 +315,6 @@ impl Wire {
                     )
                     .into());
                 }
-                Err(e) if self.eof && e.to_string().starts_with("stdout closed") => {
-                    return Ok(());
-                }
-                Err(e) => return Err(e),
             }
         }
     }
@@ -594,6 +611,13 @@ mod tests {
         )
     }
 
+    /// A case that ignored its own deadline would hang; this makes it fail instead.
+    async fn bounded(case: impl Future<Output = TestResult>) -> TestResult {
+        tokio::time::timeout(Duration::from_secs(30), case)
+            .await
+            .map_err(|_| "the case did not finish within 30 s")?
+    }
+
     async fn read_request(server: &mut BufReader<impl AsyncRead + Unpin>) -> Result<Value> {
         let mut line = String::new();
         server.read_line(&mut line).await?;
@@ -746,6 +770,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn driver_poll_response_looks_without_failing() -> TestResult {
+        bounded(poll_response_looks_without_failing()).await
+    }
+
+    async fn poll_response_looks_without_failing() -> TestResult {
         let (mut wire, mut server_in, mut server_out) = rig();
         let id = wire.send_request("tools/call", json!({})).await?;
         read_request(&mut server_in).await?;
@@ -776,6 +804,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn driver_expect_eof_needs_the_stream_to_end() -> TestResult {
+        bounded(expect_eof_needs_the_stream_to_end()).await
+    }
+
+    async fn expect_eof_needs_the_stream_to_end() -> TestResult {
         // Still open: the wait times out with an error instead of hanging.
         let (mut wire, _server_in, _server_out) = rig();
         let err = wire.expect_eof(Duration::from_millis(150)).await;

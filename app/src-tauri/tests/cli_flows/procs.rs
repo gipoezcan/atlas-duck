@@ -2,6 +2,8 @@
 //! (S-02: the launched app is not part of the launcher's process tree, session or job). Included
 //! with `#[path]` by both targets; each target uses only part of it.
 
+// Kept after trying to drop it: `mcp_flows` does not use the job helpers (`Job`, `MAX_JOB_PIDS`)
+// or `resume_threads`, which only the `cli_flows` job-close case needs.
 #![allow(dead_code)]
 
 #[cfg(target_os = "linux")]
@@ -194,7 +196,7 @@ pub mod win {
         GetProcessTimes, OpenProcess, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION, ResumeThread,
         THREAD_SUSPEND_RESUME,
     };
-    use windows_sys::Win32::UI::WindowsAndMessaging::GetShellWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
 
     use super::utf16_until_nul;
 
@@ -341,6 +343,20 @@ pub mod win {
     pub fn has_shell_window() -> bool {
         // SAFETY: plain call without arguments; null when there is no shell window.
         !unsafe { GetShellWindow() }.is_null()
+    }
+
+    /// The pid owning the shell window (`GetShellWindow`), if there is one: what launch step 1
+    /// takes as the app's parent.
+    pub fn shell_pid() -> Option<u32> {
+        // SAFETY: no arguments; null when this desktop has no shell.
+        let hwnd = unsafe { GetShellWindow() };
+        if hwnd.is_null() {
+            return None;
+        }
+        let mut pid = 0u32;
+        // SAFETY: a stale `hwnd` makes the call return 0; `pid` is a local out-parameter.
+        let tid = unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        (tid != 0 && pid != 0).then_some(pid)
     }
 
     /// `ResumeThread` on every thread of `pid` (a process created suspended has one); returns how
