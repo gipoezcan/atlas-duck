@@ -399,8 +399,10 @@ jobs:
           set -euo pipefail
           export TMPDIR="$PWD/.ci-tmp"
           npm ci --ignore-scripts --prefix ci/mcp-conformance
-          bash ci/cli-flows-linux.sh --ignored --exact i05_ts_sdk_conformance
-          printf 'i05_ts_sdk_conformance: test\n' > "$RUNNER_TEMP/mcp-conformance.list"
+          # libtest names the test by module path (`conformance::i05_ts_sdk_conformance`): a plain
+          # filter is a substring match, `--exact` would need the whole path.
+          bash ci/cli-flows-linux.sh --ignored i05_ts_sdk_conformance
+          printf 'conformance::i05_ts_sdk_conformance: test\n' > "$RUNNER_TEMP/mcp-conformance.list"
           : > "$RUNNER_TEMP/mcp-conformance.none"
           node ci/check-no-skips.mjs "$TMPDIR/mcp_flows.log" "$RUNNER_TEMP/mcp-conformance.list" "$RUNNER_TEMP/mcp-conformance.none" mcp_flows
 

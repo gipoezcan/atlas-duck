@@ -48,7 +48,7 @@ const scenarios = [
   {
     name: "write",
     tool: "jira_issue_create",
-    args: { project: "ABC", type: "Bug", summary: "TS SDK conformance", reason: "atlas-test:approve" },
+    args: { project: "ABC", issuetype: "Bug", summary: "TS SDK conformance", reason: "atlas-test:approve" },
     expect: { isError: false, status: "succeeded", receipt: true },
   },
   {
@@ -68,6 +68,13 @@ const unknown = [...(wanted ?? [])].filter((n) => !scenarios.some((s) => s.name 
 if (unknown.length > 0) throw new Error(`unknown scenarios: ${unknown.join(", ")}`);
 
 let failed = false;
+const serverStderr = [];
+// An exception ends the process with a stack: show what the server said first.
+process.on("uncaughtException", (err) => {
+  console.error(`atlas-duck mcp stderr:\n${Buffer.concat(serverStderr).toString("utf8")}`);
+  console.error(err);
+  process.exit(1);
+});
 function fail(message) {
   failed = true;
   console.error(`FAIL: ${message}`);
@@ -81,7 +88,8 @@ async function connect(tools) {
     env: childEnv,
     stderr: "pipe",
   });
-  transport.stderr?.on("data", () => {});
+  // The server's diagnostics: kept, and printed on stderr when the run fails (see the end).
+  transport.stderr?.on("data", (chunk) => serverStderr.push(chunk));
   const client = new Client({ name: "ts-sdk-conformance", version: "1.0.0" });
   await client.connect(transport);
   return client;
@@ -128,4 +136,6 @@ for (const tools of sets) {
     await client.close();
   }
 }
-process.exit(failed ? 1 : 0);
+if (failed) console.error(`atlas-duck mcp stderr:\n${Buffer.concat(serverStderr).toString("utf8")}`);
+// exitCode, not exit(): lets the event loop flush the stdout lines on a pipe.
+process.exitCode = failed ? 1 : 0;

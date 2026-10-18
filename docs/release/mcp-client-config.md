@@ -66,3 +66,7 @@ Use `request_list` with `agent` and `state` (`pending` or `recent`) and `match_p
 > "on `outcome_unknown`, check the target before retrying" (§12.4)
 
 > "run every new or changed script with `--dry-run=sparse` and `--dry-run=full` first (no approval needed; results come from documented examples, `meta.dry_run: true`), then run it for real once" (§12.4)
+
+## Large results and the TypeScript SDK client
+
+Results with more than about 5 MiB of data cannot be received by a TypeScript SDK client over stdio. The server sends the envelope twice, once in `structuredContent` and once as the last text block (one JSON line), so a result with D bytes of data is about 2D bytes on the wire. The SDK's stdio `ReadBuffer` allows 10 MiB per message by default. This is a documented limit, observed at the 3 MiB scenario of the conformance test (`large_released`, about 6 MiB on the wire, received intact); the exact SDK limit is not verified. Where a request offers slicing (`start`/`max`, `fields`), ask for smaller slices instead of one large read.
