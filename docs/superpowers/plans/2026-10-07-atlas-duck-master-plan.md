@@ -795,7 +795,7 @@ Each milestone entry lists: scope (§14, with the placements this plan makes whe
 - **Ledger:** L02, L03, L14, L18, L19, L20, L21, L26, L31.
 - **Handoff from M6** (M6 plan "Handoffs", review ledger L134; scope unchanged): `RunningScriptView.started_at` is `submitted_at` in M6 and may be refined; the Running window's kill ends a run through its own `SCRIPT_FAILED killed_by_user` path (`Core::kill_script`); the "Updated — restart to apply" status line id exists, its trigger is M8's.
 
-- **Status:** in progress: T1-T34 implemented on `m8-t14` (docs pass 2026-10-18), CI verification and final review pending; plan reviewed and revised 2026-10-16 (detailed plan: 2026-10-16-atlas-duck-m08-script-sandbox.md)
+- **Status:** done 2026-10-18 (T1-T34 implemented, final Opus review approved with fixes, fixes reviewed; GitHub CI green on all legs and install-probes 7/7 on the bundle run; evidence file docs/m8/script-sandbox-evidence.md stays `partial` until signed by a human; open human items: R11 clean-profile Windows run, macOS GUI checklist additions); plan reviewed and revised 2026-10-16 (detailed plan: 2026-10-16-atlas-duck-m08-script-sandbox.md)
 
 ### M9 — MCP front end
 
