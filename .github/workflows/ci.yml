@@ -717,7 +717,7 @@ jobs:
           # heap limits (the test asserts it; this line is the record), and the R13 line is data
           # (`completed=true|false`): only its presence is required here, never its value.
           grep -E '(^|[[:space:]])M8 i21_all_result_at_cap heap_mb=[0-9]+ process_mb=[0-9]+ bytes=[0-9]+ issues=[0-9]+ completed=true([^[:alnum:]_]|$)' "$log" || { echo "::error::M8 i21_all_result_at_cap completed=true evidence missing"; exit 1; }
-          grep -E '(^|[[:space:]])M8 i21_r13 heap_mb=240 process_mb=328bytes=[0-9]+ completed=(true|false) ' "$log" || { echo "::error::M8 i21_r13 evidence missing"; exit 1; }
+          grep -E '(^|[[:space:]])M8 i21_r13 heap_mb=240 process_mb=328 bytes=[0-9]+ completed=(true|false) ' "$log" || { echo "::error::M8 i21_r13 evidence missing"; exit 1; }
           # M8 T9 (V10, PD-134): host-measured memory limits. The tests assert their verdicts;
           # these gates make a missing evidence line fail too.
           grep -E "(^|[[:space:]])V10 heap_limit os=$os verdict=heap_mb " "$log" || { echo "::error::V10 heap_limit os=$os evidence missing"; exit 1; }
@@ -1098,7 +1098,7 @@ jobs:
           grep -F -- 'M8 s10_handles os=macos fds=[0, 1, 2]' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::S-10 worker held descriptors other than 0, 1, 2"; exit 1; }
           # M8 T25 (I-21, R13): as on the native legs (the R13 line is data, only its presence is required).
           grep -E '(^|[[:space:]])M8 i21_all_result_at_cap heap_mb=[0-9]+ process_mb=[0-9]+ bytes=[0-9]+ issues=[0-9]+ completed=true([^[:alnum:]_]|$)' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::M8 i21_all_result_at_cap completed=true evidence missing"; exit 1; }
-          grep -E '(^|[[:space:]])M8 i21_r13 heap_mb=240 process_mb=328bytes=[0-9]+ completed=(true|false) ' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::M8 i21_r13 evidence missing"; exit 1; }
+          grep -E '(^|[[:space:]])M8 i21_r13 heap_mb=240 process_mb=328 bytes=[0-9]+ completed=(true|false) ' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::M8 i21_r13 evidence missing"; exit 1; }
           # M8 T9 (V10, PD-134): the heap limit and the footprint watchdog under Rosetta.
           grep -E '(^|[[:space:]])V10 heap_limit os=macos verdict=heap_mb ' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::V10 heap_limit os=macos evidence missing"; exit 1; }
           grep -E '(^|[[:space:]])V10 watchdog_kill verdict=process_mb spawn_to_reap_ms=[0-9]+ arch=x86_64([^[:alnum:]_]|$)' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::V10 watchdog_kill evidence missing"; exit 1; }
