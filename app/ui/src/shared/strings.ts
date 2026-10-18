@@ -518,6 +518,8 @@ export const SETTINGS_TEXT = {
   confinement: 'Script confinement',
   confinement_met: 'met: scripts may run',
   confinement_not_met: 'not met: scripts are off',
+  /** The unmet floor while the user's opt-in lets scripts run anyway: never "scripts are off". */
+  confinement_not_met_degraded: 'not met: scripts run only because degraded confinement is allowed',
   confinement_pending: 'the startup probe has not finished',
   confinement_mode: 'Mode',
   confinement_failed: 'Failed probes',

@@ -444,6 +444,28 @@ describe('Settings', () => {
     }
   });
 
+  it('script_limits_restart_pending_is_shown_and_default_hint_is_described_by', async () => {
+    await show(
+      plain({}, { settings: { ...FULL.settings, config_read_only: null, restart_pending: ['script_limits'] } }),
+    );
+    const region = screen.getByRole('region', { name: 'Script limits' });
+    expect(within(region).getByText('a changed value is waiting for the next start')).toBeTruthy();
+    const input = within(region).getByLabelText('Script call limit');
+    const hint = document.getElementById(input.getAttribute('aria-describedby') ?? '');
+    expect(hint?.textContent).toContain('default 200');
+  });
+
+  it('confinement_degraded_shows_one_accurate_verdict', async () => {
+    await show(scriptsView({ ...NOT_MET, scripts: 'degraded', degraded_allowed: true }, true));
+    const region = screen.getByRole('region', { name: 'Script confinement' });
+    expect(
+      within(region).getByText('not met: scripts run only because degraded confinement is allowed'),
+    ).toBeTruthy();
+    // The "scripts are off" verdict would contradict the state line beside it.
+    expect(within(region).queryByText('not met: scripts are off')).toBeNull();
+    expect(within(region).getByText('Scripts are enabled with degraded confinement')).toBeTruthy();
+  });
+
   it('degraded_toggle_shows_persistent_warning', async () => {
     const caution = 'scripts run with degraded confinement';
     const toggle = () => screen.getByLabelText('Allow scripts with degraded confinement') as HTMLInputElement;

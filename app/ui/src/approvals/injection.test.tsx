@@ -50,7 +50,7 @@ const FIXTURES = new Map<string, Json>(
 const DISCRIMINANTS = new Set([
   'kind', 'class', 'status', 'level', 'step', 'state', 'product', 'purpose', 'choice', 'result',
   'outcome', 'mode', 'op', 'scope', 'preset', 'method', 'cli', 'autostart',
-  'attention_mode', 'secret_service', 'code', 'field', 'conn', 'error', 'preselect',
+  'attention_mode', 'secret_service', 'code', 'field', 'conn', 'error', 'preselect', 'scripts',
 ]);
 
 /** The one discriminator path a `free` run poisons as well (the per-path prototype pass), or null. */
@@ -478,7 +478,8 @@ const SCENARIOS: Scenario[] = [
       mirror = true;
     },
   },
-  ...[0, 1, 2].map((i): Scenario => ({ name: `settings ${i}`, modes: only(i), element: () => <Settings />, before: () => void (pin = i) })),
+  // Fixture 3 is the degraded one (`confinement.scripts` = degraded, the caution and the toggle on).
+  ...[0, 1, 2, 3].map((i): Scenario => ({ name: `settings ${i}`, modes: only(i), element: () => <Settings />, before: () => void (pin = i) })),
   { name: 'settings tokens', modes: ['free'], element: () => <Settings />, before: () => void (variant = 'tokens') },
   { name: 'settings removal', modes: ['free', 'all'], element: () => <Settings />, before: () => void ((variant = 'removal'), (pin = 1)) },
   ...[0, 1, 2, 3, 4].map((i): Scenario => ({ name: `setup ${i}`, cheap: true, modes: only(i), element: () => <Wizard />, before: () => void (pin = i) })),

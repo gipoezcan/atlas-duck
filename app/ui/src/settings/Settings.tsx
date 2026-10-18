@@ -127,7 +127,9 @@ function ConfinementStatus({
     confinement.state === 'met'
       ? T.confinement_met
       : confinement.state === 'not_met'
-        ? T.confinement_not_met
+        ? confinement.scripts === 'degraded'
+          ? T.confinement_not_met_degraded
+          : T.confinement_not_met
         : T.confinement_pending;
   return (
     <section aria-label={T.confinement}>

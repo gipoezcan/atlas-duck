@@ -210,6 +210,20 @@ impl<'de> Deserialize<'de> for SettingChanges {
         if !(1..=MAX_CHANGES).contains(&items.len()) {
             return Err(bad());
         }
+        // A limit past `u32` is a whole number too, but `ScriptLimitsReq` cannot hold it: name it
+        // here, before the typed parse turns it into a malformed `changes`.
+        for item in &items {
+            if item.get("key").and_then(Value::as_str) == Some(KEY_SCRIPT_LIMITS)
+                && let Some(set) = item.get("value").and_then(Value::as_object)
+                && let Some(key) = SCRIPT_KEYS.into_iter().find(|key| {
+                    set.get(*key)
+                        .and_then(Value::as_u64)
+                        .is_some_and(|n| u32::try_from(n).is_err())
+                })
+            {
+                return Err(refuse(key));
+            }
+        }
         let changes = items
             .into_iter()
             .map(|v| SettingChangeReq::deserialize(v).map_err(|_| bad()))
@@ -850,6 +864,9 @@ pub async fn settings_apply<R: Runtime>(
                 ))
             })
             .await
+            // If the blocking task itself fails (a join error) after core committed a flip, `flipped`
+            // stays false and no `status_banner` follows: accepted (T23 review m-5), the header
+            // re-reads `app_status` on its next refresh and `settings_changed` is still emitted.
             .and_then(|(applied, flip)| {
                 flipped = flip;
                 applied

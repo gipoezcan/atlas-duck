@@ -2598,14 +2598,22 @@ mod settings_commands {
                     "{key} = {ok} is inside its bound"
                 );
             }
-            for bad in [json!(0), json!(top + 1), json!(u32::MAX)] {
+            // Past `u32` is still a whole number: it is named too, not a malformed `changes`.
+            let past_u32 = u64::from(u32::MAX) + 1;
+            for bad in [
+                json!(0),
+                json!(top + 1),
+                json!(u32::MAX),
+                json!(past_u32),
+                json!(u64::MAX),
+            ] {
                 let err = refused(key, bad.clone()).ok_or(format!("{key} = {bad} accepted"))?;
                 // The helper turns the parse error into text; the field is what `parse` named.
                 let named = err.to_string();
                 assert!(named.contains(key), "{key} = {bad}: {named}");
             }
-            // Not a whole number of `u32`: refused as a malformed `changes`.
-            for bad in [json!(-1), json!("5"), json!(1.5), json!(u64::MAX)] {
+            // Not a whole number: refused as a malformed `changes`.
+            for bad in [json!(-1), json!("5"), json!(1.5)] {
                 assert!(
                     refused(key, bad.clone()).is_some(),
                     "{key} = {bad} accepted"

@@ -9,6 +9,9 @@ import { useAction } from './useAction';
 
 type ScriptKey = keyof ScriptLimits;
 
+/** The `restart_pending` name of the whole `[scripts]` table (core's `KEY_SCRIPT_LIMITS`). */
+const KEY_SCRIPT_LIMITS = 'script_limits';
+
 /** The eight §9.4 limits, in the spec's order. */
 const KEYS: readonly ScriptKey[] = [
   'timeout_s',
@@ -88,12 +91,19 @@ export function ScriptLimitsForm({ view, onChanged, readOnly }: ScriptLimitsProp
                 type="text"
                 inputMode="numeric"
                 value={draft[key] ?? shown(key)}
+                aria-describedby={`script-default-${key}`}
                 onChange={(e) => setDraft({ ...draft, [key]: e.target.value })}
               />
             </label>
-            <span className="default-hint"> ({T.script_default(DEFAULTS[key])})</span>
+            <span id={`script-default-${key}`} className="default-hint">
+              {' '}
+              ({T.script_default(DEFAULTS[key])})
+            </span>
           </div>
         ))}
+        {view.restart_pending.includes(KEY_SCRIPT_LIMITS) ? (
+          <p className="restart-waiting">{T.restart_waiting}</p>
+        ) : null}
         <p>{T.script_limits_note}</p>
         <button type="button" disabled={action.pending} onClick={submit}>
           {T.apply}
