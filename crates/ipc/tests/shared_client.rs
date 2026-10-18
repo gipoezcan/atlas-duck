@@ -599,14 +599,26 @@ async fn shared_client_in_flight_cap() -> TestResult {
         let _ = task.await;
     }
 
-    // No slot comes free before the server answers: a short deadline queues nothing.
-    let sent = client
-        .call::<Envelope>(
-            method::DOCTOR,
-            json!({}),
-            Some(Instant::now() + Duration::from_millis(200)),
-        )
-        .await;
+    // The 49th request is an await too, so the server's own count shows whether it was held
+    // beside the 48. No slot comes free before the server answers: a short deadline queues
+    // nothing.
+    let forty_ninth = rid(SHARED_IN_FLIGHT);
+    let await_49th = |at: Option<Instant>| {
+        let c = client.clone();
+        let request_id = forty_ninth.clone();
+        async move {
+            c.call::<Envelope>(
+                method::REQUEST_AWAIT,
+                AwaitParams {
+                    request_id,
+                    timeout_ms: None,
+                },
+                at,
+            )
+            .await
+        }
+    };
+    let sent = await_49th(Some(Instant::now() + Duration::from_millis(200))).await;
     assert!(!sent.written);
     assert!(
         matches!(sent.result, Err(ClientError::DeadlineExceeded)),
@@ -615,9 +627,7 @@ async fn shared_client_in_flight_cap() -> TestResult {
     );
 
     // A patient call gets a slot once the server answered a dropped await.
-    let c = client.clone();
-    let patient =
-        tokio::spawn(async move { c.call::<Envelope>(method::DOCTOR, json!({}), soon()).await });
+    let patient = tokio::spawn(await_49th(soon()));
     let sent = join(patient).await?;
     assert!(sent.written);
     sent.result?;
@@ -628,56 +638,67 @@ async fn shared_client_in_flight_cap() -> TestResult {
         .map(|e| e.at)
         .min()
         .ok_or("no await finished")?;
-    let doctors = fake.of(Kind::Doctor);
+    let starts_49th: Vec<_> = fake
+        .of(Kind::AwaitStart)
+        .into_iter()
+        .filter(|e| e.detail.as_deref() == Some(forty_ninth.as_str()))
+        .collect();
     assert_eq!(
-        doctors.len(),
+        starts_49th.len(),
         1,
         "the short-deadline call reached the server"
     );
     assert!(
-        doctors[0].at >= first_done,
+        starts_49th[0].at >= first_done,
         "the 49th request reached the server before any slot came free"
     );
-    let starts_before = fake
-        .of(Kind::AwaitStart)
-        .iter()
-        .filter(|e| e.at < first_done)
-        .count();
-    assert_eq!(starts_before, SHARED_IN_FLIGHT);
+    // The server never held more than 48 of this client's awaits at once.
+    let mut changes: Vec<(Instant, i32)> = Vec::new();
+    for e in fake.events() {
+        match e.kind {
+            Kind::AwaitStart => changes.push((e.at, 1)),
+            Kind::AwaitDone | Kind::AwaitDropped => changes.push((e.at, -1)),
+            _ => {}
+        }
+    }
+    // An end sorts before a start at the same instant.
+    changes.sort();
+    let (mut held, mut most) = (0, 0);
+    for (_, change) in changes {
+        held += change;
+        most = most.max(held);
+    }
+    assert_eq!(most, SHARED_IN_FLIGHT as i32, "most awaits held at once");
     assert!(!client.is_closed());
     srv.stop().await
 }
 
-/// An answer that does not deserialize as the caller's type fails that call with `Protocol`;
-/// the call in flight beside it and the next call are unaffected.
+/// A connection that ended before `into_shared` gives a closed client: its calls fail at
+/// once, unwritten, instead of waiting on a dead connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shared_client_answer_of_wrong_shape_is_protocol_for_that_call_only() -> TestResult {
-    let handler = Scripted {
-        status_delay: [(rid(2), Duration::from_millis(300))].into_iter().collect(),
-        ..Scripted::default()
-    };
-    let srv = start(Arc::new(handler)).await;
-    let client = shared(&srv).await?;
-    let slow = status_call(&client, 2);
-    let wrong = client
-        .call::<HelloReply>(
-            method::REQUEST_STATUS,
-            IdParams { request_id: rid(1) },
-            soon(),
-        )
-        .await;
-    assert!(wrong.written);
+async fn shared_client_into_shared_on_a_lost_connection_is_closed() -> TestResult {
+    let peer = RawPeer::start().await;
+    let mut client = connect_at(&peer.location, &peer.data).await?;
+    peer.send(Cmd::Close)?;
+    // Whether the call meets the reader's end or the failed write first, the client is dead.
+    let lost = tokio::time::timeout(
+        WAIT,
+        client.call::<Envelope>(method::DOCTOR, json!({"call": "after the close"})),
+    )
+    .await?;
+    assert!(matches!(lost, Err(ClientError::ConnectionLost)), "{lost:?}");
+    let shared = client.into_shared();
+    assert!(shared.is_closed());
+    let sent = tokio::time::timeout(
+        WAIT,
+        shared.call::<Envelope>(method::DOCTOR, json!({}), None),
+    )
+    .await?;
+    assert!(!sent.written);
     assert!(
-        matches!(wrong.result, Err(ClientError::Protocol(_))),
+        matches!(sent.result, Err(ClientError::ConnectionLost)),
         "{:?}",
-        wrong.result
+        sent.result
     );
-    let sent = join(slow).await?;
-    assert_eq!(answered_id(&sent.result?), Some(rid(2)));
-    assert!(!client.is_closed());
-    let sent = client
-        .call::<Envelope>(method::DOCTOR, json!({}), soon())
-        .await;
-    sent.result?;
-    srv.stop().await
+    Ok(())
 }

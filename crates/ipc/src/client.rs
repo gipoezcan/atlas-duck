@@ -271,6 +271,14 @@ impl fmt::Debug for IpcClient {
     }
 }
 
+/// How a shared client starts when the sequential one is no longer usable.
+fn closed_by(unusable: Option<Unusable>) -> Option<Closed> {
+    unusable.map(|u| match u {
+        Unusable::Torn => Closed::Protocol(MSG_TORN.to_owned()),
+        Unusable::Lost => Closed::Lost,
+    })
+}
+
 /// A background task that ends with its owner.
 struct AbortOnDrop(JoinHandle<()>);
 
@@ -360,11 +368,7 @@ impl IpcClient {
             written: _,
             unusable,
         } = self;
-        let closed = unusable.map(|u| match u {
-            Unusable::Torn => Closed::Protocol(MSG_TORN.to_owned()),
-            Unusable::Lost => Closed::Lost,
-        });
-        SharedClient::start(writer, &routes, reader, next_id, closed)
+        SharedClient::start(writer, &routes, reader, next_id, closed_by(unusable))
     }
 
     /// Sends `method` with `params` and waits for its answer. `request.progress` notifications
@@ -1084,6 +1088,22 @@ mod tests {
         assert!(cut.is_err(), "the stalled write completed");
         assert!(wrote);
         assert!(matches!(unusable, Some(Unusable::Torn)), "{unusable:?}");
+    }
+
+    /// `into_shared` on a client a cancelled call left torn, or whose write failed, starts
+    /// closed (the Windows pipe buffers a whole frame, so a torn client cannot be made there
+    /// through a real connection).
+    #[test]
+    fn unusable_client_gives_a_closed_shared_client() {
+        assert!(closed_by(None).is_none());
+        assert!(matches!(
+            closed_by(Some(Unusable::Torn)),
+            Some(Closed::Protocol(m)) if m == MSG_TORN
+        ));
+        assert!(matches!(
+            closed_by(Some(Unusable::Lost)),
+            Some(Closed::Lost)
+        ));
     }
 
     fn null_id_answer() -> Response {

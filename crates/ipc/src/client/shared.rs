@@ -103,6 +103,9 @@ pub(super) struct Core {
     /// Unit tests: the writer takes a permit before it takes each frame.
     #[cfg(test)]
     gate: Option<Arc<Semaphore>>,
+    /// Unit tests: runs when a call stopped waiting, before it looks at its frame and answer.
+    #[cfg(test)]
+    after_wait: Option<Arc<dyn Fn(&Core) + Send + Sync>>,
 }
 
 #[derive(Default)]
@@ -168,6 +171,8 @@ impl Core {
             stop: CancellationToken::new(),
             #[cfg(test)]
             gate: None,
+            #[cfg(test)]
+            after_wait: None,
         }
     }
 
@@ -446,6 +451,17 @@ impl SharedClient {
                 () = &mut deadline => break Err(ClientError::DeadlineExceeded),
             }
         };
+        #[cfg(test)]
+        if let Some(hook) = &core.after_wait {
+            hook(core);
+        }
+        // An answer routed after the deadline branch won is still this call's answer.
+        let end = match end {
+            Err(ClientError::DeadlineExceeded) => {
+                answer.try_recv().map_err(|_| ClientError::DeadlineExceeded)
+            }
+            end => end,
+        };
         if let Some(f) = on_progress.as_mut() {
             while let Ok(n) = progress.try_recv() {
                 f(n);
@@ -522,6 +538,9 @@ async fn write_loop<W: AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use std::time::Duration;
 
     use serde_json::{Value, json};
@@ -559,6 +578,13 @@ mod tests {
             tokio::time::timeout(d, self.rd.read(&mut byte))
                 .await
                 .is_err()
+        }
+
+        async fn send(&mut self, message: Value) {
+            let bytes = serde_json::to_vec(&message).expect("encode");
+            write_frame_async(&mut self.wr, &bytes)
+                .await
+                .expect("write frame");
         }
 
         async fn answer(&mut self, request: &Value, result: Value) {
@@ -624,6 +650,99 @@ mod tests {
             .await
             .expect("the call did not return within WAIT")
             .expect("the call panicked")
+    }
+
+    fn spawn_progress_call(
+        client: &SharedClient,
+        p: Value,
+        at: Option<Instant>,
+    ) -> tokio::task::JoinHandle<Sent<Value>> {
+        let c = client.clone();
+        tokio::spawn(async move {
+            let mut on_progress = |_: ProgressNotification| {};
+            c.call_with_progress::<Value>(STATUS, p, at, &mut on_progress)
+                .await
+        })
+    }
+
+    /// Progress subscriptions now held, over all request ids.
+    fn subscriptions(client: &SharedClient) -> usize {
+        client
+            .inner
+            .core
+            .lock()
+            .progress
+            .values()
+            .map(Vec::len)
+            .sum()
+    }
+
+    /// Waits until `n` progress subscriptions are held; panics after [`WAIT`].
+    async fn subscribed(client: &SharedClient, n: usize) {
+        let deadline = Instant::now() + WAIT;
+        while subscriptions(client) != n {
+            assert!(Instant::now() < deadline, "the call never subscribed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// An `AsyncWrite` whose every write fails with `kind`.
+    struct FailingWriter(io::ErrorKind);
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::from(self.0)))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A client whose writer is held and whose writes fail with `kind`; the returned stream is
+    /// the far end of its reader, kept open so the reader does not end.
+    fn failing_writer(kind: io::ErrorKind) -> (SharedClient, Arc<Semaphore>, DuplexStream) {
+        let (ours, theirs) = tokio::io::duplex(1024);
+        let routes = Arc::new(Mutex::new(Routes::default()));
+        let reader = AbortOnDrop(tokio::spawn(read_loop(ours, routes.clone())));
+        let gate = Arc::new(Semaphore::new(0));
+        let mut core = Core::new();
+        core.gate = Some(gate.clone());
+        let client = SharedClient::start_with(core, FailingWriter(kind), &routes, reader, 2, None);
+        (client, gate, theirs)
+    }
+
+    /// Two calls (ids 2 and 3) with their frames queued, in that order, behind a held writer.
+    async fn queue_two(
+        client: &SharedClient,
+    ) -> (
+        tokio::task::JoinHandle<Sent<Value>>,
+        tokio::task::JoinHandle<Sent<Value>>,
+    ) {
+        let first = spawn_call(client, params("first"), None);
+        routed(client, 1).await;
+        let second = spawn_call(client, params("second"), None);
+        routed(client, 2).await;
+        // Both frames reach the queue right after their routes exist.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (first, second)
+    }
+
+    /// Waits until `n` routes exist; panics after [`WAIT`].
+    async fn routed(client: &SharedClient, n: usize) {
+        let deadline = Instant::now() + WAIT;
+        while client.inner.core.lock().routes.len() != n {
+            assert!(Instant::now() < deadline, "the call never queued");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -783,6 +902,203 @@ mod tests {
             sent.result
         );
         assert!(client.is_closed());
+        idle(&client).await;
+    }
+
+    /// A progress call's subscription ends with the call: at its deadline, and when its future
+    /// is dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_client_unsubscribes_when_a_progress_call_ends() {
+        let (client, _gate, _peer) = pair(true, 1024);
+
+        let task = spawn_progress_call(&client, params("deadline"), after(300));
+        subscribed(&client, 1).await;
+        let sent = join(task).await;
+        assert!(!sent.written);
+        assert!(
+            matches!(sent.result, Err(ClientError::DeadlineExceeded)),
+            "{:?}",
+            sent.result
+        );
+        assert_eq!(
+            subscriptions(&client),
+            0,
+            "the deadline kept the subscription"
+        );
+        assert!(client.idle());
+
+        let task = spawn_progress_call(&client, params("dropped"), None);
+        subscribed(&client, 1).await;
+        task.abort();
+        let _ = task.await;
+        assert_eq!(subscriptions(&client), 0, "a drop kept the subscription");
+        assert!(client.idle());
+    }
+
+    /// The writer's `write` fails with the peer gone: it first gives the reader a moment, so an
+    /// answer that was already on its way still reaches its call; then the client closes. The
+    /// failing frame's call was written, the one queued behind it was not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_client_write_failure_closes_after_a_moment_for_answers() {
+        let (client, gate, _theirs) = failing_writer(io::ErrorKind::BrokenPipe);
+        let (first, second) = queue_two(&client).await;
+        gate.add_permits(1);
+
+        // The first frame was taken and failed; its answer arrives during the moment.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!client.is_closed(), "closed without waiting for answers");
+        client
+            .inner
+            .core
+            .deliver(Response::result(2, json!({"late": true})));
+        let first = join(first).await;
+        assert!(first.written);
+        assert_eq!(first.result.expect("answer"), json!({"late": true}));
+        let second = join(second).await;
+        assert!(!second.written);
+        assert!(
+            matches!(second.result, Err(ClientError::ConnectionLost)),
+            "{:?}",
+            second.result
+        );
+        assert!(client.is_closed());
+        idle(&client).await;
+    }
+
+    /// A write failure that does not mean the peer is gone closes at once; the frame that
+    /// failed is written, the queued one behind it is not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_client_write_failure_closes_with_failing_frame_written() {
+        let (client, gate, _theirs) = failing_writer(io::ErrorKind::Other);
+        let (first, second) = queue_two(&client).await;
+        gate.add_permits(1);
+
+        let first = join(first).await;
+        assert!(first.written);
+        assert!(
+            matches!(first.result, Err(ClientError::ConnectionLost)),
+            "{:?}",
+            first.result
+        );
+        let second = join(second).await;
+        assert!(!second.written);
+        assert!(
+            matches!(second.result, Err(ClientError::ConnectionLost)),
+            "{:?}",
+            second.result
+        );
+        assert!(client.is_closed());
+        idle(&client).await;
+    }
+
+    /// A client started on a reader that already ended is closed with the reader's reason.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_client_start_on_an_ended_reader_is_closed() {
+        let (ours, theirs) = tokio::io::duplex(1024);
+        let (rd, wr) = tokio::io::split(ours);
+        let routes = Arc::new(Mutex::new(Routes::default()));
+        let reader = AbortOnDrop(tokio::spawn(read_loop(rd, routes.clone())));
+        drop(theirs);
+        let deadline = Instant::now() + WAIT;
+        while lock(&routes).closed.is_none() {
+            assert!(Instant::now() < deadline, "the reader never ended");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let client = SharedClient::start(wr, &routes, reader, 2, None);
+        assert!(client.is_closed());
+        let sent = client.call::<Value>(STATUS, params("x"), soon()).await;
+        assert!(!sent.written);
+        assert!(
+            matches!(sent.result, Err(ClientError::ConnectionLost)),
+            "{:?}",
+            sent.result
+        );
+    }
+
+    /// A close wakes the calls that wait for a slot: they fail at once, unwritten, not at their
+    /// deadlines.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_client_close_wakes_calls_waiting_for_a_slot() {
+        let (client, _gate, peer) = pair(true, 64 * 1024);
+        let held: Vec<_> = (0..SHARED_IN_FLIGHT)
+            .map(|i| spawn_call(&client, params(&format!("held{i}")), None))
+            .collect();
+        let deadline = Instant::now() + WAIT;
+        while client.inner.core.slots.available_permits() > 0 {
+            assert!(Instant::now() < deadline, "the slots were never taken");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let t0 = Instant::now();
+        let waiting = spawn_call(&client, params("waiting"), after(5000));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "the call did not wait for a slot");
+        drop(peer);
+
+        let sent = join(waiting).await;
+        assert!(!sent.written);
+        assert!(
+            matches!(sent.result, Err(ClientError::ConnectionLost)),
+            "{:?}",
+            sent.result
+        );
+        assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
+        for task in held {
+            let sent = join(task).await;
+            assert!(!sent.written);
+            assert!(matches!(sent.result, Err(ClientError::ConnectionLost)));
+        }
+        idle(&client).await;
+    }
+
+    /// An answer for an id nobody waits for, a second answer for an id, and a `null`-id result
+    /// are discarded: they close nothing and reach no other call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_client_unknown_and_duplicate_answers_are_discarded() {
+        let (client, _gate, mut peer) = pair(false, 64 * 1024);
+        let task = spawn_call(&client, params("a"), soon());
+        let req = peer.next().await;
+        peer.send(json!({"jsonrpc": "2.0", "id": 9999, "result": {"unknown": true}}))
+            .await;
+        peer.send(json!({"jsonrpc": "2.0", "id": null, "result": {"null_id": true}}))
+            .await;
+        peer.answer(&req, json!({"first": true})).await;
+        peer.answer(&req, json!({"duplicate": true})).await;
+        let sent = join(task).await;
+        assert!(sent.written);
+        assert_eq!(sent.result.expect("answer"), json!({"first": true}));
+
+        // Everything above was read before this call's answer is.
+        let task = spawn_call(&client, params("b"), soon());
+        let req = peer.next().await;
+        peer.answer(&req, json!({"second": true})).await;
+        let sent = join(task).await;
+        assert_eq!(sent.result.expect("answer"), json!({"second": true}));
+        assert!(!client.is_closed());
+        idle(&client).await;
+    }
+
+    /// An answer routed after the deadline branch won, before the call looks at its frame, is
+    /// the call's answer: it is not discarded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_client_answer_landing_after_the_deadline_is_kept() {
+        let (ours, theirs) = tokio::io::duplex(64 * 1024);
+        let (rd, wr) = tokio::io::split(ours);
+        let routes = Arc::new(Mutex::new(Routes::default()));
+        let reader = AbortOnDrop(tokio::spawn(read_loop(rd, routes.clone())));
+        let mut core = Core::new();
+        core.after_wait = Some(Arc::new(|core: &Core| {
+            core.deliver(Response::result(2, json!({"late": true})));
+        }));
+        let client = SharedClient::start_with(core, wr, &routes, reader, 2, None);
+        let (rd, wr) = tokio::io::split(theirs);
+        let mut peer = Peer { rd, wr };
+
+        let task = spawn_call(&client, params("late"), after(300));
+        let req = peer.next().await;
+        assert_eq!(req["params"]["request_id"], "late");
+        let sent = join(task).await;
+        assert!(sent.written);
+        assert_eq!(sent.result.expect("the late answer"), json!({"late": true}));
         idle(&client).await;
     }
 
