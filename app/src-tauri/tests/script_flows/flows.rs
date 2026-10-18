@@ -14,6 +14,7 @@
 
 use std::time::{Duration, Instant};
 
+use atlas_duck_app_lib::testing::control::QUEUE_FILE;
 use atlas_duck_atlassian::testing::{MockDc, TEST_USER, TEST_USER_KEY, XAuser, fixtures};
 use atlas_duck_audit::EventType;
 use atlas_duck_ipc::envelope::{Envelope, ErrorCode, Status};
@@ -129,27 +130,67 @@ async fn submit_args(world: &World, args: &[&str]) -> Result<String> {
         .ok_or_else(|| format!("no request id in {}", r.stdout).into())
 }
 
-/// Polls `status <id>` until `accept` holds for its envelope (or the deadline passes).
-async fn wait_status(
-    world: &World,
-    id: &str,
-    accept: impl Fn(&Envelope) -> bool,
-) -> Result<Envelope> {
+/// The request ids on the scripted approver's queue mirror (`test-control/queue.json`): the
+/// requests that wait for a decision. A script run is on it only once it has ended (its release
+/// item); a run that is queued for a slot, running or in flight is not. A read is on it once its
+/// fetch is done. Empty before the mirror exists.
+fn queued_ids(world: &World) -> Result<Vec<String>> {
+    let path = world.control_dir().join(QUEUE_FILE);
+    let mut last = None;
+    // A reader can meet the file while the app renames a new one over it (Windows): try again.
+    for _ in 0..10 {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let rows: Vec<Value> = serde_json::from_str(&text)?;
+                return Ok(rows
+                    .iter()
+                    .filter_map(|r| r["request_id"].as_str().map(str::to_owned))
+                    .collect());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                last = Some(e);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    Err(last.map_or_else(|| "no queue mirror".into(), Into::into))
+}
+
+/// Waits (bounded by [`POLL_DEADLINE`], returns as soon as it holds) until every id is on the
+/// approver's queue: each of those script runs has ended and waits on its release item.
+async fn wait_queued(world: &World, ids: &[&str]) -> Result<()> {
     let start = Instant::now();
     loop {
-        let r = run(world, &["status", id]).await?;
-        let env = r.envelope.ok_or("no envelope")?;
-        if accept(&env) {
-            return Ok(env);
+        let queued = queued_ids(world)?;
+        if ids.iter().all(|id| queued.iter().any(|q| q == id)) {
+            return Ok(());
         }
         if start.elapsed() > POLL_DEADLINE {
             return Err(format!(
-                "{id} not decided in {POLL_DEADLINE:?}: {}",
-                env.to_json_line()
+                "not all of {ids:?} reached the queue in {POLL_DEADLINE:?}: {queued:?}"
             )
             .into());
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Fails with a clear message when one of `ids` is already on the queue: the run the flow wants
+/// in flight, running or waiting for a slot has ended (the flow ran too slowly for its set-up).
+fn assert_not_queued(world: &World, ids: &[&str], what: &str) -> Result<()> {
+    let queued = queued_ids(world)?;
+    let ended: Vec<&&str> = ids
+        .iter()
+        .filter(|id| queued.iter().any(|q| q == **id))
+        .collect();
+    if ended.is_empty() {
+        Ok(())
+    } else {
+        Err(
+            format!("{what}: {ended:?} already ended (on the queue), the set-up was too slow")
+                .into(),
+        )
     }
 }
 
@@ -179,6 +220,17 @@ fn shape(env: &Envelope) -> Result<Value> {
     let mut v = serde_json::to_value(env)?;
     v["request_id"] = Value::Null;
     v["meta"] = Value::Null;
+    Ok(v)
+}
+
+/// [`shape`] without the request's routing fields too: a cancel answer echoes the request's
+/// `op_id` and `instance` (`cancelled_by_client` builds it from the request head), and those
+/// differ between a script and a read. What I-10 requires to be identical is the rest: status,
+/// error code, message, retryable and `details.reason`.
+fn answer_shape(env: &Envelope) -> Result<Value> {
+    let mut v = shape(env)?;
+    v["op_id"] = Value::Null;
+    v["instance"] = Value::Null;
     Ok(v)
 }
 
@@ -229,11 +281,13 @@ fn count_of(records: &[(EventType, Value)], kind: EventType) -> usize {
     payloads(records, kind).len()
 }
 
-/// A script that reaches its call and then holds its slot busy for a minute.
+/// A script that reaches its call and then holds its slot busy for 100 s: well past what a flow
+/// needs (the flow cancels it), and under the 120 s default `timeout_s`, so a holder never ends
+/// by itself nor by a limit.
 fn spinner(key: &str) -> String {
     format!(
         "await atlas.call('jira.issue.get', {{key: '{key}'}});\n\
-         const end = Date.now() + 60000;\n\
+         const end = Date.now() + 100000;\n\
          while (Date.now() < end) {{}}\n\
          return 'spun';\n"
     )
@@ -354,10 +408,17 @@ async fn u03_dry_run_no_http_real_worker() -> Result<()> {
                 r.stdout
             );
             if file == &rejects {
-                // A write is rejected like in a real run, whatever the dry-run mode.
+                // A bad op and a write are rejected like in a real run, whatever the dry-run mode.
                 assert_eq!(
-                    data_at(env, &["result", "write"]),
-                    Some(&json!("validation")),
+                    data_at(env, &["result"]),
+                    Some(&json!({"bad": "validation", "write": "validation"})),
+                    "{}",
+                    r.stdout
+                );
+            } else {
+                assert_eq!(
+                    data_at(env, &["result", "one"]),
+                    Some(&json!(true)),
                     "{}",
                     r.stdout
                 );
@@ -439,9 +500,9 @@ async fn i07_script_streams_identical_real_worker() -> Result<()> {
         ids.push(submit(&world, &file, HOLD, &limits).await?);
     }
     // Every run is over (the spinner after its five seconds and the kill): the answers below are
-    // those of a request whose script ended, which is where a leak would show.
-    wait_hits(mock, &format!("{ISSUE_PREFIX}ABC-1"), 1).await?;
-    tokio::time::sleep(Duration::from_secs(20)).await;
+    // those of a request whose script ended, which is where a leak would show. Only an ended run
+    // is on the approver's queue (its release item), whichever way it ended.
+    wait_queued(&world, &ids.iter().map(String::as_str).collect::<Vec<_>>()).await?;
 
     let leaks = [
         "CANARY",
@@ -496,8 +557,10 @@ async fn i07_script_streams_identical_real_worker() -> Result<()> {
 /// I-10: a cancel is the same answer in every phase: a run that waits for a slot, two runs in
 /// flight (a call the upstream answers late), a run that finished and waits on its release item,
 /// a read that is fetching and a read that waits for release. Every `cancel` is exit 7,
-/// `cancelled`, reason `by_client`, identical modulo the id. The audit shows the two killed runs
-/// failed as `cancelled_by_client`, six requests cancelled and nothing released.
+/// `cancelled`, reason `by_client`, identical apart from the request's own id, op and instance.
+/// The audit shows the two killed runs failed as `cancelled_by_client`, six requests cancelled
+/// and nothing released. Which phase a request is in comes from the approver's queue mirror
+/// (only an ended run or a fetched read is on it), not from sleeps.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn i10_cancel_identical_every_phase_real_worker() -> Result<()> {
     if !opted_in("i10_cancel_identical_every_phase_real_worker") {
@@ -528,29 +591,43 @@ async fn i10_cancel_identical_every_phase_real_worker() -> Result<()> {
         "await atlas.call('jira.issue.get', {key: 'SLOW-1'});\nreturn 'slow';",
     )?;
 
-    // A run that finished: on its release item.
+    // The two that wait on a release item come first, before any late answer is pending: a run
+    // that finished, and a read that was fetched. Each is on the approver's queue once it is
+    // there (a structural wait, no sleep).
     let finished = submit(&world, &quick, HOLD, &[]).await?;
-    tokio::time::sleep(Duration::from_secs(8)).await;
-    // Two runs in flight fill both slots.
+    let awaiting =
+        submit_args(&world, &["jira", "issue", "get", "ABC-1", "--reason", HOLD]).await?;
+    wait_queued(&world, &[finished.as_str(), awaiting.as_str()]).await?;
+    // Two runs in flight fill both slots. From their calls on, the upstream answers in 28 s, so
+    // the rest of the set-up and the cancels below are a handful of CLI calls.
     let flying_a = submit(&world, &slow, HOLD, &[]).await?;
     let flying_b = submit(&world, &slow, HOLD, &[]).await?;
     wait_hits(mock, &format!("{ISSUE_PREFIX}SLOW-1"), 2).await?;
-    // A run that waits for a slot.
+    // A run that waits for a slot: both are taken, so it cannot have started (it would be on the
+    // queue at once, its script is a `return`).
     let waiting = submit(&world, &quick, HOLD, &[]).await?;
-    // A read that is fetching, one that waits for release.
+    // A read that is fetching (its answer is late, too).
     let fetching = submit_args(
         &world,
         &["jira", "issue", "get", "SLOW-2", "--reason", HOLD],
     )
     .await?;
     wait_hits(mock, &format!("{ISSUE_PREFIX}SLOW-2"), 1).await?;
-    let awaiting =
-        submit_args(&world, &["jira", "issue", "get", "ABC-1", "--reason", HOLD]).await?;
-    wait_hits(mock, &format!("{ISSUE_PREFIX}ABC-1"), 1).await?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // The phases are the intended ones: none of these has ended (an ended run or a fetched read
+    // is on the queue), so the cancels below meet them as in flight, waiting and fetching.
+    let open = [
+        flying_a.as_str(),
+        flying_b.as_str(),
+        waiting.as_str(),
+        fetching.as_str(),
+    ];
+    assert_not_queued(&world, &open, "I-10 set-up")?;
 
+    // `waiting` goes first: cancelling an in-flight run frees its slot, and the queue would start
+    // the waiting run before the cancel reaches it (a third `SCRIPT_FAILED`, or a release item).
+    // Then the two in-flight runs, before their late answer lands, and the rest.
     let ids = [
-        &finished, &flying_a, &flying_b, &waiting, &fetching, &awaiting,
+        &waiting, &flying_a, &flying_b, &fetching, &awaiting, &finished,
     ];
     let mut answers = Vec::new();
     for id in ids {
@@ -562,8 +639,9 @@ async fn i10_cancel_identical_every_phase_real_worker() -> Result<()> {
         assert_eq!(code_of(env), Some(ErrorCode::Cancelled));
         assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(false));
         assert_eq!(detail(env, "reason"), Some(&json!("by_client")));
-        answers.push(r.stdout.replace(id.as_str(), "<request_id>"));
+        answers.push(answer_shape(env)?);
     }
+    // Identical in every phase: the same envelope apart from the request's id, op and instance.
     for a in &answers {
         assert_eq!(a, &answers[0], "the cancel answers differ");
     }
@@ -631,31 +709,49 @@ async fn i13_slot_timing_independent_real_worker() -> Result<()> {
     )
     .await?;
     let queued_after = submit(&world, &after, RELEASE, &[]).await?;
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Both holders are still spinning (an ended holder would be on the queue), so the two runs
+    // above wait for a slot.
+    assert_not_queued(&world, &[spin_a.as_str(), spin_b.as_str()], "I-13 holders")?;
+    // "Has not started" is a negative: nothing to wait for, so one short, bounded look. The
+    // structural half is the line above (no slot is free) and the `pending` answers.
+    tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(hits(mock, &format!("{ISSUE_PREFIX}DONE-1")).await, 0);
     for id in [&queued_limit, &queued_after] {
         let r = run(&world, &["status", id]).await?;
         assert_eq!(envelope(&r)?.status, Status::Pending, "{}", r.stdout);
     }
 
-    // A slot frees: the queue runs, in order.
+    // A slot frees: the queue runs, in order. `await` (it returns the moment the run is released,
+    // bounded by the CLI's `--timeout`) delivers the data; `status` never carries any.
     let r = cancel(&world, &spin_a).await?;
     assert_eq!(r.exit, 7, "{}", r.stdout);
-    let limit_env = wait_status(&world, &queued_limit, |e| e.status == Status::Released).await?;
-    assert!(
-        data_at(&limit_env, &["script_error"]).is_some()
-            || code_of(&limit_env) == Some(ErrorCode::ScriptLimit),
-        "{}",
-        limit_env.to_json_line()
-    );
-    let after_env = wait_status(&world, &queued_after, |e| e.status == Status::Released).await?;
+    let r = run(&world, &["await", &queued_limit, "--timeout", LONG_WAIT]).await?;
+    let env = envelope(&r)?;
+    assert_eq!(env.status, Status::Released, "{}", r.stdout);
     assert_eq!(
-        data_at(&after_env, &["result"]),
+        r.exit, 8,
+        "the limit stop is a script_error item: {}",
+        r.stdout
+    );
+    assert_eq!(
+        data_at(env, &["script_error", "class"]),
+        Some(&json!("script_limit")),
+        "{}",
+        r.stdout
+    );
+    let r = run(&world, &["await", &queued_after, "--timeout", LONG_WAIT]).await?;
+    let env = envelope(&r)?;
+    assert_eq!(env.status, Status::Released, "{}", r.stdout);
+    assert_eq!(r.exit, 0, "{}", r.stdout);
+    assert_eq!(
+        data_at(env, &["result"]),
         Some(&json!("done")),
         "{}",
-        after_env.to_json_line()
+        r.stdout
     );
     assert_eq!(hits(mock, &format!("{ISSUE_PREFIX}DONE-1")).await, 1);
+    // The other holder was in flight all along.
+    assert_not_queued(&world, &[spin_b.as_str()], "I-13 second holder")?;
     let r = cancel(&world, &spin_b).await?;
     assert_eq!(r.exit, 7, "{}", r.stdout);
 
@@ -767,7 +863,9 @@ async fn i14_dispatch_rule_cases_real_worker() -> Result<()> {
         .await?,
     );
     wait_hits(mock, &format!("{ISSUE_PREFIX}BIG-1"), 1).await?;
-    tokio::time::sleep(Duration::from_secs(20)).await;
+    // All three runs end on a release item (the two limits at their 6 s, the third once a slot is
+    // free): each is on the approver's queue, held there by the `hold` directive.
+    wait_queued(&world, &ids.iter().map(String::as_str).collect::<Vec<_>>()).await?;
     for id in &ids {
         let r = run(&world, &["status", id]).await?;
         assert_eq!(envelope(&r)?.status, Status::Pending, "{}", r.stdout);
@@ -918,13 +1016,22 @@ async fn i23_script_call_paths_real() -> Result<()> {
     for want in ["redirect_3xx", "non_json_2xx", "non_json_401"] {
         assert!(rejections.contains(&want), "{want} not in {rejections:?}");
     }
+    // A re-check commits two `SYSTEM_FETCH` records (`phase: start`, then `phase: result` per
+    // call): count by purpose and phase, `(starts, results)`.
     let rechecks = |records: &[(EventType, Value)]| {
-        payloads(records, EventType::SYSTEM_FETCH)
-            .iter()
-            .filter(|p| p["purpose"] == json!("token_recheck"))
-            .count()
+        let phase = |want: &str| {
+            payloads(records, EventType::SYSTEM_FETCH)
+                .iter()
+                .filter(|p| p["purpose"] == json!("token_recheck") && p["phase"] == json!(want))
+                .count()
+        };
+        (phase("start"), phase("result"))
     };
-    assert_eq!(rechecks(&records), 0, "a soft failure re-checked the token");
+    assert_eq!(
+        rechecks(&records),
+        (0, 0),
+        "a soft failure re-checked the token"
+    );
 
     // The JSON 401: the re-check passes (the fixture's `myself` answers).
     let hard = script_file(&world, "i23_hard.js", &classify("['J-1']"))?;
@@ -972,7 +1079,8 @@ async fn i23_script_call_paths_real() -> Result<()> {
         r.stdout
     );
     let records = audit(&world).await?;
-    assert_eq!(rechecks(&records), 2, "one re-check per JSON 401");
+    // One re-check per JSON 401: two starts, each with its one result.
+    assert_eq!(rechecks(&records), (2, 2), "one re-check per JSON 401");
     Ok(())
 }
 
@@ -1112,8 +1220,10 @@ async fn s11_containment_corpus() -> Result<()> {
     assert_eq!(code_of(env), Some(ErrorCode::ScriptLimit), "{}", r.stdout);
     assert!(env.data.is_none(), "{}", r.stdout);
 
-    // A heap bomb: stopped, whichever limit the host measures first; it does not hang and does not
-    // succeed.
+    // A heap bomb: no call and no queue (the slots are free), so a limit is direct and data-free,
+    // like the loop above: `failed`, `script_limit`, exit 8. Which limit measured it first is in
+    // the audit below: `heap_mb` (the allocator's refusal), or `process_mb` where the OS limit
+    // fires before it.
     let bomb = script_file(
         &world,
         "s11_bomb.js",
@@ -1133,10 +1243,10 @@ async fn s11_containment_corpus() -> Result<()> {
     )
     .await?;
     let env = envelope(&r)?;
-    assert_ne!(env.status, Status::Succeeded, "{}", r.stdout);
-    if env.status == Status::Failed {
-        assert_eq!(code_of(env), Some(ErrorCode::ScriptLimit), "{}", r.stdout);
-    }
+    assert_eq!(r.exit, 8, "{}", r.stdout);
+    assert_eq!(env.status, Status::Failed, "{}", r.stdout);
+    assert_eq!(code_of(env), Some(ErrorCode::ScriptLimit), "{}", r.stdout);
+    assert!(env.data.is_none(), "{}", r.stdout);
 
     // A limit after a call is data-dependent: not a direct failure, a release item.
     let after_call = script_file(
@@ -1169,7 +1279,9 @@ async fn s11_containment_corpus() -> Result<()> {
         ),
     )?;
     let id = submit(&world, &secret, HOLD, &[]).await?;
-    tokio::time::sleep(Duration::from_secs(15)).await;
+    // The run has ended (its error is on the release item): the answers below are those of a
+    // request that holds the data.
+    wait_queued(&world, &[id.as_str()]).await?;
     for args in [
         vec!["status", id.as_str()],
         vec!["await", id.as_str(), "--timeout", "1"],
@@ -1195,6 +1307,20 @@ async fn s11_containment_corpus() -> Result<()> {
 
     let records = audit(&world).await?;
     assert_eq!(count_of(&records, EventType::SCRIPT_DENIED), 0);
+    let failed = payloads(&records, EventType::SCRIPT_FAILED);
+    assert!(
+        failed.iter().any(|p| {
+            p["direct"] == json!(true)
+                && matches!(p["reason"].as_str(), Some("heap_mb" | "process_mb"))
+        }),
+        "the heap bomb was not a direct memory-limit stop: {failed:?}"
+    );
+    assert!(
+        failed
+            .iter()
+            .any(|p| p["direct"] == json!(true) && p["reason"] == json!("timeout_s")),
+        "the loop was not a direct timeout stop: {failed:?}"
+    );
     Ok(())
 }
 

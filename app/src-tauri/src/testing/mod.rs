@@ -129,7 +129,7 @@ pub fn keys_factory() -> Arc<dyn KeysFactory> {
 /// the store opens, after a keychain retry swapped `Core` in, and when nothing could be served.
 pub fn spawn(app: &AppHandle, data: &LocalDataDir) {
     control::Control::spawn(data.clone(), app.clone());
-    approver::ScriptedApp::spawn_for_app(app.clone());
+    approver::ScriptedApp::spawn_for_app(app.clone(), data.path().join(control::CONTROL_DIR));
 }
 
 #[cfg(test)]

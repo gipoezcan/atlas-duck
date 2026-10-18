@@ -46,6 +46,9 @@ pub const QUIT_FILE: &str = "quit";
 pub const ENV_NAMES_FILE: &str = "env-names.json";
 pub const REFUSED_FILE: &str = "refused";
 pub const PID_FILE: &str = "pid";
+/// Written by the scripted approver (not by the watcher): the queue as a JSON array of
+/// `{request_id, class, approvable}`, rewritten on change.
+pub const QUEUE_FILE: &str = "queue.json";
 pub const DELAY_STARTUP_FILE: &str = "delay-startup-ms";
 pub const MARKER_HANDLE_FILE: &str = "marker-handle";
 pub const MARKER_FILE: &str = "marker";

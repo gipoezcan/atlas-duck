@@ -5,6 +5,7 @@
 //! `DecisionApi` is synchronous: every tick runs on a blocking thread.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -16,6 +17,8 @@ use tauri::{AppHandle, Manager};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+use super::control::QUEUE_FILE;
+use super::keystore::{create_private_dir, write_atomic};
 use crate::state::ServeSlot;
 
 /// The reason prefix that carries a directive.
@@ -117,30 +120,61 @@ impl ScriptedApp {
 
     /// The approver of the app: the core is the one the managed `ServeSlot` serves, whenever
     /// it serves one (at start or after a keychain retry).
-    pub fn spawn_for_app(app: AppHandle) {
+    ///
+    /// The queue is mirrored to `<control_dir>/queue.json` (the items waiting for a decision:
+    /// request id, class, approvable), so a flow can wait for "this run ended and waits on its
+    /// release item" instead of sleeping: only an ended run is in the queue.
+    pub fn spawn_for_app(app: AppHandle, control_dir: PathBuf) {
         let source: DecisionSource = Arc::new(move || {
             let slot = app.try_state::<ServeSlot>()?;
             let core = slot.get()?.core.get()?.clone();
             Some(core.decisions())
         });
-        tauri::async_runtime::spawn(run(source, app_wake()));
+        tauri::async_runtime::spawn(run(source, app_wake(), Some(control_dir)));
     }
 
     /// The seam both use: ticks on `wake` and every [`TICK`].
     pub fn spawn_with(source: DecisionSource, wake: Arc<Wake>) -> JoinHandle<()> {
-        tokio::spawn(run(source, wake))
+        tokio::spawn(run(source, wake, None))
     }
 }
 
 /// What the approver remembers per request: the revision it acted on (or gave up), and the one
-/// that keeps failing with its count.
+/// that keeps failing with its count; and the text of the queue mirror it last wrote.
 #[derive(Default)]
 struct Memory {
     acted: HashMap<String, CandidateRev>,
     failures: HashMap<String, (CandidateRev, u32)>,
+    mirrored: Option<String>,
 }
 
 impl Memory {
+    /// Writes the queue mirror when the queue changed since the last successful write. A failed
+    /// write (the control dir is not there yet, a reader holds the file on Windows) is tried
+    /// again on the next tick; it never fails the tick.
+    fn mirror(&mut self, dir: &Path, items: &[QueueItem]) {
+        let rows: Vec<serde_json::Value> = items
+            .iter()
+            .map(|i| {
+                serde_json::json!({
+                    "request_id": i.request_id,
+                    "class": i.class,
+                    "approvable": i.approvable,
+                })
+            })
+            .collect();
+        let Ok(text) = serde_json::to_string(&rows) else {
+            return;
+        };
+        if self.mirrored.as_deref() == Some(text.as_str()) {
+            return;
+        }
+        if create_private_dir(dir).is_ok() && write_atomic(dir, QUEUE_FILE, text.as_bytes()).is_ok()
+        {
+            self.mirrored = Some(text);
+        }
+    }
+
     /// Requests that left the queue are forgotten (bounded memory).
     fn keep_only(&mut self, items: &[QueueItem]) {
         let queued = |id: &String| items.iter().any(|i| &i.request_id == id);
@@ -175,7 +209,7 @@ impl Memory {
     }
 }
 
-async fn run(source: DecisionSource, wake: Arc<Wake>) {
+async fn run(source: DecisionSource, wake: Arc<Wake>, mirror: Option<PathBuf>) {
     let mut memory = Memory::default();
     loop {
         tokio::select! {
@@ -183,8 +217,9 @@ async fn run(source: DecisionSource, wake: Arc<Wake>) {
             () = tokio::time::sleep(TICK) => {}
         }
         let Some(api) = source() else { continue };
+        let dir = mirror.clone();
         let ticked = tokio::task::spawn_blocking(move || {
-            tick(api, &mut memory);
+            tick(api, &mut memory, dir.as_deref());
             memory
         })
         .await;
@@ -195,9 +230,12 @@ async fn run(source: DecisionSource, wake: Arc<Wake>) {
 }
 
 /// One pass over the queue.
-fn tick(api: Arc<dyn DecisionApi>, memory: &mut Memory) {
+fn tick(api: Arc<dyn DecisionApi>, memory: &mut Memory, mirror: Option<&Path>) {
     let items = api.queue_list();
     memory.keep_only(&items);
+    if let Some(dir) = mirror {
+        memory.mirror(dir, &items);
+    }
     let approver = ScriptedApprover::new(api);
     for item in &items {
         let d = directive(item.reason_excerpt.as_deref());
