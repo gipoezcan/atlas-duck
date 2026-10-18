@@ -147,6 +147,12 @@ export function Panel(props: PanelProps) {
     () => (candidate?.state === 'ready' ? new TreeModel(candidate.candidate) : null),
     [candidate],
   );
+  // The drops that clear the flagged entries: a tree walk per entry, so only when the tree or the list changes.
+  const probe = props.flagged;
+  const flaggedPlan = useMemo(
+    () => (model === null || probe === null || 'failed' in probe ? null : flaggedRound(model, probe.flagged)),
+    [model, probe],
+  );
   const [expanded, setExpanded] = useState<ReadonlySet<number>>(new Set());
   const [selected, setSelected] = useState<TreeNode | null>(null);
   const [maskText, setMaskText] = useState('');
@@ -403,13 +409,13 @@ export function Panel(props: PanelProps) {
     const found = props.flagged;
     if (found === null) return <p role="status">{REDACTION_TEXT.flagged_checking}</p>;
     if ('failed' in found || found.flagged.length === 0) return <p role="alert">{REDACTION_TEXT.flagged_missing}</p>;
-    const plan = model === null ? null : flaggedRound(model, found.flagged);
+    const plan = flaggedPlan;
     const missing = plan === null ? [] : plan.round.filter((r) => !inRound.has(canonical(r.op)));
     return (
       <div className="redaction-flagged">
         <strong>{REDACTION_TEXT.flagged_heading}</strong>
         <ul>
-          {found.flagged.map((b, i) => (
+          {found.flagged.slice(0, FLAGGED_SHOWN).map((b, i) => (
             <li key={i}>
               {own(BLOCK_REASON_TEXT, b.reason) ?? b.reason}
               {': '}
@@ -417,6 +423,10 @@ export function Panel(props: PanelProps) {
             </li>
           ))}
         </ul>
+        {/* Only the list is cut: the drops below name every flagged entry. */}
+        {found.flagged.length > FLAGGED_SHOWN ? (
+          <p>{REDACTION_TEXT.flagged_more(found.flagged.length - FLAGGED_SHOWN)}</p>
+        ) : null}
         <button
           type="button"
           disabled={plan === null || plan.round.length === 0 || missing.length === 0 || roundSingles || removeAll}
@@ -578,6 +588,9 @@ export function Panel(props: PanelProps) {
     </section>
   );
 }
+
+/** The flagged entries listed at most; the rest is a count (the drops still name every entry). */
+const FLAGGED_SHOWN = 50;
 
 /**
  * The drops that clear `flagged` (core `redact`: an entry the mirror check flags blocks until a drop

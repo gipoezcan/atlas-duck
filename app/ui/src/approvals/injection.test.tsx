@@ -50,7 +50,7 @@ const FIXTURES = new Map<string, Json>(
 const DISCRIMINANTS = new Set([
   'kind', 'class', 'status', 'level', 'step', 'state', 'product', 'purpose', 'choice', 'result',
   'outcome', 'mode', 'op', 'scope', 'preset', 'method', 'cli', 'autostart',
-  'attention_mode', 'secret_service', 'code', 'field', 'conn', 'error',
+  'attention_mode', 'secret_service', 'code', 'field', 'conn', 'error', 'preselect',
 ]);
 
 /** The one discriminator path a `free` run poisons as well (the per-path prototype pass), or null. */
@@ -155,6 +155,8 @@ let preview = 0;
 let enabled = false;
 let pin = 0;
 let variant: 'none' | 'tokens' | 'removal' = 'none';
+/** The blocked read of the M-11 scenario: `redaction_preview` answers the report that flags mirror entries. */
+let mirror = false;
 let counters = new Map<string, number>();
 
 /** The fixture called `name` as a list, poisoned as the current pass says (or as `pass` says). */
@@ -240,6 +242,20 @@ function answered(v: Json): Json {
 
 const hasBlocked = (r: Json) => ((r as { blocked?: unknown[] }).blocked?.length ?? 0) > 0;
 
+/**
+ * The probe of a mirror-blocked read (T24): the report of the fixture that flags mirror entries. Its
+ * `reason` names stay as Rust wrote them (the panel only offers the item for the two mirror reasons,
+ * and `reason` is not a discriminant: a poisoned one would end the item as "could not be found"); the
+ * paths stay poisoned, so the flagged list and the tree lookup are drawn from the payload.
+ */
+function mirrorReport(): Promise<Json> {
+  const orig = FIXTURES.get('redaction_report') as { blocked: { reason: string }[] }[];
+  const at = orig.findIndex((r) => r.blocked.some((b) => b.reason.startsWith('mirror_')));
+  const poisoned = fx('redaction_report')[at] as { blocked: object[] };
+  const blocked = poisoned.blocked.map((b, i) => ({ ...b, reason: orig[at]?.blocked[i]?.reason }));
+  return Promise.resolve({ ...poisoned, blocked });
+}
+
 /** A row a batch may decide: opened, approvable, not flagged (a batch needs all of it). */
 function decidable(item: Json): Json {
   return { ...(item as object), opened: true, approvable: true, possible_duplicate_of: null, similar_to: null };
@@ -254,7 +270,13 @@ function answer(cmd: string, args: Record<string, unknown>): Promise<Json> {
     case 'queue_get': return reply(cmd, 'queue_detail');
     case 'preview_fetch': return Promise.resolve(previewResponse(String(args['request_id'])));
     case 'raw_page': return rawPage(Number(args['page']));
-    case 'redaction_preview': return reply(cmd, 'redaction_report', (l) => l.find((r) => hasBlocked(r)) ?? l[0]);
+    case 'redaction_preview':
+      // The first answer (the probe) is the mirror report; the second, as in every window, is a refusal.
+      if (mirror && (counters.get(cmd) ?? 0) % 2 === 0) {
+        counters.set(cmd, (counters.get(cmd) ?? 0) + 1);
+        return mirrorReport();
+      }
+      return reply(cmd, 'redaction_report', (l) => l.find((r) => hasBlocked(r)) ?? l[0]);
     case 'decide': return reply(cmd, 'decision_outcome');
     case 'decide_batch': return reply(cmd, 'batch_outcome');
     case 'deny_batch':
@@ -430,7 +452,8 @@ const SCENARIOS: Scenario[] = [
   // The nineteen preview kinds, alternately blocked as Rust built them and made approvable. The
   // corpus runs take the kinds that differ in what the window draws: a read with the redaction
   // panel (0), a write with the edit form, blocked (1) and approvable (4), a read with an
-  // "also appears in" note (8); the others only join the wide runs.
+  // "also appears in" note (8); the others only join the wide runs. Kind 0 as a blocked read with
+  // the mirror probe follows these nineteen (its own scenario, below).
   ...Array.from({ length: 19 }, (_, i): Scenario => ({
     name: `approvals preview ${i}`,
     wide: ![0, 1, 4, 8].includes(i),
@@ -441,6 +464,20 @@ const SCENARIOS: Scenario[] = [
       enabled = i % 2 === 0;
     },
   })),
+  // M8 T24 (M-11): the blocked read of kind 0 keeps its banner and its redaction context, and the probe
+  // answers the mirror report: the flagged list (Rust's reason and path text), the tree it is looked
+  // up in and "Drop the flagged items" are drawn and pressed. Not in `all`: the banner needs its
+  // discriminators. A core scenario, so every payload reaches it.
+  {
+    name: 'approvals preview blocked read',
+    modes: ['free'],
+    element: () => <App />,
+    before: () => {
+      preview = 0;
+      enabled = false;
+      mirror = true;
+    },
+  },
   ...[0, 1, 2].map((i): Scenario => ({ name: `settings ${i}`, modes: only(i), element: () => <Settings />, before: () => void (pin = i) })),
   { name: 'settings tokens', modes: ['free'], element: () => <Settings />, before: () => void (variant = 'tokens') },
   { name: 'settings removal', modes: ['free', 'all'], element: () => <Settings />, before: () => void ((variant = 'removal'), (pin = 1)) },
@@ -459,6 +496,7 @@ async function run(scenario: Scenario): Promise<string[]> {
   current = new Set();
   variant = 'none';
   pin = 0;
+  mirror = false;
   scenario.before?.();
   let stop: () => void = () => undefined;
   let view: ReturnType<typeof render> | null = null;

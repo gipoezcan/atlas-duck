@@ -343,18 +343,21 @@ describe('Detail', () => {
     const target = screen.getByText('Target');
     expect(target.tagName).toBe('DT');
     expect(within(target.nextElementSibling as HTMLElement).getByText(`“${hostile}”`).tagName).toBe('BDI');
-    const shown = screen.getByText('Limits');
+    // What the script asked for, not what applies (the host clamps to the configured ceilings).
+    const shown = screen.getByText('Requested limits');
     expect(shown.tagName).toBe('DT');
     expect((shown.nextElementSibling as HTMLElement).querySelector('pre')?.textContent).toBe(
       JSON.stringify(limits, null, 2),
     );
     unmount();
-    // A script that sent no limits runs with the configured ones.
+    // A script that sent no limits asked for none: the configured ones apply.
     asked('script', { source: 'return 1', args: {} });
     const again = render(<Detail item={item} />);
     fireEvent.click(screen.getByRole('tab', { name: 'Request' }));
     await screen.findByText(detail.request.params_sha256);
-    expect((screen.getByText('Limits').nextElementSibling as HTMLElement).textContent).toBe('configured limits');
+    expect((screen.getByText('Requested limits').nextElementSibling as HTMLElement).textContent).toBe(
+      'none requested (the configured limits apply)',
+    );
     again.unmount();
     // Other classes have neither row.
     asked('read', { key: 'ABC-1' });
@@ -362,7 +365,7 @@ describe('Detail', () => {
     fireEvent.click(screen.getByRole('tab', { name: 'Request' }));
     await screen.findByText(detail.request.params_sha256);
     expect(screen.queryByText('Target')).toBeNull();
-    expect(screen.queryByText('Limits')).toBeNull();
+    expect(screen.queryByText('Requested limits')).toBeNull();
   });
 
   it('request_tab_all_text_nodes', async () => {

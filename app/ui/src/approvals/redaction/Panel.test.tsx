@@ -972,15 +972,15 @@ describe('a mirror-blocked item (M8 T24, T19c M-11, L217)', () => {
   };
 
   /** Rust's answer for a mirror-blocked read: the banner, not approvable, with its redaction context. */
-  function blockedPreview(): PreviewFetchResponse {
-    const response = previewOf(READ, 'jira_issue', { approvable: false }, context([], []));
+  function blockedPreview(ops: RedactionOp[] = []): PreviewFetchResponse {
+    const response = previewOf(READ, 'jira_issue', { approvable: false }, context(ops, []));
     response.preview.header = { ...response.preview.header, release_blocked: BANNER };
     return response;
   }
 
   /** Opens the blocked read; `redaction_preview` of no ops lists `flagged`, any ops list nothing. */
-  async function openBlocked(flagged: { reason: string; path: string }[]) {
-    serveCandidate(DOC_MIRROR);
+  async function openBlocked(flagged: { reason: string; path: string }[], doc: unknown = DOC_MIRROR) {
+    serveCandidate(doc);
     mockedPreview.mockResolvedValue(blockedPreview());
     mockedReport.mockImplementation((_id, _rev, ops) =>
       Promise.resolve(ops.length === 0 ? { ...OK, blocked: flagged } : OK),
@@ -1020,9 +1020,6 @@ describe('a mirror-blocked item (M8 T24, T19c M-11, L217)', () => {
   it('a_mirror_blocked_item_with_nothing_unsent_cannot_be_released', async () => {
     await openBlocked([{ reason: 'mirror_orphan', path: `${COMMENTS}[1]` }]);
     expect(panelRelease().disabled).toBe(true);
-    fireEvent.click(panelRelease());
-    await flush();
-    expect(mockedDecide).not.toHaveBeenCalled();
     // Ops that do not clear the flag keep it off: the report's blocked list gates it.
     mockedReport.mockResolvedValue({ ...OK, blocked: [{ reason: 'mirror_orphan', path: `${COMMENTS}[1]` }] });
     expand('fields');
@@ -1031,6 +1028,59 @@ describe('a mirror-blocked item (M8 T24, T19c M-11, L217)', () => {
     await checked();
     expect(panelRelease().disabled).toBe(true);
     expect(within(panel()).getByText('Release is blocked:')).toBeTruthy();
+    // Ops that clear it open Release; once the round is removed again nothing is unsent and it is off
+    // (the gate is "unsent redactions that Rust's report clears", not "a mirror-blocked item").
+    mockedReport.mockResolvedValue(OK);
+    fireEvent.click(within(panel()).getByRole('button', { name: 'Remove' }));
+    fireEvent.click(action('Drop the flagged items'));
+    await checked();
+    expect(panelRelease().disabled).toBe(false);
+    fireEvent.click(within(panel()).getByRole('button', { name: 'Remove' }));
+    expect(panelRelease().disabled).toBe(true);
+    expect(mockedDecide).not.toHaveBeenCalled();
+  });
+
+  it('a_fail_closed_revision_that_has_ops_does_not_get_the_mirror_flow', async () => {
+    // A revision with ops that failed at release time has the banner and a context too, but Rust
+    // refuses its probe (`takes_redactions` admits a failed revision only without ops).
+    const held: RedactionOp = { drop_field: { field_loc: 'fields.summary', scope: 'per_item' } };
+    serveCandidate(DOC_MIRROR);
+    mockedPreview.mockResolvedValue(blockedPreview([held]));
+    mockedReport.mockRejectedValue({ kind: 'not_approvable' });
+    await renderWindow();
+    fireEvent.click(screen.getByRole('button', { name: `Open ${READ.op_id} ${READ.target_display}` }));
+    await flush();
+    advance(INERT_MS);
+    fireEvent.click(screen.getByRole('tab', { name: 'Structured' }));
+    await flush();
+    expect(screen.getByText(BANNER, { exact: false })).toBeTruthy();
+    expect(mockedReport).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('region', { name: 'Redact before releasing' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Drop the flagged items' })).toBeNull();
+    // No Release button is on (the card's, if it shows one, is not approvable either).
+    for (const b of screen.queryAllByRole('button', { name: 'Release' })) expect((b as HTMLButtonElement).disabled).toBe(true);
+    expect(mockedDecide).not.toHaveBeenCalled();
+  });
+
+  it('a_probe_without_a_mirror_reason_does_not_get_the_mirror_flow', async () => {
+    // Only the two mirror reasons make an item this one: another blocked reason is a plain failure.
+    await openBlocked([{ reason: 'mask_still_occurs', path: 'fields.summary' }]);
+    expect(screen.queryByRole('region', { name: 'Redact before releasing' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Drop the flagged items' })).toBeNull();
+  });
+
+  it('only_the_mirror_reasons_of_a_probe_are_listed_and_dropped', async () => {
+    await openBlocked([
+      { reason: 'over_release_cap', path: '' },
+      { reason: 'mirror_orphan', path: `${COMMENTS}[1]` },
+      { reason: 'mask_still_occurs', path: 'fields.summary' },
+    ]);
+    const list = panel().querySelector('.redaction-flagged') as HTMLElement;
+    expect(within(list).getAllByRole('listitem')).toHaveLength(1);
+    expect(within(list).queryByText(/fields\.summary/)).toBeNull();
+    fireEvent.click(dropFlagged());
+    await checked();
+    expect(lastReportOps()).toEqual([{ drop_item: { array_loc: COMMENTS, key: 'id', value: '9' } }]);
   });
 
   it('unmatchable_entries_are_cleared_by_dropping_their_whole_list', async () => {
@@ -1041,6 +1091,54 @@ describe('a mirror-blocked item (M8 T24, T19c M-11, L217)', () => {
     fireEvent.click(dropFlagged());
     await checked();
     expect(lastReportOps()).toEqual([{ drop_field: { field_loc: COMMENTS, scope: 'per_item' } }]);
+  });
+
+  it('orphans_and_unmatchable_entries_are_dropped_together_in_the_round_order', async () => {
+    const doc = {
+      renderedFields: {
+        comment: { comments: [{ id: '7', body: 'a' }, { id: '9', body: 'b' }] },
+        worklog: { worklogs: [{ t: 1 }, { t: 2 }, { t: 3 }] },
+        notes: ['x', 'y'],
+      },
+    };
+    await openBlocked(
+      [
+        { reason: 'mirror_orphan', path: `${COMMENTS}[1]` },
+        { reason: 'mirror_unmatchable', path: 'renderedFields.worklog.worklogs[0]' },
+        { reason: 'mirror_unmatchable', path: 'renderedFields.worklog.worklogs[2]' },
+        { reason: 'mirror_orphan', path: 'renderedFields.notes[0]' },
+        { reason: 'mirror_orphan', path: 'renderedFields.notes[1]' },
+      ],
+      doc,
+    );
+    fireEvent.click(dropFlagged());
+    await checked();
+    // Entries without an identity go by index, later ones first; then the list (once, for both of
+    // its entries) and the orphan with an identity, in the order they were added.
+    expect(lastReportOps()).toEqual([
+      { drop_field: { field_loc: 'renderedFields.notes[1]', scope: 'per_item' } },
+      { drop_field: { field_loc: 'renderedFields.notes[0]', scope: 'per_item' } },
+      { drop_field: { field_loc: 'renderedFields.worklog.worklogs', scope: 'per_item' } },
+      { drop_item: { array_loc: COMMENTS, key: 'id', value: '9' } },
+    ]);
+    // Everything is in the round now: the button has nothing left to add.
+    expect(dropFlagged().disabled).toBe(true);
+  });
+
+  it('a_long_flagged_list_is_cut_but_every_entry_is_dropped', async () => {
+    const comments = Array.from({ length: 60 }, (_, i) => ({ id: String(i), body: 'b' }));
+    await openBlocked(
+      comments.map((_, i) => ({ reason: 'mirror_orphan', path: `${COMMENTS}[${i}]` })),
+      { renderedFields: { comment: { comments } } },
+    );
+    const list = panel().querySelector('.redaction-flagged') as HTMLElement;
+    expect(within(list).getAllByRole('listitem')).toHaveLength(50);
+    expect(within(list).getByText(/and 10 more flagged entries/)).toBeTruthy();
+    fireEvent.click(dropFlagged());
+    await checked();
+    expect(lastReportOps()).toEqual(
+      comments.map((c) => ({ drop_item: { array_loc: COMMENTS, key: 'id', value: c.id } })),
+    );
   });
 
   it('a_failed_probe_offers_no_drop_flagged_items', async () => {

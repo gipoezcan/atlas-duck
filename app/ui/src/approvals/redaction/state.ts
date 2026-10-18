@@ -164,6 +164,13 @@ const MIRROR_REASONS: readonly string[] = ['mirror_orphan', 'mirror_unmatchable'
  * revision's own ops, whose `blocked` lists every flagged entry still in the shown candidate (core
  * `check_redacted`), in document order and as `name[3]` paths into the tree the panel shows. Asked
  * once per revision while `enabled`; each answer carries the revision it is for.
+ *
+ * No automatic retry on a failed probe (T24 review M-2): the failure is shown as "Could not find the
+ * flagged items. Deny this request.", which is the safe end of this item, and a retry loop would
+ * hide a persistent fault behind a spinner. Leaving the Structured tab and coming back asks again
+ * (`enabled` is in the effect's dependencies). The answer is keyed by revision only, not by request:
+ * the flagged list depends on the candidate's bytes and the rules, so two requests with the same
+ * candidate hash would show the same list until their own probe answers.
  */
 export function useFlagged(
   requestId: string,

@@ -261,7 +261,8 @@ export const REDACTION_TEXT = {
   flagged_heading: 'These entries have no counterpart and block the release:',
   drop_flagged: 'Drop the flagged items',
   drop_flagged_note:
-    'Drops each flagged entry; where entries cannot be matched, their whole list is dropped. Release then makes a new revision.',
+    'Drops each flagged entry; where entries cannot be matched, their whole list is dropped, and so is the list it mirrors. Release then makes a new revision.',
+  flagged_more: (n: number) => `and ${n} more flagged entries (the drops name all of them)`,
   flagged_checking: 'Looking for the flagged items',
   flagged_missing: 'Could not find the flagged items. Deny this request.',
   flagged_unresolved: 'Some flagged entries are not in the tree: drop them there, or deny this request.',
@@ -330,8 +331,8 @@ export const REQUEST_TEXT = {
   op: 'Operation',
   /** M8 T24: a script's target (what the queue row shows) and the limits it asked for. */
   target: 'Target',
-  limits: 'Limits',
-  limits_default: 'configured limits',
+  limits: 'Requested limits',
+  limits_default: 'none requested (the configured limits apply)',
   submitted_at: 'Submitted',
   age: 'Age',
   connection: 'Connection',

@@ -225,21 +225,26 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
   // M-11 (M8 T19c): a candidate the 5.3 mirror check blocks arrives with its banner and a redaction
   // context (a candidate that cannot be rebuilt at all has no preview, so it is not this). Its tree is
   // offered so the flagged entries can be dropped; only a release of those redactions is open.
-  const redactable = context !== null && shown !== null && !gone && shown.preview.body.kind !== 'outcome';
-  const mirrorBlocked = redactable && releaseBlocked !== null;
+  // The banner and a context are not enough (a revision with ops that failed at release time has
+  // both): the item is mirror-blocked only when Rust's probe lists at least one mirror-flagged entry.
+  // Without that, a fail-closed preview keeps the old behaviour: no panel, no tree, no release.
+  const readable = context !== null && shown !== null && !gone && shown.preview.body.kind !== 'outcome';
+  const mirrorProbe = readable && releaseBlocked !== null;
+  const shownRev = shown?.preview.candidate_rev ?? null;
+  const shownRevKey = shownRev === null ? '' : revKey(shownRev);
+  const flagged = useFlagged(
+    item.request_id,
+    mirrorProbe ? shownRev : null,
+    context?.ops ?? [],
+    mirrorProbe && tab === 'structured',
+  );
+  const mirrorBlocked = mirrorProbe && flagged !== null && 'flagged' in flagged && flagged.flagged.length > 0;
+  const redactable = readable && (releaseBlocked === null || mirrorBlocked);
   const draft = redactable ? draftOf(context, round, urlChoice, removeAll) : null;
   /** Redactions the user built and has not released: every other positive control is off. */
   const unsentRedactions = (draft?.unsent ?? false) || pendingInput;
-  const shownRev = shown?.preview.candidate_rev ?? null;
-  const shownRevKey = shownRev === null ? '' : revKey(shownRev);
   const report = useRedactionReport(item.request_id, redactable ? shownRev : null, draft);
   const candidate = useCandidate(item.request_id, redactable ? shownRev : null, redactable && tab === 'structured');
-  const flagged = useFlagged(
-    item.request_id,
-    mirrorBlocked ? shownRev : null,
-    context?.ops ?? [],
-    mirrorBlocked && tab === 'structured',
-  );
   const reportShown =
     report !== null && draft !== null && report.rev === shownRevKey && report.key === draft.key ? report : null;
   /** The redaction panel's Release (spec 5.3): the report for exactly these ops, nothing blocked, others confirmed. */
