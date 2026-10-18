@@ -244,7 +244,9 @@ describe('Settings', () => {
     // for what writes config.toml; the CLI install and "Prepare for removal" record audit events only.
     for (const c of controls) {
       const name = c.textContent ?? '';
-      const stays = /token|Re-test|Prune backlog|CLI|full backup/.test(name);
+      // The degraded toggle is audit-authoritative, not a config.toml key: it stays on (PD-141).
+      const degraded = c.closest('label')?.textContent === 'Allow scripts with degraded confinement';
+      const stays = degraded || /token|Re-test|Prune backlog|CLI|full backup/.test(name);
       expect(c.matches(':disabled'), c.outerHTML).toBe(!stays);
     }
     expect(open.length).toBeGreaterThan(0);
