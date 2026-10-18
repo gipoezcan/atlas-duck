@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 
 use atlas_duck_app_lib::testing::ENV_TEST_SERVER_BUILD_ID;
 use atlas_duck_app_lib::testing::control::{DELAY_STARTUP_FILE, QUIT_FILE};
-use atlas_duck_atlassian::testing::MockDc;
 use atlas_duck_atlassian::testing::fixtures::{self, JIRA_COMMENT};
+use atlas_duck_atlassian::testing::{MockDc, TEST_USER, UserKind};
 use atlas_duck_audit::request_set::requests_from_json;
 use atlas_duck_audit::{EventType, RequestRecord};
 use atlas_duck_ipc::envelope::Status;
@@ -1449,5 +1449,191 @@ async fn x05_sc1_walk_jira_cli_and_mcp() -> Result<()> {
         .filter(|(kind, _)| *kind == EventType::WRITE_DENIED)
         .count();
     assert_eq!(denied, 4, "WRITE_DENIED records");
+    Ok(())
+}
+
+// ---- Confluence tools (Task 22) ------------------------------------------------------------------
+
+/// The fixture set's page and its wire path under the context path.
+const WIKI_PAGE_ID: &str = "65537";
+const WIKI_PAGE_PATH: &str = "/rest/api/content/65537";
+/// The `userKey` `MockDc::mount_fixture_set` answers `user/current` with for Confluence.
+const WIKI_USER_KEY: &str = "8a7f808a1";
+
+/// One Confluence instance `wiki` (the only one of its product, so a tool call without `instance`
+/// routes to it); the mock answers the fixture set: `user/current`, the applinks manifest, page
+/// `65537` at version 7 and a search page.
+async fn wiki_world() -> Result<World> {
+    let mut world = World::new(WorldOpts::default())?;
+    world
+        .provision_store(&[("wiki", Product::Confluence)])
+        .await?;
+    Ok(world)
+}
+
+fn wiki(world: &World) -> Result<&MockDc> {
+    world.mock("wiki").ok_or_else(|| "no mock for wiki".into())
+}
+
+/// The mock started over (as `confluence_flows`): no mount of the fixture set is left, only the
+/// identity and the applinks answers of the provisioning.
+async fn restart_wiki(mock: &MockDc) {
+    mock.server().reset().await;
+    mock.confluence_user_current(UserKind::Known, TEST_USER, WIKI_USER_KEY)
+        .await;
+    mock.applinks_manifest(fixtures::CONFLUENCE_8_5_VERSION)
+        .await;
+}
+
+/// The fixture page as the historical version 6 (stage 2 of a page update).
+fn wiki_historical_page() -> Result<String> {
+    let mut v: Value = serde_json::from_str(fixtures::CONFLUENCE_PAGE)?;
+    v["status"] = json!("historical");
+    v["version"]["number"] = json!(6);
+    v["body"]["storage"]["value"] = json!("<p>Check the build, first draft.</p>");
+    Ok(v.to_string())
+}
+
+/// The fixture search page as the first of five results: a page size of one, `totalSize` 5 and a
+/// `_links.next`, so a read of `max` 1 stops with a continuation.
+fn wiki_search_first_of_five() -> Result<String> {
+    let mut v: Value = serde_json::from_str(fixtures::CONFLUENCE_SEARCH_PAGE)?;
+    v["limit"] = json!(1);
+    v["totalSize"] = json!(5);
+    v["_links"]["next"] = json!("/rest/api/search?start=1&limit=1");
+    Ok(v.to_string())
+}
+
+/// Task 22: the Confluence tools through MCP, against the same app and mock as the CLI's
+/// `confluence_flows` (this flow is their MCP twin). Four calls, in this order:
+/// 1. `confluence_page_get {id, format: markdown}` released: `data.result.body.format` is
+///    `markdown` and `meta.conversion` is there.
+/// 2. `confluence_search {cql, max: 1}` released against a page that has more: the tool description
+///    carries the `meta.page.next_start` sentence, and `meta.page` is the one the core wrote.
+/// 3. `confluence_page_update` of a Markdown body with a `page get` placeholder: `failed` /
+///    `markdown_placeholders`, `isError`, and nothing fetched or written.
+/// 4. `confluence_page_update` from base version 6 of a page at version 7, denied by the
+///    scripted approver (`deny-hint`: the first hint the hold takes, else a plain deny): `denied`,
+///    `isError`, no `PUT` at the mock.
+///
+/// Source: `confluence_flows` (`page_update_conflict_denied_exit3`, `placeholders_rejected_exit2`,
+/// `page_get_markdown_released_with_conversion_meta`, `cql_rewrite_on_the_wire`), `engine/read.rs`
+/// (`meta.page`: start, returned, total, truncated, next_start), `ipc::proto::exit_code` (a failed
+/// `markdown_placeholders` is exit 2, so `isError`), the tool catalog `mcp_tools_full.json`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confluence_tools_end_to_end() -> Result<()> {
+    if !opted_in("confluence_tools_end_to_end") {
+        return Ok(());
+    }
+    let world = wiki_world().await?;
+    let mock = wiki(&world)?;
+    // The search page mount goes ahead of the fixture's; the page and identity mounts of the
+    // fixture set serve the first calls and are reset before the conflict.
+    mock.json_first("/rest/api/search", 200, &wiki_search_first_of_five()?)
+        .await;
+    let _app = world.start_app().await?;
+    let mut mcp = mcp_client(&world, "mcp-flows-confluence", "30").await?;
+
+    // 1. page get as Markdown.
+    let out = mcp
+        .call(
+            "confluence_page_get",
+            json!({"id": WIKI_PAGE_ID, "format": "markdown", "reason": "atlas-test:release"}),
+            None,
+        )
+        .await?;
+    assert_released(&mcp, &out);
+    let env = out.structured();
+    assert_eq!(
+        env["data"]["result"]["body"]["format"],
+        json!("markdown"),
+        "{env}"
+    );
+    assert!(env["meta"]["conversion"]["lossy"].is_boolean(), "{env}");
+    assert!(env["meta"]["conversion"]["lost"].is_object(), "{env}");
+
+    // 2. search, paginated.
+    let tools = mcp.list_tools().await?;
+    let search = tools
+        .iter()
+        .find(|t| t["name"] == "confluence_search")
+        .ok_or("no confluence_search tool")?;
+    let description = search["description"].as_str().unwrap_or_default();
+    assert!(
+        description.contains("continue only from meta.page.next_start"),
+        "the next_start sentence is missing: {description}"
+    );
+    let out = mcp
+        .call(
+            "confluence_search",
+            json!({"cql": "space = DOC", "max": 1, "reason": "atlas-test:release"}),
+            None,
+        )
+        .await?;
+    assert_released(&mcp, &out);
+    assert_eq!(
+        out.structured()["meta"]["page"],
+        json!({"start": 0, "returned": 1, "total": 5, "truncated": true, "next_start": 1}),
+        "{}",
+        out.structured()
+    );
+
+    // 3. a placeholder in a Markdown body: refused before anything is fetched or queued.
+    let fetched_before = mock.received().await.len();
+    let out = mcp
+        .call(
+            "confluence_page_update",
+            json!({"id": WIKI_PAGE_ID, "base_version": 7, "body": "[macro: toc {}]",
+                   "reason": "atlas-test:approve"}),
+            None,
+        )
+        .await?;
+    let env = out.structured();
+    assert!(out.is_error(), "{env}\n{}", mcp.transcript());
+    assert_eq!(status_of(env), "failed", "{env}");
+    assert_eq!(error_code(env), "markdown_placeholders", "{env}");
+    assert_eq!(
+        env["error"]["details"]["placeholders"],
+        json!([{"kind": "macro", "count": 1}]),
+        "{env}"
+    );
+    assert_eq!(
+        mock.received().await.len(),
+        fetched_before,
+        "a refused body reached the mock"
+    );
+
+    // 4. a stale base version: the conflict hold, denied.
+    restart_wiki(mock).await;
+    mock.json_once(WIKI_PAGE_PATH, 200, fixtures::CONFLUENCE_PAGE)
+        .await;
+    mock.json(WIKI_PAGE_PATH, 200, &wiki_historical_page()?)
+        .await;
+    let out = mcp
+        .call(
+            "confluence_page_update",
+            json!({"id": WIKI_PAGE_ID, "base_version": 6, "body": "**done**",
+                   "reason": "atlas-test:deny-hint"}),
+            None,
+        )
+        .await?;
+    let env = out.structured();
+    assert!(out.is_error(), "{env}\n{}", mcp.transcript());
+    assert_eq!(status_of(env), "denied", "{env}");
+    let puts = mock
+        .received()
+        .await
+        .iter()
+        .filter(|r| r.method.as_str() == "PUT")
+        .count();
+    assert_eq!(puts, 0, "a denied update reached the mock");
+
+    for line in mcp.raw_stdout_lines() {
+        assert!(!line.contains(PAT_CANARY), "the PAT canary is on stdout");
+    }
+    mcp.close_stdin();
+    let exit = mcp.wait_exit().await?;
+    assert!(exit.success(), "{exit}\n{}", mcp.transcript());
+    quit_app(&world).await?;
     Ok(())
 }
