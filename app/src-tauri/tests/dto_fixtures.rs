@@ -34,7 +34,7 @@ use atlas_duck_audit::AuditError;
 use atlas_duck_core::engine::write::CONFLICT_DENY_PREFILL;
 use atlas_duck_core::payloads::InvalidReason;
 use atlas_duck_core::redact::{BlockReason, DropScope, RedactionPreset};
-use atlas_duck_core::running::RunningScriptView;
+use atlas_duck_core::running::{KillAnswer as CoreKillAnswer, RunningScriptView};
 use atlas_duck_core::validate::ValidationError;
 use atlas_duck_core::{
     AdminError, AttentionMode, BatchFailure, BatchOutcome, CandidateRev, ConfigBanner,
@@ -1129,9 +1129,32 @@ fn running_scripts() -> Vec<RunningScriptView> {
     ]
 }
 
-/// `running_kill` (M6 T30): a kill was asked for, and no such live run.
+/// `running_kill` (M6 T30, M8 T22): the three answers.
 fn kill_answers() -> Vec<KillAnswer> {
-    vec![KillAnswer { killed: true }, KillAnswer { killed: false }]
+    [
+        CoreKillAnswer::Killed,
+        CoreKillAnswer::NotRunning,
+        CoreKillAnswer::AlreadyStopping,
+    ]
+    .map(|answer| KillAnswer { answer })
+    .to_vec()
+}
+
+/// `running_kill` (M8 T22, Δ8, PD-143): the answer is one object with one `answer` tag, the three
+/// outcomes of core's `KillAnswer` in snake_case.
+#[test]
+fn running_kill_answer_shape() -> Result<(), Box<dyn std::error::Error>> {
+    for (answer, tag) in [
+        (CoreKillAnswer::Killed, "killed"),
+        (CoreKillAnswer::NotRunning, "not_running"),
+        (CoreKillAnswer::AlreadyStopping, "already_stopping"),
+    ] {
+        assert_eq!(
+            serde_json::to_value(KillAnswer { answer })?,
+            serde_json::json!({ "answer": tag })
+        );
+    }
+    Ok(())
 }
 
 /// `onboarding_text` (M6 T30): a short sample; the real text is generated from the registry.

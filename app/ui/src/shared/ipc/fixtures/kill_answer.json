@@ -1,8 +1,11 @@
 [
   {
-    "killed": true
+    "answer": "killed"
   },
   {
-    "killed": false
+    "answer": "not_running"
+  },
+  {
+    "answer": "already_stopping"
   }
 ]

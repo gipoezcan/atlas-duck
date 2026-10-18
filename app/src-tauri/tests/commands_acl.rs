@@ -4470,6 +4470,51 @@ fn s09_command_outside_grant_rejected_every_window() -> TestResult {
     Ok(())
 }
 
+/// M8 T22 (Δ8, §10.3): the kill answer grows from `{killed}` to `{answer}` and the window's columns
+/// grow, but the Running-scripts window's grants do not: exactly the two commands and the two event
+/// permissions it had, and no other window holds either command.
+#[test]
+fn s09_running_scripts_grants_unchanged() -> TestResult {
+    let capability = s09_capability("running_scripts")?;
+    assert_eq!(capability["windows"], json!(["running_scripts"]));
+    assert_eq!(
+        s09_permissions(&capability),
+        [
+            "allow-running-kill",
+            "allow-running-list",
+            "core:event:allow-listen",
+            "core:event:allow-unlisten",
+        ]
+    );
+    for (label, commands) in S09_GRANTS {
+        let holds = commands.contains(&"running_list") || commands.contains(&"running_kill");
+        assert_eq!(holds, label == "running_scripts", "{label}");
+        if label != "running_scripts" {
+            let from_file = s09_permissions(&s09_capability(label)?);
+            assert!(
+                from_file.iter().all(|p| !p.starts_with("allow-running")),
+                "{label}: {from_file:?}"
+            );
+        }
+    }
+    let app = app()?;
+    let w = s09_window(&app, "running_scripts")?;
+    for (cmd, body) in [
+        ("running_list", json!({})),
+        (
+            "running_kill",
+            json!({"request_id": "req_0123456789abcdefghij"}),
+        ),
+    ] {
+        assert_eq!(
+            invoke(&w, cmd, body),
+            Err(json!({"kind": "not_ready"})),
+            "{cmd} reaches its handler"
+        );
+    }
+    Ok(())
+}
+
 /// A body and where it goes: the window that holds the command, and per case the edit that must be
 /// refused before the handler.
 struct S09Case {

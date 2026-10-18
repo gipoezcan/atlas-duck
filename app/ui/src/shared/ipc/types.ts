@@ -405,9 +405,13 @@ export interface RunningScriptView {
   bytes_fetched: number;
 }
 
-/** `running_kill`: `killed: false` = no such live run (it ended meanwhile). */
+/**
+ * `running_kill` (Δ8, PD-143): `killed` = a kill was asked for, `not_running` = no such live run
+ * (it ended meanwhile), `already_stopping` = a kill reason was already set or the record is not
+ * appended yet.
+ */
 export interface KillAnswer {
-  killed: boolean;
+  answer: 'killed' | 'not_running' | 'already_stopping';
 }
 
 /** `onboarding_text` (PD-80): the snippet to copy, generated in Rust from the registry. */

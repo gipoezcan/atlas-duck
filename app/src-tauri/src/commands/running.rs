@@ -5,8 +5,8 @@
 //! The kill is `Core::kill_script`: it asks the run's worker to die and returns; the run's own
 //! path then records `SCRIPT_FAILED {killed_by_user}` and turns the request into a release item
 //! (audit before effect stays with that path, nothing here appends or releases). A request that is
-//! not a live real run is `{killed: false}`, not an error: the list the page showed was a moment
-//! old and the page re-reads it.
+//! not a live real run is `{answer: "not_running"}`, not an error: the list the page showed was a
+//! moment old and the page re-reads it.
 
 use atlas_duck_core::running::{KillAnswer as CoreKillAnswer, RunningScriptView};
 use serde::{Deserialize, Serialize};
@@ -27,11 +27,11 @@ pub struct RunningKillArgs {
     pub request_id: RequestId,
 }
 
-/// `running_kill` answer: whether a kill was asked for (`false` = no such live run, or a kill was
-/// already on its way).
+/// `running_kill` answer (Δ8, PD-143): `{answer}` is core's three-way `KillAnswer` as a snake_case
+/// tag (`killed`, `not_running`, `already_stopping`); the window owns the texts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct KillAnswer {
-    pub killed: bool,
+    pub answer: CoreKillAnswer,
 }
 
 /// `running_list {}` (Δ1, PD-81): the live real script runs, oldest first.
@@ -60,8 +60,7 @@ pub async fn running_kill<R: Runtime>(
         Ok(core) => {
             blocking(move || {
                 Ok(KillAnswer {
-                    // The three-way answer (Δ8, PD-143) reaches the window with Task 22.
-                    killed: core.kill_script(request_id.as_str()) == CoreKillAnswer::Killed,
+                    answer: core.kill_script(request_id.as_str()),
                 })
             })
             .await
