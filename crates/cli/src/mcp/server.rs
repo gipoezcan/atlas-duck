@@ -7,15 +7,14 @@
 use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use atlas_duck_ipc::build_info::APP_VERSION;
 use atlas_duck_ipc::envelope::Envelope;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, Implementation, InitializeRequestParams,
-    InitializeResult, ListToolsResult, PaginatedRequestParams, ProgressToken, ProtocolVersion,
-    ServerCapabilities, ServerConfig,
+    CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
+    PaginatedRequestParams, ProgressToken, ProtocolVersion, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
@@ -39,17 +38,13 @@ const MSG_NOT_YET: &str = "this tool is not available in this build yet";
 pub(crate) type SendFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// What the server holds for every tool call.
-// `connector`, `heartbeat_every` and `client_name` are read by the session and the tool bodies
-// (Tasks 7-9).
+// `connector` and `heartbeat_every` are read by the session and the tool bodies (Tasks 7-9).
 #[allow(dead_code)]
 pub(crate) struct Shared {
     pub cfg: McpConfig,
     pub connector: Arc<dyn Connector>,
     /// `HEARTBEAT_EVERY` in production.
     pub heartbeat_every: Duration,
-    /// `clientInfo.name` from `initialize`, as the client sent it (PD-122 reads it at the first
-    /// connect).
-    pub client_name: OnceLock<String>,
 }
 
 /// One connected tool call, its arguments already checked (fixed tools and `call`: PD-118).
@@ -73,6 +68,15 @@ impl ToolCall {
     #[allow(dead_code)]
     pub(crate) fn progress_token(&self) -> Option<ProgressToken> {
         self.context.meta.get_progress_token()
+    }
+
+    /// `clientInfo.name` as the client sent it (PD-122 decides what an empty one means): from the
+    /// request's own `_meta` when it carries one, else from `initialize`. Both lifecycles carry
+    /// it, so a client that never sends `initialize` still names itself (T6 review I-1).
+    // Task 8's bodies hand it to the session.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn client_name(&self) -> Option<String> {
+        self.context.client_info().map(|info| info.name)
     }
 }
 
@@ -110,7 +114,6 @@ impl AtlasMcp {
                 cfg,
                 connector,
                 heartbeat_every,
-                client_name: OnceLock::new(),
             }),
             bodies: Arc::new(NotYet),
         }
@@ -190,26 +193,16 @@ impl ServerHandler for AtlasMcp {
             .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
     }
 
-    /// Only the revisions with an `initialize` handshake: the session (one IPC connection, the
-    /// agent name from `clientInfo`) starts there, and a request using the 2026-07-28 inline
-    /// lifecycle is refused with `unsupported_protocol_version`.
+    /// Up to the newest revision with an `initialize` handshake: a request naming 2026-07-28 is
+    /// refused with `unsupported_protocol_version`. A client may still skip `initialize` (its
+    /// requests then carry `clientInfo` in `_meta`, which `ToolCall::client_name` reads).
+    /// `server/discover` keeps rmcp's answer: refusing it would not make a probing client use
+    /// `initialize` (rmcp keeps requiring inline `_meta` once a session opened with a probe, so
+    /// the fallback's tool calls would all be refused; M9 T7 report).
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Borrowed(ProtocolVersion::known_up_to(
             &ProtocolVersion::LATEST_WITH_INITIALIZE,
         ))
-    }
-
-    async fn initialize(
-        &self,
-        request: InitializeRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<InitializeResult, McpError> {
-        let _ = self
-            .shared
-            .client_name
-            .set(request.client_info.name.clone());
-        context.peer.set_peer_info(request.clone());
-        self.negotiate_initialize(&request)
     }
 
     async fn list_tools(

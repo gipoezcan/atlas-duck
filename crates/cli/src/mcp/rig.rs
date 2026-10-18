@@ -25,7 +25,8 @@ use rmcp::model::{
     RequestMetaObject, ServerResult, Tool,
 };
 use rmcp::service::{
-    NotificationContext, PeerRequestOptions, RequestHandle, RunningService, ServiceError,
+    ClientLifecycleMode, ClientServiceExt, NotificationContext, PeerRequestOptions, RequestHandle,
+    RunningService, ServiceError,
 };
 use rmcp::{ClientHandler, RoleClient, ServiceExt};
 use serde_json::Value;
@@ -71,6 +72,8 @@ pub(crate) struct RigOpts {
     pub present: bool,
     /// Replaces the server's tool bodies.
     pub bodies: Option<Arc<dyn ToolBodies>>,
+    /// How the client starts its lifecycle (`None`: rmcp's default, `initialize`).
+    pub lifecycle: Option<ClientLifecycleMode>,
 }
 
 impl Default for RigOpts {
@@ -90,6 +93,7 @@ impl Default for RigOpts {
             fake,
             present: true,
             bodies: None,
+            lifecycle: None,
         }
     }
 }
@@ -306,10 +310,16 @@ impl Rig {
             ),
             progress: progress.clone(),
         };
-        let client = tokio::time::timeout(WAIT, handler.serve(client_io))
-            .await
-            .expect("initialize within WAIT")
-            .expect("initialize");
+        let client = match opts.lifecycle {
+            None => tokio::time::timeout(WAIT, handler.serve(client_io))
+                .await
+                .expect("initialize within WAIT")
+                .expect("initialize"),
+            Some(mode) => tokio::time::timeout(WAIT, handler.serve_with_lifecycle(client_io, mode))
+                .await
+                .expect("lifecycle start within WAIT")
+                .expect("lifecycle start"),
+        };
         Rig {
             app,
             client,

@@ -67,10 +67,12 @@ fn code(env: &Envelope) -> Option<ErrorCode> {
     env.error.as_ref().map(|e| e.code)
 }
 
-/// PD-121: an error unless the CLI would exit 0 or 4, and always for a lost connection.
+/// PD-121: an error unless the CLI would exit 0 or 4, and always for a `pending` whose connection
+/// was lost (also over `request_status`'s exit-0 rule for a known id).
 pub(crate) fn is_error(kind: ToolKind, env: &Envelope) -> bool {
     let exit = exit_for_kind(kind.call_kind(), env);
-    !(exit == 0 || exit == 4) || reason(env) == Some(REASON_CONNECTION_LOST)
+    let lost = env.status == Status::Pending && reason(env) == Some(REASON_CONNECTION_LOST);
+    !(exit == 0 || exit == 4) || lost
 }
 
 /// PD-123: `protocol_mismatch`, any `unreachable` reason (a lost connection included) except
@@ -201,6 +203,29 @@ mod tests {
                 "pending + connection_lost (known id)",
             ),
             (
+                // The lost connection beats the status exit-0 rule for a known id.
+                ToolKind::Status,
+                with_id(env(
+                    S::Pending,
+                    Some(C::Unreachable),
+                    Some("connection_lost"),
+                )),
+                true,
+                "request_status: pending + connection_lost (known id)",
+            ),
+            (
+                // The clause is about `pending` only (PD-121): another status keeps the
+                // §4.4 exit-0 rule of a known id.
+                ToolKind::Status,
+                with_id(env(
+                    S::Released,
+                    Some(C::Unreachable),
+                    Some("connection_lost"),
+                )),
+                false,
+                "request_status: not pending, reason connection_lost",
+            ),
+            (
                 ToolKind::Await,
                 env(S::Denied, Some(C::Denied), None),
                 true,
@@ -295,6 +320,15 @@ mod tests {
                 env(S::Failed, Some(code), None),
                 true,
                 "failed",
+            ));
+        }
+        // §4.3 `failed`/8: a script that could not run.
+        for code in [C::ScriptSyntax, C::ScriptLimit, C::SandboxUnavailable] {
+            rows.push((
+                ToolKind::Submit,
+                env(S::Failed, Some(code), None),
+                true,
+                "failed, exit 8",
             ));
         }
         for (kind, e, want, label) in rows {
@@ -423,7 +457,6 @@ mod tests {
             // Round trip through the wire shape: still the same value.
             let wire = serde_json::to_value(&r)?;
             assert_eq!(wire.get("structuredContent"), Some(&want));
-            assert!(wire.get("outputSchema").is_none());
         }
         Ok(())
     }

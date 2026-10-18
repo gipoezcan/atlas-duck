@@ -20,11 +20,13 @@ use rmcp::ServiceError;
 use rmcp::model::{ErrorCode as McpErrorCode, ProtocolVersion, RequestMetaObject};
 use serde_json::{Map, Value, json};
 
+use rmcp::service::ClientLifecycleMode;
+
 use super::config::{McpConfig, ToolSet};
-use super::rig::{RIG_BUILD, Rig, RigApp, RigOpts};
-use super::run_on;
-use super::server::{SendFuture, Shared, ToolBodies, ToolCall};
+use super::rig::{RIG_BUILD, RIG_HEARTBEAT, Rig, RigApp, RigOpts};
+use super::server::{AtlasMcp, SendFuture, Shared, ToolBodies, ToolCall};
 use super::tools::catalog;
+use super::{run_on, run_on_with, serve_with};
 use crate::connected::Connector;
 use crate::local;
 use crate::test_support::{AwaitScript, HelloMode, Kind, REQ_ID, TestConnector, WAIT};
@@ -80,12 +82,12 @@ async fn tools_list_never_connects() -> TestResult {
             ..RigOpts::default()
         })
         .await;
-        let names: Vec<String> = rig
-            .list_tools()
-            .await
-            .into_iter()
-            .map(|t| t.name.into_owned())
-            .collect();
+        let tools = rig.list_tools().await;
+        // §4.6: no tool declares an `outputSchema` on the wire (T6 review M-3).
+        for tool in &tools {
+            assert!(tool.output_schema.is_none(), "{}", tool.name);
+        }
+        let names: Vec<String> = tools.into_iter().map(|t| t.name.into_owned()).collect();
         let want: Vec<String> = catalog(set)
             .into_iter()
             .map(|t| t.name.into_owned())
@@ -294,6 +296,138 @@ async fn inline_lifecycle_request_is_refused() -> TestResult {
     Ok(())
 }
 
+/// Bodies that record the `clientInfo.name` each tool call saw.
+#[derive(Default)]
+struct RecordClientName(std::sync::Mutex<Vec<Option<String>>>);
+
+impl RecordClientName {
+    fn seen(&self) -> Vec<Option<String>> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+impl ToolBodies for RecordClientName {
+    fn call<'a>(&'a self, _shared: &'a Shared, call: ToolCall) -> SendFuture<'a, Envelope> {
+        self.0.lock().unwrap().push(call.client_name());
+        Box::pin(std::future::ready(local::ops_list()))
+    }
+}
+
+/// T6 review I-1, `initialize` lifecycle: the name comes from the handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_name_from_initialize() -> TestResult {
+    let bodies = Arc::new(RecordClientName::default());
+    let rig = Rig::new(RigOpts {
+        client_name: "desk".to_owned(),
+        bodies: Some(bodies.clone()),
+        ..RigOpts::default()
+    })
+    .await;
+    let called = rig
+        .call("request_status", json!({"request_id": REQ_ID}), false)
+        .await;
+    assert!(!called.is_error(), "{:?}", called.texts());
+    assert_eq!(bodies.seen(), [Some("desk".to_owned())]);
+    Ok(())
+}
+
+/// T6 review I-1, a client that never sends `initialize` (its first request carries the
+/// lifecycle in `_meta`): the name comes from the request's `_meta.clientInfo`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_name_from_request_meta_without_initialize() -> TestResult {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let bodies = Arc::new(RecordClientName::default());
+    let connector: Arc<dyn Connector> =
+        Arc::new(TestConnector::failing(|| ConnectError::NotRunning));
+    let server =
+        AtlasMcp::new(plain_config(), connector, RIG_HEARTBEAT).with_bodies(bodies.clone());
+    let (client_end, server_end) = tokio::io::duplex(1 << 16);
+    let (server_read, server_write) = tokio::io::split(server_end);
+    let serve = tokio::spawn(serve_with(server, server_read, server_write));
+    let (client_read, mut client_write) = tokio::io::split(client_end);
+    let call = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "request_status",
+            "arguments": {"request_id": REQ_ID},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2025-11-25",
+                "io.modelcontextprotocol/clientInfo": {"name": "inline-client", "version": "1"},
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        },
+    });
+    client_write
+        .write_all(format!("{call}\n").as_bytes())
+        .await?;
+    let mut lines = BufReader::new(client_read).lines();
+    let line = tokio::time::timeout(WAIT, lines.next_line())
+        .await??
+        .ok_or("no answer")?;
+    let answer: Value = serde_json::from_str(&line)?;
+    assert_eq!(answer.get("id"), Some(&json!(1)), "{answer}");
+    assert!(answer.get("result").is_some(), "{answer}");
+    assert_eq!(bodies.seen(), [Some("inline-client".to_owned())]);
+    // Both halves: the pipe reports EOF once the whole client end is gone.
+    drop((client_write, lines));
+    let served = tokio::time::timeout(WAIT, serve).await??;
+    assert!(served.is_ok(), "{served:?}");
+    Ok(())
+}
+
+/// T6 review I-1: a client that probes with `server/discover` (rmcp's `Auto` lifecycle, 2026-07-28
+/// first) is refused that revision, settles on 2025-11-25 without `initialize`, and is served;
+/// its tool calls carry its name in `_meta`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn discovering_client_is_served_and_named() -> TestResult {
+    let bodies = Arc::new(RecordClientName::default());
+    let rig = Rig::new(RigOpts {
+        client_name: "auto".to_owned(),
+        bodies: Some(bodies.clone()),
+        lifecycle: Some(ClientLifecycleMode::Auto {
+            preferred_versions: vec![ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25],
+            legacy_version: Some(ProtocolVersion::V_2025_11_25),
+        }),
+        ..RigOpts::default()
+    })
+    .await;
+    let called = rig
+        .call("request_status", json!({"request_id": REQ_ID}), false)
+        .await;
+    let lines: Vec<Value> = rig
+        .lines()
+        .iter()
+        .map(|l| serde_json::from_str(l))
+        .collect::<Result<_, _>>()?;
+    let answers: Vec<&Value> = lines.iter().filter(|l| l.get("id").is_some()).collect();
+    // 2026-07-28 refused, then the discover answer: no `initialize` ran.
+    assert_eq!(
+        answers
+            .first()
+            .and_then(|a| a.get("error"))
+            .and_then(|e| e.get("code")),
+        Some(&json!(-32022)),
+        "{lines:?}"
+    );
+    let discovered = answers.get(1).and_then(|a| a.get("result"));
+    assert!(
+        discovered.is_some_and(|r| r.get("supportedVersions").is_some()),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l
+            .get("result")
+            .is_some_and(|r| r.get("protocolVersion").is_some())),
+        "an initialize answer: {lines:?}"
+    );
+    assert!(!called.is_error(), "{:?}", called.texts());
+    assert_eq!(bodies.seen(), [Some("auto".to_owned())]);
+    Ok(())
+}
+
 fn plain_config() -> McpConfig {
     RigOpts::default().config()
 }
@@ -311,15 +445,75 @@ fn run_on_thread(input: &'static [u8]) -> Option<(i32, Duration)> {
     rx.recv_timeout(WAIT).ok()
 }
 
+const INIT: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"1\"}}}\n";
+
 #[test]
 fn run_on_returns_after_stdin_eof() {
-    const INIT: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"1\"}}}\n";
     // A closed reader before `initialize`, and one closed right after it.
     for input in [&b""[..], INIT] {
         let (code, took) = run_on_thread(input).expect("run_on returned");
         assert_eq!(code, 0, "{}", String::from_utf8_lossy(input));
         assert!(took < Duration::from_secs(2), "{took:?}");
     }
+}
+
+/// How long the blocking task [`LeaveBlocking`] leaves behind sleeps.
+const LEFT_BLOCKING: Duration = Duration::from_secs(6);
+
+/// Bodies that leave a blocking task behind (like a launch poll still sleeping on its blocking
+/// thread) and say so.
+struct LeaveBlocking(std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>);
+
+impl ToolBodies for LeaveBlocking {
+    fn call<'a>(&'a self, _shared: &'a Shared, _call: ToolCall) -> SendFuture<'a, Envelope> {
+        drop(tokio::task::spawn_blocking(|| {
+            std::thread::sleep(LEFT_BLOCKING)
+        }));
+        if let Some(tx) = self.0.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
+        Box::pin(std::future::ready(local::ops_list()))
+    }
+}
+
+/// T6 review M-5: `run_on` returns at stdin EOF although a blocking task is still running (the
+/// runtime is shut down in the background; dropping it would wait for the task).
+#[test]
+fn run_on_does_not_wait_for_blocking_tasks() {
+    use tokio::io::AsyncWriteExt;
+
+    const CALL: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"request_status\",\"arguments\":{\"request_id\":\"req_00000000000000000000000000000001\"}}}\n";
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let bodies = Arc::new(LeaveBlocking(std::sync::Mutex::new(Some(started_tx))));
+    let (input, feed) = tokio::io::duplex(1 << 16);
+    // Feeds `initialize` and one tool call, then closes stdin once the body left its task.
+    let feeder = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("feeder runtime");
+        rt.block_on(async move {
+            let mut feed = feed;
+            feed.write_all(INIT).await.expect("write initialize");
+            feed.write_all(CALL).await.expect("write tools/call");
+            let started = started_rx.recv_timeout(WAIT).is_ok();
+            drop(feed);
+            started
+        })
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let connector: Arc<dyn Connector> =
+            Arc::new(TestConnector::failing(|| ConnectError::NotRunning));
+        let server = AtlasMcp::new(plain_config(), connector, RIG_HEARTBEAT).with_bodies(bodies);
+        let start = Instant::now();
+        let code = run_on_with(server, input, tokio::io::sink());
+        let _ = tx.send((code, start.elapsed()));
+    });
+    let (code, took) = rx.recv_timeout(WAIT).expect("run_on returned");
+    assert!(feeder.join().expect("feeder"), "the body never ran");
+    assert_eq!(code, 0);
+    assert!(took < Duration::from_secs(3), "{took:?}");
 }
 
 // ---------- the rig itself, over a plain IpcClient ----------

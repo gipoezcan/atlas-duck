@@ -54,6 +54,15 @@ where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
+    run_on_with(AtlasMcp::new(cfg, connector, HEARTBEAT_EVERY), read, write)
+}
+
+/// [`run_on`] with a prepared handler (tests: bodies that leave blocking work behind).
+pub(crate) fn run_on_with<R, W>(server: AtlasMcp, read: R, write: W) -> i32
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
     let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(WORKERS)
         .enable_all()
@@ -61,7 +70,7 @@ where
     else {
         return 1;
     };
-    let served = runtime.block_on(serve(cfg, connector, read, write));
+    let served = runtime.block_on(serve_with(server, read, write));
     runtime.shutdown_background();
     match served {
         Ok(()) => 0,
@@ -69,22 +78,8 @@ where
     }
 }
 
-/// Serves until stdin EOF (`Ok`) or a transport error (`Err`). Transport-generic: the rig runs
-/// it over an in-process duplex pipe.
-pub(crate) async fn serve<R, W>(
-    cfg: McpConfig,
-    connector: Arc<dyn Connector>,
-    read: R,
-    write: W,
-) -> io::Result<()>
-where
-    R: AsyncRead + Send + Unpin + 'static,
-    W: AsyncWrite + Send + Unpin + 'static,
-{
-    serve_with(AtlasMcp::new(cfg, connector, HEARTBEAT_EVERY), read, write).await
-}
-
-/// [`serve`] with a prepared handler (the rig sets a short heartbeat period).
+/// Serves `server` until stdin EOF (`Ok`) or a transport error (`Err`). Transport-generic: the
+/// rig runs it over an in-process duplex pipe (with a short heartbeat period).
 pub(crate) async fn serve_with<R, W>(server: AtlasMcp, read: R, write: W) -> io::Result<()>
 where
     R: AsyncRead + Send + Unpin + 'static,
