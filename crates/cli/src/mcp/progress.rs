@@ -249,6 +249,14 @@ mod tests {
         Duration::from_millis(n)
     }
 
+    /// `fut`, or a failed test: a stalled wait leaves a paused runtime nothing to advance to,
+    /// so without this bound it would park for ever.
+    async fn bounded<T>(fut: impl Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(600), fut)
+            .await
+            .expect("the wait never ended")
+    }
+
     /// Offsets from `receipt` of the notifications without a message.
     fn beats(sent: &[(Instant, ProgressNotificationParam)], receipt: Instant) -> Vec<Duration> {
         sent.iter()
@@ -292,7 +300,7 @@ mod tests {
             HEARTBEAT_EVERY,
             std::future::pending(),
         );
-        let (out, ()) = tokio::join!(waiting, app);
+        let (out, ()) = bounded(async { tokio::join!(waiting, app) }).await;
         assert_eq!(out.and_then(Result::ok), Some(42));
 
         let sent = peer.sent();
@@ -339,7 +347,7 @@ mod tests {
                 HEARTBEAT_EVERY,
                 std::future::pending(),
             );
-            let (out, ()) = tokio::join!(waiting, app);
+            let (out, ()) = bounded(async { tokio::join!(waiting, app) }).await;
             assert!(matches!(out, Some(Ok(()))), "{done_at}");
             let returned = Instant::now();
             assert_eq!(returned - receipt, ms(done_at));
@@ -382,13 +390,13 @@ mod tests {
             let _flag = flag;
             std::future::pending::<()>().await;
         };
-        let out = wait_with_progress(
+        let out = bounded(wait_with_progress(
             never,
             &mut progress,
             receipt,
             HEARTBEAT_EVERY,
             sleep_until(receipt + ms(7_000)),
-        )
+        ))
         .await;
         assert!(out.is_none());
         assert_eq!(Instant::now() - receipt, ms(7_000));
@@ -421,7 +429,7 @@ mod tests {
             HEARTBEAT_EVERY,
             std::future::pending(),
         );
-        let (out, ()) = tokio::join!(waiting, app);
+        let (out, ()) = bounded(async { tokio::join!(waiting, app) }).await;
         assert!(matches!(out, Some(Ok(()))));
         assert!(peer.sent().is_empty());
         Ok(())
@@ -448,13 +456,13 @@ mod tests {
             relay(change(Status::Succeeded));
             7
         };
-        let out = wait_with_progress(
+        let out = bounded(wait_with_progress(
             answer,
             &mut progress,
             receipt,
             HEARTBEAT_EVERY,
             std::future::pending(),
-        )
+        ))
         .await;
         assert_eq!(out, Some(7));
         let messages: Vec<(f64, Option<String>)> = peer
