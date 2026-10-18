@@ -1671,12 +1671,14 @@ jobs:
       # fails the build; the Rust steps above stay blocking. `npm audit` reads only the lockfile (no
       # `npm ci`). This job has no Node of its own, hence the pinned setup-node step first.
       - name: Set up Node.js (for the advisory npm audit)
+        if: always()
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
           package-manager-cache: false
 
       - name: MCP conformance npm audit (advisory)
+        if: always()
         continue-on-error: true
         run: |
           set -uo pipefail
