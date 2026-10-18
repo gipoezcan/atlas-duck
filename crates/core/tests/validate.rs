@@ -211,13 +211,15 @@ fn schema_error_message_is_cut_on_a_boundary() -> TestResult {
         assert!(!kept.contains('\u{202E}'));
     }
     // A family emoji (7 chars, 25 bytes) is kept whole or dropped, never left with a dangling
-    // joiner.
-    let key = "👨\u{200D}👩\u{200D}👧\u{200D}👦".repeat(10);
+    // joiner. The one-byte prefix moves the 200-byte cut off a family boundary (a plain char
+    // cut would land 21 bytes into the eighth family, right after a joiner).
+    let key = format!("a{}", "👨\u{200D}👩\u{200D}👧\u{200D}👦".repeat(10));
     let e = rejected(check("jira.issue.get", json!({"key": "ABC-1", key: 1}))?)?;
     let path = e
         .message
         .strip_prefix("params/")
         .and_then(|m| m.strip_suffix("…: additionalProperties"))
+        .and_then(|m| m.strip_prefix('a'))
         .ok_or_else(|| e.message.clone())?;
     assert!(!path.is_empty() && path.chars().count() % 7 == 0, "{path}");
     assert!(!path.ends_with('\u{200D}'));
