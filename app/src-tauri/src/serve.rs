@@ -551,10 +551,15 @@ impl ServeState {
     }
 
     /// Serves the gate in `state` from the next request on. False after the freeze, the shutdown
-    /// signal, or once `Core` serves.
+    /// signal, or once `Core` serves. Once the store failed only `StoreFailed` itself installs
+    /// (permanent until a restart, by construction rather than by every caller's guard); the
+    /// quit path's `ShuttingDown` swap does not go through here.
     fn install_gate(&self, state: GateState) -> bool {
         let frozen = lock(&self.frozen);
         if !self.swaps_allowed(*frozen) || self.core.get().is_some() {
+            return false;
+        }
+        if self.store_failed() && state != GateState::StoreFailed {
             return false;
         }
         let gate = GateHandler::new(state, self.ui.clone());
@@ -2254,8 +2259,10 @@ mod tests {
         assert!(!err.retryable);
         assert_eq!(reason_of(&env), Some("store_unavailable"));
         assert_eq!(state.refused(), Some(1), "the kept gate counts the refusal");
-        // Nothing offers a retry any more.
-        assert_eq!(state.keychain_lost(), None);
+        // The gate stays: a later swap cannot replace it (`install_gate` keeps `StoreFailed`).
+        assert!(!state.install_gate(GateState::FirstRun));
+        assert_eq!(state.gate_state(), Some(GateState::StoreFailed));
+        assert_eq!(told.count(), 1, "a refused swap is not a change");
 
         // I/O: the locked gate stays, nothing is marked failed.
         let tmp = tempfile::tempdir()?;
@@ -2804,6 +2811,11 @@ mod tests {
         assert_eq!(told.count(), 3);
         assert!(state.store_failed());
         assert_eq!(state.keychain_lost(), None, "nothing to unlock or archive");
+        // The failed store is permanent in the cell: no other gate replaces it.
+        assert!(!state.install_gate(GateState::FirstRun));
+        assert!(!state.install_gate(GateState::Locked(LockedReason::KeychainUnavailable)));
+        assert_eq!(state.gate_state(), Some(GateState::StoreFailed));
+        assert_eq!(told.count(), 3, "a refused swap is not a change");
         state.freeze();
         assert!(!state.install_gate(GateState::FirstRun));
         assert_eq!(told.count(), 3, "a refused swap is not a change");

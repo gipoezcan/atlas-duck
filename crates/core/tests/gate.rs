@@ -49,6 +49,7 @@ fn states() -> Vec<GateState> {
         GateState::NotConfigured("data_dir_not_local"),
         GateState::NotConfigured("config_unreadable"),
         GateState::ShuttingDown,
+        GateState::StoreFailed,
     ]
 }
 
@@ -149,6 +150,12 @@ async fn gate_envelopes_per_state() -> TestResult {
             "app_shutting_down",
             5,
         ),
+        (
+            GateState::StoreFailed,
+            ErrorCode::Unreachable,
+            "store_unavailable",
+            5,
+        ),
     ];
     for (state, code, why, exit) in table {
         let h = GateHandler::new(state, Arc::new(RecordingUi::default()));
@@ -156,7 +163,8 @@ async fn gate_envelopes_per_state() -> TestResult {
         assert_eq!(env.status, Status::Failed, "{why}");
         let err = env.error.as_ref().ok_or("no error object")?;
         assert_eq!(err.code, code, "{why}");
-        assert!(err.retryable, "{why}");
+        // `store_unavailable` is the one gate answer that is final until a restart (M9 Δ4).
+        assert_eq!(err.retryable, why != "store_unavailable", "{why}");
         assert_eq!(reason(&env), Some(why));
         assert!(env.request_id.is_none(), "{why}");
         assert_eq!(exit_code(&env), exit, "{why}");
@@ -256,6 +264,7 @@ async fn gate_doctor_labels_each_state() -> TestResult {
         "not_configured",
         "not_configured",
         "shutting_down",
+        "store_failed",
     ];
     for (state, label) in states().into_iter().zip(want) {
         let h = GateHandler::new(state, Arc::new(RecordingUi::default()));

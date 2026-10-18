@@ -572,6 +572,7 @@ mod tests {
             GateState::FirstRun,
             GateState::StoreNewer,
             GateState::ShuttingDown,
+            GateState::StoreFailed,
             GateState::NotConfigured("data_dir_missing"),
             locked(LockedReason::KeychainUnavailable),
             locked(LockedReason::KeyringNotLocal),

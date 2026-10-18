@@ -1036,6 +1036,10 @@ mod tests {
                 AppSnapshot::StoreUnavailable,
                 Relaunch::ShowErrorDialog("audit store could not be opened".into()),
             ),
+            (
+                AppSnapshot::Gate(GateState::StoreFailed),
+                Relaunch::ShowErrorDialog("audit store could not be opened".into()),
+            ),
             (AppSnapshot::ShuttingDown, Relaunch::Nothing),
             (
                 AppSnapshot::Gate(GateState::ShuttingDown),

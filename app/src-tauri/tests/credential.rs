@@ -1451,6 +1451,8 @@ async fn a_failed_retry_is_a_failed_store_the_relaunch_says_so() -> TestResult {
 
     let snapshot = serving_snapshot(Some(slot));
     assert_eq!(snapshot, AppSnapshot::StoreUnavailable);
+    // The cell serves the failed-store gate, not the stale locked one (M9 Δ4, L217).
+    assert_eq!(state.gate_state(), Some(GateState::StoreFailed));
     assert_eq!(
         status_lines(&snapshot, &StatusInputs::default()),
         vec![MSG_STORE_UNAVAILABLE.to_owned()]

@@ -207,6 +207,7 @@ mod tests {
             "app_upgraded",
             "app_shutting_down",
             "store_newer",
+            "store_unavailable",
         ] {
             app.push((
                 app_row(S::Failed, Some(C::Unreachable), Some(reason)),
