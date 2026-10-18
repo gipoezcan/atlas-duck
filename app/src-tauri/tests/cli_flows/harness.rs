@@ -625,9 +625,38 @@ impl World {
         Ok(cmd.spawn()?)
     }
 
+    /// `atlas-duck <args>` (normally `["mcp"]`) still running with piped stdin, stdout and stderr,
+    /// for a stdio MCP driver. `extra_env` is added for this child only. The child is killed when
+    /// dropped.
+    pub fn mcp_spawn(
+        &self,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Result<tokio::process::Child> {
+        let mut command = self.command(self.cli_exe(), args);
+        for (k, v) in extra_env {
+            command.env(k, v);
+        }
+        let mut cmd = tokio::process::Command::from(command);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        Ok(cmd.spawn()?)
+    }
+
     /// Spawns `atlas-duck-app --background` and waits (30 s) for `<data>/endpoint`.
     pub async fn start_app(&self) -> Result<AppProc> {
+        self.start_app_with_env(&[]).await
+    }
+
+    /// [`World::start_app`] with `env` added to the app process for this one start (the test-only
+    /// `ATLAS_DUCK_TEST_SERVER_BUILD_ID` is read from the app's own environment at start only).
+    pub async fn start_app_with_env(&self, env: &[(&str, &str)]) -> Result<AppProc> {
         let mut cmd = self.command(self.app_exe(), &["--background"]);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
