@@ -1,0 +1,14 @@
+{
+  "name": "atlas-duck-mcp-conformance",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Drives `atlas-duck mcp` with the official TypeScript MCP SDK client (spec I-05). CI only.",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.0",
+    "zod": "3.25.76"
+  }
+}

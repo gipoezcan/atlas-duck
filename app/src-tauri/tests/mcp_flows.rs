@@ -4,6 +4,8 @@
 //! `harness::opted_in(..)` and skips unless `ATLAS_DUCK_CLI_FLOWS=1` (CI).
 //! Run with `--test-threads=2`: the GUI processes are heavy.
 
+#[path = "mcp_flows/conformance.rs"]
+mod conformance;
 #[path = "mcp_flows/driver.rs"]
 mod driver;
 #[path = "mcp_flows/flows.rs"]
