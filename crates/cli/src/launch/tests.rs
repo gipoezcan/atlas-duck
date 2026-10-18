@@ -681,3 +681,49 @@ fn blocked_by_job_envelope_verbatim() {
         assert_eq!(reason(&launch_failed(&e)), Some("not_running"), "{e:?}");
     }
 }
+
+/// L81 / PD-130: the Windows stub wait is `min(STUB_WAIT, remaining)`, and says so when the
+/// deadline was the limit.
+#[test]
+fn l81_stub_wait_capped_by_deadline() {
+    let capped = Deadline::new(Instant::now(), Some(Duration::from_secs(1)));
+    let got = stub_wait(&capped, STUB_WAIT).unwrap();
+    assert!(got.wait <= Duration::from_secs(1), "{:?}", got.wait);
+    assert!(got.capped);
+
+    let long = Deadline::new(Instant::now(), Some(Duration::from_secs(60)));
+    let got = stub_wait(&long, STUB_WAIT).unwrap();
+    assert_eq!(got.wait, STUB_WAIT);
+    assert!(!got.capped);
+
+    let open = Deadline::new(Instant::now(), None);
+    let got = stub_wait(&open, STUB_WAIT).unwrap();
+    assert_eq!(got.wait, STUB_WAIT);
+    assert!(!got.capped);
+}
+
+#[test]
+fn l81_expired_deadline_never_waits() {
+    let past = Instant::now()
+        .checked_sub(Duration::from_secs(5))
+        .unwrap_or_else(Instant::now);
+    let expired = Deadline::new(past, Some(Duration::from_millis(1)));
+    std::thread::sleep(Duration::from_millis(5));
+    assert!(matches!(
+        stub_wait(&expired, STUB_WAIT),
+        Err(LaunchError::DeadlineExpired)
+    ));
+}
+
+#[test]
+fn l81_deadline_expired_maps_to_launch_timeout() {
+    let env = launch_failed(&LaunchError::DeadlineExpired);
+    assert_eq!(
+        env.error.as_ref().map(|e| e.code),
+        Some(ErrorCode::Unreachable)
+    );
+    assert_eq!(reason(&env), Some("launch_timeout"));
+    assert_eq!(exit_code(&env), 5);
+    let own = launch_failed(&LaunchError::Io(io::Error::from(io::ErrorKind::TimedOut)));
+    assert_eq!(reason(&own), Some("not_running"));
+}

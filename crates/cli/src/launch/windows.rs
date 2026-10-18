@@ -20,7 +20,6 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, FALSE, HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::Security::{
@@ -49,9 +48,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetShellWindow, GetWindowThreadProcessId, WSF_VISIBLE,
 };
 
-use super::LaunchError;
 use super::plan::APP_ARGS;
 use super::stub::{EXIT_BLOCKED, EXIT_STARTED, STUB_COMMAND};
+use super::{LaunchError, STUB_WAIT, stub_wait};
+use crate::deadline::Deadline;
 use crate::discover::APP_FILE_NAME;
 
 /// §4.7 step 1: detached, own process group, the parent attribute, a Unicode environment.
@@ -63,8 +63,6 @@ pub(crate) const SHELL_PARENT_FLAGS: u32 = DETACHED_PROCESS
 /// `CREATE_BREAKAWAY_FROM_JOB`.
 pub(crate) const DETACHED_FLAGS: u32 =
     DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT;
-/// PD-21: how long the CLI waits for the stub's exit code.
-const STUB_WAIT: Duration = Duration::from_secs(5);
 /// The marker the app's early-argv dispatch hands to the CLI entry (§12.1).
 const APP_CLI_MARKER: &str = "__cli";
 const VERBATIM_PREFIX: &str = r"\\?\";
@@ -81,8 +79,12 @@ pub(crate) enum Started {
 }
 
 /// Starts `app --background` detached (§4.7 Windows steps 1-3).
-pub(crate) fn launch_app(app: &Path, env: &[(OsString, OsString)]) -> Result<(), LaunchError> {
-    spawn_detached(app, env).map(|_| ())
+pub(crate) fn launch_app(
+    app: &Path,
+    env: &[(OsString, OsString)],
+    deadline: &Deadline,
+) -> Result<(), LaunchError> {
+    spawn_detached(app, env, deadline).map(|_| ())
 }
 
 /// §4.7 Windows steps 1-3 for `app --background` with exactly `env` (plus the system `SystemRoot`
@@ -90,6 +92,7 @@ pub(crate) fn launch_app(app: &Path, env: &[(OsString, OsString)]) -> Result<(),
 pub(crate) fn spawn_detached(
     app: &Path,
     env: &[(OsString, OsString)],
+    deadline: &Deadline,
 ) -> Result<Started, LaunchError> {
     let target = Target::new(app, APP_ARGS, env)?;
     if let Ok(pid) = via_shell_parent(&target) {
@@ -108,7 +111,7 @@ pub(crate) fn spawn_detached(
         &target.cwd,
     )?;
     let child = create_process(&stub, None).map_err(|e| stub_error(e, breakaway))?;
-    wait_for_stub(&child.process)
+    wait_for_stub(&child.process, deadline)
 }
 
 /// The stub's half of PD-21: starts `app --background` detached and out of this process's job
@@ -475,12 +478,17 @@ pub(crate) fn create_process(
     })
 }
 
-/// PD-21: the stub must exit within 5 s; its exit code decides (`stub_exit`).
-fn wait_for_stub(process: &OwnedHandle) -> Result<Started, LaunchError> {
-    let ms = u32::try_from(STUB_WAIT.as_millis()).unwrap_or(u32::MAX);
+/// PD-21: the stub must exit within 5 s, or within the deadline if that is shorter (L81, PD-130);
+/// its exit code decides (`stub_exit`).
+fn wait_for_stub(process: &OwnedHandle, deadline: &Deadline) -> Result<Started, LaunchError> {
+    let plan = stub_wait(deadline, STUB_WAIT)?;
+    let ms = u32::try_from(plan.wait.as_millis()).unwrap_or(u32::MAX);
     // SAFETY: a process handle we own.
     let waited = unsafe { WaitForSingleObject(process.as_raw_handle(), ms) };
     if waited != WAIT_OBJECT_0 {
+        if plan.capped {
+            return Err(LaunchError::DeadlineExpired);
+        }
         return Err(LaunchError::Io(io::Error::new(
             io::ErrorKind::TimedOut,
             "the launch stub did not exit in time",
@@ -872,7 +880,7 @@ pub(crate) fn command_line(argv: &[OsString]) -> Result<Vec<u16>, LaunchError> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,

@@ -71,6 +71,34 @@ pub(crate) enum LaunchError {
     /// No launcher on this OS (neither Unix nor Windows), or the stub run off Windows.
     #[cfg_attr(windows, allow(dead_code))]
     Unsupported,
+    /// The deadline, not the step's own limit, ran out during the Windows stub wait (L81).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    DeadlineExpired,
+}
+
+/// PD-21: how long the CLI waits for the Windows launch stub's exit code.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const STUB_WAIT: Duration = Duration::from_secs(5);
+
+/// How long to wait for the stub and whether the deadline (not `own`) set that limit.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StubWait {
+    pub wait: Duration,
+    pub capped: bool,
+}
+
+/// L81 / PD-130: `min(own, remaining)`; an expired deadline is `DeadlineExpired` without waiting.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn stub_wait(deadline: &Deadline, own: Duration) -> Result<StubWait, LaunchError> {
+    if deadline.expired() {
+        return Err(LaunchError::DeadlineExpired);
+    }
+    let wait = deadline.cap(own);
+    Ok(StubWait {
+        wait,
+        capped: wait < own,
+    })
 }
 
 /// The OS seams of `ensure_running`; `OsLaunchSys` is the real one, tests inject doubles.
@@ -118,9 +146,7 @@ impl LaunchSys for OsLaunchSys {
         }
         #[cfg(windows)]
         {
-            // No probe runs on Windows.
-            let _ = deadline;
-            windows::launch_app(app, env)
+            windows::launch_app(app, env, deadline)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -188,6 +214,7 @@ pub(crate) fn launch_failed(e: &LaunchError) -> Box<Envelope> {
         LaunchError::BlockedByJob => {
             unreachable(REASON_LAUNCH_BLOCKED_BY_JOB, MSG_LAUNCH_BLOCKED_BY_JOB)
         }
+        LaunchError::DeadlineExpired => launch_timeout(),
         _ => unreachable(REASON_NOT_RUNNING, MSG_LAUNCH_FAILED),
     }
 }
