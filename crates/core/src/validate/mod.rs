@@ -146,7 +146,7 @@ pub(crate) fn invalid(param: &str, message: &str, value: Option<&str>) -> Valida
         message: if param.is_empty() {
             format!("params: {message}")
         } else {
-            format!("params/{param}: {message}")
+            format!("params/{}: {message}", cap_path(param.to_owned()))
         },
         details,
     }
