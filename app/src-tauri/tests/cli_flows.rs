@@ -13,6 +13,9 @@ mod flows;
 // newer config, two instances.
 #[path = "cli_flows/flows2.rs"]
 mod flows2;
+// Process facts and Toolhelp/job helpers of the S-02 cases, shared with `mcp_flows`.
+#[path = "cli_flows/procs.rs"]
+mod procs;
 // Task 25: the security cases (S-01 squatter pipe, S-02 launch survival, V13 job close).
 #[path = "cli_flows/security.rs"]
 mod security;

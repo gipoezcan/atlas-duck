@@ -12,3 +12,9 @@ mod driver;
 mod flows;
 #[path = "cli_flows/harness.rs"]
 pub mod harness;
+// Process facts and Toolhelp/job helpers, shared with `cli_flows` (S-02).
+#[path = "cli_flows/procs.rs"]
+mod procs;
+// Task 16: the S-02 cases for `atlas-duck mcp` (stdout, parent, no console, tree kill; V13).
+#[path = "mcp_flows/security.rs"]
+mod security;

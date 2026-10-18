@@ -260,6 +260,48 @@ impl Wire {
         }
     }
 
+    /// Waits at most `period` for the response of `id`: `Ok(None)` when it has not come by then
+    /// (a bounded look, not a failure), `Ok(Some(..))` when it came (the whole message).
+    pub async fn poll_response(&mut self, id: u64, period: Duration) -> Result<Option<Value>> {
+        let deadline = Instant::now() + period;
+        loop {
+            if let Some(v) = self.stash.remove(&id) {
+                self.consumed.insert(id);
+                return Ok(Some(v));
+            }
+            if !self.pump_one(deadline).await? {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Reads until the server closes stdout (at most `timeout`): every line that still arrives is
+    /// kept and checked like any other. Anything but a clean end of the stream is an error: a
+    /// timeout means some process still holds the write end.
+    pub async fn expect_eof(&mut self, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.eof {
+                return Ok(());
+            }
+            match self.pump_one(deadline).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(format!(
+                        "stdout did not close within {timeout:?}: a process still holds its \
+                         write end\n{}",
+                        self.transcript()
+                    )
+                    .into());
+                }
+                Err(e) if self.eof && e.to_string().starts_with("stdout closed") => {
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Reads for `period` and returns an error if the response of `id` arrives meanwhile (a
     /// request that must stay unanswered, e.g. after `notifications/cancelled`).
     pub async fn expect_no_response(&mut self, id: u64, period: Duration) -> Result<()> {
@@ -430,6 +472,21 @@ impl McpChild {
         })
     }
 
+    /// Looks (at most `period`) for the response of a call sent with `send_call`: `Ok(None)` while
+    /// it is unanswered.
+    pub async fn poll_call(&mut self, id: u64, period: Duration) -> Result<Option<CallOutcome>> {
+        let Some(response) = self.wire.poll_response(id, period).await? else {
+            return Ok(None);
+        };
+        if let Some(e) = response.get("error") {
+            return Err(format!("tools/call answered a JSON-RPC error: {e}").into());
+        }
+        Ok(Some(CallOutcome {
+            result: response["result"].clone(),
+            notifications: self.wire.take_notifications_since(id),
+        }))
+    }
+
     /// `tools/call` and its result, with the notifications that arrived meanwhile.
     pub async fn call(
         &mut self,
@@ -480,6 +537,12 @@ impl McpChild {
     /// Closes the child's stdin (end of input: the server ends).
     pub fn close_stdin(&mut self) {
         self.wire.close_stdin();
+    }
+
+    /// Reads the child's stdout up to its end (at most `timeout`), e.g. after `close_stdin`: the
+    /// end comes only when no process holds the write end any more.
+    pub async fn wait_stdout_eof(&mut self, timeout: Duration) -> Result<()> {
+        self.wire.expect_eof(timeout).await
     }
 
     /// Waits (at most 20 s) for the child to end, e.g. after `close_stdin`.
@@ -678,6 +741,64 @@ mod tests {
         assert_eq!(older.len(), 1, "{older:?}");
         assert_eq!(older[0]["params"]["progress"], 1);
         assert_eq!(wire.raw_stdout_lines().len(), 3);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn driver_poll_response_looks_without_failing() -> TestResult {
+        let (mut wire, mut server_in, mut server_out) = rig();
+        let id = wire.send_request("tools/call", json!({})).await?;
+        read_request(&mut server_in).await?;
+        // Unanswered: a bounded look ends with `None`, not an error.
+        assert!(
+            wire.poll_response(id, Duration::from_millis(100))
+                .await?
+                .is_none()
+        );
+        let reply = json!({"jsonrpc": "2.0", "id": id, "result": {"ok": true}});
+        server_out
+            .write_all(format!("{reply}\n").as_bytes())
+            .await?;
+        let got = wire
+            .poll_response(id, Duration::from_secs(5))
+            .await?
+            .ok_or("the answer was not seen")?;
+        assert_eq!(got["result"]["ok"], true);
+        // A stdout line that is not JSON-RPC is still an error here.
+        server_out.write_all(b"oops\n").await?;
+        assert!(
+            wire.poll_response(id, Duration::from_secs(5))
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn driver_expect_eof_needs_the_stream_to_end() -> TestResult {
+        // Still open: the wait times out with an error instead of hanging.
+        let (mut wire, _server_in, _server_out) = rig();
+        let err = wire.expect_eof(Duration::from_millis(150)).await;
+        let text = err.err().ok_or("an open stdout counted as closed")?;
+        assert!(text.to_string().contains("did not close"), "{text}");
+
+        // Closed after a last notification: the line is kept and checked, then the end is clean.
+        let (mut wire, _server_in, mut server_out) = rig();
+        let note = json!({"jsonrpc": "2.0", "method": "notifications/message", "params": {}});
+        server_out.write_all(format!("{note}\n").as_bytes()).await?;
+        server_out.shutdown().await?;
+        wire.expect_eof(Duration::from_secs(5)).await?;
+        assert_eq!(wire.raw_stdout_lines().len(), 1);
+        // Asking again after the end is still fine.
+        wire.expect_eof(Duration::from_millis(50)).await?;
+
+        // A log line before the end fails the check.
+        let (mut wire, _server_in, mut server_out) = rig();
+        server_out.write_all(b"a stray log line\n").await?;
+        server_out.shutdown().await?;
+        let err = wire.expect_eof(Duration::from_secs(5)).await;
+        let text = err.err().ok_or("a log line before the end was accepted")?;
+        assert!(text.to_string().contains("a stray log line"), "{text}");
         Ok(())
     }
 

@@ -59,7 +59,7 @@ const COMMENT_PARAMS: &str = r#"{"key":"ABC-1","body":"Seen on staging.","body_f
 
 /// One Jira instance `jira-main`; the first connected tool call cold-starts the app through the
 /// test home unless the flow started it.
-async fn jira_world() -> Result<World> {
+pub(crate) async fn jira_world() -> Result<World> {
     let mut world = World::new(WorldOpts::default())?;
     world
         .provision_store(&[("jira-main", Product::Jira)])
@@ -175,7 +175,7 @@ fn progress_of(notes: &[Value], token: &str) -> Vec<Value> {
 
 /// The id of the "submitted request_id=<id> status=pending" notification of `token`, if one was
 /// seen.
-fn submitted_id(notes: &[Value], token: &str) -> Option<String> {
+pub(crate) fn submitted_id(notes: &[Value], token: &str) -> Option<String> {
     progress_of(notes, token).iter().find_map(|n| {
         let message = n["params"]["message"].as_str()?;
         let rest = message.strip_prefix("submitted request_id=")?;
