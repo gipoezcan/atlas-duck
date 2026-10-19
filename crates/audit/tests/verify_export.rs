@@ -723,6 +723,28 @@ fn prune_line_without_its_row_is_21_with_the_anchor_dir() {
     );
 }
 
+/// The recipient's anchor dir is newer than the export: a prune committed after it has a `Prune`
+/// line that no row of the export's `prune_log.jsonl` matches, which is no contradiction.
+#[test]
+fn prune_after_the_export_is_no_contradiction() {
+    let (store, _f, anchor) = anchored_store();
+    let ex = export_all(&store);
+    assert_eq!(ex.receipt.last_seq, 9);
+    store.append_batch(mixed(2)).expect("append");
+    let later = fake_prune(&store, "2026-06-05", store.settings().to_json());
+    assert!(later > ex.receipt.last_seq);
+    assert!(store.testing_anchor_dir_drain());
+    let v = verify_export(&ex.dir, Some(anchor.path()), Some(ex.hash));
+    expect(&v, 0, "manifest and the newer anchor dir");
+    let v = verify_export(&ex.dir, Some(anchor.path()), None);
+    expect(
+        &v,
+        0,
+        "the newer anchor dir alone (the last row is anchored)",
+    );
+    assert!(has_line(&v, "anchor dir: ok"), "{:?}", v.report());
+}
+
 #[test]
 fn partial_range_export_verifies() {
     let anchor = tempfile::tempdir().expect("anchor dir");
