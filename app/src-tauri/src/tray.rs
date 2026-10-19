@@ -211,6 +211,13 @@ pub fn tooltip_text(status: &[String], pending: u32, presentation: bool) -> Stri
     text
 }
 
+/// The macOS menu-bar title next to the tray icon (PD-173): the pending count, or none at 0. The
+/// app is an `Accessory` app with no Dock tile, so this is its badge. Digits only: the text is
+/// app-generated and carries no agent string (§5.6).
+pub fn tray_title(pending: u32) -> Option<String> {
+    (pending > 0).then(|| pending.to_string())
+}
+
 /// The tray status text of a startup state: `startup_message(state)` for the four error
 /// states (§7.7 "shows the error in the tray and a window"), `None` otherwise. It is the
 /// same app-generated text the dialog shows, never agent- or file-supplied text (§5.6).
@@ -375,9 +382,19 @@ pub fn refresh(app: &AppHandle) {
         return;
     };
     let (entries, tooltip) = tray_view(app);
+    let pending = app.try_state::<AppState>().map_or(0, |s| s.pending());
     let updated = tray_menu(app, &entries)
         .and_then(|menu| tray.set_menu(Some(menu)))
-        .and_then(|()| tray.set_tooltip(Some(tooltip)));
+        .and_then(|()| tray.set_tooltip(Some(tooltip)))
+        .and_then(|()| {
+            // The menu-bar count is macOS's badge (PD-173); the other platforms ignore a title
+            // or show it as a label next to the icon, which is not wanted there.
+            if cfg!(target_os = "macos") {
+                tray.set_title(tray_title(pending))
+            } else {
+                Ok(())
+            }
+        });
     if updated.is_err() {
         tracing::warn!(
             event = LOG_EVENT_TRAY_BUILD_FAILED,
@@ -658,6 +675,19 @@ mod tests {
             tooltip_text(&["a".to_owned(), "b".to_owned()], 1, false),
             "a\nb\natlas-duck: 1 pending"
         );
+    }
+
+    #[test]
+    fn macos_tray_title_is_count_only() {
+        assert_eq!(tray_title(0), None, "nothing pending: no title");
+        assert_eq!(tray_title(1).as_deref(), Some("1"));
+        assert_eq!(tray_title(7).as_deref(), Some("7"));
+        assert_eq!(tray_title(120).as_deref(), Some("120"));
+        for pending in [1, 9, 10, 99, 1000, u32::MAX] {
+            let title = tray_title(pending).expect("a count");
+            assert_eq!(title, pending.to_string());
+            assert!(title.chars().all(|c| c.is_ascii_digit()), "{title}");
+        }
     }
 
     fn gate_inputs(gate: GateState, refused: u64) -> StatusInputs {

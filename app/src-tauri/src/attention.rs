@@ -10,7 +10,7 @@
 //! `queue_list()`, a window call or the keychain-backed settings read.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -494,18 +494,166 @@ fn handle(engine: &AttentionEngine, env: &dyn AttentionEnv, event: &UiEvent) {
     engine.on_event(event, counts, env.window_hidden());
 }
 
+// ---------- Taskbar overlay (PD-173) ----------
+
+/// The Windows taskbar overlay image for a pending count: the digit 1-9, or "9+" from ten up. Zero
+/// has none (the overlay is cleared). App-generated, count only (§5.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayIcon {
+    Digit(u8),
+    NinePlus,
+}
+
+/// The overlay image for `pending`; `None` clears it.
+pub fn overlay_for(pending: u32) -> Option<OverlayIcon> {
+    match pending {
+        0 => None,
+        1..=9 => u8::try_from(pending).ok().map(OverlayIcon::Digit),
+        _ => Some(OverlayIcon::NinePlus),
+    }
+}
+
+/// Where the overlay goes: the Approvals window's taskbar button on Windows, nowhere on the other
+/// platforms (macOS: the tray title, `tray::tray_title`; Linux: the tray menu and tooltip).
+pub trait OverlaySink {
+    fn set_overlay(&self, icon: Option<OverlayIcon>);
+}
+
+/// Drives the overlay for the pending count: the image for 1 or more, cleared at 0.
+pub fn drive_overlay(sink: &dyn OverlaySink, pending: u32) {
+    sink.set_overlay(overlay_for(pending));
+}
+
+/// §5.6: a default-mode raise shows the window without activating it; only where `show()` may not
+/// activate-or-surface it (Windows) does it also flash the taskbar button. macOS and Linux no longer
+/// flash on that raise (M6 final review M-6, L217).
+pub fn flash_after_default_raise(os: &str) -> bool {
+    os == "windows"
+}
+
+/// Decodes one committed overlay PNG (`icons/overlay-*.png`) into `(width, height, RGBA)`. The
+/// generator (`ci/gen-overlay-icons.mjs`) writes 8-bit RGBA, no interlace, filter none and a stored
+/// (level 0) deflate stream, and that is all this reads: `tauri::image::Image::from_bytes` would
+/// need tauri's `image-png` feature and with it the `image` crate, which the workspace does not link.
+#[cfg(any(windows, test))]
+pub fn decode_overlay(png: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let be32 = |b: &[u8]| -> Option<u32> { Some(u32::from_be_bytes(b.get(..4)?.try_into().ok()?)) };
+    let mut rest = png.strip_prefix(&SIGNATURE)?;
+    let mut header: Option<(u32, u32)> = None;
+    let mut idat = Vec::new();
+    loop {
+        let len = usize::try_from(be32(rest)?).ok()?;
+        let kind = rest.get(4..8)?;
+        let data = rest.get(8..8usize.checked_add(len)?)?;
+        // The 4 CRC bytes after the data are not checked: the file is ours, compiled in.
+        rest = rest.get(8usize.checked_add(len)?.checked_add(4)?..)?;
+        match kind {
+            b"IHDR" => {
+                // 8 bit, RGBA, deflate, adaptive filtering, no interlace.
+                if data.get(8..13)? != [8, 6, 0, 0, 0] {
+                    return None;
+                }
+                header = Some((be32(data)?, be32(data.get(4..)?)?));
+            }
+            b"IDAT" => idat.extend_from_slice(data),
+            b"IEND" => break,
+            _ => {}
+        }
+    }
+    let (width, height) = header?;
+    let row = usize::try_from(width).ok()?.checked_mul(4)?;
+    let want = row
+        .checked_add(1)?
+        .checked_mul(usize::try_from(height).ok()?)?;
+    // zlib: two header bytes, then stored blocks only (BTYPE 00), the Adler-32 trailer ignored.
+    let mut stream = idat.get(2..)?;
+    let mut raw = Vec::with_capacity(want);
+    loop {
+        let flags = *stream.first()?;
+        if flags & 0b110 != 0 {
+            return None;
+        }
+        let len = usize::from(u16::from_le_bytes(stream.get(1..3)?.try_into().ok()?));
+        let nlen = u16::from_le_bytes(stream.get(3..5)?.try_into().ok()?);
+        if nlen != !u16::try_from(len).ok()? {
+            return None;
+        }
+        raw.extend_from_slice(stream.get(5..5usize.checked_add(len)?)?);
+        stream = stream.get(5usize.checked_add(len)?..)?;
+        if flags & 1 == 1 {
+            break;
+        }
+    }
+    if raw.len() != want {
+        return None;
+    }
+    let mut rgba = Vec::with_capacity(want);
+    for line in raw.chunks_exact(row.checked_add(1)?) {
+        let (filter, pixels) = line.split_first()?;
+        if *filter != 0 {
+            return None;
+        }
+        rgba.extend_from_slice(pixels);
+    }
+    Some((width, height, rgba))
+}
+
+#[cfg(any(windows, test))]
+impl OverlayIcon {
+    /// The committed PNG of this image (`icons/overlay-{1..9,9plus}.png`, `ci/gen-overlay-icons.mjs`).
+    pub fn png(self) -> &'static [u8] {
+        match self {
+            OverlayIcon::Digit(1) => include_bytes!("../icons/overlay-1.png"),
+            OverlayIcon::Digit(2) => include_bytes!("../icons/overlay-2.png"),
+            OverlayIcon::Digit(3) => include_bytes!("../icons/overlay-3.png"),
+            OverlayIcon::Digit(4) => include_bytes!("../icons/overlay-4.png"),
+            OverlayIcon::Digit(5) => include_bytes!("../icons/overlay-5.png"),
+            OverlayIcon::Digit(6) => include_bytes!("../icons/overlay-6.png"),
+            OverlayIcon::Digit(7) => include_bytes!("../icons/overlay-7.png"),
+            OverlayIcon::Digit(8) => include_bytes!("../icons/overlay-8.png"),
+            OverlayIcon::Digit(_) => include_bytes!("../icons/overlay-9.png"),
+            OverlayIcon::NinePlus => include_bytes!("../icons/overlay-9plus.png"),
+        }
+    }
+}
+
 // ---------- Tauri ----------
 
 /// The Tauri half of [`Notifier`]: the Approvals window, the taskbar, the notification plugin and
 /// the tray. The notification plugin is used from Rust only; no window capability grants it.
 pub struct TauriNotifier {
     app: AppHandle<Wry>,
+    /// The last badge count: the overlay is applied again when the Approvals window is created
+    /// after it (it only shows "while the window exists", PD-173).
+    pending: AtomicU32,
 }
 
 impl TauriNotifier {
     pub fn new(app: AppHandle<Wry>) -> TauriNotifier {
-        TauriNotifier { app }
+        TauriNotifier {
+            app,
+            pending: AtomicU32::new(0),
+        }
     }
+}
+
+impl OverlaySink for TauriNotifier {
+    #[cfg(windows)]
+    fn set_overlay(&self, icon: Option<OverlayIcon>) {
+        let Some(w) = self.app.get_webview_window(Label::Approvals.as_str()) else {
+            return;
+        };
+        let image = icon
+            .and_then(|i| decode_overlay(i.png()))
+            .map(|(width, height, rgba)| tauri::image::Image::new_owned(rgba, width, height));
+        // The OS refusing an overlay is not an error of ours; the tray still shows the count.
+        let _ = w.set_overlay_icon(image);
+    }
+
+    /// macOS (no Dock tile, the tray title carries the count) and Linux have no overlay.
+    #[cfg(not(windows))]
+    fn set_overlay(&self, _icon: Option<OverlayIcon>) {}
 }
 
 impl Notifier for TauriNotifier {
@@ -518,9 +666,11 @@ impl Notifier for TauriNotifier {
             Show::WithoutActivating
         };
         let _ = windows::open(&self.app, Label::Approvals, how);
-        if !focus {
-            // Where the platform cannot show a window without activating it, or it stays behind
-            // others: the taskbar flash / dock bounce / urgency hint instead (§5.6).
+        // The window may have been created just now: it gets the overlay it missed.
+        drive_overlay(self, self.pending.load(Ordering::Relaxed));
+        if !focus && flash_after_default_raise(std::env::consts::OS) {
+            // Where `show()` may not activate or surface the window (Windows) the taskbar flash
+            // says so (§5.6); macOS and Linux do not flash on a default-mode raise (L217 M-6).
             self.flash();
         }
     }
@@ -543,9 +693,11 @@ impl Notifier for TauriNotifier {
     }
 
     fn set_badge(&self, pending: u32) {
-        // The tray's "Open approvals (N)" and tooltip; the Windows overlay icon and the macOS dock
-        // badge are not used (the macOS app has no Dock icon, §2.5).
+        // The tray's "Open approvals (N)", tooltip and (macOS) menu-bar title, and the Windows
+        // taskbar overlay icon (PD-173). The macOS app has no Dock tile (§2.5).
+        self.pending.store(pending, Ordering::Relaxed);
         crate::tray::set_pending(&self.app, pending);
+        drive_overlay(self, pending);
     }
 }
 
@@ -1097,6 +1249,81 @@ mod tests {
         r.engine.on_event(&queue(2), counts(1, 1, 0), false);
         r.engine.on_event(&queue(0), Counts::default(), false);
         assert_eq!(r.mock.take(), vec![Call::Badge(2), Call::Badge(0)]);
+    }
+
+    #[derive(Default)]
+    struct FakeOverlay(Mutex<Vec<Option<OverlayIcon>>>);
+
+    impl OverlaySink for FakeOverlay {
+        fn set_overlay(&self, icon: Option<OverlayIcon>) {
+            lock(&self.0).push(icon);
+        }
+    }
+
+    #[test]
+    fn badge_overlay_counts_and_clears() {
+        let sink = FakeOverlay::default();
+        for pending in [1, 2, 9, 10, 11, u32::MAX, 0] {
+            drive_overlay(&sink, pending);
+        }
+        assert_eq!(
+            *lock(&sink.0),
+            vec![
+                Some(OverlayIcon::Digit(1)),
+                Some(OverlayIcon::Digit(2)),
+                Some(OverlayIcon::Digit(9)),
+                Some(OverlayIcon::NinePlus),
+                Some(OverlayIcon::NinePlus),
+                Some(OverlayIcon::NinePlus),
+                None,
+            ]
+        );
+        // Every image the counts name decodes to a 16x16 RGBA picture of its own.
+        let mut seen = Vec::new();
+        for icon in (1..=9)
+            .map(OverlayIcon::Digit)
+            .chain([OverlayIcon::NinePlus])
+        {
+            let (w, h, rgba) = decode_overlay(icon.png()).expect("committed PNG decodes");
+            assert_eq!((w, h, rgba.len()), (16, 16, 16 * 16 * 4), "{icon:?}");
+            assert!(rgba.chunks(4).any(|p| p[3] == 0), "{icon:?}: clear corners");
+            assert!(
+                rgba.chunks(4).any(|p| p == [0xff, 0xff, 0xff, 0xff]),
+                "{icon:?}: drawn count"
+            );
+            assert!(!seen.contains(&rgba), "{icon:?} repeats an image");
+            seen.push(rgba);
+        }
+    }
+
+    #[test]
+    fn overlay_decoder_refuses_what_it_does_not_read() {
+        let png = OverlayIcon::Digit(1).png();
+        assert_eq!(decode_overlay(&[]), None);
+        assert_eq!(decode_overlay(&png[..png.len() - 1]), None);
+        let mut bad_signature = png.to_vec();
+        bad_signature[1] = b'X';
+        assert_eq!(decode_overlay(&bad_signature), None);
+        // A palette image (colour type 3) is not what the generator writes.
+        let mut palette = png.to_vec();
+        palette[25] = 3;
+        assert_eq!(decode_overlay(&palette), None);
+        // A compressed (non-stored) deflate block is refused, not misread.
+        let mut compressed = png.to_vec();
+        let idat = compressed
+            .windows(4)
+            .position(|w| w == b"IDAT")
+            .expect("IDAT chunk");
+        compressed[idat + 4 + 2] = 0x03;
+        assert_eq!(decode_overlay(&compressed), None);
+    }
+
+    #[test]
+    fn default_raise_flashes_only_on_windows() {
+        assert!(flash_after_default_raise("windows"));
+        assert!(!flash_after_default_raise("macos"));
+        assert!(!flash_after_default_raise("linux"));
+        assert!(!flash_after_default_raise("freebsd"));
     }
 
     #[test]
