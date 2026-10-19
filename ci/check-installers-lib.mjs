@@ -166,17 +166,141 @@ function isExecDeleteLine(l) {
   );
 }
 
+const CHECKBOX_VAR = "$DeleteAppDataCheckboxState";
+const FORCED_OFF = /^StrCpy\s+\$DeleteAppDataCheckboxState\s+"?0"?$/i;
+const CHECKBOX_GUARD = /^\$\{If\}\s+\$DeleteAppDataCheckboxState\s*=\s*1$/i;
+const FORCED_OFF_PROBLEM =
+  'PREUNINSTALL does not force $DeleteAppDataCheckboxState to 0 (spec 12.5: the "delete app data" option is disabled)';
+
 /**
- * The generated installer.nsi (Tauri 2.12.1 template) deletes app data only in the uninstall section:
+ * The lines NSIS compiles, as [{ n, text }] (`n`: 1-based line of the first physical line): block
+ * comments (slash-star to star-slash) removed, lines ending in a backslash joined with the next
+ * (NSIS continues a comment line too), then `;`/`#` comment lines and empty lines dropped. A line with a trailing comment stays
+ * whole, so an exact-match rule on it fails closed.
+ */
+function nsisLines(text) {
+  const out = [];
+  let acc = null;
+  text
+    .replace(/\/\*[\s\S]*?\*\//g, (block) => block.replace(/[^\n]/g, ""))
+    .split(/\r?\n/)
+    .forEach((raw, i) => {
+      const cur = acc ? { n: acc.n, text: acc.text + raw } : { n: i + 1, text: raw };
+      if (/\\\s*$/.test(cur.text)) {
+        acc = { n: cur.n, text: cur.text.replace(/\\\s*$/, "") };
+        return;
+      }
+      acc = null;
+      const t = cur.text.trim();
+      if (t === "" || t.startsWith(";") || t.startsWith("#")) return;
+      out.push({ n: cur.n, text: t });
+    });
+  if (acc && acc.text.trim() !== "" && !/^[;#]/.test(acc.text.trim())) out.push({ n: acc.n, text: acc.text.trim() });
+  return out;
+}
+
+/** The compiled lines of every `!macro <name>` ... `!macroend` body in `text`: [[{ n, text }]]. */
+function macroBodies(text, name) {
+  const bodies = [];
+  let body = null;
+  for (const l of nsisLines(text)) {
+    if (body === null) {
+      if (new RegExp(`^!macro\\s+${name}(\\s|$)`, "i").test(l.text)) body = [];
+    } else if (/^!macroend\b/i.test(l.text)) {
+      bodies.push(body);
+      body = null;
+    } else {
+      body.push(l);
+    }
+  }
+  if (body !== null) bodies.push(body);
+  return bodies;
+}
+
+/**
+ * Spec 12.5, the "delete app data" option disabled (M10 T23/T24): the PREUNINSTALL hook forces the
+ * template's checkbox state to 0, and the template's guard reads it only after that.
+ * - PREUNINSTALL is defined once (both texts together); its body, comments dropped, is `Call un.X`
+ *   lines and, as its LAST line, `StrCpy $DeleteAppDataCheckboxState 0`. Nothing else: no ${If},
+ *   Goto, label or !if can make the line conditional or late.
+ * - The variable appears nowhere else in the hooks file (comments included), so no other macro or
+ *   function there sets it.
+ * - In installer.nsi's `Section Uninstall`, `!insertmacro NSIS_HOOK_PREUNINSTALL` comes before the
+ *   template's guard `${If} $DeleteAppDataCheckboxState = 1`, and after the hook the variable is
+ *   named only in such guards (`${If}`/`${AndIf} ... = 1`), so nothing re-reads the checkbox.
+ * With zero definitions the "is not defined" problem of checkNsisText covers it.
+ */
+export function checkForcedAppDataOff(nsiText, hooksText) {
+  const problems = [];
+  const hookBodies = macroBodies(hooksText, "NSIS_HOOK_PREUNINSTALL");
+  const bodies = [...hookBodies, ...macroBodies(nsiText, "NSIS_HOOK_PREUNINSTALL")];
+  if (bodies.length > 1) {
+    problems.push(`NSIS_HOOK_PREUNINSTALL is defined ${bodies.length} times (installer.nsi and the hooks file together)`);
+  }
+  if (bodies.length === 1) {
+    const body = bodies[0];
+    const last = body[body.length - 1];
+    const others = body.slice(0, -1);
+    if (!last || !FORCED_OFF.test(last.text) || !last.text.includes(CHECKBOX_VAR)) {
+      problems.push(`${FORCED_OFF_PROBLEM}: its last line must be \`StrCpy ${CHECKBOX_VAR} 0\``);
+    }
+    for (const l of others) {
+      if (!/^Call\s+un\.\w+$/i.test(l.text)) {
+        problems.push(`${FORCED_OFF_PROBLEM}: only \`Call un.X\` lines may precede the StrCpy, found line ${l.n}: ${l.text}`);
+      }
+    }
+    // Mentions in the hooks file, comments included: exactly the one StrCpy of the hooks' body.
+    // (None when the macro is defined in installer.nsi instead.)
+    const mentions = hooksText.split(/\r?\n/).filter((l) => l.toLowerCase().includes(CHECKBOX_VAR.toLowerCase()));
+    if (mentions.length !== hookBodies.length) {
+      problems.push(`${FORCED_OFF_PROBLEM}: ${CHECKBOX_VAR} is named on ${mentions.length} lines of the hooks file (only the StrCpy may name it)`);
+    }
+  }
+  if (bodies.length >= 1) {
+    problems.push(...checkUninstallOrder(nsiText));
+  }
+  return problems;
+}
+
+/** installer.nsi side of checkForcedAppDataOff: the hook runs before the guard, nothing re-reads. */
+function checkUninstallOrder(nsiText) {
+  const lines = nsisLines(nsiText);
+  const start = lines.findIndex((l) => /^Section\s+"?Uninstall"?$/i.test(l.text));
+  if (start < 0) return [`${FORCED_OFF_PROBLEM}: no \`Section Uninstall\` in installer.nsi`];
+  let end = lines.findIndex((l, i) => i > start && /^SectionEnd\b/i.test(l.text));
+  if (end < 0) end = lines.length;
+  const section = lines.slice(start + 1, end);
+  const hook = section.findIndex((l) => /^!insertmacro\s+NSIS_HOOK_PREUNINSTALL$/i.test(l.text));
+  const guard = section.findIndex((l) => CHECKBOX_GUARD.test(l.text));
+  if (hook < 0) return [`${FORCED_OFF_PROBLEM}: \`Section Uninstall\` does not expand NSIS_HOOK_PREUNINSTALL`];
+  if (guard < 0) return [`${FORCED_OFF_PROBLEM}: no \`\${If} ${CHECKBOX_VAR} = 1\` guard in \`Section Uninstall\` (the template changed: re-read it)`];
+  if (guard < hook) {
+    return [`${FORCED_OFF_PROBLEM}: the template's guard (line ${section[guard].n}) comes before the PREUNINSTALL hook (line ${section[hook].n})`];
+  }
+  const problems = [];
+  for (const l of section.slice(hook + 1)) {
+    if (!l.text.toLowerCase().includes(CHECKBOX_VAR.toLowerCase())) continue;
+    if (!/^\$\{(If|AndIf)\}\s+\$DeleteAppDataCheckboxState\s*=\s*1$/i.test(l.text)) {
+      problems.push(`${FORCED_OFF_PROBLEM}: installer.nsi line ${l.n} names ${CHECKBOX_VAR} after the PREUNINSTALL hook: ${l.text}`);
+    }
+  }
+  return problems;
+}
+
+/**
+ * The generated installer.nsi (tauri-bundler 2.10.1 template, tauri-cli 2.12.1) deletes app data only
+ * in the uninstall section:
  *   ${If} $DeleteAppDataCheckboxState = 1 / ${AndIf} $UpdateMode <> 1
  *     RmDir /r "$APPDATA\${BUNDLEID}"
  *     RmDir /r "$LOCALAPPDATA\${BUNDLEID}"
- * i.e. an opt-in checkbox, and only the bundle-identifier folder, which the identifier check keeps
- * apart from the data-dir folder. This check accepts exactly that mechanism: every recursive delete
- * (RmDir /r) that is rooted in a user or app-data location must name ${BUNDLEID} (nothing else) and
- * the BUNDLEID define must equal the identifier. A recursive delete of anything else there, or any
- * line naming the data-dir folder in a delete, fails. Returns { problems, matched } where `matched`
- * holds the lines to print as the V19 evidence.
+ * i.e. behind the template's checkbox, and only the bundle-identifier folder, which the identifier
+ * check keeps apart from the data-dir folder. atlas-duck disables the checkbox: PREUNINSTALL forces it
+ * to 0 before that guard (checkForcedAppDataOff). The guard checks below stay as defense in depth:
+ * every recursive delete (RmDir /r) that is rooted in a user or app-data location must name
+ * ${BUNDLEID} (nothing else) and sit behind both guards, and the BUNDLEID define must equal the
+ * identifier. A recursive delete of anything else there, or any line naming the data-dir folder in a
+ * delete, fails. Returns { problems, matched } where `matched` holds the lines to print as the V19
+ * evidence.
  *
  * `hooksText` is the text of the installerHooks file (the generated script only !includes it);
  * the PREINSTALL and PREUNINSTALL macros must be defined in one of the two texts and invoked by the
@@ -234,7 +358,7 @@ export function checkNsisText(nsiText, { folder, identifier, hooksText = "" }) {
     if (userRoots.test(l)) {
       const conds = activeConds();
       if (!conds.some((c) => /\$DeleteAppDataCheckboxState\s*=\s*1/.test(c))) {
-        problems.push(`line ${i + 1}: the app-data RmDir is not inside an \`If $DeleteAppDataCheckboxState = 1\` (opt-in checkbox) block: ${l}`);
+        problems.push(`line ${i + 1}: the app-data RmDir is not inside an \`If $DeleteAppDataCheckboxState = 1\` (the template's checkbox guard) block: ${l}`);
       }
       if (!conds.some((c) => /\$UpdateMode\s*<>\s*1/.test(c))) {
         problems.push(`line ${i + 1}: the app-data delete is not guarded by \`$UpdateMode <> 1\` (an upgrade must never delete app data): ${l}`);
@@ -267,6 +391,7 @@ export function checkNsisText(nsiText, { folder, identifier, hooksText = "" }) {
       problems.push(`installer.nsi does not invoke ${macro}`);
     }
   }
+  problems.push(...checkForcedAppDataOff(nsiText, hooksText));
   return { problems, matched };
 }
 
@@ -338,14 +463,14 @@ function main(argv) {
       const folder = folderFromFile(a[3]);
       const identifier = extractIdentifier(readText(a[2]));
       const r = checkNsisText(readText(a[0]), { folder, identifier, hooksText: readText(a[1]) });
-      console.log("V19 evidence: installer.nsi app-data deletion lines (Tauri 2.12.1 template):");
+      console.log("V19 evidence: installer.nsi app-data deletion lines (tauri-bundler 2.10.1 template, tauri-cli 2.12.1):");
       for (const m of r.matched) console.log(`  ${m}`);
       if (r.matched.length === 0) console.log("  (none)");
       const id = checkIdentifier(identifier, folder);
-      report("installer.nsi app-data deletion is opt-in and limited to the identifier folder; hooks present", [
-        ...id,
-        ...r.problems,
-      ]);
+      report(
+        "installer.nsi app-data deletion is disabled (forced to 0 in PREUNINSTALL before the template's guard) and limited to the identifier folder; hooks present",
+        [...id, ...r.problems],
+      );
       return;
     }
     default:

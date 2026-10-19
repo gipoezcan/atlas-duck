@@ -22,8 +22,16 @@
 //!   (logoff, shutdown, critical) with `OsShutdown` ([`end_session_reason`]).
 //! - The installer's quit request (§2.5, §12.2): the registered message [`INSTALLER_QUIT_MESSAGE`],
 //!   sent by `windows/hooks.nsh` to the window found by [`WINDOW_CLASS`], runs the path with
-//!   `Installer` and is answered after the path ended, at most [`super::PATH_WAIT`]; no block goes
-//!   up (no session ends).
+//!   `Installer` and is answered 1 after the path ended, at most [`super::PATH_WAIT`]; no block
+//!   goes up (no session ends). The installer waits for the app's process only after that 1: a
+//!   failed send, or `DefWindowProcW`'s 0 when the app could not register the message, means it
+//!   terminates the app at once.
+//! - Who can send the quit request: any process on the same desktop at the app's integrity level
+//!   or higher (the same user's medium-IL programs, an elevated installer), as with
+//!   `WM_QUERYENDSESSION`, which such a process can send as well (or it ends the app outright).
+//!   Low-IL and AppContainer senders, the script sandbox's worker among them, are blocked: UIPI
+//!   drops their messages (the app never calls `ChangeWindowMessageFilterEx`), and the worker's job
+//!   has `JOB_OBJECT_UILIMIT_ALL` (no USER handles outside the job).
 //!
 //! PD-83: when Windows ends the process first, the write on the wire is reconciled
 //! `outcome_unknown {crash}` at the next start.
@@ -52,6 +60,9 @@ pub const WINDOW_CLASS: &str = "atlas-duck-end-session";
 /// The name of the installer's registered quit message (`RegisterWindowMessageW`; `hooks.nsh`
 /// `ATLAS_DUCK_INSTALLER_QUIT_MESSAGE`, the same string).
 pub const INSTALLER_QUIT_MESSAGE: &str = "AtlasDuckInstallerQuit";
+/// The app's answer to the quit request: it took it (`hooks.nsh` compares the answer with this
+/// value; `DefWindowProcW` answers 0).
+pub const INSTALLER_QUIT_TAKEN: isize = 1;
 /// `ENDSESSION_CLOSEAPP` (WinUser.h; every OS compiles the mapping, the Windows build checks the
 /// value against `windows-sys`).
 pub const ENDSESSION_CLOSEAPP: u32 = 0x0000_0001;
@@ -220,8 +231,8 @@ mod window {
 
     use super::super::{LOG_EVENT_OS_END_SESSION, LOG_EVENT_OS_HOOK_FAILED, PATH_WAIT};
     use super::{
-        EndSession, INSTALLER_QUIT_MESSAGE, QUERY_WAIT, ShutdownBlock, ShutdownPort,
-        TIMER_INTERVAL, WINDOW_CLASS, end_session_reason,
+        EndSession, INSTALLER_QUIT_MESSAGE, INSTALLER_QUIT_TAKEN, QUERY_WAIT, ShutdownBlock,
+        ShutdownPort, TIMER_INTERVAL, WINDOW_CLASS, end_session_reason,
     };
 
     const THREAD_NAME: &str = "atlas-duck-end-session";
@@ -231,7 +242,8 @@ mod window {
 
     static PORT: OnceLock<Arc<dyn ShutdownPort>> = OnceLock::new();
     /// The id Windows gave [`INSTALLER_QUIT_MESSAGE`] (set before the window exists; unset when
-    /// the registration failed: the installer then terminates the app instead).
+    /// the registration failed: `DefWindowProcW` then answers the request 0, and the installer
+    /// terminates the app at once instead of waiting for it).
     static QUIT_MESSAGE: OnceLock<u32> = OnceLock::new();
 
     /// `msg` is the installer's quit request.
@@ -416,7 +428,8 @@ mod window {
                     if !state.installer_quit(&**port, PATH_WAIT) {
                         failed("path_wait_expired");
                     }
-                    Some(0)
+                    // 1: the app took the request (`hooks.nsh` waits for its process only then).
+                    Some(INSTALLER_QUIT_TAKEN)
                 }
                 WM_QUERYENDSESSION => {
                     tracing::info!(
@@ -855,11 +868,215 @@ mod tests {
         })
     }
 
+    const HOOKS_NSH: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/windows/hooks.nsh"));
+
+    /// The drain's command as nsExec receives it: the backtick string of the one
+    /// `nsExec::ExecToLog /TIMEOUT=` line, `$$` written `$`, `${NAME}` the define's value and
+    /// `$SYSDIR` a 19-character System32 path. `None` when the line or a define is missing, or when
+    /// the string holds any other NSIS `$` (a variable NSIS would expand into the command).
+    fn drain_command(nsh: &str) -> Option<String> {
+        let mut lines = nsh
+            .lines()
+            .filter(|l| l.trim_start().starts_with("nsExec::ExecToLog /TIMEOUT="));
+        let line = lines.next()?;
+        if lines.next().is_some() {
+            return None;
+        }
+        let raw = line.split_once('`')?.1.rsplit_once('`')?.0;
+        let mut out = String::new();
+        let mut rest = raw;
+        while let Some(i) = rest.find('$') {
+            out.push_str(&rest[..i]);
+            let tail = &rest[i..];
+            rest = if let Some(t) = tail.strip_prefix("$$") {
+                out.push('$');
+                t
+            } else if let Some(t) = tail.strip_prefix("$SYSDIR") {
+                out.push_str(r"C:\Windows\System32");
+                t
+            } else {
+                let (name, t) = tail.strip_prefix("${")?.split_once('}')?;
+                out.push_str(nsh_define(nsh, name)?);
+                t
+            };
+        }
+        out.push_str(rest);
+        Some(out)
+    }
+
+    /// The `[[bin]]` names of a Cargo manifest.
+    fn cargo_bins(toml: &str) -> Vec<&str> {
+        let mut bins = Vec::new();
+        let mut in_bin = false;
+        for line in toml.lines().map(str::trim) {
+            if line.starts_with('[') {
+                in_bin = line == "[[bin]]";
+                continue;
+            }
+            let value = line
+                .strip_prefix("name")
+                .and_then(|r| r.trim_start().strip_prefix('='))
+                .and_then(|v| v.trim().strip_prefix('"')?.strip_suffix('"'));
+            if let (true, Some(v)) = (in_bin, value) {
+                bins.push(v);
+            }
+        }
+        bins
+    }
+
+    /// I-1 (T23 review, PD-172): the drain selects a process by its full image path, the install
+    /// directory AND one of the images the installer ships (`tauri.conf.json` `mainBinaryName` and
+    /// the Cargo `[[bin]]`s), never by directory alone (a `/D=C:\Tools` install must not kill the
+    /// other programs there) nor by name alone. The app's window is matched the same way.
+    #[test]
+    fn drain_selects_atlas_duck_images_in_instdir_only() {
+        let manifest = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+        let conf: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tauri.conf.json"
+        )))
+        .expect("tauri.conf.json");
+        let main = conf["mainBinaryName"].as_str().expect("mainBinaryName");
+        let mut shipped: Vec<String> = cargo_bins(manifest)
+            .into_iter()
+            .chain([main])
+            .map(|b| format!("{b}.exe"))
+            .collect();
+        shipped.sort();
+        shipped.dedup();
+        assert_eq!(shipped.len(), 3, "{shipped:?}");
+        let images = nsh_define(HOOKS_NSH, "ATLAS_DUCK_IMAGES").expect("ATLAS_DUCK_IMAGES");
+        let mut listed: Vec<String> = images
+            .split(',')
+            .map(|i| i.strip_prefix('\'')?.strip_suffix('\'').map(str::to_owned))
+            .collect::<Option<_>>()
+            .expect("a PowerShell list of quoted names");
+        listed.sort();
+        assert_eq!(listed, shipped);
+        assert_eq!(
+            nsh_define(HOOKS_NSH, "ATLAS_DUCK_APP_IMAGE"),
+            Some(format!("{main}.exe").as_str())
+        );
+
+        let cmd = drain_command(HOOKS_NSH).expect("the drain command");
+        assert!(
+            cmd.contains(&format!(r"$f=@({images}|%{{$d+'\'+$_}});")),
+            "the full image paths: {cmd}"
+        );
+        assert!(
+            cmd.contains(
+                "$l=@($p|?{$s -notcontains $_.ProcessId -and $f -contains $_.ExecutablePath});"
+            ),
+            "selection by full image path only: {cmd}"
+        );
+        assert!(!cmd.contains("LastIndexOf"), "no directory-only selection");
+        // The window: its process image is the app's in $INSTDIR (no directory-only match).
+        assert_eq!(
+            HOOKS_NSH
+                .matches(r#"$2 == "$INSTDIR\${ATLAS_DUCK_APP_IMAGE}""#)
+                .count(),
+            2
+        );
+        assert!(!HOOKS_NSH.contains("GetParent"));
+    }
+
+    /// I-2, I-3, M-4 (T23 review): the drain fails closed (any error before the kill ends the run,
+    /// exit 1, nothing killed), is bounded (nsExec's timeout, above the wait for the app, which is
+    /// above the app's own path), and its expanded command fits NSIS's 1024-character strings,
+    /// which the build checks too.
+    #[test]
+    fn drain_command_fails_closed_is_bounded_and_fits() {
+        let cmd = drain_command(HOOKS_NSH).expect("the drain command");
+        let head = concat!(
+            r#""C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe""#,
+            r#" -NoLogo -NoProfile -NonInteractive -Command ""#
+        );
+        let script = cmd
+            .strip_prefix(head)
+            .and_then(|s| s.strip_suffix('"'))
+            .expect("powershell.exe -Command \"...\"");
+        assert!(!script.contains('"'), "one quoted -Command argument");
+        assert!(
+            script.starts_with("$ErrorActionPreference='Stop';"),
+            "fail closed from the first statement: {script}"
+        );
+        assert!(cmd.len() < 1000, "{} characters", cmd.len());
+        assert!(
+            HOOKS_NSH.replace("\r\n", "\n").contains(concat!(
+                "!if ${NSIS_MAX_STRLEN} < 1024\n",
+                "  !error \"atlas-duck: the drain's PowerShell command needs NSIS_MAX_STRLEN >= 1024\"\n",
+                "!endif\n"
+            )),
+            "the build-time length guard"
+        );
+
+        // `!define NAME 123`
+        let ms = |name: &str| -> u64 {
+            HOOKS_NSH
+                .lines()
+                .find_map(|l| {
+                    l.trim()
+                        .strip_prefix("!define ")?
+                        .strip_prefix(name)?
+                        .strip_prefix(' ')
+                })
+                .and_then(|v| v.trim().parse().ok())
+                .expect(name)
+        };
+        let drain = ms("ATLAS_DUCK_DRAIN_MS");
+        let timeout = ms("ATLAS_DUCK_DRAIN_TIMEOUT_MS");
+        assert!(super::super::PATH_WAIT.as_millis() < u128::from(drain));
+        assert!(
+            drain + 30_000 <= timeout,
+            "{drain} ms wait, {timeout} ms bound"
+        );
+        let exec = HOOKS_NSH
+            .lines()
+            .filter(|l| l.contains("nsExec::"))
+            .filter(|l| l.contains("powershell.exe"))
+            .collect::<Vec<_>>();
+        assert_eq!(exec.len(), 1);
+        assert!(
+            exec[0]
+                .trim_start()
+                .starts_with("nsExec::ExecToLog /TIMEOUT=${ATLAS_DUCK_DRAIN_TIMEOUT_MS} `"),
+            "{}",
+            exec[0]
+        );
+
+        // The expansion itself: an NSIS variable left in the command is refused.
+        let stray = HOOKS_NSH.replacen("$$d=$$env:", "$$d=$INSTDIR;$$env:", 1);
+        assert_eq!(drain_command(&stray), None);
+        assert!(drain_command("nsExec::ExecToLog /TIMEOUT=1 `a $$b ${X}`").is_none());
+        assert_eq!(
+            drain_command("!define X \"x\"\nnsExec::ExecToLog /TIMEOUT=1 `a $$b ${X} $SYSDIR`")
+                .as_deref(),
+            Some(r"a $b x C:\Windows\System32")
+        );
+    }
+
+    /// M-1 (T23 review): the installer waits for the app's process only when the send succeeded
+    /// and the app answered [`INSTALLER_QUIT_TAKEN`]; a failed send or `DefWindowProcW`'s 0 (the
+    /// app could not register the message) skips the wait.
+    #[test]
+    fn the_quit_answer_matches_hooks_nsh() {
+        let send = HOOKS_NSH
+            .lines()
+            .find(|l| l.contains("user32::SendMessageTimeoutW("))
+            .expect("the send");
+        assert!(
+            send.trim_end().ends_with("*p .r7) p .r2'"),
+            "answer in $7, result in $2: {send}"
+        );
+        let wait = format!("${{If}} $2 <> 0\n      ${{AndIf}} $7 = {INSTALLER_QUIT_TAKEN}\n");
+        assert!(HOOKS_NSH.replace("\r\n", "\n").contains(&wait), "{wait}");
+    }
+
     /// The installer finds the window by its class and sends the registered message by its name:
     /// one string each, shared by this file and `windows/hooks.nsh`.
     #[test]
     fn endsession_class_name_matches_hooks_nsh() {
-        let nsh = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/windows/hooks.nsh"));
+        let nsh = HOOKS_NSH;
         assert_eq!(
             nsh_define(nsh, "ATLAS_DUCK_ENDSESSION_CLASS"),
             Some(WINDOW_CLASS)

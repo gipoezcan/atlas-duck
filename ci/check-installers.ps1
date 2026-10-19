@@ -4,12 +4,18 @@
   CI-06 inspection of the NSIS installer script (spec 12.5, L35, V19).
 
 .DESCRIPTION
-  Reads the installer.nsi that `cargo tauri build --bundles nsis` generated and passes it, with the
+  Reads the installer.nsi that `cargo tauri build --bundles nsis` generated (tauri-bundler 2.10.1
+  template, tauri-cli 2.12.1) and passes it, with the
   installerHooks file, tauri.conf.json and crates/ipc/src/paths/mod.rs, to ci/check-installers-lib.mjs
   (tested by ci/check-installers.test.mjs). The check prints the app-data deletion lines it matched
   (the V19 evidence: record them from the first CI run) and fails when
     - a recursive delete under %APPDATA%/%LOCALAPPDATA%/profile names anything but the bundle-identifier
-      folder, or is not behind the opt-in checkbox and the not-an-update guard,
+      folder, or is not behind the template's checkbox guard and the not-an-update guard,
+    - the "delete app data" option is not disabled (spec 12.5): the PREUNINSTALL hook does not end
+      with `StrCpy $DeleteAppDataCheckboxState 0` after nothing but `Call un.X` lines, is defined
+      more than once, the hooks file names that variable anywhere else, or installer.nsi's
+      `Section Uninstall` does not expand PREUNINSTALL before the checkbox guard or names the
+      variable after the hook outside such a guard,
     - the bundle identifier equals the data-dir folder name (case-insensitive; the name is read from
       APP_DIR_NAME in paths/mod.rs, not a literal),
     - the hooks file deletes anything under app data or outside $INSTDIR (Delete/RmDir or a
