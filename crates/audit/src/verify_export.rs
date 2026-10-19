@@ -15,8 +15,9 @@
 //! the row-hash chain and contiguity (`check_prune_log`), and the anchor dir's `Prune` lines.
 //! (4) `events.jsonl`, one pass, one line at a time (at most [`MAX_EXPORT_LINE_BYTES`]): the
 //! strict column set, `record_hash` and the chain from `boundary_prev_hash`, `payload_len` and
-//! `payload_sha256` of `payload_b64`, `payload` (when present) byte for byte against the
-//! plaintext, the `unanchored` marks against the manifest, `request_set_hash` of each
+//! `payload_sha256` of `payload_b64`, `payload` byte for byte against the plaintext (absent only
+//! where the exporter writes none, `export::payload_field_shown`), the `unanchored` marks against
+//! the manifest, `request_set_hash` of each
 //! `WRITE_APPROVED`, the `RESTORE` boundaries (§8.11), each `PRUNE` against its `prune_log` row and
 //! its settings snapshot (the store's parser), and the range-aware anchor comparison (a line naming
 //! a row must match it; lines outside the range are skipped; the line at `first_seq - 1` must name
@@ -33,10 +34,13 @@
 //! `--manifest-sha256` names → 21; a file differs from what a verified manifest names → 21; an
 //! anchor line contradicts a row → 21 (`FORK` when it is a fork, §8.11); the input cannot be read
 //! as an export (a missing or unreadable file, a `.partial` directory, a bound exceeded, a line
-//! that is not an export line) → 22; the export contradicts itself → 21; then the manifest hash
+//! that is not an export line, a record `format_version` or a settings-snapshot key of another
+//! version) → 22; the export contradicts itself → 21; then the manifest hash
 //! binds the whole export → 0; the anchor dir alone binds the rows up to its last in-range
 //! anchored row `L`, so 0 only when `L` is the last row, else 20; neither → 20 ("internally
-//! consistent; trust root NOT verified", §8.10). Both trust roots given: both must hold.
+//! consistent; trust root NOT verified", §8.10). Both trust roots given: both must hold, and the
+//! last line names the anchor dir only when one of its lines names a row of the export. Entries
+//! of the export directory beside its three files are named in the report, never verified.
 //!
 //! **Bounds.** No total cap on `events.jsonl` (streamed). Column by column: hashes, nonce, ids,
 //! integers (at most 2^53 − 1) and the two base64 columns (at most their decoded bounds,
@@ -50,13 +54,19 @@
 //! and base64 columns are borrowed from it; `payload_ct` and `payload_b64` are decoded in 48 KiB
 //! pieces straight into the hashes. What is copied out of the line is never longer than the part
 //! of the line it comes from: the text columns, the decoded OS paths and the plaintext, which is
-//! held whole only when a check parses it or `payload` is present (at most `MAX_PAYLOAD_LEN`), and
-//! what that check parses out of it. So a row needs at most 2 × `MAX_EXPORT_LINE_BYTES` plus fixed
-//! buffers (under 128 KiB); the largest honest row (a 96 MiB plaintext) about 260 MiB. Besides:
-//! the anchor map (the in-range lines of the files read, each file at most
-//! `anchor_dir::MAX_FILE_BYTES` while it is parsed) and the `prune_log` rows. A growing line
+//! held whole only when a check parses it or it is at most `MAX_EXPORT_PAYLOAD_FIELD_BYTES` (the
+//! `payload` check), and what that check parses out of it. A JSON string with an escape costs
+//! serde_json a scratch copy of the decoded text, which `Vec` doubling may make twice its length,
+//! before the owned copy (T8 review I-2): a text column, or a string in a parsed plaintext, as
+//! long as the line costs the line again three times. So a row needs at most
+//! 4 × `MAX_EXPORT_LINE_BYTES`, plus one value tree of a JSON text of at most 1 MiB (a `PRUNE`'s
+//! settings snapshot, or the JCS check of a plaintext whose line has no `payload`; at most 32
+//! bytes per byte of text, so 32 MiB), plus fixed buffers (under 128 KiB). Measured: an escaped
+//! text column as long as the line 4.0 × the line; the largest honest row (a 96 MiB plaintext)
+//! about 244 MB, one line. Besides: the anchor map (the in-range lines of the files read, each file
+//! at most `anchor_dir::MAX_FILE_BYTES` while it is parsed) and the `prune_log` rows. A growing
 //! buffer may be copied once by the allocator, and the buffers are zeroized on drop but not their
-//! earlier copies. No allocation is sized by a number the input claims.
+//! earlier copies (nor serde_json's scratch). No allocation is sized by a number the input claims.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -82,10 +92,11 @@ use crate::encoding::{FORMAT_VERSION, Field, RecordHasher, RowFields, ZERO_HASH,
 use crate::export::{
     EVENTS_FILE, EXPORT_FORMAT, MANIFEST_FILE, MAX_EXPORT_CT_LEN, MAX_EXPORT_LINE_BYTES,
     MAX_EXPORT_MANIFEST_BYTES, MAX_EXPORT_PAYLOAD_FIELD_BYTES, PARTIAL_SUFFIX, PRUNE_LOG_FILE,
+    payload_field_shown,
 };
 use crate::open::is_id;
 use crate::request_set::REQUEST_SET_DOMAIN;
-use crate::settings::Settings;
+use crate::settings::{Settings, snapshot_has_unknown_key};
 use crate::types::{EventFlags, EventType, ExportVerdict};
 use crate::verify::{Findings, PruneLogRow, check_prune_log, hex32};
 
@@ -130,12 +141,11 @@ const NO_ROOT: &str = "internally consistent; trust root NOT verified";
 pub trait FsRead {
     /// Metadata, following links (the directories given).
     fn metadata(&self, path: &Path) -> io::Result<Metadata>;
-    /// Metadata of the entry itself (a link is not followed).
-    fn symlink_metadata(&self, path: &Path) -> io::Result<Metadata>;
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf>;
     /// Calls `each` with every entry name of the directory until it returns `false`.
     fn read_dir(&self, path: &Path, each: &mut dyn FnMut(OsString) -> bool) -> io::Result<()>;
-    /// Opens for reading (on Unix without blocking on a FIFO).
+    /// Opens for reading without following a link in the last component (on Unix also without
+    /// blocking on a FIFO); the caller checks what the handle names.
     fn open(&self, path: &Path) -> io::Result<File>;
 }
 
@@ -145,10 +155,6 @@ pub struct OsFs;
 impl FsRead for OsFs {
     fn metadata(&self, path: &Path) -> io::Result<Metadata> {
         std::fs::metadata(path)
-    }
-
-    fn symlink_metadata(&self, path: &Path) -> io::Result<Metadata> {
-        std::fs::symlink_metadata(path)
     }
 
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
@@ -167,10 +173,17 @@ impl FsRead for OsFs {
     fn open(&self, path: &Path) -> io::Result<File> {
         let mut o = std::fs::OpenOptions::new();
         o.read(true);
+        // A link is opened as itself (Unix refuses it with ELOOP), so the handle check of
+        // `open_regular` sees it: no window between a path check and the open (T8 review M-4).
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            o.custom_flags(libc::O_NONBLOCK);
+            o.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            o.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
         }
         o.open(path)
     }
@@ -239,21 +252,22 @@ fn kind(e: &io::Error) -> String {
     format!("{:?}", e.kind())
 }
 
-/// Opens a file of the export or the anchor dir: a regular file, never a link, checked again on
-/// the open handle. `Ok(None)`: it does not exist.
+/// Opens a file of the export or the anchor dir: a regular file, never a link, judged on the
+/// open handle (a link is opened as itself, [`FsRead::open`]). On Windows only name-surrogate
+/// reparse points (symbolic links, junctions) are links: a cloud-file placeholder (OneDrive) is
+/// a reparse point too and stays a regular file. `Ok(None)`: it does not exist.
 fn open_regular(fs: &dyn FsRead, path: &Path) -> Result<Option<File>, String> {
-    match fs.symlink_metadata(path) {
-        Ok(m) if m.is_file() => {}
-        Ok(_) => return Err("is not a regular file".into()),
+    let not_regular = || "is not a regular file".to_string();
+    let f = match fs.open(path) {
+        Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(not_regular()),
         Err(e) => return Err(format!("cannot be read ({})", kind(&e))),
-    }
-    let f = fs
-        .open(path)
-        .map_err(|e| format!("cannot be read ({})", kind(&e)))?;
+    };
     match f.metadata() {
-        Ok(m) if m.is_file() => Ok(Some(f)),
-        _ => Err("is not a regular file".into()),
+        Ok(m) if m.is_file() && !m.file_type().is_symlink() => Ok(Some(f)),
+        _ => Err(not_regular()),
     }
 }
 
@@ -262,19 +276,29 @@ fn read_capped(fs: &dyn FsRead, path: &Path, cap: u64) -> Result<Option<Vec<u8>>
     let Some(f) = open_regular(fs, path)? else {
         return Ok(None);
     };
+    read_rest(f, Vec::new(), cap).map(Some)
+}
+
+/// `head` (already read from `f`) and the rest of `f`, at most `cap` bytes in all.
+fn read_rest(f: File, mut bytes: Vec<u8>, cap: u64) -> Result<Vec<u8>, String> {
     let too_long = || format!("is longer than {cap} bytes");
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
     if len > cap {
         return Err(too_long());
     }
-    let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
-    f.take(cap.saturating_add(1))
+    bytes.reserve_exact(
+        usize::try_from(len)
+            .unwrap_or(0)
+            .saturating_sub(bytes.len()),
+    );
+    let room = cap.saturating_add(1).saturating_sub(bytes.len() as u64);
+    f.take(room)
         .read_to_end(&mut bytes)
         .map_err(|e| format!("cannot be read ({})", kind(&e)))?;
     if bytes.len() as u64 > cap {
         return Err(too_long());
     }
-    Ok(Some(bytes))
+    Ok(bytes)
 }
 
 /// One file read once, line by line, hashed as it is read.
@@ -379,7 +403,7 @@ fn grow(buf: &mut Vec<u8>, extra: usize, cap: usize) {
 
 /// Whether the JSON text `b` nests arrays and objects at most `max` deep (strings skipped; text
 /// that is not JSON is left to the parser).
-fn depth_ok(b: &[u8], max: usize) -> bool {
+pub(crate) fn depth_ok(b: &[u8], max: usize) -> bool {
     let (mut depth, mut in_str, mut esc) = (0usize, false, false);
     for &c in b {
         if in_str {
@@ -953,29 +977,30 @@ fn read_anchor_dir(
     for chain in ids.iter().filter(|c| !ours.contains(c.as_str())) {
         let name = anchor_dir::file_name(chain);
         let path = dir.join(&name);
-        let Ok(Some(f)) = open_regular(fs, &path) else {
+        let Ok(Some(mut f)) = open_regular(fs, &path) else {
             continue;
         };
         let mut head = Vec::new();
         let probe = anchor_dir::HEADER_PROBE_BYTES;
-        if f.take(probe).read_to_end(&mut head).is_err() {
+        if (&mut f).take(probe).read_to_end(&mut head).is_err() {
             continue;
         }
-        let head = if (head.len() as u64) < probe {
+        let probed = if (head.len() as u64) < probe {
             &head[..]
         } else {
             anchor_dir::complete_lines(&head)
         };
         let (mut problems, mut notes) = (Vec::new(), Vec::new());
         let same = matches!(
-            anchor_dir::parse_file(&name, chain, head, &mut problems, &mut notes).first(),
+            anchor_dir::parse_file(&name, chain, probed, &mut problems, &mut notes).first(),
             Some((_, AnchorLine::Header { install_id, host, os_user, .. }))
                 if *install_id == m.install_id && *host == m.host && *os_user == m.os_user
         );
         if !same {
             continue;
         }
-        let Ok(Some(bytes)) = read_capped(fs, &path, lim.anchor_file) else {
+        // The rest from the same handle: the header judged is the file's.
+        let Ok(bytes) = read_rest(f, head, lim.anchor_file) else {
             continue;
         };
         let (mut problems, mut notes) = (Vec::new(), Vec::new());
@@ -1176,7 +1201,6 @@ struct Restore {
     seq: u64,
     source_chain: Option<String>,
     source_head_seq: Option<u64>,
-    new_chain: Option<String>,
     lost: Option<LostSpan>,
 }
 
@@ -1218,6 +1242,8 @@ struct Outcome {
     walked: bool,
     last_anchored: Option<u64>,
     range: Option<(u64, u64)>,
+    /// The report line naming entries of the export directory beside its three files.
+    others: Option<String>,
 }
 
 impl Outcome {
@@ -1351,6 +1377,9 @@ impl Outcome {
             .into(),
         );
         report.push(self.anchor_line());
+        if let Some(others) = &self.others {
+            report.push(others.clone());
+        }
         let tampered = |t: &str| format!("TAMPERED: {t}");
         let found = if let Some(t) = &self.file_tamper {
             Some(tampered(t))
@@ -1384,8 +1413,11 @@ impl Outcome {
         let anchored_all =
             matches!((self.last_anchored, self.range), (Some(l), Some((_, last))) if l >= last);
         match (self.manifest == Root::Match, self.anchor_given) {
-            (true, true) => report.push(BOTH_OK.into()),
-            (true, false) => report.push(MANIFEST_OK.into()),
+            // The anchor dir is named only when one of its lines names a row of the export
+            // (rows after its last such line are the manifest's alone, the anchor line says
+            // so); an anchor dir naming none verified nothing (T8 review I-3).
+            (true, true) if self.last_anchored.is_some() => report.push(BOTH_OK.into()),
+            (true, _) => report.push(MANIFEST_OK.into()),
             (false, true) if anchored_all => report.push(ANCHOR_OK.into()),
             _ => {
                 report.push(NO_ROOT.into());
@@ -1468,6 +1500,7 @@ fn check(
              that was never renamed), never a valid one",
         ));
     }
+    o.others = other_entries(fs, dir);
 
     // (1) The manifest: its hash first, then its shape.
     let bytes = match read_capped(fs, &dir.join(MANIFEST_FILE), lim.manifest) {
@@ -1562,6 +1595,53 @@ fn check(
     }
     o.last_anchored = w.last_anchored;
     Ok(())
+}
+
+/// Names shown of the other entries of the export directory.
+const MAX_OTHERS_SHOWN: usize = 8;
+
+/// The report line naming the entries of the export directory beside its three files (T8
+/// review M-5): a recipient must not take them for part of the verified export. Names are input,
+/// so only short plain-ASCII ones are printed (the first few in byte order); the rest are counted.
+fn other_entries(fs: &dyn FsRead, dir: &Path) -> Option<String> {
+    let (mut count, mut shown) = (0usize, BTreeSet::new());
+    let listed = fs.read_dir(dir, &mut |name| {
+        let name = name.to_string_lossy();
+        if [EVENTS_FILE, PRUNE_LOG_FILE, MANIFEST_FILE].contains(&name.as_ref()) {
+            return true;
+        }
+        count += 1;
+        let plain = name.len() <= 64
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+        if plain {
+            shown.insert(name.into_owned());
+            if shown.len() > MAX_OTHERS_SHOWN {
+                shown.pop_last();
+            }
+        }
+        true
+    });
+    if listed.is_err() {
+        return Some("export dir: its entries cannot be listed".into());
+    }
+    if count == 0 {
+        return None;
+    }
+    let mut line = format!(
+        "export dir: {count} other {}, not part of the export and not verified",
+        if count == 1 { "entry" } else { "entries" }
+    );
+    if !shown.is_empty() {
+        let names: Vec<String> = shown.into_iter().collect();
+        line.push_str(": ");
+        line.push_str(&names.join(", "));
+        if count > names.len() {
+            line.push_str(&format!(" and {} more", count - names.len()));
+        }
+    }
+    Some(line)
 }
 
 /// Reads `prune_log.jsonl` (hashed to its end); `None` when a row could not be read (the rows
@@ -1849,7 +1929,12 @@ impl<'a> Walk<'a> {
             prev_hash: &prev_hash,
         };
         let hash = if l.format_version != FORMAT_VERSION {
-            o.chain(seq, "format_version is not supported");
+            // Another version's record cannot be judged (T8 review M-6); the walk goes on.
+            o.unreadable(format!(
+                "events.jsonl line {n} is a record of format_version {}, which this verifier \
+                 does not read (an export of another version?)",
+                l.format_version
+            ));
             None
         } else {
             let mut h = RecordHasher::new(f.format_version, f.prev_hash);
@@ -1877,9 +1962,10 @@ impl<'a> Walk<'a> {
         if (seq == 1) != genesis || (genesis && !ct_eq(&prev_hash, &ZERO_HASH)) {
             o.chain(seq, "GENESIS is not the first record of the log");
         }
+        // A row of another format has no hash to link to (that is a 22 already).
         if let Some(p) = &self.prev
             && contiguous
-            && !p.hash.is_some_and(|h| ct_eq(&h, &prev_hash))
+            && p.hash.is_some_and(|h| !ct_eq(&h, &prev_hash))
         {
             o.chain(seq, "prev_hash does not link to the row before it");
         }
@@ -1928,12 +2014,12 @@ impl<'a> Walk<'a> {
         }
 
         // The payload: length and hash of payload_b64; the plaintext kept only when a check
-        // parses it or `payload` must be compared with it.
+        // parses it or it may have a `payload` field (present or absent, both are judged).
         let parse = restore
             || l.event_type == EventType::PRUNE.as_str()
             || l.event_type == EventType::WRITE_APPROVED.as_str();
         let len = b64_decoded_len(b64);
-        let keep = parse || (l.payload.is_some() && len <= MAX_EXPORT_PAYLOAD_FIELD_BYTES);
+        let keep = parse || len <= MAX_EXPORT_PAYLOAD_FIELD_BYTES;
         let mut plain = Zeroizing::new(Vec::new());
         if keep {
             plain.reserve_exact(usize::try_from(len).unwrap_or(0));
@@ -1953,11 +2039,15 @@ impl<'a> Walk<'a> {
         } else if !ct_eq(&digest, &payload_sha256) {
             o.payload(seq, "payload_sha256 is not the hash of payload_b64");
         }
+        // `payload` byte for byte when present; absent only where the exporter writes none (too
+        // long, too deep or not JCS: `payload_field_shown`, T8 review I-1).
         if l.payload.is_some() {
             let shown = top_level_value(raw, b"payload").and_then(|(s, e)| raw.get(s..e));
             if !keep || shown != Some(&plain[..]) {
                 o.payload(seq, "the payload field is not the payload");
             }
+        } else if keep && payload_field_shown(&plain) {
+            o.payload(seq, "the payload field is missing");
         }
         if l.event_type == EventType::WRITE_APPROVED.as_str() && !request_set_ok(&plain) {
             o.writes.get_or_insert(seq);
@@ -2026,7 +2116,6 @@ impl<'a> Walk<'a> {
                 seq,
                 source_chain: None,
                 source_head_seq: None,
-                new_chain: None,
                 lost: None,
             };
         };
@@ -2069,7 +2158,6 @@ impl<'a> Walk<'a> {
             seq,
             source_chain: p.source_chain_id.filter(|c| is_id(c)),
             source_head_seq: p.source_head_seq,
-            new_chain: p.new_chain_id,
             lost,
         }
     }
@@ -2110,9 +2198,16 @@ impl<'a> Walk<'a> {
             .as_ref()
             .and_then(|s| Settings::from_json(s).ok())
         else {
-            o.prune(format!(
-                "the settings snapshot of the PRUNE at seq {seq} is malformed"
-            ));
+            if p.settings.as_ref().is_some_and(snapshot_has_unknown_key) {
+                o.unreadable(format!(
+                    "the settings snapshot of the PRUNE at seq {seq} has a key this verifier \
+                     does not know (an export of a newer version?)"
+                ));
+            } else {
+                o.prune(format!(
+                    "the settings snapshot of the PRUNE at seq {seq} is malformed"
+                ));
+            }
             return;
         };
         if settings.legal_hold {
@@ -2174,13 +2269,16 @@ impl<'a> Walk<'a> {
             return;
         };
         let behind = l.flags & EventFlags::BEHIND.bits() != 0;
-        let (mut hit, mut miss) = (false, false);
+        // `other_hash`: a line naming another record hash (fork evidence beside a hit);
+        // `other_fields`: the row's hash with another epoch or kind (only a mismatch).
+        let (mut hit, mut other_hash, mut other_fields) = (false, false, false);
         for n in lines {
             let Some(file) = a.files.get(n.file) else {
                 continue;
             };
             if file.chain == l.chain_id {
-                let same = ct_eq(&n.record_hash, hash)
+                let same_hash = ct_eq(&n.record_hash, hash);
+                let same = same_hash
                     && n.epoch == l.epoch
                     && match &n.kind {
                         Kind::Record { clock_behind } => *clock_behind == behind,
@@ -2189,8 +2287,10 @@ impl<'a> Walk<'a> {
                     };
                 if same {
                     hit = true;
+                } else if same_hash {
+                    other_fields = true;
                 } else {
-                    miss = true;
+                    other_hash = true;
                 }
             } else if file.export {
                 // A line of another chain of the export: only a RESTORE's source chain may name
@@ -2216,15 +2316,20 @@ impl<'a> Walk<'a> {
                 *at = (*at).max(seq);
             }
         }
-        match (hit, miss) {
+        if other_fields {
+            o.anchor_mismatch(format!(
+                "the line naming seq {seq} has the row's record hash but another epoch or kind"
+            ));
+        }
+        match (hit, other_hash) {
             (true, true) => o.fork(format!(
                 "two lines name seq {seq} with different record hashes"
             )),
             (false, true) => {
                 o.anchor_mismatch(format!("the line naming seq {seq} contradicts the row"))
             }
-            (true, false) => self.last_anchored = Some(seq),
-            (false, false) => {}
+            (true, false) if !other_fields => self.last_anchored = Some(seq),
+            _ => {}
         }
     }
 
@@ -2246,16 +2351,13 @@ impl<'a> Walk<'a> {
         {
             o.tamper("the manifest's chain_ids, restore_records or key_recovered_records list rows the export does not hold");
         }
+        // A candidate names a row by its exact record hash only when its file holds lines of
+        // the export's chain: a writer only ever writes a record's line into its own chain's
+        // file (a RESTORE's lines included), so a RESTORE of the export accounts for none
+        // (T8 review M-7).
         if let Some(a) = self.anchors {
             for (file, at) in &self.shares {
-                let Some(f) = a.files.get(*file) else {
-                    continue;
-                };
-                let accounted = self.restores.iter().any(|r| {
-                    r.source_chain.as_deref() == Some(f.chain.as_str())
-                        || r.new_chain.as_deref() == Some(f.chain.as_str())
-                });
-                if !accounted {
+                if let Some(f) = a.files.get(*file) {
                     o.fork(format!(
                         "chain {} of this installation shares rows up to seq {at} with the export \
                          and continues under another chain_id without a RESTORE",

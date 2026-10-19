@@ -10,7 +10,8 @@
 //!   integers as JSON numbers; `nonce`, `payload_sha256`, `prev_hash`, `peer_exe` and
 //!   `peer_origin_exe` (the stored WTF-8 bytes) as lowercase hex; `payload_ct` as base64), plus
 //!   `payload_b64` (the decrypted plaintext bytes, base64), `payload` (the same plaintext as JSON
-//!   text, only when it is at most [`MAX_EXPORT_PAYLOAD_FIELD_BYTES`] and parses) and
+//!   text, only when it is at most [`MAX_EXPORT_PAYLOAD_FIELD_BYTES`], nests at most
+//!   [`MAX_EXPORT_PAYLOAD_FIELD_DEPTH`] deep and is JCS, [`payload_field_shown`]) and
 //!   `unanchored: true` (only when an anchor dir is configured and the row comes after the last
 //!   anchored row of the range). There is no `record_hash` key: the verifier recomputes it. Base64
 //!   is RFC 4648 standard with padding. A line is at most [`MAX_EXPORT_LINE_BYTES`] (without its
@@ -88,6 +89,7 @@ use crate::schema;
 use crate::store::Store;
 use crate::types::{EventType, ExportControl, ExportReceipt, RustChosenPath, TimeRange};
 use crate::verify::{DecryptError, Deks};
+use crate::verify_export::{MAX_JSON_DEPTH, depth_ok};
 use crate::writer::{PreparedEvent, ts_text};
 
 /// Rows per batch, each read in its own read transaction (PD-181).
@@ -490,6 +492,21 @@ fn int_val(seq: u64, v: u64) -> Result<Val<'static>, AuditError> {
     Ok(Val::Text(v.to_string().into_bytes()))
 }
 
+/// `payload` only for a plaintext nesting at most this deep: the line adds one level, and the
+/// verifier reads no line nesting deeper than [`MAX_JSON_DEPTH`] (T8 review I-1; an agent's
+/// `REQUEST_RECEIVED` params may nest up to serde_json's limit).
+pub const MAX_EXPORT_PAYLOAD_FIELD_DEPTH: usize = MAX_JSON_DEPTH - 1;
+
+/// Whether a line carries `payload` for the plaintext `plain` (the exporter writes it exactly
+/// then, and the verifier accepts its absence only when this is `false`): at most
+/// [`MAX_EXPORT_PAYLOAD_FIELD_BYTES`], nesting at most [`MAX_EXPORT_PAYLOAD_FIELD_DEPTH`] deep
+/// and JCS. The depth is checked before the parse, so a deep plaintext is never parsed.
+pub(crate) fn payload_field_shown(plain: &[u8]) -> bool {
+    plain.len() as u64 <= MAX_EXPORT_PAYLOAD_FIELD_BYTES
+        && depth_ok(plain, MAX_EXPORT_PAYLOAD_FIELD_DEPTH)
+        && is_jcs(plain)
+}
+
 /// Whether `plain` is JSON text in its JCS form, so it can be embedded in a line as is: the
 /// store writes every payload through `to_jcs_vec`, but a line must never depend on that (a raw
 /// newline would split the line, unsorted keys would break its JCS form).
@@ -545,7 +562,7 @@ fn event_line(
         ("prev_hash", hex_val(f.prev_hash)),
         ("payload_b64", Val::B64(plain)),
     ];
-    if plain.len() as u64 <= MAX_EXPORT_PAYLOAD_FIELD_BYTES && is_jcs(plain) {
+    if payload_field_shown(plain) {
         parts.push(("payload", Val::Json(plain)));
     }
     if unanchored {

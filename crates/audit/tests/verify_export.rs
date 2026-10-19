@@ -805,6 +805,8 @@ fn partial_range_export_verifies() {
         "{:?}",
         v.report()
     );
+    // No line of the anchor dir names a row: the anchor dir verified nothing (T8 review I-3).
+    assert_eq!(last(&v), MANIFEST_OK, "{:?}", v.report());
     let v = verify_export(&ex.dir, Some(anchor.path()), None);
     expect(&v, 20, "no anchored line in 500..=800");
 }
@@ -1113,6 +1115,169 @@ fn verify_export_tamper_matrix() {
     assert_eq!(last(&v), NO_ROOT);
 }
 
+/// `{"params": [[…[1]…]]}` nesting `depth` deep (the object counts).
+fn nested(depth: usize) -> Value {
+    let mut v = json!(1);
+    for _ in 1..depth {
+        v = Value::Array(vec![v]);
+    }
+    json!({ "params": v })
+}
+
+/// An agent's params nesting 64 or more deep get no `payload` display field (the line would nest
+/// deeper than the verifier reads); 63 deep still do. Every one verifies (T8 review I-1).
+#[test]
+fn deeply_nested_payload_exports_and_verifies() {
+    let (store, _f) = new_store(fake_clock(START), MemKeyring::new());
+    let depths = [63usize, 64, 80, 126];
+    store
+        .append_batch(
+            depths
+                .iter()
+                .map(|d| {
+                    ev(
+                        EventType::REQUEST_RECEIVED,
+                        Some(&format!("depth-{d}")),
+                        nested(*d),
+                    )
+                })
+                .collect(),
+        )
+        .expect("append");
+    let ex = export_all(&store);
+    let lines = jsonl(&ex.dir.join("events.jsonl"));
+    for d in depths {
+        let id = json!(format!("depth-{d}"));
+        let l = lines.iter().find(|l| l["request_id"] == id).expect("row");
+        assert_eq!(l.get("payload").is_some(), d < 64, "depth {d}");
+    }
+    let v = verify_export(&ex.dir, None, Some(ex.hash));
+    expect(&v, 0, "with the manifest SHA-256");
+    assert_eq!(last(&v), MANIFEST_OK);
+    expect(&verify_export(&ex.dir, None, None), 20, "without a root");
+}
+
+/// The verifier accepts a line without `payload` only where the exporter writes none: a JCS
+/// plaintext of at most 1 MiB nesting at most 63 deep must show it (T8 review I-1).
+#[test]
+fn missing_payload_on_a_shallow_row_is_refused() {
+    let (store, _f, anchor) = anchored_store();
+    let ex = export_all(&store);
+    expect(
+        &verify_export(&ex.dir, Some(anchor.path()), None),
+        0,
+        "honest",
+    );
+    let c = copy_export(&ex.dir);
+    let mut fg = Forge::load(&c.dir);
+    // Seq 2 (`CONFIG_CHANGED anchor_dir`) has an immediate line.
+    assert!(fg.lines[1].get("payload").is_some());
+    fg.lines[1].as_object_mut().unwrap().remove("payload");
+    fg.save();
+    let v = verify_export(&c.dir, None, None);
+    expect(&v, 21, "no root");
+    assert!(
+        has_line(&v, "payloads: mismatch at seq 2"),
+        "{:?}",
+        v.report()
+    );
+    let v = verify_export(&c.dir, Some(anchor.path()), None);
+    expect(&v, 21, "anchor dir only");
+}
+
+/// A line naming a row with its record hash but another epoch contradicts the row; it is no
+/// fork, whose evidence is two record hashes for one seq (T8 review M-3).
+#[test]
+fn same_hash_line_of_another_epoch_is_a_mismatch_not_a_fork() {
+    let (store, _f, anchor) = anchored_store();
+    let ex = export_all(&store);
+    let chain = ex.receipt.chain_ids[0].clone();
+    let fg = Forge::load(&ex.dir);
+    assert_eq!(fg.lines[8]["seq"], json!(9));
+    let epoch = if fg.lines[8]["epoch"] == json!("2026-10-01") {
+        "2026-10-02"
+    } else {
+        "2026-10-01"
+    };
+    append_anchor_line(
+        anchor.path(),
+        &chain,
+        &AnchorLine::Record {
+            seq: 9,
+            record_hash: fg.record_hash(8),
+            epoch: Some(epoch.into()),
+            clock_behind: false,
+        },
+    );
+    let v = verify_export(&ex.dir, Some(anchor.path()), None);
+    expect(&v, 21, "a line contradicting the row's epoch");
+    assert!(last(&v).starts_with("TAMPERED: "), "{:?}", v.report());
+    assert!(has_prefix(&v, "anchor dir: mismatch: "), "{:?}", v.report());
+}
+
+/// A record of a format this verifier does not read cannot be judged: 22, not TAMPERED (T8
+/// review M-6).
+#[test]
+fn a_record_format_of_another_version_cannot_be_verified() {
+    let (store, _f) = basic_store(4);
+    let ex = export_all(&store);
+    let c = copy_export(&ex.dir);
+    let mut fg = Forge::load(&c.dir);
+    assert!(fg.lines.len() > 3);
+    fg.lines[2]["format_version"] = json!(2);
+    fg.save();
+    let v = verify_export(&c.dir, None, None);
+    expect(&v, 22, "format_version 2");
+    assert!(
+        last(&v).starts_with("cannot verify: ") && last(&v).contains("format_version 2"),
+        "{:?}",
+        v.report()
+    );
+    assert!(has_line(&v, "chain: ok"), "{:?}", v.report());
+}
+
+/// More rows than the manifest claims: the walk stops there and the export is TAMPERED.
+#[test]
+fn more_rows_than_the_manifest_claims_is_21() {
+    let (store, _f) = basic_store(4);
+    let ex = export_all(&store);
+    let c = copy_export(&ex.dir);
+    let mut fg = Forge::load(&c.dir);
+    let extra = fg.lines.last().expect("rows").clone();
+    fg.lines.push(extra);
+    fg.save();
+    let v = verify_export(&c.dir, None, None);
+    expect(&v, 21, "a row beyond the manifest's count");
+    assert_eq!(
+        last(&v),
+        "TAMPERED: events.jsonl holds more rows than the manifest claims"
+    );
+}
+
+/// Files beside the export's three are named in the report (names that are not plain ASCII only
+/// counted) and never verified (T8 review M-5).
+#[test]
+fn other_entries_of_the_export_dir_are_reported() {
+    let (store, _f) = basic_store(4);
+    let ex = export_all(&store);
+    let c = copy_export(&ex.dir);
+    std::fs::write(c.dir.join("events-readable.txt"), b"x").unwrap();
+    std::fs::create_dir(c.dir.join("notes")).unwrap();
+    std::fs::write(c.dir.join("r\u{e9}sum\u{e9} 1.txt"), b"x").unwrap();
+    let v = verify_export(&c.dir, None, Some(ex.hash));
+    expect(&v, 0, "the export itself is unchanged");
+    assert!(
+        has_line(
+            &v,
+            "export dir: 3 other entries, not part of the export and not verified: \
+             events-readable.txt, notes and 1 more"
+        ),
+        "{:?}",
+        v.report()
+    );
+    assert_eq!(last(&v), MANIFEST_OK);
+}
+
 #[test]
 fn request_set_hash_mismatch_is_21_without_a_trust_root() {
     let (store, _f) = new_store(fake_clock(START), MemKeyring::new());
@@ -1236,6 +1401,65 @@ fn verify_export_fork_reported_as_fork() {
     assert!(last(&v).starts_with("FORK: "), "{:?}", v.report());
 }
 
+/// A chain file of this installation naming a row of the export by its exact record hash is fork
+/// evidence even when its chain is the source of the `RESTORE` the export starts with: no honest
+/// writer puts a line for one chain's record into another chain's file (T8 review M-7).
+#[test]
+fn source_chain_file_naming_an_export_row_is_a_fork() {
+    let anchor = tempfile::tempdir().expect("anchor dir");
+    let clock = fake_clock(START);
+    let (store, f) = new_store(clock.clone(), MemKeyring::new());
+    store
+        .change_anchor_dir(Some(chosen(anchor.path())), confirmed())
+        .expect("anchor dir");
+    store.append_batch(mixed(4)).expect("append");
+    store.flush_head_anchor().expect("flush");
+    let out = tempfile::tempdir().expect("backup dir");
+    let bundle = store.backup(chosen(out.path())).expect("backup");
+    store.append_batch(mixed(2)).expect("append");
+    store.flush_head_anchor().expect("flush");
+    clock.advance(Duration::from_secs(3600));
+    let t1 = clock.now_utc();
+    let rep = store
+        .restore(
+            chosen(&bundle.bundle_dir),
+            &SecretString::from(PASSPHRASE.to_string()),
+            Some(confirmed()),
+        )
+        .expect("restore");
+    store.append_batch(mixed(3)).expect("append");
+    assert!(store.testing_anchor_dir_drain());
+    let ex = export(
+        &store,
+        TimeRange {
+            from_utc: t1,
+            to_utc: UtcInstant(i64::MAX),
+        },
+    );
+    assert_eq!(
+        ex.receipt.first_seq, rep.restore_seq,
+        "starts at the RESTORE"
+    );
+    assert!(!ex.receipt.chain_ids.contains(&f.chain_id));
+    let v = verify_export(&ex.dir, Some(anchor.path()), Some(ex.hash));
+    expect(&v, 0, "honest");
+
+    let fg = Forge::load(&ex.dir);
+    let seq = fg.lines[1]["seq"].as_u64().expect("seq");
+    append_anchor_line(
+        anchor.path(),
+        &f.chain_id,
+        &record_line(seq, fg.record_hash(1)),
+    );
+    let v = verify_export(&ex.dir, Some(anchor.path()), Some(ex.hash));
+    expect(
+        &v,
+        21,
+        "the source chain's file names a row of the new chain",
+    );
+    assert!(last(&v).starts_with("FORK: "), "{:?}", v.report());
+}
+
 #[test]
 fn fork_same_seq_two_hashes_reported_as_fork() {
     let (store, _f, anchor) = anchored_store();
@@ -1262,12 +1486,44 @@ fn prune_snapshot_with_allow_degraded_scripts_verifies() {
     expect(&v, 0, "both snapshot shapes");
     assert!(has_line(&v, "prune_log: ok"), "{:?}", v.report());
 
-    // A snapshot the store's parser refuses is a finding.
-    let mut bad = store.settings().to_json();
-    bad["unknown_key"] = json!(1);
-    fake_prune(&store, "2026-06-03", bad);
-    let ex = export_all(&store);
-    let v = verify_export(&ex.dir, None, Some(ex.hash));
+    // A key this verifier does not know (a newer version's setting) cannot be judged: 22 (T8
+    // review M-6), at the top level or in an instance policy.
+    let snapshot = |edit: &dyn Fn(&mut Value)| {
+        let (store, _f) = new_store(fake_clock(START), MemKeyring::new());
+        store.append_batch(mixed(3)).expect("append");
+        let mut s = store.settings().to_json();
+        edit(&mut s);
+        fake_prune(&store, "2026-06-01", s);
+        let ex = export_all(&store);
+        verify_export(&ex.dir, None, Some(ex.hash))
+    };
+    let policy = json!({"ca_fingerprint": null, "origin": "https://jira.example", "proxy": null});
+    for (what, v) in [
+        ("top level", snapshot(&|s| s["unknown_key"] = json!(1))),
+        (
+            "instance policy",
+            snapshot(&|s| {
+                let mut p = policy.clone();
+                p["pinned_key"] = json!("x");
+                s["instances"] = json!({ "jira": p });
+            }),
+        ),
+    ] {
+        expect(&v, 22, &format!("a newer settings key ({what})"));
+        assert!(
+            last(&v).starts_with("cannot verify: ") && last(&v).contains("settings snapshot"),
+            "{what}: {:?}",
+            v.report()
+        );
+    }
+    expect(
+        &snapshot(&|s| s["instances"] = json!({ "jira": policy.clone() })),
+        0,
+        "a known instance policy",
+    );
+
+    // A snapshot the store's parser refuses for its known keys is a finding.
+    let v = snapshot(&|s| s["retention_days"] = json!("ninety"));
     expect(&v, 21, "malformed snapshot");
     assert!(has_prefix(&v, "prune_log: "), "{:?}", v.report());
 }
@@ -1331,17 +1587,36 @@ fn duplicate_keys_and_missing_files_are_refused() {
     expect(&v, 22, "no such directory");
 }
 
-#[cfg(unix)]
+/// On Windows creating a symbolic link needs a privilege (or Developer Mode): without it the test
+/// says so on stderr and checks nothing.
+#[cfg(any(unix, windows))]
 #[test]
 fn symlinked_export_file_is_refused() {
     let (store, _f) = basic_store(4);
     let ex = export_all(&store);
     let c = copy_export(&ex.dir);
     let elsewhere = c._tmp.path().join("events-elsewhere.jsonl");
-    std::fs::rename(c.dir.join("events.jsonl"), &elsewhere).unwrap();
-    std::os::unix::fs::symlink(&elsewhere, c.dir.join("events.jsonl")).unwrap();
+    let link = c.dir.join("events.jsonl");
+    std::fs::rename(&link, &elsewhere).unwrap();
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(&elsewhere, &link);
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_file(&elsewhere, &link);
+    if let Err(e) = made {
+        // ERROR_PRIVILEGE_NOT_HELD
+        if cfg!(windows) && e.raw_os_error() == Some(1314) {
+            eprintln!("symlinked_export_file_is_refused: SKIPPED, no privilege to create a link");
+            return;
+        }
+        panic!("symlink: {e}");
+    }
     let v = verify_export(&c.dir, None, Some(ex.hash));
     expect(&v, 22, "a symlinked events.jsonl");
+    assert!(
+        last(&v).contains("events.jsonl is not a regular file"),
+        "{:?}",
+        v.report()
+    );
 }
 
 #[test]
@@ -1392,10 +1667,6 @@ impl FsRead for Recording {
     fn metadata(&self, path: &Path) -> io::Result<Metadata> {
         self.note(path);
         OsFs.metadata(path)
-    }
-    fn symlink_metadata(&self, path: &Path) -> io::Result<Metadata> {
-        self.note(path);
-        OsFs.symlink_metadata(path)
     }
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
         self.note(path);
@@ -1462,6 +1733,13 @@ fn verify_export_never_decrypts() {
     for word in ["Deks", "decrypt", "KeyStore", "Kek"] {
         assert!(!src.contains(word), "verify_export.rs names {word}");
     }
+    // Of the crypto module only the payload bound and the constant-time compare (T8 review M-7).
+    let crypto: Vec<&str> = src
+        .lines()
+        .filter(|l| l.contains("crypto::"))
+        .map(str::trim)
+        .collect();
+    assert_eq!(crypto, ["use crate::crypto::{MAX_PAYLOAD_LEN, ct_eq};"]);
 }
 
 #[test]
@@ -1492,6 +1770,20 @@ fn report_last_line_texts_verbatim() {
         last(&verify_export(&ex.dir, Some(anchor.path()), Some(ex.hash))),
         BOTH_OK
     );
+    // Both roots given, but the anchor dir (empty, or another installation's) names no row: only
+    // the manifest SHA-256 verified the export (T8 review I-3).
+    let empty = tempfile::tempdir().expect("empty anchor dir");
+    let v = verify_export(&ex.dir, Some(empty.path()), Some(ex.hash));
+    expect(&v, 0, "manifest, and an anchor dir naming no row");
+    assert_eq!(
+        &v.report()[7..],
+        &[
+            "anchor dir: no line names a row of this export; rows 1..9 covered by the manifest \
+             SHA-256 only"
+                .to_string(),
+            MANIFEST_OK.to_string(),
+        ]
+    );
     let v = verify_export(&ex.dir, None, None);
     assert!(has_line(&v, "manifest: not checked"));
     assert_eq!(last(&v), NO_ROOT);
@@ -1501,6 +1793,96 @@ fn report_last_line_texts_verbatim() {
 
 // ---------------------------------------------------------------------------------------
 // bounded memory
+
+/// The verifier's documented working set per row (module doc "Working set"): this many times the
+/// line bound, one value tree of at most [`TREE_TEXT`] bytes of JSON text (at most
+/// [`TREE_FACTOR`] times its text), and fixed buffers under [`FIXED`].
+const LINE_FACTOR: usize = 4;
+const TREE_TEXT: usize = 1 << 20;
+const TREE_FACTOR: usize = 32;
+const FIXED: usize = 128 << 10;
+
+fn documented_bound(line: u64) -> usize {
+    let line = usize::try_from(line).expect("line bound");
+    LINE_FACTOR * line + TREE_FACTOR * line.min(TREE_TEXT) + FIXED
+}
+
+/// An export whose row 3 `edit` changes (rehashed), and the length of its longest line.
+fn forged_row(edit: impl FnOnce(&mut Value)) -> (Copy, u64) {
+    let (store, _f) = basic_store(4);
+    let ex = export_all(&store);
+    let c = copy_export(&ex.dir);
+    let mut fg = Forge::load(&c.dir);
+    edit(&mut fg.lines[2]);
+    fg.rehash();
+    fg.save();
+    let longest = raw_lines(&c.dir).iter().map(Vec::len).max().expect("lines");
+    (c, longest as u64)
+}
+
+/// A text column with escapes costs serde_json a scratch copy (up to twice the decoded text by
+/// `Vec` doubling: `"\n"`, then the long run reserved exactly, then the second escape doubles it)
+/// and the owned `String`, beside the line buffer (T8 review I-2). The line bound is set to the
+/// line's length so the line buffer is measured at its cap.
+#[test]
+fn escaped_text_column_stays_within_the_documented_bound() {
+    let run = 4 << 20;
+    let (c, longest) = forged_row(|l| {
+        let mut target = String::with_capacity(run + 2);
+        target.push('\n');
+        target.extend(std::iter::repeat_n('a', run));
+        target.push('\n');
+        l["target"] = json!(target);
+    });
+    let lim = Limits {
+        line: longest,
+        ..Limits::default()
+    };
+    let (v, peak) = peak_during(|| verify_export_with(&OsFs, lim, &c.dir, None, None));
+    expect(&v, 20, "a consistent forgery");
+    eprintln!(
+        "verify_export escaped text column: line {longest} bytes, peak {peak} bytes ({:.2} x)",
+        peak as f64 / longest as f64
+    );
+    let bound = LINE_FACTOR * longest as usize + FIXED;
+    assert!(peak <= bound, "peak {peak} > {bound}");
+}
+
+/// The absence check of `payload` parses a plaintext of at most 1 MiB into a value tree (T8
+/// review I-1): the largest tree per byte of text is a list of one-digit numbers.
+#[test]
+fn value_tree_of_a_small_plaintext_stays_within_the_documented_bound() {
+    let n = (TREE_TEXT - 1) / 2;
+    let mut plain = String::with_capacity(TREE_TEXT);
+    plain.push('[');
+    for i in 0..n {
+        plain.push_str(if i + 1 < n { "0," } else { "0]" });
+    }
+    assert!(plain.len() <= TREE_TEXT);
+    let (c, longest) = forged_row(|l| {
+        l["payload_b64"] = json!(STANDARD.encode(&plain));
+        l["payload_len"] = json!(plain.len());
+        l["payload_sha256"] = json!(hex::encode(sha256(plain.as_bytes())));
+        l.as_object_mut().unwrap().remove("payload");
+    });
+    let lim = Limits {
+        line: longest,
+        ..Limits::default()
+    };
+    let (v, peak) = peak_during(|| verify_export_with(&OsFs, lim, &c.dir, None, None));
+    expect(&v, 21, "a JCS plaintext of 1 MiB without its payload field");
+    assert!(
+        has_line(&v, "payloads: mismatch at seq 3"),
+        "{:?}",
+        v.report()
+    );
+    eprintln!(
+        "verify_export value tree of {} bytes: peak {peak} bytes",
+        plain.len()
+    );
+    let bound = documented_bound(longest);
+    assert!(peak <= bound, "peak {peak} > {bound}");
+}
 
 /// What the garbage cases change in one of the three files.
 #[derive(Debug, Clone)]
@@ -1662,9 +2044,26 @@ fn verify_export_garbage_never_panics() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(256);
-    // Bounded by the lowered line bound (a line and its parsed copy) and fixed-size buffers,
-    // never by a claimed number.
-    let bound = 4 * lim.line as usize + (1 << 20);
+    // The documented bound at the lowered line bound, never a claimed number.
+    let bound = documented_bound(lim.line);
+    // The manifest keys no check compares with the files: a change to them alone may verify.
+    let free_text = [
+        "accountability",
+        "app_version",
+        "build_id",
+        "exported_at",
+        "install",
+        "requested_range",
+    ];
+    let claims = |bytes: &[u8]| -> Option<Value> {
+        let mut v: Value = serde_json::from_slice(bytes).ok()?;
+        let o = v.as_object_mut()?;
+        for k in free_text {
+            o.remove(k);
+        }
+        Some(v)
+    };
+    let template_claims = claims(&template[2]);
     let mut runner = TestRunner::new(ProptestConfig {
         cases,
         failure_persistence: None,
@@ -1683,18 +2082,39 @@ fn verify_export_garbage_never_panics() {
                 std::fs::write(dir.join(name), bytes).expect("write");
             }
             let root = with_anchor.then_some(anchor.path());
-            let (v, peak) =
-                peak_during(|| verify_export_with(&OsFs, lim, &dir, root, Some(ex.hash)));
-            worst.set(worst.get().max(peak));
-            if !matches!(v.exit_code(), 21 | 22) {
-                return Err(TestCaseError::fail(format!("{m:?}: {:?}", v.report())));
-            }
-            if peak > bound {
-                return Err(TestCaseError::fail(format!("{m:?}: peak {peak} > {bound}")));
+            let free_only = files[..2] == template[..2] && claims(&files[2]) == template_claims;
+            // (a) the honest manifest's hash: every change is 21 or 22; (b) no manifest root: never
+            // 0 (the template's last rows are unanchored, so the anchor dir alone never verifies
+            // it); (c) the mutated manifest's own hash, so its parser and every claim are judged
+            // against the files: 21 or 22 unless only free text changed.
+            for (mode, given) in [
+                ("honest manifest", Some(ex.hash)),
+                ("no manifest root", None),
+                ("mutated manifest", Some(sha256(&files[2]))),
+            ] {
+                let (v, peak) = peak_during(|| verify_export_with(&OsFs, lim, &dir, root, given));
+                worst.set(worst.get().max(peak));
+                let code = v.exit_code();
+                let ok = match given {
+                    None => code != 0,
+                    Some(h) if h == ex.hash => matches!(code, 21 | 22),
+                    Some(_) => matches!(code, 21 | 22) || (free_only && code == 0),
+                };
+                if !ok {
+                    return Err(TestCaseError::fail(format!(
+                        "{mode}: {m:?}: {:?}",
+                        v.report()
+                    )));
+                }
+                if peak > bound {
+                    return Err(TestCaseError::fail(format!(
+                        "{mode}: {m:?}: peak {peak} > {bound}"
+                    )));
+                }
             }
             Ok(())
         })
-        .expect("every garbage export is 21 or 22 within the bound");
+        .expect("no garbage export verifies, and each stays within the bound");
     eprintln!(
         "verify_export garbage: {cases} cases, worst peak {} bytes (bound {bound})",
         worst.get()
@@ -1702,7 +2122,8 @@ fn verify_export_garbage_never_panics() {
 }
 
 /// The largest plaintext the store takes, exported by T7 and verified: exit 0, with the
-/// verifier's peak heap within its documented bound (PD-162: 2 × `MAX_EXPORT_LINE_BYTES`).
+/// verifier's peak heap within its documented bound ([`documented_bound`] of
+/// `MAX_EXPORT_LINE_BYTES`; this honest row needs far less, about one line).
 #[test]
 #[ignore = "CI: large-payload export step"]
 fn max_size_payload_round_trips() {
@@ -1725,7 +2146,7 @@ fn max_size_payload_round_trips() {
     let ex = export_all(&store);
     let (v, peak) = peak_during(|| verify_export(&ex.dir, None, Some(ex.hash)));
     expect(&v, 0, "the largest row");
-    let bound = 2 * MAX_EXPORT_LINE_BYTES as usize;
+    let bound = documented_bound(MAX_EXPORT_LINE_BYTES);
     eprintln!("verify_export of a 96 MiB payload: peak {peak} bytes (bound {bound})");
     assert!(peak <= bound, "peak {peak} > {bound}");
 }

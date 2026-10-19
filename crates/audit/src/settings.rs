@@ -78,6 +78,35 @@ pub const KEY_ALLOW_DEGRADED_SCRIPTS: &str = "allow_degraded_scripts";
 
 const BAD_SNAPSHOT: AuditError = AuditError::Invalid("settings snapshot is malformed");
 
+/// The keys of a settings snapshot and of each of its instance policies ([`Settings::to_json`]).
+const SNAPSHOT_KEYS: [&str; 5] = [
+    KEY_ALLOW_DEGRADED_SCRIPTS,
+    "anchor_dir",
+    "instances",
+    "legal_hold",
+    "retention_days",
+];
+const POLICY_KEYS: [&str; 3] = ["ca_fingerprint", "origin", "proxy"];
+
+/// Whether the snapshot `v` names a key [`Settings::from_json`] does not know, at its top level
+/// or in an instance policy: a newer version's setting, which this version cannot judge (the
+/// export verifier answers "cannot verify", T8 review M-6).
+pub(crate) fn snapshot_has_unknown_key(v: &Value) -> bool {
+    let Some(o) = v.as_object() else {
+        return false;
+    };
+    let unknown =
+        |p: &Map<String, Value>, known: &[&str]| p.keys().any(|k| !known.contains(&k.as_str()));
+    unknown(o, &SNAPSHOT_KEYS)
+        || o.get("instances")
+            .and_then(Value::as_object)
+            .is_some_and(|is| {
+                is.values()
+                    .filter_map(Value::as_object)
+                    .any(|p| unknown(p, &POLICY_KEYS))
+            })
+}
+
 fn opt_string(v: &Value) -> Result<Option<String>, AuditError> {
     match v {
         Value::Null => Ok(None),
