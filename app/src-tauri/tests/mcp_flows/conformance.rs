@@ -56,10 +56,11 @@ fn project_dir() -> PathBuf {
         .join("mcp-conformance")
 }
 
-/// A Jira issue of the standard fixture with a `description` of `bytes` bytes, under key `ABC-BIG`.
+/// A Jira issue of the standard fixture with a `description` of `bytes` bytes, under key `ABC-9999` (an
+/// issue key is `^[A-Z][A-Z0-9_]*-[0-9]+$`: a non-numeric suffix is refused as `validation`).
 fn big_issue(bytes: usize) -> Result<String> {
     let mut issue: Value = serde_json::from_str(fixtures::JIRA_ISSUE)?;
-    issue["key"] = json!("ABC-BIG");
+    issue["key"] = json!("ABC-9999");
     issue["fields"]["description"] = json!("x".repeat(bytes));
     Ok(serde_json::to_string(&issue)?)
 }
@@ -172,7 +173,7 @@ async fn i05_ts_sdk_conformance() -> Result<()> {
     mock.json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
         .await;
     mock.json(
-        "/rest/api/2/issue/ABC-BIG",
+        "/rest/api/2/issue/ABC-9999",
         200,
         &big_issue(BIG_DESCRIPTION_BYTES)?,
     )

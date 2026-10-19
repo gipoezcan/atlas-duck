@@ -60,7 +60,8 @@ const scenarios = [
     args: { op_id: "jira.issue.get", params: { key: "ABC-1" }, reason: "atlas-test:release" },
     expect: { isError: false, status: "released" },
   },
-  { name: "large_released", ...get("ABC-BIG", "release"), expect: { isError: false, status: "released", big: true } },
+  // ABC-9999: the mock issue with the 3 MiB description (a key must match ^[A-Z][A-Z0-9_]*-[0-9]+$).
+  { name: "large_released", ...get("ABC-9999", "release"), expect: { isError: false, status: "released", big: true } },
   // A script that throws, released with its error: `released`, and an error result (exit 8,
   // PD-121); the SDK client must hand it back, not throw. The first script of an app waits for the
   // sandbox probe, which can outlast the 5 s timeout of this child: `wait` follows a `pending`
