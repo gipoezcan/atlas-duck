@@ -38,8 +38,8 @@ const RUN_LIMIT: Duration = Duration::from_secs(300);
 /// What each scenario must print: `(scenario, isError, status, error_code)`.
 const EXPECTED: &[(&str, bool, &str, Option<&str>)] = &[
     ("pending", false, "pending", None),
-    ("denied", true, "denied", None),
-    ("expired", true, "expired", None),
+    ("denied", true, "denied", Some("denied")),
+    ("expired", true, "expired", Some("expired")),
     ("failed", true, "failed", Some("validation")),
     ("redacted_released", false, "released", None),
     ("write", false, "succeeded", None),
