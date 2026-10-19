@@ -4,7 +4,7 @@
 
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -180,6 +180,8 @@ struct Inner {
     thread: Mutex<Option<JoinHandle<()>>>,
     anchor_thread: Mutex<Option<JoinHandle<()>>>,
     anchor_dir_thread: Mutex<Option<JoinHandle<()>>>,
+    /// `stop()` has waited for the anchor threads once.
+    anchors_stopped: AtomicBool,
     shared: Arc<Shared>,
     install_id: String,
     /// Read by `full_verify` for the anchors; only the anchor thread writes them.
@@ -215,6 +217,11 @@ impl Inner {
         }
         if let Some(h) = lock(&self.thread).take() {
             let _ = h.join();
+        }
+        // Only the first call waits for the anchor threads: a second one (`Drop` after
+        // `shutdown`) would wait again for a thread the first left behind.
+        if self.anchors_stopped.swap(true, Ordering::SeqCst) {
+            return;
         }
         let dir_exited = self.shared.anchor_dir.drain_and_stop(SHUTDOWN_DRAIN);
         if let Some(h) = lock(&self.anchor_dir_thread).take() {
@@ -372,6 +379,7 @@ impl Store {
                 thread: Mutex::new(Some(thread)),
                 anchor_thread: Mutex::new(Some(anchor_thread)),
                 anchor_dir_thread: Mutex::new(Some(anchor_dir_thread)),
+                anchors_stopped: AtomicBool::new(false),
                 shared,
                 install_id,
                 keys: cfg.keys,
@@ -1053,9 +1061,74 @@ impl Store {
                 record_hash: p.record_hash,
             })?
             .complete();
+        } else {
+            self.queue_committed_prune_lines();
         }
         self.enable_anchors();
         Ok(outcome)
+    }
+
+    /// A `PRUNE` whose first-retained update reached the keychain, but whose anchor-dir lines
+    /// were lost (the dir failed until quit, or a crash before the anchor-dir thread wrote
+    /// them): its `Prune` and `Immediate` lines, unless the file already holds them. Only the
+    /// latest `prune_log` row, and only when the keychain's first-retained anchor names exactly
+    /// its values (as startup verification compares them): a prune the trust root does not
+    /// confirm is never attested. Best effort, like `queue_missing_prune_lines`.
+    fn queue_committed_prune_lines(&self) {
+        type Latest = (i64, i64, Vec<u8>, Vec<u8>, String, String);
+        let read: Result<Option<Latest>, AuditError> = self.with_reader(|c| {
+            let io = |e: rusqlite::Error| AuditError::Io(e.to_string());
+            c.query_row(
+                "SELECT p.prune_seq, p.first_retained_seq, p.last_pruned_record_hash, \
+                 e.record_hash, e.chain_id, e.event_type \
+                 FROM prune_log p JOIN events e ON e.seq = p.prune_seq \
+                 ORDER BY p.prune_seq DESC LIMIT 1",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(io)
+        });
+        let Ok(Some((prune_seq, frs, last, hash, chain_id, event_type))) = read else {
+            return;
+        };
+        let (Ok(prune_seq), Ok(frs), Ok(last), Ok(record_hash)) = (
+            u64::try_from(prune_seq),
+            u64::try_from(frs),
+            <[u8; 32]>::try_from(last),
+            <[u8; 32]>::try_from(hash),
+        ) else {
+            return;
+        };
+        if event_type != EventType::PRUNE.as_str() || chain_id != self.head().2 {
+            return;
+        }
+        let Ok((_, Some(fr))) = anchors::load_anchors(&*self.inner.keys) else {
+            return;
+        };
+        if fr.chain_id != chain_id
+            || fr.first_retained_seq != frs
+            || !crypto::ct_eq(&fr.first_retained_prev_hash, &last)
+        {
+            return;
+        }
+        self.queue_missing_prune_lines(
+            &fr,
+            &HeadAnchor {
+                chain_id,
+                seq: prune_seq,
+                record_hash,
+            },
+        );
     }
 
     /// Interrupted prune (§8.7: "the missing anchor-dir `PRUNE` line is appended"): the

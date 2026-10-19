@@ -4,8 +4,9 @@
 //! verification called `enable` (§8.7 "No anchor writes before verification"). A chain file is
 //! only ever created with create-new, header first, then fsynced together with its directory;
 //! after that it is only appended to and fsynced: the writer never rewrites, truncates or
-//! deletes a byte. A failing directory is retried with backoff and shown in `StoreHealth`,
-//! never an incident (§8.5 "a write failure is shown in Settings and the tray").
+//! deletes a byte. A failing file is retried with its own backoff, never holding back another
+//! file's lines (the order is kept per file), and shown in `StoreHealth`, never an incident
+//! (§8.5 "a write failure is shown in Settings and the tray").
 //!
 //! Which records get which line (PD-157, L185):
 //! - a daily `Record` line for the first committed record whose non-NULL `epoch` is a date with
@@ -45,6 +46,10 @@ pub(crate) const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
 /// Longest idle wait of the thread.
 const MAX_WAIT: Duration = Duration::from_secs(1);
+
+/// An attempt still running after this long (a hung share or a blocking special file) is shown
+/// as failing; the thread itself cannot be interrupted (`Store::shutdown` leaves it behind).
+const STUCK_AFTER: Duration = Duration::from_secs(30);
 
 /// `host` and `os_user` of a header are cut to this many characters (the line must stay below
 /// `MAX_LINE_BYTES` even when every character is escaped).
@@ -237,6 +242,16 @@ impl Classifier {
 // ---------------------------------------------------------------------------------------
 // The shared queue
 
+/// One chain file: the resolved anchor dir and the chain id.
+type FileKey = (PathBuf, String);
+
+/// A file whose last attempt failed: the failures in a row, and when it is tried again.
+#[derive(Clone, Copy)]
+struct Retry {
+    failures: u32,
+    next: Instant,
+}
+
 struct DirState {
     /// Startup verification passed (the same gate as the keychain anchor thread).
     enabled: bool,
@@ -245,10 +260,16 @@ struct DirState {
     queue: VecDeque<Pending>,
     /// `Keep::Daily` lines in `queue`.
     daily_queued: usize,
+    /// Lines were queued since the thread last took the queue: they are tried now, whatever
+    /// another file's backoff says.
+    fresh: bool,
     /// Lines the thread took and is writing now.
     in_flight: usize,
-    failures: u32,
-    next_retry: Option<Instant>,
+    /// When the running attempt began.
+    attempt_started: Option<Instant>,
+    /// The files whose lines are queued because their last attempt failed (each retried with
+    /// its own backoff, so one failing file never holds back another's lines).
+    failing: HashMap<FileKey, Retry>,
     /// Divides the retry backoff (tests only).
     scale_div: u32,
     /// One attempt now, whatever the backoff says (`Store::shutdown`, tests).
@@ -285,9 +306,10 @@ impl AnchorDirShared {
                 fallback: None,
                 queue: VecDeque::new(),
                 daily_queued: 0,
+                fresh: false,
                 in_flight: 0,
-                failures: 0,
-                next_retry: None,
+                attempt_started: None,
+                failing: HashMap::new(),
                 scale_div: 1,
                 drain: false,
                 forced: 0,
@@ -330,6 +352,7 @@ impl AnchorDirShared {
                 st.daily_queued += 1;
             }
             st.queue.push_back(p);
+            st.fresh = true;
         }
         compact(&mut st);
         drop(st);
@@ -349,8 +372,11 @@ impl AnchorDirShared {
 
     pub(crate) fn health(&self) -> DirHealth {
         let st = lock(&self.state);
+        let stuck = st
+            .attempt_started
+            .is_some_and(|t| t.elapsed() >= STUCK_AFTER);
         DirHealth {
-            write_failing: st.failures > 0 || st.dead,
+            write_failing: !st.failing.is_empty() || st.dead || stuck,
             lines_pending: u32::try_from(st.queue.len() + st.in_flight).unwrap_or(u32::MAX),
         }
     }
@@ -389,7 +415,14 @@ impl AnchorDirShared {
     /// `Store::shutdown`: one last attempt for the queued lines, then the thread stops; both
     /// within `budget`. `false`: the thread did not leave in time (a hung share) and is left
     /// behind. Lines still queued are lost here; the `APP_STOP` one is written at the next start.
+    /// A second call (`Drop` after `Store::shutdown`) returns at once: the first one waited.
     pub(crate) fn drain_and_stop(&self, budget: Duration) -> bool {
+        {
+            let st = lock(&self.state);
+            if st.stop {
+                return st.exited;
+            }
+        }
         let end = Instant::now() + budget;
         self.drain(budget);
         let mut st = lock(&self.state);
@@ -450,7 +483,10 @@ fn bounded(s: String) -> String {
 }
 
 /// The OS user as the recovery note names it (the first non-empty of `USERNAME`, `USER`,
-/// `LOGNAME`).
+/// `LOGNAME`): the same rule as the app's `credential::os_user`. Task 6's previous-chain
+/// detection (RF-3) matches a header's `host` and `os_user` exactly, so the two must never
+/// drift (one shared helper, never a third copy), and it compares against the value as written
+/// here, after [`bounded`] (cut to 200 characters, empty -> `unknown`).
 fn os_user() -> String {
     ["USERNAME", "USER", "LOGNAME"]
         .iter()
@@ -499,8 +535,16 @@ pub(crate) fn run(shared: Arc<AnchorDirShared>, header: HeaderFacts) {
     shared.cv.notify_all();
 }
 
-/// Per `(dir, chain_id)`: the newest date with a `Record` line in the file, once read.
-type Files = HashMap<(PathBuf, String), Option<NaiveDate>>;
+/// Per file: the newest date with a `Record` line in it, once read.
+type Files = HashMap<FileKey, Option<NaiveDate>>;
+
+/// What one attempt needs besides the lines.
+struct Attempt<'a> {
+    fallback: Option<&'a Path>,
+    /// Also try the files whose backoff has not run out (`drain`).
+    forced: bool,
+    scale_div: u32,
+}
 
 fn run_loop(shared: &AnchorDirShared, header: &HeaderFacts) {
     let mut files: Files = HashMap::new();
@@ -511,7 +555,9 @@ fn run_loop(shared: &AnchorDirShared, header: &HeaderFacts) {
         }
         let now = Instant::now();
         let work = st.enabled && !st.queue.is_empty();
-        let due = work && (st.drain || st.next_retry.is_none_or(|t| now >= t));
+        // Newly queued lines are tried at once; a failing file's lines wait for its backoff.
+        let next_retry = st.failing.values().map(|r| r.next).min();
+        let due = work && (st.drain || st.fresh || next_retry.is_none_or(|t| now >= t));
         if !due {
             if st.drain {
                 // Nothing to write now (empty, or disabled): the forced attempt is over.
@@ -520,7 +566,7 @@ fn run_loop(shared: &AnchorDirShared, header: &HeaderFacts) {
                 shared.cv.notify_all();
                 continue;
             }
-            let wait = match (work, st.next_retry) {
+            let wait = match (work, next_retry) {
                 (true, Some(t)) => t.saturating_duration_since(now).min(MAX_WAIT),
                 _ => MAX_WAIT,
             };
@@ -532,29 +578,30 @@ fn run_loop(shared: &AnchorDirShared, header: &HeaderFacts) {
             continue;
         }
         let forced = std::mem::take(&mut st.drain);
+        st.fresh = false;
         let batch: Vec<Pending> = st.queue.drain(..).collect();
         st.daily_queued = 0;
         st.in_flight = batch.len();
+        st.attempt_started = Some(now);
         let fallback = st.fallback.clone();
+        let attempt = Attempt {
+            fallback: fallback.as_deref(),
+            forced,
+            scale_div: st.scale_div,
+        };
+        // Health keeps showing the failing files while this attempt runs.
+        let mut failing = st.failing.clone();
         drop(st);
-        let (done, result) = write_batch(shared, header, fallback.as_deref(), &batch, &mut files);
+        let kept = write_batch(shared, header, &attempt, &batch, &mut failing, &mut files);
         st = lock(&shared.state);
         // What was not written goes back in front of what arrived meanwhile, in order.
-        for p in batch.into_iter().skip(done).rev() {
+        for p in kept.into_iter().rev() {
             st.queue.push_front(p);
         }
         st.daily_queued = st.queue.iter().filter(|p| p.keep == Keep::Daily).count();
         st.in_flight = 0;
-        match result {
-            Ok(()) => {
-                st.failures = 0;
-                st.next_retry = None;
-            }
-            Err(_) => {
-                st.failures = st.failures.saturating_add(1);
-                st.next_retry = Some(Instant::now() + backoff(st.failures) / st.scale_div);
-            }
-        }
+        st.attempt_started = None;
+        st.failing = failing;
         if forced {
             st.forced += 1;
         }
@@ -562,15 +609,23 @@ fn run_loop(shared: &AnchorDirShared, header: &HeaderFacts) {
     }
 }
 
-/// Writes `batch` in order, one append per run of lines for the same file; stops at the first
-/// failure. Returns how many items are done (written, skipped or without a dir).
+/// Writes `batch`, one append per run of lines for the same file. The order is kept per file
+/// only: once a file fails, its later lines in the batch are not tried, but every other file's
+/// lines are. A file in backoff is not tried unless the attempt is forced. Updates `failing`
+/// (a file that succeeded, or has no line left, is no longer failing) and returns the lines
+/// not written, in their order.
 fn write_batch(
     shared: &AnchorDirShared,
     header: &HeaderFacts,
-    fallback: Option<&Path>,
+    attempt: &Attempt<'_>,
     batch: &[Pending],
+    failing: &mut HashMap<FileKey, Retry>,
     files: &mut Files,
-) -> (usize, io::Result<()>) {
+) -> Vec<Pending> {
+    let now = Instant::now();
+    let mut failed_now: HashSet<FileKey> = HashSet::new();
+    let mut kept_files: HashSet<FileKey> = HashSet::new();
+    let mut kept = Vec::new();
     let mut i = 0;
     while i < batch.len() {
         let (dir, chain_id) = (&batch[i].dir, &batch[i].chain_id);
@@ -578,17 +633,45 @@ fn write_batch(
         while j < batch.len() && batch[j].dir == *dir && batch[j].chain_id == *chain_id {
             j += 1;
         }
+        let group = &batch[i..j];
+        i = j;
         // No anchor dir: nothing to write. A chain id that is not an id never becomes a path
         // component (the verifier reports such a store).
-        if let Some(path) = resolve(dir.as_deref(), fallback)
-            && is_id(chain_id)
-            && let Err(e) = append_group(shared, header, &path, chain_id, &batch[i..j], files)
-        {
-            return (i, Err(e));
+        let Some(path) = resolve(dir.as_deref(), attempt.fallback).filter(|_| is_id(chain_id))
+        else {
+            continue;
+        };
+        let key: FileKey = (path, chain_id.clone());
+        let waiting = failed_now.contains(&key)
+            || (!attempt.forced && failing.get(&key).is_some_and(|r| now < r.next));
+        let result = if waiting {
+            None
+        } else {
+            Some(append_group(shared, header, &key.0, chain_id, group, files))
+        };
+        match result {
+            Some(Ok(())) => {
+                failing.remove(&key);
+            }
+            Some(Err(_)) => {
+                let failures = failing
+                    .get(&key)
+                    .map_or(0, |r| r.failures)
+                    .saturating_add(1);
+                let next = Instant::now() + backoff(failures) / attempt.scale_div;
+                failing.insert(key.clone(), Retry { failures, next });
+                failed_now.insert(key.clone());
+                kept.extend_from_slice(group);
+                kept_files.insert(key);
+            }
+            None => {
+                kept.extend_from_slice(group);
+                kept_files.insert(key);
+            }
         }
-        i = j;
     }
-    (batch.len(), Ok(()))
+    failing.retain(|k, _| kept_files.contains(k));
+    kept
 }
 
 fn append_group(
@@ -643,6 +726,10 @@ fn append_group(
         last = last.max(date);
         buf.push_str(&text);
         buf.push('\n');
+        // A catch-up line behind the same line in this group is written once.
+        if !catch_up.is_empty() {
+            present.insert(text);
+        }
     }
     if !buf.is_empty() {
         file.write_all(buf.as_bytes())?;
@@ -678,6 +765,17 @@ fn open_chain_file(
         record_sync(path);
         Ok(())
     };
+    // Only a regular file is appended to: a FIFO would block the open for good, a symlink would
+    // send the lines elsewhere (planting either needs write access to the dir; checked, then
+    // opened, so not race-free).
+    if let Ok(m) = std::fs::symlink_metadata(path)
+        && !m.file_type().is_file()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the chain file is not a regular file",
+        ));
+    }
     match OpenOptions::new().append(true).open(path) {
         Ok(mut f) => {
             if f.metadata()?.len() == 0 {
@@ -823,6 +921,38 @@ mod tests {
         s.set_fallback(Some(PathBuf::from("/fallback")));
         s.push(vec![p]);
         assert_eq!(s.health().lines_pending, 1);
+    }
+
+    #[test]
+    fn an_attempt_stuck_past_the_bound_shows_as_failing() {
+        let s = AnchorDirShared::new();
+        s.push(vec![line(1, Keep::Always)]);
+        let mut st = lock(&s.state);
+        st.in_flight = 1;
+        st.attempt_started = Some(Instant::now());
+        drop(st);
+        assert!(
+            !s.health().write_failing,
+            "a running attempt is not a failure"
+        );
+        let long_ago = Instant::now().checked_sub(STUCK_AFTER + Duration::from_secs(1));
+        lock(&s.state).attempt_started = long_ago;
+        assert!(s.health().write_failing, "a stuck attempt is shown");
+    }
+
+    #[test]
+    fn a_second_stop_does_not_wait_again_for_a_stuck_thread() {
+        // Nobody serves the queue: like a thread stuck on a hung share.
+        let s = AnchorDirShared::new();
+        s.init(true, 1);
+        s.push(vec![line(1, Keep::Always)]);
+        let budget = Duration::from_millis(300);
+        let t = Instant::now();
+        assert!(!s.drain_and_stop(budget));
+        assert!(t.elapsed() >= budget);
+        let t = Instant::now();
+        assert!(!s.drain_and_stop(budget));
+        assert!(t.elapsed() < budget / 3, "{:?}", t.elapsed());
     }
 
     fn note(seq: u64, epoch: Option<&str>, cd: Option<&str>, flags: EventFlags) -> RowNote {

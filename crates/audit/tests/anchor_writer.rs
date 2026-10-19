@@ -340,6 +340,12 @@ fn config_changed_non_policy_key_gets_no_line() {
         Some("instance.jira1.origin")
     ));
     assert!(!writer::gets_immediate_line("CONFIG_CHANGED", None));
+    // A legal hold change is its own type, `LEGAL_HOLD_CHANGED` (L185), never a
+    // `CONFIG_CHANGED` key.
+    assert!(!writer::gets_immediate_line(
+        "CONFIG_CHANGED",
+        Some("legal_hold")
+    ));
 }
 
 #[test]
@@ -714,6 +720,73 @@ fn interrupted_prune_appends_missing_prune_line() {
     assert!(fs.is_empty(), "{fs:?}");
 }
 
+#[test]
+fn committed_prune_lines_lost_with_the_dir_are_written_at_next_start() {
+    let base = tempfile::tempdir().expect("base");
+    let dir = base.path().join("anchors");
+    std::fs::create_dir(&dir).expect("anchor dir");
+    let (store, f) = store_on(&dir, |_| {});
+    corroborate(&store);
+    store.append_batch(mixed(10)).expect("append");
+    store.flush_head_anchor().expect("flush");
+    drain(&store);
+    // The share goes offline; the PRUNE commits and its first-retained update reaches the
+    // keychain, but its anchor-dir lines are lost at quit.
+    let away = base.path().join("away");
+    std::fs::rename(&dir, &away).expect("share offline");
+    let prune = testing::insert_fake_prune(
+        &store,
+        FakePrune {
+            first_retained_seq: 3,
+            cutoff: "2026-06-01".into(),
+            settings: snapshot(&dir),
+            update_first_retained: true,
+        },
+    )
+    .expect("fake prune")
+    .seq;
+    store.flush_head_anchor().expect("flush");
+    store.shutdown();
+    std::fs::rename(&away, &dir).expect("share back");
+    let is_prune_line = |l: &AnchorLine| matches!(l, AnchorLine::Prune { .. });
+    assert!(!lines(&dir, &f.chain_id).iter().any(is_prune_line));
+
+    // The next start appends them once; not an interrupted prune (the keychain has it).
+    let counts = |ls: &[AnchorLine]| {
+        (
+            ls.iter().filter(|l| is_prune_line(l)).count(),
+            immediates(ls)
+                .iter()
+                .filter(|i| **i == (prune, "PRUNE".to_string()))
+                .count(),
+        )
+    };
+    let (store, findings) = open_ready(&f, f.config());
+    assert!(
+        !findings
+            .iter()
+            .any(|x| x.kind == FindingKind::InterruptedPruneReconciled),
+        "{findings:?}"
+    );
+    drain(&store);
+    store.shutdown();
+    let ls = lines(&dir, &f.chain_id);
+    assert_eq!(counts(&ls), (1, 1), "{ls:?}");
+    assert!(ls.contains(&AnchorLine::Prune {
+        first_retained_seq: 3,
+        first_retained_prev_hash: row_hash_of(&f, 2),
+        cutoff_epoch: "2026-06-01".into(),
+    }));
+
+    // A later start does not write them again.
+    let (store, _) = open_ready(&f, f.config());
+    drain(&store);
+    store.shutdown();
+    assert_eq!(counts(&lines(&dir, &f.chain_id)), (1, 1));
+    let fs = full_verify_fresh(&f);
+    assert!(fs.is_empty(), "{fs:?}");
+}
+
 /// The `last_pruned_record_hash` of the `prune_log` row whose first retained seq is `seq + 1`.
 fn row_hash_of(f: &Fixture, seq: u64) -> [u8; 32] {
     let h: Vec<u8> = raw_conn(f)
@@ -819,6 +892,88 @@ fn write_failure_sets_health_and_retries_no_incident() {
     store.shutdown();
     let types = testing::event_types(&f.data).expect("event types");
     assert!(!types.iter().any(|t| t == "VERIFY"), "{types:?}");
+}
+
+/// Whether the chain file holds `(seq, event_type)` as an immediate line; tolerates a file
+/// being appended to meanwhile (a torn last line is skipped).
+fn holds_immediate(dir: &Path, chain_id: &str, want: &(u64, String)) -> bool {
+    let Ok(text) = std::fs::read_to_string(chain_file(dir, chain_id)) else {
+        return false;
+    };
+    let ls: Vec<AnchorLine> = text.lines().filter_map(|l| parse_line(l).ok()).collect();
+    immediates(&ls).contains(want)
+}
+
+#[test]
+fn failing_old_dir_does_not_block_the_new_dirs_lines() {
+    let base = tempfile::tempdir().expect("base");
+    let old = base.path().join("offline");
+    let (store, f) = store_on(&old, |_| {});
+    corroborate(&store);
+    store.append_batch(mixed(3)).expect("append");
+    wait_until("old dir failing", || {
+        store.health().anchor_dir_write_failing
+    });
+
+    // The user switches to a reachable dir: its lines are written right after their commit,
+    // without a forced attempt, while the old dir's lines stay queued.
+    let new = base.path().join("local");
+    std::fs::create_dir(&new).expect("new dir");
+    store
+        .apply_setting(
+            SettingChange::AnchorDir(Some(dir_text(&new))),
+            Some(confirmed()),
+        )
+        .expect("switch");
+    let retention = store
+        .apply_setting(SettingChange::RetentionDays(120), None)
+        .expect("retention")
+        .seq;
+    let want = (retention, "CONFIG_CHANGED".to_string());
+    wait_until("the new dir's line", || {
+        holds_immediate(&new, &f.chain_id, &want)
+    });
+    let h = store.health();
+    assert!(h.anchor_dir_write_failing, "the old dir still fails: {h:?}");
+    assert!(h.anchor_dir_lines_pending > 0, "{h:?}");
+
+    // A forced attempt (as at quit) writes the new dir's lines and leaves the old dir's queued.
+    let hold = store
+        .apply_setting(SettingChange::LegalHold(true), Some(confirmed()))
+        .expect("legal hold")
+        .seq;
+    assert!(!store.testing_anchor_dir_drain(), "the old dir's lines");
+    let ls = lines(&new, &f.chain_id);
+    assert!(matches!(ls[0], AnchorLine::Header { .. }), "{ls:?}");
+    assert_eq!(headers(&ls), 1);
+    let got = immediates(&ls);
+    assert!(got.contains(&want), "{got:?}");
+    assert!(
+        got.contains(&(hold, "LEGAL_HOLD_CHANGED".to_string())),
+        "{got:?}"
+    );
+    assert!(store.health().anchor_dir_write_failing);
+    assert!(!old.exists());
+    let t = Instant::now();
+    store.shutdown();
+    assert!(
+        t.elapsed() < Duration::from_secs(5),
+        "a failing drain is bounded"
+    );
+}
+
+#[test]
+fn first_run_creates_the_chain_file_with_its_header() {
+    let dir = tempfile::tempdir().expect("anchor dir");
+    let (store, f) = new_store_with(fake_clock(START), MemKeyring::new(), |cfg| {
+        cfg.anchor_dir = Some(dir.path().to_path_buf());
+    });
+    // No line is due yet (GENESIS has a NULL epoch), but the file and its header exist.
+    drain(&store);
+    let ls = lines(dir.path(), &f.chain_id);
+    assert_eq!(ls.len(), 1, "{ls:?}");
+    assert!(matches!(ls[0], AnchorLine::Header { .. }), "{ls:?}");
+    store.shutdown();
 }
 
 #[test]

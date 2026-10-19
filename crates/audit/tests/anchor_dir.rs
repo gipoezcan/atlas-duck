@@ -774,6 +774,8 @@ fn interrupted_prune() -> (Fixture, TempDir, u64) {
     store.append_batch(mixed(10)).expect("append");
     store.testing_enable_anchors();
     store.flush_head_anchor().expect("flush");
+    // The writer's lines are in the file before the pause (it would hold them otherwise).
+    assert!(store.testing_anchor_dir_drain(), "anchor-dir queue drained");
     store.testing_pause_anchors();
     let prune = testing::insert_fake_prune(
         &store,
@@ -832,6 +834,17 @@ fn contradicting_anchor_line_blocks_interrupted_prune_reconciliation() {
     );
     assert!(v.anchor_actions.set_first_retained.is_none());
     assert!(v.anchor_actions.defer_prune.is_none());
+
+    // A start with that verdict never attests the refused prune with a `Prune` line.
+    let (store, _) = open_ready(&f);
+    assert!(store.testing_anchor_dir_drain(), "anchor-dir queue drained");
+    store.shutdown();
+    let text = std::fs::read_to_string(dir.path().join(file_name(&f.chain_id))).expect("file");
+    let ls: Vec<AnchorLine> = text.lines().map(|l| parse_line(l).expect("line")).collect();
+    assert!(
+        !ls.iter().any(|l| matches!(l, AnchorLine::Prune { .. })),
+        "{ls:?}"
+    );
 }
 
 #[test]
