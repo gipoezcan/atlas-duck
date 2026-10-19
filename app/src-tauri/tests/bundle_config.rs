@@ -586,9 +586,10 @@ mod t21 {
     }
 
     #[test]
-    fn hooks_define_only_the_post_install_hook() {
-        // The upgrade drain and the uninstall rules are M10 (§14); defining their macros here
-        // would silently take them over.
+    fn hooks_define_the_drain_and_uninstall_macros() {
+        // M10 Task 23 (§12.2, PD-172): the upgrade drain (PREINSTALL, PREUNINSTALL) and the
+        // uninstall rules (PREUNINSTALL forces the app-data option off, POSTUNINSTALL is an
+        // explicit no-op) live in hooks.nsh; the M1 rule that they were absent is retired.
         let code = hooks_code();
         for macro_name in [
             "NSIS_HOOK_PREINSTALL",
@@ -596,8 +597,8 @@ mod t21 {
             "NSIS_HOOK_POSTUNINSTALL",
         ] {
             assert!(
-                !code.contains(&format!("!macro {macro_name}")),
-                "hooks.nsh defines {macro_name}, which is M10's"
+                code.contains(&format!("!macro {macro_name}")),
+                "hooks.nsh does not define {macro_name} (M10 Task 23)"
             );
         }
     }
