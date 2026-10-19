@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use atlas_duck_audit::anchor_dir::{AnchorLine, file_name, parse_line, to_line, writer};
+use atlas_duck_audit::anchor_dir::{
+    AnchorLine, MAX_LINE_BYTES, file_name, parse_line, to_line, writer,
+};
 use atlas_duck_audit::error::AuditError;
 use atlas_duck_audit::testing::{self, FakePrune, FaultPoint, Faults, MemKeyring};
 use atlas_duck_audit::types::{Confirmed, EventFlags, EventType, RustChosenPath};
@@ -1021,13 +1023,20 @@ fn missing_current_chain_file_recreated_with_header() {
     store.flush_head_anchor().expect("flush");
     store.shutdown();
 
-    // At a start: the current chain's file is created with its header, no line needed.
+    // At a start: the current chain's file is created with its header, no line needed (the
+    // only other line is the catch-up of the anchor-dir change that named this dir, which the
+    // file no longer holds).
     std::fs::remove_file(&file).expect("remove");
     let (store, _) = open_ready(&f, f.config());
     drain(&store);
     let ls = lines(dir.path(), &f.chain_id);
-    assert_eq!(ls.len(), 1, "{ls:?}");
+    assert_eq!(ls.len(), 2, "{ls:?}");
     assert!(matches!(ls[0], AnchorLine::Header { .. }));
+    let switch = dump_rows(&f)
+        .into_iter()
+        .find(|r| r.event_type == "CONFIG_CHANGED")
+        .expect("the anchor-dir change");
+    assert_eq!(ls[1], immediate_of(&switch), "{ls:?}");
     store.shutdown();
 }
 
@@ -1254,13 +1263,15 @@ fn u06_change_anchor_dir_writes_detached_first() {
     let old = lines(&a, &f.chain_id);
     let n = old.len();
     assert_eq!(old[n - 2], immediate_of(&r), "{old:?}");
+    // `detached_at` is the record's `ts_utc` (deterministic, so a startup catch-up of a lost
+    // switch line writes the same text).
     assert_eq!(
         old[n - 1],
         AnchorLine::Detached {
             seq: c.seq,
             record_hash: r.record_hash,
             epoch: r.epoch.clone(),
-            detached_at: START.into(),
+            detached_at: r.ts_utc.clone(),
         },
         "{old:?}"
     );
@@ -1502,13 +1513,24 @@ fn unwritable_new_dir_commits_nothing() {
     std::fs::write(&not_a_dir, b"x").expect("file");
     let (head, settings) = (store.head(), store.settings());
     let rows = dump_rows(&f).len();
+    let mut same_dir = vec![
+        // The dir in force already: nothing to change.
+        dir.path().to_path_buf(),
+        // Spelled with a trailing separator (review M-6).
+        dir.path().join(""),
+    ];
+    if cfg!(windows) {
+        // In other case (Windows paths are case-insensitive).
+        same_dir.push(PathBuf::from(dir_text(dir.path()).to_uppercase()));
+    }
     for p in [
         missing.clone(),
         not_a_dir.clone(),
         PathBuf::from("relative-anchors"),
-        // The dir in force already: nothing to change.
-        dir.path().to_path_buf(),
-    ] {
+    ]
+    .into_iter()
+    .chain(same_dir)
+    {
         let e = store
             .change_anchor_dir(Some(chosen(&p)), confirmed())
             .expect_err("refused");
@@ -1573,13 +1595,26 @@ fn change_anchor_dir_never_deletes() {
     only_appended(&before, &files_under(base.path()));
 
     // White box: the anchor-dir code asks the file system for no deletion, rename or
-    // truncation at all (a file is only ever created with create-new or opened to append).
-    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src")
-        .join("anchor_dir");
-    for e in std::fs::read_dir(&src).expect("anchor_dir sources") {
+    // truncation at all (a file is only ever created with create-new or opened to append):
+    // the `anchor_dir` sources, and the switch's code outside them (review M-7).
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut scanned: Vec<(String, String)> = Vec::new();
+    for e in std::fs::read_dir(src.join("anchor_dir")).expect("anchor_dir sources") {
         let p = e.expect("entry").path();
         let text = std::fs::read_to_string(&p).expect("source");
+        scanned.push((p.display().to_string(), text));
+    }
+    for (file, sig) in [
+        ("store.rs", "    pub fn change_anchor_dir("),
+        ("store.rs", "    fn send_change_anchor_dir("),
+        ("store.rs", "    fn queue_committed_switch_lines("),
+        ("writer.rs", "    pub(crate) fn push_anchor_dir_switch("),
+        ("settings.rs", "    pub(crate) fn change_anchor_dir_run("),
+    ] {
+        let text = std::fs::read_to_string(src.join(file)).expect("source");
+        scanned.push((format!("{file}: {}", sig.trim()), method_body(&text, sig)));
+    }
+    for (what, text) in &scanned {
         for needle in [
             "remove_file",
             "remove_dir",
@@ -1590,9 +1625,22 @@ fn change_anchor_dir_never_deletes() {
             "File::create",
             "write(true)",
         ] {
-            assert!(!text.contains(needle), "{} asks for {needle}", p.display());
+            assert!(!text.contains(needle), "{what} asks for {needle}");
         }
     }
+}
+
+/// The text of the method whose signature line starts with `sig` (4-space indented, as in an
+/// `impl` block): up to its closing brace.
+fn method_body(text: &str, sig: &str) -> String {
+    let start = text
+        .find(sig)
+        .unwrap_or_else(|| panic!("{sig} not found: the scan must follow a rename"));
+    let rest = &text[start..];
+    let end = rest
+        .find("\n    }\n")
+        .unwrap_or_else(|| panic!("end of {sig} not found"));
+    rest[..end].to_string()
 }
 
 #[test]
@@ -1801,17 +1849,21 @@ fn incident_file_written_once_per_verify_seq() {
     drain(&store);
     assert!(!incident_file(dir.path(), &f.chain_id, info).exists());
 
-    // Create-new: a file already at the next incident's name is never overwritten.
+    // Create-new: a file already at the next incident's name is never overwritten; foreign
+    // content there does not pass silently (health), and the chain file's lines still go out.
     let next = store.head().0 + 1;
     let planted = incident_file(dir.path(), &f.chain_id, next);
     std::fs::write(&planted, b"planted").expect("planted");
+    assert!(!store.health().anchor_dir_write_failing);
     let second = testing::apply_startup(&store, &incident("two"))
         .expect("incident")
         .verify_seq
         .expect("VERIFY");
     assert_eq!(second, next);
     drain(&store);
-    assert!(!store.health().anchor_dir_write_failing);
+    let h = store.health();
+    assert!(h.anchor_dir_write_failing, "{h:?}");
+    assert_eq!(h.anchor_dir_lines_pending, 0, "{h:?}");
     assert_eq!(std::fs::read(&planted).expect("planted"), b"planted");
     assert_eq!(std::fs::read(&file1).expect("file"), bytes);
     store.shutdown();
@@ -1891,8 +1943,9 @@ fn torn_last_line_tolerated_both_sides() {
     );
     assert!(store.open_incidents().is_empty());
 
-    // Writer: before its next append the fragment is closed by a newline and followed by a
-    // Record line for the head; then the lines go on.
+    // Writer: before its next append the fragment is closed by a newline; then the lines go on.
+    // Nothing is corroborated in this process yet, so the head (dated) gets no Record line
+    // there (PD-157, review M-3): the newline alone closes the fragment.
     let retention = store
         .apply_setting(SettingChange::RetentionDays(120), None)
         .expect("retention")
@@ -1902,11 +1955,11 @@ fn torn_last_line_tolerated_both_sides() {
     let text = std::fs::read_to_string(&file).expect("file");
     let raw: Vec<&str> = text.lines().collect();
     let i = raw.iter().position(|l| *l == frag).expect("fragment line");
-    let head = match parse_line(raw[i + 1]) {
-        Ok(AnchorLine::Record { seq, .. }) => seq,
-        other => panic!("not a Record line after the fragment: {other:?}"),
-    };
-    assert_eq!(parse_line(raw[i + 1]).ok(), Some(record_of(&row(&f, head))));
+    assert_eq!(
+        parse_line(raw[i + 1]).ok(),
+        Some(immediate_of(&row(&f, retention))),
+        "{raw:?}"
+    );
     let ls = lines_but(dir.path(), &f.chain_id, &frag);
     assert!(immediates(&ls).contains(&(retention, "CONFIG_CHANGED".into())));
     let fs = full_verify_fresh(&f);
@@ -1943,6 +1996,10 @@ fn garbage_line_still_mismatch() {
             format!("{frag}\nnot an anchor line"),
         ),
         ("a fragment without the opening", frag[2..].to_string()),
+        (
+            "a torn-looking line longer than MAX_LINE_BYTES",
+            format!("{{\"seq\":{}", "1".repeat(MAX_LINE_BYTES)),
+        ),
     ] {
         let fs = with(&bad);
         assert!(
@@ -1961,4 +2018,518 @@ fn garbage_line_still_mismatch() {
         .count();
     assert_eq!(bad, 2, "{fs:?}");
     assert!(!kinds(&fs).contains(&FindingKind::AnchorDirTornLine));
+}
+
+/// Any `AnchorDirMismatch` whose detail contains `what`.
+fn mismatch(fs: &[VerifyFinding], what: &str) -> bool {
+    fs.iter()
+        .any(|x| x.kind == FindingKind::AnchorDirMismatch && x.detail.contains(what))
+}
+
+#[test]
+fn torn_first_line_tolerated_only_before_a_header() {
+    use FindingKind::AnchorDirTornLine as Torn;
+    let (store, f, dir) = anchored();
+    corroborate(&store);
+    store.append_batch(mixed(3)).expect("append");
+    store.flush_head_anchor().expect("flush");
+    store.shutdown();
+    let file = chain_file(dir.path(), &f.chain_id);
+    let original = std::fs::read_to_string(&file).expect("file");
+    let (header, rest) = original.split_once('\n').expect("header line");
+    let torn_header = &header[..header.len() / 2];
+    let frag = fragment();
+    let valid = to_line(&record_of(&row(&f, 1)));
+    let with = |text: String| {
+        std::fs::write(&file, text).expect("write");
+        full_verify_fresh(&f)
+    };
+
+    // A crash while the header was written, then the header on the next line (the writer's
+    // repair): informational only.
+    let fs = with(format!("{torn_header}\n{header}\n{rest}"));
+    assert_eq!(kinds(&fs), vec![Torn], "{fs:?}");
+    // Two crashes in a row (review M-1): a run of torn lines, at line 1, mid-file, at the end.
+    let fs = with(format!("{torn_header}\n{frag}\n{header}\n{rest}"));
+    assert_eq!(kinds(&fs), vec![Torn, Torn], "{fs:?}");
+    let fs = with(format!("{original}{frag}\n{frag}\n{valid}\n"));
+    assert_eq!(kinds(&fs), vec![Torn, Torn], "{fs:?}");
+    let fs = with(format!("{original}{frag}\n{frag}"));
+    assert_eq!(kinds(&fs), vec![Torn, Torn], "{fs:?}");
+
+    // The header replaced by a fragment: tearing is no quieter than deleting (review I-1).
+    let fs = with(format!("{frag}\n{rest}"));
+    assert!(mismatch(&fs, "line 1 is not a valid anchor line"), "{fs:?}");
+    assert!(!kinds(&fs).contains(&Torn), "{fs:?}");
+    // Only a torn header: no header, like an empty file.
+    for text in [torn_header.to_string(), format!("{torn_header}\n")] {
+        let fs = with(text);
+        assert!(mismatch(&fs, "no header line"), "{fs:?}");
+        assert!(!kinds(&fs).contains(&Torn), "{fs:?}");
+    }
+    // A header naming another chain after a torn line 1 does not make it torn.
+    let other = match parse_line(header) {
+        Ok(AnchorLine::Header {
+            install_id,
+            host,
+            os_user,
+            created_at,
+            ..
+        }) => to_line(&AnchorLine::Header {
+            chain_id: "ab".repeat(16),
+            install_id,
+            host,
+            os_user,
+            created_at,
+        }),
+        other => panic!("line 1 is not a header: {other:?}"),
+    };
+    let fs = with(format!("{torn_header}\n{other}\n{rest}"));
+    assert!(mismatch(&fs, "line 1 is not a valid anchor line"), "{fs:?}");
+    assert!(mismatch(&fs, "the header names another chain"), "{fs:?}");
+    // A header after a torn line elsewhere is still a header after line 1.
+    let fs = with(format!("{original}{frag}\n{header}\n"));
+    assert!(mismatch(&fs, "a header line after line 1"), "{fs:?}");
+}
+
+#[test]
+fn torn_header_gets_the_header_after_it() {
+    let (store, f) = new_store_with(fake_clock(START), MemKeyring::new(), |_| {});
+    let base = tempfile::tempdir().expect("base");
+    let header = to_line(&AnchorLine::Header {
+        chain_id: f.chain_id.clone(),
+        install_id: f.install_id.clone(),
+        host: "host".into(),
+        os_user: "user".into(),
+        created_at: START.into(),
+    });
+    let torn = header[..header.len() / 2].to_string();
+    let frag = fragment();
+    // A: the crash tore the header write (no newline). B: a second crash tore the repair right
+    // after its newline, so two torn lines and a final newline.
+    let (a, b) = (base.path().join("a"), base.path().join("b"));
+    for (d, text) in [(&a, torn.clone()), (&b, format!("{torn}\n{frag}\n"))] {
+        std::fs::create_dir(d).expect("dir");
+        std::fs::write(chain_file(d, &f.chain_id), text).expect("torn header");
+    }
+    let raw_lines = |d: &Path| -> Vec<String> {
+        let text = std::fs::read_to_string(chain_file(d, &f.chain_id)).expect("file");
+        assert!(text.ends_with('\n'), "{text:?}");
+        text.lines().map(str::to_owned).collect()
+    };
+    let is_header = |l: &str| matches!(parse_line(l), Ok(AnchorLine::Header { chain_id, .. }) if chain_id == f.chain_id);
+
+    let to_a = store
+        .change_anchor_dir(Some(chosen(&a)), confirmed())
+        .expect("a");
+    drain(&store);
+    let la = raw_lines(&a);
+    assert_eq!(la.len(), 3, "{la:?}");
+    assert_eq!(la[0], torn);
+    assert!(is_header(&la[1]), "{la:?}");
+    assert_eq!(
+        parse_line(&la[2]).ok(),
+        Some(immediate_of(&row(&f, to_a.seq)))
+    );
+    let fs = store.full_verify();
+    assert_eq!(kinds(&fs), vec![FindingKind::AnchorDirTornLine], "{fs:?}");
+
+    let to_b = store
+        .change_anchor_dir(Some(chosen(&b)), confirmed())
+        .expect("b");
+    drain(&store);
+    let lb = raw_lines(&b);
+    assert_eq!(lb.len(), 4, "{lb:?}");
+    assert_eq!(
+        (lb[0].as_str(), lb[1].as_str()),
+        (torn.as_str(), frag.as_str())
+    );
+    assert!(is_header(&lb[2]), "{lb:?}");
+    assert_eq!(
+        parse_line(&lb[3]).ok(),
+        Some(immediate_of(&row(&f, to_b.seq)))
+    );
+    let fs = store.full_verify();
+    assert_eq!(
+        kinds(&fs),
+        vec![
+            FindingKind::AnchorDirTornLine,
+            FindingKind::AnchorDirTornLine
+        ],
+        "{fs:?}"
+    );
+    // A restart (its "ensure file" item) adds no second header.
+    store.shutdown();
+    let (store, _) = open_ready(&f, f.config());
+    drain(&store);
+    store.shutdown();
+    assert_eq!(raw_lines(&b).iter().filter(|l| is_header(l)).count(), 1);
+}
+
+#[test]
+fn partial_incident_file_completed_by_appending() {
+    let (store, f, dir) = anchored();
+    let check = |path: &Path, verify_seq: u64| {
+        let bytes = std::fs::read(path).expect("incident file");
+        let v: Value = serde_json::from_slice(&bytes).expect("complete JSON");
+        assert_eq!(
+            bytes,
+            atlas_duck_ipc::jcs::to_jcs_vec(&v).expect("jcs"),
+            "JCS"
+        );
+        assert_eq!(v["chain_id"], f.chain_id.as_str());
+        assert_eq!(v["verify_seq"], verify_seq);
+        assert_eq!(
+            v["record_hash"],
+            hex::encode(row(&f, verify_seq).record_hash)
+        );
+        bytes
+    };
+    // A crash (or a failed write) between the file's creation and its text: an empty file.
+    let next = store.head().0 + 1;
+    let empty = incident_file(dir.path(), &f.chain_id, next);
+    std::fs::write(&empty, b"").expect("empty incident file");
+    let v = testing::apply_startup(&store, &incident("empty"))
+        .expect("incident")
+        .verify_seq
+        .expect("VERIFY");
+    assert_eq!(v, next);
+    drain(&store);
+    check(&empty, v);
+    assert!(!store.health().anchor_dir_write_failing);
+
+    // Cut after its first key (JCS: `chain_id` sorts first): the rest is appended.
+    let next = store.head().0 + 1;
+    let partial = incident_file(dir.path(), &f.chain_id, next);
+    let prefix = format!("{{\"chain_id\":\"{}\",", f.chain_id);
+    std::fs::write(&partial, &prefix).expect("partial incident file");
+    let v = testing::apply_startup(&store, &incident("prefix"))
+        .expect("incident")
+        .verify_seq
+        .expect("VERIFY");
+    assert_eq!(v, next);
+    drain(&store);
+    assert!(check(&partial, v).starts_with(prefix.as_bytes()));
+    assert!(!store.health().anchor_dir_write_failing);
+    store.shutdown();
+}
+
+#[test]
+fn lost_switch_lines_written_at_next_start() {
+    let base = tempfile::tempdir().expect("base");
+    let (a, b, d) = (
+        base.path().join("a"),
+        base.path().join("b"),
+        base.path().join("d"),
+    );
+    std::fs::create_dir(&b).expect("b");
+    std::fs::create_dir(&d).expect("d");
+    // The old dir is offline at the switch and stays offline until quit: its Immediate and
+    // ANCHOR_DETACHED lines are dropped by the bounded shutdown drain.
+    let (store, f) = store_on_offline(&a, |cfg| cfg.hooks.fast_anchor_backoff = true);
+    corroborate(&store);
+    store.append_batch(mixed(3)).expect("append");
+    let c = store
+        .change_anchor_dir(Some(chosen(&b)), confirmed())
+        .expect("switch")
+        .seq;
+    let want = (c, "CONFIG_CHANGED".to_string());
+    wait_until("the new dir's line", || {
+        holds_immediate(&b, &f.chain_id, &want)
+    });
+    store.flush_head_anchor().expect("flush");
+    store.shutdown();
+    std::fs::create_dir(&a).expect("share back");
+    assert!(!chain_file(&a, &f.chain_id).exists());
+
+    // The next start writes them (the new file's header first), detached_at being the
+    // record's ts_utc; the new dir's line is not written twice.
+    let r = row(&f, c);
+    let detached = AnchorLine::Detached {
+        seq: c,
+        record_hash: r.record_hash,
+        epoch: r.epoch.clone(),
+        detached_at: r.ts_utc.clone(),
+    };
+    let (store, _) = open_ready(&f, f.config());
+    drain(&store);
+    store.flush_head_anchor().expect("flush");
+    store.shutdown();
+    let la = lines(&a, &f.chain_id);
+    assert_eq!(la.len(), 3, "{la:?}");
+    assert!(matches!(la[0], AnchorLine::Header { .. }), "{la:?}");
+    assert_eq!(la[1..].to_vec(), vec![immediate_of(&r), detached.clone()]);
+    let count = |ls: &[AnchorLine], l: &AnchorLine| ls.iter().filter(|x| *x == l).count();
+    assert_eq!(count(&lines(&b, &f.chain_id), &immediate_of(&r)), 1);
+
+    // Idempotent: a later start writes nothing again.
+    let a_bytes = std::fs::read(chain_file(&a, &f.chain_id)).expect("a");
+    let (store, _) = open_ready(&f, f.config());
+    drain(&store);
+    store.flush_head_anchor().expect("flush");
+    store.shutdown();
+    assert_eq!(
+        std::fs::read(chain_file(&a, &f.chain_id)).expect("a"),
+        a_bytes
+    );
+    assert_eq!(count(&lines(&b, &f.chain_id), &immediate_of(&r)), 1);
+    let fs = full_verify_fresh(&f);
+    assert!(fs.is_empty(), "{fs:?}");
+
+    // Bounded: the old dir is tried at the first start after the change's run only, so a
+    // share removed for good is not tried at every start.
+    let away = base.path().join("b-away");
+    let (store, _) = open_ready(&f, f.config());
+    // No handle of the thread is open in b while it goes away (Windows refuses the rename).
+    drain(&store);
+    std::fs::rename(&b, &away).expect("b offline");
+    let c2 = store
+        .change_anchor_dir(Some(chosen(&d)), confirmed())
+        .expect("switch to d")
+        .seq;
+    let want = (c2, "CONFIG_CHANGED".to_string());
+    wait_until("d's line", || holds_immediate(&d, &f.chain_id, &want));
+    store.flush_head_anchor().expect("flush");
+    store.shutdown();
+    // The first start after it: b is still offline; this run's APP_START follows (Core).
+    let (store, _) = open_ready(&f, f.config());
+    append_one(&store, EventType::APP_START);
+    store.flush_head_anchor().expect("flush");
+    store.shutdown();
+    std::fs::rename(&away, &b).expect("b back");
+    let (store, _) = open_ready(&f, f.config());
+    drain(&store);
+    store.shutdown();
+    let lb = lines(&b, &f.chain_id);
+    assert!(
+        !lb.iter().any(|l| matches!(l,
+            AnchorLine::Detached { seq, .. } | AnchorLine::Immediate { seq, .. } if *seq == c2)),
+        "{lb:?}"
+    );
+}
+
+#[test]
+fn no_catch_up_lines_after_an_integrity_incident() {
+    let base = tempfile::tempdir().expect("base");
+    let (a, b) = (base.path().join("a"), base.path().join("b"));
+    std::fs::create_dir(&a).expect("a");
+    std::fs::create_dir(&b).expect("b");
+    let (store, f) = store_on(&a, |cfg| cfg.hooks.fast_anchor_backoff = true);
+    corroborate(&store);
+    store.append_batch(mixed(10)).expect("append");
+    store.flush_head_anchor().expect("flush");
+    drain(&store);
+    // A goes offline: a PRUNE (confirmed by the keychain) and a switch to B lose their lines.
+    let away = base.path().join("a-away");
+    std::fs::rename(&a, &away).expect("a offline");
+    let prune = testing::insert_fake_prune(
+        &store,
+        FakePrune {
+            first_retained_seq: 3,
+            cutoff: "2026-06-01".into(),
+            settings: snapshot(&a),
+            update_first_retained: true,
+        },
+    )
+    .expect("fake prune")
+    .seq;
+    let c = store
+        .change_anchor_dir(Some(chosen(&b)), confirmed())
+        .expect("switch")
+        .seq;
+    let want = (c, "CONFIG_CHANGED".to_string());
+    wait_until("b's line", || holds_immediate(&b, &f.chain_id, &want));
+    store.flush_head_anchor().expect("flush");
+    store.shutdown();
+    std::fs::rename(&away, &a).expect("a back");
+    let a_before = std::fs::read(chain_file(&a, &f.chain_id)).expect("a");
+    let prune_lines = |ls: &[AnchorLine]| {
+        (
+            ls.iter()
+                .filter(|l| matches!(l, AnchorLine::Prune { .. }))
+                .count(),
+            immediates(ls).contains(&(prune, "PRUNE".to_string())),
+        )
+    };
+    assert_eq!(prune_lines(&lines(&b, &f.chain_id)), (0, false));
+
+    // A start whose verification found an integrity incident attests nothing (review I-4).
+    let store = testing::open_existing(&f.data, &f.lock, f.config()).expect("open_existing");
+    testing::apply_startup(&store, &incident("the trust root disagrees")).expect("incident");
+    drain(&store);
+    assert_eq!(
+        std::fs::read(chain_file(&a, &f.chain_id)).expect("a"),
+        a_before
+    );
+    assert_eq!(prune_lines(&lines(&b, &f.chain_id)), (0, false));
+
+    // Control: a clean start writes them.
+    testing::apply_startup(&store, &StartupVerdict::default()).expect("clean");
+    drain(&store);
+    let r = row(&f, c);
+    let la = lines(&a, &f.chain_id);
+    let n = la.len();
+    assert_eq!(la[n - 2], immediate_of(&r), "{la:?}");
+    assert!(
+        matches!(&la[n - 1], AnchorLine::Detached { seq, .. } if *seq == c),
+        "{la:?}"
+    );
+    assert_eq!(prune_lines(&lines(&b, &f.chain_id)), (1, true));
+    store.shutdown();
+}
+
+#[test]
+fn torn_close_writes_no_line_dated_past_the_corroborated_date() {
+    // As daily_line_never_past_corroborated_date: the second process stamps 2026-10-13 while
+    // only 2026-10-10 is corroborated.
+    let clock = fake_clock("2026-10-13T12:00:00.000Z");
+    let (store, f) = new_store(clock.clone(), MemKeyring::new());
+    corroborate_now(&store, &clock);
+    store.append_batch(day_events(2)).expect("append");
+    let dir = tempfile::tempdir().expect("anchor dir");
+    store
+        .change_anchor_dir(Some(chosen(dir.path())), confirmed())
+        .expect("anchor dir");
+    store.flush_head_anchor().expect("flush");
+    store.shutdown();
+    let (store, _) = open_ready(&f, f.config());
+    store.observe_server_date(
+        "i1",
+        server_time("2026-10-10T12:00:00.000Z"),
+        Instant::now(),
+    );
+    drain(&store);
+    let file = chain_file(dir.path(), &f.chain_id);
+    let frag = fragment();
+    append_raw(&file, frag.as_bytes());
+
+    // The head is dated 2026-10-13, past the corroborated date: the newline alone closes the
+    // fragment (review M-3), followed by an immediate line (the CLOCK_ANOMALY of the
+    // observation, or the retention change, whichever comes first).
+    let retention = store
+        .apply_setting(SettingChange::RetentionDays(120), None)
+        .expect("retention")
+        .seq;
+    drain(&store);
+    let text = std::fs::read_to_string(&file).expect("file");
+    let raw: Vec<&str> = text.lines().collect();
+    let i = raw.iter().position(|l| *l == frag).expect("fragment line");
+    assert!(
+        matches!(parse_line(raw[i + 1]), Ok(AnchorLine::Immediate { .. })),
+        "{raw:?}"
+    );
+    let ls = lines_but(dir.path(), &f.chain_id, &frag);
+    assert!(records(&ls).is_empty(), "{ls:?}");
+    assert!(immediates(&ls).contains(&(retention, "CONFIG_CHANGED".into())));
+
+    // Once 2026-10-13 is corroborated, its daily line is written (nothing suppressed it).
+    store.observe_server_date(
+        "i1",
+        server_time("2026-10-13T12:00:00.000Z"),
+        Instant::now(),
+    );
+    let seq = append_one(&store, EventType::APP_START);
+    drain(&store);
+    store.shutdown();
+    assert_eq!(
+        records(&lines_but(dir.path(), &f.chain_id, &frag)),
+        vec![(seq, false, Some("2026-10-13".to_string()))]
+    );
+}
+
+#[test]
+fn torn_line_closed_by_a_group_without_lines() {
+    let frag = fragment();
+    let after_fragment = |file: &Path| -> Vec<Option<AnchorLine>> {
+        let text = std::fs::read_to_string(file).expect("file");
+        assert!(text.ends_with('\n'), "{text:?}");
+        let raw: Vec<&str> = text.lines().collect();
+        let i = raw.iter().position(|l| *l == frag).expect("fragment line");
+        raw[i + 1..].iter().map(|l| parse_line(l).ok()).collect()
+    };
+
+    // An incident file alone (a corroborated head): the newline, then the head's Record line.
+    let (store, f, dir) = anchored();
+    corroborate(&store);
+    store.append_batch(mixed(3)).expect("append");
+    drain(&store);
+    let file = chain_file(dir.path(), &f.chain_id);
+    append_raw(&file, frag.as_bytes());
+    let v = testing::apply_startup(&store, &incident("close"))
+        .expect("incident")
+        .verify_seq
+        .expect("VERIFY");
+    drain(&store);
+    store.shutdown();
+    assert!(incident_file(dir.path(), &f.chain_id, v).exists());
+    assert_eq!(after_fragment(&file), vec![Some(record_of(&row(&f, v)))]);
+
+    // The "ensure file" item alone at a start (nothing ever corroborated: a NULL-epoch head).
+    let (store, f, dir) = anchored();
+    store.append_batch(mixed(3)).expect("append");
+    store.flush_head_anchor().expect("flush");
+    store.shutdown();
+    let file = chain_file(dir.path(), &f.chain_id);
+    append_raw(&file, frag.as_bytes());
+    let (store, findings) = open_ready(&f, f.config());
+    assert!(
+        kinds(&findings).contains(&FindingKind::AnchorDirTornLine),
+        "{findings:?}"
+    );
+    drain(&store);
+    store.shutdown();
+    let head = dump_rows(&f).last().expect("rows").clone();
+    assert!(head.epoch.is_none());
+    assert_eq!(after_fragment(&file), vec![Some(record_of(&head))]);
+}
+
+#[test]
+fn a_torn_line_never_silences_a_mismatch() {
+    let (store, f, dir) = anchored();
+    corroborate(&store);
+    store.append_batch(mixed(6)).expect("append");
+    day(&store, &f.clock, 4);
+    append_one(&store, EventType::APP_STOP);
+    store.flush_head_anchor().expect("flush");
+    store.shutdown();
+    let recs = records(&lines(dir.path(), &f.chain_id));
+    assert!(recs.len() >= 2, "{recs:?}");
+    let k = recs[1].0;
+    append_raw(&chain_file(dir.path(), &f.chain_id), fragment().as_bytes());
+    raw_conn(&f)
+        .execute(
+            "UPDATE events SET target = 'PROJ-forged' WHERE seq = ?1",
+            [k as i64],
+        )
+        .expect("tamper");
+    let head = rehash_from(&f, k);
+    set_keychain_head(&f, &head);
+
+    let fs = full_verify_fresh(&f);
+    assert!(has(&fs, FindingKind::AnchorDirMismatch, k), "{fs:?}");
+    assert!(
+        kinds(&fs).contains(&FindingKind::AnchorDirTornLine),
+        "{fs:?}"
+    );
+    // At a start: the VERIFY is an integrity incident.
+    let (store, findings) = open_ready(&f, f.config());
+    assert!(
+        has(&findings, FindingKind::AnchorDirMismatch, k),
+        "{findings:?}"
+    );
+    assert!(
+        kinds(&findings).contains(&FindingKind::AnchorDirTornLine),
+        "{findings:?}"
+    );
+    let verify_seq = dump_rows(&f)
+        .into_iter()
+        .rfind(|r| r.event_type == "VERIFY")
+        .expect("startup VERIFY")
+        .seq;
+    assert!(
+        store.open_incidents().contains(&verify_seq),
+        "{:?}",
+        store.open_incidents()
+    );
+    store.shutdown();
 }

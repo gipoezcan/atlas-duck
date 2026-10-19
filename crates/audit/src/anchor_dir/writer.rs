@@ -26,8 +26,10 @@
 //! `ANCHOR_DETACHED` line of an anchor-dir change come through the same queue (the store pushes
 //! them), and every integrity-incident `VERIFY` gets its incident file
 //! `<chain_id>.incident-<verify_seq>.json` beside the chain file (PD-164), created once with
-//! create-new. A chain file whose last line was torn by a crash is closed with a newline and a
-//! `Record` line for the head before anything else is appended to it (PD-165).
+//! create-new (one left partial is completed by appending; foreign content is never touched and
+//! shows as a write failure). A chain file whose last line was torn by a crash is closed with a
+//! newline and, when its date is not past the corroborated one, a `Record` line for the head
+//! before anything else is appended to it; a torn header gets the header after it (PD-165).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -41,7 +43,7 @@ use chrono::NaiveDate;
 use serde_json::json;
 
 use super::{AnchorLine, IMMEDIATE_TYPES, MAX_FILE_BYTES, MAX_LINE_BYTES, file_name, is_id};
-use super::{parse_line, resolve, to_line};
+use super::{parse_line, parse_raw, resolve, to_line};
 use crate::anchors::backoff;
 use crate::clock::{Clock, epoch_text, parse_epoch};
 use crate::settings;
@@ -403,6 +405,9 @@ struct DirState {
     /// The thread panicked: nothing will be written again.
     dead: bool,
     exited: bool,
+    /// An incident file's name held other content, left as it is (PD-164): shown as a write
+    /// failure for the rest of the process.
+    foreign_incident: bool,
 }
 
 /// The state shared by the writer thread (producer), the `Store` handles and the
@@ -440,6 +445,7 @@ impl AnchorDirShared {
                 stop: false,
                 dead: false,
                 exited: false,
+                foreign_incident: false,
             }),
             cv: Condvar::new(),
             file_lock: Mutex::new(()),
@@ -456,9 +462,19 @@ impl AnchorDirShared {
         lock(&self.state).fallback.clone()
     }
 
-    /// The committed head (writer thread, after each commit and at open), as its `Record` line.
-    pub(crate) fn set_head(&self, chain_id: &str, line: AnchorLine) {
-        lock(&self.state).head = Some((chain_id.to_owned(), line));
+    /// The committed head (writer thread, after each commit and at open), as its `Record` line,
+    /// with the date corroborated in this process when it committed (`None` at open). A head
+    /// dated past that date is never written after a torn line (PD-157: no dated line past the
+    /// corroborated date, which the file's daily rule would then read back); the newline alone
+    /// closes the fragment then.
+    pub(crate) fn set_head(
+        &self,
+        chain_id: &str,
+        line: AnchorLine,
+        corroborated: Option<NaiveDate>,
+    ) {
+        let dated_ok = record_date(&line).is_none_or(|d| corroborated.is_some_and(|c| d <= c));
+        lock(&self.state).head = dated_ok.then(|| (chain_id.to_owned(), line));
     }
 
     /// The new dir's chain file opened first (PD-166, also the writability check): created with
@@ -558,7 +574,7 @@ impl AnchorDirShared {
             .attempt_started
             .is_some_and(|t| t.elapsed() >= STUCK_AFTER);
         DirHealth {
-            write_failing: !st.failing.is_empty() || st.dead || stuck,
+            write_failing: !st.failing.is_empty() || st.dead || stuck || st.foreign_incident,
             lines_pending: u32::try_from(st.queue.len() + st.in_flight).unwrap_or(u32::MAX),
         }
     }
@@ -868,9 +884,10 @@ fn write_batch(
 }
 
 /// One group: the chain file opened (or created with its header), the group's incident files
-/// created, a torn last line closed (PD-165: a newline, then `head`'s `Record` line), then the
-/// lines appended in one write and fsynced. A failed write forgets what was known of the file,
-/// so the next attempt reads it again (and finds a line the failure tore).
+/// created, a torn last line closed (PD-165: a newline, then `head`'s `Record` line when there
+/// is one, see `set_head`), then the lines appended in one write and fsynced. A failed write
+/// forgets what was known of the file, so the next attempt reads it again (and finds a line the
+/// failure tore).
 fn append_group(
     shared: &AnchorDirShared,
     header: &HeaderFacts,
@@ -898,8 +915,10 @@ fn append_group(
         files.insert(key.clone(), None);
     }
     for p in group {
-        if let Item::Incident { verify_seq, text } = &p.item {
-            write_incident(dir, &incident_file_name(chain_id, *verify_seq), text)?;
+        if let Item::Incident { verify_seq, text } = &p.item
+            && !write_incident(dir, &incident_file_name(chain_id, *verify_seq), text)?
+        {
+            lock(&shared.state).foreign_incident = true;
         }
     }
     let r = append_lines(&mut file, &path, &key, group, head, fresh, files);
@@ -986,20 +1005,42 @@ fn ends_torn(path: &Path) -> io::Result<bool> {
     Ok(b != [b'\n'])
 }
 
-/// An incident file, created once with create-new and fsynced with its directory entry; one
-/// that exists already (written before, or put there by someone else) is left as it is.
-fn write_incident(dir: &Path, name: &str, text: &str) -> io::Result<()> {
+/// An existing incident file larger than this is not one the writer began (its text is a few
+/// hundred bytes).
+const MAX_INCIDENT_BYTES: u64 = 4096;
+
+/// An incident file, created once with create-new and fsynced with its directory entry. One that
+/// exists already is never rewritten: holding `text`, it is done; holding a strict prefix of it,
+/// even none (a crash or a failed write between its creation and its text), the rest is
+/// appended. `Ok(false)`: it holds anything else (put there by someone else), left as it is.
+fn write_incident(dir: &Path, name: &str, text: &str) -> io::Result<bool> {
     let path = dir.join(name);
-    match OpenOptions::new().append(true).create_new(true).open(&path) {
-        Ok(mut f) => {
-            f.write_all(text.as_bytes())?;
-            f.sync_all()?;
-            record_sync(&path);
-            sync_dir_of(dir)
+    let (mut f, rest) = match OpenOptions::new().append(true).create_new(true).open(&path) {
+        Ok(f) => (f, text.as_bytes()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            // Only a regular file is read or appended to (as for chain files: a FIFO would block).
+            if !std::fs::symlink_metadata(&path)?.file_type().is_file() {
+                return Ok(false);
+            }
+            let mut held = Vec::new();
+            File::open(&path)?
+                .take(MAX_INCIDENT_BYTES + 1)
+                .read_to_end(&mut held)?;
+            if held.as_slice() == text.as_bytes() {
+                return Ok(true);
+            }
+            let Some(rest) = text.as_bytes().strip_prefix(held.as_slice()) else {
+                return Ok(false);
+            };
+            (OpenOptions::new().append(true).open(&path)?, rest)
         }
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(e),
-    }
+        Err(e) => return Err(e),
+    };
+    f.write_all(rest)?;
+    f.sync_all()?;
+    record_sync(&path);
+    sync_dir_of(dir)?;
+    Ok(true)
 }
 
 /// The date of a `Record` line with a non-NULL epoch.
@@ -1012,15 +1053,18 @@ fn record_date(l: &AnchorLine) -> Option<NaiveDate> {
 
 /// Opens the chain file for appending; a missing one is created with create-new and its
 /// header, fsynced, and its directory entry flushed. `true`: this call wrote the header. An
-/// existing empty file (a crash between its creation and its header) gets the header too; an
-/// existing file with content never gets a second one.
+/// existing file without a header yet gets it too: an empty one (a crash between its creation
+/// and its header), and one whose lines are all unreadable (a crash tore the header, PD-165),
+/// where it follows on a line of its own (the verifier tolerates a torn first line only before
+/// a header). A file holding any valid line never gets a second one.
 fn open_chain_file(
     dir: &Path,
     path: &Path,
     header: impl Fn() -> io::Result<String>,
 ) -> io::Result<(File, bool)> {
-    let write_header = |f: &mut File| -> io::Result<()> {
-        let mut h = header()?;
+    let write_header = |f: &mut File, sep: &str| -> io::Result<()> {
+        let mut h = sep.to_owned();
+        h.push_str(&header()?);
         h.push('\n');
         f.write_all(h.as_bytes())?;
         f.sync_all()?;
@@ -1040,8 +1084,13 @@ fn open_chain_file(
     }
     match OpenOptions::new().append(true).open(path) {
         Ok(mut f) => {
-            if f.metadata()?.len() == 0 {
-                write_header(&mut f)?;
+            let len = f.metadata()?.len();
+            if len == 0 {
+                write_header(&mut f, "")?;
+                return Ok((f, true));
+            }
+            if let Some(sep) = header_missing(path, len)? {
+                write_header(&mut f, sep)?;
                 return Ok((f, true));
             }
             Ok((f, false))
@@ -1049,7 +1098,7 @@ fn open_chain_file(
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             match OpenOptions::new().append(true).create_new(true).open(path) {
                 Ok(mut f) => {
-                    write_header(&mut f)?;
+                    write_header(&mut f, "")?;
                     sync_dir_of(dir)?;
                     Ok((f, true))
                 }
@@ -1062,6 +1111,35 @@ fn open_chain_file(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Files larger than this always hold a valid line when the writer made them: a crash while the
+/// header was written leaves at most a few torn lines.
+const HEADER_SCAN_BYTES: u64 = 16 * (MAX_LINE_BYTES as u64 + 1);
+
+/// A non-empty chain file of `len` bytes no line of which is a valid anchor line (a torn
+/// header, PD-165): `Some(separator)` to write before the header (a newline unless the file
+/// already ends with one). `None`: the file holds a valid line, or is too large to be a torn
+/// header.
+fn header_missing(path: &Path, len: u64) -> io::Result<Option<&'static str>> {
+    if len > HEADER_SCAN_BYTES {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(HEADER_SCAN_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() as u64 > HEADER_SCAN_BYTES {
+        return Ok(None);
+    }
+    let body = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+    if body
+        .split(|b| *b == b'\n')
+        .any(|raw| parse_raw(raw).is_ok())
+    {
+        return Ok(None);
+    }
+    Ok(Some(if bytes.ends_with(b"\n") { "" } else { "\n" }))
 }
 
 /// The new directory entry made durable. Unix: an error fails the attempt. Windows: best effort

@@ -445,6 +445,27 @@ pub(crate) fn resolve(setting: Option<&str>, configured: Option<&Path>) -> Optio
         .or_else(|| configured.map(Path::to_path_buf))
 }
 
+/// Whether two anchor dirs name the same directory as far as their text tells: trailing
+/// separators do not count, and on Windows neither does ASCII case nor `/` against `\`
+/// (`C:\Anchors` and `c:\anchors\` are one dir there). No file system access.
+pub(crate) fn same_dir(a: Option<&Path>, b: Option<&Path>) -> bool {
+    fn norm(p: &Path) -> String {
+        let s = p.to_string_lossy();
+        let s = if cfg!(windows) {
+            s.replace('/', "\\").to_ascii_lowercase()
+        } else {
+            s.into_owned()
+        };
+        let t = s.trim_end_matches(['/', '\\']);
+        if t.is_empty() { s } else { t.to_owned() }
+    }
+    match (a, b) {
+        (Some(a), Some(b)) => norm(a) == norm(b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 fn problem(detail: impl Into<String>) -> VerifyFinding {
     VerifyFinding::new(FindingKind::AnchorDirMismatch, detail)
 }
@@ -521,7 +542,7 @@ pub(crate) fn load(
                     .push(problem(format!("{name} is empty: it has no header line")));
             }
             Ok(Some(bytes)) => {
-                let lines = parse_file(&name, &bytes, &mut out.problems, &mut out.notes);
+                let lines = parse_file(&name, &chain, &bytes, &mut out.problems, &mut out.notes);
                 out.chains.insert(chain, lines);
             }
             Err(what) => out.problems.push(problem(format!("{name}: {what}"))),
@@ -581,26 +602,111 @@ fn is_torn(raw: &[u8]) -> bool {
     matches!(serde_json::from_str::<Value>(text), Err(e) if e.is_eof())
 }
 
+/// The bad and torn lines of one file, each reported one by one up to
+/// [`MAX_BAD_LINES_REPORTED`], the rest counted.
+struct Tally<'a> {
+    name: &'a str,
+    bad: usize,
+    torn: usize,
+}
+
+impl Tally<'_> {
+    fn bad(&mut self, problems: &mut Vec<VerifyFinding>, n: usize, e: &AnchorLineError) {
+        self.bad += 1;
+        if self.bad <= MAX_BAD_LINES_REPORTED {
+            problems.push(problem(format!(
+                "{} line {n} is not a valid anchor line: {e}",
+                self.name
+            )));
+        }
+    }
+
+    fn torn(&mut self, notes: &mut Vec<VerifyFinding>, n: usize) {
+        self.torn += 1;
+        if self.torn <= MAX_BAD_LINES_REPORTED {
+            notes.push(VerifyFinding::new(
+                FindingKind::AnchorDirTornLine,
+                format!(
+                    "{} line {n} is a torn line (an interrupted append)",
+                    self.name
+                ),
+            ));
+        }
+    }
+}
+
+/// Consecutive torn-looking lines not judged yet: the first one's number, how many, and the
+/// first errors (reported should the run turn out bad).
+#[derive(Default)]
+struct TornRun {
+    start: usize,
+    len: usize,
+    errors: Vec<AnchorLineError>,
+}
+
+impl TornRun {
+    fn push(&mut self, n: usize, e: AnchorLineError) {
+        if self.len == 0 {
+            self.start = n;
+        }
+        self.len += 1;
+        if self.errors.len() < MAX_BAD_LINES_REPORTED {
+            self.errors.push(e);
+        }
+    }
+
+    /// Judges the run (`torn`: tolerated) and empties it.
+    fn settle(
+        &mut self,
+        torn: bool,
+        t: &mut Tally<'_>,
+        problems: &mut Vec<VerifyFinding>,
+        notes: &mut Vec<VerifyFinding>,
+    ) {
+        let lines = self.start..self.start + self.len;
+        if torn {
+            lines.for_each(|n| t.torn(notes, n));
+        } else {
+            let errors = std::mem::take(&mut self.errors);
+            for (n, e) in lines.zip(&errors) {
+                t.bad(problems, n, e);
+            }
+            // Beyond the reported ones: counted only (the first ones already reached the bound).
+            t.bad += self.len - errors.len();
+        }
+        *self = TornRun::default();
+    }
+}
+
 /// Lines separated by `\n`, split lazily; the empty remainder after a final newline is not a
-/// line. Every other line must parse (an empty one does not), except a torn line (PD-165,
-/// [`is_torn`]) that is the file's last line or is followed by a valid line: the writer closes
-/// such a line with a newline and a `Record` line before its next append. A torn line is an
-/// informational `AnchorDirTornLine` in `notes`; a torn-looking line followed by another bad
-/// line is a bad line like any other. At most [`MAX_BAD_LINES_REPORTED`] bad (and torn) lines are
-/// reported one by one, the rest in one summary, and at most [`MAX_LINES`] lines are read, so a
-/// file of garbage costs bounded memory and time.
+/// line. Every other line must parse (an empty one does not), except torn lines (PD-165,
+/// [`is_torn`]). A run of consecutive torn lines (two crashes in a row leave two) is tolerated
+/// when it ends the file or is followed by a valid line: the writer closes a torn last line with
+/// a newline (and a `Record` line for the head) before its next append. A run that starts at
+/// line 1 (a crash while the header was written) is tolerated only when the line after it is a
+/// header naming `chain`, which the writer then appends; a file of torn lines only has no
+/// header, like an empty file (a problem). A tolerated torn line is an informational
+/// `AnchorDirTornLine` in `notes` and never a line: a record whose line was torn is unanchored,
+/// as if the line had never been written. A run that is not tolerated is bad lines like any
+/// other. At most [`MAX_BAD_LINES_REPORTED`] bad (and torn) lines are reported one by one, the
+/// rest in one summary, and at most [`MAX_LINES`] lines are read, so a file of garbage costs
+/// bounded memory and time.
 fn parse_file(
     name: &str,
+    chain: &str,
     bytes: &[u8],
     problems: &mut Vec<VerifyFinding>,
     notes: &mut Vec<VerifyFinding>,
 ) -> Vec<(usize, AnchorLine)> {
     let mut lines = Vec::new();
     let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
-    let mut bad = 0usize;
-    let mut torn = 0usize;
-    let mut it = body.split(|b| *b == b'\n').enumerate().peekable();
-    while let Some((i, raw)) = it.next() {
+    let mut t = Tally {
+        name,
+        bad: 0,
+        torn: 0,
+    };
+    let mut run = TornRun::default();
+    for (i, raw) in body.split(|b| *b == b'\n').enumerate() {
         let n = i + 1;
         if n > MAX_LINES {
             problems.push(problem(format!(
@@ -609,36 +715,43 @@ fn parse_file(
             break;
         }
         match parse_raw(raw) {
-            Ok(l) => lines.push((n, l)),
-            Err(_) if is_torn(raw) && it.peek().is_none_or(|(_, next)| parse_raw(next).is_ok()) => {
-                torn += 1;
-                if torn <= MAX_BAD_LINES_REPORTED {
-                    notes.push(VerifyFinding::new(
-                        FindingKind::AnchorDirTornLine,
-                        format!("{name} line {n} is a torn line (an interrupted append)"),
-                    ));
+            Ok(l) => {
+                if run.len > 0 {
+                    let ok = run.start != 1
+                        || matches!(&l, AnchorLine::Header { chain_id, .. } if chain_id == chain);
+                    run.settle(ok, &mut t, problems, notes);
                 }
+                lines.push((n, l));
             }
+            Err(e) if is_torn(raw) => run.push(n, e),
             Err(e) => {
-                bad += 1;
-                if bad <= MAX_BAD_LINES_REPORTED {
-                    problems.push(problem(format!(
-                        "{name} line {n} is not a valid anchor line: {e}"
-                    )));
-                }
+                run.settle(false, &mut t, problems, notes);
+                t.bad(problems, n, &e);
             }
         }
     }
-    if bad > MAX_BAD_LINES_REPORTED {
+    if run.len > 0 {
+        if run.start == 1 {
+            problems.push(problem(format!(
+                "{name} holds only torn lines: it has no header line"
+            )));
+        } else {
+            run.settle(true, &mut t, problems, notes);
+        }
+    }
+    if t.bad > MAX_BAD_LINES_REPORTED {
         problems.push(problem(format!(
             "{name}: {} more lines are not valid anchor lines",
-            bad - MAX_BAD_LINES_REPORTED
+            t.bad - MAX_BAD_LINES_REPORTED
         )));
     }
-    if torn > MAX_BAD_LINES_REPORTED {
+    if t.torn > MAX_BAD_LINES_REPORTED {
         notes.push(VerifyFinding::new(
             FindingKind::AnchorDirTornLine,
-            format!("{name}: {} more torn lines", torn - MAX_BAD_LINES_REPORTED),
+            format!(
+                "{name}: {} more torn lines",
+                t.torn - MAX_BAD_LINES_REPORTED
+            ),
         ));
     }
     lines
@@ -819,11 +932,14 @@ pub(crate) fn check(
         {
             out.push(problem(format!("{name} does not start with a header line")));
         }
-        for (n, l) in file {
+        for (i, (n, l)) in file.iter().enumerate() {
             let at = |what: &str| format!("{name} line {n}: {what}");
             match l {
+                // The first line read: line 1, or the header after a torn first line (which
+                // `parse_file` tolerates only before a header naming this chain) or after an
+                // unreadable one (already a load problem).
                 AnchorLine::Header { chain_id, .. } => {
-                    if *n != 1 {
+                    if i != 0 {
                         out.push(problem(at("a header line after line 1")));
                     } else if chain_id != chain {
                         out.push(problem(at("the header names another chain")));
@@ -1008,4 +1124,26 @@ fn check_pruned(
 fn ts_date(ts: Option<&str>) -> Option<NaiveDate> {
     ts.and_then(UtcInstant::parse_rfc3339_ms)
         .map(UtcInstant::date)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn same(a: &str, b: &str) -> bool {
+        same_dir(Some(Path::new(a)), Some(Path::new(b)))
+    }
+
+    #[test]
+    fn same_dir_ignores_trailing_separators_and_windows_case() {
+        assert!(same("/srv/anchors", "/srv/anchors/"));
+        assert!(same("/srv/anchors//", "/srv/anchors"));
+        assert!(!same("/srv/anchors", "/srv/anchors2"));
+        assert!(same("/", "/"));
+        assert!(same_dir(None, None));
+        assert!(!same_dir(Some(Path::new("/srv/anchors")), None));
+        assert_eq!(same(r"C:\Anchors", r"c:\anchors\"), cfg!(windows));
+        assert_eq!(same("/srv/Anchors", "/srv/anchors"), cfg!(windows));
+        assert_eq!(same(r"C:\Anchors", "C:/Anchors"), cfg!(windows));
+    }
 }

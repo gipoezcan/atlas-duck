@@ -3,7 +3,7 @@
 //! connection on the caller's thread (WAL reader) and never block on the writer.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -770,7 +770,11 @@ impl Store {
         {
             return Err(settings::untrusted());
         }
-        if dir == self.settings().anchor_dir {
+        // The same dir however its text is spelled (case on Windows, a trailing separator).
+        if anchor_dir::same_dir(
+            dir.as_deref().map(Path::new),
+            self.settings().anchor_dir.as_deref().map(Path::new),
+        ) {
             return Err(AuditError::Invalid("the setting already has this value"));
         }
         if let Some(p) = &new {
@@ -779,7 +783,15 @@ impl Store {
                 .shared
                 .anchor_dir
                 .ensure_chain_file(&self.inner.header, p.path(), &chain_id)
-                .map_err(|_| AuditError::Invalid("the anchor directory cannot be written"))?;
+                .map_err(|e| {
+                    AuditError::Invalid(if e.kind() == std::io::ErrorKind::TimedOut {
+                        // The anchor-dir thread holds the file lock (a hung share): the new dir
+                        // was not tried.
+                        "the anchor-dir writer is busy; try again"
+                    } else {
+                        "the anchor directory cannot be written"
+                    })
+                })?;
         }
         self.send_change_anchor_dir(dir, confirmed)
     }
@@ -1159,7 +1171,10 @@ impl Store {
                 record_hash: p.record_hash,
             })?
             .complete();
-        } else {
+        } else if !v.findings.iter().any(|f| f.kind.is_incident()) {
+            // Never after an integrity incident: the rows these lines would attest are what
+            // the trust root just failed to confirm.
+            self.queue_committed_switch_lines();
             self.queue_committed_lines();
         }
         self.enable_anchors();
@@ -1170,7 +1185,7 @@ impl Store {
     /// `RESTORE` that started the current chain, which the anchor-dir thread may have lost (the
     /// dir failed until quit, or a crash before it wrote them), each only when the keychain
     /// anchors confirm that record (one keychain read for both). Catch-up lines: nothing is
-    /// written twice. Best effort.
+    /// written twice. Best effort. Not called after an integrity incident.
     fn queue_committed_lines(&self) {
         if self.settings().anchor_dir.is_none() && self.inner.anchor_dir.is_none() {
             return;
@@ -1184,6 +1199,118 @@ impl Store {
         if let Some(h) = head {
             self.queue_committed_restore_lines(&h);
         }
+    }
+
+    /// The current chain's latest anchor-dir change (`change_anchor_dir`, PD-166), whose switch
+    /// lines live only in the anchor-dir queue: a crash before the thread wrote them, or an old
+    /// dir that failed until quit, loses them. They are queued again as catch-up lines, written
+    /// once (`detached_at` is the record's `ts_utc`, as in the live line): the new dir's
+    /// `Immediate` line, and the old dir's `Immediate` and `ANCHOR_DETACHED` lines, those only
+    /// at the first start after the change's run (no `APP_START` since), so a share removed for
+    /// good is not tried at every start. Only a change whose `new` is the dir in force. Best
+    /// effort: an unreadable row ends the search.
+    fn queue_committed_switch_lines(&self) {
+        /// `CONFIG_CHANGED` rows searched, newest first, for the change.
+        const SCAN: i64 = 64;
+        type Row = (i64, Vec<u8>, Option<String>, String);
+        let (_, _, chain_id) = self.head();
+        let read: Result<(Vec<Row>, Option<i64>), AuditError> = self.with_reader(|c| {
+            let io = |e: rusqlite::Error| AuditError::Io(e.to_string());
+            let mut stmt = c
+                .prepare(
+                    "SELECT seq, record_hash, epoch, ts_utc FROM events \
+                     WHERE event_type = 'CONFIG_CHANGED' AND chain_id = ?1 \
+                     ORDER BY seq DESC LIMIT ?2",
+                )
+                .map_err(io)?;
+            let rows = stmt
+                .query_map(rusqlite::params![chain_id, SCAN], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .map_err(io)?
+                .collect::<Result<Vec<Row>, _>>()
+                .map_err(io)?;
+            let app_start = c
+                .query_row(
+                    "SELECT max(seq) FROM events WHERE event_type = 'APP_START'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(io)?;
+            Ok((rows, app_start))
+        });
+        let Ok((rows, app_start)) = read else {
+            return;
+        };
+        let mut found = None;
+        for (seq, hash, epoch, ts) in rows {
+            let Ok(seq) = u64::try_from(seq) else {
+                return;
+            };
+            let Ok(Ok(p)) = self
+                .read_payload(seq)
+                .map(|plain| serde_json::from_slice::<serde_json::Value>(&plain))
+            else {
+                return;
+            };
+            if p.get("key").and_then(|k| k.as_str()) == Some("anchor_dir")
+                && p.get("applied").and_then(|a| a.as_bool()) == Some(true)
+            {
+                found = Some((seq, hash, epoch, ts, p));
+                break;
+            }
+        }
+        let Some((seq, hash, epoch, ts, p)) = found else {
+            return;
+        };
+        let dir_of = |k: &str| match p.get(k) {
+            Some(serde_json::Value::String(s)) => Some(Some(s.clone())),
+            Some(serde_json::Value::Null) => Some(None),
+            _ => None,
+        };
+        let (Ok(record_hash), Some(old), Some(new)) =
+            (<[u8; 32]>::try_from(hash), dir_of("old"), dir_of("new"))
+        else {
+            return;
+        };
+        if new != self.settings().anchor_dir {
+            return;
+        }
+        let fallback = self.inner.shared.anchor_dir.fallback();
+        let from = anchor_dir::resolve(old.as_deref(), fallback.as_deref());
+        let to = anchor_dir::resolve(new.as_deref(), fallback.as_deref());
+        if anchor_dir::same_dir(from.as_deref(), to.as_deref()) {
+            return;
+        }
+        let immediate = AnchorLine::Immediate {
+            seq,
+            record_hash,
+            epoch: epoch.clone(),
+            event_type: EventType::CONFIG_CHANGED.as_str().to_owned(),
+        };
+        let first_start = app_start
+            .and_then(|s| u64::try_from(s).ok())
+            .is_none_or(|s| s < seq);
+        let mut lines = Vec::new();
+        if from.is_some() && first_start {
+            lines.push(Pending::catch_up(old.clone(), &chain_id, immediate.clone()));
+            if UtcInstant::parse_rfc3339_ms(&ts).is_some() {
+                lines.push(Pending::catch_up(
+                    old,
+                    &chain_id,
+                    AnchorLine::Detached {
+                        seq,
+                        record_hash,
+                        epoch,
+                        detached_at: ts,
+                    },
+                ));
+            }
+        }
+        if to.is_some() {
+            lines.push(Pending::catch_up(new, &chain_id, immediate));
+        }
+        self.inner.shared.anchor_dir.push(lines);
     }
 
     /// The current chain's `RESTORE` (§8.11 step 5) whose anchor reset happened (the keychain

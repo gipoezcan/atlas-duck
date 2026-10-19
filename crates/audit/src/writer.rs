@@ -23,7 +23,7 @@ use zeroize::Zeroizing;
 use crate::anchor_dir::writer::{
     AnchorDirShared, Classifier, IncidentDraft, Pending, PruneNote, RowNote, gets_immediate_line,
 };
-use crate::anchor_dir::{AnchorLine, resolve};
+use crate::anchor_dir::{AnchorLine, resolve, same_dir};
 use crate::anchors::{AnchorShared, HeadAnchor};
 #[cfg(any(test, feature = "testing"))]
 use crate::anchors::{Barrier, FirstRetainedAnchor};
@@ -814,7 +814,7 @@ impl WriterState {
         if let Some(r) = rows.iter().find(|r| r.seq == head) {
             self.shared
                 .anchor_dir
-                .set_head(&self.head.chain_id, r.record_line());
+                .set_head(&self.head.chain_id, r.record_line(), r.corroborated);
         }
         let dir = &self.settings.anchor_dir;
         let incidents = Pending::incidents(dir, &self.head.chain_id, &rows);
@@ -960,7 +960,7 @@ impl Writer {
         };
         st.shared
             .anchor_dir
-            .set_head(&st.head.chain_id, head_line.clone());
+            .set_head(&st.head.chain_id, head_line.clone(), None);
         let mut pending = vec![Pending::ensure_file(dir.clone(), &st.head.chain_id)];
         if head_type == EventType::APP_STOP.as_str() {
             pending.push(Pending::catch_up(dir, &st.head.chain_id, head_line));
@@ -1120,16 +1120,14 @@ impl Writer {
             .map_err(|e| AuditError::Io(e.to_string()))
     }
 
-    /// Closes the read-write connection of the live store (a restore is about to replace the
-    /// file; Windows refuses that while a handle is open). Closing the last connection
-    /// checkpoints the WAL. The writer holds an in-memory placeholder until
-    /// [`Writer::reopen_live`] or [`Writer::reopen_on`].
     /// The lines of an anchor-dir change `c` (PD-166) after its commit, which already queued the
     /// record's `Immediate` line for the old dir (the dir in force when it committed): the old
     /// dir's `ANCHOR_DETACHED` naming `c`, then the same `Immediate` line for the new dir (none
     /// on a removal). Both go through the queue: a failing old dir never holds back the new
     /// one, and is shown in health. Nothing when both settings resolve to the same dir.
-    /// Best effort: the record is in the chain whatever happens here.
+    /// `detached_at` is the record's `ts_utc`, so the startup catch-up of a lost switch writes
+    /// the same text (`Store::queue_committed_switch_lines`). Best effort: the record is in the
+    /// chain whatever happens here.
     pub(crate) fn push_anchor_dir_switch(
         &mut self,
         old: Option<String>,
@@ -1139,19 +1137,18 @@ impl Writer {
         let fallback = self.st.shared.anchor_dir.fallback();
         let from = resolve(old.as_deref(), fallback.as_deref());
         let to = resolve(new.as_deref(), fallback.as_deref());
-        if from == to {
+        if same_dir(from.as_deref(), to.as_deref()) {
             return;
         }
         let Ok(seq) = i64::try_from(c.seq) else {
             return;
         };
-        let epoch: Result<Option<String>, _> =
-            self.conn
-                .query_row("SELECT epoch FROM events WHERE seq = ?1", [seq], |r| {
-                    r.get(0)
-                });
-        let (Ok(epoch), Some(detached_at)) = (epoch, self.st.clock.now_utc().try_to_rfc3339_ms())
-        else {
+        let row: Result<(Option<String>, String), _> = self.conn.query_row(
+            "SELECT epoch, ts_utc FROM events WHERE seq = ?1",
+            [seq],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        );
+        let Ok((epoch, detached_at)) = row else {
             return;
         };
         let chain_id = self.st.head.chain_id.clone();
@@ -1183,6 +1180,10 @@ impl Writer {
         self.st.shared.anchor_dir.push(lines);
     }
 
+    /// Closes the read-write connection of the live store (a restore is about to replace the
+    /// file; Windows refuses that while a handle is open). Closing the last connection
+    /// checkpoints the WAL. The writer holds an in-memory placeholder until
+    /// [`Writer::reopen_live`] or [`Writer::reopen_on`].
     pub(crate) fn close_live(&mut self) -> Result<(), AuditError> {
         let placeholder = Connection::open_in_memory().map_err(sql)?;
         std::mem::replace(&mut self.conn, placeholder)
