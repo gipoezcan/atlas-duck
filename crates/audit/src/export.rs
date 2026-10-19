@@ -86,7 +86,9 @@ pub const MAX_EXPORT_CT_LEN: u64 = MAX_PAYLOAD_LEN + (MAX_PAYLOAD_LEN >> 8) + 64
 /// `payload` (the parsed copy for human readers) only for plaintexts up to this size.
 pub const MAX_EXPORT_PAYLOAD_FIELD_BYTES: u64 = 1024 * 1024;
 
-/// Every column but the two base64 fields and `payload`, with the JSON framing of the line.
+/// The share of [`MAX_EXPORT_LINE_BYTES`] for every column but the two base64 fields and
+/// `payload`, with the JSON framing of the line. The exporter asserts only the total line
+/// length; whether the verifier also caps this share is the verifier's rule (T8).
 pub const MAX_EXPORT_OTHER_BYTES: u64 = 64 * 1024;
 
 const fn base64_len(n: u64) -> u64 {
@@ -526,7 +528,9 @@ fn decrypt_error(seq: u64, e: &DecryptError) -> AuditError {
 
 /// One batch in its own read transaction: the rows already written must still be the store's
 /// (the batch boundary's `record_hash`, when that row is still retained) and the next one must
-/// be there (a prune between batches that removed rows of the range ends the export).
+/// be there (a prune between batches that removed rows of the range ends the export). The cancel
+/// flag is also checked before each row: a batch of large payloads can take far longer than the
+/// shutdown path waits for the store (PD-181 quit).
 fn batch(
     conn: &Connection,
     deks: &mut Deks<'_>,
@@ -534,6 +538,7 @@ fn batch(
     limit: u64,
     w: &mut Walk,
     out: &mut HashedFile,
+    ctl: &ExportControl<'_>,
 ) -> Result<(), AuditError> {
     let tx = conn.unchecked_transaction().map_err(sql)?;
     if let Some(last) = w.last_hash {
@@ -566,6 +571,7 @@ fn batch(
         .map_err(sql)?;
     let mut first = true;
     while let Some(row) = rows.next().map_err(sql)? {
+        check_cancel(ctl)?;
         let expected = w.next;
         let f = RowFields::from_row(row).map_err(|_| AuditError::InvalidRecord {
             seq: expected,
@@ -672,8 +678,8 @@ impl Store {
     /// name exists (nothing is written into it). Every row must decrypt (else `Decrypt` /
     /// `PayloadHash`, and no export): an export cannot omit a payload.
     ///
-    /// `ctl.progress` runs after each batch; a set `ctl.cancel` ends the export between batches
-    /// or before the manifest with `Cancelled`. A prune that removes not-yet-exported rows, a
+    /// `ctl.progress` runs after each batch; a set `ctl.cancel` ends the export before the next
+    /// row (between batches too) or before the manifest with `Cancelled`. A prune that removes not-yet-exported rows, a
     /// restore, `shutdown()` and a failed `EXPORT` append also end it. On every `Err` the new
     /// directory is removed and no `EXPORT` is logged.
     pub fn export(
@@ -765,7 +771,15 @@ impl Store {
         while w.next <= plan.last_seq {
             check_cancel(ctl)?;
             self.serving(parts.generation)?;
-            batch(conn, &mut deks, plan, parts.batch_rows, &mut w, &mut events)?;
+            batch(
+                conn,
+                &mut deks,
+                plan,
+                parts.batch_rows,
+                &mut w,
+                &mut events,
+                ctl,
+            )?;
             (ctl.progress)(w.next - plan.first_seq, total);
         }
         let events_sha256 = events.finish().map_err(io)?;

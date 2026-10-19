@@ -299,7 +299,8 @@ pub struct ExportReceipt {
 
 /// Progress and cancellation of a running export (PD-181). `progress(done, total)` is called
 /// on the exporting thread after each batch, with row counts; a set `cancel` ends the export
-/// at the next check (between batches and before the manifest) with `AuditError::Cancelled`.
+/// at the next check (before each row, so also between batches, and before the manifest) with
+/// `AuditError::Cancelled`.
 #[derive(Clone, Copy)]
 pub struct ExportControl<'a> {
     pub progress: &'a (dyn Fn(u64, u64) + Sync),
