@@ -242,14 +242,12 @@ pub fn is_policy_key(key: &str) -> bool {
 }
 
 /// The audit-policy keys of that list, whose `CONFIG_CHANGED` records get an immediate
-/// anchor-dir line (§8.5 "audit-policy `CONFIG_CHANGED`", PD-157, L185): `retention_days`,
-/// `anchor_dir` and `allow_degraded_scripts` (the legal hold has its own `LEGAL_HOLD_CHANGED`).
-/// The per-instance keys are connection policy, not audit policy.
+/// anchor-dir line (§8.5 "audit-policy `CONFIG_CHANGED`", PD-157, L185): every policy key but
+/// the per-instance ones, which are connection policy (today `retention_days`, `anchor_dir`,
+/// `allow_degraded_scripts`; the legal hold has its own `LEGAL_HOLD_CHANGED`). A key added to
+/// the list is audit policy unless it is an instance key.
 pub(crate) fn is_audit_policy_key(key: &str) -> bool {
-    matches!(
-        parse_key(key),
-        Some(PolicyKey::Retention | PolicyKey::AnchorDir | PolicyKey::AllowDegradedScripts)
-    )
+    matches!(parse_key(key), Some(k) if !matches!(k, PolicyKey::Instance(..)))
 }
 
 fn key_of(id: &str, f: Field) -> String {
