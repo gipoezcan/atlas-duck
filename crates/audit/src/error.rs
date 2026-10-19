@@ -160,6 +160,9 @@ pub enum AuditError {
     KeyStore(KeyStoreError),
     Restore(RestoreError),
     Io(String),
+    /// A long job (the compliance export) was cancelled through its control (PD-181); it left
+    /// nothing behind.
+    Cancelled,
 }
 
 impl fmt::Display for AuditError {
@@ -186,6 +189,7 @@ impl fmt::Display for AuditError {
             AuditError::KeyStore(e) => write!(f, "{e}"),
             AuditError::Restore(e) => write!(f, "{e}"),
             AuditError::Io(m) => write!(f, "i/o error: {m}"),
+            AuditError::Cancelled => f.write_str("cancelled"),
         }
     }
 }

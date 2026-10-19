@@ -41,6 +41,7 @@ pub mod crypto;
 mod crypto;
 pub mod encoding;
 pub mod error;
+pub mod export;
 mod incidents;
 pub mod keystore;
 pub mod open;
@@ -78,6 +79,7 @@ pub use backup::BackupReceipt;
 pub use clock::{Clock, SystemClock};
 pub use crypto::MAX_PAYLOAD_LEN;
 pub use error::{AuditError, OpenError, RestoreError};
+pub use export::{MAX_EXPORT_CT_LEN, MAX_EXPORT_LINE_BYTES};
 pub use keystore::{EntryName, KeyStore, KeyStoreError, KeyringLocality, OsKeyStore};
 pub use open::{
     ArchivedDb, FirstRunInput, LockedReason, RecoveryOffer, StartupOutcome, create_new_store,
@@ -96,8 +98,8 @@ pub use settings::{
 };
 pub use store::{Hooks, OpenConfig, Store, StoreHealth};
 pub use types::{
-    Actor, Committed, Confirmed, DecisionColumn, EventFlags, EventHeader, EventType, NewEvent,
-    QueryKind, RustChosenPath, UtcInstant,
+    Actor, Committed, Confirmed, DecisionColumn, EventFlags, EventHeader, EventType, ExportControl,
+    ExportReceipt, NewEvent, QueryKind, RustChosenPath, TimeRange, UtcInstant,
 };
 pub use verify::{FindingKind, VerifyFinding, VerifyOutcome};
 

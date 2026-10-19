@@ -280,6 +280,9 @@ pub enum FaultPoint {
     /// Restore: the KEK is re-sealed, the anchors are not reset yet. An armed failure is a
     /// crash there, as for `AfterRestoreCommit`.
     AfterKekReseal,
+    /// Export: every file is written and flushed, `manifest.json` last; the `EXPORT` record is
+    /// not appended yet. An armed failure fails that append.
+    ExportBeforeAppend,
 }
 
 /// Runs when a [`FaultPoint`] is reached (see [`Faults::on_hit`]).

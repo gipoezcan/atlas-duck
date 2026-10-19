@@ -245,8 +245,9 @@ pub(crate) fn strip_snapshot(path: &Path) -> Result<(), AuditError> {
         .map_err(io)
 }
 
-/// `YYYYMMDDTHHMMSSZ` of an RFC 3339 `ts_utc` text (F.1 bundle name; no `:` on Windows).
-fn compact_stamp(ts: &str) -> String {
+/// `YYYYMMDDTHHMMSSZ` of an RFC 3339 `ts_utc` text (F.1 bundle name, PD-159 export directory
+/// name; no `:` on Windows).
+pub(crate) fn compact_stamp(ts: &str) -> String {
     let secs = ts.split('.').next().unwrap_or(ts);
     let mut s: String = secs
         .chars()

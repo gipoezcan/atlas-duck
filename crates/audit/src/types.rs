@@ -259,6 +259,61 @@ pub struct Confirmed {
     pub dialog_text_sha256: [u8; 32],
 }
 
+/// The UTC time range of a compliance export, both ends inclusive (PD-160). The store resolves
+/// it to a contiguous seq interval; instants outside years 0000..=9999 count as the nearest
+/// bound, so [`TimeRange::all`] is the full range (the first retained record to the head).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeRange {
+    pub from_utc: UtcInstant,
+    pub to_utc: UtcInstant,
+}
+
+impl TimeRange {
+    /// Every record the store holds (the export dialog's default).
+    pub fn all() -> TimeRange {
+        TimeRange {
+            from_utc: UtcInstant(i64::MIN),
+            to_utc: UtcInstant(i64::MAX),
+        }
+    }
+}
+
+/// What a compliance export wrote (C.3, Δ-M10-1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportReceipt {
+    /// The new subdirectory's name inside the chosen directory.
+    pub dir_name: String,
+    /// SHA-256 of `manifest.json`; also in the `EXPORT` record, for the recipient out of band.
+    pub manifest_sha256: [u8; 32],
+    pub first_seq: u64,
+    pub last_seq: u64,
+    pub rows: u64,
+    /// The chains of the exported rows, in seq order (more than one across a `RESTORE`).
+    pub chain_ids: Vec<String>,
+    /// The first row marked `unanchored`, when an anchor dir is configured and the last
+    /// exported row is not anchored.
+    pub unanchored_from: Option<u64>,
+    /// The `EXPORT` record.
+    pub export_seq: u64,
+}
+
+/// Progress and cancellation of a running export (PD-181). `progress(done, total)` is called
+/// on the exporting thread after each batch, with row counts; a set `cancel` ends the export
+/// at the next check (between batches and before the manifest) with `AuditError::Cancelled`.
+#[derive(Clone, Copy)]
+pub struct ExportControl<'a> {
+    pub progress: &'a (dyn Fn(u64, u64) + Sync),
+    pub cancel: &'a std::sync::atomic::AtomicBool,
+}
+
+impl fmt::Debug for ExportControl<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExportControl")
+            .field("cancel", &self.cancel)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A path chosen in a native file dialog. Only the native-dialog paths in M3/M6/M10 may
 /// construct one (audit cannot depend on `core`/`app`; an M10 grep check enforces it).
 #[derive(Debug, Clone, PartialEq, Eq)]

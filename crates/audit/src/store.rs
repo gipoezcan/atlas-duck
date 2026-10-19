@@ -99,6 +99,10 @@ pub struct Hooks {
     /// head for the version gate.
     #[cfg(any(test, feature = "testing"))]
     pub extra_migrations: Vec<schema::Migration>,
+    /// Overrides the rows per export batch (default 10 000), so a test reaches several batches
+    /// with a few rows.
+    #[cfg(any(test, feature = "testing"))]
+    pub export_batch_rows: Option<u64>,
 }
 
 impl Hooks {
@@ -498,6 +502,66 @@ impl Store {
             return Err(AuditError::PayloadHash { seq });
         }
         Ok(plain)
+    }
+
+    /// What a compliance export reads of this handle (`export.rs`): the store file and its
+    /// generation, the KEK, the anchor dir in force and the install's header facts. It never
+    /// touches the writer or the shared reader. `Closed` after `shutdown()`.
+    pub(crate) fn export_parts(&self) -> Result<crate::export::Parts, AuditError> {
+        self.sender()?;
+        let s = &self.inner.shared;
+        #[allow(unused_mut)]
+        let mut batch_rows = crate::export::EXPORT_BATCH_ROWS;
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(n) = self.inner.hooks.export_batch_rows {
+            batch_rows = n.max(1);
+        }
+        Ok(crate::export::Parts {
+            db_path: self.inner.db_path.clone(),
+            kek: lock(&s.keys).kek.clone(),
+            generation: s.generation.load(Ordering::SeqCst),
+            anchor_dir: anchor_dir::resolve(
+                self.settings().anchor_dir.as_deref(),
+                self.inner.anchor_dir.as_deref(),
+            ),
+            anchor_dir_unknown: s.settings_unreadable.load(Ordering::Relaxed),
+            install_id: self.inner.install_id.clone(),
+            host: self.inner.header.host().to_owned(),
+            os_user: self.inner.header.os_user().to_owned(),
+            now: self.inner.clock.now_utc(),
+            batch_rows,
+        })
+    }
+
+    /// `Ok` while this handle still serves store file `generation`: `Closed` after
+    /// `shutdown()`, `Invalid` once a restore replaced the file.
+    pub(crate) fn serving(&self, generation: u64) -> Result<(), AuditError> {
+        self.sender()?;
+        if self.inner.shared.generation.load(Ordering::SeqCst) != generation {
+            return Err(AuditError::Invalid(
+                "the store was restored while the export ran",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Appends one store-written record computed from store file `generation`: the writer
+    /// refuses it once a restore replaced that file.
+    pub(crate) fn append_for_generation(
+        &self,
+        mut p: PreparedEvent,
+        generation: u64,
+    ) -> Result<Committed, AuditError> {
+        p.for_generation = Some(generation);
+        self.send_append(vec![p])?
+            .pop()
+            .ok_or_else(|| AuditError::AppendFailed("the writer returned no row".into()))
+    }
+
+    /// Runs the fault point `p` of this handle's hooks (feature `testing`).
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn fault(&self, p: crate::testing::FaultPoint) -> Result<(), AuditError> {
+        self.inner.hooks.fault(p)
     }
 
     /// Runs `f` on the read-only connection (opened on first use) while holding the reader
