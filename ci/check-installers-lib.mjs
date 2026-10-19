@@ -36,8 +36,11 @@ export function checkIdentifier(identifier, folder) {
 
 // ------------------------------------------------------------------ maintainer scripts
 
-const REMOVERS = /(^|[\s;&|(`])(rm|rmdir|unlink|shred)(\s|$)/;
-const FIND_DELETE = /\bfind\b.*(-delete\b|-exec\s+(rm|rmdir|unlink)\b)/;
+// Any non-word, non-[.-] character may precede the command name, so `/bin/rm`, `\rm`, `'rm ...'` in
+// `sh -c` and `$(rm ...)` are all seen; the arguments are then judged token by token.
+const REMOVERS = /(^|[^\w.-])(rm|rmdir|unlink|shred|mv|truncate)(?![\w.-])/;
+const FIND_DELETE = /\bfind\b.*(-delete\b|-exec(dir)?\s+\S*?(rm|rmdir|unlink|shred|mv)\b)/;
+const RSYNC_DELETE = /\brsync\b.*--(delete|remove-source-files)/;
 const USER_REMOVERS = /\b(userdel|deluser)\b.*(\s-\w*r\w*\b|--remove-home|--remove-all-files|--remove)/;
 const PROTECTED_FRAGMENTS = [
   "/home",
@@ -72,15 +75,16 @@ function logicalLines(text) {
 }
 
 /**
- * Lines of one maintainer script that remove something that is, or may be, user data: a removal
- * command (rm, rmdir, unlink, shred, find -delete, userdel -r) whose argument is under a home, under
+ * Lines of one maintainer script that remove or move away something that is, or may be, user data: a
+ * removal command (rm, rmdir, unlink, shred, mv, truncate, find -delete/-exec rm, rsync --delete,
+ * userdel -r; also path-qualified, backslashed or inside `sh -c`) whose argument is under a home, under
  * /var/lib, a config dir, the data/config folder name outside the install tree (/usr, /opt), or a
  * variable (fail-closed: its value is not known here). Returns [{ line, reason }].
  */
 export function findDestructiveLines(scriptText, folderNames) {
   const hits = [];
   for (const line of logicalLines(scriptText)) {
-    const isRemover = REMOVERS.test(line) || FIND_DELETE.test(line);
+    const isRemover = REMOVERS.test(line) || FIND_DELETE.test(line) || RSYNC_DELETE.test(line);
     const isUserRemover = USER_REMOVERS.test(line);
     if (!isRemover && !isUserRemover) continue;
     if (isUserRemover) {
@@ -154,6 +158,14 @@ export function checkRpmScripts(scriptsText, folderNames) {
 
 const HOOK_MACROS = ["NSIS_HOOK_PREINSTALL", "NSIS_HOOK_PREUNINSTALL"];
 
+/** An NSIS line that runs a command string which deletes (nsExec::Exec 'cmd /c rmdir /s /q ...'). */
+function isExecDeleteLine(l) {
+  return (
+    /^(nsExec::Exec(ToLog)?|ExecWait|ExecShell(Wait)?|ExecDos::exec|Exec)\b/i.test(l) &&
+    /(^|[^\w.-])(rmdir|rd|del|erase|rm|Remove-Item|shred)(?![\w.-])/i.test(l)
+  );
+}
+
 /**
  * The generated installer.nsi (Tauri 2.12.1 template) deletes app data only in the uninstall section:
  *   ${If} $DeleteAppDataCheckboxState = 1 / ${AndIf} $UpdateMode <> 1
@@ -183,13 +195,30 @@ export function checkNsisText(nsiText, { folder, identifier, hooksText = "" }) {
     problems.push(`BUNDLEID '${bundleId[1]}' differs from the identifier '${identifier}'`);
   }
 
+  // The ${If} conditions enclosing the current line. A guard counts for an RmDir only when it is on
+  // this stack at that line (not merely somewhere in the file). ${Else}/${ElseIf}/${OrIf} drop the
+  // top frame's conditions: the branch is no longer known to be behind the guard.
+  const stack = [];
+  const activeConds = () => stack.flat();
+
   let deleteLines = 0;
   lines.forEach((raw, i) => {
     const l = raw.trim();
     if (/^;/.test(l) || l === "") return;
+    if (/^\$\{(If|IfNot|Unless)\}/i.test(l)) stack.push([l]);
+    else if (/^\$\{AndIf(Not)?\}/i.test(l)) {
+      if (stack.length > 0) stack[stack.length - 1].push(l);
+    } else if (/^\$\{(Else|ElseIf|ElseIfNot|OrIf|OrIfNot)\}/i.test(l)) {
+      if (stack.length > 0) stack[stack.length - 1] = [];
+    } else if (/^\$\{EndIf\}/i.test(l)) stack.pop();
+
     const isDelete = /^(RmDir|Delete)\b/i.test(l);
-    if (/DeleteAppData|DELETEAPPDATA/i.test(l) || (isDelete && userRoots.test(l))) {
+    const isExecDelete = isExecDeleteLine(l);
+    if (/DeleteAppData|DELETEAPPDATA/i.test(l) || ((isDelete || isExecDelete) && userRoots.test(l))) {
       matched.push(`${i + 1}: ${l}`);
+    }
+    if (isExecDelete && (userRoots.test(l) || (folder && l.toLowerCase().includes(folder.toLowerCase())))) {
+      problems.push(`line ${i + 1} deletes app data through a command string: ${l}`);
     }
     if (!isDelete) return;
     deleteLines += 1;
@@ -202,20 +231,32 @@ export function checkNsisText(nsiText, { folder, identifier, hooksText = "" }) {
         problems.push(`line ${i + 1} deletes app data other than the bundle-identifier folder: ${l}`);
       }
     }
+    if (userRoots.test(l)) {
+      const conds = activeConds();
+      if (!conds.some((c) => /\$DeleteAppDataCheckboxState\s*=\s*1/.test(c))) {
+        problems.push(`line ${i + 1}: the app-data RmDir is not inside an \`If $DeleteAppDataCheckboxState = 1\` (opt-in checkbox) block: ${l}`);
+      }
+      if (!conds.some((c) => /\$UpdateMode\s*<>\s*1/.test(c))) {
+        problems.push(`line ${i + 1}: the app-data delete is not guarded by \`$UpdateMode <> 1\` (an upgrade must never delete app data): ${l}`);
+      }
+    }
   });
   if (deleteLines === 0) {
     problems.push("no Delete/RmDir line at all in installer.nsi: the template changed, the mechanism must be re-read (fail closed)");
   }
-  const appDataDeletes = matched.filter((m) => /RmDir/i.test(m));
-  if (appDataDeletes.length > 0) {
-    const guarded = lines.some((l) => /\$DeleteAppDataCheckboxState\s*=\s*1/.test(l));
-    if (!guarded) {
-      problems.push("an app-data RmDir exists but is not behind $DeleteAppDataCheckboxState = 1 (opt-in checkbox)");
+
+  // The hooks file is included by installer.nsi, so its macros run inside the install and uninstall
+  // sections: nothing in it may touch app data or anything outside $INSTDIR.
+  hooksText.split(/\r?\n/).forEach((raw, i) => {
+    const l = raw.trim();
+    if (/^;/.test(l) || l === "") return;
+    if (!(/^(RmDir|Delete)\b/i.test(l) || isExecDeleteLine(l))) return;
+    const namesFolder = folder && l.toLowerCase().includes(folder.toLowerCase());
+    const outsideInstdir = !/\$\{?INSTDIR\}?/i.test(l) || /\.\.[\\/]/.test(l);
+    if (userRoots.test(l) || namesFolder || outsideInstdir) {
+      problems.push(`hooks file line ${i + 1} deletes outside $INSTDIR or under app data: ${l}`);
     }
-    if (!lines.some((l) => /\$UpdateMode\s*<>\s*1/.test(l))) {
-      problems.push("the app-data delete is not guarded by `$UpdateMode <> 1` (an upgrade must never delete app data)");
-    }
-  }
+  });
 
   for (const macro of HOOK_MACROS) {
     const defined = new RegExp(`^\\s*!macro\\s+${macro}\\b`, "mi");

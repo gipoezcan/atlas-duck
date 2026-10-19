@@ -174,6 +174,85 @@ test("nsis: macros defined inside installer.nsi itself count", () => {
   assert.deepEqual(r.problems, []);
 });
 
+test("nsis: the guards must enclose the specific RmDir, not just appear in the file", () => {
+  const moved = NSI.replace(
+    '    RmDir /r "$APPDATA\\${BUNDLEID}"\n',
+    '',
+  ).replace("SectionEnd\nSection Install", '  RmDir /r "$APPDATA\\${BUNDLEID}"\nSectionEnd\nSection Install');
+  const r = checkNsisText(moved, opts);
+  assert.ok(r.problems.some((p) => p.includes("opt-in checkbox")), r.problems.join("|"));
+  assert.ok(r.problems.some((p) => p.includes("UpdateMode")));
+  const elseBranch = NSI.replace("  ${EndIf}\nSectionEnd", '  ${Else}\n    RmDir /r "$APPDATA\\${BUNDLEID}"\n  ${EndIf}\nSectionEnd');
+  assert.ok(checkNsisText(elseBranch, opts).problems.some((p) => p.includes("opt-in checkbox")));
+});
+
+test("nsis: a delete run through a command string under app data fails", () => {
+  for (const line of [
+    `nsExec::Exec 'cmd /c rmdir /s /q "%APPDATA%\\atlas-duck"'`,
+    `nsExec::ExecToLog 'cmd /c rd /s /q "$LOCALAPPDATA\\example.release.app"'`,
+    `ExecWait 'powershell -Command Remove-Item -Recurse "$PROFILE\\x"'`,
+  ]) {
+    assert.ok(checkNsisText(`${NSI}\n  ${line}\n`, opts).problems.length >= 1, line);
+  }
+});
+
+// ------------------------------------------------------------------ NSIS hooks file
+
+const hooksWith = (body) => `${HOOKS}!macro NSIS_HOOK_POSTUNINSTALL\n${body}\n!macroend\n`;
+
+test("nsis hooks: deletes of app data or outside $INSTDIR in any macro fail", () => {
+  for (const line of [
+    '  RmDir /r "$APPDATA\\atlas-duck"',
+    '  RmDir /r "$LOCALAPPDATA\\example.release.app"',
+    '  Delete "$PROFILE\\x.txt"',
+    '  RmDir /r "$DOCUMENTS\\atlas-duck"',
+    '  RmDir /r "C:\\data\\stuff"',
+    '  RmDir /r "$INSTDIR\\..\\atlas-duck"',
+    `  nsExec::Exec 'cmd /c rmdir /s /q "%APPDATA%\\atlas-duck"'`,
+    `  nsExec::ExecToLog 'cmd /c del /q "C:\\x"'`,
+  ]) {
+    const r = checkNsisText(NSI, { ...opts, hooksText: hooksWith(line) });
+    assert.ok(r.problems.some((p) => p.startsWith("hooks file")), line);
+  }
+  for (const macro of ["PREINSTALL", "PREUNINSTALL", "POSTINSTALL"]) {
+    const h = `!macro NSIS_HOOK_${macro}\n  RmDir /r "$APPDATA\\atlas-duck"\n!macroend\n${HOOKS}`;
+    assert.ok(checkNsisText(NSI, { ...opts, hooksText: h }).problems.some((p) => p.startsWith("hooks file")), macro);
+  }
+});
+
+test("nsis hooks: deletes under $INSTDIR and comments pass", () => {
+  const body = '  ; RmDir /r "$APPDATA\\atlas-duck"\n  Delete "$INSTDIR\\old.dll"\n  RmDir /r "$INSTDIR\\resources\\old"';
+  assert.deepEqual(checkNsisText(NSI, { ...opts, hooksText: hooksWith(body) }).problems, []);
+});
+
+test("deb/rpm: removal through path-qualified, backslashed, nested or other commands fails", () => {
+  const bad = [
+    "/bin/rm -rf /var/lib/atlas-duck",
+    "/usr/bin/rm -rf ~/.config/atlas-duck",
+    "\\rm -rf ~/x",
+    "sh -c 'rm -rf /var/lib/atlas-duck'",
+    'bash -c "rm -rf $HOME/.config/x"',
+    "find /var/lib/atlas-duck -type f -exec /bin/rm {} +",
+    "find ~/.config/atlas-duck -type f -execdir rm {} +",
+    "mv ~/.config/atlas-duck /tmp",
+    "mv /var/lib/atlas-duck /var/lib/old",
+    "rsync -a --delete /empty/ /var/lib/atlas-duck/",
+    "shred -u ~/.config/atlas-duck/key",
+    "/usr/bin/shred -u /var/lib/atlas-duck/key",
+    "truncate -s 0 /var/lib/atlas-duck/db",
+  ];
+  for (const line of bad) {
+    const deb = parseMaintainerScripts({ postrm: `#!/bin/sh\n${line}\n` }, [FOLDER]);
+    assert.equal(deb.problems.length, 1, `deb should flag: ${line}`);
+    const rpm = checkRpmScripts(`postuninstall scriptlet (using /bin/sh):\n${line}\n`, [FOLDER]);
+    assert.equal(rpm.problems.length, 1, `rpm should flag: ${line}`);
+  }
+  const ok = ["/bin/rm -f /usr/share/applications/atlas-duck.desktop", "mv /usr/share/x /usr/share/y", "sh -c 'update-desktop-database -q'"];
+  for (const line of ok) {
+    assert.deepEqual(parseMaintainerScripts({ postrm: `${line}\n` }, [FOLDER]).problems, [], line);
+  }
+});
+
 test("nsis: a script without any delete line fails closed", () => {
   const r = checkNsisText('!define BUNDLEID "example.release.app"\n', opts);
   assert.ok(r.problems.some((p) => p.includes("fail closed")));

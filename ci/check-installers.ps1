@@ -12,6 +12,8 @@
       folder, or is not behind the opt-in checkbox and the not-an-update guard,
     - the bundle identifier equals the data-dir folder name (case-insensitive; the name is read from
       APP_DIR_NAME in paths/mod.rs, not a literal),
+    - the hooks file deletes anything under app data or outside $INSTDIR (Delete/RmDir or a
+      nsExec/ExecWait command string),
     - the PREINSTALL or PREUNINSTALL hook macro is undefined or not invoked.
   Run from the repository root. Needs node (set up before the build in bundle.yml).
 

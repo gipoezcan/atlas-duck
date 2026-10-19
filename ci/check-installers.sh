@@ -36,7 +36,8 @@ only_file() {
     echo "FAIL: expected exactly one $pattern in $dir, found ${#matches[@]}" >&2
     exit 1
   fi
-  echo "${matches[0]}"
+  # absolute: the AppImage step cds away from the repository root (bundle_dir is relative)
+  realpath "${matches[0]}"
 }
 
 work="$(mktemp -d)"
@@ -57,8 +58,9 @@ if [ "${#scripts[@]}" -gt 0 ]; then
 else
   node "$lib" deb "$paths_rs" || fail "deb maintainer scripts"
 fi
-dpkg-deb --fsys-tarfile "$deb" | tar -t | sed -E 's|^(\./)?/?||' | grep -qxF "$launcher" ||
-  fail "deb lacks /$launcher"
+# list to a file first: `grep -q` exiting early would SIGPIPE the writer and fail the pipeline (pipefail)
+dpkg-deb --fsys-tarfile "$deb" | tar -t | sed -E 's|^(\./)?/?||' >"$work/deb-files.txt"
+grep -qxF "$launcher" "$work/deb-files.txt" || fail "deb lacks /$launcher"
 
 # --- .rpm ---------------------------------------------------------------------------
 rpm_file="$(only_file "$bundle_dir/rpm" '*.rpm')"
@@ -67,7 +69,8 @@ rpm -qp --scripts "$rpm_file" >"$work/rpm-scripts.txt"
 echo "rpm --scripts output ($(wc -l <"$work/rpm-scripts.txt" | tr -d ' ') lines):"
 sed 's/^/  /' "$work/rpm-scripts.txt"
 node "$lib" rpm "$paths_rs" "$work/rpm-scripts.txt" || fail "rpm scriptlets"
-rpm -qlp "$rpm_file" | grep -qxF "/$launcher" || fail "rpm lacks /$launcher"
+rpm -qlp "$rpm_file" >"$work/rpm-files.txt"
+grep -qxF "/$launcher" "$work/rpm-files.txt" || fail "rpm lacks /$launcher"
 
 # --- AppImage -----------------------------------------------------------------------
 appimage="$(only_file "$bundle_dir/appimage" '*.AppImage')"
