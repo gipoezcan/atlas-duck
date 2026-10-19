@@ -1259,8 +1259,9 @@ where
     }
     // M10 T12 (PD-181): an Audit-window export ends before its next row once its cancel flag is
     // set, and removes its partial directory; waiting for it here, before the core's shutdown,
-    // lets that cleanup run and keeps `APP_STOP` after any record the job appends. A backup has
-    // no cancel and is waited for the same way. Bounded by `STORE_WAIT`.
+    // lets that cleanup run and keeps `APP_STOP` after any record the job appends. A backup sees
+    // the flag only once its folder dialog was answered (it then backs up nothing); once
+    // `Store::backup` runs it is waited for the same way. Bounded by `STORE_WAIT`.
     let job = state.stop_audit_job();
     if let Some(job) = job {
         bounded(job, STORE_WAIT, deadline, "audit_job").await;
@@ -2597,14 +2598,17 @@ mod tests {
         )
     }
 
-    /// The job's answer and a receiver that hears when the export reached its first row.
+    /// The job's answer, a receiver that hears when the export reached its first row, and a flag
+    /// the job sets as its last step (after `run_export` returned, before the task ends).
     type PausedExport = (
         tokio::sync::oneshot::Receiver<Result<ExportDoneDto, CommandError>>,
         std::sync::mpsc::Receiver<()>,
+        Arc<AtomicBool>,
     );
 
     /// The export of `rig` as the audit job: its first row waits (bounded, 30 s) until the job's
-    /// cancel flag is set, so the job is known to be inside `Store::export` when the test acts.
+    /// cancel flag is set, so the job is known to be inside `Store::export` when the test acts, and
+    /// then lingers 50 ms, so a caller that does not wait for the job finds it still running.
     fn paused_export(
         state: &ServeState,
         rig: &Rig,
@@ -2627,24 +2631,29 @@ mod tests {
                     {
                         std::thread::sleep(Duration::from_millis(5));
                     }
+                    std::thread::sleep(Duration::from_millis(50));
                 },
             );
         }
         let (store, out) = (rig.store.clone(), rig.out.clone());
+        let finished = Arc::new(AtomicBool::new(false));
+        let ended = finished.clone();
         let rx = state
             .spawn_audit_job(AuditJobKind::Export, move |cancel| {
                 let _ = flag.set(cancel.clone());
-                run_export(
+                let answer = run_export(
                     &store,
                     &Answers::new(&[Confirm::Ok]),
                     || Some(chosen(&out)),
                     atlas_duck_audit::TimeRange::all(),
                     &cancel,
                     &Events::default(),
-                )
+                );
+                ended.store(true, Ordering::SeqCst);
+                answer
             })
             .map_err(|e| format!("{e:?}"))?;
-        Ok((rx, reached))
+        Ok((rx, reached, finished))
     }
 
     /// PD-181 (`export_cancel`): the running export's flag is set through the serving state; the
@@ -2655,7 +2664,7 @@ mod tests {
         let rig = rig(4)?;
         let state = serving_store(&rig);
         assert!(!state.cancel_export(), "nothing runs");
-        let (rx, reached) = paused_export(&state, &rig)?;
+        let (rx, reached, _) = paused_export(&state, &rig)?;
         reached.recv_timeout(Duration::from_secs(30))?;
         assert_eq!(entries(&rig.out).len(), 1, "the partial directory exists");
         assert!(state.cancel_export());
@@ -2711,23 +2720,31 @@ mod tests {
     }
 
     /// PD-181 (§2.5): Quit while an export runs sets its cancel flag and waits for it before the
-    /// core's shutdown and the store's: the partial directory is gone and the log holds no
-    /// `EXPORT` (the store is opened again to look). The wait ends with the export, far inside
-    /// `STORE_WAIT`.
+    /// core's shutdown and the store's: when the core stage starts (it appends `APP_STOP`), the
+    /// job has ended and its partial directory is gone (T12 review I-1: recorded by the stage
+    /// itself); the log holds no `EXPORT` (the store is opened again to look). The wait ends with
+    /// the export, far inside `STORE_WAIT`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn quit_during_export_removes_partial_dir() -> Result<(), Box<dyn std::error::Error>> {
         let rig = rig(4)?;
         let state = serving_store(&rig);
-        let (rx, reached) = paused_export(&state, &rig)?;
+        let (rx, reached, finished) = paused_export(&state, &rig)?;
         reached.recv_timeout(Duration::from_secs(30))?;
         assert_eq!(entries(&rig.out).len(), 1, "the partial directory exists");
 
+        let at_core_stage: OnceLock<(bool, Vec<String>)> = OnceLock::new();
         let started = Instant::now();
         let outcome = shutdown_with(&state, started + Duration::from_secs(60), |_| {
-            None::<std::future::Ready<ShutdownReport>>
+            let _ = at_core_stage.set((finished.load(Ordering::SeqCst), entries(&rig.out)));
+            Some(std::future::ready(ShutdownReport::default()))
         })
         .await;
-        assert_eq!(outcome.report, None);
+        assert_eq!(
+            at_core_stage.get(),
+            Some(&(true, Vec::new())),
+            "(job finished, export folder entries) when the core stage started"
+        );
+        assert_eq!(outcome.report, Some(ShutdownReport::default()));
         assert!(started.elapsed() < STORE_WAIT, "{:?}", started.elapsed());
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(30), rx).await??,

@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { PROOF_HELPERS, collectFiles, isExempt, scanDialogProofs } from "./check-dialog-proofs.mjs";
+import { GUARDED_CALLS, PROOF_HELPERS, collectFiles, isExempt, scanDialogProofs } from "./check-dialog-proofs.mjs";
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SERVE = "app/src-tauri/src/serve.rs";
@@ -318,10 +318,84 @@ test("M-3: impl<T> Confirmed {} is not a literal", () => {
   }
 });
 
+// T12 review (rule 5): `Store::acknowledge_incident` takes no `Confirmed`; its callers must run it
+// on a native confirmation's Ok path.
+const ACK = "app/src-tauri/src/commands/audit.rs";
+
+test("rule 5: a guarded call outside a dialog function's Ok path is flagged", () => {
+  assert.deepEqual(GUARDED_CALLS.map((g) => g.name), ["acknowledge_incident"]);
+  const quiet = ["fn ack(store: &Store, seq: u64) {", "    let _ = store.acknowledge_incident(seq, \"u\", \"\");", "}"].join("\n");
+  assert.deepEqual(scanDialogProofs([{ path: ACK, src: quiet }]), [
+    `${ACK}:2: guarded call acknowledge_incident from fn ack, which does not run it on a native confirmation's Ok path`,
+  ]);
+  // Before the dialog, on its Cancel path, as a path call or a function value, outside any fn.
+  const shapes = [
+    [
+      "fn early(c: &dyn NativeConfirmer, store: &Store) {",
+      "    let _ = store.acknowledge_incident(1, \"u\", \"\");",
+      "    if c.confirm(\"t\") != Confirm::Ok { return; }",
+      "}",
+    ],
+    [
+      "fn cancel_arm(c: &dyn NativeConfirmer, store: &Store) {",
+      "    match c.confirm(\"t\") {",
+      "        Confirm::Cancel => { let _ = store.acknowledge_incident(1, \"u\", \"\"); }",
+      "        Confirm::Ok => {}",
+      "    }",
+      "}",
+    ],
+    ["fn path_call(store: &Store) {", "    let _ = Store::acknowledge_incident(store, 1, \"u\", \"\");", "}"],
+    ["fn value(store: &Store) {", "    let f = Store::acknowledge_incident;", "}"],
+    ["static F: fn(&Store, u64, &str, &str) = Store::acknowledge_incident;"],
+  ];
+  for (const lines of shapes) {
+    const found = scanDialogProofs([{ path: OTHER, src: lines.join("\n") }]);
+    assert.equal(found.length, 1, `${lines.join("\n")}\n${found.join("\n")}`);
+    assert.match(found[0], /guarded call acknowledge_incident from /);
+  }
+});
+
+test("rule 5: a guarded call on the Ok path, its definition and other names of it are accepted", () => {
+  const dialog = [
+    "fn acknowledge_dto(store: &Store, c: &dyn NativeConfirmer, seq: u64) {",
+    "    if c.confirm(&text(seq)) != Confirm::Ok {",
+    "        return;",
+    "    }",
+    "    let _ = store.acknowledge_incident(seq, \"u\", \"\");",
+    "}",
+    "fn propagated(store: &Store, c: &Confirmer) -> Result<(), E> {",
+    "    c.confirm(\"t\")?;",
+    "    store.acknowledge_incident(1, \"u\", \"\").map(|_| ())",
+    "}",
+  ].join("\n");
+  assert.deepEqual(scanDialogProofs([{ path: ACK, src: dialog }]), []);
+  const others = [
+    "pub fn acknowledge_incident(&self, verify_seq: u64, os_user: &str, note: &str) {}",
+    "pub async fn acknowledge_incident_cmd() {}",
+    "fn handlers() { let _ = commands::audit::acknowledge_incident; }",
+    "// store.acknowledge_incident(1, \"u\", \"\") in a comment",
+    "#[cfg(test)]",
+    "mod tests { fn t(store: &Store) { let _ = store.acknowledge_incident(1, \"u\", \"\"); } }",
+  ].join("\n");
+  assert.deepEqual(scanDialogProofs([{ path: OTHER, src: others }]), []);
+  // The crate-root tests/ directories are exempt.
+  const quiet = ["fn t(store: &Store) {", "    let _ = store.acknowledge_incident(1, \"u\", \"\");", "}"].join("\n");
+  assert.deepEqual(scanDialogProofs([{ path: "crates/audit/tests/verify.rs", src: quiet }]), []);
+  // An empty guarded list accepts the quiet caller (the list is what the rule checks).
+  assert.deepEqual(scanDialogProofs([{ path: ACK, src: quiet }], PROOF_HELPERS, []), []);
+});
+
 // M-4: the allowlist and the dialog proof are load-bearing on the real files. A slice of the real
-// tree (the three files that hold a listed helper) is copied into a scratch directory (the env var,
-// else `target/`, never the system temp dir) and mutated; the CLI must then fail.
-const SLICE = [SERVE, "crates/core/src/instances/admin.rs", "crates/core/src/settings/mod.rs"];
+// tree (the three files that hold a listed helper, and rule 5's guarded method and its caller) is
+// copied into a scratch directory (the env var, else `target/`, never the system temp dir) and
+// mutated; the CLI must then fail.
+const SLICE = [
+  SERVE,
+  "crates/core/src/instances/admin.rs",
+  "crates/core/src/settings/mod.rs",
+  "crates/audit/src/store.rs",
+  ACK,
+];
 
 function withSliceCopy(mutate, run) {
   const base = process.env.CHECK_DIALOG_PROOFS_SCRATCH ?? join(REPO, "target", "check-dialog-proofs-scratch");
@@ -373,6 +447,27 @@ test("M-4: removing the answer test before a real helper call fails the check", 
   const r = withSliceCopy((rel, t) => (rel === SERVE ? replaceOnce(t, "answer != Confirm::Ok", "false") : t), cli);
   assert.equal(r.status, 1);
   assert.match(r.stdout, /serve\.rs:\d+: proof helper confirmed_by called from fn /);
+});
+
+test("rule 5: removing the acknowledgement's dialog test in the real caller fails the check", () => {
+  const r = withSliceCopy(
+    (rel, t) =>
+      rel === ACK
+        ? replaceOnce(t, "confirmer.confirm(&acknowledge_text(verify_seq, &result, &detected_at)) != Confirm::Ok", "false")
+        : t,
+    cli,
+  );
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /commands\/audit\.rs:\d+: guarded call acknowledge_incident from fn acknowledge_dto/);
+});
+
+test("rule 5: renaming the guarded store method fails the check (stale GUARDED_CALLS)", () => {
+  const r = withSliceCopy(
+    (rel, t) => (rel === "crates/audit/src/store.rs" ? replaceOnce(t, "pub fn acknowledge_incident(", "pub fn ack_incident(") : t),
+    cli,
+  );
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /guarded call acknowledge_incident not found \(update GUARDED_CALLS\)/);
 });
 
 test("accepts_current_tree", () => {

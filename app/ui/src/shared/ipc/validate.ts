@@ -5,6 +5,7 @@ import type {
   AuditJobEvent,
   AuditPage,
   AuditPayload,
+  AuditReadFailure,
   AuditStatus,
   AuditTrail,
   BatchOutcome,
@@ -24,6 +25,7 @@ import type {
   EventHeader,
   ExportCancelAnswer,
   ExportDone,
+  ExportFailure,
   InputKind,
   InstanceView,
   KillAnswer,
@@ -583,6 +585,32 @@ export const isAuditJobEvent = (v: unknown): v is AuditJobEvent => {
 
 const isCoreError = (v: unknown): v is CoreError => fields(v, { kind: isStr });
 
+const isSha256Hex = (v: unknown): v is string => isStr(v) && /^[0-9a-f]{64}$/.test(v);
+
+/** `export`'s nested error, closed per kind: `not_renamed`'s hash is shown to the user, who hands it on. */
+export const isExportFailure = (v: unknown): v is ExportFailure => {
+  if (!rec(v)) return false;
+  switch (v.kind) {
+    case 'empty_range':
+    case 'exists':
+    case 'failed':
+      return closed(v, { kind: isStr });
+    case 'leftover':
+      return closed(v, { kind: isStr, dir_name: isStr });
+    case 'not_renamed':
+      return closed(v, { kind: isStr, manifest_sha256: isSha256Hex, dir_name: isStr, rows: isNum });
+    default:
+      return false;
+  }
+};
+
+/** `audit`'s nested error, closed per kind. */
+export const isAuditReadFailure = (v: unknown): v is AuditReadFailure => {
+  if (!rec(v)) return false;
+  if (v.kind === 'unreadable') return closed(v, { kind: isStr, seq: isNum });
+  return v.kind === 'failed' && closed(v, { kind: isStr });
+};
+
 /** Maps whatever a rejected invoke carried to a `CommandError`. */
 export function toCommandError(raw: unknown): CommandError {
   if (rec(raw) && isStr(raw.kind)) {
@@ -602,9 +630,13 @@ export function toCommandError(raw: unknown): CommandError {
       case 'settings':
       case 'cli_install':
       case 'removal':
-      case 'export':
-      case 'audit':
         if (isCoreError(raw.error)) return { kind: raw.kind, error: raw.error };
+        break;
+      case 'export':
+        if (isExportFailure(raw.error)) return { kind: 'export', error: raw.error };
+        break;
+      case 'audit':
+        if (isAuditReadFailure(raw.error)) return { kind: 'audit', error: raw.error };
         break;
       case 'release_blocked':
         if (isStr(raw.text)) return { kind: 'release_blocked', text: raw.text };

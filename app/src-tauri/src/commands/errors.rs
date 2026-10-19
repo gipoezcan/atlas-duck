@@ -69,6 +69,9 @@ pub enum CommandError {
 pub enum ExportFailure {
     /// The time range holds no record; nothing was written.
     EmptyRange,
+    /// The chosen folder already holds an export directory of this name (the same range exported
+    /// in the same second); nothing was written. A later attempt gets a new name.
+    Exists,
     /// The failed or cancelled export's staging directory `dir_name` (a `….partial` subdirectory
     /// of the folder the user chose; its name only, never a path) could not be removed: it may
     /// hold decrypted records, no `EXPORT` was logged, and the user must delete it.
@@ -90,6 +93,7 @@ impl ExportFailure {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::EmptyRange => "empty_range",
+            Self::Exists => "exists",
             Self::Leftover { .. } => "leftover",
             Self::NotRenamed { .. } => "not_renamed",
             Self::Failed => "failed",
@@ -112,7 +116,7 @@ impl Serialize for ExportFailure {
                 m.serialize_entry("dir_name", dir_name)?;
                 m.serialize_entry("rows", rows)?;
             }
-            Self::EmptyRange | Self::Failed => {}
+            Self::EmptyRange | Self::Exists | Self::Failed => {}
         }
         m.end()
     }
@@ -358,6 +362,7 @@ mod tests {
         );
         for (f, kind) in [
             (ExportFailure::EmptyRange, "empty_range"),
+            (ExportFailure::Exists, "exists"),
             (ExportFailure::Failed, "failed"),
         ] {
             assert_eq!(

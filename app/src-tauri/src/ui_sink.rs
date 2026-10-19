@@ -69,7 +69,7 @@ pub fn emit_wizard_changed<R: Runtime>(app: &AppHandle<R>) {
 /// not a core event; counts only.
 pub const EVENT_AUDIT_JOB: &str = "audit_job";
 /// The event the Audit window re-reads its status and list on (Δ-M10-3): the window appended a
-/// record (an acknowledgement, an export, a backup). No payload.
+/// record (an acknowledgement, an export, a backup), or "Verify now" found an incident. No payload.
 pub const EVENT_AUDIT_CHANGED: &str = "audit_changed";
 
 /// `audit_job`'s `job` (`export|backup`; `restore` is Task 13's).

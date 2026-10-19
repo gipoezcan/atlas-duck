@@ -188,6 +188,42 @@ describe('fixtures validate against their TS types', () => {
     expect(isOnboardingText({ text: null })).toBe(false);
     expect(isOnboardingText({ text: 'x', extra: 1 })).toBe(false);
   });
+  it('export and audit errors: closed nested shapes, a not_renamed hash is 64 lowercase hex digits', () => {
+    const exportErrors = commandError.filter((e) => e.kind === 'export');
+    expect(exportErrors.map((e) => (e as unknown as { error: { kind: string } }).error.kind)).toEqual([
+      'empty_range',
+      'exists',
+      'leftover',
+      'not_renamed',
+      'failed',
+    ]);
+    const renamed = { kind: 'not_renamed', manifest_sha256: '5e'.repeat(32), dir_name: 'd.partial', rows: 40 };
+    expect(toCommandError({ kind: 'export', error: renamed })).toEqual({ kind: 'export', error: renamed });
+    const refused = (error: unknown) => toCommandError({ kind: 'export', error }).kind;
+    for (const bad of [
+      { ...renamed, manifest_sha256: '5e'.repeat(31) },
+      { ...renamed, manifest_sha256: '5E'.repeat(32) },
+      { ...renamed, manifest_sha256: `${'5e'.repeat(31)}zz` },
+      { ...renamed, rows: '40' },
+      { ...renamed, path: '/x' },
+      { kind: 'not_renamed', dir_name: 'd.partial', rows: 40 },
+      { kind: 'leftover' },
+      { kind: 'leftover', dir_name: 'd.partial', path: '/x' },
+      { kind: 'exists', dir_name: 'd' },
+      { kind: 'failed', message: 'os text' },
+      { kind: 'other' },
+    ]) {
+      expect(refused(bad)).toBe('refused');
+    }
+    const audit = (error: unknown) => toCommandError({ kind: 'audit', error }).kind;
+    expect(audit({ kind: 'unreadable', seq: 3 })).toBe('audit');
+    expect(audit({ kind: 'failed' })).toBe('audit');
+    const badAudit = [{ kind: 'unreadable' }, { kind: 'unreadable', seq: '3' }, { kind: 'failed', seq: 3 }, { kind: 'x' }];
+    for (const bad of badAudit) {
+      expect(audit(bad)).toBe('refused');
+    }
+  });
+
   it('a plain string rejection (ACL refusal) maps to refused', () => {
     expect(toCommandError('command not allowed')).toEqual({
       kind: 'refused',

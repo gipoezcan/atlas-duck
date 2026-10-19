@@ -110,6 +110,9 @@ pub const PARTIAL_SUFFIX: &str = ".partial";
 
 /// The `Invalid` text of a time range that resolves to no record (the Audit window names it, T12).
 pub const EXPORT_NO_RECORDS: &str = "no records in the requested time range";
+/// The `Invalid` text of an export whose directory name is taken in the chosen folder (a second
+/// export of the same range in the same second; the Audit window names it, T12 review M-5).
+pub const EXPORT_DIR_EXISTS: &str = "an export directory of this name already exists";
 
 /// Attempts of the final rename (a scanner may hold a just-closed file of the directory for a
 /// moment, which makes Windows refuse to rename the directory), [`RENAME_RETRY_PAUSE`] apart.
@@ -844,13 +847,11 @@ impl Store {
         let staging_name = format!("{name}{PARTIAL_SUFFIX}");
         let dir = out.join(&staging_name);
         if entry_exists(&final_dir).map_err(io)? {
-            return Err(AuditError::Invalid(
-                "an export directory of this name already exists",
-            ));
+            return Err(AuditError::Invalid(EXPORT_DIR_EXISTS));
         }
         create_private_dir(&dir).map_err(|e| {
             if e.kind() == io::ErrorKind::AlreadyExists {
-                AuditError::Invalid("an export directory of this name already exists")
+                AuditError::Invalid(EXPORT_DIR_EXISTS)
             } else {
                 io(e)
             }

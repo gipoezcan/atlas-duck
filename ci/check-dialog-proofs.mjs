@@ -22,6 +22,11 @@
 //    dialog function (the same Ok-path rule at the call) or another listed helper.
 // 4. `Confirmed` / `RustChosenPath` imported under another name (`as X`) or aliased with `type`
 //    is a violation: the aliased literal would not be seen.
+// 5. A guarded call (per-method list `GUARDED_CALLS`, one comment each: a store method that takes
+//    no `Confirmed` although a native confirmation must come first) must sit in a dialog function,
+//    on the Ok path (rule 1's test at the call). It is matched as `.name(`, `.name` or
+//    `Store::name` / `Self::name`, in any crate; a function of the same name elsewhere is not a
+//    call of it unless reached that way.
 //
 // Exempt: `crates/audit/src/testing.rs`, `crates/core/src/testing/**` (not `cfg(test)`), the
 // crate-root `tests/` directories (`crates/*/tests`, `app/src-tauri/tests`, which the scan visits),
@@ -33,7 +38,7 @@
 // arm/block a site sits in, so `let ok = c.confirm(t) == Confirm::Ok; if ok {..}` is flagged (safe
 // direction) while a hand-built branch structure that merely looks like an Ok path is accepted.
 // Macro-generated code and the compiler's own name resolution are not seen. The store's runtime
-// checks (`NeedsConfirmation`) are the backstop.
+// checks (`NeedsConfirmation`) are the backstop; rule 5's calls have none (code review is).
 //
 // Usage: node ci/check-dialog-proofs.mjs [repo-root]
 // Exit 0 = ok. Exit 1 = violations (one `file:line: text` per line on stdout).
@@ -59,6 +64,16 @@ export const PROOF_HELPERS = [
   { file: "crates/core/src/instances/admin.rs", name: "apply", noneOk: true },
   // Audit settings in core: `Settings::confirm` (settings/mod.rs:912) shows the dialog, the helper hashes the text.
   { file: "crates/core/src/settings/mod.rs", name: "confirmed" },
+];
+
+/**
+ * The guarded calls (rule 5): store methods that take no `Confirmed`, so neither the type nor the
+ * store's runtime check proves the dialog; every call must be on a dialog function's Ok path.
+ */
+export const GUARDED_CALLS = [
+  // §8.7, PD-180: `INTEGRITY_ACK` records no dialog hash (M10 T12 ruling); the confirmation naming
+  // the incident's seq, result and time comes first (`acknowledge_dto`, app commands/audit.rs).
+  { file: "crates/audit/src/store.rs", name: "acknowledge_incident" },
 ];
 
 const posix = (p) => p.split(sep).join("/");
@@ -307,9 +322,10 @@ function pathProvedAt(code, f, m) {
 
 /**
  * Violations over `files` (`[{ path, src }]`, repo-relative posix paths): `file:line: text`.
- * `helpers` is the proof-helper allowlist (`PROOF_HELPERS`).
+ * `helpers` is the proof-helper allowlist (`PROOF_HELPERS`), `guarded` the guarded calls
+ * (`GUARDED_CALLS`).
  */
-export function scanDialogProofs(files, helpers = PROOF_HELPERS) {
+export function scanDialogProofs(files, helpers = PROOF_HELPERS, guarded = GUARDED_CALLS) {
   const testMods = cfgTestModules(files);
   const isTestModule = (p) => testMods.some((t) => t.file === p || p.startsWith(t.dir));
   const prepared = files
@@ -341,6 +357,18 @@ export function scanDialogProofs(files, helpers = PROOF_HELPERS) {
     });
     each(ALIASED, file.code, (m) => add(file, m.index, `${m[1]} imported under another name hides its construction sites from this check`));
     each(TYPE_ALIAS, file.code, (m) => add(file, m.index, `${m[1]} aliased with \`type\` hides its construction sites from this check`));
+    // 5: every guarded call is on a dialog function's Ok path.
+    for (const g of guarded) {
+      each(new RegExp(`(?:\\.\\s*|\\b(?:Store|Self)\\s*::\\s*)${g.name}\\b`, "g"), file.code, (m) => {
+        const f = enclosing(file.fns, m.index);
+        if (f && confirmProvedAt(file.code, f, m.index)) return;
+        add(
+          file,
+          m.index,
+          `guarded call ${g.name} from ${f ? `fn ${f.name}` : "outside any fn"}, which does not run it on a native confirmation's Ok path`,
+        );
+      });
+    }
   }
 
   // 3: every caller of a helper is a dialog function or another helper.
@@ -434,6 +462,11 @@ export function main(repo = join(dirname(fileURLToPath(import.meta.url)), ".."))
     const f = files.find((x) => x.path === h.file);
     const defined = f && new RegExp(`\\bfn\\s+${h.name}\\s*[<(]`).test(stripNonCode(f.src));
     if (!defined) violations.push(`${h.file}: listed proof helper ${h.name} not found (update PROOF_HELPERS)`);
+  }
+  for (const g of GUARDED_CALLS) {
+    const f = files.find((x) => x.path === g.file);
+    const defined = f && new RegExp(`\\bfn\\s+${g.name}\\s*[<(]`).test(stripNonCode(f.src));
+    if (!defined) violations.push(`${g.file}: guarded call ${g.name} not found (update GUARDED_CALLS)`);
   }
   for (const v of violations) console.log(v);
   if (violations.length > 0) return 1;

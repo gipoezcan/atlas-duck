@@ -24,9 +24,9 @@ use std::sync::atomic::AtomicBool;
 
 use atlas_duck_audit::types::RustChosenPath;
 use atlas_duck_audit::{
-    AuditCursor, AuditError, AuditFilter, AuditPage, AuditTrail, DecisionColumn, EXPORT_NO_RECORDS,
-    EventFlags, EventHeader, EventType, ExportControl, MAX_AUDIT_PAGE_ROWS, MAX_FILTER_TEXT_BYTES,
-    Store, TimeRange, UtcInstant,
+    AuditCursor, AuditError, AuditFilter, AuditPage, AuditTrail, DecisionColumn, EXPORT_DIR_EXISTS,
+    EXPORT_NO_RECORDS, EventFlags, EventHeader, EventType, ExportControl, MAX_AUDIT_PAGE_ROWS,
+    MAX_FILTER_TEXT_BYTES, Store, TimeRange, UtcInstant,
 };
 use atlas_duck_core::{Confirm, NativeConfirmer, StoreHealthView, VerifyNow};
 use atlas_duck_preview::Platform;
@@ -40,7 +40,7 @@ use super::{AuditReadFailure, CommandError, ExportFailure, blocking, core, finis
 use crate::removal::{self, BackupAnswer, RemovalState};
 use crate::serve::{AuditJobKind, JobRefused, ServeState};
 use crate::state::ServeSlot;
-use crate::ui_sink::{EventOut, emit_audit_changed, emit_audit_job};
+use crate::ui_sink::{EventOut, emit_audit_changed, emit_audit_job, emit_status_changed};
 
 /// plan text (PD-161): the native warning before the export's folder dialog.
 pub const EXPORT_WARNING_TEXT: &str = "The export contains decrypted audit payloads. Any program \
@@ -57,6 +57,10 @@ pub const DEFAULT_PAGE_ROWS: u32 = 200;
 pub const MAX_LISTED_INCIDENTS: usize = 100;
 /// The longest `VERIFY.result` the window shows (the finding kinds are short snake_case words).
 const MAX_RESULT_CHARS: usize = 64;
+
+// `payload_dto` shows a one-page payload as the tree: the renderer must parse a whole page (T12
+// review M-7; a smaller tree bound would silently turn such payloads into Raw text).
+const _: () = assert!(render::AUDIT_TREE_MAX_BYTES == atlas_duck_audit::PAYLOAD_PAGE_BYTES);
 
 /// PD-180 (plan text): the acknowledgement's native confirmation, from the record's facts.
 pub fn acknowledge_text(verify_seq: u64, result: &str, detected_at: &str) -> String {
@@ -644,13 +648,15 @@ pub fn status_dto(store: &Store) -> Result<AuditStatusDto, CommandError> {
 
 /// `acknowledge_incident` (§8.7, PD-180): only an open incident; the native confirmation names the
 /// record's seq, result and detected-at time; `Cancel` appends nothing. Then `INTEGRITY_ACK
-/// {verify_seq, os_user, note}`.
+/// {verify_seq, os_user, note}`, `audit_changed` and `status_banner` (T12 review I-2: the headers'
+/// red `integrity_incident` line comes from the open incidents and is read again).
 pub fn acknowledge_dto(
     store: &Store,
     confirmer: &dyn NativeConfirmer,
     verify_seq: u64,
     note: &str,
     os_user: &str,
+    out: &dyn EventOut,
 ) -> Result<AcknowledgedDto, CommandError> {
     if !store.open_incidents().contains(&verify_seq) {
         return Err(CommandError::NotFound);
@@ -660,10 +666,14 @@ pub fn acknowledge_dto(
         return Err(CommandError::Cancelled);
     }
     match store.acknowledge_incident(verify_seq, os_user, note) {
-        Ok(ack) => Ok(AcknowledgedDto {
-            verify_seq,
-            ack_seq: ack.seq,
-        }),
+        Ok(ack) => {
+            emit_audit_changed(out);
+            emit_status_changed(out);
+            Ok(AcknowledgedDto {
+                verify_seq,
+                ack_seq: ack.seq,
+            })
+        }
         // Acknowledged meanwhile (a second window's click, a race with this one).
         Err(AuditError::Invalid(_)) => Err(CommandError::NotFound),
         Err(AuditError::Closed) => Err(CommandError::NotReady),
@@ -735,27 +745,40 @@ pub fn run_export(
         }
         Err(e) => {
             emit_audit_job(out, job, "failed", None);
-            Err(CommandError::Export(match e {
-                AuditError::ExportLeftover { dir_name, .. } => ExportFailure::Leftover { dir_name },
-                AuditError::Invalid(EXPORT_NO_RECORDS) => ExportFailure::EmptyRange,
-                _ => ExportFailure::Failed,
-            }))
+            Err(CommandError::Export(export_failure(e)))
         }
+    }
+}
+
+/// The window's kind of a failed export (not `Cancelled`, not `ExportNotRenamed`): the cases the
+/// user can act on by name, `failed` for the rest. The leftover's cause is dropped (OS text).
+fn export_failure(e: AuditError) -> ExportFailure {
+    match e {
+        AuditError::ExportLeftover { dir_name, .. } => ExportFailure::Leftover { dir_name },
+        AuditError::Invalid(EXPORT_NO_RECORDS) => ExportFailure::EmptyRange,
+        AuditError::Invalid(EXPORT_DIR_EXISTS) => ExportFailure::Exists,
+        _ => ExportFailure::Failed,
     }
 }
 
 /// The backup (§8.10) the Audit window triggers, inside `removal::backup`'s claim (the M6 path of
 /// "Prepare for removal" step 1): Rust's folder dialog (`pick`; `Ok(false)` when cancelled), then
-/// `Store::backup`, which logs `BACKUP` itself. `audit_job` is indeterminate (PD-181).
+/// `Store::backup`, which logs `BACKUP` itself. `audit_job` is indeterminate (PD-181). `cancel`
+/// set while the dialog was open (Quit, T12 review I-3) is `cancelled` with nothing written: no
+/// `BACKUP` after the quit path moved on. Once `Store::backup` runs it is not interrupted.
 pub fn run_backup(
     store: &Store,
     pick: impl FnOnce() -> Result<Option<RustChosenPath>, CommandError>,
+    cancel: &AtomicBool,
     out: &dyn EventOut,
 ) -> Result<bool, CommandError> {
     let job = AuditJobKind::Backup;
     let Some(dir) = pick()? else {
         return Ok(false);
     };
+    if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(CommandError::Cancelled);
+    }
     emit_audit_job(out, job, "started", None);
     match store.backup(dir) {
         Ok(_) => {
@@ -820,7 +843,18 @@ pub async fn verify_now<R: Runtime>(
         }
         Err(e) => Err(e),
     };
+    verify_now_events(&app, &response);
     finish(&app, response)
+}
+
+/// After `verify_now`: an incident it found opened the headers' red `integrity_incident` line, so
+/// they read `app_status` again (`status_banner`, T12 review I-2), and the Audit window re-reads
+/// its status (`audit_changed`). Any other answer opened none.
+pub fn verify_now_events(out: &dyn EventOut, response: &Result<VerifyNow, CommandError>) {
+    if let Ok(VerifyNow::Incident { .. }) = response {
+        emit_audit_changed(out);
+        emit_status_changed(out);
+    }
 }
 
 /// `audit_query {filter, cursor?}` (§8.10): one page of headers, newest first.
@@ -883,7 +917,7 @@ pub async fn audit_status<R: Runtime>(
 }
 
 /// `acknowledge_incident {verify_seq, note}` (§8.7, PD-180): Rust's native confirmation first, then
-/// `INTEGRITY_ACK` with this OS user; `audit_changed` after it.
+/// `INTEGRITY_ACK` with this OS user; `audit_changed` and `status_banner` after it.
 #[tauri::command]
 pub async fn acknowledge_incident<R: Runtime>(
     app: AppHandle<R>,
@@ -895,12 +929,18 @@ pub async fn acknowledge_incident<R: Runtime>(
         let store = state.open_store().ok_or(CommandError::NotReady)?;
         let confirmer = state.confirmer().ok_or(CommandError::NotReady)?;
         let os_user = crate::credential::os_user();
-        let acked = blocking(move || {
-            acknowledge_dto(&store, &*confirmer, verify_seq, note.as_str(), &os_user)
+        let handle = app.clone();
+        blocking(move || {
+            acknowledge_dto(
+                &store,
+                &*confirmer,
+                verify_seq,
+                note.as_str(),
+                &os_user,
+                &handle,
+            )
         })
-        .await?;
-        emit_audit_changed(&app);
-        Ok(acked)
+        .await
     }
     .await;
     finish(&app, response)
@@ -964,7 +1004,7 @@ pub async fn backup_trigger<R: Runtime>(
         let store = state.open_store().ok_or(CommandError::NotReady)?;
         let handle = app.clone();
         let rx = state
-            .spawn_audit_job(AuditJobKind::Backup, move |_cancel| {
+            .spawn_audit_job(AuditJobKind::Backup, move |cancel| {
                 let removal = handle
                     .try_state::<RemovalState>()
                     .ok_or(CommandError::NotReady)?;
@@ -972,6 +1012,7 @@ pub async fn backup_trigger<R: Runtime>(
                     run_backup(
                         &store,
                         || super::settings::pick_backup_folder(&handle),
+                        &cancel,
                         &handle,
                     )
                 })
@@ -1349,6 +1390,37 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// T12 review M-5: the failures the user can act on keep their kind (a taken directory name
+    /// is `exists`, not `failed`); a leftover keeps its directory's name and drops its cause (OS
+    /// text); everything else is `failed`.
+    #[test]
+    fn export_failures_keep_the_cases_the_user_can_act_on() {
+        assert_eq!(
+            export_failure(AuditError::Invalid(EXPORT_DIR_EXISTS)),
+            ExportFailure::Exists
+        );
+        assert_eq!(
+            export_failure(AuditError::Invalid(EXPORT_NO_RECORDS)),
+            ExportFailure::EmptyRange
+        );
+        assert_eq!(
+            export_failure(AuditError::ExportLeftover {
+                dir_name: "d.partial".into(),
+                cause: Box::new(AuditError::Io("C:\\Users\\x: denied".into())),
+            }),
+            ExportFailure::Leftover {
+                dir_name: "d.partial".into()
+            }
+        );
+        for other in [
+            AuditError::Invalid("the export location is not a directory"),
+            AuditError::Io("disk full".into()),
+            AuditError::Closed,
+        ] {
+            assert_eq!(export_failure(other), ExportFailure::Failed);
+        }
+    }
+
     /// PD-180: the acknowledgement asks Rust's native confirmation first. Its text names the
     /// incident's seq, result and detected-at time as the `VERIFY` record holds them; `Cancel`
     /// appends no `INTEGRITY_ACK` and keeps the incident open. A seq that is no open incident gets
@@ -1365,7 +1437,8 @@ pub(crate) mod tests {
         assert_eq!(result, "chain_broken");
 
         let confirmer = Answers::new(&[Confirm::Cancel]);
-        let res = acknowledge_dto(&r.store, &confirmer, seq, "looked at it", "alice");
+        let events = Events::default();
+        let res = acknowledge_dto(&r.store, &confirmer, seq, "looked at it", "alice", &events);
         assert_eq!(res, Err(CommandError::Cancelled));
         assert_eq!(
             confirmer.texts(),
@@ -1381,29 +1454,40 @@ pub(crate) mod tests {
         let confirmer = Answers::new(&[Confirm::Ok]);
         for other in [seq + 1, 1] {
             assert_eq!(
-                acknowledge_dto(&r.store, &confirmer, other, "", "alice"),
+                acknowledge_dto(&r.store, &confirmer, other, "", "alice", &events),
                 Err(CommandError::NotFound)
             );
         }
         assert!(confirmer.texts().is_empty());
         assert_eq!(count(&r.store, EventType::INTEGRITY_ACK)?, 0);
+        assert!(events.all().is_empty(), "{:?}", events.all());
         Ok(())
     }
 
     /// §8.7: after `Ok` the store appends `INTEGRITY_ACK {verify_seq, os_user, note}` with the OS
     /// user in its plaintext column, and the incident is closed; a second acknowledgement of it is
-    /// `not_found`.
+    /// `not_found`. The Audit window (`audit_changed`) and the headers (`status_banner`, no line
+    /// named: the red `integrity_incident` line clears, T12 review I-2) read their status again.
     #[test]
     fn acknowledge_incident_records_os_user_and_note() -> TestResult {
         let r = rig(0)?;
         let seq = incident(&r.store)?;
+        let events = Events::default();
         let acked = acknowledge_dto(
             &r.store,
             &Answers::new(&[Confirm::Ok]),
             seq,
             "restored from backup <b>",
             "alice",
+            &events,
         )?;
+        assert_eq!(
+            events.all(),
+            [
+                ("audit_changed".to_owned(), Value::Null),
+                ("status_banner".to_owned(), json!({"line_ids": []}))
+            ]
+        );
         assert_eq!(acked.verify_seq, seq);
         let payload: Value = serde_json::from_slice(&r.store.read_payload(acked.ack_seq)?)?;
         assert_eq!(
@@ -1421,10 +1505,42 @@ pub(crate) mod tests {
         assert_eq!(page.rows[0].actor.os_user.as_deref(), Some("alice"));
         assert!(r.store.open_incidents().is_empty());
         assert_eq!(
-            acknowledge_dto(&r.store, &Answers::new(&[Confirm::Ok]), seq, "", "alice"),
+            acknowledge_dto(
+                &r.store,
+                &Answers::new(&[Confirm::Ok]),
+                seq,
+                "",
+                "alice",
+                &events
+            ),
             Err(CommandError::NotFound)
         );
+        assert_eq!(events.all().len(), 2, "nothing more: {:?}", events.all());
         Ok(())
+    }
+
+    /// T12 review I-2: a `verify_now` that found an incident opened the headers' red line: they
+    /// read `app_status` again (`status_banner`) and the Audit window its status (`audit_changed`).
+    /// Any other answer, or an error, opened none: no event.
+    #[test]
+    fn verify_now_incident_announces_the_status_change() {
+        let events = Events::default();
+        for quiet in [
+            Ok(VerifyNow::Verified),
+            Ok(VerifyNow::DidNotComplete),
+            Err(CommandError::NotReady),
+        ] {
+            verify_now_events(&events, &quiet);
+        }
+        assert!(events.all().is_empty(), "{:?}", events.all());
+        verify_now_events(&events, &Ok(VerifyNow::Incident { count: 2 }));
+        assert_eq!(
+            events.all(),
+            [
+                ("audit_changed".to_owned(), Value::Null),
+                ("status_banner".to_owned(), json!({"line_ids": []}))
+            ]
+        );
     }
 
     /// L134: `audit_status` counts the open incidents and lists them newest first with their
@@ -1449,7 +1565,14 @@ pub(crate) mod tests {
             let at = i.detected_at.as_deref().ok_or("detected_at")?;
             assert!(UtcInstant::parse_rfc3339_ms(at).is_some(), "{at}");
         }
-        acknowledge_dto(&r.store, &Answers::new(&[Confirm::Ok]), first, "", "alice")?;
+        acknowledge_dto(
+            &r.store,
+            &Answers::new(&[Confirm::Ok]),
+            first,
+            "",
+            "alice",
+            &Events::default(),
+        )?;
         let status = status_dto(&r.store)?;
         assert_eq!(status.incident_count, 1);
         assert_eq!(status.open_incidents[0].verify_seq, second);
@@ -1583,9 +1706,15 @@ pub(crate) mod tests {
     fn backup_trigger_rust_dialog_and_indeterminate_job() -> TestResult {
         let r = rig(1)?;
         let events = Events::default();
-        assert!(!run_backup(&r.store, || Ok(None), &events)?);
+        let cancel = AtomicBool::new(false);
+        assert!(!run_backup(&r.store, || Ok(None), &cancel, &events)?);
         assert!(events.all().is_empty());
-        assert!(run_backup(&r.store, || Ok(Some(chosen(&r.out))), &events)?);
+        assert!(run_backup(
+            &r.store,
+            || Ok(Some(chosen(&r.out))),
+            &cancel,
+            &events
+        )?);
         assert_eq!(events.phases(), ["started", "done"]);
         assert_eq!(
             events.all().last().map(|(n, _)| n.clone()).as_deref(),
@@ -1593,6 +1722,30 @@ pub(crate) mod tests {
         );
         assert_eq!(count(&r.store, EventType::BACKUP)?, 1);
         assert_eq!(entries(&r.out).len(), 1, "one bundle directory");
+        Ok(())
+    }
+
+    /// T12 review I-3: Quit sets the job's cancel flag while the backup's folder dialog is open;
+    /// the folder the user then picks is not backed up: `cancelled`, no `BACKUP` (it would follow
+    /// `APP_STOP` once the quit path stopped waiting), nothing written, no event.
+    #[test]
+    fn backup_trigger_cancelled_while_its_dialog_was_open_backs_up_nothing() -> TestResult {
+        let r = rig(1)?;
+        let events = Events::default();
+        let cancel = AtomicBool::new(false);
+        let res = run_backup(
+            &r.store,
+            || {
+                cancel.store(true, Ordering::SeqCst);
+                Ok(Some(chosen(&r.out)))
+            },
+            &cancel,
+            &events,
+        );
+        assert_eq!(res, Err(CommandError::Cancelled));
+        assert_eq!(count(&r.store, EventType::BACKUP)?, 0);
+        assert!(entries(&r.out).is_empty(), "{:?}", entries(&r.out));
+        assert!(events.all().is_empty(), "{:?}", events.all());
         Ok(())
     }
 

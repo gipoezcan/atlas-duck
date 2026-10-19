@@ -365,8 +365,10 @@ fn push_escaped_char(out: &mut String, c: char) {
 
 /// The byte length of the `⟨…⟩` escape `rest` starts with: `⟨U+XXXX⟩` (4 to 6 upper-case hex
 /// digits), [`ws::NO_NEWLINE_AT_END`], or the PD-68 byte escape `⟨0xHH⟩` of a Raw page (Audit
-/// window, M10 T12; text that went through the display escaping holds no literal `⟨`, so none can
-/// be forged); `None` for anything else.
+/// window, M10 T12); `None` for anything else. Text that went through the display escaping holds
+/// no literal `⟨`, so none can be forged there. Text that is marked without that escaping first
+/// (`mark_text`, the sanitized `*_html` text) can carry a literal `⟨0x41⟩` or `⟨U+0041⟩`; it is
+/// then only styled as an escape (a `<mark>`), nothing else follows from it.
 fn escape_len(rest: &str) -> Option<usize> {
     if rest.starts_with(ws::NO_NEWLINE_AT_END) {
         return Some(ws::NO_NEWLINE_AT_END.len());

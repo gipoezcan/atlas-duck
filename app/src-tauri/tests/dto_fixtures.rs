@@ -704,6 +704,7 @@ fn command_errors() -> Vec<CommandError> {
         // M10 T12: the Audit window's kinds (a name, never a path; no error text).
         CommandError::Cancelled,
         CommandError::Export(ExportFailure::EmptyRange),
+        CommandError::Export(ExportFailure::Exists),
         CommandError::Export(ExportFailure::Leftover {
             dir_name: format!("atlas-duck-export-{CHAIN}-1-40-20261019T120000Z.partial"),
         }),

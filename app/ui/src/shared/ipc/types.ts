@@ -687,6 +687,23 @@ export interface AuditJobEvent {
   total?: number;
 }
 
+/**
+ * How an export did not simply succeed (Rust `ExportFailure`, closed shapes; a name, never a path):
+ * `empty_range` (nothing to export), `exists` (the folder already holds an export of this name:
+ * try again), `leftover` (a partial directory to delete), `not_renamed` (complete and logged under
+ * its `.partial` name: rename it, never retry; `manifest_sha256` is 64 lowercase hex digits, the
+ * recipient's trust root), `failed`.
+ */
+export type ExportFailure =
+  | { kind: 'empty_range' }
+  | { kind: 'exists' }
+  | { kind: 'leftover'; dir_name: string }
+  | { kind: 'not_renamed'; manifest_sha256: string; dir_name: string; rows: number }
+  | { kind: 'failed' };
+
+/** Why an Audit-window read failed (Rust `AuditReadFailure`, closed shapes). */
+export type AuditReadFailure = { kind: 'unreadable'; seq: number } | { kind: 'failed' };
+
 /** A tagged error object from core (`DecisionError` / `AdminError` / `SettingsError`). */
 export interface CoreError {
   kind: string;
@@ -724,14 +741,10 @@ export type CommandError =
   | { kind: 'release_blocked'; text: string }
   /** A native confirmation or folder dialog was cancelled (or an export's cancel): nothing happened. */
   | { kind: 'cancelled' }
-  /**
-   * The export did not simply succeed: `error.kind` is `empty_range`, `leftover` (+`dir_name`, a
-   * partial directory to delete), `not_renamed` (+`manifest_sha256`, `dir_name`, `rows`: complete
-   * and logged, rename it without `.partial`; never retry) or `failed`.
-   */
-  | { kind: 'export'; error: CoreError }
+  /** The export did not simply succeed (see `ExportFailure`). */
+  | { kind: 'export'; error: ExportFailure }
   /** The backup failed; nothing to undo. */
   | { kind: 'backup' }
   /** An Audit-window read failed: `error.kind` is `unreadable` (+`seq`) or `failed`. */
-  | { kind: 'audit'; error: CoreError }
+  | { kind: 'audit'; error: AuditReadFailure }
   | { kind: 'refused'; message: string };

@@ -14,7 +14,8 @@ use super::{DOC_MAX_ROWS, Doc, Frame, Platform, len_u64, raw};
 use crate::sanitize::iframe_document;
 
 /// Most bytes of a payload the document shows as a JSON tree: one page of the Audit window's
-/// payload view (`audit::PAYLOAD_PAGE_BYTES`); a larger payload is paged as Raw text.
+/// payload view (`audit::PAYLOAD_PAGE_BYTES`; the app asserts the two are equal at compile time);
+/// a larger payload is paged as Raw text.
 pub const AUDIT_TREE_MAX_BYTES: usize = 256 << 10;
 
 /// What a cap of the payload document left out (the PD-67 note for this window: the Raw text of
