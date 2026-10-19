@@ -2571,7 +2571,10 @@ async fn an_incomplete_wizard_restore_stops_with_the_new_id_pinned() -> TestResu
     call(&w, "submit_secret", json!({ "secret": PASSPHRASE }))
         .await
         .map_err(|e| format!("submit_secret: {e}"))?;
-    let s = until(&setup, "the restore ended", |s| s["step"] != "restore").await?;
+    let s = until(&setup, "the restore ended", |s| {
+        s["stopped_text"] == wizard::MSG_RESTORE_COMMITTED_INCOMPLETE || !s["error"].is_null()
+    })
+    .await?;
     assert_eq!(
         (s["step"].clone(), s["stopped_text"].clone()),
         (

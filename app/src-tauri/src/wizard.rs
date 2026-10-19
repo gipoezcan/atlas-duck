@@ -296,6 +296,11 @@ pub fn step_of(p: &Progress, f: &Facts<'_>) -> WizardStep {
         AppSnapshot::BeforeFirstRun | AppSnapshot::Starting if !p.existing_store => {
             WizardStep::AnchorDir
         }
+        // A restore that committed but did not complete failed the store before the wizard
+        // recorded it (its own stop text follows).
+        AppSnapshot::StoreUnavailable if p.in_flight == Some(InFlight::Restore) => {
+            WizardStep::Restore
+        }
         // PD-06: nothing is served; only a restart helps.
         AppSnapshot::StoreUnavailable => WizardStep::Stopped(MSG_STORE_UNAVAILABLE),
         // (1a): locked, store newer, starting; the credential window or the error window says what
@@ -1669,6 +1674,11 @@ mod tests {
         };
         assert_eq!(
             step_of(&restoring, &facts(&AppSnapshot::Serving)),
+            WizardStep::Restore
+        );
+        // An incomplete restore failed the store before the wizard recorded it (T15 review I-1).
+        assert_eq!(
+            step_of(&restoring, &facts(&AppSnapshot::StoreUnavailable)),
             WizardStep::Restore
         );
         // M6 final review M-9: a pinned file without the store's id holds every later step.
