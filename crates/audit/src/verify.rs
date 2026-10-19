@@ -62,6 +62,7 @@ pub enum FindingKind {
     UnanchoredTail,
     InterruptedPruneReconciled,
     InterruptedRestoreReconciled,
+    AnchorDirTornLine,
 }
 
 impl FindingKind {
@@ -91,16 +92,18 @@ impl FindingKind {
             FindingKind::UnanchoredTail => "unanchored_tail",
             FindingKind::InterruptedPruneReconciled => "interrupted_prune_reconciled",
             FindingKind::InterruptedRestoreReconciled => "interrupted_restore_reconciled",
+            FindingKind::AnchorDirTornLine => "anchor_dir_torn_line",
         }
     }
 
-    /// Everything except the three informational kinds is an integrity incident.
+    /// Everything except the four informational kinds is an integrity incident.
     pub fn is_incident(&self) -> bool {
         !matches!(
             self,
             FindingKind::UnanchoredTail
                 | FindingKind::InterruptedPruneReconciled
                 | FindingKind::InterruptedRestoreReconciled
+                | FindingKind::AnchorDirTornLine
         )
     }
 }
@@ -1469,7 +1472,7 @@ fn check_anchor_dir(
     let Some(lines) = lines else {
         return Ok(AnchorDirState::default());
     };
-    for p in &lines.problems {
+    for p in lines.problems.iter().chain(&lines.notes) {
         out.push(p.clone());
     }
     let ctx = VerifyCtx {
@@ -1945,8 +1948,9 @@ pub(crate) fn snapshot_keyed(conn: &Connection, kek: &Kek) -> rusqlite::Result<V
 }
 
 /// The anchor-dir checks (§8.11 step 1: "against the anchor directory's lines for that
-/// `chain_id`") of a restore source. Every finding, a dir that cannot be read included, is
-/// one: a restore is never verified against a dir it could not read. `rollback` is the span
+/// `chain_id`") of a restore source. Every incident finding, a dir that cannot be read
+/// included, refuses it: a restore is never verified against a dir it could not read (a torn
+/// line, PD-165, is informational and refuses nothing). `rollback` is the span
 /// of the snapshot's own chain the restore being made gives up (a confirmed same-machine
 /// rollback), as its `RESTORE` will record it.
 pub(crate) fn snapshot_anchor_dir(

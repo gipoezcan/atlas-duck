@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::admission::{self, DEFAULT_MIN_FREE_BYTES, FreeSpaceProbe, OsFreeSpace};
-use crate::anchor_dir::writer::{HeaderFacts, Pending, SHUTDOWN_DRAIN};
+use crate::anchor_dir::writer::{HeaderFacts, IncidentDraft, Pending, SHUTDOWN_DRAIN};
 use crate::anchor_dir::{self, AnchorDirLines, AnchorLine};
 use crate::anchors::{
     self, AnchorLoadError, Barrier, BarrierGuard, BarrierKind, FirstRetainedAnchor, HeadAnchor,
@@ -33,7 +33,7 @@ use crate::keystore::KeyStore;
 use crate::prune::PruneOutcome;
 use crate::restore::{RestoreReport, RestoreRequest};
 use crate::schema;
-use crate::settings::{FilePolicy, SettingChange, Settings};
+use crate::settings::{self, FilePolicy, SettingChange, Settings};
 use crate::types::{
     Committed, Confirmed, EventFlags, EventType, NewEvent, QueryKind, RustChosenPath,
 };
@@ -192,6 +192,8 @@ struct Inner {
     /// `OpenConfig.anchor_dir`: verification reads it only while the store's own
     /// `anchor_dir` setting names none.
     anchor_dir: Option<PathBuf>,
+    /// The anchor-dir header facts (`change_anchor_dir` creates the new dir's file with them).
+    header: HeaderFacts,
     min_free_bytes: u64,
     free_space: Arc<dyn FreeSpaceProbe>,
     /// Fault points of the startup steps (feature `testing`).
@@ -355,9 +357,10 @@ impl Store {
             }
         };
         shared.anchor_dir.init(enabled, scale_div);
+        let header = HeaderFacts::new(install_id.clone(), cfg.clock.clone());
         let spawned = {
             let shared = shared.anchor_dir.clone();
-            let header = HeaderFacts::new(install_id.clone(), cfg.clock.clone());
+            let header = header.clone();
             std::thread::Builder::new()
                 .name("audit-anchor-dir".into())
                 .spawn(move || anchor_dir::writer::run(shared, header))
@@ -387,6 +390,7 @@ impl Store {
                 db_path: schema::db_path(data),
                 data_dir: data.path().to_path_buf(),
                 anchor_dir: cfg.anchor_dir,
+                header,
                 min_free_bytes: cfg.min_free_bytes,
                 free_space: cfg.free_space.unwrap_or_else(|| Arc::new(OsFreeSpace)),
                 #[cfg(any(test, feature = "testing"))]
@@ -694,16 +698,19 @@ impl Store {
 
     /// One settings change (C.3, §8.8, §10.3), logged as `CONFIG_CHANGED` /
     /// `LEGAL_HOLD_CHANGED {source: "app"}` with the confirmation's dialog hash. Needs
-    /// `Some(Confirmed)`: a lower retention, lifting the legal hold, any anchor directory or
-    /// instance origin change, setting or changing a CA fingerprint, allowing degraded script
-    /// confinement. Without it:
+    /// `Some(Confirmed)`: a lower retention, lifting the legal hold, any instance origin change,
+    /// setting or changing a CA fingerprint, allowing degraded script confinement. Without it:
     /// `NeedsConfirmation(<what>)` and nothing is logged. `Invalid`: retention below 92, an
-    /// empty value, or a value the setting already has.
+    /// empty value, or a value the setting already has. `SettingChange::AnchorDir` is always
+    /// `Invalid("use change_anchor_dir")` (Δ-M10-1): see [`Store::change_anchor_dir`].
     pub fn apply_setting(
         &self,
         change: SettingChange,
         confirmed: Option<Confirmed>,
     ) -> Result<Committed, AuditError> {
+        if matches!(change, SettingChange::AnchorDir(_)) {
+            return Err(settings::ANCHOR_DIR_REFUSED);
+        }
         let (reply, rx) = sync_channel(1);
         self.sender()?
             .send(Cmd::ApplySetting {
@@ -713,6 +720,95 @@ impl Store {
             })
             .map_err(|_| AuditError::Closed)?;
         rx.recv().map_err(|_| AuditError::Closed)?
+    }
+
+    /// Changes (`Some`) or removes (`None`) the anchor directory (Δ-M10-1, §8.5, §10.3; the
+    /// native confirmation is the caller's, its proof is not optional). In order (PD-166):
+    /// 1. the new dir's `<chain_id>.jsonl` is opened first: created with create-new and its
+    ///    header (fsynced), or opened for append when it exists, which then gets no second
+    ///    header (switching back to an earlier dir). Nothing is ever deleted, renamed or
+    ///    truncated, so this also checks writability on an append-only (WORM) share. Failure:
+    ///    `Invalid`, nothing committed;
+    /// 2. `CONFIG_CHANGED {key: anchor_dir, old, new, source: app, confirmed}` is committed;
+    /// 3. the old dir gets that record's immediate line, then `ANCHOR_DETACHED {seq,
+    ///    record_hash, epoch, detached_at}` naming it, through the writer's queue: an old dir
+    ///    that cannot be written is shown in `health()` and does not block the switch;
+    /// 4. the new dir gets the same immediate line (after closing a torn last line, PD-165).
+    ///
+    /// A removal runs steps 2 and 3. `Invalid` also for a path that is not absolute or not
+    /// UTF-8, or the dir already in force.
+    pub fn change_anchor_dir(
+        &self,
+        new: Option<RustChosenPath>,
+        confirmed: Confirmed,
+    ) -> Result<Committed, AuditError> {
+        self.sender()?;
+        let dir = match &new {
+            None => None,
+            Some(p) => {
+                if !p.path().is_absolute() {
+                    return Err(AuditError::Invalid(
+                        "the anchor directory is not an absolute path",
+                    ));
+                }
+                let text =
+                    p.path()
+                        .to_str()
+                        .filter(|s| !s.is_empty())
+                        .ok_or(AuditError::Invalid(
+                            "the anchor directory path is not valid UTF-8",
+                        ))?;
+                Some(text.to_owned())
+            }
+        };
+        // Checked again on the writer thread; here so that no file is made for nothing.
+        if self
+            .inner
+            .shared
+            .settings_unreadable
+            .load(Ordering::Relaxed)
+        {
+            return Err(settings::untrusted());
+        }
+        if dir == self.settings().anchor_dir {
+            return Err(AuditError::Invalid("the setting already has this value"));
+        }
+        if let Some(p) = &new {
+            let (_, _, chain_id) = self.head();
+            self.inner
+                .shared
+                .anchor_dir
+                .ensure_chain_file(&self.inner.header, p.path(), &chain_id)
+                .map_err(|_| AuditError::Invalid("the anchor directory cannot be written"))?;
+        }
+        self.send_change_anchor_dir(dir, confirmed)
+    }
+
+    fn send_change_anchor_dir(
+        &self,
+        dir: Option<String>,
+        confirmed: Confirmed,
+    ) -> Result<Committed, AuditError> {
+        let (reply, rx) = sync_channel(1);
+        self.sender()?
+            .send(Cmd::ChangeAnchorDir {
+                dir,
+                confirmed,
+                reply,
+            })
+            .map_err(|_| AuditError::Closed)?;
+        rx.recv().map_err(|_| AuditError::Closed)?
+    }
+
+    /// `change_anchor_dir` without step 1 (feature `testing`): for a dir that does not exist (an
+    /// offline share), which `change_anchor_dir` refuses.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn testing_set_anchor_dir(
+        &self,
+        dir: Option<String>,
+        confirmed: Confirmed,
+    ) -> Result<Committed, AuditError> {
+        self.send_change_anchor_dir(dir, confirmed)
     }
 
     /// X-01 (§8.8): logs every config-file value that differs from the settings in force
@@ -913,7 +1009,8 @@ impl Store {
     }
 
     /// The `VERIFY` record of a run (F.11), flagged `integrity_incident` iff any finding is an
-    /// incident kind.
+    /// incident kind; such a record also gets its incident file in the anchor dir once it
+    /// committed (PD-164).
     fn verify_event(
         &self,
         scope: &str,
@@ -930,7 +1027,8 @@ impl Store {
             })?;
         let payload = verify::verify_payload(scope, findings, &detected_at, unanchored_tail);
         let mut p = PreparedEvent::system(EventType::VERIFY, &payload)?;
-        if findings.iter().any(|f| f.kind.is_incident()) {
+        p.incident = IncidentDraft::of(findings, &detected_at);
+        if p.incident.is_some() {
             p.store_flags = EventFlags::INTEGRITY_INCIDENT;
         }
         Ok(p)
@@ -1062,19 +1160,117 @@ impl Store {
             })?
             .complete();
         } else {
-            self.queue_committed_prune_lines();
+            self.queue_committed_lines();
         }
         self.enable_anchors();
         Ok(outcome)
     }
 
+    /// At a normal start with an anchor dir: the lines of the latest `PRUNE` and of the
+    /// `RESTORE` that started the current chain, which the anchor-dir thread may have lost (the
+    /// dir failed until quit, or a crash before it wrote them), each only when the keychain
+    /// anchors confirm that record (one keychain read for both). Catch-up lines: nothing is
+    /// written twice. Best effort.
+    fn queue_committed_lines(&self) {
+        if self.settings().anchor_dir.is_none() && self.inner.anchor_dir.is_none() {
+            return;
+        }
+        let Ok((head, first_retained)) = anchors::load_anchors(&*self.inner.keys) else {
+            return;
+        };
+        if let Some(fr) = first_retained {
+            self.queue_committed_prune_lines(&fr);
+        }
+        if let Some(h) = head {
+            self.queue_committed_restore_lines(&h);
+        }
+    }
+
+    /// The current chain's `RESTORE` (§8.11 step 5) whose anchor reset happened (the keychain
+    /// head anchor names the current chain) but whose `Record` and `Immediate` lines were lost:
+    /// they are queued again (fix-f M-1's case for a restore).
+    fn queue_committed_restore_lines(&self, head: &HeadAnchor) {
+        let (_, _, chain_id) = self.head();
+        if head.chain_id != chain_id {
+            return;
+        }
+        let read = self.with_reader(|c| {
+            c.query_row(
+                "SELECT seq FROM events WHERE event_type = 'RESTORE' AND chain_id = ?1 \
+                 ORDER BY seq DESC LIMIT 1",
+                [&chain_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| AuditError::Io(e.to_string()))
+        });
+        if let Ok(Some(seq)) = read
+            && let Ok(seq) = u64::try_from(seq)
+        {
+            self.queue_restore_lines(seq);
+        }
+    }
+
+    /// `RESTORE` `restore_seq`'s `Record` and `Immediate` lines (§8.5 "on `RESTORE`", §8.7
+    /// interrupted restore: "the missing anchor-dir `RESTORE` line is written") for the restored
+    /// chain's file in the restored view's anchor dir; `Writer::open` already queued that file
+    /// (its header first). Catch-up lines: skipped when the file holds them. Best effort.
+    fn queue_restore_lines(&self, restore_seq: u64) {
+        type Row = (Vec<u8>, Option<String>, i64, String, String);
+        let Ok(seq) = i64::try_from(restore_seq) else {
+            return;
+        };
+        let read: Result<Row, AuditError> = self.with_reader(|c| {
+            c.query_row(
+                "SELECT record_hash, epoch, flags, chain_id, event_type FROM events \
+                 WHERE seq = ?1",
+                [seq],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .map_err(|e| AuditError::Io(e.to_string()))
+        });
+        let Ok((hash, epoch, flags, chain_id, event_type)) = read else {
+            return;
+        };
+        let (Ok(record_hash), Ok(flags)) = (<[u8; 32]>::try_from(hash), u64::try_from(flags))
+        else {
+            return;
+        };
+        if event_type != EventType::RESTORE.as_str() {
+            return;
+        }
+        let dir = self.settings().anchor_dir;
+        self.inner.shared.anchor_dir.push(vec![
+            Pending::catch_up(
+                dir.clone(),
+                &chain_id,
+                AnchorLine::Record {
+                    seq: restore_seq,
+                    record_hash,
+                    epoch: epoch.clone(),
+                    clock_behind: EventFlags::from_bits(flags).contains(EventFlags::BEHIND),
+                },
+            ),
+            Pending::catch_up(
+                dir,
+                &chain_id,
+                AnchorLine::Immediate {
+                    seq: restore_seq,
+                    record_hash,
+                    epoch,
+                    event_type: EventType::RESTORE.as_str().to_owned(),
+                },
+            ),
+        ]);
+    }
+
     /// A `PRUNE` whose first-retained update reached the keychain, but whose anchor-dir lines
     /// were lost (the dir failed until quit, or a crash before the anchor-dir thread wrote
     /// them): its `Prune` and `Immediate` lines, unless the file already holds them. Only the
-    /// latest `prune_log` row, and only when the keychain's first-retained anchor names exactly
-    /// its values (as startup verification compares them): a prune the trust root does not
-    /// confirm is never attested. Best effort, like `queue_missing_prune_lines`.
-    fn queue_committed_prune_lines(&self) {
+    /// latest `prune_log` row, and only when the keychain's first-retained anchor `fr` names
+    /// exactly its values (as startup verification compares them): a prune the trust root does
+    /// not confirm is never attested. Best effort, like `queue_missing_prune_lines`.
+    fn queue_committed_prune_lines(&self, fr: &FirstRetainedAnchor) {
         type Latest = (i64, i64, Vec<u8>, Vec<u8>, String, String);
         let read: Result<Option<Latest>, AuditError> = self.with_reader(|c| {
             let io = |e: rusqlite::Error| AuditError::Io(e.to_string());
@@ -1112,9 +1308,6 @@ impl Store {
         if event_type != EventType::PRUNE.as_str() || chain_id != self.head().2 {
             return;
         }
-        let Ok((_, Some(fr))) = anchors::load_anchors(&*self.inner.keys) else {
-            return;
-        };
         if fr.chain_id != chain_id
             || fr.first_retained_seq != frs
             || !crypto::ct_eq(&fr.first_retained_prev_hash, &last)
@@ -1122,7 +1315,7 @@ impl Store {
             return;
         }
         self.queue_missing_prune_lines(
-            &fr,
+            fr,
             &HeadAnchor {
                 chain_id,
                 seq: prune_seq,
@@ -1197,6 +1390,9 @@ impl Store {
             reset: None,
         })?
         .complete();
+        // Written once anchor writes are enabled below (interrupted restore, "Finish restore",
+        // `restore_from_source`).
+        self.queue_restore_lines(restore_seq);
         let rx = self
             .inner
             .shared
@@ -1227,7 +1423,8 @@ impl Store {
     /// a count: the caller shows `records_lost` from `RollbackNeedsConfirmation` and the
     /// `RESTORE` records the count at the commit, which can be higher if records were appended
     /// in between. The config file must be reconciled again (`reconcile_config_file`) before
-    /// prune runs on the restored store.
+    /// prune runs on the restored store. With an anchor dir in the restored view, the restored
+    /// chain's file gets its header, then the `RESTORE`'s `Record` and `Immediate` lines (§8.5).
     pub fn restore(
         &self,
         source: RustChosenPath,
@@ -1250,7 +1447,11 @@ impl Store {
                 reply,
             })
             .map_err(|_| AuditError::Closed)?;
-        rx.recv().map_err(|_| AuditError::Closed)?
+        let report = rx.recv().map_err(|_| AuditError::Closed)??;
+        // The restored chain's file (its header queued when the writer reopened), then the
+        // `RESTORE` lines (§8.5).
+        self.queue_restore_lines(report.restore_seq);
+        Ok(report)
     }
 
     /// Startup step 4 (§8.13): runs the pending migrations on the writer's connection, each

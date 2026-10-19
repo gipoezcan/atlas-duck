@@ -21,15 +21,24 @@
 //!   for a `PRUNE`.
 //!
 //! `Record` lines carry `clock_behind: true` exactly when the record has the flag.
+//!
+//! Besides the commit lines (Task 5): `RESTORE`'s `Record` and `Immediate` lines and the
+//! `ANCHOR_DETACHED` line of an anchor-dir change come through the same queue (the store pushes
+//! them), and every integrity-incident `VERIFY` gets its incident file
+//! `<chain_id>.incident-<verify_seq>.json` beside the chain file (PD-164), created once with
+//! create-new. A chain file whose last line was torn by a crash is closed with a newline and a
+//! `Record` line for the head before anything else is appended to it (PD-165).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
+use atlas_duck_ipc::jcs::to_jcs_vec;
 use chrono::NaiveDate;
+use serde_json::json;
 
 use super::{AnchorLine, IMMEDIATE_TYPES, MAX_FILE_BYTES, MAX_LINE_BYTES, file_name, is_id};
 use super::{parse_line, resolve, to_line};
@@ -37,6 +46,7 @@ use crate::anchors::backoff;
 use crate::clock::{Clock, epoch_text, parse_epoch};
 use crate::settings;
 use crate::types::{EventFlags, EventType};
+use crate::verify::VerifyFinding;
 
 /// Queued lines beyond which only the newest daily line is kept with every other line (PD-156).
 pub(crate) const MAX_PENDING: usize = 100_000;
@@ -54,6 +64,10 @@ const STUCK_AFTER: Duration = Duration::from_secs(30);
 /// `host` and `os_user` of a header are cut to this many characters (the line must stay below
 /// `MAX_LINE_BYTES` even when every character is escaped).
 const MAX_HEADER_TEXT_CHARS: usize = 200;
+
+/// How long `change_anchor_dir` waits for the file lock (the thread may hold it while stuck on
+/// a hung share: the switch away from that share must not hang with it).
+const FILE_LOCK_WAIT: Duration = Duration::from_secs(5);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -81,6 +95,76 @@ pub(crate) struct RowNote {
     pub(crate) immediate: bool,
     /// The date corroborated in this process when the row was stamped.
     pub(crate) corroborated: Option<NaiveDate>,
+    /// An integrity-incident `VERIFY`: what its incident file says (PD-164).
+    pub(crate) incident: Option<IncidentDraft>,
+}
+
+impl RowNote {
+    /// The `Record` line naming this row.
+    pub(crate) fn record_line(&self) -> AnchorLine {
+        AnchorLine::Record {
+            seq: self.seq,
+            record_hash: self.record_hash,
+            epoch: self.epoch.map(epoch_text),
+            clock_behind: self.flags.contains(EventFlags::BEHIND),
+        }
+    }
+}
+
+/// The incident file of an integrity-incident `VERIFY` (§8.7 "an incident JSON is written
+/// there", PD-164): its `result` and the first incident finding's expected/observed values, as
+/// the `VERIFY` payload names them. The record's `seq`, `record_hash` and `chain_id` are added
+/// once it committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IncidentDraft {
+    result: &'static str,
+    expected_seq: Option<u64>,
+    expected_hash: Option<[u8; 32]>,
+    observed_seq: Option<u64>,
+    observed_hash: Option<[u8; 32]>,
+    detected_at: String,
+}
+
+impl IncidentDraft {
+    /// `None` when no finding is an incident (no incident file then).
+    pub(crate) fn of(findings: &[VerifyFinding], detected_at: &str) -> Option<IncidentDraft> {
+        let f = findings.iter().find(|f| f.kind.is_incident())?;
+        Some(IncidentDraft {
+            result: f.kind.as_str(),
+            expected_seq: f.expected_seq,
+            expected_hash: f.expected_hash,
+            observed_seq: f.observed_seq,
+            observed_hash: f.observed_hash,
+            detected_at: detected_at.to_owned(),
+        })
+    }
+
+    /// The file's JCS text: `{chain_id, verify_seq, record_hash, result, expected_seq,
+    /// expected_hash, observed_seq, observed_hash, detected_at}`.
+    fn text(&self, chain_id: &str, verify_seq: u64, record_hash: &[u8; 32]) -> String {
+        let v = json!({
+            "chain_id": chain_id,
+            "verify_seq": verify_seq,
+            "record_hash": hex::encode(record_hash),
+            "result": self.result,
+            "expected_seq": self.expected_seq,
+            "expected_hash": self.expected_hash.map(hex::encode),
+            "observed_seq": self.observed_seq,
+            "observed_hash": self.observed_hash.map(hex::encode),
+            "detected_at": self.detected_at,
+        });
+        // As `to_line`: JCS fails only for an integer beyond 2^53 − 1, which no seq reaches.
+        to_jcs_vec(&v)
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_else(|| v.to_string())
+    }
+}
+
+/// `"<chain_id>.incident-<verify_seq>.json"`: not a `*.jsonl` name, so no reader of chain files
+/// ever parses it.
+pub(crate) fn incident_file_name(chain_id: &str, verify_seq: u64) -> String {
+    format!("{chain_id}.incident-{verify_seq}.json")
 }
 
 /// The `prune_log` values of a committed `PRUNE` (its `Prune` line).
@@ -97,6 +181,11 @@ pub(crate) enum Item {
     /// The chain file must exist (with its header), even if no line is due (M2 handoff: a
     /// missing current-chain file is created at the next start).
     EnsureFile,
+    /// The incident file of `VERIFY` `verify_seq` beside the chain file, with its text.
+    Incident {
+        verify_seq: u64,
+        text: String,
+    },
 }
 
 /// How a queued line is treated.
@@ -138,6 +227,38 @@ impl Pending {
             item: Item::EnsureFile,
             keep: Keep::Always,
         }
+    }
+
+    /// A line every commit path must write (`ANCHOR_DETACHED`, the new dir's line).
+    pub(crate) fn always(dir: Option<String>, chain_id: &str, line: AnchorLine) -> Pending {
+        Pending {
+            dir,
+            chain_id: chain_id.to_owned(),
+            item: Item::Line(line),
+            keep: Keep::Always,
+        }
+    }
+
+    /// The incident files of `rows`' integrity-incident `VERIFY`s.
+    pub(crate) fn incidents(
+        dir: &Option<String>,
+        chain_id: &str,
+        rows: &[RowNote],
+    ) -> Vec<Pending> {
+        rows.iter()
+            .filter_map(|r| {
+                let d = r.incident.as_ref()?;
+                Some(Pending {
+                    dir: dir.clone(),
+                    chain_id: chain_id.to_owned(),
+                    item: Item::Incident {
+                        verify_seq: r.seq,
+                        text: d.text(chain_id, r.seq, &r.record_hash),
+                    },
+                    keep: Keep::Always,
+                })
+            })
+            .collect()
     }
 }
 
@@ -257,6 +378,8 @@ struct DirState {
     enabled: bool,
     /// `OpenConfig.anchor_dir`, used while the store's setting names none (as verification).
     fallback: Option<PathBuf>,
+    /// The committed head's chain and `Record` line: what follows a torn last line (PD-165).
+    head: Option<(String, AnchorLine)>,
     queue: VecDeque<Pending>,
     /// `Keep::Daily` lines in `queue`.
     daily_queued: usize,
@@ -304,6 +427,7 @@ impl AnchorDirShared {
             state: Mutex::new(DirState {
                 enabled: false,
                 fallback: None,
+                head: None,
                 queue: VecDeque::new(),
                 daily_queued: 0,
                 fresh: false,
@@ -325,6 +449,64 @@ impl AnchorDirShared {
     /// Before the writer starts (first run commits `GENESIS` inside its start).
     pub(crate) fn set_fallback(&self, dir: Option<PathBuf>) {
         lock(&self.state).fallback = dir;
+    }
+
+    /// `OpenConfig.anchor_dir`.
+    pub(crate) fn fallback(&self) -> Option<PathBuf> {
+        lock(&self.state).fallback.clone()
+    }
+
+    /// The committed head (writer thread, after each commit and at open), as its `Record` line.
+    pub(crate) fn set_head(&self, chain_id: &str, line: AnchorLine) {
+        lock(&self.state).head = Some((chain_id.to_owned(), line));
+    }
+
+    /// The new dir's chain file opened first (PD-166, also the writability check): created with
+    /// create-new and its header, or found (an existing file gets no second header; an empty
+    /// one gets its header). Never deletes, truncates or rewrites anything. Takes the file lock
+    /// like the thread (the one header), waiting for it at most [`FILE_LOCK_WAIT`].
+    pub(crate) fn ensure_chain_file(
+        &self,
+        header: &HeaderFacts,
+        dir: &Path,
+        chain_id: &str,
+    ) -> io::Result<()> {
+        if !dir.is_absolute() || !is_id(chain_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not an absolute anchor directory or not a chain id",
+            ));
+        }
+        if !std::fs::metadata(dir)?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the anchor directory is not a directory",
+            ));
+        }
+        let _g = self.file_lock_within(FILE_LOCK_WAIT)?;
+        open_chain_file(dir, &dir.join(file_name(chain_id)), || {
+            header.line(chain_id)
+        })
+        .map(drop)
+    }
+
+    fn file_lock_within(&self, wait: Duration) -> io::Result<MutexGuard<'_, ()>> {
+        let end = Instant::now() + wait;
+        loop {
+            match self.file_lock.try_lock() {
+                Ok(g) => return Ok(g),
+                Err(TryLockError::Poisoned(e)) => return Ok(e.into_inner()),
+                Err(TryLockError::WouldBlock) if Instant::now() < end => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "the anchor-dir writer is busy",
+                    ));
+                }
+            }
+        }
     }
 
     /// Once the writer is ready; lines queued before are kept.
@@ -466,6 +648,7 @@ fn compact(st: &mut DirState) {
 // The thread
 
 /// The header facts of this install (§8.5 header line).
+#[derive(Clone)]
 pub(crate) struct HeaderFacts {
     install_id: String,
     host: String,
@@ -544,6 +727,8 @@ struct Attempt<'a> {
     /// Also try the files whose backoff has not run out (`drain`).
     forced: bool,
     scale_div: u32,
+    /// The committed head's chain and `Record` line when the attempt began.
+    head: Option<(String, AnchorLine)>,
 }
 
 fn run_loop(shared: &AnchorDirShared, header: &HeaderFacts) {
@@ -588,6 +773,7 @@ fn run_loop(shared: &AnchorDirShared, header: &HeaderFacts) {
             fallback: fallback.as_deref(),
             forced,
             scale_div: st.scale_div,
+            head: st.head.clone(),
         };
         // Health keeps showing the failing files while this attempt runs.
         let mut failing = st.failing.clone();
@@ -644,10 +830,17 @@ fn write_batch(
         let key: FileKey = (path, chain_id.clone());
         let waiting = failed_now.contains(&key)
             || (!attempt.forced && failing.get(&key).is_some_and(|r| now < r.next));
+        let head = attempt
+            .head
+            .as_ref()
+            .filter(|(c, _)| c == chain_id)
+            .map(|(_, l)| l);
         let result = if waiting {
             None
         } else {
-            Some(append_group(shared, header, &key.0, chain_id, group, files))
+            Some(append_group(
+                shared, header, &key.0, chain_id, group, head, files,
+            ))
         };
         match result {
             Some(Ok(())) => {
@@ -674,12 +867,17 @@ fn write_batch(
     kept
 }
 
+/// One group: the chain file opened (or created with its header), the group's incident files
+/// created, a torn last line closed (PD-165: a newline, then `head`'s `Record` line), then the
+/// lines appended in one write and fsynced. A failed write forgets what was known of the file,
+/// so the next attempt reads it again (and finds a line the failure tore).
 fn append_group(
     shared: &AnchorDirShared,
     header: &HeaderFacts,
     dir: &Path,
     chain_id: &str,
     group: &[Pending],
+    head: Option<&AnchorLine>,
     files: &mut Files,
 ) -> io::Result<()> {
     if !dir.is_absolute() {
@@ -691,28 +889,63 @@ fn append_group(
     }
     let path = dir.join(file_name(chain_id));
     let key = (dir.to_path_buf(), chain_id.to_owned());
-    let _g = lock(&shared.file_lock);
-    let (mut file, fresh) = open_chain_file(dir, &path, || header.line(chain_id))?;
+    // The lock guards the header (whoever creates the file writes it); only this thread appends.
+    let (mut file, fresh) = {
+        let _g = lock(&shared.file_lock);
+        open_chain_file(dir, &path, || header.line(chain_id))?
+    };
     if fresh {
         files.insert(key.clone(), None);
     }
+    for p in group {
+        if let Item::Incident { verify_seq, text } = &p.item {
+            write_incident(dir, &incident_file_name(chain_id, *verify_seq), text)?;
+        }
+    }
+    let r = append_lines(&mut file, &path, &key, group, head, fresh, files);
+    if r.is_err() {
+        files.remove(&key);
+    }
+    r
+}
+
+fn append_lines(
+    file: &mut File,
+    path: &Path,
+    key: &FileKey,
+    group: &[Pending],
+    head: Option<&AnchorLine>,
+    fresh: bool,
+    files: &mut Files,
+) -> io::Result<()> {
     let catch_up: Vec<String> = group
         .iter()
         .filter(|p| p.keep == Keep::CatchUp)
         .filter_map(|p| match &p.item {
             Item::Line(l) => Some(to_line(l)),
-            Item::EnsureFile => None,
+            Item::EnsureFile | Item::Incident { .. } => None,
         })
         .collect();
     let mut present = HashSet::new();
-    if !files.contains_key(&key) || !catch_up.is_empty() {
-        let (last, found) = scan(&path, &catch_up)?;
+    if !files.contains_key(key) || !catch_up.is_empty() {
+        let (last, found) = scan(path, &catch_up)?;
         present = found;
-        let known = files.get(&key).copied().flatten();
+        let known = files.get(key).copied().flatten();
         files.insert(key.clone(), last.max(known));
     }
-    let mut last = files.get(&key).copied().flatten();
+    let mut last = files.get(key).copied().flatten();
     let mut buf = String::new();
+    // Checked before every append: a crash (or a failed write) may have torn the last line.
+    if !fresh && ends_torn(path)? {
+        buf.push('\n');
+        if let Some(h) = head {
+            let text = to_line(h);
+            buf.push_str(&text);
+            buf.push('\n');
+            last = last.max(record_date(h));
+            present.insert(text);
+        }
+    }
     for p in group {
         let Item::Line(l) = &p.item else { continue };
         let text = to_line(l);
@@ -734,10 +967,39 @@ fn append_group(
     if !buf.is_empty() {
         file.write_all(buf.as_bytes())?;
         file.sync_all()?;
-        record_sync(&path);
+        record_sync(path);
     }
-    files.insert(key, last);
+    files.insert(key.clone(), last);
     Ok(())
+}
+
+/// Whether the file's last byte is not a newline (a crash tore its last line). An empty file is
+/// not torn.
+fn ends_torn(path: &Path) -> io::Result<bool> {
+    let mut f = File::open(path)?;
+    if f.metadata()?.len() == 0 {
+        return Ok(false);
+    }
+    f.seek(SeekFrom::End(-1))?;
+    let mut b = [0u8; 1];
+    f.read_exact(&mut b)?;
+    Ok(b != [b'\n'])
+}
+
+/// An incident file, created once with create-new and fsynced with its directory entry; one
+/// that exists already (written before, or put there by someone else) is left as it is.
+fn write_incident(dir: &Path, name: &str, text: &str) -> io::Result<()> {
+    let path = dir.join(name);
+    match OpenOptions::new().append(true).create_new(true).open(&path) {
+        Ok(mut f) => {
+            f.write_all(text.as_bytes())?;
+            f.sync_all()?;
+            record_sync(&path);
+            sync_dir_of(dir)
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// The date of a `Record` line with a non-NULL epoch.
@@ -964,6 +1226,7 @@ mod tests {
             event_type: EventType::APP_START,
             immediate: false,
             corroborated: cd.and_then(parse_epoch),
+            incident: None,
         }
     }
 

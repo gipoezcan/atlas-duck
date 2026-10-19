@@ -6,7 +6,7 @@ mod common;
 
 use atlas_duck_audit::error::AuditError;
 use atlas_duck_audit::testing::MemKeyring;
-use atlas_duck_audit::types::{Confirmed, EventType};
+use atlas_duck_audit::types::{Confirmed, EventType, RustChosenPath};
 use atlas_duck_audit::{
     FilePolicy, InstancePolicy, OpenConfig, PruneOutcome, PruneSkip, SettingChange, Settings,
     StartupOutcome, Store, open,
@@ -402,21 +402,46 @@ fn unchanged_value_is_invalid_and_logs_nothing() {
     assert_eq!(head_seq(&store), before);
 }
 
+/// The anchor dir changes only through `change_anchor_dir` (PD-166), whose confirmation is not
+/// optional; `apply_setting` refuses it. The `CONFIG_CHANGED` it logs is the policy row the view
+/// replays.
 #[test]
-fn anchor_dir_change_needs_confirmation() {
-    let (store, _f) = reconciled();
-    needs_confirmation(&store, SettingChange::AnchorDir(s("D:/a")), "anchor_dir");
+fn anchor_dir_changes_through_change_anchor_dir() {
+    let (store, f) = reconciled();
+    let (a, b) = (
+        tempfile::tempdir().expect("a"),
+        tempfile::tempdir().expect("b"),
+    );
+    let text = |d: &tempfile::TempDir| d.path().to_string_lossy().into_owned();
+    let chosen = |d: &tempfile::TempDir| RustChosenPath::from_native_dialog(d.path().into());
+    for confirm in [None, Some(confirmed())] {
+        assert!(matches!(
+            store.apply_setting(SettingChange::AnchorDir(Some(text(&a))), confirm),
+            Err(AuditError::Invalid("use change_anchor_dir"))
+        ));
+    }
     assert_eq!(store.settings().anchor_dir, None);
     let c = store
-        .apply_setting(SettingChange::AnchorDir(s("D:/a")), Some(confirmed()))
+        .change_anchor_dir(Some(chosen(&a)), confirmed())
         .expect("set");
-    assert_eq!(payload(&store, c.seq)["key"], json!("anchor_dir"),);
-    assert_eq!(store.settings().anchor_dir, s("D:/a"));
-    needs_confirmation(&store, SettingChange::AnchorDir(s("D:/b")), "anchor_dir");
-    needs_confirmation(&store, SettingChange::AnchorDir(None), "anchor_dir");
+    assert_eq!(
+        payload(&store, c.seq),
+        json!({
+            "source": "app", "key": "anchor_dir", "old": null, "requested": text(&a),
+            "new": text(&a), "applied": true,
+            "confirmed": { "dialog_text_sha256": hex::encode([7u8; 32]) },
+        })
+    );
+    assert_eq!(store.settings().anchor_dir, Some(text(&a)));
     store
-        .apply_setting(SettingChange::AnchorDir(None), Some(confirmed()))
-        .expect("remove");
+        .change_anchor_dir(Some(chosen(&b)), confirmed())
+        .expect("change");
+    assert_eq!(store.settings().anchor_dir, Some(text(&b)));
+    let c = store.change_anchor_dir(None, confirmed()).expect("remove");
+    assert_eq!(payload(&store, c.seq)["new"], Value::Null);
+    assert_eq!(store.settings().anchor_dir, None);
+    // The view replays it at the next open.
+    let store = reopen(&store, &f);
     assert_eq!(store.settings().anchor_dir, None);
 }
 

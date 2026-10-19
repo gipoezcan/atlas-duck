@@ -8,8 +8,9 @@
 //! `applied: true`. Every `PRUNE` embeds the snapshot ([`Settings::to_json`]), so pruning the
 //! events that set a value never loses it. The writer builds the view when it opens the store
 //! (decrypting only those rows) and keeps it; it changes only through
-//! [`crate::Store::apply_setting`] and [`crate::Store::reconcile_config_file`], and a caller
-//! cannot append a policy `CONFIG_CHANGED` itself (the writer refuses it).
+//! [`crate::Store::apply_setting`], [`crate::Store::change_anchor_dir`] (the anchor dir, PD-166)
+//! and [`crate::Store::reconcile_config_file`], and a caller cannot append a policy
+//! `CONFIG_CHANGED` itself (the writer refuses it).
 //!
 //! The store keeps instance strings verbatim; validation and normalisation are `core`'s.
 
@@ -170,6 +171,8 @@ impl Settings {
 pub enum SettingChange {
     RetentionDays(u32),
     LegalHold(bool),
+    /// Refused by `apply_setting` (`Invalid("use change_anchor_dir")`): the anchor dir changes
+    /// only through `Store::change_anchor_dir` (PD-166).
     AnchorDir(Option<String>),
     InstanceOrigin {
         instance_id: String,
@@ -573,9 +576,12 @@ impl Planned {
     }
 }
 
-fn untrusted() -> AuditError {
+pub(crate) fn untrusted() -> AuditError {
     AuditError::AppendFailed("the settings view could not be rebuilt from the audit log".into())
 }
+
+/// `apply_setting(SettingChange::AnchorDir(..))` (Δ-M10-1, PD-166).
+pub(crate) const ANCHOR_DIR_REFUSED: AuditError = AuditError::Invalid("use change_anchor_dir");
 
 impl Writer {
     /// Makes `s` the view (writer thread) and publishes it for `Store::settings`.
@@ -603,11 +609,16 @@ impl Writer {
 
     /// `Store::apply_setting` (C.3, §8.8, §10.3): the confirmation rules, then one
     /// `CONFIG_CHANGED` / `LEGAL_HOLD_CHANGED` row with `source: "app"`.
+    /// The anchor dir is refused here: it changes only through `Store::change_anchor_dir`, which
+    /// opens the new dir's file first and leaves `ANCHOR_DETACHED` in the old one (PD-166).
     pub(crate) fn apply_setting_run(
         &mut self,
         change: SettingChange,
         confirmed: Option<Confirmed>,
     ) -> Result<crate::types::Committed, AuditError> {
+        if matches!(change, SettingChange::AnchorDir(_)) {
+            return Err(ANCHOR_DIR_REFUSED);
+        }
         if !self.st.settings_trusted {
             return Err(untrusted());
         }
@@ -621,6 +632,28 @@ impl Writer {
         let mut rows = self.log_settings(&[(&planned, payload)])?;
         rows.pop()
             .ok_or_else(|| AuditError::AppendFailed("the writer returned no row".into()))
+    }
+
+    /// `Store::change_anchor_dir` once the new dir's file is open (PD-166): the same
+    /// `CONFIG_CHANGED {key: anchor_dir, source: app, confirmed}` as any setting, then the
+    /// switch lines ([`Writer::push_anchor_dir_switch`]).
+    pub(crate) fn change_anchor_dir_run(
+        &mut self,
+        dir: Option<String>,
+        confirmed: Confirmed,
+    ) -> Result<crate::types::Committed, AuditError> {
+        if !self.st.settings_trusted {
+            return Err(untrusted());
+        }
+        let old = self.st.settings.anchor_dir.clone();
+        let planned = plan(&self.st.settings, &SettingChange::AnchorDir(dir.clone()))?;
+        let payload = planned.payload("app", Some(&confirmed));
+        let c = self
+            .log_settings(&[(&planned, payload)])?
+            .pop()
+            .ok_or_else(|| AuditError::AppendFailed("the writer returned no row".into()))?;
+        self.push_anchor_dir_switch(old, dir, c);
+        Ok(c)
     }
 
     /// `Store::reconcile_config_file` (X-01, §8.8): every file value that differs from the view

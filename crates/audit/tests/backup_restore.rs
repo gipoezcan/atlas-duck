@@ -1704,11 +1704,10 @@ fn write_anchor_lines(dir: &Path, chain_id: &str, lines: &[atlas_duck_audit::Anc
 fn superseded_chain_lines_are_accounted_for_by_records_lost() {
     let (a, fa) = store_with(0);
     let dir = tempfile::tempdir().expect("anchor dir");
-    a.apply_setting(
-        SettingChange::AnchorDir(Some(dir.path().to_string_lossy().into_owned())),
-        Some(confirmed()),
-    )
-    .expect("anchor dir");
+    a.change_anchor_dir(Some(chosen(dir.path())), confirmed())
+        .expect("anchor dir");
+    // Its line is written now: the file is rewritten below.
+    assert!(a.testing_anchor_dir_drain());
     a.append_batch(mixed(20)).expect("append_batch");
     let out = tempfile::tempdir().expect("out dir");
     let bundle = backup_into(&a, out.path());

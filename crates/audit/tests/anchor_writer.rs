@@ -1,23 +1,31 @@
-//! The anchor-directory writer (§8.5, §8.7, PD-156, PD-157; U-06 writer half): the
-//! `audit-anchor-dir` thread appends header, daily, `APP_STOP`, immediate and prune lines to
-//! `<anchor_dir>/<chain_id>.jsonl` after each commit, never before startup verification, and
-//! its output passes (and, once a record is altered, fails) the M2 verifier.
+//! The anchor-directory writer (§8.5, §8.7, PD-156, PD-157, PD-164..PD-166; U-06 writer half):
+//! the `audit-anchor-dir` thread appends header, daily, `APP_STOP`, immediate, prune and
+//! `RESTORE` lines to `<anchor_dir>/<chain_id>.jsonl` after each commit, never before startup
+//! verification, and its output passes (and, once a record is altered, fails) the M2 verifier.
+//! `Store::change_anchor_dir` opens the new dir's file first and leaves an `ANCHOR_DETACHED`
+//! line in the old one; incident files sit beside the chain files; a torn last line is
+//! tolerated by both the writer and the verifier.
 
 mod common;
 
+use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use atlas_duck_audit::anchor_dir::{AnchorLine, file_name, parse_line, writer};
+use atlas_duck_audit::anchor_dir::{AnchorLine, file_name, parse_line, to_line, writer};
+use atlas_duck_audit::error::AuditError;
 use atlas_duck_audit::testing::{self, FakePrune, FaultPoint, Faults, MemKeyring};
-use atlas_duck_audit::types::{Confirmed, EventFlags, EventType};
+use atlas_duck_audit::types::{Confirmed, EventFlags, EventType, RustChosenPath};
 use atlas_duck_audit::verify::{FindingKind, StartupVerdict, VerifyFinding};
 use atlas_duck_audit::{
-    FilePolicy, OpenConfig, SettingChange, Settings, StartupOutcome, Store, open,
+    FilePolicy, LockedReason, OpenConfig, RecoveryOffer, SettingChange, Settings, StartupOutcome,
+    Store, finish_restore, open, restore_from_source,
 };
 use common::*;
-use serde_json::json;
+use secrecy::SecretString;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------------------
@@ -33,14 +41,25 @@ fn dir_text(dir: &Path) -> String {
     dir.to_string_lossy().into_owned()
 }
 
-/// A new store whose `anchor_dir` setting (confirmed) names `dir`.
+fn chosen(p: &Path) -> RustChosenPath {
+    RustChosenPath::from_native_dialog(p.to_path_buf())
+}
+
+/// A new store whose anchor dir is `dir` (an existing dir), set by `change_anchor_dir`.
 fn store_on(dir: &Path, tweak: impl FnOnce(&mut OpenConfig)) -> (Store, Fixture) {
     let (store, f) = new_store_with(fake_clock(START), MemKeyring::new(), tweak);
     store
-        .apply_setting(
-            SettingChange::AnchorDir(Some(dir_text(dir))),
-            Some(confirmed()),
-        )
+        .change_anchor_dir(Some(chosen(dir)), confirmed())
+        .expect("anchor dir setting");
+    (store, f)
+}
+
+/// The same for a dir that does not exist (an offline share): `change_anchor_dir` refuses it
+/// (PD-166: the new dir's file is opened first), so the testing setter logs the setting.
+fn store_on_offline(dir: &Path, tweak: impl FnOnce(&mut OpenConfig)) -> (Store, Fixture) {
+    let (store, f) = new_store_with(fake_clock(START), MemKeyring::new(), tweak);
+    store
+        .testing_set_anchor_dir(Some(dir_text(dir)), confirmed())
         .expect("anchor dir setting");
     (store, f)
 }
@@ -267,6 +286,8 @@ fn u06_immediate_lines_for_six_types() {
     let ls = lines(dir.path(), &f.chain_id);
     let got = immediates(&ls);
     for (seq, t) in [
+        // The anchor dir setting itself (PD-166: its line reaches the new dir).
+        (2, "CONFIG_CHANGED"),
         (prune, "PRUNE"),
         (retention, "CONFIG_CHANGED"),
         (hold, "LEGAL_HOLD_CHANGED"),
@@ -277,8 +298,9 @@ fn u06_immediate_lines_for_six_types() {
     }
     // The incident VERIFY itself and the ordinary rows get none.
     assert!(!got.iter().any(|(s, _)| *s == verify), "{got:?}");
-    assert_eq!(got.len(), 5, "{got:?}");
-    // RESTORE is the sixth type; its lines come from the restore paths (Task 5).
+    assert_eq!(got.len(), 6, "{got:?}");
+    // RESTORE is the sixth type; its lines come from the restore paths
+    // (`restore_writes_restore_line_to_new_chain_file`).
     for t in [
         "PRUNE",
         "RESTORE",
@@ -329,7 +351,13 @@ fn config_changed_non_policy_key_gets_no_line() {
         .seq;
     drain(&store);
     let got = immediates(&lines(dir.path(), &f.chain_id));
-    assert_eq!(got, vec![(retention, "CONFIG_CHANGED".to_string())]);
+    assert_eq!(
+        got,
+        vec![
+            (2, "CONFIG_CHANGED".to_string()),
+            (retention, "CONFIG_CHANGED".to_string())
+        ]
+    );
     assert!(!got.iter().any(|(s, _)| *s == ui || *s == origin));
     assert!(!writer::gets_immediate_line(
         "CONFIG_CHANGED",
@@ -365,6 +393,7 @@ fn allow_degraded_scripts_change_gets_immediate_line() {
     assert_eq!(
         got,
         vec![
+            (2, "CONFIG_CHANGED".to_string()),
             (on, "CONFIG_CHANGED".to_string()),
             (off, "CONFIG_CHANGED".to_string())
         ]
@@ -443,10 +472,7 @@ fn daily_line_never_past_corroborated_date() {
     store.append_batch(day_events(2)).expect("append");
     let dir = tempfile::tempdir().expect("anchor dir");
     store
-        .apply_setting(
-            SettingChange::AnchorDir(Some(dir_text(dir.path()))),
-            Some(confirmed()),
-        )
+        .change_anchor_dir(Some(chosen(dir.path())), confirmed())
         .expect("anchor dir");
     store.flush_head_anchor().expect("flush");
     store.shutdown();
@@ -579,7 +605,7 @@ fn app_stop_line_after_app_stop_commit_and_shutdown_drains() {
 fn pending_app_stop_line_written_at_next_start() {
     let base = tempfile::tempdir().expect("base");
     let dir = base.path().join("anchors");
-    let (store, f) = store_on(&dir, |_| {});
+    let (store, f) = store_on_offline(&dir, |_| {});
     corroborate(&store);
     store.append_batch(mixed(3)).expect("append");
     let stop = append_one(&store, EventType::APP_STOP);
@@ -862,7 +888,7 @@ fn no_anchor_dir_line_before_verification() {
 fn write_failure_sets_health_and_retries_no_incident() {
     let base = tempfile::tempdir().expect("base");
     let dir = base.path().join("offline");
-    let (store, f) = store_on(&dir, |cfg| cfg.hooks.fast_anchor_backoff = true);
+    let (store, f) = store_on_offline(&dir, |cfg| cfg.hooks.fast_anchor_backoff = true);
     corroborate(&store);
     let retention = store
         .apply_setting(SettingChange::RetentionDays(120), None)
@@ -908,7 +934,7 @@ fn holds_immediate(dir: &Path, chain_id: &str, want: &(u64, String)) -> bool {
 fn failing_old_dir_does_not_block_the_new_dirs_lines() {
     let base = tempfile::tempdir().expect("base");
     let old = base.path().join("offline");
-    let (store, f) = store_on(&old, |_| {});
+    let (store, f) = store_on_offline(&old, |_| {});
     corroborate(&store);
     store.append_batch(mixed(3)).expect("append");
     wait_until("old dir failing", || {
@@ -920,10 +946,7 @@ fn failing_old_dir_does_not_block_the_new_dirs_lines() {
     let new = base.path().join("local");
     std::fs::create_dir(&new).expect("new dir");
     store
-        .apply_setting(
-            SettingChange::AnchorDir(Some(dir_text(&new))),
-            Some(confirmed()),
-        )
+        .change_anchor_dir(Some(chosen(&new)), confirmed())
         .expect("switch");
     let retention = store
         .apply_setting(SettingChange::RetentionDays(120), None)
@@ -1051,4 +1074,891 @@ fn u06_writer_lines_then_tamper_fails_verify() {
         "the chain and the keychain are consistent: {fs:?}"
     );
     assert!(has(&fs, FindingKind::AnchorDirMismatch, k), "{fs:?}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Task 5 helpers
+
+fn pass(s: &str) -> SecretString {
+    SecretString::from(s.to_string())
+}
+
+fn kinds(fs: &[VerifyFinding]) -> Vec<FindingKind> {
+    fs.iter().map(|x| x.kind).collect()
+}
+
+fn payload(store: &Store, seq: u64) -> Value {
+    serde_json::from_slice(&store.read_payload(seq).expect("read_payload")).expect("json")
+}
+
+fn immediate_of(r: &RawRow) -> AnchorLine {
+    AnchorLine::Immediate {
+        seq: r.seq,
+        record_hash: r.record_hash,
+        epoch: r.epoch.clone(),
+        event_type: r.event_type.clone(),
+    }
+}
+
+fn record_of(r: &RawRow) -> AnchorLine {
+    AnchorLine::Record {
+        seq: r.seq,
+        record_hash: r.record_hash,
+        epoch: r.epoch.clone(),
+        clock_behind: flagged(r),
+    }
+}
+
+/// The first half of a valid line: what a crash in the middle of an append leaves behind.
+fn fragment() -> String {
+    let full = to_line(&AnchorLine::Record {
+        seq: 99,
+        record_hash: [3; 32],
+        epoch: Some("2026-10-08".into()),
+        clock_behind: false,
+    });
+    full[..full.len() / 2].to_string()
+}
+
+fn append_raw(path: &Path, bytes: &[u8]) {
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("open for append")
+        .write_all(bytes)
+        .expect("append");
+}
+
+/// Every line of the chain file except `skip` (a planted fragment), parsed.
+fn lines_but(dir: &Path, chain_id: &str, skip: &str) -> Vec<AnchorLine> {
+    let text = std::fs::read_to_string(chain_file(dir, chain_id)).expect("chain file");
+    assert!(text.ends_with('\n'), "every line ends with a newline");
+    text.lines()
+        .filter(|l| *l != skip)
+        .map(|l| parse_line(l).unwrap_or_else(|e| panic!("bad line {l:?}: {e}")))
+        .collect()
+}
+
+fn incident_file(dir: &Path, chain_id: &str, verify_seq: u64) -> PathBuf {
+    dir.join(format!("{chain_id}.incident-{verify_seq}.json"))
+}
+
+/// An integrity-incident verdict (its `VERIFY` is flagged).
+fn incident(detail: &str) -> StartupVerdict {
+    StartupVerdict {
+        findings: vec![VerifyFinding {
+            kind: FindingKind::AnchorMissing,
+            expected_seq: Some(1),
+            expected_hash: Some([1; 32]),
+            observed_seq: Some(2),
+            observed_hash: None,
+            detail: detail.into(),
+        }],
+        ..StartupVerdict::default()
+    }
+}
+
+/// The restored chain's file: one header naming it, then exactly one `Record` and one
+/// `Immediate` line for its `RESTORE`.
+fn assert_restore_lines(dir: &Path, f: &Fixture, chain_id: &str, restore_seq: u64) {
+    let r = row(f, restore_seq);
+    assert_eq!(r.event_type, "RESTORE");
+    assert_eq!(r.chain_id, chain_id);
+    let ls = lines(dir, chain_id);
+    match &ls[0] {
+        AnchorLine::Header {
+            chain_id: c,
+            install_id,
+            ..
+        } => {
+            assert_eq!(c, chain_id);
+            assert_eq!(install_id, &f.install_id);
+        }
+        other => panic!("line 1 is not a header: {other:?}"),
+    }
+    assert_eq!(headers(&ls), 1, "{ls:?}");
+    let count = |want: &AnchorLine| ls.iter().filter(|l| *l == want).count();
+    assert_eq!(count(&record_of(&r)), 1, "{ls:?}");
+    assert_eq!(count(&immediate_of(&r)), 1, "{ls:?}");
+}
+
+/// Every file under `base` (one level of subdirectories), with its bytes.
+fn files_under(base: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    for e in std::fs::read_dir(base).expect("read_dir") {
+        let p = e.expect("entry").path();
+        if p.is_dir() {
+            for e in std::fs::read_dir(&p).expect("read_dir") {
+                let q = e.expect("entry").path();
+                out.insert(q.clone(), std::fs::read(&q).expect("read"));
+            }
+        } else {
+            out.insert(p.clone(), std::fs::read(&p).expect("read"));
+        }
+    }
+    out
+}
+
+/// Every file of `before` still exists and starts with its earlier bytes (append-only).
+fn only_appended(before: &BTreeMap<PathBuf, Vec<u8>>, after: &BTreeMap<PathBuf, Vec<u8>>) {
+    for (p, old) in before {
+        let new = after
+            .get(p)
+            .unwrap_or_else(|| panic!("{} was deleted or renamed", p.display()));
+        assert!(
+            new.starts_with(old),
+            "{} was truncated or rewritten",
+            p.display()
+        );
+    }
+}
+
+/// Seq of the newest `RESTORE` and its `new_chain_id`, read from a closed store.
+fn latest_restore(f: &Fixture) -> (u64, String) {
+    let r = dump_rows(f)
+        .into_iter()
+        .rfind(|r| r.event_type == "RESTORE")
+        .expect("a RESTORE row");
+    (r.seq, r.chain_id)
+}
+
+// ---------------------------------------------------------------------------------------
+// change and removal of the anchor dir (PD-166)
+
+#[test]
+fn u06_change_anchor_dir_writes_detached_first() {
+    let base = tempfile::tempdir().expect("base");
+    let (a, b) = (base.path().join("a"), base.path().join("b"));
+    std::fs::create_dir(&a).expect("a");
+    std::fs::create_dir(&b).expect("b");
+    let (store, f) = store_on(&a, |_| {});
+    corroborate(&store);
+    store.append_batch(mixed(3)).expect("append");
+    drain(&store);
+
+    let c = store
+        .change_anchor_dir(Some(chosen(&b)), confirmed())
+        .expect("switch");
+    drain(&store);
+    assert_eq!(store.settings().anchor_dir, Some(dir_text(&b)));
+    let p = payload(&store, c.seq);
+    assert_eq!(p["key"], "anchor_dir");
+    assert_eq!(p["source"], "app");
+    assert_eq!(p["old"], dir_text(&a).as_str());
+    assert_eq!(p["new"], dir_text(&b).as_str());
+    assert_eq!(p["applied"], true);
+    assert_eq!(p["confirmed"]["dialog_text_sha256"], hex::encode([7u8; 32]));
+
+    // The old dir: the record's immediate line, then ANCHOR_DETACHED naming it.
+    let r = row(&f, c.seq);
+    let old = lines(&a, &f.chain_id);
+    let n = old.len();
+    assert_eq!(old[n - 2], immediate_of(&r), "{old:?}");
+    assert_eq!(
+        old[n - 1],
+        AnchorLine::Detached {
+            seq: c.seq,
+            record_hash: r.record_hash,
+            epoch: r.epoch.clone(),
+            detached_at: START.into(),
+        },
+        "{old:?}"
+    );
+    // The new dir starts with a header, then the same immediate line.
+    let new = lines(&b, &f.chain_id);
+    assert!(matches!(new[0], AnchorLine::Header { .. }), "{new:?}");
+    assert_eq!(new[1..].to_vec(), vec![immediate_of(&r)]);
+    // Order: the new file was created (and fsynced) first, the old dir's ANCHOR_DETACHED went
+    // out before the new dir's line.
+    let syncs = writer::testing_synced_under(base.path());
+    let last = |p: &Path| syncs.iter().rposition(|s| s == p).expect("synced");
+    let first = |p: &Path| syncs.iter().position(|s| s == p).expect("synced");
+    let (fa, fb) = (chain_file(&a, &f.chain_id), chain_file(&b, &f.chain_id));
+    assert!(first(&fb) < last(&fa), "{syncs:?}");
+    assert!(last(&fa) < last(&fb), "{syncs:?}");
+
+    // Later lines go to the new dir only.
+    let before = std::fs::read(&fa).expect("old file");
+    let retention = store
+        .apply_setting(SettingChange::RetentionDays(120), None)
+        .expect("retention")
+        .seq;
+    drain(&store);
+    assert_eq!(std::fs::read(&fa).expect("old file"), before);
+    assert!(immediates(&lines(&b, &f.chain_id)).contains(&(retention, "CONFIG_CHANGED".into())));
+    store.shutdown();
+    let fs = full_verify_fresh(&f);
+    assert!(fs.is_empty(), "{fs:?}");
+}
+
+#[test]
+fn remove_anchor_dir_writes_detached_only() {
+    let base = tempfile::tempdir().expect("base");
+    let a = base.path().join("a");
+    std::fs::create_dir(&a).expect("a");
+    let (store, f) = store_on(&a, |_| {});
+    corroborate(&store);
+    store.append_batch(mixed(3)).expect("append");
+    let c = store.change_anchor_dir(None, confirmed()).expect("remove");
+    drain(&store);
+    assert_eq!(store.settings().anchor_dir, None);
+    let p = payload(&store, c.seq);
+    assert_eq!(p["old"], dir_text(&a).as_str());
+    assert_eq!(p["new"], Value::Null);
+
+    let r = row(&f, c.seq);
+    let ls = lines(&a, &f.chain_id);
+    let n = ls.len();
+    assert_eq!(ls[n - 2], immediate_of(&r), "{ls:?}");
+    assert!(
+        matches!(&ls[n - 1], AnchorLine::Detached { seq, .. } if *seq == c.seq),
+        "{ls:?}"
+    );
+    // Nothing is written anywhere afterwards: not on a new day, not at quit, not at a start.
+    let file = chain_file(&a, &f.chain_id);
+    let before = std::fs::read(&file).expect("file");
+    f.clock.advance(DAY);
+    corroborate_now(&store, &f.clock);
+    store.append_batch(day_events(2)).expect("append");
+    append_one(&store, EventType::APP_STOP);
+    store.flush_head_anchor().expect("flush");
+    store.shutdown();
+    let (store, _) = open_ready(&f, f.config());
+    store.append_batch(day_events(2)).expect("append");
+    drain(&store);
+    store.shutdown();
+    assert_eq!(std::fs::read(&file).expect("file"), before);
+    assert_eq!(files_under(base.path()).len(), 1, "no other file was made");
+}
+
+#[test]
+fn old_dir_write_failure_does_not_block_switch() {
+    let base = tempfile::tempdir().expect("base");
+    let old = base.path().join("offline");
+    let new = base.path().join("local");
+    std::fs::create_dir(&new).expect("new dir");
+    let (store, f) = store_on_offline(&old, |cfg| cfg.hooks.fast_anchor_backoff = true);
+    corroborate(&store);
+    store.append_batch(mixed(3)).expect("append");
+    wait_until("old dir failing", || {
+        store.health().anchor_dir_write_failing
+    });
+
+    // The old dir cannot take its ANCHOR_DETACHED line: the switch happens anyway.
+    let c = store
+        .change_anchor_dir(Some(chosen(&new)), confirmed())
+        .expect("switch despite the old dir");
+    assert_eq!(store.settings().anchor_dir, Some(dir_text(&new)));
+    let want = (c.seq, "CONFIG_CHANGED".to_string());
+    wait_until("the new dir's line", || {
+        holds_immediate(&new, &f.chain_id, &want)
+    });
+    let h = store.health();
+    assert!(h.anchor_dir_write_failing, "shown in health: {h:?}");
+    assert!(h.anchor_dir_lines_pending > 0, "{h:?}");
+    assert!(store.open_incidents().is_empty());
+    let ls = lines(&new, &f.chain_id);
+    assert!(matches!(ls[0], AnchorLine::Header { .. }), "{ls:?}");
+    assert_eq!(headers(&ls), 1);
+
+    // The old share comes back: its queued lines end with the ANCHOR_DETACHED line.
+    std::fs::create_dir(&old).expect("share back");
+    wait_until("the old dir's lines", || {
+        let h = store.health();
+        !h.anchor_dir_write_failing && h.anchor_dir_lines_pending == 0
+    });
+    let r = row(&f, c.seq);
+    let ls = lines(&old, &f.chain_id);
+    let n = ls.len();
+    assert_eq!(ls[n - 2], immediate_of(&r), "{ls:?}");
+    assert!(
+        matches!(&ls[n - 1], AnchorLine::Detached { seq, .. } if *seq == c.seq),
+        "{ls:?}"
+    );
+    store.shutdown();
+}
+
+#[test]
+fn switch_back_to_earlier_dir_appends_without_new_header() {
+    let base = tempfile::tempdir().expect("base");
+    let (a, b) = (base.path().join("a"), base.path().join("b"));
+    std::fs::create_dir(&a).expect("a");
+    std::fs::create_dir(&b).expect("b");
+    let (store, f) = store_on(&a, |_| {});
+    corroborate(&store);
+    store.append_batch(mixed(2)).expect("append");
+    let to_b = store
+        .change_anchor_dir(Some(chosen(&b)), confirmed())
+        .expect("to b")
+        .seq;
+    drain(&store);
+    // A crash had torn A's last line (PD-165): the switch back closes it first.
+    let fa = chain_file(&a, &f.chain_id);
+    let frag = fragment();
+    append_raw(&fa, frag.as_bytes());
+    let a_before = std::fs::read(&fa).expect("a");
+
+    let back = store
+        .change_anchor_dir(Some(chosen(&a)), confirmed())
+        .expect("back to a")
+        .seq;
+    drain(&store);
+    let after = std::fs::read(&fa).expect("a");
+    assert!(after.starts_with(&a_before), "only appended to");
+    let ls = lines_but(&a, &f.chain_id, &frag);
+    assert_eq!(headers(&ls), 1, "no second header: {ls:?}");
+    assert!(matches!(ls[0], AnchorLine::Header { .. }));
+    assert_eq!(ls.last(), Some(&immediate_of(&row(&f, back))), "{ls:?}");
+    // The fragment became a line of its own, followed by a Record line.
+    let text = String::from_utf8(after).expect("utf-8");
+    let raw: Vec<&str> = text.lines().collect();
+    let i = raw.iter().position(|l| *l == frag).expect("fragment line");
+    assert!(
+        matches!(parse_line(raw[i + 1]), Ok(AnchorLine::Record { .. })),
+        "{raw:?}"
+    );
+    // B: its header, the line of the switch to it, the switch back's lines (its daily line
+    // too: B had none of that day) and ANCHOR_DETACHED last.
+    let lb = lines(&b, &f.chain_id);
+    assert!(matches!(lb[0], AnchorLine::Header { .. }));
+    assert_eq!(headers(&lb), 1);
+    assert_eq!(
+        immediates(&lb),
+        vec![
+            (to_b, "CONFIG_CHANGED".to_string()),
+            (back, "CONFIG_CHANGED".to_string())
+        ]
+    );
+    assert!(
+        matches!(lb.last(), Some(AnchorLine::Detached { seq, .. }) if *seq == back),
+        "{lb:?}"
+    );
+    store.shutdown();
+    let fs = full_verify_fresh(&f);
+    assert_eq!(kinds(&fs), vec![FindingKind::AnchorDirTornLine], "{fs:?}");
+}
+
+#[test]
+fn writer_does_not_duplicate_header_after_change_anchor_dir() {
+    // The setting names a dir the writer already created the file in (first run against
+    // `OpenConfig.anchor_dir`): change_anchor_dir finds the file and writes no header.
+    let dir = tempfile::tempdir().expect("anchor dir");
+    let (store, f) = new_store_with(fake_clock(START), MemKeyring::new(), |cfg| {
+        cfg.anchor_dir = Some(dir.path().to_path_buf());
+    });
+    drain(&store);
+    let c = store
+        .change_anchor_dir(Some(chosen(dir.path())), confirmed())
+        .expect("same dir as the setting");
+    corroborate(&store);
+    store.append_batch(mixed(5)).expect("append");
+    drain(&store);
+    let ls = lines(dir.path(), &f.chain_id);
+    assert!(matches!(ls[0], AnchorLine::Header { .. }), "{ls:?}");
+    assert_eq!(headers(&ls), 1, "{ls:?}");
+    assert!(immediates(&ls).contains(&(c.seq, "CONFIG_CHANGED".into())));
+
+    // A new dir: change_anchor_dir writes the header, the thread only appends, also after a
+    // restart (whose "ensure file" item finds the file).
+    let other = tempfile::tempdir().expect("other dir");
+    let c2 = store
+        .change_anchor_dir(Some(chosen(other.path())), confirmed())
+        .expect("other dir");
+    store.append_batch(mixed(5)).expect("append");
+    drain(&store);
+    store.shutdown();
+    let (store, _) = open_ready(&f, f.config());
+    store.append_batch(mixed(2)).expect("append");
+    drain(&store);
+    store.shutdown();
+    let ls = lines(other.path(), &f.chain_id);
+    assert!(matches!(ls[0], AnchorLine::Header { .. }), "{ls:?}");
+    assert_eq!(headers(&ls), 1, "{ls:?}");
+    assert!(immediates(&ls).contains(&(c2.seq, "CONFIG_CHANGED".into())));
+
+    // An existing empty file (a crash between its creation and its header) gets one header.
+    let empty = tempfile::tempdir().expect("empty dir");
+    std::fs::write(chain_file(empty.path(), &f.chain_id), b"").expect("empty file");
+    let (store, _) = open_ready(&f, f.config());
+    let c3 = store
+        .change_anchor_dir(Some(chosen(empty.path())), confirmed())
+        .expect("empty file");
+    drain(&store);
+    store.shutdown();
+    let ls = lines(empty.path(), &f.chain_id);
+    assert!(matches!(ls[0], AnchorLine::Header { .. }), "{ls:?}");
+    assert_eq!(headers(&ls), 1, "{ls:?}");
+    assert!(immediates(&ls).contains(&(c3.seq, "CONFIG_CHANGED".into())));
+    assert!(full_verify_fresh(&f).is_empty());
+}
+
+#[test]
+fn unwritable_new_dir_commits_nothing() {
+    let (store, f, dir) = anchored();
+    drain(&store);
+    let base = tempfile::tempdir().expect("base");
+    let missing = base.path().join("missing");
+    let not_a_dir = base.path().join("file");
+    std::fs::write(&not_a_dir, b"x").expect("file");
+    let (head, settings) = (store.head(), store.settings());
+    let rows = dump_rows(&f).len();
+    for p in [
+        missing.clone(),
+        not_a_dir.clone(),
+        PathBuf::from("relative-anchors"),
+        // The dir in force already: nothing to change.
+        dir.path().to_path_buf(),
+    ] {
+        let e = store
+            .change_anchor_dir(Some(chosen(&p)), confirmed())
+            .expect_err("refused");
+        assert!(
+            matches!(e, AuditError::Invalid(_)),
+            "{}: {e:?}",
+            p.display()
+        );
+    }
+    assert_eq!(store.head(), head);
+    assert_eq!(store.settings(), settings);
+    assert_eq!(dump_rows(&f).len(), rows, "nothing committed");
+    assert!(!missing.exists());
+    assert_eq!(std::fs::read(&not_a_dir).expect("file"), b"x");
+    assert!(!Path::new("relative-anchors").exists());
+    store.shutdown();
+}
+
+#[test]
+fn change_anchor_dir_never_deletes() {
+    // Black box: across a switch, a switch back over a torn line, an incident file, a removal
+    // and a restart, every file in either dir only grows.
+    let base = tempfile::tempdir().expect("base");
+    let (a, b) = (base.path().join("a"), base.path().join("b"));
+    std::fs::create_dir(&a).expect("a");
+    std::fs::create_dir(&b).expect("b");
+    let (store, f) = store_on(&a, |_| {});
+    corroborate(&store);
+    store.append_batch(mixed(4)).expect("append");
+    drain(&store);
+    let step = |store: &Store, what: &dyn Fn(&Store)| {
+        let before = files_under(base.path());
+        what(store);
+        drain(store);
+        only_appended(&before, &files_under(base.path()));
+    };
+    step(&store, &|s| {
+        s.change_anchor_dir(Some(chosen(&b)), confirmed())
+            .expect("to b");
+    });
+    append_raw(&chain_file(&a, &f.chain_id), fragment().as_bytes());
+    step(&store, &|s| {
+        s.change_anchor_dir(Some(chosen(&a)), confirmed())
+            .expect("back to a");
+    });
+    step(&store, &|s| {
+        testing::apply_startup(s, &incident("never deletes")).expect("incident");
+    });
+    step(&store, &|s| {
+        s.change_anchor_dir(None, confirmed()).expect("remove");
+    });
+    step(&store, &|s| {
+        s.change_anchor_dir(Some(chosen(&b)), confirmed())
+            .expect("b again");
+    });
+    let before = files_under(base.path());
+    store.shutdown();
+    let (store, _) = open_ready(&f, f.config());
+    store.append_batch(mixed(2)).expect("append");
+    drain(&store);
+    store.shutdown();
+    only_appended(&before, &files_under(base.path()));
+
+    // White box: the anchor-dir code asks the file system for no deletion, rename or
+    // truncation at all (a file is only ever created with create-new or opened to append).
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("anchor_dir");
+    for e in std::fs::read_dir(&src).expect("anchor_dir sources") {
+        let p = e.expect("entry").path();
+        let text = std::fs::read_to_string(&p).expect("source");
+        for needle in [
+            "remove_file",
+            "remove_dir",
+            "rename(",
+            "set_len",
+            "truncate(",
+            "fs::write",
+            "File::create",
+            "write(true)",
+        ] {
+            assert!(!text.contains(needle), "{} asks for {needle}", p.display());
+        }
+    }
+}
+
+#[test]
+fn apply_setting_anchor_dir_refused() {
+    let (store, f, dir) = anchored();
+    let other = tempfile::tempdir().expect("other");
+    let (head, settings) = (store.head(), store.settings());
+    for change in [
+        SettingChange::AnchorDir(Some(dir_text(other.path()))),
+        SettingChange::AnchorDir(None),
+        SettingChange::AnchorDir(Some(dir_text(dir.path()))),
+    ] {
+        for confirm in [None, Some(confirmed())] {
+            match store.apply_setting(change.clone(), confirm) {
+                Err(AuditError::Invalid(why)) => assert_eq!(why, "use change_anchor_dir"),
+                other => panic!("{change:?}: {other:?}"),
+            }
+        }
+    }
+    assert_eq!(store.head(), head);
+    assert_eq!(store.settings(), settings);
+    drain(&store);
+    assert!(!chain_file(other.path(), &f.chain_id).exists());
+    store.shutdown();
+}
+
+// ---------------------------------------------------------------------------------------
+// RESTORE lines (§8.5, §8.7 interrupted restore, §8.11 step 5)
+
+#[test]
+fn restore_writes_restore_line_to_new_chain_file() {
+    let dir = tempfile::tempdir().expect("anchor dir");
+    let (a, fa) = store_on(dir.path(), |_| {});
+    corroborate(&a);
+    a.append_batch(mixed(10)).expect("append");
+    a.flush_head_anchor().expect("flush");
+    let out = tempfile::tempdir().expect("out dir");
+    let bundle = a.backup(chosen(out.path())).expect("backup");
+    a.append_batch(mixed(3)).expect("append");
+    a.flush_head_anchor().expect("flush");
+
+    // Store::restore on the live store (a same-machine rollback, confirmed).
+    let rep = a
+        .restore(
+            chosen(&bundle.bundle_dir),
+            &pass(PASSPHRASE),
+            Some(confirmed()),
+        )
+        .expect("restore");
+    drain(&a);
+    assert_eq!(a.settings().anchor_dir, Some(dir_text(dir.path())));
+    assert_restore_lines(dir.path(), &fa, &rep.new_chain_id, rep.restore_seq);
+    assert_eq!(a.full_verify(), vec![]);
+    a.shutdown();
+
+    // restore_from_source on a new machine: the restored view names the same anchor dir.
+    let fb = fixture(fake_clock(START), MemKeyring::new());
+    let (b, rep) = restore_from_source(
+        &fb.data,
+        &fb.lock,
+        fb.config(),
+        chosen(&bundle.bundle_dir),
+        &pass(PASSPHRASE),
+        None,
+    )
+    .expect("restore_from_source");
+    drain(&b);
+    assert_restore_lines(dir.path(), &fb, &rep.new_chain_id, rep.restore_seq);
+    assert_eq!(b.full_verify(), vec![]);
+    b.shutdown();
+}
+
+#[test]
+fn finish_restore_and_interrupted_restore_write_missing_restore_line() {
+    let dir = tempfile::tempdir().expect("anchor dir");
+    let (a, _fa) = store_on(dir.path(), |_| {});
+    corroborate(&a);
+    a.append_batch(mixed(10)).expect("append");
+    a.flush_head_anchor().expect("flush");
+    let out = tempfile::tempdir().expect("out dir");
+    let bundle = a.backup(chosen(out.path())).expect("backup");
+    a.shutdown();
+    let machine = |faults: &Arc<Faults>| {
+        let faults = faults.clone();
+        let (s, f) = new_store_with(fake_clock(START), MemKeyring::new(), move |cfg| {
+            cfg.hooks.faults = Some(faults);
+            cfg.hooks.fast_anchor_backoff = true;
+        });
+        s.append_batch(mixed(3)).expect("append");
+        s.flush_head_anchor().expect("flush");
+        (s, f)
+    };
+
+    // Interrupted restore: a crash between the KEK re-seal and the anchor reset.
+    let faults = Faults::new();
+    let (b, fb) = machine(&faults);
+    faults.fail(FaultPoint::AfterKekReseal, 1);
+    assert!(
+        b.restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
+            .is_err()
+    );
+    drop(b);
+    let (restore_seq, chain) = latest_restore(&fb);
+    assert!(
+        !chain_file(dir.path(), &chain).exists(),
+        "nothing before the restore completes"
+    );
+    let mut cfg = fb.config();
+    cfg.pinned_install_id = Some(fb.install_id.clone());
+    let (s, findings) = open_ready(&fb, cfg);
+    assert_eq!(
+        kinds(&findings),
+        vec![FindingKind::InterruptedRestoreReconciled]
+    );
+    drain(&s);
+    s.shutdown();
+    assert_restore_lines(dir.path(), &fb, &chain, restore_seq);
+    // A later start writes them no second time.
+    let (s, _) = open_ready(&fb, fb.config());
+    drain(&s);
+    s.shutdown();
+    assert_restore_lines(dir.path(), &fb, &chain, restore_seq);
+
+    // "Finish restore": a crash right after the commit, before the re-seal.
+    let faults = Faults::new();
+    let (c, fc) = machine(&faults);
+    faults.fail(FaultPoint::AfterRestoreCommit, 1);
+    assert!(
+        c.restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
+            .is_err()
+    );
+    drop(c);
+    match open(&fc.data, &fc.lock, fc.config()).expect("open") {
+        StartupOutcome::Locked(LockedReason::KeychainLost {
+            offer: RecoveryOffer::FinishRestore,
+        }) => {}
+        other => panic!("expected FinishRestore, got {other:?}"),
+    }
+    let (restore_seq, chain) = latest_restore(&fc);
+    assert!(!chain_file(dir.path(), &chain).exists());
+    let (s, v, _) =
+        finish_restore(&fc.data, &fc.lock, fc.config(), &pass(PASSPHRASE)).expect("finish");
+    assert_eq!(
+        kinds(&v.findings),
+        vec![FindingKind::InterruptedRestoreReconciled]
+    );
+    drain(&s);
+    assert_eq!(s.full_verify(), vec![]);
+    s.shutdown();
+    assert_restore_lines(dir.path(), &fc, &chain, restore_seq);
+}
+
+// ---------------------------------------------------------------------------------------
+// incident files (PD-164)
+
+#[test]
+fn incident_file_written_once_per_verify_seq() {
+    let (store, f, dir) = anchored();
+    let first = testing::apply_startup(&store, &incident("one"))
+        .expect("incident")
+        .verify_seq
+        .expect("VERIFY");
+    drain(&store);
+    let file1 = incident_file(dir.path(), &f.chain_id, first);
+    let bytes = std::fs::read(&file1).expect("incident file");
+    let v: Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(
+        bytes,
+        atlas_duck_ipc::jcs::to_jcs_vec(&v).expect("jcs"),
+        "JCS"
+    );
+    let r = row(&f, first);
+    assert_eq!(
+        v,
+        json!({
+            "chain_id": f.chain_id,
+            "verify_seq": first,
+            "record_hash": hex::encode(r.record_hash),
+            "result": "anchor_missing",
+            "expected_seq": 1,
+            "expected_hash": hex::encode([1u8; 32]),
+            "observed_seq": 2,
+            "observed_hash": null,
+            "detected_at": START,
+        })
+    );
+
+    // A VERIFY that is not an incident gets no file.
+    let info = testing::apply_startup(
+        &store,
+        &StartupVerdict {
+            findings: vec![VerifyFinding {
+                kind: FindingKind::UnanchoredTail,
+                expected_seq: None,
+                expected_hash: None,
+                observed_seq: None,
+                observed_hash: None,
+                detail: "informational".into(),
+            }],
+            ..StartupVerdict::default()
+        },
+    )
+    .expect("info")
+    .verify_seq
+    .expect("VERIFY");
+    drain(&store);
+    assert!(!incident_file(dir.path(), &f.chain_id, info).exists());
+
+    // Create-new: a file already at the next incident's name is never overwritten.
+    let next = store.head().0 + 1;
+    let planted = incident_file(dir.path(), &f.chain_id, next);
+    std::fs::write(&planted, b"planted").expect("planted");
+    let second = testing::apply_startup(&store, &incident("two"))
+        .expect("incident")
+        .verify_seq
+        .expect("VERIFY");
+    assert_eq!(second, next);
+    drain(&store);
+    assert!(!store.health().anchor_dir_write_failing);
+    assert_eq!(std::fs::read(&planted).expect("planted"), b"planted");
+    assert_eq!(std::fs::read(&file1).expect("file"), bytes);
+    store.shutdown();
+
+    // A restart writes no incident file again.
+    let (store, _) = open_ready(&f, f.config());
+    drain(&store);
+    store.shutdown();
+    assert_eq!(std::fs::read(&file1).expect("file"), bytes);
+    let incident_files = std::fs::read_dir(dir.path())
+        .expect("read_dir")
+        .filter(|e| {
+            e.as_ref()
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .contains(".incident-")
+        })
+        .count();
+    assert_eq!(incident_files, 2);
+}
+
+#[test]
+fn load_ignores_incident_files() {
+    let (store, f, dir) = anchored();
+    corroborate(&store);
+    store.append_batch(mixed(4)).expect("append");
+    let v = testing::apply_startup(&store, &incident("load"))
+        .expect("incident")
+        .verify_seq
+        .expect("VERIFY");
+    drain(&store);
+    assert!(incident_file(dir.path(), &f.chain_id, v).exists());
+    // Another incident file that is not even JSON.
+    std::fs::write(incident_file(dir.path(), &f.chain_id, 999_999), b"not json")
+        .expect("junk incident file");
+    store.flush_head_anchor().expect("flush");
+    store.shutdown();
+    let (store, findings) = open_ready(&f, f.config());
+    assert!(findings.is_empty(), "{findings:?}");
+    store.flush_head_anchor().expect("flush");
+    store.shutdown();
+    let fs = full_verify_fresh(&f);
+    assert!(fs.is_empty(), "{fs:?}");
+}
+
+// ---------------------------------------------------------------------------------------
+// torn lines (PD-165)
+
+#[test]
+fn torn_last_line_tolerated_both_sides() {
+    let (store, f, dir) = anchored();
+    corroborate(&store);
+    store.append_batch(mixed(4)).expect("append");
+    append_one(&store, EventType::APP_STOP);
+    store.flush_head_anchor().expect("flush");
+    store.shutdown();
+    // A crash in the middle of an append: half a line, no newline.
+    let file = chain_file(dir.path(), &f.chain_id);
+    let frag = fragment();
+    append_raw(&file, frag.as_bytes());
+
+    // Verifier: an informational finding, no incident, at a full verification and at a start.
+    let fs = full_verify_fresh(&f);
+    assert_eq!(kinds(&fs), vec![FindingKind::AnchorDirTornLine], "{fs:?}");
+    assert!(!FindingKind::AnchorDirTornLine.is_incident());
+    assert_eq!(
+        FindingKind::AnchorDirTornLine.as_str(),
+        "anchor_dir_torn_line"
+    );
+    // (The VERIFY that full verification appended is an unanchored tail record now.)
+    let (store, findings) = open_ready(&f, f.config());
+    assert_eq!(
+        kinds(&findings),
+        vec![FindingKind::AnchorDirTornLine, FindingKind::UnanchoredTail],
+        "{findings:?}"
+    );
+    assert!(store.open_incidents().is_empty());
+
+    // Writer: before its next append the fragment is closed by a newline and followed by a
+    // Record line for the head; then the lines go on.
+    let retention = store
+        .apply_setting(SettingChange::RetentionDays(120), None)
+        .expect("retention")
+        .seq;
+    drain(&store);
+    store.shutdown();
+    let text = std::fs::read_to_string(&file).expect("file");
+    let raw: Vec<&str> = text.lines().collect();
+    let i = raw.iter().position(|l| *l == frag).expect("fragment line");
+    let head = match parse_line(raw[i + 1]) {
+        Ok(AnchorLine::Record { seq, .. }) => seq,
+        other => panic!("not a Record line after the fragment: {other:?}"),
+    };
+    assert_eq!(parse_line(raw[i + 1]).ok(), Some(record_of(&row(&f, head))));
+    let ls = lines_but(dir.path(), &f.chain_id, &frag);
+    assert!(immediates(&ls).contains(&(retention, "CONFIG_CHANGED".into())));
+    let fs = full_verify_fresh(&f);
+    assert_eq!(kinds(&fs), vec![FindingKind::AnchorDirTornLine], "{fs:?}");
+}
+
+#[test]
+fn garbage_line_still_mismatch() {
+    let (store, f, dir) = anchored();
+    corroborate(&store);
+    store.append_batch(mixed(3)).expect("append");
+    store.flush_head_anchor().expect("flush");
+    store.shutdown();
+    let file = chain_file(dir.path(), &f.chain_id);
+    let original = std::fs::read_to_string(&file).expect("file");
+    let valid = to_line(&record_of(&row(&f, 1)));
+    let frag = fragment();
+    let with = |bad: &str| {
+        std::fs::write(&file, format!("{original}{bad}\n{valid}\n")).expect("write");
+        full_verify_fresh(&f)
+    };
+    // Control: a torn-looking line followed by a valid line is informational.
+    assert_eq!(kinds(&with(&frag)), vec![FindingKind::AnchorDirTornLine]);
+    for (what, bad) in [
+        ("not JSON", "not an anchor line".to_string()),
+        (
+            "complete JSON, unknown key",
+            r#"{"seq":1,"x":2}"#.to_string(),
+        ),
+        ("complete JSON, not canonical", format!("{valid} ")),
+        ("an empty line", String::new()),
+        (
+            "a torn-looking line followed by a bad line",
+            format!("{frag}\nnot an anchor line"),
+        ),
+        ("a fragment without the opening", frag[2..].to_string()),
+    ] {
+        let fs = with(&bad);
+        assert!(
+            fs.iter().any(|x| x.kind == FindingKind::AnchorDirMismatch
+                && x.detail.contains("is not a valid anchor line")),
+            "{what}: {fs:?}"
+        );
+    }
+    // Both lines are judged in the torn-then-bad case.
+    let fs = with(&format!("{frag}\nnot an anchor line"));
+    let bad = fs
+        .iter()
+        .filter(|x| {
+            x.kind == FindingKind::AnchorDirMismatch && x.detail.contains("not a valid anchor line")
+        })
+        .count();
+    assert_eq!(bad, 2, "{fs:?}");
+    assert!(!kinds(&fs).contains(&FindingKind::AnchorDirTornLine));
 }

@@ -12,7 +12,7 @@ use atlas_duck_audit::anchor_dir::{AnchorLine, AnchorLineError, file_name, parse
 use atlas_duck_audit::anchors::{FirstRetainedAnchor, HeadAnchor};
 use atlas_duck_audit::keystore::service_name;
 use atlas_duck_audit::testing::{self, FakePrune, MemKeyring};
-use atlas_duck_audit::types::{Confirmed, EventFlags, EventType};
+use atlas_duck_audit::types::{Confirmed, EventFlags, EventType, RustChosenPath};
 use atlas_duck_audit::{
     FindingKind, OpenConfig, SettingChange, Settings, StartupOutcome, Store, VerifyFinding, open,
 };
@@ -36,17 +36,20 @@ fn dir_text(dir: &Path) -> String {
     dir.to_string_lossy().into_owned()
 }
 
+fn chosen(p: &Path) -> RustChosenPath {
+    RustChosenPath::from_native_dialog(p.to_path_buf())
+}
+
 /// A store whose `anchor_dir` setting (confirmed) names a fresh temp dir. The setting's
 /// `CONFIG_CHANGED` is seq 2 (an immediate-line type, NULL epoch: nothing corroborated yet).
+/// Its line is written before this returns, so a test that rewrites the file races nothing.
 fn anchored_store() -> (Store, Fixture, TempDir) {
     let (store, f) = new_store(fake_clock(START), MemKeyring::new());
     let dir = tempfile::tempdir().expect("anchor dir");
     store
-        .apply_setting(
-            SettingChange::AnchorDir(Some(dir_text(dir.path()))),
-            Some(confirmed()),
-        )
+        .change_anchor_dir(Some(chosen(dir.path())), confirmed())
         .expect("anchor dir setting");
+    assert!(store.testing_anchor_dir_drain(), "anchor-dir lines written");
     (store, f, dir)
 }
 
@@ -977,10 +980,7 @@ fn store_setting_wins_over_open_config() {
     let store = reopen_with(&f, |_| {});
     let good = tempfile::tempdir().expect("dir");
     store
-        .apply_setting(
-            SettingChange::AnchorDir(Some(dir_text(good.path()))),
-            Some(confirmed()),
-        )
+        .change_anchor_dir(Some(chosen(good.path())), confirmed())
         .expect("setting");
     store.shutdown();
     let fs = full_verify_with(&f, |cfg| cfg.anchor_dir = Some(bad.path().to_path_buf()));

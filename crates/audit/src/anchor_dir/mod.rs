@@ -2,7 +2,10 @@
 //! header line, then unsigned, append-only JSON lines (daily, `APP_STOP` and `RESTORE` lines,
 //! immediate lines, prune lines, `ANCHOR_DETACHED`). [`parse_line`] and [`to_line`] are the one
 //! line format both sides use; [`writer`] appends the lines (M10), [`load`] reads the files of
-//! the store's chains and [`check`] compares them with the store (§8.7).
+//! the store's chains (only `<chain_id>.jsonl` names: the incident files
+//! `<chain_id>.incident-<verify_seq>.json` beside them never reach the parser, PD-164) and
+//! [`check`] compares them with the store (§8.7). A line torn by a crash is tolerated on both
+//! sides (PD-165, see `parse_file`).
 //!
 //! Lines are JCS text (sorted keys, no whitespace); a line that is not exactly what
 //! [`to_line`] produces for its content is rejected. Hashes are 64 lowercase hex characters,
@@ -413,6 +416,9 @@ pub(crate) struct AnchorDirLines {
     /// a clean pass, but none contradicts the store (it defers, not refuses, a reconciliation).
     /// Bounded: at most a few per file.
     pub(crate) problems: Vec<VerifyFinding>,
+    /// Informational findings (`AnchorDirTornLine`, PD-165): neither a mismatch nor a reason to
+    /// defer anything. Bounded like `problems`.
+    pub(crate) notes: Vec<VerifyFinding>,
     /// Store `chain_id`s that are not valid ids (their files were not read): a store defect,
     /// reported by [`check`].
     pub(crate) invalid_chain_ids: usize,
@@ -515,7 +521,7 @@ pub(crate) fn load(
                     .push(problem(format!("{name} is empty: it has no header line")));
             }
             Ok(Some(bytes)) => {
-                let lines = parse_file(&name, &bytes, &mut out.problems);
+                let lines = parse_file(&name, &bytes, &mut out.problems, &mut out.notes);
                 out.chains.insert(chain, lines);
             }
             Err(what) => out.problems.push(problem(format!("{name}: {what}"))),
@@ -548,19 +554,53 @@ fn read_file(path: &Path) -> Result<Option<Vec<u8>>, String> {
     Ok(Some(bytes))
 }
 
+fn parse_raw(raw: &[u8]) -> Result<AnchorLine, AnchorLineError> {
+    std::str::from_utf8(raw)
+        .map_err(|_| AnchorLineError::NotJson)
+        .and_then(parse_line)
+}
+
+/// A line a crash cut off while it was appended (PD-165): at most [`MAX_LINE_BYTES`], starting
+/// like every line (`{"`), and an unfinished JSON text (the parser runs out of input, which a
+/// complete line, however wrong, never does). A cut inside a multi-byte character counts too.
+fn is_torn(raw: &[u8]) -> bool {
+    if raw.len() > MAX_LINE_BYTES || !raw.starts_with(b"{\"") {
+        return false;
+    }
+    let text = match std::str::from_utf8(raw) {
+        Ok(t) => t,
+        Err(e) if e.error_len().is_none() => match raw.get(..e.valid_up_to()) {
+            Some(valid) => match std::str::from_utf8(valid) {
+                Ok(t) => t,
+                Err(_) => return false,
+            },
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+    matches!(serde_json::from_str::<Value>(text), Err(e) if e.is_eof())
+}
+
 /// Lines separated by `\n`, split lazily; the empty remainder after a final newline is not a
-/// line. Every other line must parse (an empty one does not). At most
-/// [`MAX_BAD_LINES_REPORTED`] bad lines are reported one by one, the rest in one summary, and
-/// at most [`MAX_LINES`] lines are read, so a file of garbage costs bounded memory and time.
+/// line. Every other line must parse (an empty one does not), except a torn line (PD-165,
+/// [`is_torn`]) that is the file's last line or is followed by a valid line: the writer closes
+/// such a line with a newline and a `Record` line before its next append. A torn line is an
+/// informational `AnchorDirTornLine` in `notes`; a torn-looking line followed by another bad
+/// line is a bad line like any other. At most [`MAX_BAD_LINES_REPORTED`] bad (and torn) lines are
+/// reported one by one, the rest in one summary, and at most [`MAX_LINES`] lines are read, so a
+/// file of garbage costs bounded memory and time.
 fn parse_file(
     name: &str,
     bytes: &[u8],
     problems: &mut Vec<VerifyFinding>,
+    notes: &mut Vec<VerifyFinding>,
 ) -> Vec<(usize, AnchorLine)> {
     let mut lines = Vec::new();
     let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     let mut bad = 0usize;
-    for (i, raw) in body.split(|b| *b == b'\n').enumerate() {
+    let mut torn = 0usize;
+    let mut it = body.split(|b| *b == b'\n').enumerate().peekable();
+    while let Some((i, raw)) = it.next() {
         let n = i + 1;
         if n > MAX_LINES {
             problems.push(problem(format!(
@@ -568,11 +608,17 @@ fn parse_file(
             )));
             break;
         }
-        let parsed = std::str::from_utf8(raw)
-            .map_err(|_| AnchorLineError::NotJson)
-            .and_then(parse_line);
-        match parsed {
+        match parse_raw(raw) {
             Ok(l) => lines.push((n, l)),
+            Err(_) if is_torn(raw) && it.peek().is_none_or(|(_, next)| parse_raw(next).is_ok()) => {
+                torn += 1;
+                if torn <= MAX_BAD_LINES_REPORTED {
+                    notes.push(VerifyFinding::new(
+                        FindingKind::AnchorDirTornLine,
+                        format!("{name} line {n} is a torn line (an interrupted append)"),
+                    ));
+                }
+            }
             Err(e) => {
                 bad += 1;
                 if bad <= MAX_BAD_LINES_REPORTED {
@@ -588,6 +634,12 @@ fn parse_file(
             "{name}: {} more lines are not valid anchor lines",
             bad - MAX_BAD_LINES_REPORTED
         )));
+    }
+    if torn > MAX_BAD_LINES_REPORTED {
+        notes.push(VerifyFinding::new(
+            FindingKind::AnchorDirTornLine,
+            format!("{name}: {} more torn lines", torn - MAX_BAD_LINES_REPORTED),
+        ));
     }
     lines
 }

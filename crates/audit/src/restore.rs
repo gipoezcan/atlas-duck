@@ -491,8 +491,10 @@ fn check_anchor_dir(
         prior.map(|a| (a.chain_id.as_str(), a.seq)),
         records_lost,
     );
-    let found =
+    let mut found =
         verify::snapshot_anchor_dir(&conn, &staged.kek, lines.as_ref(), rollback).map_err(sql)?;
+    // A torn line (PD-165) is informational: it refuses nothing.
+    found.retain(|f| f.kind.is_incident());
     if !found.is_empty() {
         return Err(restore_err(RestoreError::AnchorDirMismatch(summary(
             &found,

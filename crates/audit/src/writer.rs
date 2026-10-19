@@ -20,10 +20,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::anchor_dir::AnchorLine;
 use crate::anchor_dir::writer::{
-    AnchorDirShared, Classifier, Pending, PruneNote, RowNote, gets_immediate_line,
+    AnchorDirShared, Classifier, IncidentDraft, Pending, PruneNote, RowNote, gets_immediate_line,
 };
+use crate::anchor_dir::{AnchorLine, resolve};
 use crate::anchors::{AnchorShared, HeadAnchor};
 #[cfg(any(test, feature = "testing"))]
 use crate::anchors::{Barrier, FirstRetainedAnchor};
@@ -129,6 +129,8 @@ pub(crate) struct PreparedEvent {
     /// The committed row gets an immediate anchor-dir line (§8.5): decided here, where a
     /// `CONFIG_CHANGED` payload's `key` is still plaintext.
     pub(crate) anchor_immediate: bool,
+    /// An integrity-incident `VERIFY`: its incident file in the anchor dir (PD-164).
+    pub(crate) incident: Option<IncidentDraft>,
     pub(crate) payload_len: u64,
     pub(crate) payload_sha256: [u8; 32],
     pub(crate) compressed: Zeroizing<Vec<u8>>,
@@ -203,6 +205,7 @@ impl PreparedEvent {
             ack_of: None,
             for_generation: None,
             anchor_immediate,
+            incident: None,
             payload_len,
             payload_sha256,
             compressed,
@@ -390,6 +393,12 @@ pub(crate) enum Cmd {
     ApplySetting {
         change: SettingChange,
         confirmed: Option<Confirmed>,
+        reply: SyncSender<Result<Committed, AuditError>>,
+    },
+    /// `Store::change_anchor_dir` after the new dir's file was opened (PD-166).
+    ChangeAnchorDir {
+        dir: Option<String>,
+        confirmed: Confirmed,
         reply: SyncSender<Result<Committed, AuditError>>,
     },
     /// `Store::reconcile_config_file` (T12).
@@ -713,6 +722,7 @@ impl WriterState {
             event_type: p.event_type,
             immediate: p.anchor_immediate,
             corroborated: self.clock_state.corroborated_date(mono),
+            incident: p.incident.clone(),
         });
         self.head = Head {
             seq,
@@ -801,10 +811,18 @@ impl WriterState {
             .into_iter()
             .filter(|r| r.seq <= head)
             .collect();
+        if let Some(r) = rows.iter().find(|r| r.seq == head) {
+            self.shared
+                .anchor_dir
+                .set_head(&self.head.chain_id, r.record_line());
+        }
+        let dir = &self.settings.anchor_dir;
+        let incidents = Pending::incidents(dir, &self.head.chain_id, &rows);
         let prune = self.anchor_prune.take();
-        let lines =
-            self.anchor_lines
-                .lines(&self.settings.anchor_dir, &self.head.chain_id, rows, prune);
+        let mut lines = self
+            .anchor_lines
+            .lines(dir, &self.head.chain_id, rows, prune);
+        lines.extend(incidents);
         self.shared.anchor_dir.push(lines);
     }
 }
@@ -934,18 +952,18 @@ impl Writer {
         // chain's file if it is missing, and the line of an APP_STOP head that the last
         // shutdown could not write (PD-157; skipped when the file holds it).
         let dir = st.settings.anchor_dir.clone();
+        let head_line = AnchorLine::Record {
+            seq,
+            record_hash: hash,
+            epoch: epoch.map(epoch_text),
+            clock_behind: flags.contains(EventFlags::BEHIND),
+        };
+        st.shared
+            .anchor_dir
+            .set_head(&st.head.chain_id, head_line.clone());
         let mut pending = vec![Pending::ensure_file(dir.clone(), &st.head.chain_id)];
         if head_type == EventType::APP_STOP.as_str() {
-            pending.push(Pending::catch_up(
-                dir,
-                &st.head.chain_id,
-                AnchorLine::Record {
-                    seq,
-                    record_hash: hash,
-                    epoch: epoch.map(epoch_text),
-                    clock_behind: flags.contains(EventFlags::BEHIND),
-                },
-            ));
+            pending.push(Pending::catch_up(dir, &st.head.chain_id, head_line));
         }
         st.shared.anchor_dir.push(pending);
         Ok(Writer { conn, st })
@@ -1106,6 +1124,65 @@ impl Writer {
     /// file; Windows refuses that while a handle is open). Closing the last connection
     /// checkpoints the WAL. The writer holds an in-memory placeholder until
     /// [`Writer::reopen_live`] or [`Writer::reopen_on`].
+    /// The lines of an anchor-dir change `c` (PD-166) after its commit, which already queued the
+    /// record's `Immediate` line for the old dir (the dir in force when it committed): the old
+    /// dir's `ANCHOR_DETACHED` naming `c`, then the same `Immediate` line for the new dir (none
+    /// on a removal). Both go through the queue: a failing old dir never holds back the new
+    /// one, and is shown in health. Nothing when both settings resolve to the same dir.
+    /// Best effort: the record is in the chain whatever happens here.
+    pub(crate) fn push_anchor_dir_switch(
+        &mut self,
+        old: Option<String>,
+        new: Option<String>,
+        c: Committed,
+    ) {
+        let fallback = self.st.shared.anchor_dir.fallback();
+        let from = resolve(old.as_deref(), fallback.as_deref());
+        let to = resolve(new.as_deref(), fallback.as_deref());
+        if from == to {
+            return;
+        }
+        let Ok(seq) = i64::try_from(c.seq) else {
+            return;
+        };
+        let epoch: Result<Option<String>, _> =
+            self.conn
+                .query_row("SELECT epoch FROM events WHERE seq = ?1", [seq], |r| {
+                    r.get(0)
+                });
+        let (Ok(epoch), Some(detached_at)) = (epoch, self.st.clock.now_utc().try_to_rfc3339_ms())
+        else {
+            return;
+        };
+        let chain_id = self.st.head.chain_id.clone();
+        let mut lines = Vec::new();
+        if from.is_some() {
+            lines.push(Pending::always(
+                old,
+                &chain_id,
+                AnchorLine::Detached {
+                    seq: c.seq,
+                    record_hash: c.record_hash,
+                    epoch: epoch.clone(),
+                    detached_at,
+                },
+            ));
+        }
+        if to.is_some() {
+            lines.push(Pending::always(
+                new,
+                &chain_id,
+                AnchorLine::Immediate {
+                    seq: c.seq,
+                    record_hash: c.record_hash,
+                    epoch,
+                    event_type: EventType::CONFIG_CHANGED.as_str().to_owned(),
+                },
+            ));
+        }
+        self.st.shared.anchor_dir.push(lines);
+    }
+
     pub(crate) fn close_live(&mut self) -> Result<(), AuditError> {
         let placeholder = Connection::open_in_memory().map_err(sql)?;
         std::mem::replace(&mut self.conn, placeholder)
@@ -1491,6 +1568,14 @@ impl Writer {
                     reply,
                 } => {
                     let r = self.apply_setting_run(change, confirmed);
+                    let _ = reply.send(r);
+                }
+                Cmd::ChangeAnchorDir {
+                    dir,
+                    confirmed,
+                    reply,
+                } => {
+                    let r = self.change_anchor_dir_run(dir, confirmed);
                     let _ = reply.send(r);
                 }
                 Cmd::Reconcile { file, reply } => {
