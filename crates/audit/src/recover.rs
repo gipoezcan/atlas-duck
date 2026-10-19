@@ -12,7 +12,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension};
 use secrecy::SecretString;
 
-use crate::anchor_dir::{self, AnchorDirLines, PreviousChain};
+use crate::anchor_dir::{self, AnchorDirLines, PreviousChain, Witness};
 use crate::anchors::{self, AnchorLoadError, FirstRetainedAnchor};
 use crate::clock::UtcInstant;
 use crate::crypto::{Kek, KekEntryError, ct_eq};
@@ -504,16 +504,22 @@ pub fn archive_and_start_fresh(
 ///   and head seq (nothing outside `archived/` is opened), a regular file whose plaintext head
 ///   is `a`'s `(head_seq, head_hash, chain_id)`;
 /// - no anchored seq lies beyond that head;
-/// - every anchored `(seq, record_hash)` at or after the archive's first retained seq (its latest
-///   `prune_log` row, else 1) names a row of the archive whose stored `record_hash` is the line's
-///   and whose columns hash to it (recomputed: a `record_hash` column copied from the lines does
-///   not cover anything). Lines below the first retained seq were pruned from the archive.
+/// - the archive's `prune_log` is sound (rows readable, row-hash chain, contiguity, the first
+///   retained record against the latest row) and bound to the chain file: its latest row is one
+///   of the file's `Prune` lines (`first_retained_seq`, `last_pruned_record_hash` as
+///   `first_retained_prev_hash`, `cutoff_epoch`) and no line names a later first retained seq;
+///   a file without a `Prune` line requires a `prune_log` without rows. An archive whose own
+///   rows claimed the anchored records pruned would otherwise cover nothing (T6 review C-1);
+/// - every anchored `(seq, record_hash)` at or after that first retained seq names a row of the
+///   archive whose stored `record_hash` is the line's and whose columns hash to it (recomputed:
+///   a `record_hash` column copied from the lines does not cover anything). Lines below the
+///   first retained seq were pruned from the archive.
 ///
 /// Read-only (a sidecar-free reader; a `-shm` it leaves is removed, as in [`latest_archived`]).
 /// Any error reads as "not covered".
 pub(crate) fn archive_covers(data: &LocalDataDir, a: &ArchivedDb, chain: &PreviousChain) -> bool {
-    let Some(named) = chain
-        .named
+    let Some(witness) = chain
+        .witness
         .as_ref()
         .filter(|_| chain.chain_id == a.chain_id)
     else {
@@ -529,13 +535,14 @@ pub(crate) fn archive_covers(data: &LocalDataDir, a: &ArchivedDb, chain: &Previo
     if !std::fs::metadata(&path).is_ok_and(|m| m.is_file()) {
         return false;
     }
-    let covered = covers(&path, a, named);
+    let covered = covers(&path, a, witness);
     // A read-only open of a store with a WAL may have created `-shm`; it is derived state.
     let _ = remove_if_present(&with_suffix(&path, "-shm"));
     covered.unwrap_or(false)
 }
 
-fn covers(path: &Path, a: &ArchivedDb, named: &[(u64, [u8; 32])]) -> Result<bool, OpenError> {
+fn covers(path: &Path, a: &ArchivedDb, witness: &Witness) -> Result<bool, OpenError> {
+    let named = &witness.named;
     let (head_seq, head_hash, head_chain) = plaintext_head(path)?;
     if head_seq != a.head_seq || !ct_eq(&head_hash, &a.head_hash) || head_chain != a.chain_id {
         return Ok(false);
@@ -544,7 +551,28 @@ fn covers(path: &Path, a: &ArchivedDb, named: &[(u64, [u8; 32])]) -> Result<bool
         return Ok(false);
     }
     let conn = schema::open_peek(path)?;
-    let (first_retained, _) = verify::latest_prune_values(&conn).map_err(sql)?;
+    let Some((first_retained, last_pruned, cutoff)) =
+        verify::checked_prune_values(&conn).map_err(sql)?
+    else {
+        return Ok(false);
+    };
+    // Which records the archive no longer holds is the chain file's word, not the archive's: its
+    // latest prune_log row must be a `Prune` line of the file, and no line may name a later
+    // prune (as full verification matches a `Prune` line to a row); without a `Prune` line,
+    // nothing was pruned.
+    let bound = match cutoff {
+        None => witness.prunes.is_empty(),
+        Some(cutoff) => {
+            let mut prunes = witness.prunes.iter();
+            let named = prunes.clone().any(|(seq, hash, c)| {
+                *seq == first_retained && ct_eq(hash, &last_pruned) && *c == cutoff
+            });
+            named && prunes.all(|(seq, ..)| *seq <= first_retained)
+        }
+    };
+    if !bound {
+        return Ok(false);
+    }
     let mut stmt = conn
         .prepare(&format!(
             "SELECT {}, record_hash FROM events WHERE seq = ?1",

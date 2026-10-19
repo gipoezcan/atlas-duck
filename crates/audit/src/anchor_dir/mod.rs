@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -57,6 +57,14 @@ pub const MAX_BAD_LINES_REPORTED: usize = 16;
 /// Chain files (`<chain_id>.jsonl`) a first run reads to find previous chains (PD-167, the same
 /// bound as the export verifier's, PD-162); an anchor dir holding more is refused.
 pub const MAX_FIRST_RUN_CHAIN_FILES: usize = 256;
+
+/// What a first run reads of a chain file before it knows whose it is: the header, also after a
+/// run of torn lines (each at most [`MAX_LINE_BYTES`]), lies far inside it.
+const HEADER_PROBE_BYTES: u64 = 64 * 1024;
+
+/// The end of a chain file a first run did not parse to the end, read for its last anchored
+/// line.
+const TAIL_BYTES: u64 = 64 * 1024;
 
 /// The event types written as immediate lines (§8.5).
 const IMMEDIATE_TYPES: [&str; 6] = [
@@ -571,10 +579,15 @@ fn read_file(path: &Path) -> Result<Option<Vec<u8>>, String> {
     if meta.len() > MAX_FILE_BYTES {
         return Err(too_large());
     }
+    let unreadable = |e: std::io::Error| format!("could not be read ({:?})", e.kind());
+    // The handle is checked again (a FIFO swapped in after the check above does not block).
+    let file = open_regular(path)
+        .map_err(unreadable)?
+        .ok_or_else(|| "is not a regular file".to_string())?;
     let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .and_then(|f| f.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes))
-        .map_err(|e| format!("could not be read ({:?})", e.kind()))?;
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
     if bytes.len() as u64 > MAX_FILE_BYTES {
         return Err(too_large());
     }
@@ -771,13 +784,27 @@ fn parse_file(
 pub(crate) struct PreviousChain {
     /// The file's `<chain_id>`.
     pub(crate) chain_id: String,
-    /// The last line in file order that names a record: `(seq, record_hash, epoch)`.
-    pub(crate) last: Option<(u64, [u8; 32], Option<String>)>,
+    /// The last line in file order that names a record: `(seq, record_hash, epoch)`. Of a file
+    /// not parsed to its end (beyond [`MAX_FILE_BYTES`] or [`MAX_LINES`]), the last one within
+    /// its final [`TAIL_BYTES`], else the parsed part's.
+    pub(crate) last: Option<Anchored>,
     pub(crate) mtime: Option<SystemTime>,
-    /// Every `(seq, record_hash)` the file's lines name, kept only for the chain asked for and
-    /// only when the whole file was read and every line parsed (torn lines aside). `None`: no
-    /// complete witness, so no archive can be shown to cover it.
-    pub(crate) named: Option<Vec<(u64, [u8; 32])>>,
+    /// What the file witnesses, kept only for the chain asked for and only when the whole file
+    /// was read and every line parsed (torn lines aside). `None`: no complete witness, so no
+    /// archive can be shown to cover it.
+    pub(crate) witness: Option<Witness>,
+}
+
+/// `(seq, record_hash, epoch)` of a line that names a record.
+pub(crate) type Anchored = (u64, [u8; 32], Option<String>);
+
+/// The lines of a previous chain's file an archive must agree with to cover it (PD-167).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Witness {
+    /// Every `(seq, record_hash)` the lines name.
+    pub(crate) named: Vec<(u64, [u8; 32])>,
+    /// Every `Prune` line: `(first_retained_seq, first_retained_prev_hash, cutoff_epoch)`.
+    pub(crate) prunes: Vec<(u64, [u8; 32], String)>,
 }
 
 impl PreviousChain {
@@ -794,10 +821,12 @@ impl PreviousChain {
 
 /// The chains of this `host` and `os_user` in `dir` (headers compared exactly, after the
 /// writer's bounds; RF-3), newest first, for a first run whose own chain is `own_chain`. Only
-/// regular files named `<chain_id>.jsonl` are read (never an incident file), each with the
-/// bounds and the torn-line rule of [`load`] (a header after a torn line 1 counts), and nothing
-/// is written. A file whose first readable line is a header of this host and user is a previous
-/// chain, whatever else it holds. `named` is kept for `keep_named` only.
+/// regular files named `<chain_id>.jsonl` are read (never an incident file; the opened handle
+/// is checked, and on Unix a FIFO does not block the open), each with the bounds and the
+/// torn-line rule of [`load`] (a header after a torn line 1 counts), and nothing is written. A
+/// file whose first readable line is a header of this host and user is a previous chain,
+/// whatever else it holds; a file of anyone else is read no further than
+/// [`HEADER_PROBE_BYTES`]. The [`Witness`] is kept for `keep_named` only.
 ///
 /// Refused (`Invalid`), so that a first run never starts over a dir it could not check: a dir
 /// that is not absolute, not a directory or cannot be listed; more than
@@ -808,6 +837,18 @@ pub(crate) fn previous_chains(
     os_user: &str,
     own_chain: &str,
     keep_named: Option<&str>,
+) -> Result<Vec<PreviousChain>, OpenError> {
+    previous_chains_with(dir, host, os_user, own_chain, keep_named, MAX_FILE_BYTES)
+}
+
+/// [`previous_chains`] with the per-file bound as a parameter (tests use a small one).
+fn previous_chains_with(
+    dir: &Path,
+    host: &str,
+    os_user: &str,
+    own_chain: &str,
+    keep_named: Option<&str>,
+    max_bytes: u64,
 ) -> Result<Vec<PreviousChain>, OpenError> {
     let unreadable = || OpenError::Invalid("the anchor directory cannot be read");
     if !dir.is_absolute() {
@@ -847,63 +888,155 @@ pub(crate) fn previous_chains(
     for chain in chains {
         let name = file_name(&chain);
         let path = dir.join(&name);
-        // Only a regular file is opened (a FIFO would block); one gone since the listing is not
-        // a chain.
+        let unreadable_file =
+            || OpenError::Invalid("a chain file in the anchor directory cannot be read");
+        // Only a regular file is a chain (a directory is not); one gone since the listing is not
+        // one. The handle is checked again: that check is the one a swap cannot get past.
         match std::fs::metadata(&path) {
             Ok(m) if m.is_file() => {}
             Ok(_) => continue,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => {
-                return Err(OpenError::Invalid(
-                    "a chain file in the anchor directory cannot be read",
-                ));
-            }
+            Err(_) => return Err(unreadable_file()),
         }
-        let (bytes, whole) = read_prefix(&path).map_err(|_| {
-            OpenError::Invalid("a chain file in the anchor directory cannot be read")
-        })?;
-        let (mut problems, mut notes) = (Vec::new(), Vec::new());
-        let lines = parse_file(&name, &chain, &bytes, &mut problems, &mut notes);
-        let ours = matches!(lines.first(),
-            Some((_, AnchorLine::Header { host: h, os_user: u, .. })) if h == host && u == os_user);
-        if !ours {
-            continue;
-        }
-        let complete = whole && problems.is_empty();
-        out.push(PreviousChain {
-            last: lines
-                .iter()
-                .rev()
-                .find_map(|(_, l)| named(l))
-                .map(|n| (n.seq, *n.record_hash, n.epoch.clone())),
-            mtime: std::fs::metadata(&path).and_then(|m| m.modified()).ok(),
-            named: (complete && keep_named == Some(chain.as_str())).then(|| {
-                lines
-                    .iter()
-                    .filter_map(|(_, l)| named(l).map(|n| (n.seq, *n.record_hash)))
-                    .collect()
-            }),
-            chain_id: chain,
-        });
+        let file = match open_regular(&path) {
+            Ok(Some(f)) => f,
+            Ok(None) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(unreadable_file()),
+        };
+        let keep = keep_named == Some(chain.as_str());
+        let found = read_if_ours(file, &name, &chain, (host, os_user), keep, max_bytes)
+            .map_err(|_| unreadable_file())?;
+        out.extend(found);
     }
     out.sort_by(|a, b| b.newness().cmp(&a.newness()));
     Ok(out)
 }
 
-/// At most [`MAX_FILE_BYTES`] of the file, cut after its last complete line when it is longer;
-/// `true` when that is the whole file.
-fn read_prefix(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
+/// The previous chain in `file` (`<chain>.jsonl`, `name`) when its first readable line is a
+/// header of `owner` (host, OS user), else `None`. Only the first [`HEADER_PROBE_BYTES`] are
+/// read to tell, so another user's file is never read further (T6 review M-4); a file of this
+/// user is then read on from the same handle, up to `max_bytes` (a longer one is cut after its
+/// last complete line). `keep`: keep its [`Witness`] when the file was read whole and every
+/// line parsed.
+fn read_if_ours(
+    mut file: std::fs::File,
+    name: &str,
+    chain: &str,
+    (host, os_user): (&str, &str),
+    keep: bool,
+    max_bytes: u64,
+) -> std::io::Result<Option<PreviousChain>> {
     let mut bytes = Vec::new();
-    std::fs::File::open(path)?
-        .take(MAX_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 <= MAX_FILE_BYTES {
-        return Ok((bytes, true));
+    let probe = HEADER_PROBE_BYTES.min(max_bytes.saturating_add(1));
+    file.by_ref().take(probe).read_to_end(&mut bytes)?;
+    // A probe that filled may end inside a line: only its complete lines are judged.
+    let head = if (bytes.len() as u64) < probe {
+        &bytes[..]
+    } else {
+        complete_lines(&bytes)
+    };
+    let (mut problems, mut notes) = (Vec::new(), Vec::new());
+    let ours = matches!(parse_file(name, chain, head, &mut problems, &mut notes).first(),
+        Some((_, AnchorLine::Header { host: h, os_user: u, .. })) if h == host && u == os_user);
+    if !ours {
+        return Ok(None);
     }
-    // The partial last line is dropped from the buffer (the file itself is only read).
-    let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-    drop(bytes.split_off(complete));
-    Ok((bytes, false))
+    let rest = max_bytes
+        .saturating_add(1)
+        .saturating_sub(bytes.len() as u64);
+    file.by_ref().take(rest).read_to_end(&mut bytes)?;
+    let whole = bytes.len() as u64 <= max_bytes;
+    if !whole {
+        // The partial last line is dropped from the buffer (the file itself is only read).
+        let keep = complete_lines(&bytes).len();
+        drop(bytes.split_off(keep));
+    }
+    let (mut problems, mut notes) = (Vec::new(), Vec::new());
+    let lines = parse_file(name, chain, &bytes, &mut problems, &mut notes);
+    let complete = whole && problems.is_empty();
+    let mut last = lines.iter().rev().find_map(|(_, l)| named(l)).map(anchor);
+    if !complete && let Some(at_end) = last_named_in_tail(&mut file)? {
+        // The lines past what was parsed (beyond the bound or `MAX_LINES`) name the later
+        // records: the newest is read from the file's end (T6 review M-3).
+        last = Some(at_end);
+    }
+    let witness = (complete && keep).then(|| Witness {
+        named: lines
+            .iter()
+            .filter_map(|(_, l)| named(l).map(|n| (n.seq, *n.record_hash)))
+            .collect(),
+        prunes: lines
+            .iter()
+            .filter_map(|(_, l)| match l {
+                AnchorLine::Prune {
+                    first_retained_seq,
+                    first_retained_prev_hash,
+                    cutoff_epoch,
+                } => Some((
+                    *first_retained_seq,
+                    *first_retained_prev_hash,
+                    cutoff_epoch.clone(),
+                )),
+                _ => None,
+            })
+            .collect(),
+    });
+    Ok(Some(PreviousChain {
+        chain_id: chain.to_owned(),
+        last,
+        mtime: file.metadata().and_then(|m| m.modified()).ok(),
+        witness,
+    }))
+}
+
+fn anchor(n: Named<'_>) -> Anchored {
+    (n.seq, *n.record_hash, n.epoch.clone())
+}
+
+/// The last line naming a record within the final [`TAIL_BYTES`] of `file` (the window's first,
+/// cut line aside).
+fn last_named_in_tail(file: &mut std::fs::File) -> std::io::Result<Option<Anchored>> {
+    let start = file.metadata()?.len().saturating_sub(TAIL_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut tail = Vec::new();
+    file.by_ref().take(TAIL_BYTES).read_to_end(&mut tail)?;
+    let body = match start {
+        0 => &tail[..],
+        _ => tail
+            .iter()
+            .position(|b| *b == b'\n')
+            .and_then(|i| tail.get(i + 1..))
+            .unwrap_or_default(),
+    };
+    Ok(body
+        .split(|b| *b == b'\n')
+        .rev()
+        .find_map(|raw| parse_raw(raw).ok().as_ref().and_then(named).map(anchor)))
+}
+
+/// `bytes` up to and including its last newline (empty without one).
+fn complete_lines(bytes: &[u8]) -> &[u8] {
+    bytes
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .and_then(|i| bytes.get(..=i))
+        .unwrap_or_default()
+}
+
+/// Opens `path` for reading and checks the handle, not the path, so that nothing swapped in
+/// after an earlier check is read: `Ok(None)` when it is not a regular file. On Unix the open
+/// does not block on a FIFO (`O_NONBLOCK`, which a regular file ignores). T6 review M-5.
+fn open_regular(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = opts.open(path)?;
+    Ok(file.metadata()?.is_file().then_some(file))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1294,5 +1427,61 @@ mod tests {
         assert_eq!(same(r"C:\Anchors", r"c:\anchors\"), cfg!(windows));
         assert_eq!(same("/srv/Anchors", "/srv/anchors"), cfg!(windows));
         assert_eq!(same(r"C:\Anchors", "C:/Anchors"), cfg!(windows));
+    }
+
+    const CHAIN: &str = "0123456789abcdef0123456789abcdef";
+    const OWN: &str = "ffffffffffffffffffffffffffffffff";
+
+    /// A chain file of host `h` and user `u`: the header, then `Record` lines for seqs 1..=n.
+    fn chain_text(n: u64) -> String {
+        let mut s = to_line(&AnchorLine::Header {
+            chain_id: CHAIN.into(),
+            install_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            host: "h".into(),
+            os_user: "u".into(),
+            created_at: "2026-10-01T00:00:00.000Z".into(),
+        });
+        s.push('\n');
+        for seq in 1..=n {
+            s += &to_line(&AnchorLine::Record {
+                seq,
+                record_hash: [seq as u8; 32],
+                epoch: Some("2026-10-01".into()),
+                clock_behind: false,
+            });
+            s.push('\n');
+        }
+        s
+    }
+
+    #[test]
+    fn oversized_chain_file_names_its_real_last_line_and_witnesses_nothing() {
+        let dir = tempfile::tempdir().expect("dir");
+        let text = chain_text(40);
+        // Created the way the writer creates one (this module asks for no plain write).
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create_new(true)
+            .open(dir.path().join(file_name(CHAIN)))
+            .expect("chain file");
+        std::io::Write::write_all(&mut file, text.as_bytes()).expect("lines");
+        drop(file);
+        let read =
+            |max| previous_chains_with(dir.path(), "h", "u", OWN, Some(CHAIN), max).expect("read");
+
+        let whole = read(MAX_FILE_BYTES);
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0].last.as_ref().map(|l| l.0), Some(40));
+        assert_eq!(whole[0].witness.as_ref().map(|w| w.named.len()), Some(40));
+
+        // Beyond the bound only a prefix is parsed: still this user's chain, never a witness,
+        // and its last anchored line is the file's real last one, not the prefix's.
+        let part = read(text.len() as u64 / 3);
+        assert_eq!(part.len(), 1, "attributed by its header");
+        assert_eq!(part[0].witness, None);
+        assert_eq!(
+            part[0].last.as_ref().map(|l| (l.0, l.1)),
+            Some((40, [40; 32]))
+        );
     }
 }

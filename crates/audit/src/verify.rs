@@ -1900,6 +1900,33 @@ pub(crate) fn latest_prune_values(conn: &Connection) -> rusqlite::Result<(u64, [
     Ok(latest_values(&log))
 }
 
+/// `(first_retained_seq, last_pruned_record_hash, cutoff_epoch)` of the latest `prune_log` row;
+/// `GENESIS`'s `(1, ZERO_HASH)` and no cutoff without a row.
+pub(crate) type PruneValues = (u64, [u8; 32], Option<String>);
+
+/// The [`PruneValues`] of a store, only when every row reads, the row-hash chain and contiguity
+/// hold and the first retained record agrees with the latest row (the checks [`snapshot_chain`]
+/// makes before its walk); `None` otherwise. The archive exemption binds them to the chain
+/// file's `Prune` lines (PD-167, T6 review C-1).
+pub(crate) fn checked_prune_values(conn: &Connection) -> rusqlite::Result<Option<PruneValues>> {
+    let tx = conn.unchecked_transaction()?;
+    let conn: &Connection = &tx;
+    let mut out = Findings::default();
+    let (first, _) = bounds(conn)?;
+    let log = load_prune_log(conn, &mut out)?;
+    check_prune_log(&log, &mut out);
+    check_first_retained(conn, first, &log, &mut out)?;
+    drop(tx);
+    let (first_retained, last_pruned) = latest_values(&log);
+    Ok(out.counts.is_empty().then(|| {
+        (
+            first_retained,
+            last_pruned,
+            log.last().map(|r| r.cutoff_epoch.clone()),
+        )
+    }))
+}
+
 // ---------------------------------------------------------------------------------------
 // Restore source (§8.11 step 1)
 

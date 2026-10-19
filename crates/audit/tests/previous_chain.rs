@@ -13,14 +13,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use atlas_duck_audit::anchor_dir::{AnchorLine, file_name, parse_line, to_line};
+use atlas_duck_audit::encoding::{ZERO_HASH, prune_row_hash};
 use atlas_duck_audit::error::OpenError;
 use atlas_duck_audit::keystore::{EntryName, KeyStore};
-use atlas_duck_audit::testing::{self, MemKeyStore, MemKeyring};
+use atlas_duck_audit::testing::{self, FakePrune, MemKeyStore, MemKeyring};
 use atlas_duck_audit::types::{Confirmed, EventFlags, RustChosenPath};
 use atlas_duck_audit::verify::FindingKind;
 use atlas_duck_audit::{
-    ArchivedDb, FirstRunInput, OpenConfig, StartupOutcome, Store, archive_and_start_fresh,
-    create_new_store, new_ids, open,
+    ArchivedDb, FirstRunInput, OpenConfig, Settings, StartupOutcome, Store,
+    archive_and_start_fresh, create_new_store, new_ids, open,
 };
 use common::*;
 use serde_json::{Value, json};
@@ -194,7 +195,11 @@ fn flags(f: &Fixture, seq: u64) -> EventFlags {
 }
 
 fn open_ready(f: &Fixture) -> (Store, Vec<atlas_duck_audit::VerifyFinding>) {
-    match open(&f.data, &f.lock, f.config()).expect("open") {
+    open_ready_with(f, f.config())
+}
+
+fn open_ready_with(f: &Fixture, cfg: OpenConfig) -> (Store, Vec<atlas_duck_audit::VerifyFinding>) {
+    match open(&f.data, &f.lock, cfg).expect("open") {
         StartupOutcome::Ready { store, verify, .. } => (store, verify.findings),
         other => panic!("not ready: {other:?}"),
     }
@@ -209,6 +214,116 @@ fn after_archive(a: &Fixture, dir: Option<&Path>) -> (ArchivedDb, FirstRunInput,
     let mut inp = wizard_input(&install_id, &chain_id, dir);
     inp.archived_db = Some(archived.clone());
     (archived, inp, OpenConfig::new(a.clock.clone(), keys))
+}
+
+/// The config of the store a first run after [`after_archive`] created (its own install id).
+fn config_of(a: &Fixture, install_id: &str) -> OpenConfig {
+    OpenConfig::new(
+        a.clock.clone(),
+        Arc::new(MemKeyStore::new(a.ring.clone(), install_id)),
+    )
+}
+
+/// [`used_chain`] with a prune: the records below seq 3 are gone from the store, and the chain
+/// file holds the prune's `Prune` line.
+fn used_pruned_chain(dir: &Path) -> (Fixture, Anchor) {
+    let f = fixture(fake_clock(START), MemKeyring::new());
+    let store = first_run(&f, Some(dir)).expect("first run of the earlier chain");
+    corroborate_now(&store, &f.clock);
+    store.append_batch(day_events(2)).expect("append");
+    testing::insert_fake_prune(
+        &store,
+        FakePrune {
+            first_retained_seq: 3,
+            cutoff: "2026-06-01".into(),
+            // Keeps the anchor dir in the view once its CONFIG_CHANGED (seq 2) is pruned.
+            settings: Settings {
+                retention_days: 92,
+                anchor_dir: Some(dir_text(dir)),
+                ..Settings::default()
+            }
+            .to_json(),
+            update_first_retained: true,
+        },
+    )
+    .expect("fake prune");
+    store.flush_head_anchor().expect("flush");
+    drain(&store);
+    store.shutdown();
+    assert!(
+        lines(dir, &f.chain_id)
+            .iter()
+            .any(|l| matches!(l, AnchorLine::Prune { .. })),
+        "the chain file holds the Prune line"
+    );
+    let last = last_anchor(dir, &f.chain_id);
+    (f, last)
+}
+
+/// One well-formed `prune_log` row (`prev_row_hash` `ZERO_HASH`, range from 1, its own
+/// `row_hash`) written into the archive at `path`.
+fn forge_prune_row(path: &Path, prune_seq: u64, first_retained_seq: u64, last_pruned: [u8; 32]) {
+    let cutoff = "2026-10-01";
+    let row_hash = prune_row_hash(
+        &ZERO_HASH,
+        prune_seq,
+        1,
+        cutoff,
+        &last_pruned,
+        first_retained_seq,
+    );
+    let c = rusqlite::Connection::open(path).expect("open archive");
+    c.execute(
+        "INSERT INTO prune_log (prune_seq, range_start, cutoff_epoch, last_pruned_record_hash, \
+         first_retained_seq, prev_row_hash, row_hash) VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            prune_seq as i64,
+            cutoff,
+            &last_pruned[..],
+            first_retained_seq as i64,
+            &ZERO_HASH[..],
+            &row_hash[..]
+        ],
+    )
+    .expect("forge prune_log row");
+}
+
+/// Keeps a file unreadable to this process while it lives: Windows holds it open without
+/// sharing; Unix clears its permission bits and restores them on drop.
+#[cfg(windows)]
+struct Denied {
+    _held: std::fs::File,
+}
+
+#[cfg(windows)]
+fn deny_reads(path: &Path) -> Option<Denied> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(path)
+        .expect("exclusive handle");
+    Some(Denied { _held: held })
+}
+
+#[cfg(unix)]
+struct Denied(PathBuf);
+
+#[cfg(unix)]
+impl Drop for Denied {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
+    }
+}
+
+/// `None` when the process reads the file anyway (root).
+#[cfg(unix)]
+fn deny_reads(path: &Path) -> Option<Denied> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0)).expect("chmod 000");
+    let denied = Denied(path.to_path_buf());
+    std::fs::File::open(path).is_err().then_some(denied)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -574,6 +689,141 @@ fn substituted_archive_not_covering_anchors_raises_incident() {
     store.shutdown();
 }
 
+#[test]
+fn forged_prune_log_row_raises_incident() {
+    // The archive's `prune_log` is bound to the chain file's `Prune` lines (none here: nothing
+    // was pruned), so a row claiming that the anchored records were pruned covers nothing
+    // (T6 review C-1).
+    // 0: every record kept, a row claiming all of them pruned (first retained = head + 1);
+    // 1: only the head kept, with a row that agrees with it (the head's prev_hash is its
+    //    last_pruned): the archive's own checks pass, only the binding catches it;
+    // 2: a row naming nothing pruned (1, ZERO_HASH): a prune the file does not name.
+    for case in 0..3 {
+        let dir = tempfile::tempdir().expect("anchor dir");
+        let (a, last) = used_chain(dir.path(), START);
+        let (archived, inp, cfg) = after_archive(&a, Some(dir.path()));
+        let path = a.data.path().join(&archived.file);
+        let head = archived.head_seq;
+        assert!(head > last.0, "the head itself is not anchored");
+        match case {
+            0 => forge_prune_row(&path, head + 1, head + 1, archived.head_hash),
+            1 => {
+                let c = rusqlite::Connection::open(&path).expect("open archive");
+                let prev: Vec<u8> = c
+                    .query_row(
+                        "SELECT prev_hash FROM events WHERE seq = ?1",
+                        [head as i64],
+                        |r| r.get(0),
+                    )
+                    .expect("head prev_hash");
+                c.execute("DELETE FROM events WHERE seq < ?1", [head as i64])
+                    .expect("keep the head only");
+                drop(c);
+                forge_prune_row(&path, head, head, prev.try_into().expect("32 bytes"));
+            }
+            _ => forge_prune_row(&path, head, 1, ZERO_HASH),
+        }
+        let store = create_new_store(&a.data, &a.lock, cfg, inp).expect("first run");
+        assert_eq!(
+            types(&a),
+            ["GENESIS", "CONFIG_CHANGED", "VERIFY"],
+            "case {case}"
+        );
+        assert_eq!(
+            payload(&store, 3)["chains"],
+            json!([chain_json(&a.chain_id, &last)]),
+            "case {case}"
+        );
+        store.shutdown();
+    }
+}
+
+#[test]
+fn pruned_archive_covers_only_with_its_prune_line() {
+    // Honest: the archive's latest prune_log row is the chain file's Prune line.
+    let dir = tempfile::tempdir().expect("anchor dir");
+    let (a, _) = used_pruned_chain(dir.path());
+    let (_, inp, cfg) = after_archive(&a, Some(dir.path()));
+    let store = create_new_store(&a.data, &a.lock, cfg, inp).expect("first run");
+    assert_eq!(types(&a), ["GENESIS", "CONFIG_CHANGED"], "no incident");
+    store.shutdown();
+
+    // The dir missed the prune (its Prune line is not in the file): the archive's prune_log
+    // cannot be bound to the file, so the exemption fails closed.
+    let dir = tempfile::tempdir().expect("anchor dir");
+    let (a, last) = used_pruned_chain(dir.path());
+    let path = chain_file(dir.path(), &a.chain_id);
+    let kept: String = std::fs::read_to_string(&path)
+        .expect("chain file")
+        .lines()
+        .filter(|l| !matches!(parse_line(l), Ok(AnchorLine::Prune { .. })))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&path, kept).expect("drop the Prune line");
+    let (_, inp, cfg) = after_archive(&a, Some(dir.path()));
+    let store = create_new_store(&a.data, &a.lock, cfg, inp).expect("first run");
+    assert_eq!(types(&a), ["GENESIS", "CONFIG_CHANGED", "VERIFY"]);
+    assert_eq!(
+        payload(&store, 3)["chains"],
+        json!([chain_json(&a.chain_id, &last)])
+    );
+    store.shutdown();
+
+    // The archive's prune_log row agrees with the Prune line but its row_hash does not hash the
+    // row: the prune_log's own chain is checked too.
+    let dir = tempfile::tempdir().expect("anchor dir");
+    let (a, last) = used_pruned_chain(dir.path());
+    let (archived, inp, cfg) = after_archive(&a, Some(dir.path()));
+    {
+        let c = rusqlite::Connection::open(a.data.path().join(&archived.file)).expect("open");
+        let n = c
+            .execute("UPDATE prune_log SET row_hash = zeroblob(32)", [])
+            .expect("tamper");
+        assert_eq!(n, 1);
+    }
+    let store = create_new_store(&a.data, &a.lock, cfg, inp).expect("first run");
+    assert_eq!(types(&a), ["GENESIS", "CONFIG_CHANGED", "VERIFY"]);
+    assert_eq!(
+        payload(&store, 3)["chains"],
+        json!([chain_json(&a.chain_id, &last)])
+    );
+    store.shutdown();
+}
+
+#[test]
+fn exempt_archived_chain_among_other_previous_chains() {
+    // The archived chain is the newest: GENESIS still names it, the incident names only the
+    // other one.
+    let dir = tempfile::tempdir().expect("anchor dir");
+    let (a1, last1) = used_chain(dir.path(), START);
+    let (a2, last2) = used_chain(dir.path(), LATER);
+    let (_, inp, cfg) = after_archive(&a2, Some(dir.path()));
+    let store = create_new_store(&a2.data, &a2.lock, cfg, inp).expect("first run");
+    let genesis = payload(&store, 1);
+    assert_eq!(genesis["previous_chain_id"], json!(a2.chain_id));
+    assert_eq!(genesis["previous_last_anchor"], anchor_json(&last2));
+    assert_eq!(types(&a2), ["GENESIS", "CONFIG_CHANGED", "VERIFY"]);
+    assert_eq!(
+        payload(&store, 3)["chains"],
+        json!([chain_json(&a1.chain_id, &last1)])
+    );
+    store.shutdown();
+
+    // The archived chain is the older one: GENESIS names the newer, which alone raises it.
+    let dir = tempfile::tempdir().expect("anchor dir");
+    let (a1, _) = used_chain(dir.path(), START);
+    let (a2, last2) = used_chain(dir.path(), LATER);
+    let (_, inp, cfg) = after_archive(&a1, Some(dir.path()));
+    let store = create_new_store(&a1.data, &a1.lock, cfg, inp).expect("first run");
+    assert_eq!(payload(&store, 1)["previous_chain_id"], json!(a2.chain_id));
+    assert_eq!(types(&a1), ["GENESIS", "CONFIG_CHANGED", "VERIFY"]);
+    assert_eq!(
+        payload(&store, 3)["chains"],
+        json!([chain_json(&a2.chain_id, &last2)])
+    );
+    store.shutdown();
+}
+
 // ---------------------------------------------------------------------------------------
 // the archive confirmation (PD-171)
 
@@ -584,6 +834,8 @@ fn archive_confirmation_recorded_after_genesis() {
     store.shutdown();
     let (archived, mut inp, cfg) = after_archive(&a, Some(dir.path()));
     inp.archive_confirmed = Some(confirmed(0x11));
+    let install_id = inp.install_id.clone();
+    let new_cfg = || config_of(&a, &install_id);
     let store = create_new_store(&a.data, &a.lock, cfg, inp).expect("first run");
     // GENESIS, the anchor dir setting, then the archive's confirmation.
     assert_eq!(types(&a), ["GENESIS", "CONFIG_CHANGED", "CONFIG_CHANGED"]);
@@ -613,6 +865,16 @@ fn archive_confirmation_recorded_after_genesis() {
         .collect();
     assert_eq!(immediates, [2]);
     store.shutdown();
+
+    // The record is not a setting the next start or a full verification trips over.
+    let (store, findings) = open_ready_with(&a, new_cfg());
+    assert!(findings.is_empty(), "{findings:?}");
+    assert!(store.open_incidents().is_empty());
+    store.shutdown();
+    let s = testing::open_existing(&a.data, &a.lock, new_cfg()).expect("open_existing");
+    let fs = s.full_verify();
+    s.shutdown();
+    assert!(fs.is_empty(), "{fs:?}");
 }
 
 #[test]
@@ -681,5 +943,40 @@ fn too_many_chain_files_refused() {
     let err = first_run(&f, Some(dir.path())).expect_err("refused");
     assert!(matches!(err, OpenError::Invalid(_)), "{err:?}");
     assert!(!f.db_path().exists());
+    assert_eq!(dir_bytes(dir.path()), before);
+}
+
+#[test]
+fn exactly_the_chain_file_bound_is_read() {
+    let dir = tempfile::tempdir().expect("anchor dir");
+    let a: Anchor = (1, [1; 32], None);
+    for _ in 0..atlas_duck_audit::anchor_dir::MAX_FIRST_RUN_CHAIN_FILES {
+        forge_chain(dir.path(), "elsewhere", "someone", &a);
+    }
+    let f = fixture(fake_clock(START), MemKeyring::new());
+    let store = first_run(&f, Some(dir.path())).expect("256 chain files are read");
+    assert_eq!(types(&f), ["GENESIS", "CONFIG_CHANGED"]);
+    store.shutdown();
+}
+
+#[test]
+fn unreadable_chain_file_refused() {
+    // Another user's file the first run cannot read: it cannot tell whose it is, so it does not
+    // start over the dir (fail closed), and writes nothing.
+    let dir = tempfile::tempdir().expect("anchor dir");
+    let a: Anchor = (1, [1; 32], None);
+    let chain = forge_chain(dir.path(), "elsewhere", "someone", &a);
+    let before = dir_bytes(dir.path());
+    let Some(denied) = deny_reads(&chain_file(dir.path(), &chain)) else {
+        eprintln!("skipped: this process reads a file without read permission");
+        return;
+    };
+    let f = fixture(fake_clock(START), MemKeyring::new());
+    let res = first_run(&f, Some(dir.path()));
+    drop(denied);
+    let err = res.map(|s| s.shutdown()).expect_err("refused");
+    assert!(matches!(err, OpenError::Invalid(_)), "{err:?}");
+    assert!(!f.db_path().exists());
+    assert_eq!(f.keys().get(&EntryName::Kek).expect("keystore"), None);
     assert_eq!(dir_bytes(dir.path()), before);
 }
