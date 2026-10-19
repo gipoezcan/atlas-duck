@@ -1044,6 +1044,25 @@ mod tests {
             exec[0]
         );
 
+        // M-3: the child's module path is the system's only, set right before the run and unset
+        // after it (no module from the user's Documents folder in an elevated drain).
+        let lines: Vec<&str> = HOOKS_NSH.lines().map(str::trim).collect();
+        let at = |text: &str| {
+            let found: Vec<usize> = (0..lines.len()).filter(|&i| lines[i] == text).collect();
+            assert_eq!(found.len(), 1, "{text}");
+            found[0]
+        };
+        let set = at(
+            r#"System::Call 'kernel32::SetEnvironmentVariableW(w "PSModulePath", w "$SYSDIR\WindowsPowerShell\v1.0\Modules")'"#,
+        );
+        let unset =
+            at(r#"System::Call 'kernel32::SetEnvironmentVariableW(w "PSModulePath", p 0)'"#);
+        let run = lines
+            .iter()
+            .position(|l| l.starts_with("nsExec::ExecToLog /TIMEOUT="))
+            .expect("the run");
+        assert!(set < run && run < unset, "{set} < {run} < {unset}");
+
         // The expansion itself: an NSIS variable left in the command is refused.
         let stray = HOOKS_NSH.replacen("$$d=$$env:", "$$d=$INSTDIR;$$env:", 1);
         assert_eq!(drain_command(&stray), None);
