@@ -131,6 +131,39 @@ fn windows_sync_dir_flushes_directory_handle() {
     assert_eq!(e.to_string(), "injected open failure");
 }
 
+/// The `MoveFileExW` flags (the test crate has no `windows-sys`).
+#[cfg(windows)]
+#[test]
+fn windows_rename_asks_for_replace_and_write_through() {
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let flags = atlas_duck_audit::testing::durable_move_flags();
+    assert_eq!(
+        flags,
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        "{flags:#x}"
+    );
+}
+
+/// A bundle directory that cannot be flushed (FAT, a share, a drop folder) is still a complete
+/// backup: the flush is best effort, the manifest-last rename is the completeness contract.
+#[test]
+fn backup_succeeds_when_the_bundle_dir_flush_fails() {
+    let (a, _fa) = new_store(fake_clock(START), MemKeyring::new());
+    a.append_batch(mixed(4)).expect("append_batch");
+    a.flush_head_anchor().expect("flush");
+    let out = tempfile::tempdir().expect("out dir");
+    atlas_duck_audit::testing::fail_sync_dir_under(out.path());
+    let bundle = a
+        .backup(chosen(out.path()))
+        .expect("a failing directory flush does not fail the backup");
+    assert!(bundle.bundle_dir.join("manifest.json").is_file());
+    assert!(
+        bundle.backup_seq > bundle.head_seq,
+        "the BACKUP record was appended"
+    );
+}
+
 fn renamed(from: &Path, to: &Path) -> (PathBuf, PathBuf) {
     (from.to_path_buf(), to.to_path_buf())
 }

@@ -449,6 +449,9 @@ pub fn archive_and_start_fresh(
         && let Err(e) = durable_rename(&wal, &target_wal)
     {
         let _ = durable_rename(&target, &db);
+        // Best effort, as after the move-back below.
+        let _ = sync_dir(&dir);
+        let _ = sync_dir(data.path());
         return Err(e.into());
     }
 

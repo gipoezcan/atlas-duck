@@ -179,16 +179,24 @@ pub(crate) fn remove_staging_leftovers(data: &LocalDataDir) -> io::Result<()> {
     remove_with_side_files(data, RESTORING_DB_FILE)
 }
 
-/// Makes a rename inside `dir` durable: `fsync` of the directory.
-#[cfg(unix)]
+/// Makes a rename inside `dir` durable: the directory is flushed (Unix: `fsync`; Windows:
+/// `FlushFileBuffers` on a handle of the directory, M2 final review M-2). Under `testing` a
+/// directory registered with `testing::fail_sync_dir_under` fails instead.
 pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(any(test, feature = "testing"))]
+    if crate::testing::sync_dir_fault(dir) {
+        return Err(io::Error::other("injected directory flush failure"));
+    }
+    sync_dir_os(dir)
+}
+
+#[cfg(unix)]
+fn sync_dir_os(dir: &Path) -> io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
-/// Makes a rename inside `dir` durable: `FlushFileBuffers` on a handle of the directory (M2
-/// final review M-2).
 #[cfg(windows)]
-pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
+fn sync_dir_os(dir: &Path) -> io::Result<()> {
     sync_dir_with(dir, &open_dir_handle)
 }
 
@@ -219,10 +227,16 @@ pub(crate) fn open_dir_handle(path: &Path, flags: u32) -> io::Result<std::fs::Fi
 
 /// Renames `from` to `to`, replacing an existing `to`; an `Err` means `from` was not moved
 /// (every caller renames inside one data dir, one volume). Windows: `MoveFileExW` with
-/// `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`, so the call returns only once the move
-/// is on disk (std's `rename` asks for no write-through); Unix: `rename(2)`. The directory flush
-/// is the caller's [`sync_dir`] right after it, which every call site already treats as a step
-/// after the rename (first run: `renamed`; restore: `SwapError::After`; archive: move back).
+/// `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`; Unix: `rename(2)`.
+/// `MOVEFILE_WRITE_THROUGH` is documented only for a move done as copy-and-delete (the flush is
+/// at the end of the copy); for a same-volume rename it is a hint. The durability step is the
+/// caller's [`sync_dir`] right after the rename, which every call site already treats as a step
+/// after it (first run: `renamed`; restore: `SwapError::After`; archive: move back). Do not
+/// drop it on the strength of the flag.
+///
+/// Windows replaces the target the classic way, which fails while any handle is open on it
+/// (std's POSIX-semantics rename would succeed): a held `audit.db` makes the restore commit
+/// fail cleanly as a retryable `SwapError::Before`, the link made before it is removed.
 /// M2 final review M-2: the restore commit, first-run and archive renames.
 pub(crate) fn durable_rename(from: &Path, to: &Path) -> io::Result<()> {
     rename_os(from, to)?;
@@ -231,23 +245,21 @@ pub(crate) fn durable_rename(from: &Path, to: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// The `MoveFileExW` flags of [`durable_rename`] (pinned by a test).
+#[cfg(windows)]
+pub(crate) const DURABLE_MOVE_FLAGS: u32 =
+    windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING
+        | windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH;
+
 #[cfg(windows)]
 fn rename_os(from: &Path, to: &Path) -> io::Result<()> {
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
 
     let from = wide_path(from)?;
     let to = wide_path(to)?;
     // SAFETY: `from` and `to` are NUL-terminated UTF-16 strings without an interior NUL, and
     // both outlive the call; `MoveFileExW` only reads them.
-    let ok = unsafe {
-        MoveFileExW(
-            from.as_ptr(),
-            to.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
+    let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), DURABLE_MOVE_FLAGS) };
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -260,9 +272,10 @@ fn rename_os(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 /// `p` as a NUL-terminated wide string. An interior NUL would end the name early at the C
-/// boundary and name another file: refused. No `\\?\` prefix is added (it would stop `/` from
-/// being a separator): a path past `MAX_PATH` fails with the OS error, as the data dir's
-/// free-space probe (`GetDiskFreeSpaceExW`) already does.
+/// boundary and name another file: refused. No `\\?\` prefix is added, so a path past `MAX_PATH`
+/// fails with the OS error. That is no regression in practice: SQLite's win32 VFS opens every
+/// renamed path (`audit.db`, `audit.db.new`, staging, the archive target) without the prefix and
+/// has the same limit, as has the data dir's free-space probe (`GetDiskFreeSpaceExW`).
 #[cfg(windows)]
 fn wide_path(p: &Path) -> io::Result<Vec<u16>> {
     use std::os::windows::ffi::OsStrExt;

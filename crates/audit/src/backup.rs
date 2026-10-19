@@ -348,7 +348,12 @@ impl Writer {
         let tmp = dir.join(MANIFEST_TMP);
         write_new(&tmp, &bytes).map_err(io)?;
         std::fs::rename(&tmp, dir.join(MANIFEST_FILE)).map_err(io)?;
-        sync_dir(dir).map_err(io)?;
+        // Best effort, on every OS: the bundle is complete once `manifest.json` exists (manifest
+        // last, atomically). It never promised a durable directory entry, and a lost manifest
+        // after a power cut reads as an incomplete bundle that restore refuses. A target that
+        // cannot flush a directory (FAT, a share, a drop folder without write access to it) must
+        // not fail a backup whose files have all landed.
+        let _ = sync_dir(dir);
         let manifest_sha256: [u8; 32] = Sha256::digest(&bytes).into();
         let p = PreparedEvent::system(
             EventType::BACKUP,

@@ -406,9 +406,28 @@ pub fn durable_renames_into(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
         .collect()
 }
 
+/// Directories whose flush (`sync_dir`) fails; a flush of a directory under one of them fails.
+static SYNC_DIR_FAULTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+pub(crate) fn sync_dir_fault(dir: &Path) -> bool {
+    lock(&SYNC_DIR_FAULTS).iter().any(|p| dir.starts_with(p))
+}
+
+/// From now on the directory flush fails for `dir` and everything below it (a FAT stick, a
+/// share or a drop folder that refuses it). Scoped by path: parallel tests are not affected.
+pub fn fail_sync_dir_under(dir: &Path) {
+    lock(&SYNC_DIR_FAULTS).push(dir.to_path_buf());
+}
+
 /// The store's rename (Windows: `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`).
 pub fn durable_rename(from: &Path, to: &Path) -> std::io::Result<()> {
     crate::open::durable_rename(from, to)
+}
+
+/// The `MoveFileExW` flags `durable_rename` passes.
+#[cfg(windows)]
+pub fn durable_move_flags() -> u32 {
+    crate::open::DURABLE_MOVE_FLAGS
 }
 
 /// The Windows directory flush with an injected opener: `open(dir, flags)` returns the handle
