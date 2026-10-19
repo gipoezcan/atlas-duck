@@ -240,6 +240,19 @@ describe('Removal', () => {
     expect(screen.queryByText(/x‮y/)).toBeNull();
   });
 
+  it('a command file of a newer atlas-duck is named as the reason, not the general sentence', async () => {
+    await show(active(item({ choice: 'done' })));
+    vi.mocked(removalFinish).mockResolvedValue({
+      cli: 'not_removed',
+      cli_reason: 'newer_version',
+      autostart: 'removed',
+    });
+    vi.mocked(removalState).mockResolvedValue(idle);
+    await click('Finish removal');
+    expect(screen.getByText(/installed by a newer atlas-duck and was left alone/)).toBeTruthy();
+    expect(screen.queryByText(/Done\. You can uninstall/)).toBeNull();
+  });
+
   it('a nothing-found command line is an honest, complete finish', async () => {
     await show(active(item({ choice: 'done' })));
     vi.mocked(removalFinish).mockResolvedValue({

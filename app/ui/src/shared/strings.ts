@@ -547,9 +547,9 @@ export const SETTINGS_TEXT = {
     installed:
       'Installed. Open a new terminal, and restart your MCP clients, so they find the atlas-duck command.',
     installed_local_bin:
-      'Installed to ~/.local/bin (not on your PATH). If a new terminal does not find the atlas-duck command, add ~/.local/bin to the PATH of your shell (on Ubuntu, log out and in again), and restart your MCP clients afterwards.',
+      'Installed to ~/.local/bin, which might not be on the PATH of the terminals you open. If a new terminal does not find the atlas-duck command, add ~/.local/bin to the PATH of your shell (on Ubuntu, log out and in again), and restart your MCP clients afterwards.',
     installed_local_bin_on_path:
-      'Installed to ~/.local/bin, which is on your PATH. Open a new terminal, and restart your MCP clients, so they find the atlas-duck command.',
+      'Installed to ~/.local/bin, which is on the PATH this app was started with. Open a new terminal, and restart your MCP clients, so they find the atlas-duck command.',
     replaced_stale_entry:
       'Installed. The PATH entry of an earlier atlas-duck folder that no longer exists was removed. Open a new terminal, and restart your MCP clients, so they find the atlas-duck command.',
     already_installed: 'The atlas-duck command was already installed.',
@@ -624,6 +624,8 @@ export const SETTINGS_TEXT = {
     io: 'The files of this computer could not be read',
     registry: 'Your user PATH could not be read or changed',
     cli_toml: 'The file that records where the app is could not be removed',
+    newer_version:
+      'The command file was installed by a newer atlas-duck and was left alone: use that version to remove it, or remove the file yourself',
     other: 'The command line could not be removed',
   } as Readonly<Record<string, string>>,
   /** Shown only when every step succeeded. */

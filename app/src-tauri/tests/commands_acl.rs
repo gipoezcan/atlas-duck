@@ -3792,6 +3792,7 @@ mod settings_commands {
             &deb.cli_toml,
             &atlas_duck_ipc::paths::CliToml {
                 app_path: Some("/usr/bin/atlas-duck".into()),
+                ..Default::default()
             },
         )
         .map_err(|e| format!("{e:?}"))?;
@@ -3867,6 +3868,7 @@ mod settings_commands {
             &fallback.cli_toml,
             &atlas_duck_ipc::paths::CliToml {
                 app_path: Some("C:/Old/atlas-duck.exe".into()),
+                ..Default::default()
             },
         )
         .map_err(|e| format!("{e:?}"))?;
@@ -3878,6 +3880,35 @@ mod settings_commands {
         );
         assert_eq!(ops.state(), State::default(), "cli.toml went");
         assert_eq!(records[1]["new"]["prepared"], false);
+        Ok(())
+    }
+
+    /// PD-177: a wrapper of a newer atlas-duck stays. The CLI step says so (`not_removed`, reason
+    /// `newer_version`) instead of reporting a removal, nothing of the CLI is removed, and `finish`
+    /// completes with `prepared: false`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn finish_over_a_newer_wrapper_says_the_command_line_stays() -> TestResult {
+        use atlas_duck_app_lib::cli_install::linux::WRAPPER_MARKER_NAME;
+        let ops = installed_ops()?;
+        let layout = appimage_layout()?;
+        let wrapper = match &layout.kind {
+            atlas_duck_app_lib::cli_install::Kind::AppImage { wrapper, .. } => wrapper.clone(),
+            other => return Err(format!("{other:?}").into()),
+        };
+        let newer = format!("#!/bin/sh\n{WRAPPER_MARKER_NAME} v99\n");
+        ops.write_file(&wrapper, newer.as_bytes(), 0o755)?;
+        let before = ops.state();
+        let (res, st, _h, records) = finish_cli_step(ops.clone(), Ok(layout), None).await?;
+        assert_eq!(
+            (res.cli, res.cli_reason),
+            ("not_removed", Some("newer_version"))
+        );
+        assert_eq!(ops.state(), before, "nothing of the CLI was removed");
+        assert!(!st.dto(RET).active, "finish completed");
+        assert_eq!(
+            records[1]["new"],
+            json!({"prepared": false, "cli": "not_removed", "cli_reason": "newer_version"})
+        );
         Ok(())
     }
 

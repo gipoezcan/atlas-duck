@@ -32,6 +32,10 @@ pub struct FakeOps {
     broadcasts: Mutex<usize>,
     /// `write_file` of this path fails (undo tests).
     fail_write: Mutex<Option<PathBuf>>,
+    /// `read_file` (and so `file_exists`) of this path fails: an unreadable file.
+    fail_read: Mutex<Option<PathBuf>>,
+    /// `read_file` of this path answers `InvalidInput`: a FIFO, a device or a directory.
+    non_regular: Mutex<Option<PathBuf>>,
     /// What `session_path` answers (none by default: the `PATH` of the test process is not read).
     session_path: Mutex<Option<OsString>>,
 }
@@ -77,6 +81,14 @@ impl FakeOps {
 
     pub fn fail_writes_to(&self, p: &Path) {
         *lock(&self.fail_write) = Some(p.to_path_buf());
+    }
+
+    pub fn fail_reads_of(&self, p: &Path) {
+        *lock(&self.fail_read) = Some(p.to_path_buf());
+    }
+
+    pub fn non_regular_at(&self, p: &Path) {
+        *lock(&self.non_regular) = Some(p.to_path_buf());
     }
 
     pub fn set_session_path(&self, v: Option<OsString>) {
@@ -138,6 +150,12 @@ impl PlatformOps for FakeOps {
     }
 
     fn read_file(&self, p: &Path) -> io::Result<Option<Vec<u8>>> {
+        if lock(&self.fail_read).as_deref() == Some(p) {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        if lock(&self.non_regular).as_deref() == Some(p) {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
         let s = lock(&self.state);
         if let Some((bytes, _)) = s.files.get(p) {
             return Ok(Some(bytes.clone()));

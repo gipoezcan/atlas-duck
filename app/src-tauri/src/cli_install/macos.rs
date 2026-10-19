@@ -22,7 +22,9 @@ pub fn link_path(home: &Path) -> PathBuf {
     home.join(".local").join("bin").join(CLI_NAME)
 }
 
-/// The target is the CLI inside an app bundle: `*.app/Contents/MacOS/atlas-duck`.
+/// The target is the CLI inside an app bundle: `*.app/Contents/MacOS/atlas-duck`. A shape check
+/// on the path text only: it does not prove a real bundle (any folder tree of that name
+/// qualifies), and install and removal use the same rule so they stay consistent.
 pub(super) fn is_ours(target: &Path) -> bool {
     let names: Vec<&str> = target
         .components()

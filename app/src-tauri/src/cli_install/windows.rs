@@ -1,7 +1,9 @@
 //! Windows (§12.3): the install dir joins `HKCU\Environment\Path` (stored as `REG_EXPAND_SZ`, no
 //! duplicate, compared case-insensitively) and `WM_SETTINGCHANGE` tells running shells. The PATH
 //! text logic is pure and tested everywhere; [`registry`] is the real registry code (Windows only;
-//! its one test is `#[ignore]`d and runs on the CI Windows leg).
+//! its one test is `#[ignore]`d and runs on the CI Windows leg). `install` records the entry it
+//! added in `cli.toml` (`path_entry`); only that record lets a later install drop the entry of a
+//! folder the app moved away from ([`stale_entry`]).
 //!
 //! The value is read and written unexpanded: a `%USERPROFILE%\bin` entry stays exactly that.
 //! `uninstall` removes every segment equal to the install dir and keeps the others verbatim, in
@@ -9,6 +11,8 @@
 //! `install` swallowed when it appended.
 
 use std::path::Path;
+
+use atlas_duck_ipc::paths::CliToml;
 
 use super::{Artifact, InstallError, Kind, PlatformOps, Report, registry_error};
 
@@ -85,17 +89,23 @@ pub fn path_remove(current: &str, dir: &str) -> Option<String> {
     Some(kept.join(";"))
 }
 
+/// Adds the install dir to the PATH (and drops the entry of an earlier install of this app that
+/// moved away). Answers the PATH entry `cli.toml` has to record: the entry this install added, or
+/// the one an earlier install of this dir added and that is still ours; `None` when the entry was
+/// on the PATH before (it is not ours to remove later).
 pub fn install(
     ops: &dyn PlatformOps,
     kind: &Kind,
     app_path: &Path,
     cli_toml: &Path,
     done: &mut Report,
-) -> Result<(), InstallError> {
+) -> Result<Option<String>, InstallError> {
     let dir = entry(kind)?;
     let current = ops.user_path_get().map_err(|e| registry_error(&e))?;
+    // An unreadable or unparsable `cli.toml` proves nothing.
+    let recorded = ops.read_cli_toml(cli_toml).ok().flatten();
     // An earlier install of this app, since moved: its entry goes in the same write.
-    let without_stale = stale_entry(ops, app_path, cli_toml, &dir)
+    let without_stale = stale_entry(ops, app_path, recorded.as_ref(), &dir)
         .zip(current.as_deref())
         .and_then(|(stale, path)| path_remove(path, &stale));
     let replaced = without_stale.is_some();
@@ -119,7 +129,13 @@ pub fn install(
         }
         ops.broadcast_setting_change();
     }
-    Ok(())
+    Ok(if appended.is_some() {
+        Some(dir)
+    } else {
+        recorded
+            .and_then(|c| c.path_entry)
+            .filter(|e| normalized(e) == normalized(&dir))
+    })
 }
 
 /// A drive path: `X:\` or `X:/` and more. UNC names are not followed (a `stat` on an unreachable
@@ -130,18 +146,21 @@ fn drive_path(text: &str) -> bool {
 }
 
 /// The PATH entry of the folder an earlier install of this app lived in, when that install is
-/// provably ours and gone (PD-177, M-11): `cli.toml` (written by `install`, one per host) names the
-/// old app file; the file is a drive path with the same file name as this app's, in a folder that
-/// can be a PATH entry other than this install's, with no `.`/`..` segment, and it no longer
-/// exists. Anything else (no `cli.toml`, another program, an unreadable answer) leaves every entry
-/// alone.
+/// provably ours and gone (PD-177, M-11). The proof is `cli.toml` (written by `install`, one per
+/// host): it records the PATH entry install added (`path_entry`; an older file or an entry that was
+/// on the PATH already has none, and nothing is removed) and names the old app file. The app file
+/// is a drive path with the same file name as this app's, in the folder that entry names (equal
+/// after the PATH comparison's normalisation), no drive root, no `.`/`..` segment, other than this
+/// install's folder, and it no longer exists. Anything else leaves every entry alone.
 fn stale_entry(
     ops: &dyn PlatformOps,
     app_path: &Path,
-    cli_toml: &Path,
+    recorded: Option<&CliToml>,
     current_dir: &str,
 ) -> Option<String> {
-    let recorded = ops.read_cli_toml(cli_toml).ok().flatten()?.app_path?;
+    let recorded = recorded?;
+    let added = recorded.path_entry.as_deref()?;
+    let recorded = recorded.app_path.as_deref()?;
     let text = recorded.to_str()?;
     if !drive_path(text) {
         return None;
@@ -158,11 +177,16 @@ fn stale_entry(
         install_dir: parent.into(),
     })
     .ok()?;
-    if normalized(&old) == normalized(current_dir) {
+    // A drive root (`C:\`) is shared with everything on the drive: never an entry to drop.
+    if old.ends_with(":\\") {
         return None;
     }
-    match ops.file_exists(&recorded) {
-        Ok(false) => Some(old),
+    if normalized(&old) != normalized(added) || normalized(&old) == normalized(current_dir) {
+        return None;
+    }
+    // Only a plain "not found" counts as gone; a file that cannot be read is not known to be.
+    match ops.file_exists(recorded) {
+        Ok(false) => Some(added.to_owned()),
         _ => None,
     }
 }

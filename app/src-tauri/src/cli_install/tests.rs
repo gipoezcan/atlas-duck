@@ -356,6 +356,7 @@ fn deb_and_rpm_are_already_on_path() {
         &layout.cli_toml,
         &CliToml {
             app_path: Some(PathBuf::from("/home/u/Apps/old.AppImage")),
+            path_entry: None,
         },
     )
     .expect("leftover");
@@ -371,8 +372,8 @@ fn marked(line: &str) -> Vec<u8> {
 }
 
 /// A build that writes v2 still replaces and removes the v1 files an older build wrote, and
-/// refuses only a version newer than its own. Anything that is not exactly `<name> v<digits>` is
-/// foreign, a newer marker anywhere in the file wins, and the names do not mix.
+/// refuses only a version newer than its own. Anything that is not exactly `<name> v<digits>` on
+/// the second line is foreign, and the names do not mix.
 #[test]
 fn marker_v1_recognised_by_current() {
     use linux::{LAUNCHER_MARKER_NAME, MARKER_VERSION, Marker, WRAPPER_MARKER_NAME, marker_state};
@@ -452,9 +453,14 @@ fn marker_v1_recognised_by_current() {
         "bytes that are no text"
     );
 
-    // Two markers in one file: the newer one decides.
+    // Only the second line is read: a second marker line further down does not count.
     let both = b"#!/bin/sh\n# atlas-duck-cli-wrapper v1\n# atlas-duck-cli-wrapper v7\n";
-    assert_eq!(marker_state(both, WRAPPER_MARKER_NAME, 2), Marker::Newer);
+    assert_eq!(marker_state(both, WRAPPER_MARKER_NAME, 2), Marker::Ours);
+    let newer_first = b"#!/bin/sh\n# atlas-duck-cli-wrapper v7\n# atlas-duck-cli-wrapper v1\n";
+    assert_eq!(
+        marker_state(newer_first, WRAPPER_MARKER_NAME, 2),
+        Marker::Newer
+    );
     let crlf = b"#!/bin/sh\r\n# atlas-duck-cli-wrapper v1\r\n";
     assert_eq!(
         marker_state(crlf, WRAPPER_MARKER_NAME, 2),
@@ -518,11 +524,26 @@ fn newer_marker_refused_with_text() {
             before,
             "nothing is written, not even the other file: {path:?}"
         );
-        let gone = uninstall(&ops, &l).expect("uninstall");
-        assert!(gone.changed.is_empty(), "{path:?}");
+        // Removal is refused with the same kind (not a silent success), and removes nothing: not
+        // even the other file, nor `cli.toml`.
+        assert_eq!(
+            uninstall(&ops, &l),
+            Err(InstallError::NewerVersion),
+            "{path:?}"
+        );
         assert_eq!(ops.state(), before, "a newer file is not removed: {path:?}");
         assert!(!is_installed(&ops, &l));
     }
+
+    // A newer wrapper next to a launcher of ours: still nothing is removed.
+    let ops = FakeOps::new();
+    ops.write_file(&wrapper, &newer_wrapper, 0o755)
+        .expect("newer");
+    ops.write_file(&launcher, &marked(linux::LAUNCHER_MARKER), 0o644)
+        .expect("ours");
+    let before = ops.state();
+    assert_eq!(uninstall(&ops, &l), Err(InstallError::NewerVersion));
+    assert_eq!(ops.state(), before);
 
     // A foreign file stays `occupied`; the newer kind is only for a marker that is ours-but-newer.
     let ops = FakeOps::new();
@@ -534,14 +555,197 @@ fn newer_marker_refused_with_text() {
     .expect("foreign");
     assert_eq!(install(&ops, &l), Err(InstallError::Occupied));
 
-    // The kind is a fixed word and the page has fixed text for it.
+    // The kind is a fixed word (the page's text for it is pinned by Settings.test.tsx).
     assert_eq!(InstallError::NewerVersion.kind(), "newer_version");
-    let strings = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/src/shared/strings.ts"),
-    )
-    .expect("strings.ts");
-    assert!(strings.contains("newer_version:"), "cli_errors key");
-    assert!(strings.contains("installed by a newer atlas-duck"));
+}
+
+/// I-2: the marker is the second line, as the wrapper and the launcher are written. A script that
+/// quotes the wrapper text further down (a backup, a heredoc, a dotfile generator) is not ours: it
+/// is neither replaced nor removed.
+#[test]
+fn the_marker_counts_only_on_the_second_line() {
+    use linux::{Marker, WRAPPER_MARKER, WRAPPER_MARKER_NAME, marker_state};
+
+    let at = |lines: &[&str]| marker_state(lines.join("\n").as_bytes(), WRAPPER_MARKER_NAME, 1);
+    assert_eq!(at(&["#!/bin/sh", WRAPPER_MARKER]), Marker::Ours);
+    assert_eq!(at(&["#!/bin/sh", WRAPPER_MARKER, "echo x"]), Marker::Ours);
+    // On the first line, or from the third on: foreign, whatever else the file says.
+    assert_eq!(at(&[WRAPPER_MARKER, "#!/bin/sh"]), Marker::Foreign);
+    assert_eq!(at(&["#!/bin/sh", "", WRAPPER_MARKER]), Marker::Foreign);
+    assert_eq!(
+        at(&["#!/bin/sh", "cat <<EOF", WRAPPER_MARKER, "EOF"]),
+        Marker::Foreign
+    );
+    assert_eq!(
+        at(&["#!/bin/sh", "x", "x", "x", WRAPPER_MARKER]),
+        Marker::Foreign
+    );
+    // A newer marker below the second line is no newer marker either.
+    assert_eq!(
+        at(&["#!/bin/sh", "x", "# atlas-duck-cli-wrapper v9"]),
+        Marker::Foreign
+    );
+    // A one-line file has no second line.
+    assert_eq!(at(&[WRAPPER_MARKER]), Marker::Foreign);
+
+    // Through install and uninstall: the foreign script is left byte for byte.
+    let l = Layout::resolve(&image("/home/u/Apps/a.AppImage")).expect("appimage");
+    let Kind::AppImage {
+        wrapper, launcher, ..
+    } = l.kind.clone()
+    else {
+        panic!("{l:?}");
+    };
+    for (path, text) in [
+        (
+            &wrapper,
+            "#!/bin/sh\necho mine\n# atlas-duck-cli-wrapper v1\n",
+        ),
+        (
+            &launcher,
+            "[Desktop Entry]\nName=x\n# atlas-duck-launcher v1\n",
+        ),
+    ] {
+        let ops = FakeOps::new();
+        ops.write_file(path, text.as_bytes(), 0o755)
+            .expect("foreign");
+        let before = ops.state();
+        assert_eq!(install(&ops, &l), Err(InstallError::Occupied), "{path:?}");
+        assert_eq!(ops.state(), before, "{path:?}");
+        assert!(uninstall(&ops, &l).expect("uninstall").changed.is_empty());
+        assert_eq!(ops.state(), before, "{path:?}");
+    }
+}
+
+/// I-2: a file bigger than [`MAX_READ`] is foreign, marker or not (`read_file` hands over one byte
+/// past the limit, never a truncated head that could look like ours). The limit itself still fits.
+#[test]
+fn an_oversize_file_is_foreign() {
+    use linux::{Marker, WRAPPER_MARKER, WRAPPER_MARKER_NAME, marker_state};
+
+    let head = format!("#!/bin/sh\n{WRAPPER_MARKER}\n");
+    let padded = |len: usize| {
+        let mut text = head.clone().into_bytes();
+        text.resize(len, b'#');
+        text
+    };
+    assert_eq!(
+        marker_state(&padded(MAX_READ), WRAPPER_MARKER_NAME, 1),
+        Marker::Ours,
+        "exactly the limit"
+    );
+    assert_eq!(
+        marker_state(&padded(MAX_READ + 1), WRAPPER_MARKER_NAME, 1),
+        Marker::Foreign,
+        "one byte over"
+    );
+    // A newer marker in a file that big is foreign too, not a refusal.
+    let mut big = b"#!/bin/sh\n# atlas-duck-cli-wrapper v9\n".to_vec();
+    big.resize(MAX_READ + 1, b'#');
+    assert_eq!(marker_state(&big, WRAPPER_MARKER_NAME, 1), Marker::Foreign);
+
+    // Through install and uninstall (the fake hands over the whole file, like a read of a file
+    // bigger than the limit would be cut one past it: both are over the limit).
+    let l = Layout::resolve(&image("/home/u/Apps/a.AppImage")).expect("appimage");
+    let Kind::AppImage {
+        wrapper, launcher, ..
+    } = l.kind.clone()
+    else {
+        panic!("{l:?}");
+    };
+    let launcher_head = format!("[Desktop Entry]\n{}\n", linux::LAUNCHER_MARKER);
+    for (path, mut bytes) in [
+        (&wrapper, head.clone().into_bytes()),
+        (&launcher, launcher_head.into_bytes()),
+    ] {
+        bytes.resize(MAX_READ + 1, b'#');
+        let ops = FakeOps::new();
+        ops.write_file(path, &bytes, 0o755).expect("oversize");
+        let before = ops.state();
+        assert_eq!(install(&ops, &l), Err(InstallError::Occupied), "{path:?}");
+        assert_eq!(ops.state(), before, "{path:?}");
+        assert!(uninstall(&ops, &l).expect("uninstall").changed.is_empty());
+        assert_eq!(ops.state(), before, "not removed: {path:?}");
+    }
+}
+
+/// The real `read_file`: a file is read whole up to [`MAX_READ`] and cut one byte past it (so the
+/// caller sees it is too big), a missing file is `None`, a directory is no file.
+#[test]
+fn read_file_stops_one_byte_past_the_limit() {
+    let dir = tempfile::Builder::new()
+        .prefix("atlas-duck-t19u-")
+        .tempdir()
+        .expect("tempdir");
+    let write = |name: &str, len: usize| {
+        let p = dir.path().join(name);
+        std::fs::write(&p, vec![b'x'; len]).expect("write");
+        p
+    };
+    let small = write("small", 10);
+    let exact = write("exact", MAX_READ);
+    let over = write("over", MAX_READ + 5000);
+    let len = |p: &Path| SystemOps.read_file(p).expect("read").map(|b| b.len());
+    assert_eq!(len(&small), Some(10));
+    assert_eq!(len(&exact), Some(MAX_READ));
+    assert_eq!(len(&over), Some(MAX_READ + 1));
+    assert_eq!(len(&dir.path().join("missing")), None);
+    assert!(SystemOps.read_file(dir.path()).is_err(), "a directory");
+    // The null device opens like a file but is none (checked on the handle): refused, nothing read.
+    let null = Path::new(if cfg!(windows) { "NUL" } else { "/dev/null" });
+    let err = SystemOps.read_file(null).expect_err("a device is no file");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+}
+
+/// M-4 (the fake): something that is no regular file where the wrapper or launcher goes is in the
+/// way, not ours: install answers `occupied`, uninstall leaves it.
+#[test]
+fn a_non_regular_file_is_occupied_not_ours() {
+    let l = Layout::resolve(&image("/home/u/Apps/a.AppImage")).expect("appimage");
+    let Kind::AppImage {
+        wrapper, launcher, ..
+    } = l.kind.clone()
+    else {
+        panic!("{l:?}");
+    };
+    for path in [&wrapper, &launcher] {
+        let ops = FakeOps::new();
+        ops.non_regular_at(path);
+        let before = ops.state();
+        assert_eq!(install(&ops, &l), Err(InstallError::Occupied), "{path:?}");
+        assert_eq!(ops.state(), before, "{path:?}");
+        assert!(uninstall(&ops, &l).expect("uninstall").changed.is_empty());
+        assert_eq!(ops.state(), before, "{path:?}");
+    }
+}
+
+/// M-4 (the real ops, unix): a FIFO where the wrapper goes is refused without blocking on it; a
+/// blocking open would hang the install for ever, so the read runs on its own thread with a bound.
+#[cfg(unix)]
+#[test]
+fn read_file_refuses_a_fifo_without_blocking() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::Builder::new()
+        .prefix("atlas-duck-t19u-")
+        .tempdir()
+        .expect("tempdir");
+    let fifo = dir.path().join("atlas-duck");
+    let name = CString::new(fifo.as_os_str().as_bytes()).expect("no NUL in the path");
+    // SAFETY: `name` is a NUL-terminated path that outlives the call.
+    let rc = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let target = fifo.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(SystemOps.read_file(&target));
+    });
+    let answer = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("read_file blocked on a FIFO");
+    let err = answer.expect_err("a FIFO is refused");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 }
 
 /// `~/.local/bin` counts as "on your PATH" only when it is an absolute entry of the user's PATH
@@ -630,15 +834,11 @@ fn macos_non_bundle_build_has_no_stable_path() {
     let ok = Layout::resolve(&bundle_inputs()).expect("a bundle resolves");
     match ok.kind {
         Kind::Macos { cli, link } => {
-            assert!(macos_cli_is_in_a_bundle(&cli));
+            assert!(macos::is_ours(&cli));
             assert_eq!(link, PathBuf::from("/home/u/.local/bin/atlas-duck"));
         }
         other => panic!("{other:?}"),
     }
-}
-
-fn macos_cli_is_in_a_bundle(cli: &Path) -> bool {
-    cli.ends_with("Atlas Duck.app/Contents/MacOS/atlas-duck")
 }
 
 const OLD_DIR: &str = r"C:\Users\u\AppData\Local\Programs\Atlas Duck";
@@ -655,6 +855,27 @@ fn win_layout(dir: &str) -> Layout {
     }
 }
 
+/// A `cli.toml` naming `app` and, when given, the PATH entry its install added.
+fn toml(app: &str, entry: Option<&str>) -> CliToml {
+    CliToml {
+        app_path: Some(PathBuf::from(app)),
+        path_entry: entry.map(str::to_owned),
+    }
+}
+
+/// The `cli.toml` of an install of `dir` that added `dir` to the PATH.
+fn added_toml(dir: &str) -> CliToml {
+    toml(&format!(r"{dir}\atlas-duck-app.exe"), Some(dir))
+}
+
+/// The PATH entry the fake's `cli.toml` says the install added.
+fn recorded_entry(ops: &FakeOps) -> Option<String> {
+    ops.state()
+        .cli_tomls
+        .get(Path::new(WIN_CLI_TOML))
+        .and_then(|c| c.path_entry.clone())
+}
+
 /// M-11, second half: the app moved. Its own `cli.toml` names the old app file; the old folder's
 /// PATH entry goes when that file is gone, in the same write that adds the new folder, and the
 /// report says so. Uninstall afterwards restores the machine to before the first install.
@@ -667,6 +888,19 @@ fn moved_install_replaces_own_stale_path_entry() {
         ops.state().path.as_deref(),
         Some(format!("{original};{OLD_DIR}").as_str())
     );
+    assert_eq!(
+        recorded_entry(&ops),
+        Some(OLD_DIR.to_owned()),
+        "install records the entry it added"
+    );
+    // The same install again keeps that record (it is still the entry we added).
+    assert!(
+        install(&ops, &win_layout(OLD_DIR))
+            .expect("again")
+            .changed
+            .is_empty()
+    );
+    assert_eq!(recorded_entry(&ops), Some(OLD_DIR.to_owned()));
     let (sets, broadcasts) = (ops.path_sets(), ops.broadcasts());
 
     // The user moved the app: the old file is gone, the install now runs from NEW_DIR.
@@ -674,6 +908,11 @@ fn moved_install_replaces_own_stale_path_entry() {
     assert_eq!(
         moved.changed,
         [Artifact::StaleEntry, Artifact::PathEntry, Artifact::CliToml]
+    );
+    assert_eq!(
+        recorded_entry(&ops),
+        Some(NEW_DIR.to_owned()),
+        "cli.toml now records the entry of the new folder"
     );
     assert_eq!(
         ops.state().path.as_deref(),
@@ -691,32 +930,24 @@ fn moved_install_replaces_own_stale_path_entry() {
     assert_eq!(gone.changed, [Artifact::PathEntry, Artifact::CliToml]);
     assert_eq!(ops.state().path.as_deref(), Some(original));
 
-    // The new folder already on the PATH (the user added it by hand): the stale entry still goes.
+    // The new folder already on the PATH (the user added it by hand): the stale entry still goes,
+    // and the record no longer claims an entry (we did not add the new one).
     let ops = FakeOps::with_path(&format!(r"C:\Windows;{OLD_DIR}\;{NEW_DIR}"));
-    ops.write_cli_toml(
-        Path::new(WIN_CLI_TOML),
-        &CliToml {
-            app_path: Some(PathBuf::from(format!(r"{OLD_DIR}\atlas-duck-app.exe"))),
-        },
-    )
-    .expect("old cli.toml");
+    ops.write_cli_toml(Path::new(WIN_CLI_TOML), &added_toml(OLD_DIR))
+        .expect("old cli.toml");
     let moved = install(&ops, &win_layout(NEW_DIR)).expect("install");
     assert_eq!(moved.changed, [Artifact::StaleEntry, Artifact::CliToml]);
     assert_eq!(
         ops.state().path.as_deref(),
         Some(format!(r"C:\Windows;{NEW_DIR}").as_str())
     );
+    assert_eq!(recorded_entry(&ops), None);
 
     // The old app file still exists: that install is alive, its entry stays.
     let ops = FakeOps::with_path(&format!(r"C:\Windows;{OLD_DIR}"));
     let old_app = PathBuf::from(format!(r"{OLD_DIR}\atlas-duck-app.exe"));
-    ops.write_cli_toml(
-        Path::new(WIN_CLI_TOML),
-        &CliToml {
-            app_path: Some(old_app.clone()),
-        },
-    )
-    .expect("old cli.toml");
+    ops.write_cli_toml(Path::new(WIN_CLI_TOML), &added_toml(OLD_DIR))
+        .expect("old cli.toml");
     ops.write_file(&old_app, b"MZ", 0o755).expect("old exe");
     let moved = install(&ops, &win_layout(NEW_DIR)).expect("install");
     assert_eq!(moved.changed, [Artifact::PathEntry, Artifact::CliToml]);
@@ -726,41 +957,167 @@ fn moved_install_replaces_own_stale_path_entry() {
     );
 }
 
+/// I-1: the entry goes only when this host's install ADDED it. A folder that was on the PATH
+/// before (the user keeps other tools there) is not removed when the app moves away, however the
+/// install and the move went; a `cli.toml` of an older build (no record) removes nothing.
+#[test]
+fn a_path_entry_the_install_did_not_add_is_never_removed() {
+    // The user's own entry, then install into the same folder (nothing appended), then a move.
+    let own = format!(r"C:\Windows;{OLD_DIR}");
+    let ops = FakeOps::with_path(&own);
+    let first = install(&ops, &win_layout(OLD_DIR)).expect("install");
+    assert_eq!(first.changed, [Artifact::CliToml], "the entry was there");
+    assert_eq!(recorded_entry(&ops), None, "so no entry is claimed");
+    let moved = install(&ops, &win_layout(NEW_DIR)).expect("install after the move");
+    assert_eq!(moved.changed, [Artifact::PathEntry, Artifact::CliToml]);
+    assert_eq!(
+        ops.state().path.as_deref(),
+        Some(format!("{own};{NEW_DIR}").as_str()),
+        "the shared folder stays on the PATH"
+    );
+
+    // A cli.toml of an older build: it names the old app file, which is gone, and says nothing
+    // else. Fail safe: nothing is removed and the answer is a plain install.
+    let ops = FakeOps::with_path(&own);
+    ops.write_cli_toml(
+        Path::new(WIN_CLI_TOML),
+        &CliToml {
+            app_path: Some(PathBuf::from(format!(r"{OLD_DIR}\atlas-duck-app.exe"))),
+            path_entry: None,
+        },
+    )
+    .expect("old-build cli.toml");
+    let done = install(&ops, &win_layout(NEW_DIR)).expect("install");
+    assert_eq!(done.changed, [Artifact::PathEntry, Artifact::CliToml]);
+    assert_eq!(
+        ops.state().path.as_deref(),
+        Some(format!("{own};{NEW_DIR}").as_str())
+    );
+}
+
+/// What the proof accepts: the recorded entry, however the PATH spells it (case, quotes, a
+/// trailing separator, as the PATH comparison does), for an app file on a drive path with this
+/// app's file name in any case, with either kind of separator.
+#[test]
+fn a_provably_stale_entry_goes_however_it_is_spelled() {
+    let cases = [
+        (
+            r"D:\Old\Atlas Duck\atlas-duck-app.exe",
+            r"D:\Old\Atlas Duck",
+            r"D:\OLD\atlas duck\",
+        ),
+        (r"D:\Old\ATLAS-DUCK-APP.EXE", r"D:\Old", r"D:\Old"),
+        (r"D:\Old\atlas-duck-app.exe", r"D:\Old", r#""D:\Old""#),
+        // Forward slashes: the recorded entry and the PATH segment spell the folder the same way.
+        ("D:/Old/atlas-duck-app.exe", "D:/Old", "D:/Old"),
+    ];
+    for (app, added, on_path) in cases {
+        let ops = FakeOps::with_path(&format!(r"C:\Windows;{on_path}"));
+        ops.write_cli_toml(Path::new(WIN_CLI_TOML), &toml(app, Some(added)))
+            .expect("cli.toml");
+        let done = install(&ops, &win_layout(NEW_DIR)).expect(app);
+        assert_eq!(
+            done.changed,
+            [Artifact::StaleEntry, Artifact::PathEntry, Artifact::CliToml],
+            "{app}"
+        );
+        assert_eq!(
+            ops.state().path.as_deref(),
+            Some(format!(r"C:\Windows;{NEW_DIR}").as_str()),
+            "{app}"
+        );
+    }
+}
+
 /// An entry that is not provably the old install's is never touched: no `cli.toml`, one naming
 /// another program or a folder the PATH cannot carry, a relative or `%`-expanded name, or the
 /// folder this install is in.
 #[test]
 fn foreign_stale_path_entry_left_alone() {
-    let path = format!(r"C:\Gone\Tools;{OLD_DIR};%USERPROFILE%\Atlas Duck;C:\Windows");
+    // Every candidate entry is on the PATH, each `cli.toml` below records its own as "added", and
+    // the app file is gone (or unreadable): only the one rule under test stands between the entry
+    // and its removal.
+    let path = [
+        r"C:\Gone\Tools",
+        OLD_DIR,
+        r"%USERPROFILE%\Atlas Duck",
+        r"C:\Windows",
+        r"C:\",
+        r"\\server\share",
+        r"C:\Tools\..\Gone",
+        r"C:\Tools\.\Gone",
+        r"C:\Users\%USERNAME%\Atlas Duck",
+        "Tools",
+        r"D:\Old",
+    ]
+    .join(";");
     let appended = format!("{path};{NEW_DIR}");
-    let named = |app: &str| CliToml {
-        app_path: Some(PathBuf::from(app)),
-    };
+    let tools = r"C:\Gone\Tools";
     let cases: Vec<(&str, Option<CliToml>)> = vec![
         ("no cli.toml", None),
-        ("an empty cli.toml", Some(CliToml { app_path: None })),
+        ("an empty cli.toml", Some(CliToml::default())),
+        (
+            "an older cli.toml: no record of an added entry",
+            Some(toml(&format!(r"{OLD_DIR}\atlas-duck-app.exe"), None)),
+        ),
         (
             "another program in the folder",
-            Some(named(r"C:\Gone\Tools\other-tool.exe")),
+            Some(toml(r"C:\Gone\Tools\other-tool.exe", Some(tools))),
         ),
         (
             "a name that only ends the same",
-            Some(named(r"C:\Gone\Tools\not-atlas-duck-app.exe")),
+            Some(toml(r"C:\Gone\Tools\not-atlas-duck-app.exe", Some(tools))),
         ),
-        ("a relative path", Some(named(r"Tools\atlas-duck-app.exe"))),
-        ("no folder", Some(named("atlas-duck-app.exe"))),
         (
-            "a folder the PATH cannot carry",
-            Some(named(r"C:\Gone;Tools\atlas-duck-app.exe")),
+            "a relative path",
+            Some(toml(r"Tools\atlas-duck-app.exe", Some("Tools"))),
+        ),
+        (
+            "no folder",
+            Some(toml("atlas-duck-app.exe", Some("atlas-duck-app.exe"))),
         ),
         (
             "an expandable name",
-            Some(named(r"%USERPROFILE%\Atlas Duck\atlas-duck-app.exe")),
+            Some(toml(
+                r"C:\Users\%USERNAME%\Atlas Duck\atlas-duck-app.exe",
+                Some(r"C:\Users\%USERNAME%\Atlas Duck"),
+            )),
         ),
-        ("a root path", Some(named(r"C:\atlas-duck-app.exe"))),
         (
-            "this install's own folder",
-            Some(named(&format!(r"{NEW_DIR}\atlas-duck-app.exe"))),
+            "a drive root",
+            Some(toml(r"C:\atlas-duck-app.exe", Some(r"C:\"))),
+        ),
+        (
+            "a UNC name",
+            Some(toml(
+                r"\\server\share\atlas-duck-app.exe",
+                Some(r"\\server\share"),
+            )),
+        ),
+        (
+            "a `..` segment",
+            Some(toml(
+                r"C:\Tools\..\Gone\atlas-duck-app.exe",
+                Some(r"C:\Tools\..\Gone"),
+            )),
+        ),
+        (
+            "a `.` segment",
+            Some(toml(
+                r"C:\Tools\.\Gone\atlas-duck-app.exe",
+                Some(r"C:\Tools\.\Gone"),
+            )),
+        ),
+        (
+            "a record that names another entry than the app's folder",
+            Some(toml(
+                r"C:\Gone\Tools\atlas-duck-app.exe",
+                Some(r"C:\Windows"),
+            )),
+        ),
+        (
+            "an entry spelled other than the app's folder",
+            Some(toml("D:/Old/atlas-duck-app.exe", Some(r"D:\Old"))),
         ),
     ];
     for (what, toml) in cases {
@@ -778,14 +1135,36 @@ fn foreign_stale_path_entry_left_alone() {
         );
     }
 
+    // An app file that cannot be read is not known to be gone: the entry stays.
+    let ops = FakeOps::with_path(&path);
+    let app = PathBuf::from(r"C:\Gone\Tools\atlas-duck-app.exe");
+    ops.write_cli_toml(
+        Path::new(WIN_CLI_TOML),
+        &toml(r"C:\Gone\Tools\atlas-duck-app.exe", Some(tools)),
+    )
+    .expect("cli.toml");
+    ops.fail_reads_of(&app);
+    let done = install(&ops, &win_layout(NEW_DIR)).expect("unreadable");
+    assert!(!done.changed.contains(&Artifact::StaleEntry));
+    assert_eq!(ops.state().path.as_deref(), Some(appended.as_str()));
+
+    // This install's own folder is never "stale", even when its record is: the PATH and the
+    // record stay as they are and nothing is written.
+    let on_path = format!(r"C:\Windows;{NEW_DIR}");
+    let ops = FakeOps::with_path(&on_path);
+    ops.write_cli_toml(Path::new(WIN_CLI_TOML), &added_toml(NEW_DIR))
+        .expect("cli.toml");
+    let done = install(&ops, &win_layout(NEW_DIR)).expect("own folder");
+    assert!(done.changed.is_empty(), "{done:?}");
+    assert_eq!(ops.state().path.as_deref(), Some(on_path.as_str()));
+    assert_eq!((ops.path_sets(), ops.broadcasts()), (0, 0));
+
     // Uninstall removes this install's entry and nothing else, a stale or foreign one included.
     let ops = FakeOps::with_path(&appended);
     let layout = win_layout(NEW_DIR);
     ops.write_cli_toml(
         Path::new(WIN_CLI_TOML),
-        &CliToml {
-            app_path: Some(layout.app_path.clone()),
-        },
+        &toml(layout.app_path.to_str().expect("utf-8"), Some(NEW_DIR)),
     )
     .expect("cli.toml");
     let gone = uninstall(&ops, &layout).expect("uninstall");
@@ -804,6 +1183,7 @@ fn errors_name_a_kind_and_nothing_else() {
         (InstallError::PathTooLong, "path_too_long"),
         (InstallError::Io, "io"),
         (InstallError::CliToml, "cli_toml"),
+        (InstallError::NewerVersion, "newer_version"),
     ] {
         assert_eq!(e.to_string(), kind);
         assert_eq!(serde_json::to_value(&e).ok(), Some(json!({ "kind": kind })));

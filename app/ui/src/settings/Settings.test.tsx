@@ -644,11 +644,13 @@ describe('Settings', () => {
         expect(text).toContain('~/.local/bin');
         expect(text).toMatch(/does not find the atlas-duck command/);
         expect(text).toMatch(/log out and in again/);
-        expect(text).toContain('not on your PATH');
-      } else if (outcome === 'installed_local_bin_on_path') {
-        // PD-177: the directory is on the PATH, so the text claims nothing to fix.
-        expect(text).toContain('~/.local/bin, which is on your PATH');
+        // The app sees only its own PATH, so the text does not assert what the terminals have.
+        expect(text).toContain('might not be on the PATH of the terminals you open');
         expect(text).not.toContain('not on your PATH');
+      } else if (outcome === 'installed_local_bin_on_path') {
+        // PD-177: the directory is on the PATH this app runs with, so the text claims nothing to fix.
+        expect(text).toContain('~/.local/bin, which is on the PATH this app was started with');
+        expect(text).not.toContain('might not be on the PATH');
         expect(text).not.toMatch(/log out and in again/);
       } else {
         expect(text).not.toContain('~/.local/bin');

@@ -366,6 +366,7 @@ mod tests {
             &cli_file(&b, HOST),
             &CliToml {
                 app_path: Some(listed.clone()),
+                ..CliToml::default()
             },
         )
         .unwrap();
@@ -550,6 +551,7 @@ mod tests {
                 &cli_file(&b, HOST),
                 &CliToml {
                     app_path: Some(PathBuf::from(relative)),
+                    ..CliToml::default()
                 },
             )
             .unwrap();

@@ -20,6 +20,7 @@
 //! # cli.toml / cli-<host>.toml
 //! schema_version = 1
 //! app_path = "/opt/atlas-duck/atlas-duck-app"   # optional (M10)
+//! path_entry = 'D:\Apps\Atlas Duck'             # optional: the user-PATH entry the Windows install added
 //! ```
 //!
 //! Reads are additive like `config.toml` (§7.7): the known keys are read
@@ -50,6 +51,7 @@ const KEY_DATA_DIR: &str = "data_dir";
 const KEY_CONFIG_DIR: &str = "config_dir";
 const KEY_INSTALL_ID: &str = "install_id";
 const KEY_APP_PATH: &str = "app_path";
+const KEY_PATH_ENTRY: &str = "path_entry";
 /// Largest pinned file that is read; a bigger one is a `Parse` error.
 const MAX_PINNED_FILE_BYTES: u64 = 64 * 1024;
 
@@ -69,6 +71,9 @@ pub struct PinnedPaths {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CliToml {
     pub app_path: Option<PathBuf>,
+    /// The user-PATH entry the Windows install added (absent: it added none, or this file is from
+    /// an older build). Written only when set, so a file without it stays valid for old readers.
+    pub path_entry: Option<String>,
 }
 
 /// Errors from reading or writing a pinned file. No variant carries file
@@ -248,6 +253,9 @@ pub fn read_cli_toml(path: &Path) -> Result<Option<CliToml>, PinnedError> {
         app_path: optional_str(&doc, KEY_APP_PATH)?
             .filter(|s| !s.is_empty())
             .map(PathBuf::from),
+        path_entry: optional_str(&doc, KEY_PATH_ENTRY)?
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
     }))
 }
 
@@ -259,11 +267,15 @@ pub fn write_cli_toml(path: &Path, c: &CliToml) -> Result<(), PinnedError> {
         // Same validation as read_cli_toml: schema_version and app_path type.
         refuse_newer(schema_version_of(&doc)?)?;
         optional_str(&doc, KEY_APP_PATH)?;
+        optional_str(&doc, KEY_PATH_ENTRY)?;
     }
     let mut doc = DocumentMut::new();
     doc[KEY_SCHEMA_VERSION] = value(i64::from(PINNED_SCHEMA_VERSION));
     if let Some(app_path) = app_path {
         doc[KEY_APP_PATH] = value(app_path);
+    }
+    if let Some(entry) = c.path_entry.as_deref().filter(|s| !s.is_empty()) {
+        doc[KEY_PATH_ENTRY] = value(entry);
     }
     atomic_write(path, doc.to_string().as_bytes())
 }

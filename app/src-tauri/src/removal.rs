@@ -1013,8 +1013,17 @@ fn remove_cli(
         cli_install::uninstall(ops, &layout)?;
         return Ok(CliStep::done("already_on_path"));
     }
-    cli_uninstall_dto(settings, ops, Ok(layout))?;
-    Ok(CliStep::done("removed"))
+    match cli_uninstall_dto(settings, ops, Ok(layout)) {
+        Ok(_) => Ok(CliStep::done("removed")),
+        // A wrapper or launcher of a newer atlas-duck stays (PD-177): the step says so, with the
+        // kind, and `finish` completes with `prepared: false` like any CLI step that could not
+        // remove everything.
+        Err(CommandError::CliInstall(e @ InstallError::NewerVersion)) => Ok(CliStep {
+            cli: CLI_NOT_REMOVED,
+            reason: Some(e.kind()),
+        }),
+        Err(e) => Err(e),
+    }
 }
 
 /// No layout could be derived: remove by content what sits at fixed paths. Those removals are

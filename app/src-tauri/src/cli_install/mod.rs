@@ -33,6 +33,10 @@ use serde::ser::SerializeMap;
 /// The `CONFIG_CHANGED {source: app}` key (§12.3, `SettingsAdmin::record_app_change`).
 pub const APP_CHANGE_KEY: &str = "cli_install";
 
+/// The most a wrapper, launcher or `cli.toml` this module writes can hold. [`PlatformOps::read_file`]
+/// reads one byte more than this, so a caller sees that a file is too big to be ours.
+pub const MAX_READ: usize = 64 * 1024;
+
 /// What the app does to the machine. Each method is one OS action the fake can record; the real
 /// implementation is [`SystemOps`].
 pub trait PlatformOps: Send + Sync {
@@ -50,7 +54,9 @@ pub trait PlatformOps: Send + Sync {
     fn write_file(&self, p: &Path, bytes: &[u8], mode: u32) -> io::Result<()>;
     /// Removes a file or symlink; a missing one is `Ok`.
     fn remove(&self, p: &Path) -> io::Result<()>;
-    /// The file's bytes, `None` when it does not exist.
+    /// The file's bytes (at most [`MAX_READ`] + 1: a longer file is cut one byte past the limit),
+    /// `None` when it does not exist, `InvalidInput` when it is no regular file (a FIFO, a device,
+    /// a directory; the real ops never block on one).
     fn read_file(&self, p: &Path) -> io::Result<Option<Vec<u8>>>;
     /// The symlink's target, `None` when nothing exists there; `InvalidInput` when it is no symlink.
     fn read_link(&self, p: &Path) -> io::Result<Option<PathBuf>>;
@@ -384,9 +390,11 @@ fn install_steps(
     layout: &Layout,
     done: &mut Report,
 ) -> Result<(), InstallError> {
+    let mut path_entry = None;
     match &layout.kind {
         Kind::Windows { .. } => {
-            windows::install(ops, &layout.kind, &layout.app_path, &layout.cli_toml, done)?;
+            path_entry =
+                windows::install(ops, &layout.kind, &layout.app_path, &layout.cli_toml, done)?;
         }
         Kind::Macos { .. } => macos::install(ops, &layout.kind, done)?,
         Kind::AppImage { .. } => linux::install(ops, &layout.kind, done)?,
@@ -396,6 +404,7 @@ fn install_steps(
     // `cli.toml` last: it says "installed" to the CLI, so it exists only after the rest worked.
     let want = CliToml {
         app_path: Some(layout.app_path.clone()),
+        path_entry,
     };
     if ops.read_cli_toml(&layout.cli_toml).ok().flatten().as_ref() != Some(&want) {
         ops.write_cli_toml(&layout.cli_toml, &want)
@@ -451,7 +460,7 @@ pub fn is_installed(ops: &dyn PlatformOps, layout: &Layout) -> bool {
     artifacts
         && matches!(
             ops.read_cli_toml(&layout.cli_toml),
-            Ok(Some(CliToml { app_path: Some(p) })) if p == layout.app_path
+            Ok(Some(CliToml { app_path: Some(p), .. })) if p == layout.app_path
         )
 }
 
@@ -587,15 +596,29 @@ impl PlatformOps for SystemOps {
 
     fn read_file(&self, p: &Path) -> io::Result<Option<Vec<u8>>> {
         use std::io::Read;
-        // A wrapper or launcher is a few hundred bytes; a bigger file is not ours.
-        const LIMIT: u64 = 64 * 1024;
-        let file = match std::fs::File::open(p) {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        // A FIFO opens for reading only once a writer shows up; without this the install would
+        // wait for ever on a pipe someone left at the wrapper's path.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let file = match options.open(p) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
+        // Checked on the opened handle (not on the path, which could be swapped in between). A
+        // handle that cannot even say what it is (a Windows device) is no regular file either.
+        if !file.metadata().is_ok_and(|m| m.is_file()) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        // A wrapper or launcher is a few hundred bytes: one byte past the limit is enough to tell
+        // the file is too big to be ours (the marker check refuses such a file).
         let mut bytes = Vec::new();
-        file.take(LIMIT).read_to_end(&mut bytes)?;
+        file.take(MAX_READ as u64 + 1).read_to_end(&mut bytes)?;
         Ok(Some(bytes))
     }
 

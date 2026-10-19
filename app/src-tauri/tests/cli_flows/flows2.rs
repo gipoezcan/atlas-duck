@@ -1381,6 +1381,7 @@ async fn i42_cli_toml_missing_app_path_not_running() -> Result<()> {
         &world.cli_toml(),
         &CliToml {
             app_path: Some(world.root().join("gone").join("atlas-duck-app")),
+            ..Default::default()
         },
     )
     .map_err(|e| format!("{e:?}"))?;

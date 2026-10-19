@@ -3,15 +3,15 @@
 //! `~/.local/share/applications` whose `Exec` is that same path. The wrapper prints the fixed §4.2
 //! `unreachable {not_running}` envelope with the §12.3 hint and exits 5 when the file is missing or
 //! not executable (the AppImage was moved: re-run the install), else `exec`s `$APPIMAGE_PATH
-//! __cli "$@"` (§12.1). Both files carry a marker line; a file without it is never overwritten or
-//! removed.
+//! __cli "$@"` (§12.1). Both files carry a marker line `<name> vN` as their second line; a file
+//! without it (or bigger than [`MAX_READ`]) is never overwritten or removed.
 
 use std::path::{Path, PathBuf};
 
 use atlas_duck_ipc::envelope::{Envelope, ErrorCode};
 use serde_json::{Map, Value};
 
-use super::{Artifact, InstallError, Kind, PlatformOps, Report, io_error};
+use super::{Artifact, InstallError, Kind, MAX_READ, PlatformOps, Report, io_error};
 
 /// The layout version this build writes (the `vN` of both markers). A reader accepts every version
 /// up to this one (a table of known layouts, v1 first) and refuses a newer one (PD-177).
@@ -36,31 +36,34 @@ pub enum Marker {
     Foreign,
 }
 
-/// Classifies `bytes` by the line `<name> v<N>` (exact line, `N` plain decimal digits without a
-/// leading zero, 1 or more). A newer marker anywhere wins over an older one in the same file.
+/// Classifies `bytes` by the marker line `<name> v<N>`: it has to be the second line (after the
+/// shebang or the `[Desktop Entry]` header, where the wrapper and the launcher put it), exact, `N`
+/// plain decimal digits without a leading zero, 1 or more. The same text anywhere else is only
+/// text (a script that quotes the wrapper is not ours). A file bigger than [`MAX_READ`] is foreign
+/// too: this module writes a few hundred bytes, and `read_file` hands over one byte past the
+/// limit for a longer file, so a truncated head can never pass for ours.
 pub fn marker_state(bytes: &[u8], name: &str, current: u32) -> Marker {
-    let text = String::from_utf8_lossy(bytes);
-    let mut state = Marker::Foreign;
-    for line in text.lines() {
-        let Some(digits) = line
-            .strip_prefix(name)
-            .and_then(|rest| rest.strip_prefix(" v"))
-        else {
-            continue;
-        };
-        if digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        // Empty or too large for a `u32`: no version this build can name, so not a marker.
-        let Ok(version) = digits.parse::<u32>() else {
-            continue;
-        };
-        if version > current {
-            return Marker::Newer;
-        }
-        state = Marker::Ours;
+    if bytes.len() > MAX_READ {
+        return Marker::Foreign;
     }
-    state
+    let text = String::from_utf8_lossy(bytes);
+    let Some(digits) = text
+        .lines()
+        .nth(1)
+        .and_then(|line| line.strip_prefix(name))
+        .and_then(|rest| rest.strip_prefix(" v"))
+    else {
+        return Marker::Foreign;
+    };
+    if digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Marker::Foreign;
+    }
+    // Empty or too large for a `u32`: no version this build can name, so not a marker.
+    match digits.parse::<u32>() {
+        Ok(version) if version > current => Marker::Newer,
+        Ok(_) => Marker::Ours,
+        Err(_) => Marker::Foreign,
+    }
 }
 
 /// `~/.local/bin/atlas-duck`.
@@ -187,6 +190,22 @@ fn inspect(
             Marker::Newer => Err(InstallError::NewerVersion),
             Marker::Foreign => Err(InstallError::Occupied),
         },
+        // `InvalidInput`: a FIFO, a device or a directory is in the way.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Err(InstallError::Occupied),
+        Err(e) => Err(io_error(&e)),
+    }
+}
+
+/// What `uninstall` finds at `p`: `Ours` to remove, `Newer`, or `Foreign` (also: nothing there, a
+/// symlink, something that is no regular file).
+fn classify(ops: &dyn PlatformOps, p: &Path, name: &str) -> Result<Marker, InstallError> {
+    if is_symlink(ops, p)? {
+        return Ok(Marker::Foreign);
+    }
+    match ops.read_file(p) {
+        Ok(Some(existing)) => Ok(marker_of(&existing, name)),
+        Ok(None) => Ok(Marker::Foreign),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Ok(Marker::Foreign),
         Err(e) => Err(io_error(&e)),
     }
 }
@@ -245,8 +264,8 @@ pub fn install(ops: &dyn PlatformOps, kind: &Kind, done: &mut Report) -> Result<
     )
 }
 
-/// Removes `p` when it carries a marker of a known version (never a symlink, never a file of a
-/// newer version or without a marker).
+/// Removes `p` when it carries a marker of a known version (never a symlink, never a file
+/// without a marker); the caller has already refused a newer one.
 fn remove_owned(
     ops: &dyn PlatformOps,
     p: &Path,
@@ -254,19 +273,11 @@ fn remove_owned(
     artifact: Artifact,
     removed: &mut Vec<Artifact>,
 ) -> Result<(), InstallError> {
-    if is_symlink(ops, p)? {
-        return Ok(());
+    if classify(ops, p, name)? == Marker::Ours {
+        ops.remove(p).map_err(|e| io_error(&e))?;
+        removed.push(artifact);
     }
-    match ops.read_file(p) {
-        Ok(Some(existing)) if marker_of(&existing, name) == Marker::Ours => {
-            ops.remove(p).map_err(|e| io_error(&e))?;
-            removed.push(artifact);
-            Ok(())
-        }
-        // Not ours, newer, or not there: left alone.
-        Ok(_) => Ok(()),
-        Err(e) => Err(io_error(&e)),
-    }
+    Ok(())
 }
 
 pub fn uninstall(
@@ -281,6 +292,16 @@ pub fn uninstall(
     else {
         return Err(InstallError::Unsupported);
     };
+    // A file of a newer atlas-duck stays, and the call says so instead of reporting a removal that
+    // did not happen; both files are looked at first, so nothing is removed either way.
+    for (artifact, path, name) in [
+        (Artifact::Wrapper, wrapper, WRAPPER_MARKER_NAME),
+        (Artifact::Launcher, launcher, LAUNCHER_MARKER_NAME),
+    ] {
+        if wanted(artifact) && classify(ops, path, name)? == Marker::Newer {
+            return Err(InstallError::NewerVersion);
+        }
+    }
     if wanted(Artifact::Wrapper) {
         remove_owned(
             ops,

@@ -411,6 +411,7 @@ fn windows_writes_create_the_pinned_files() {
         &cli,
         &CliToml {
             app_path: Some(PathBuf::from(r"C:\Apps\atlas-duck-app.exe")),
+            ..CliToml::default()
         },
     )
     .expect("write_cli_toml");
@@ -458,6 +459,7 @@ fn shared_home_other_hosts_files_are_never_read_or_touched() {
         &cli_file(&b, "thishost"),
         &CliToml {
             app_path: Some(PathBuf::from("/opt/a")),
+            ..CliToml::default()
         },
     )
     .expect("write own cli");
@@ -539,10 +541,15 @@ fn round_trip_non_ascii_and_long_paths() {
         write_pinned(&file, p).expect("write_pinned");
         assert_eq!(read_pinned(&file).expect("read").expect("present"), *p);
     }
-    for (i, app) in [
-        None,
-        Some(r"C:\Users\Jürgen Öz\Apps\atlas-duck-app.exe"),
-        Some("/home/jürgen/Apps/Atlas Duck.AppImage"),
+    for (i, (app, entry)) in [
+        (None, None),
+        (Some(r"C:\Users\Jürgen Öz\Apps\atlas-duck-app.exe"), None),
+        (
+            Some(r"C:\Users\Jürgen Öz\Apps\atlas-duck-app.exe"),
+            Some(r"C:\Users\Jürgen Öz\Apps"),
+        ),
+        (Some("/home/jürgen/Apps/Atlas Duck.AppImage"), None),
+        (None, Some(r"D:\Apps")),
     ]
     .into_iter()
     .enumerate()
@@ -550,10 +557,67 @@ fn round_trip_non_ascii_and_long_paths() {
         let file = tmp.path().join(format!("cli-{i}.toml"));
         let c = CliToml {
             app_path: app.map(PathBuf::from),
+            path_entry: entry.map(str::to_owned),
         };
         write_cli_toml(&file, &c).expect("write_cli_toml");
         assert_eq!(read_cli_toml(&file).expect("read").expect("present"), c);
     }
+}
+
+/// `path_entry` (the PATH entry the Windows install added) is written only when set, so a file
+/// without it is byte for byte what an older build wrote and reads back as `None`; an empty or
+/// mistyped value is never an entry (`Parse` for a wrong type, `None` for empty).
+#[test]
+fn cli_toml_path_entry_is_optional_and_backward_compatible() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let file = tmp.path().join("cli.toml");
+    write_cli_toml(
+        &file,
+        &CliToml {
+            app_path: Some(PathBuf::from("/a")),
+            path_entry: None,
+        },
+    )
+    .expect("write");
+    assert_eq!(
+        fs::read_to_string(&file).expect("read"),
+        "schema_version = 1\napp_path = \"/a\"\n"
+    );
+    write_cli_toml(
+        &file,
+        &CliToml {
+            app_path: Some(PathBuf::from("/a")),
+            path_entry: Some("D:/Apps".to_owned()),
+        },
+    )
+    .expect("write");
+    assert_eq!(
+        fs::read_to_string(&file).expect("read"),
+        "schema_version = 1\napp_path = \"/a\"\npath_entry = \"D:/Apps\"\n"
+    );
+
+    // An older build's file (no key) and one with an empty value both read as no entry.
+    for text in [
+        "schema_version = 1\napp_path = \"/a\"\n",
+        "schema_version = 1\napp_path = \"/a\"\npath_entry = \"\"\n",
+    ] {
+        fs::write(&file, text).expect("seed");
+        assert_eq!(
+            read_cli_toml(&file)
+                .expect("read")
+                .expect("present")
+                .path_entry,
+            None,
+            "{text}"
+        );
+    }
+    // A value of the wrong type is a parse error, like a mistyped `app_path`.
+    fs::write(&file, "schema_version = 1\npath_entry = 5\n").expect("seed");
+    assert!(matches!(read_cli_toml(&file), Err(PinnedError::Parse)));
+    assert!(matches!(
+        write_cli_toml(&file, &CliToml::default()),
+        Err(PinnedError::Parse)
+    ));
 }
 
 #[test]
@@ -596,6 +660,7 @@ fn unix_non_utf8_path_is_refused_and_nothing_is_written() {
     assert!(matches!(write_pinned(&file, &p), Err(PinnedError::NonUtf8Path(ref x)) if *x == bad));
     let c = CliToml {
         app_path: Some(bad.clone()),
+        ..CliToml::default()
     };
     assert!(matches!(
         write_cli_toml(&dir.join("cli-h.toml"), &c),
@@ -624,6 +689,7 @@ fn windows_unpaired_surrogate_is_refused_and_nothing_is_written() {
     assert!(matches!(write_pinned(&file, &p), Err(PinnedError::NonUtf8Path(ref x)) if *x == bad));
     let c = CliToml {
         app_path: Some(bad),
+        ..CliToml::default()
     };
     assert!(matches!(
         write_cli_toml(&dir.join("cli.toml"), &c),
@@ -667,7 +733,8 @@ fn newer_schema_is_read_additively_and_never_rewritten() {
     assert_eq!(
         read_cli_toml(&cli).expect("read").expect("present"),
         CliToml {
-            app_path: Some(PathBuf::from("/a"))
+            app_path: Some(PathBuf::from("/a")),
+            path_entry: None,
         }
     );
     assert!(matches!(
