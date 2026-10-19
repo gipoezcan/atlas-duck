@@ -34,8 +34,9 @@
 //!
 //! **Failures (L186).** Every failure before the rename (a cancel, a failed append included)
 //! unlinks `manifest.json` first (a directory without one is never an export, even if the
-//! removal is interrupted) and then removes the staging directory; if that removal fails, the
-//! export returns [`AuditError::ExportLeftover`] naming it. A process that dies while the export
+//! removal is interrupted) and then removes the staging directory; if the unlink or the removal
+//! fails, the export returns [`AuditError::ExportLeftover`] naming it (its `.partial` name still
+//! marks it as no export). A process that dies while the export
 //! runs (crash, kill, power loss, an app exit that did not wait for `Store::export` to return)
 //! leaves the `.partial` directory with whatever was written, decrypted `events.jsonl`
 //! included, and no `EXPORT`: nothing cleans it up later (the store does not keep the path).

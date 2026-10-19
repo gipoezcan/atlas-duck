@@ -602,7 +602,7 @@ fn export_final_name_taken_before_rename_is_not_touched() {
         }
         let r = match export(&store, out.path(), TimeRange::all()) {
             Err(AuditError::ExportNotRenamed(r)) => r,
-            other => panic!("not ExportNotRenamed: {other:?}"),
+            other => panic!("marker {marker}: not ExportNotRenamed: {other:?}"),
         };
         assert_eq!(r.dir_name, staging_name(&chain, 1, head));
         assert_eq!((r.first_seq, r.last_seq, r.export_seq), (1, head, head + 1));
@@ -1209,14 +1209,17 @@ fn export_cancel_mid_batch_stops_before_the_next_row() {
     assert!(!types.iter().any(|t| t == "EXPORT"), "{types:?}");
 }
 
-/// M-10: a restore (the store file generation moves on) between batches ends the export.
+/// M-10: a restore (the store file generation moves on) between batches ends the export before
+/// the next batch.
 #[test]
 fn export_restore_between_batches_aborts() {
     let (store, f) = new_store_with(fake_clock(START), MemKeyring::new(), |c| {
         c.hooks.export_batch_rows = Some(2);
     });
     store.append_batch(mixed(5)).expect("append");
+    let calls = Mutex::new(Vec::new());
     let progress = |done: u64, _: u64| {
+        calls.lock().expect("lock").push(done);
         if done == 2 {
             store.testing_bump_generation();
         }
@@ -1236,6 +1239,11 @@ fn export_restore_between_batches_aborts() {
         Err(AuditError::Invalid(
             "the store was restored while the export ran"
         ))
+    );
+    assert_eq!(
+        calls.into_inner().expect("lock"),
+        vec![2],
+        "no batch after the restore"
     );
     assert!(entries(out.path()).is_empty());
     assert_eq!(count(&f, EventType::EXPORT), 0);

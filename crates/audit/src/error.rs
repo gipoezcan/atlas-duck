@@ -166,9 +166,10 @@ pub enum AuditError {
     /// [`AuditError::ExportLeftover`] instead.
     Cancelled,
     /// A failed or cancelled export could not remove its staging directory `dir_name` (a
-    /// `….partial` subdirectory of the chosen directory; its `manifest.json` is gone or never
-    /// existed). It may hold decrypted records and is never a valid export: the user must
-    /// delete it. `cause` is why the export ended; no `EXPORT` was logged.
+    /// `….partial` subdirectory of the chosen directory): unlinking its `manifest.json`, or
+    /// removing the rest, failed. It may hold decrypted records and is never a logged export (its
+    /// name says so): the user must delete it. `cause` is why the export ended; no `EXPORT` was
+    /// logged.
     ExportLeftover {
         dir_name: String,
         cause: Box<AuditError>,
