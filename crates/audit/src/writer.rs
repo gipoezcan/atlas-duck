@@ -20,6 +20,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use crate::anchor_dir::AnchorLine;
+use crate::anchor_dir::writer::{
+    AnchorDirShared, Classifier, Pending, PruneNote, RowNote, gets_immediate_line,
+};
 use crate::anchors::{AnchorShared, HeadAnchor};
 #[cfg(any(test, feature = "testing"))]
 use crate::anchors::{Barrier, FirstRetainedAnchor};
@@ -122,6 +126,9 @@ pub(crate) struct PreparedEvent {
     /// refuses the append once a restore replaced that file, so e.g. a full verification
     /// that raced a restore never lands its `VERIFY` in the restored chain.
     pub(crate) for_generation: Option<u64>,
+    /// The committed row gets an immediate anchor-dir line (§8.5): decided here, where a
+    /// `CONFIG_CHANGED` payload's `key` is still plaintext.
+    pub(crate) anchor_immediate: bool,
     pub(crate) payload_len: u64,
     pub(crate) payload_sha256: [u8; 32],
     pub(crate) compressed: Zeroizing<Vec<u8>>,
@@ -168,6 +175,10 @@ impl PreparedEvent {
         }
         let payload_sha256: [u8; 32] = Sha256::digest(plain.as_slice()).into();
         let compressed = Zeroizing::new(crypto::compress(&plain)?);
+        let anchor_immediate = gets_immediate_line(
+            ev.event_type.as_str(),
+            ev.payload.get("key").and_then(Value::as_str),
+        );
         let a = ev.actor;
         Ok(PreparedEvent {
             event_type: ev.event_type,
@@ -191,6 +202,7 @@ impl PreparedEvent {
             store_flags: EventFlags::default(),
             ack_of: None,
             for_generation: None,
+            anchor_immediate,
             payload_len,
             payload_sha256,
             compressed,
@@ -266,6 +278,8 @@ pub(crate) struct Shared {
     pub(crate) dropped_observations: AtomicU64,
     /// The head handed to the anchor thread after every commit (T08).
     pub(crate) anchors: Arc<AnchorShared>,
+    /// The anchor-dir lines of every commit, for the `audit-anchor-dir` thread (PD-156).
+    pub(crate) anchor_dir: Arc<AnchorDirShared>,
     /// Seqs of open integrity incidents (T09): loaded at open, updated after every commit of
     /// a flagged `VERIFY` or an `INTEGRITY_ACK`.
     pub(crate) incidents: Mutex<BTreeSet<u64>>,
@@ -325,6 +339,7 @@ impl Shared {
             dek_cache: Mutex::new(HashMap::new()),
             dropped_observations: AtomicU64::new(0),
             anchors: Arc::new(AnchorShared::new()),
+            anchor_dir: Arc::new(AnchorDirShared::new()),
             incidents: Mutex::new(BTreeSet::new()),
             prune_backlog_days: AtomicU32::new(0),
             checkpoint_pending: AtomicBool::new(false),
@@ -447,11 +462,21 @@ pub(crate) struct WriterState {
     pub(crate) checkpoint_retries: u32,
     /// A fault point simulated a crash: the writer stops (feature `testing`).
     pub(crate) crashed: bool,
+    /// The rows inserted since the last commit, for their anchor-dir lines; a row of a rolled
+    /// back transaction is dropped when its seq is inserted again.
+    anchor_rows: Vec<RowNote>,
+    /// The committed `PRUNE`'s `prune_log` values (its `Prune` line), set before `post_commit`.
+    pub(crate) anchor_prune: Option<PruneNote>,
+    /// Which committed rows get which anchor-dir line (PD-157).
+    anchor_lines: Classifier,
 }
 
 impl WriterState {
     fn new(parts: WriterParts, clock_state: ClockState, head: Head) -> WriterState {
         WriterState {
+            anchor_rows: Vec::new(),
+            anchor_prune: None,
+            anchor_lines: Classifier::new(clock_state.prev_flags.contains(EventFlags::BEHIND)),
             clock: parts.clock,
             published_epoch: clock_state.prev_epoch,
             clock_state,
@@ -487,8 +512,8 @@ pub(crate) struct Writer {
     pub(crate) st: WriterState,
 }
 
-/// `(seq, record_hash, chain_id, epoch, ts_utc, flags)` of the head row, as stored.
-type HeadRow = (i64, Vec<u8>, String, Option<String>, String, i64);
+/// `(seq, record_hash, chain_id, epoch, ts_utc, flags, event_type)` of the head row, as stored.
+type HeadRow = (i64, Vec<u8>, String, Option<String>, String, i64, String);
 
 fn insert_sql() -> &'static str {
     static SQL: OnceLock<String> = OnceLock::new();
@@ -679,6 +704,16 @@ impl WriterState {
         fields.payload_ct = &ct;
         let record_hash = fields.record_hash()?;
         insert_row(tx, &fields, &record_hash)?;
+        self.anchor_rows.retain(|r| r.seq < seq);
+        self.anchor_rows.push(RowNote {
+            seq,
+            record_hash,
+            epoch: st.epoch,
+            flags,
+            event_type: p.event_type,
+            immediate: p.anchor_immediate,
+            corroborated: self.clock_state.corroborated_date(mono),
+        });
         self.head = Head {
             seq,
             hash: record_hash,
@@ -728,9 +763,10 @@ impl WriterState {
         self.insert_one(tx, &stamp, p, mono, new_keys)
     }
 
-    /// After `COMMIT` returned: publish the head and the new keys, and hand the head to the
-    /// anchor thread (never blocks on the keychain). A head whose epoch date advanced queues
-    /// a prune attempt (L37 cadence).
+    /// After `COMMIT` returned: publish the head and the new keys, hand the head to the
+    /// anchor thread and the rows' anchor-dir lines to the anchor-dir thread (never blocks on
+    /// the keychain or a file). A head whose epoch date advanced queues a prune attempt (L37
+    /// cadence).
     pub(crate) fn post_commit(
         &mut self,
         new_keys: HashMap<u64, Dek>,
@@ -760,6 +796,16 @@ impl WriterState {
             seq: self.head.seq,
             record_hash: self.head.hash,
         });
+        let head = self.head.seq;
+        let rows: Vec<RowNote> = std::mem::take(&mut self.anchor_rows)
+            .into_iter()
+            .filter(|r| r.seq <= head)
+            .collect();
+        let prune = self.anchor_prune.take();
+        let lines =
+            self.anchor_lines
+                .lines(&self.settings.anchor_dir, &self.head.chain_id, rows, prune);
+        self.shared.anchor_dir.push(lines);
     }
 }
 
@@ -819,7 +865,7 @@ impl Writer {
         schema::gate_open_connection_up_to(&conn, parts.hooks.schema_head())?;
         let row: Option<HeadRow> = conn
             .query_row(
-                "SELECT seq, record_hash, chain_id, epoch, ts_utc, flags FROM events \
+                "SELECT seq, record_hash, chain_id, epoch, ts_utc, flags, event_type FROM events \
                  ORDER BY seq DESC LIMIT 1",
                 [],
                 |r| {
@@ -830,12 +876,13 @@ impl Writer {
                         r.get(3)?,
                         r.get(4)?,
                         r.get(5)?,
+                        r.get(6)?,
                     ))
                 },
             )
             .optional()
             .map_err(sql_open)?;
-        let (seq, hash, chain_id, epoch, ts, flags) =
+        let (seq, hash, chain_id, epoch, ts, flags, head_type) =
             row.ok_or_else(|| OpenError::Integrity("the store has no records".into()))?;
         let bad = |what: &str| OpenError::Integrity(format!("head record has an invalid {what}"));
         let seq = u64::try_from(seq).map_err(|_| bad("seq"))?;
@@ -883,6 +930,24 @@ impl Writer {
             hash,
             chain_id: st.head.chain_id.clone(),
         };
+        // Written once anchor writes are enabled (after startup verification): the current
+        // chain's file if it is missing, and the line of an APP_STOP head that the last
+        // shutdown could not write (PD-157; skipped when the file holds it).
+        let dir = st.settings.anchor_dir.clone();
+        let mut pending = vec![Pending::ensure_file(dir.clone(), &st.head.chain_id)];
+        if head_type == EventType::APP_STOP.as_str() {
+            pending.push(Pending::catch_up(
+                dir,
+                &st.head.chain_id,
+                AnchorLine::Record {
+                    seq,
+                    record_hash: hash,
+                    epoch: epoch.map(epoch_text),
+                    clock_behind: flags.contains(EventFlags::BEHIND),
+                },
+            ));
+        }
+        st.shared.anchor_dir.push(pending);
         Ok(Writer { conn, st })
     }
 
@@ -1366,6 +1431,12 @@ impl Writer {
                 {
                     g.complete();
                 }
+                self.st.anchor_prune = Some(PruneNote {
+                    seq: c.seq,
+                    first_retained_seq: frs,
+                    first_retained_prev_hash: last_pruned,
+                    cutoff_epoch: p.cutoff.clone(),
+                });
                 self.st.post_commit(new_keys, &[]);
                 Ok(c)
             }

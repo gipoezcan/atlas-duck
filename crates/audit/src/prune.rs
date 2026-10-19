@@ -11,6 +11,7 @@ use chrono::{Days, NaiveDate};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde_json::json;
 
+use crate::anchor_dir::writer::PruneNote;
 use crate::anchors::{Barrier, FirstRetainedAnchor};
 use crate::clock::{UtcInstant, date_of, epoch_text, month_text, parse_epoch};
 use crate::encoding::{self, ZERO_HASH};
@@ -554,6 +555,12 @@ impl Writer {
         // The PRUNE is durable: the barrier stays until the anchor thread lifts it, and the
         // guard must not release a barrier it did not set.
         guard.complete();
+        self.st.anchor_prune = Some(PruneNote {
+            seq: committed.seq,
+            first_retained_seq,
+            first_retained_prev_hash: last_pruned,
+            cutoff_epoch: cutoff_text,
+        });
         self.st.post_commit(new_keys, &[]);
         self.vacuum_and_checkpoint(BUSY_TIMEOUT);
         armed?;

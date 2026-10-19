@@ -787,6 +787,9 @@ fn interrupted_prune() -> (Fixture, TempDir, u64) {
     .expect("fake prune")
     .seq;
     store.shutdown();
+    // The writer's daily line names seq 3 (epoch 2026-10-08), which this forged prune removes
+    // although its cutoff is earlier: that line would itself block the reconciliation.
+    std::fs::remove_file(dir.path().join(file_name(&f.chain_id))).expect("writer's file");
     (f, dir, prune)
 }
 

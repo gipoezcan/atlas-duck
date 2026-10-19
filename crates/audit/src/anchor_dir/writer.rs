@@ -1,0 +1,897 @@
+//! The anchor-directory writer (§8.5; PD-156, PD-157). The writer thread classifies every
+//! committed row ([`Classifier`]) and hands the lines it asks for to the `audit-anchor-dir`
+//! thread ([`run`]), which appends them to `<anchor_dir>/<chain_id>.jsonl` once startup
+//! verification called `enable` (§8.7 "No anchor writes before verification"). A chain file is
+//! only ever created with create-new, header first, then fsynced together with its directory;
+//! after that it is only appended to and fsynced: the writer never rewrites, truncates or
+//! deletes a byte. A failing directory is retried with backoff and shown in `StoreHealth`,
+//! never an incident (§8.5 "a write failure is shown in Settings and the tray").
+//!
+//! Which records get which line (PD-157, L185):
+//! - a daily `Record` line for the first committed record whose non-NULL `epoch` is a date with
+//!   no `Record` line yet in the file, and only while that date is not past the date
+//!   corroborated in this process (§8.8; L36: never for a NULL epoch);
+//! - a `Record` line for the first unflagged record after any `clock_behind` record (M2
+//!   handoff: the verifier judges pruned `clock_behind` lines by it);
+//! - a `Record` line for every `APP_STOP` (`Store::shutdown` drains the queue, bounded; a line
+//!   still pending then is written at the next start, see `Writer::open`);
+//! - an `Immediate` line for `PRUNE`, `RESTORE`, `LEGAL_HOLD_CHANGED`, `INTEGRITY_ACK`,
+//!   `CLOCK_ANOMALY` and the `CONFIG_CHANGED` records of an audit-policy key, and a `Prune` line
+//!   for a `PRUNE`.
+//!
+//! `Record` lines carry `clock_behind: true` exactly when the record has the flag.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+use chrono::NaiveDate;
+
+use super::{AnchorLine, IMMEDIATE_TYPES, MAX_FILE_BYTES, MAX_LINE_BYTES, file_name, is_id};
+use super::{parse_line, resolve, to_line};
+use crate::anchors::backoff;
+use crate::clock::{Clock, epoch_text, parse_epoch};
+use crate::settings;
+use crate::types::{EventFlags, EventType};
+
+/// Queued lines beyond which only the newest daily line is kept with every other line (PD-156).
+pub(crate) const MAX_PENDING: usize = 100_000;
+
+/// How long `Store::shutdown` waits for the queue to drain (PD-157, inside the PD-38 budget).
+pub(crate) const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+
+/// Longest idle wait of the thread.
+const MAX_WAIT: Duration = Duration::from_secs(1);
+
+/// `host` and `os_user` of a header are cut to this many characters (the line must stay below
+/// `MAX_LINE_BYTES` even when every character is escaped).
+const MAX_HEADER_TEXT_CHARS: usize = 200;
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether a committed record of `event_type` gets an immediate line (§8.5): the six types, a
+/// `CONFIG_CHANGED` only with an audit-policy `key` (L185; the one key list of `settings.rs`).
+pub fn gets_immediate_line(event_type: &str, config_key: Option<&str>) -> bool {
+    IMMEDIATE_TYPES.contains(&event_type)
+        && (event_type != EventType::CONFIG_CHANGED.as_str()
+            || config_key.is_some_and(settings::is_audit_policy_key))
+}
+
+// ---------------------------------------------------------------------------------------
+// What the writer thread hands over
+
+/// One committed row, as the writer thread stamped it.
+pub(crate) struct RowNote {
+    pub(crate) seq: u64,
+    pub(crate) record_hash: [u8; 32],
+    pub(crate) epoch: Option<NaiveDate>,
+    pub(crate) flags: EventFlags,
+    pub(crate) event_type: EventType,
+    /// [`gets_immediate_line`] of the row (decided while its payload was still plaintext).
+    pub(crate) immediate: bool,
+    /// The date corroborated in this process when the row was stamped.
+    pub(crate) corroborated: Option<NaiveDate>,
+}
+
+/// The `prune_log` values of a committed `PRUNE` (its `Prune` line).
+pub(crate) struct PruneNote {
+    pub(crate) seq: u64,
+    pub(crate) first_retained_seq: u64,
+    pub(crate) first_retained_prev_hash: [u8; 32],
+    pub(crate) cutoff_epoch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Item {
+    Line(AnchorLine),
+    /// The chain file must exist (with its header), even if no line is due (M2 handoff: a
+    /// missing current-chain file is created at the next start).
+    EnsureFile,
+}
+
+/// How a queued line is treated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Keep {
+    /// A daily line: skipped when the file already has a `Record` line of its date; beyond
+    /// [`MAX_PENDING`] only the newest one is kept.
+    Daily,
+    /// Every other line of a commit.
+    Always,
+    /// A line a crash may have lost (startup): skipped when the file already holds it.
+    CatchUp,
+}
+
+/// One line for `<dir>/<chain_id>.jsonl`. `dir` is the store's `anchor_dir` setting in force
+/// when the record committed (the thread resolves it like verification does).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Pending {
+    pub(crate) dir: Option<String>,
+    pub(crate) chain_id: String,
+    pub(crate) item: Item,
+    pub(crate) keep: Keep,
+}
+
+impl Pending {
+    pub(crate) fn catch_up(dir: Option<String>, chain_id: &str, line: AnchorLine) -> Pending {
+        Pending {
+            dir,
+            chain_id: chain_id.to_owned(),
+            item: Item::Line(line),
+            keep: Keep::CatchUp,
+        }
+    }
+
+    pub(crate) fn ensure_file(dir: Option<String>, chain_id: &str) -> Pending {
+        Pending {
+            dir,
+            chain_id: chain_id.to_owned(),
+            item: Item::EnsureFile,
+            keep: Keep::Always,
+        }
+    }
+}
+
+/// The writer thread's per-process line state (PD-157).
+pub(crate) struct Classifier {
+    /// The latest daily date asked for, and the file it was asked for.
+    daily: Option<(Option<String>, String, NaiveDate)>,
+    /// A `clock_behind` record committed and no unflagged record got a `Record` line since.
+    behind: bool,
+}
+
+impl Classifier {
+    /// `head_behind`: the head record at open carries `clock_behind`, so the first unflagged
+    /// record of this process is the witness of that run.
+    pub(crate) fn new(head_behind: bool) -> Classifier {
+        Classifier {
+            daily: None,
+            behind: head_behind,
+        }
+    }
+
+    /// The lines of one commit's rows, in seq order.
+    pub(crate) fn lines(
+        &mut self,
+        dir: &Option<String>,
+        chain_id: &str,
+        rows: Vec<RowNote>,
+        prune: Option<PruneNote>,
+    ) -> Vec<Pending> {
+        let mut out = Vec::new();
+        let mut push = |line: AnchorLine, keep: Keep| {
+            out.push(Pending {
+                dir: dir.clone(),
+                chain_id: chain_id.to_owned(),
+                item: Item::Line(line),
+                keep,
+            });
+        };
+        for r in rows {
+            let flagged = r.flags.contains(EventFlags::BEHIND);
+            let daily = match (r.epoch, r.corroborated) {
+                (Some(e), Some(cd)) if e <= cd => {
+                    let done = matches!(&self.daily,
+                        Some((d, c, last)) if d == dir && c == chain_id && *last >= e);
+                    (!done).then_some(e)
+                }
+                _ => None,
+            };
+            let witness = !flagged && self.behind;
+            let app_stop = r.event_type == EventType::APP_STOP;
+            if daily.is_some() || witness || app_stop {
+                if let Some(e) = daily {
+                    self.daily = Some((dir.clone(), chain_id.to_owned(), e));
+                }
+                let keep = if witness || app_stop {
+                    Keep::Always
+                } else {
+                    Keep::Daily
+                };
+                push(
+                    AnchorLine::Record {
+                        seq: r.seq,
+                        record_hash: r.record_hash,
+                        epoch: r.epoch.map(epoch_text),
+                        clock_behind: flagged,
+                    },
+                    keep,
+                );
+                if !flagged {
+                    self.behind = false;
+                }
+            }
+            if flagged {
+                self.behind = true;
+            }
+            if r.immediate {
+                if let Some(p) = prune.as_ref().filter(|p| p.seq == r.seq) {
+                    push(
+                        AnchorLine::Prune {
+                            first_retained_seq: p.first_retained_seq,
+                            first_retained_prev_hash: p.first_retained_prev_hash,
+                            cutoff_epoch: p.cutoff_epoch.clone(),
+                        },
+                        Keep::Always,
+                    );
+                }
+                push(
+                    AnchorLine::Immediate {
+                        seq: r.seq,
+                        record_hash: r.record_hash,
+                        epoch: r.epoch.map(epoch_text),
+                        event_type: r.event_type.as_str().to_owned(),
+                    },
+                    Keep::Always,
+                );
+            }
+        }
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// The shared queue
+
+struct DirState {
+    /// Startup verification passed (the same gate as the keychain anchor thread).
+    enabled: bool,
+    /// `OpenConfig.anchor_dir`, used while the store's setting names none (as verification).
+    fallback: Option<PathBuf>,
+    queue: VecDeque<Pending>,
+    /// `Keep::Daily` lines in `queue`.
+    daily_queued: usize,
+    /// Lines the thread took and is writing now.
+    in_flight: usize,
+    failures: u32,
+    next_retry: Option<Instant>,
+    /// Divides the retry backoff (tests only).
+    scale_div: u32,
+    /// One attempt now, whatever the backoff says (`Store::shutdown`, tests).
+    drain: bool,
+    /// Forced attempts finished.
+    forced: u64,
+    stop: bool,
+    /// The thread panicked: nothing will be written again.
+    dead: bool,
+    exited: bool,
+}
+
+/// The state shared by the writer thread (producer), the `Store` handles and the
+/// `audit-anchor-dir` thread. Files are only touched with the state lock released.
+pub(crate) struct AnchorDirShared {
+    state: Mutex<DirState>,
+    cv: Condvar,
+    /// Held while a chain file is created or appended to: whoever creates a file writes its one
+    /// header (create-new), and nobody else writes to it meanwhile.
+    pub(crate) file_lock: Mutex<()>,
+}
+
+/// What `Store::health` reports about the anchor dir.
+pub(crate) struct DirHealth {
+    pub(crate) write_failing: bool,
+    pub(crate) lines_pending: u32,
+}
+
+impl AnchorDirShared {
+    pub(crate) fn new() -> AnchorDirShared {
+        AnchorDirShared {
+            state: Mutex::new(DirState {
+                enabled: false,
+                fallback: None,
+                queue: VecDeque::new(),
+                daily_queued: 0,
+                in_flight: 0,
+                failures: 0,
+                next_retry: None,
+                scale_div: 1,
+                drain: false,
+                forced: 0,
+                stop: false,
+                dead: false,
+                exited: false,
+            }),
+            cv: Condvar::new(),
+            file_lock: Mutex::new(()),
+        }
+    }
+
+    /// Before the writer starts (first run commits `GENESIS` inside its start).
+    pub(crate) fn set_fallback(&self, dir: Option<PathBuf>) {
+        lock(&self.state).fallback = dir;
+    }
+
+    /// Once the writer is ready; lines queued before are kept.
+    pub(crate) fn init(&self, enabled: bool, scale_div: u32) {
+        let mut st = lock(&self.state);
+        st.enabled = enabled;
+        st.scale_div = scale_div.max(1);
+        drop(st);
+        self.cv.notify_all();
+    }
+
+    /// Queues lines (writer thread; never blocks on a file). Lines for a store without any
+    /// anchor dir are dropped here.
+    pub(crate) fn push(&self, lines: Vec<Pending>) {
+        if lines.is_empty() {
+            return;
+        }
+        let mut st = lock(&self.state);
+        let no_fallback = st.fallback.is_none();
+        for p in lines {
+            if p.dir.is_none() && no_fallback {
+                continue;
+            }
+            if p.keep == Keep::Daily {
+                st.daily_queued += 1;
+            }
+            st.queue.push_back(p);
+        }
+        compact(&mut st);
+        drop(st);
+        self.cv.notify_all();
+    }
+
+    /// Startup verification passed: lines may be written.
+    pub(crate) fn enable(&self) {
+        lock(&self.state).enabled = true;
+        self.cv.notify_all();
+    }
+
+    /// Nothing is written until the next `enable` (tests).
+    pub(crate) fn disable(&self) {
+        lock(&self.state).enabled = false;
+    }
+
+    pub(crate) fn health(&self) -> DirHealth {
+        let st = lock(&self.state);
+        DirHealth {
+            write_failing: st.failures > 0 || st.dead,
+            lines_pending: u32::try_from(st.queue.len() + st.in_flight).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// Asks for one attempt now and waits (at most `timeout`) until the queue is empty or that
+    /// attempt ended. `true`: nothing is pending. Nothing is written while disabled.
+    pub(crate) fn drain(&self, timeout: Duration) -> bool {
+        let end = Instant::now() + timeout;
+        let mut st = lock(&self.state);
+        let empty = |st: &DirState| st.queue.is_empty() && st.in_flight == 0;
+        if !st.enabled || st.dead || st.exited {
+            return empty(&st);
+        }
+        let before = st.forced;
+        st.drain = true;
+        self.cv.notify_all();
+        loop {
+            if empty(&st) {
+                return true;
+            }
+            if st.forced > before || st.exited {
+                return false;
+            }
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            st = self
+                .cv
+                .wait_timeout(st, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
+    /// `Store::shutdown`: one last attempt for the queued lines, then the thread stops; both
+    /// within `budget`. `false`: the thread did not leave in time (a hung share) and is left
+    /// behind. Lines still queued are lost here; the `APP_STOP` one is written at the next start.
+    pub(crate) fn drain_and_stop(&self, budget: Duration) -> bool {
+        let end = Instant::now() + budget;
+        self.drain(budget);
+        let mut st = lock(&self.state);
+        st.stop = true;
+        self.cv.notify_all();
+        while !st.exited {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            st = self
+                .cv
+                .wait_timeout(st, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        true
+    }
+}
+
+/// Beyond [`MAX_PENDING`] queued lines only the newest daily line stays (PD-156); every other
+/// line is kept. Runs only while more than one daily line is queued, so a queue of lines that
+/// must all be kept does not pay a scan per push.
+fn compact(st: &mut DirState) {
+    if st.queue.len() <= MAX_PENDING || st.daily_queued <= 1 {
+        return;
+    }
+    let total = st.daily_queued;
+    let mut seen = 0usize;
+    st.queue.retain(|p| {
+        if p.keep != Keep::Daily {
+            return true;
+        }
+        seen += 1;
+        seen == total
+    });
+    st.daily_queued = 1;
+}
+
+// ---------------------------------------------------------------------------------------
+// The thread
+
+/// The header facts of this install (§8.5 header line).
+pub(crate) struct HeaderFacts {
+    install_id: String,
+    host: String,
+    os_user: String,
+    clock: Arc<dyn Clock>,
+}
+
+fn bounded(s: String) -> String {
+    let s: String = s.chars().take(MAX_HEADER_TEXT_CHARS).collect();
+    if s.is_empty() {
+        "unknown".to_owned()
+    } else {
+        s
+    }
+}
+
+/// The OS user as the recovery note names it (the first non-empty of `USERNAME`, `USER`,
+/// `LOGNAME`).
+fn os_user() -> String {
+    ["USERNAME", "USER", "LOGNAME"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+        .unwrap_or_default()
+}
+
+impl HeaderFacts {
+    pub(crate) fn new(install_id: String, clock: Arc<dyn Clock>) -> HeaderFacts {
+        HeaderFacts {
+            install_id,
+            host: bounded(atlas_duck_ipc::paths::raw_host_name().unwrap_or_default()),
+            os_user: bounded(os_user()),
+            clock,
+        }
+    }
+
+    fn line(&self, chain_id: &str) -> io::Result<String> {
+        let created_at = self
+            .clock
+            .now_utc()
+            .try_to_rfc3339_ms()
+            .ok_or_else(|| io::Error::other("wall clock outside years 0000..=9999"))?;
+        Ok(to_line(&AnchorLine::Header {
+            chain_id: chain_id.to_owned(),
+            install_id: self.install_id.clone(),
+            host: self.host.clone(),
+            os_user: self.os_user.clone(),
+            created_at,
+        }))
+    }
+}
+
+/// The `audit-anchor-dir` thread. A panic (defence in depth: release builds abort) marks the
+/// state dead, which `health()` reports.
+pub(crate) fn run(shared: Arc<AnchorDirShared>, header: HeaderFacts) {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_loop(&shared, &header);
+    }));
+    let mut st = lock(&shared.state);
+    if r.is_err() {
+        st.dead = true;
+    }
+    st.exited = true;
+    drop(st);
+    shared.cv.notify_all();
+}
+
+/// Per `(dir, chain_id)`: the newest date with a `Record` line in the file, once read.
+type Files = HashMap<(PathBuf, String), Option<NaiveDate>>;
+
+fn run_loop(shared: &AnchorDirShared, header: &HeaderFacts) {
+    let mut files: Files = HashMap::new();
+    let mut st = lock(&shared.state);
+    loop {
+        if st.stop {
+            break;
+        }
+        let now = Instant::now();
+        let work = st.enabled && !st.queue.is_empty();
+        let due = work && (st.drain || st.next_retry.is_none_or(|t| now >= t));
+        if !due {
+            if st.drain {
+                // Nothing to write now (empty, or disabled): the forced attempt is over.
+                st.drain = false;
+                st.forced += 1;
+                shared.cv.notify_all();
+                continue;
+            }
+            let wait = match (work, st.next_retry) {
+                (true, Some(t)) => t.saturating_duration_since(now).min(MAX_WAIT),
+                _ => MAX_WAIT,
+            };
+            st = shared
+                .cv
+                .wait_timeout(st, wait)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+            continue;
+        }
+        let forced = std::mem::take(&mut st.drain);
+        let batch: Vec<Pending> = st.queue.drain(..).collect();
+        st.daily_queued = 0;
+        st.in_flight = batch.len();
+        let fallback = st.fallback.clone();
+        drop(st);
+        let (done, result) = write_batch(shared, header, fallback.as_deref(), &batch, &mut files);
+        st = lock(&shared.state);
+        // What was not written goes back in front of what arrived meanwhile, in order.
+        for p in batch.into_iter().skip(done).rev() {
+            st.queue.push_front(p);
+        }
+        st.daily_queued = st.queue.iter().filter(|p| p.keep == Keep::Daily).count();
+        st.in_flight = 0;
+        match result {
+            Ok(()) => {
+                st.failures = 0;
+                st.next_retry = None;
+            }
+            Err(_) => {
+                st.failures = st.failures.saturating_add(1);
+                st.next_retry = Some(Instant::now() + backoff(st.failures) / st.scale_div);
+            }
+        }
+        if forced {
+            st.forced += 1;
+        }
+        shared.cv.notify_all();
+    }
+}
+
+/// Writes `batch` in order, one append per run of lines for the same file; stops at the first
+/// failure. Returns how many items are done (written, skipped or without a dir).
+fn write_batch(
+    shared: &AnchorDirShared,
+    header: &HeaderFacts,
+    fallback: Option<&Path>,
+    batch: &[Pending],
+    files: &mut Files,
+) -> (usize, io::Result<()>) {
+    let mut i = 0;
+    while i < batch.len() {
+        let (dir, chain_id) = (&batch[i].dir, &batch[i].chain_id);
+        let mut j = i + 1;
+        while j < batch.len() && batch[j].dir == *dir && batch[j].chain_id == *chain_id {
+            j += 1;
+        }
+        // No anchor dir: nothing to write. A chain id that is not an id never becomes a path
+        // component (the verifier reports such a store).
+        if let Some(path) = resolve(dir.as_deref(), fallback)
+            && is_id(chain_id)
+            && let Err(e) = append_group(shared, header, &path, chain_id, &batch[i..j], files)
+        {
+            return (i, Err(e));
+        }
+        i = j;
+    }
+    (batch.len(), Ok(()))
+}
+
+fn append_group(
+    shared: &AnchorDirShared,
+    header: &HeaderFacts,
+    dir: &Path,
+    chain_id: &str,
+    group: &[Pending],
+    files: &mut Files,
+) -> io::Result<()> {
+    if !dir.is_absolute() {
+        // It would resolve against the working directory of the process.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the anchor directory is not an absolute path",
+        ));
+    }
+    let path = dir.join(file_name(chain_id));
+    let key = (dir.to_path_buf(), chain_id.to_owned());
+    let _g = lock(&shared.file_lock);
+    let (mut file, fresh) = open_chain_file(dir, &path, || header.line(chain_id))?;
+    if fresh {
+        files.insert(key.clone(), None);
+    }
+    let catch_up: Vec<String> = group
+        .iter()
+        .filter(|p| p.keep == Keep::CatchUp)
+        .filter_map(|p| match &p.item {
+            Item::Line(l) => Some(to_line(l)),
+            Item::EnsureFile => None,
+        })
+        .collect();
+    let mut present = HashSet::new();
+    if !files.contains_key(&key) || !catch_up.is_empty() {
+        let (last, found) = scan(&path, &catch_up)?;
+        present = found;
+        let known = files.get(&key).copied().flatten();
+        files.insert(key.clone(), last.max(known));
+    }
+    let mut last = files.get(&key).copied().flatten();
+    let mut buf = String::new();
+    for p in group {
+        let Item::Line(l) = &p.item else { continue };
+        let text = to_line(l);
+        if p.keep == Keep::CatchUp && present.contains(&text) {
+            continue;
+        }
+        let date = record_date(l);
+        if p.keep == Keep::Daily && date.is_some() && last >= date {
+            continue;
+        }
+        last = last.max(date);
+        buf.push_str(&text);
+        buf.push('\n');
+    }
+    if !buf.is_empty() {
+        file.write_all(buf.as_bytes())?;
+        file.sync_all()?;
+        record_sync(&path);
+    }
+    files.insert(key, last);
+    Ok(())
+}
+
+/// The date of a `Record` line with a non-NULL epoch.
+fn record_date(l: &AnchorLine) -> Option<NaiveDate> {
+    match l {
+        AnchorLine::Record { epoch: Some(e), .. } => parse_epoch(e),
+        _ => None,
+    }
+}
+
+/// Opens the chain file for appending; a missing one is created with create-new and its
+/// header, fsynced, and its directory entry flushed. `true`: this call wrote the header. An
+/// existing empty file (a crash between its creation and its header) gets the header too; an
+/// existing file with content never gets a second one.
+fn open_chain_file(
+    dir: &Path,
+    path: &Path,
+    header: impl Fn() -> io::Result<String>,
+) -> io::Result<(File, bool)> {
+    let write_header = |f: &mut File| -> io::Result<()> {
+        let mut h = header()?;
+        h.push('\n');
+        f.write_all(h.as_bytes())?;
+        f.sync_all()?;
+        record_sync(path);
+        Ok(())
+    };
+    match OpenOptions::new().append(true).open(path) {
+        Ok(mut f) => {
+            if f.metadata()?.len() == 0 {
+                write_header(&mut f)?;
+                return Ok((f, true));
+            }
+            Ok((f, false))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            match OpenOptions::new().append(true).create_new(true).open(path) {
+                Ok(mut f) => {
+                    write_header(&mut f)?;
+                    sync_dir_of(dir)?;
+                    Ok((f, true))
+                }
+                // Created meanwhile by someone else (who wrote its header).
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    Ok((OpenOptions::new().append(true).open(path)?, false))
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The new directory entry made durable. Unix: an error fails the attempt. Windows: best effort
+/// (`FlushFileBuffers` on a directory needs write access, which an append-only share may refuse;
+/// NTFS and SMB journal the entry themselves), so such a share stays writable.
+fn sync_dir_of(dir: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        if crate::open::sync_dir(dir).is_ok() {
+            record_sync(dir);
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        crate::open::sync_dir(dir)?;
+        record_sync(dir);
+        Ok(())
+    }
+}
+
+/// Reads the file once (bounded like the verifier's reads): the newest date of its `Record`
+/// lines and which of `wanted` (canonical line texts) it holds. Unparseable lines are skipped.
+fn scan(path: &Path, wanted: &[String]) -> io::Result<(Option<NaiveDate>, HashSet<String>)> {
+    let f = File::open(path)?;
+    let mut r = BufReader::new(f.take(MAX_FILE_BYTES));
+    let mut buf = Vec::new();
+    let mut last = None;
+    let mut found = HashSet::new();
+    loop {
+        buf.clear();
+        if r.read_until(b'\n', &mut buf)? == 0 {
+            break;
+        }
+        let raw = buf.strip_suffix(b"\n").unwrap_or(&buf);
+        if raw.len() > MAX_LINE_BYTES {
+            continue;
+        }
+        let Ok(s) = std::str::from_utf8(raw) else {
+            continue;
+        };
+        if wanted.iter().any(|w| w == s) {
+            found.insert(s.to_owned());
+        }
+        if let Ok(l) = parse_line(s) {
+            last = last.max(record_date(&l));
+        }
+    }
+    Ok((last, found))
+}
+
+// ---------------------------------------------------------------------------------------
+// fsync record (feature `testing`)
+
+#[cfg(any(test, feature = "testing"))]
+static SYNCED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+fn record_sync(_p: &Path) {
+    #[cfg(any(test, feature = "testing"))]
+    lock(&SYNCED).push(_p.to_path_buf());
+}
+
+/// Every file and directory the writer fsynced under `dir`, in order (feature `testing`; one
+/// process runs many tests, so each test reads its own dir).
+#[cfg(any(test, feature = "testing"))]
+pub fn testing_synced_under(dir: &Path) -> Vec<PathBuf> {
+    lock(&SYNCED)
+        .iter()
+        .filter(|p| p.starts_with(dir))
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(seq: u64, keep: Keep) -> Pending {
+        Pending {
+            dir: Some("/a".into()),
+            chain_id: "c".into(),
+            item: Item::Line(AnchorLine::Record {
+                seq,
+                record_hash: [0; 32],
+                epoch: None,
+                clock_behind: false,
+            }),
+            keep,
+        }
+    }
+
+    #[test]
+    fn beyond_the_bound_only_the_newest_daily_line_stays() {
+        let s = AnchorDirShared::new();
+        s.push(
+            (0..MAX_PENDING as u64)
+                .map(|i| line(i, Keep::Always))
+                .collect(),
+        );
+        s.push(vec![
+            line(1_000_001, Keep::Daily),
+            line(1_000_002, Keep::Always),
+        ]);
+        s.push(vec![line(1_000_003, Keep::Daily)]);
+        let st = lock(&s.state);
+        assert_eq!(st.daily_queued, 1);
+        assert_eq!(st.queue.len(), MAX_PENDING + 2);
+        let dailies: Vec<&Pending> = st.queue.iter().filter(|p| p.keep == Keep::Daily).collect();
+        assert_eq!(dailies, vec![&line(1_000_003, Keep::Daily)]);
+    }
+
+    #[test]
+    fn lines_without_any_anchor_dir_are_not_queued() {
+        let s = AnchorDirShared::new();
+        let mut p = line(1, Keep::Always);
+        p.dir = None;
+        s.push(vec![p.clone()]);
+        assert_eq!(s.health().lines_pending, 0);
+        s.set_fallback(Some(PathBuf::from("/fallback")));
+        s.push(vec![p]);
+        assert_eq!(s.health().lines_pending, 1);
+    }
+
+    fn note(seq: u64, epoch: Option<&str>, cd: Option<&str>, flags: EventFlags) -> RowNote {
+        RowNote {
+            seq,
+            record_hash: [seq as u8; 32],
+            epoch: epoch.and_then(parse_epoch),
+            flags,
+            event_type: EventType::APP_START,
+            immediate: false,
+            corroborated: cd.and_then(parse_epoch),
+        }
+    }
+
+    fn record_seqs(v: &[Pending]) -> Vec<(u64, bool)> {
+        v.iter()
+            .filter_map(|p| match &p.item {
+                Item::Line(AnchorLine::Record {
+                    seq, clock_behind, ..
+                }) => Some((*seq, *clock_behind)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn daily_rule_per_file_and_never_past_the_corroborated_date() {
+        let mut c = Classifier::new(false);
+        let d = Some("/a".to_string());
+        let b = EventFlags::default();
+        let v = c.lines(
+            &d,
+            "c",
+            vec![
+                note(1, None, None, b),
+                note(2, Some("2026-10-08"), None, b),
+                note(3, Some("2026-10-09"), Some("2026-10-08"), b),
+                note(4, Some("2026-10-08"), Some("2026-10-08"), b),
+                note(5, Some("2026-10-08"), Some("2026-10-09"), b),
+            ],
+            None,
+        );
+        assert_eq!(record_seqs(&v), vec![(4, false)]);
+        // Another file of the same day gets its own line.
+        let v = c.lines(
+            &Some("/b".to_string()),
+            "c",
+            vec![note(6, Some("2026-10-08"), Some("2026-10-08"), b)],
+            None,
+        );
+        assert_eq!(record_seqs(&v), vec![(6, false)]);
+    }
+
+    #[test]
+    fn witness_after_a_flagged_run_also_from_the_head_at_open() {
+        let mut c = Classifier::new(true);
+        let d = Some("/a".to_string());
+        let behind = EventFlags::BEHIND;
+        let v = c.lines(
+            &d,
+            "c",
+            vec![
+                note(1, Some("2026-10-08"), None, EventFlags::default()),
+                note(2, Some("2026-10-08"), None, EventFlags::default()),
+                note(3, Some("2026-10-08"), None, behind),
+                note(4, Some("2026-10-08"), None, EventFlags::default()),
+            ],
+            None,
+        );
+        assert_eq!(record_seqs(&v), vec![(1, false), (4, false)]);
+    }
+}

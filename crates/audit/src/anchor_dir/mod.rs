@@ -1,8 +1,8 @@
-//! The external anchor directory (§8.5), verifier side (P7: the writer is M10). Each chain
-//! has `<anchor_dir>/<chain_id>.jsonl`: a header line, then unsigned, append-only JSON lines
-//! (daily, `APP_STOP` and `RESTORE` lines, immediate lines, prune lines, `ANCHOR_DETACHED`).
-//! [`parse_line`] and [`to_line`] are the one line format both sides use; [`load`] reads the
-//! files of the store's chains and [`check`] compares them with the store (§8.7).
+//! The external anchor directory (§8.5). Each chain has `<anchor_dir>/<chain_id>.jsonl`: a
+//! header line, then unsigned, append-only JSON lines (daily, `APP_STOP` and `RESTORE` lines,
+//! immediate lines, prune lines, `ANCHOR_DETACHED`). [`parse_line`] and [`to_line`] are the one
+//! line format both sides use; [`writer`] appends the lines (M10), [`load`] reads the files of
+//! the store's chains and [`check`] compares them with the store (§8.7).
 //!
 //! Lines are JCS text (sorted keys, no whitespace); a line that is not exactly what
 //! [`to_line`] produces for its content is rejected. Hashes are 64 lowercase hex characters,
@@ -31,6 +31,8 @@ use crate::crypto::ct_eq;
 use crate::error::OpenError;
 use crate::types::EventFlags;
 use crate::verify::{FindingKind, PruneLogRow, VerifyFinding, hex32};
+
+pub mod writer;
 
 /// Longer lines are rejected before JSON parsing (a header with long host and user names is
 /// far below it).
@@ -467,8 +469,8 @@ fn store_chains(conn: &Connection) -> rusqlite::Result<BTreeSet<Option<String>>>
 /// Reads `<chain_id>.jsonl` for every chain of the store from `dir` (`None`: no anchor dir is
 /// configured, nothing to compare). A dir that is not absolute or cannot be read, a file that
 /// cannot be read, is empty or too long, and a line that does not parse are problems
-/// (findings). A missing file is not: nothing writes one before M10. Only a database error is
-/// an `Err`.
+/// (findings). A missing file is not (a chain with no line yet; the writer creates the current
+/// chain's file at the next start or line). Only a database error is an `Err`.
 pub(crate) fn load(
     dir: Option<&Path>,
     conn: &Connection,

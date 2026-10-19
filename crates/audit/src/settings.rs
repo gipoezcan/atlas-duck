@@ -236,10 +236,20 @@ fn parse_key(key: &str) -> Option<PolicyKey<'_>> {
 
 /// Whether `key` names a policy value (callers may append such a `CONFIG_CHANGED` only as a
 /// record of a file difference that was not applied: `source: "file"`, `applied: false`).
-/// The one list of these keys: M10's anchor-dir writer reads it to pick the policy
-/// `CONFIG_CHANGED` records that get an immediate line (§8.5, PD-157).
+/// The one list of these keys; [`is_audit_policy_key`] picks its audit-policy part.
 pub fn is_policy_key(key: &str) -> bool {
     parse_key(key).is_some()
+}
+
+/// The audit-policy keys of that list, whose `CONFIG_CHANGED` records get an immediate
+/// anchor-dir line (§8.5 "audit-policy `CONFIG_CHANGED`", PD-157, L185): `retention_days`,
+/// `anchor_dir` and `allow_degraded_scripts` (the legal hold has its own `LEGAL_HOLD_CHANGED`).
+/// The per-instance keys are connection policy, not audit policy.
+pub(crate) fn is_audit_policy_key(key: &str) -> bool {
+    matches!(
+        parse_key(key),
+        Some(PolicyKey::Retention | PolicyKey::AnchorDir | PolicyKey::AllowDegradedScripts)
+    )
 }
 
 fn key_of(id: &str, f: Field) -> String {

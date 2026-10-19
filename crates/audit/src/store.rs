@@ -18,7 +18,8 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::admission::{self, DEFAULT_MIN_FREE_BYTES, FreeSpaceProbe, OsFreeSpace};
-use crate::anchor_dir::{self, AnchorDirLines};
+use crate::anchor_dir::writer::{HeaderFacts, Pending, SHUTDOWN_DRAIN};
+use crate::anchor_dir::{self, AnchorDirLines, AnchorLine};
 use crate::anchors::{
     self, AnchorLoadError, Barrier, BarrierGuard, BarrierKind, FirstRetainedAnchor, HeadAnchor,
     RestoreReset,
@@ -154,6 +155,12 @@ pub struct StoreHealth {
     /// A settings row of the log could not be read: the settings view is not trusted, and no
     /// prune, setting change or config reconcile runs until the store is repaired or restored.
     pub settings_unreadable: bool,
+    /// The latest attempt to append to the anchor dir failed (or its thread panicked): retried
+    /// with backoff, never an incident (§8.5).
+    pub anchor_dir_write_failing: bool,
+    /// Anchor-dir lines waiting to be written (held until startup verification passed, or
+    /// while the dir fails).
+    pub anchor_dir_lines_pending: u32,
 }
 
 /// One row's ciphertext and what opening it needs. No `Debug`: it holds a wrapped key.
@@ -172,6 +179,7 @@ struct Inner {
     tx: Mutex<Option<SyncSender<Cmd>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
     anchor_thread: Mutex<Option<JoinHandle<()>>>,
+    anchor_dir_thread: Mutex<Option<JoinHandle<()>>>,
     shared: Arc<Shared>,
     install_id: String,
     /// Read by `full_verify` for the anchors; only the anchor thread writes them.
@@ -193,8 +201,10 @@ struct Inner {
 }
 
 impl Inner {
-    /// Closes the read-only reader, stops the writer after the commands already queued, then
-    /// the anchor thread; never writes an anchor. The reader closes first so the writer's close
+    /// Closes the read-only reader, stops the writer after the commands already queued, lets
+    /// the anchor-dir thread write the lines of those commits (the `APP_STOP` line among them;
+    /// bounded, PD-157), then stops it and the anchor thread; never writes a keychain anchor.
+    /// The reader closes first so the writer's close
     /// is the last one on the database: only that close checkpoints the WAL and removes `-wal` /
     /// `-shm` (a read-only connection closing last cannot). The reader lock is released before
     /// the writer is joined (a restore on the writer thread holds it).
@@ -205,6 +215,13 @@ impl Inner {
         }
         if let Some(h) = lock(&self.thread).take() {
             let _ = h.join();
+        }
+        let dir_exited = self.shared.anchor_dir.drain_and_stop(SHUTDOWN_DRAIN);
+        if let Some(h) = lock(&self.anchor_dir_thread).take() {
+            // A thread stuck on a hung share is detached rather than waited for.
+            if dir_exited {
+                let _ = h.join();
+            }
         }
         let exited = self.shared.anchors.stop();
         if let Some(h) = lock(&self.anchor_thread).take() {
@@ -274,6 +291,8 @@ impl Store {
         F: FnOnce(WriterParts) -> Result<Writer, OpenError> + Send + 'static,
     {
         let shared = Shared::new(&kek);
+        // Before the writer starts: a first run commits inside its start.
+        shared.anchor_dir.set_fallback(cfg.anchor_dir.clone());
         #[cfg(any(test, feature = "testing"))]
         let hooks = cfg.hooks.clone();
         let parts = WriterParts {
@@ -328,11 +347,31 @@ impl Store {
                 return Err(e.into());
             }
         };
+        shared.anchor_dir.init(enabled, scale_div);
+        let spawned = {
+            let shared = shared.anchor_dir.clone();
+            let header = HeaderFacts::new(install_id.clone(), cfg.clock.clone());
+            std::thread::Builder::new()
+                .name("audit-anchor-dir".into())
+                .spawn(move || anchor_dir::writer::run(shared, header))
+        };
+        let anchor_dir_thread = match spawned {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = tx.send(Cmd::Shutdown);
+                let _ = thread.join();
+                if shared.anchors.stop() {
+                    let _ = anchor_thread.join();
+                }
+                return Err(e.into());
+            }
+        };
         Ok(Store {
             inner: Arc::new(Inner {
                 tx: Mutex::new(Some(tx)),
                 thread: Mutex::new(Some(thread)),
                 anchor_thread: Mutex::new(Some(anchor_thread)),
+                anchor_dir_thread: Mutex::new(Some(anchor_dir_thread)),
                 shared,
                 install_id,
                 keys: cfg.keys,
@@ -569,8 +608,8 @@ impl Store {
         self.inner.shared.anchors.flush()
     }
 
-    /// Startup verification passed: the anchor thread may write (§8.7 "no anchor writes
-    /// before verification").
+    /// Startup verification passed: the anchor thread and the anchor-dir thread may write
+    /// (§8.7 "no anchor writes before verification").
     pub(crate) fn enable_anchors(&self) {
         #[cfg(any(test, feature = "testing"))]
         let _ = self
@@ -578,6 +617,7 @@ impl Store {
             .hooks
             .fault(crate::testing::FaultPoint::AnchorsEnabled);
         self.inner.shared.anchors.enable();
+        self.inner.shared.anchor_dir.enable();
     }
 
     /// Holds the head anchor back (prune/restore). The guard releases the barrier when
@@ -611,6 +651,7 @@ impl Store {
 
     pub fn health(&self) -> StoreHealth {
         let a = self.inner.shared.anchors.health();
+        let d = self.inner.shared.anchor_dir.health();
         StoreHealth {
             anchor_write_failing: a.write_failing,
             first_retained_update_pending: a.first_retained_pending,
@@ -626,6 +667,8 @@ impl Store {
                 .shared
                 .settings_unreadable
                 .load(Ordering::Relaxed),
+            anchor_dir_write_failing: d.write_failing,
+            anchor_dir_lines_pending: d.lines_pending,
         }
     }
 
@@ -995,6 +1038,7 @@ impl Store {
             return Ok(outcome);
         }
         if let (Some(fr), Some(p)) = (&a.set_first_retained, &a.prune_record) {
+            self.queue_missing_prune_lines(fr, p);
             self.install_barrier(Barrier::Prune {
                 seq: p.seq,
                 record_hash: p.record_hash,
@@ -1012,6 +1056,57 @@ impl Store {
         }
         self.enable_anchors();
         Ok(outcome)
+    }
+
+    /// Interrupted prune (§8.7: "the missing anchor-dir `PRUNE` line is appended"): the
+    /// `PRUNE`'s `Prune` and `Immediate` lines, written once anchor writes are enabled unless
+    /// the file already holds them. Best effort: a store that cannot be read here keeps them
+    /// out (startup goes on; full verification reads the same store).
+    fn queue_missing_prune_lines(&self, fr: &FirstRetainedAnchor, p: &HeadAnchor) {
+        let Ok(seq) = i64::try_from(p.seq) else {
+            return;
+        };
+        let read = self.with_reader(|c| {
+            let io = |e: rusqlite::Error| AuditError::Io(e.to_string());
+            let cutoff: String = c
+                .query_row(
+                    "SELECT cutoff_epoch FROM prune_log WHERE prune_seq = ?1",
+                    [seq],
+                    |r| r.get(0),
+                )
+                .map_err(io)?;
+            let epoch: Option<String> = c
+                .query_row("SELECT epoch FROM events WHERE seq = ?1", [seq], |r| {
+                    r.get(0)
+                })
+                .map_err(io)?;
+            Ok((cutoff, epoch))
+        });
+        let Ok((cutoff_epoch, epoch)) = read else {
+            return;
+        };
+        let dir = self.settings().anchor_dir;
+        self.inner.shared.anchor_dir.push(vec![
+            Pending::catch_up(
+                dir.clone(),
+                &p.chain_id,
+                AnchorLine::Prune {
+                    first_retained_seq: fr.first_retained_seq,
+                    first_retained_prev_hash: fr.first_retained_prev_hash,
+                    cutoff_epoch,
+                },
+            ),
+            Pending::catch_up(
+                dir,
+                &p.chain_id,
+                AnchorLine::Immediate {
+                    seq: p.seq,
+                    record_hash: p.record_hash,
+                    epoch,
+                    event_type: EventType::PRUNE.as_str().to_owned(),
+                },
+            ),
+        ]);
     }
 
     /// The restore completion (§8.11 step 5) after the KEK is re-sealed: a restore barrier at
@@ -1111,7 +1206,8 @@ impl Store {
     }
 
     /// Stops the writer after the commands already queued; later calls get `Closed`. Never
-    /// writes an anchor.
+    /// writes a keychain anchor; waits (at most 5 s) until the anchor-dir lines of the
+    /// committed records, the `APP_STOP` line among them, are written (PD-157).
     pub fn shutdown(&self) {
         // `stop()` closes the reader before the writer; closing it again afterwards covers a
         // read that reopened it in between (later reads get `Closed`).
@@ -1136,6 +1232,16 @@ impl Store {
         self.append_full_verify(findings, generation)
     }
 
+    /// One anchor-dir write attempt now, waited for (feature `testing`): `true` once nothing is
+    /// pending; `false` while anchor writes are disabled or the attempt failed.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn testing_anchor_dir_drain(&self) -> bool {
+        self.inner
+            .shared
+            .anchor_dir
+            .drain(std::time::Duration::from_secs(10))
+    }
+
     /// `enable_anchors` for integration tests (feature `testing`).
     #[cfg(any(test, feature = "testing"))]
     pub fn testing_enable_anchors(&self) {
@@ -1147,6 +1253,7 @@ impl Store {
     #[cfg(any(test, feature = "testing"))]
     pub fn testing_pause_anchors(&self) {
         self.inner.shared.anchors.disable();
+        self.inner.shared.anchor_dir.disable();
     }
 
     /// `testing::insert_fake_prune` (feature `testing`).
