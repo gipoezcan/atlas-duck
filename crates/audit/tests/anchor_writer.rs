@@ -2410,14 +2410,16 @@ fn torn_close_writes_no_line_dated_past_the_corroborated_date() {
         server_time("2026-10-10T12:00:00.000Z"),
         Instant::now(),
     );
+    // The observation is handled on the writer thread: its CLOCK_ANOMALY commit (and line) is
+    // done before the drain, so no line is appended while the fragment is.
+    sync_writer(&store);
     drain(&store);
     let file = chain_file(dir.path(), &f.chain_id);
     let frag = fragment();
     append_raw(&file, frag.as_bytes());
 
     // The head is dated 2026-10-13, past the corroborated date: the newline alone closes the
-    // fragment (review M-3), followed by an immediate line (the CLOCK_ANOMALY of the
-    // observation, or the retention change, whichever comes first).
+    // fragment (review M-3), followed by an immediate line (the retention change's).
     let retention = store
         .apply_setting(SettingChange::RetentionDays(120), None)
         .expect("retention")
@@ -2427,7 +2429,7 @@ fn torn_close_writes_no_line_dated_past_the_corroborated_date() {
     let raw: Vec<&str> = text.lines().collect();
     let i = raw.iter().position(|l| *l == frag).expect("fragment line");
     assert!(
-        matches!(parse_line(raw[i + 1]), Ok(AnchorLine::Immediate { .. })),
+        matches!(parse_line(raw[i + 1]), Ok(AnchorLine::Immediate { seq, .. }) if seq == retention),
         "{raw:?}"
     );
     let ls = lines_but(dir.path(), &f.chain_id, &frag);

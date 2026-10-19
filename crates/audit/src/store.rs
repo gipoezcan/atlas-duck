@@ -1827,8 +1827,9 @@ impl Store {
         self.append_full_verify(findings, generation)
     }
 
-    /// One anchor-dir write attempt now, waited for (feature `testing`): `true` once nothing is
-    /// pending; `false` while anchor writes are disabled or the attempt failed.
+    /// One anchor-dir write attempt now, waited for (feature `testing`; lines queued while it
+    /// runs get another): `true` once nothing is pending; `false` while anchor writes are
+    /// disabled or a file failed.
     #[cfg(any(test, feature = "testing"))]
     pub fn testing_anchor_dir_drain(&self) -> bool {
         self.inner

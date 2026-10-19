@@ -581,7 +581,9 @@ impl AnchorDirShared {
     }
 
     /// Asks for one attempt now and waits (at most `timeout`) until the queue is empty or that
-    /// attempt ended. `true`: nothing is pending. Nothing is written while disabled.
+    /// attempt ended with a file failing. Lines queued while it ran (a commit racing the call)
+    /// get another attempt: after a forced attempt no file failing means none of its lines is
+    /// left. `true`: nothing is pending. Nothing is written while disabled.
     pub(crate) fn drain(&self, timeout: Duration) -> bool {
         let end = Instant::now() + timeout;
         let mut st = lock(&self.state);
@@ -589,15 +591,23 @@ impl AnchorDirShared {
         if !st.enabled || st.dead || st.exited {
             return empty(&st);
         }
-        let before = st.forced;
+        let mut before = st.forced;
         st.drain = true;
         self.cv.notify_all();
         loop {
             if empty(&st) {
                 return true;
             }
-            if st.forced > before || st.exited {
+            if st.exited {
                 return false;
+            }
+            if st.forced > before {
+                if !st.failing.is_empty() || !st.enabled {
+                    return false;
+                }
+                before = st.forced;
+                st.drain = true;
+                self.cv.notify_all();
             }
             let left = end.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -1304,6 +1314,62 @@ mod tests {
         let t = Instant::now();
         assert!(!s.drain_and_stop(budget));
         assert!(t.elapsed() < budget / 3, "{:?}", t.elapsed());
+    }
+
+    /// Waits (bounded) until `cond` holds for the shared state.
+    fn until(s: &AnchorDirShared, what: &str, cond: impl Fn(&DirState) -> bool) {
+        let end = Instant::now() + Duration::from_secs(10);
+        while !cond(&lock(&s.state)) {
+            assert!(Instant::now() < end, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_line_queued_during_the_forced_attempt_is_drained_too() {
+        // As a commit on the writer thread racing `testing_anchor_dir_drain` (CI, Linux).
+        let dir = tempfile::tempdir().expect("dir");
+        let chain_id = "0123456789abcdef0123456789abcdef";
+        let at = |seq| Pending {
+            dir: Some(dir.path().to_string_lossy().into_owned()),
+            chain_id: chain_id.to_owned(),
+            ..line(seq, Keep::Always)
+        };
+        let s = Arc::new(AnchorDirShared::new());
+        s.init(true, 1);
+        s.push(vec![at(1)]);
+        // The forced attempt takes line 1 and waits on the file lock while line 2 is queued.
+        let held = lock(&s.file_lock);
+        let drainer = {
+            let s = Arc::clone(&s);
+            std::thread::spawn(move || s.drain(Duration::from_secs(10)))
+        };
+        until(&s, "the drain request", |st| st.drain);
+        let clock: Arc<dyn Clock> = Arc::new(crate::testing::FakeClock::new(
+            crate::clock::UtcInstant(1_760_000_000_000),
+        ));
+        let thread = {
+            let s = Arc::clone(&s);
+            let header = HeaderFacts::new("i".into(), clock);
+            std::thread::spawn(move || run(s, header))
+        };
+        until(&s, "the forced attempt", |st| {
+            st.in_flight == 1 && !st.drain
+        });
+        s.push(vec![at(2)]);
+        drop(held);
+        assert!(drainer.join().expect("drainer"), "line 2 still pending");
+        let text = std::fs::read_to_string(dir.path().join(file_name(chain_id))).expect("file");
+        let seqs: Vec<u64> = text
+            .lines()
+            .filter_map(|l| match parse_line(l) {
+                Ok(AnchorLine::Record { seq, .. }) => Some(seq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seqs, vec![1, 2], "{text}");
+        assert!(s.drain_and_stop(Duration::from_secs(5)));
+        thread.join().expect("thread");
     }
 
     fn note(seq: u64, epoch: Option<&str>, cd: Option<&str>, flags: EventFlags) -> RowNote {
