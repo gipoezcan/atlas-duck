@@ -996,36 +996,45 @@ pub async fn export_cancel<R: Runtime>(
 }
 
 /// `backup_trigger {}` (§8.10, PD-181): Rust's folder dialog and `Store::backup` through
-/// `removal::backup`'s path, as the audit job; `saved: false` is a cancelled dialog.
+/// `removal::backup`'s path, as the audit job ([`backup_job`]); `saved: false` is a cancelled
+/// dialog.
 #[tauri::command]
 pub async fn backup_trigger<R: Runtime>(
     app: AppHandle<R>,
     args: Args<BackupTriggerArgs>,
 ) -> Result<BackupAnswer, CommandError> {
     let Args(BackupTriggerArgs {}) = args;
-    let response = async {
-        let state = serving(&app)?;
-        let store = state.open_store().ok_or(CommandError::NotReady)?;
-        let handle = app.clone();
-        let rx = state
-            .spawn_audit_job(AuditJobKind::Backup, move |cancel| {
-                let removal = handle
-                    .try_state::<RemovalState>()
-                    .ok_or(CommandError::NotReady)?;
-                removal::backup(&removal, || {
-                    run_backup(
-                        &store,
-                        || super::settings::pick_backup_folder(&handle),
-                        &cancel,
-                        &handle,
-                    )
-                })
-            })
-            .map_err(job_refused)?;
-        rx.await.map_err(|_| CommandError::Internal)?
-    }
-    .await;
+    let response = backup_job(&app).await;
     finish(&app, response)
+}
+
+/// The full backup of `backup_trigger` and of "Prepare for removal"'s `removal_backup` (M10 T16
+/// review I-2: one body for both): the serving state's one job (`busy` while another holds the
+/// slot; the quit path sets its cancel flag and waits for it), inside `removal::backup`'s claim
+/// (`removal {running}` while a removal call runs), [`run_backup`] (a cancel set while the folder
+/// dialog was open backs up nothing).
+pub(crate) async fn backup_job<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Result<BackupAnswer, CommandError> {
+    let state = serving(app)?;
+    let store = state.open_store().ok_or(CommandError::NotReady)?;
+    let handle = app.clone();
+    let rx = state
+        .spawn_audit_job(AuditJobKind::Backup, move |cancel| {
+            let removal = handle
+                .try_state::<RemovalState>()
+                .ok_or(CommandError::NotReady)?;
+            removal::backup(&removal, || {
+                run_backup(
+                    &store,
+                    || super::settings::pick_backup_folder(&handle),
+                    &cancel,
+                    &handle,
+                )
+            })
+        })
+        .map_err(job_refused)?;
+    rx.await.map_err(|_| CommandError::Internal)?
 }
 
 #[cfg(test)]

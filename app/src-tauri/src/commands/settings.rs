@@ -1117,6 +1117,9 @@ struct Served {
     confirmer: Arc<dyn atlas_duck_core::NativeConfirmer>,
     /// The open store: the newest record's epoch and the procedure's records (PD-176).
     store: atlas_duck_audit::Store,
+    /// The serving state: its job slot holds `removal_begin` and `removal_finish` off (M10 T16
+    /// review M-6).
+    serving: Arc<crate::serve::ServeState>,
 }
 
 fn served<R: Runtime>(app: &AppHandle<R>) -> Result<Served, CommandError> {
@@ -1132,30 +1135,22 @@ fn served<R: Runtime>(app: &AppHandle<R>) -> Result<Served, CommandError> {
         settings: core.settings(),
         confirmer,
         store,
+        serving: state,
     })
 }
 
 /// The retention facts beside the backup offer (§12.5 step 1, PD-176): the setting, and the
-/// newest record's remaining days from its `epoch` and today's UTC date.
+/// newest record's remaining days from its `epoch` and today's UTC date (display only: a head that
+/// cannot be read shows the setting, [`removal::retention_shown`]).
 async fn retention_of(served: &Served) -> Result<Retention, CommandError> {
     let (settings, store) = (served.settings.clone(), served.store.clone());
     blocking(move || {
         use atlas_duck_audit::Clock as _;
         let view = settings.view();
-        let newest = store
-            .query(
-                &atlas_duck_audit::AuditFilter::default(),
-                atlas_duck_audit::AuditCursor::first(1),
-            )
-            .map_err(|e| match e {
-                atlas_duck_audit::AuditError::Closed => CommandError::NotReady,
-                _ => CommandError::Audit(super::AuditReadFailure::Failed),
-            })?;
-        let epoch = newest.rows.first().and_then(|h| h.epoch.clone());
-        Ok(Retention::of(
+        Ok(removal::retention_shown(
             view.retention_days,
             view.legal_hold,
-            epoch.as_deref(),
+            removal::newest_epoch(&store),
             atlas_duck_audit::SystemClock::new().now_utc(),
         ))
     })
@@ -1163,35 +1158,27 @@ async fn retention_of(served: &Served) -> Result<Retention, CommandError> {
 }
 
 /// PD-176: before the first removal call of a process, the audit log is read back for an open
-/// procedure. A closed store is `not_ready`; a log that cannot be read resumes nothing (logged by
-/// class): the procedure then starts over, as before PD-176.
+/// procedure ([`RemovalState::hydrate_from`]: a closed store is `not_ready`; a log that cannot be
+/// read resumes nothing).
 async fn hydrate(state: &RemovalState, served: &Served) -> Result<(), CommandError> {
     if !state.needs_log() {
         return Ok(());
     }
     let (store, admin) = (served.store.clone(), served.instances.clone());
-    let (facts, views) = blocking(move || {
-        let facts = match removal::read_log(&store) {
-            Ok(facts) => facts,
-            Err(atlas_duck_audit::AuditError::Closed) => return Err(CommandError::NotReady),
-            Err(_) => {
-                tracing::warn!(
-                    event = removal::LOG_EVENT_REMOVAL_FAILED,
-                    error_class = "audit"
-                );
-                removal::LogFacts::default()
-            }
-        };
-        Ok((facts, admin.list()))
-    })
-    .await?;
-    state.hydrate(facts, &views);
-    Ok(())
+    let (read, views) = blocking(move || Ok((removal::read_log(&store), admin.list()))).await?;
+    state.hydrate_from(read, &views)
 }
 
 /// The credential window is open for a token (add or replace).
 fn pat_window_open<R: Runtime>(app: &AppHandle<R>) -> bool {
     credential::current_purpose(app).is_some_and(|p| p.pat_target().is_some())
+}
+
+/// What holds `removal_begin` and `removal_finish` off (`busy`): the credential window open for a
+/// token, or the serving state's job slot held (an export, a backup, a restore, a recovery-tier
+/// flow; M10 T16 review M-6: a restore could take the choices record back after the effects ran).
+fn removal_held_off<R: Runtime>(app: &AppHandle<R>, serving: &crate::serve::ServeState) -> bool {
+    pat_window_open(app) || serving.job_running()
 }
 
 /// The end of every removal call: logs a failure by kind and answers.
@@ -1264,44 +1251,19 @@ pub async fn removal_export<R: Runtime>(
     conclude_removal(&app, response, false)
 }
 
-/// `removal_backup {}` (§12.5 step 1): Rust's folder dialog, then `Store::backup` into a new bundle
-/// directory there (no token in it, §8.10; the store logs `BACKUP`). A cancelled dialog is
-/// `saved: false`. The webview supplies no path.
+/// `removal_backup {}` (§12.5 step 1): the Audit window's `backup_trigger` (M10 T16 review I-2, one
+/// body for both): Rust's folder dialog, then `Store::backup` into a new bundle directory there (no
+/// token in it, §8.10; the store logs `BACKUP`), as the serving state's one job (`busy` while
+/// another holds the slot; Quit waits for it, and a Quit while the dialog was open backs up
+/// nothing). A cancelled dialog is `saved: false`. The webview supplies no path.
 #[tauri::command]
 pub async fn removal_backup<R: Runtime>(
     app: AppHandle<R>,
     args: Args<RemovalBackupArgs>,
 ) -> Result<BackupAnswer, CommandError> {
     let Args(RemovalBackupArgs {}) = args;
-    let handle = app.clone();
-    let response = match served(&app) {
-        Ok(_) => {
-            blocking(move || {
-                let state = handle
-                    .try_state::<RemovalState>()
-                    .ok_or(CommandError::NotReady)?;
-                removal::backup(&state, || pick_folder_and_back_up(&handle))
-            })
-            .await
-        }
-        Err(e) => Err(e),
-    };
+    let response = super::audit::backup_job(&app).await;
     conclude_removal(&app, response, false)
-}
-
-/// The folder dialog and the backup into it. Blocks until the user answers: the blocking pool only.
-fn pick_folder_and_back_up<R: Runtime>(app: &AppHandle<R>) -> Result<bool, CommandError> {
-    let store = app
-        .try_state::<ServeSlot>()
-        .and_then(|slot| slot.get().and_then(|s| s.open_store()))
-        .ok_or(CommandError::NotReady)?;
-    let Some(dir) = pick_backup_folder(app)? else {
-        return Ok(false);
-    };
-    store
-        .backup(dir)
-        .map_err(|e| CommandError::Settings(SettingsError::Audit(e)))?;
-    Ok(true)
 }
 
 /// Rust's folder dialog for a backup bundle (§12.5 step 1, and the Audit window's `backup_trigger`,
@@ -1338,11 +1300,12 @@ pub async fn removal_begin<R: Runtime>(
             .try_state::<RemovalState>()
             .ok_or(CommandError::NotReady)?;
         hydrate(&state, &served).await?;
+        let serving = served.serving;
         removal::begin(
             &state,
             served.instances,
             served.confirmer,
-            || pat_window_open(&app),
+            || removal_held_off(&app, &serving),
             retention,
         )
         .await
@@ -1387,6 +1350,7 @@ pub async fn removal_finish<R: Runtime>(
             .try_state::<RemovalState>()
             .ok_or(CommandError::NotReady)?;
         hydrate(&state, &served).await?;
+        let serving = served.serving;
         removal::finish(
             &state,
             served.instances,
@@ -1396,7 +1360,7 @@ pub async fn removal_finish<R: Runtime>(
             Arc::new(SystemOps),
             layout,
             fallback,
-            || pat_window_open(&app),
+            || removal_held_off(&app, &serving),
         )
         .await
     }

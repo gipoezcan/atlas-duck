@@ -3935,7 +3935,8 @@ mod settings_commands {
     /// before any dialog and removes nothing, and the next `begin` deletes the token.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn finish_checks_every_instance_not_only_the_checklist() -> TestResult {
-        // Both instances start unconfirmed: `begin` lists none, nothing can hold a token yet.
+        // Both instances start unconfirmed: `begin` deletes their tokens and lists both as
+        // "identity unknown" (M10 T16 review I-1); the user skips them.
         let h = Harness::builder()
             .jira("jira-main")
             .confluence("wiki")
@@ -3946,7 +3947,8 @@ mod settings_commands {
         let st = RemovalState::default();
         let m = machine(&h).await?;
         let dto = begin_with(&h, &st, false).await?;
-        assert!(dto.active && dto.instances.is_empty(), "{dto:?}");
+        assert!(dto.active && dto.instances.len() == 2, "{dto:?}");
+        answer_all(&st, &["jira-main", "wiki"], Choice::Skipped)?;
         // Confirmed after `begin`, and given a token then (M10 T16, T28 m-1: `begin` deleted the
         // harness's stored one although the instance was not listed).
         h.instances().confirm_config_instance("jira-main")?;
@@ -4189,6 +4191,109 @@ mod settings_commands {
         Ok(())
     }
 
+    /// M10 T16 review I-3: a token stored after the failed effect (the credential window is not
+    /// held off by a procedure, only by a running call) is what a restarted process shows: that
+    /// item is "not deleted, not answered" with the identity the table shows now, the recorded
+    /// choices are open again, `finish` waits, and `begin` deletes the token before the procedure
+    /// can end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_resumed_procedure_shows_a_token_stored_since() -> TestResult {
+        let h = two(vec![Confirm::Ok, Confirm::Ok, Confirm::Ok, Confirm::Ok]).await?;
+        let m = machine(&h).await?;
+        finish_failed_on_autostart(&h, &m).await?;
+        let mock = h.mock("jira-main").ok_or("mock")?;
+        mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+            .await;
+        mock.jira_server_info("9.12.0").await;
+        h.instances()
+            .set_token("jira-main", secrecy::SecretString::from("fresh-pat"), None)
+            .await?;
+        let st = restarted(&h).await?;
+        let dto = st.dto(RET);
+        assert!(dto.active && !dto.recorded, "{dto:?}");
+        let item = |dto: &RemovalDto, alias: &str| {
+            dto.instances
+                .iter()
+                .find(|i| i.alias == alias)
+                .map(|i| (i.token_deleted, i.choice, i.identity.clone()))
+        };
+        assert_eq!(
+            item(&dto, "jira-main"),
+            Some((false, Choice::Pending, Some(TEST_USER.to_owned())))
+        );
+        assert_eq!(
+            item(&dto, "wiki").map(|(deleted, choice, _)| (deleted, choice)),
+            Some((true, Choice::Skipped)),
+            "the other answer stays"
+        );
+        assert_eq!(
+            finish_with(&h, &st, &m, false).await.err(),
+            Some(CommandError::Removal(RemovalError::Unticked))
+        );
+        begin_with(&h, &st, false).await?;
+        answer_all(&st, &["jira-main"], Choice::Done)?;
+        finish_with(&h, &st, &m, false).await?;
+        assert!(!st.dto(RET).active);
+        Ok(())
+    }
+
+    /// M10 T16 review M-6: `begin` and `finish` are held off (`busy`) while the serving state's job
+    /// slot is held, also when it is taken while their dialog is up: after the Ok nothing is
+    /// deleted, recorded or removed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn begin_and_finish_are_held_off_after_their_dialog() -> TestResult {
+        let h = two(vec![Confirm::Ok, Confirm::Ok, Confirm::Ok]).await?;
+        let m = machine(&h).await?;
+        let st = RemovalState::default();
+        // Free before the dialog, held after it.
+        let held_after_dialog = || {
+            let calls = std::sync::atomic::AtomicU32::new(0);
+            move || calls.fetch_add(1, Ordering::SeqCst) > 0
+        };
+        let events = h.event_count().await?;
+        let res = removal::begin(
+            &st,
+            h.instances(),
+            h.confirmer().clone(),
+            held_after_dialog(),
+            RET,
+        )
+        .await;
+        assert_eq!(res.err(), Some(CommandError::Busy));
+        assert_eq!(h.confirmer().texts().len(), 1, "the dialog was shown");
+        assert_eq!(h.event_count().await?, events, "nothing deleted or logged");
+        assert!(!st.dto(RET).active);
+        assert!(
+            h.instances().list().iter().all(|v| v.executes_as.is_some()),
+            "the tokens are kept"
+        );
+        begin_with(&h, &st, false).await?;
+        answer_all(&st, &["jira-main", "wiki"], Choice::Done)?;
+        let records = h.event_count().await?;
+        let res = removal::finish(
+            &st,
+            h.instances(),
+            h.core().settings(),
+            h.confirmer().clone(),
+            m.autostart.clone(),
+            m.ops.clone(),
+            Ok(m.layout.clone()),
+            None,
+            held_after_dialog(),
+        )
+        .await;
+        assert_eq!(res.err(), Some(CommandError::Busy));
+        assert_eq!(
+            h.confirmer().texts().len(),
+            3,
+            "the finish dialog was shown"
+        );
+        assert_eq!(h.event_count().await?, records, "nothing recorded");
+        assert!(m.autostart.is_on());
+        assert!(st.dto(RET).active && !st.dto(RET).recorded);
+        Ok(())
+    }
+
     /// M6 M-12, T28 m-5: a `finish` that removed autostart and then failed at the CLI step answers
     /// `removed` for autostart on its retry (it is off by then), in the same process and after a
     /// restart.
@@ -4216,18 +4321,22 @@ mod settings_commands {
     }
 
     /// T28 m-1, m-2: the first `begin` deletes the token of every instance, also one the checklist
-    /// does not list (an unconfirmed instance holds the harness's stored token): no keychain entry
+    /// would not list (an unconfirmed instance holds the harness's stored token): no keychain entry
     /// outlives the procedure. Its dialog names every such instance and marks the ones whose token
-    /// identity is unknown.
+    /// identity is unknown. M10 T16 review I-1 (the table that failed closed: every instance
+    /// unconfirmed, no identity): each one whose delete went through is on the checklist,
+    /// deleted, identity unknown, so `finish` cannot complete without a revoke step for it; the
+    /// user skips it, and the choices record names it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn begin_covers_every_instance_with_a_token() -> TestResult {
         let h = Harness::builder()
             .jira("jira-main")
             .confluence("wiki")
             .unconfirmed()
-            .confirm(vec![Confirm::Ok])
+            .confirm(vec![Confirm::Ok, Confirm::Ok])
             .start()
             .await?;
+        let m = machine(&h).await?;
         let ids: Vec<String> = ["jira-main", "wiki"]
             .iter()
             .map(|a| h.instance(a).map(|i| i.id.clone()).ok_or("instance"))
@@ -4245,13 +4354,52 @@ mod settings_commands {
         for id in &ids {
             assert!(!h.credentials().contains(id), "{id}: the token is gone");
         }
-        assert!(dto.active && dto.instances.is_empty(), "{dto:?}");
+        let listed: Vec<(&str, Option<&str>, bool, Choice)> = dto
+            .instances
+            .iter()
+            .map(|i| {
+                (
+                    i.alias.as_str(),
+                    i.identity.as_deref(),
+                    i.token_deleted,
+                    i.choice,
+                )
+            })
+            .collect();
+        assert!(dto.active, "{dto:?}");
+        assert_eq!(
+            listed,
+            [
+                ("jira-main", None, true, Choice::Pending),
+                ("wiki", None, true, Choice::Pending)
+            ]
+        );
         let texts = h.confirmer().texts();
         let text = texts.last().ok_or("no dialog")?;
         assert!(
             text.contains("jira-main (identity unknown), wiki (identity unknown)"),
             "{text}"
         );
+        assert!(text.contains("the next step lists it as well"), "{text}");
+        // No revoke step can be passed over: `finish` waits for both answers.
+        assert_eq!(
+            finish_with(&h, &st, &m, false).await.err(),
+            Some(CommandError::Removal(RemovalError::Unticked))
+        );
+        answer_all(&st, &["jira-main", "wiki"], Choice::Skipped)?;
+        finish_with(&h, &st, &m, false).await?;
+        let records = h.events_of(EventType::CONFIG_CHANGED).await?;
+        let choices = records
+            .iter()
+            .find(|v| v["key"] == "prepare_for_removal" && v["new"]["instances"].is_array())
+            .ok_or("no choices record")?;
+        let named: Vec<(&str, &str)> = choices["new"]["instances"]
+            .as_array()
+            .ok_or("instances")?
+            .iter()
+            .filter_map(|i| Some((i["alias"].as_str()?, i["revoke"].as_str()?)))
+            .collect();
+        assert_eq!(named, [("jira-main", "skipped"), ("wiki", "skipped")]);
         Ok(())
     }
 

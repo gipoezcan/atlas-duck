@@ -15,11 +15,14 @@
 //! prepare_for_removal}` back ([`read_log`], [`RemovalState::hydrate`]); a choices record that no
 //! outcome record followed is a procedure whose effects did not all run, and it is resumed with its
 //! answers, token identities and backup flag, recorded (a retried `finish` does not record the
-//! choices again). Before that record exists, the procedure is resumable by idempotence: after a
-//! restart, `begin` again deletes only what is still stored and logs nothing for what is gone, and
-//! the checklist lists *every* confirmed instance, so a token deleted before the restart is still
-//! offered for revocation (its identity is no longer known: `delete_token` clears it, so the page
-//! says so).
+//! choices again; a token stored since puts its item back to "not deleted"). A resumed procedure
+//! ends only with `finish` (M10 T16 review I-3: no abandon). A `RESTORE` newer than the choices
+//! record ends the scan with nothing resumed. Before that record exists, the procedure is
+//! resumable by idempotence: after a restart, `begin` again deletes only what is still stored and
+//! logs nothing for what is gone, and the checklist lists *every* confirmed instance and every
+//! other one whose delete succeeded (M10 T16 review I-1), so a token deleted before the restart is
+//! still offered for revocation (its identity is no longer known: `delete_token` clears it, so the
+//! page says so).
 //!
 //! Core decides, the page asks: nothing here takes a path, an origin or a token from a webview.
 //! Every dialog is drawn by Rust through the injected [`NativeConfirmer`] on the blocking pool.
@@ -45,6 +48,7 @@ use crate::cli_install::{self, InstallError, Kind, Layout, PlatformOps};
 use crate::commands::CommandError;
 use crate::commands::audit::{ExportDoneDto, run_export};
 use crate::commands::settings::cli_uninstall_dto;
+use crate::recovery_tier::DIALOG_LIST_MAX;
 use crate::ui_sink::EventOut;
 
 /// §12.5 step 2 (verbatim): shown per instance with its alias and token identity.
@@ -223,6 +227,30 @@ impl Retention {
     }
 }
 
+/// The newest record's `epoch` (§12.5 step 1: the log's head; PD-176), for [`retention_shown`].
+pub fn newest_epoch(store: &Store) -> Result<Option<String>, AuditError> {
+    let page = store.query(&AuditFilter::default(), AuditCursor::first(1))?;
+    Ok(page.rows.first().and_then(|h| h.epoch.clone()))
+}
+
+/// The retention facts the page shows (PD-176), `newest` being [`newest_epoch`]'s answer. They are
+/// display only (M10 T16 review M-2): a log whose head cannot be read shows the setting itself (a
+/// truthful "at least"), logged by class, and the removal call goes on. `today` is the system
+/// clock's, not the corroborated date prune uses: a clock behind shows at most the setting, a clock
+/// ahead a smaller number.
+pub fn retention_shown(
+    days: u32,
+    legal_hold: bool,
+    newest: Result<Option<String>, AuditError>,
+    today: UtcInstant,
+) -> Retention {
+    let epoch = newest.unwrap_or_else(|_| {
+        tracing::warn!(event = LOG_EVENT_REMOVAL_FAILED, error_class = "audit");
+        None
+    });
+    Retention::of(days, legal_hold, epoch.as_deref(), today)
+}
+
 /// One instance of the checklist as the page sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ItemDto {
@@ -395,21 +423,46 @@ impl RemovalState {
                 alias: r.alias,
                 product: r.product,
                 identity: r.identity,
-                // `finish` wrote the record only once every token was deleted; a token stored
-                // since is found by the next `begin` or `finish` (`reconcile`).
+                // `finish` wrote the record only once every token was deleted.
                 deleted: true,
                 error: None,
                 choice: r.choice,
             })
             .collect();
-        inner.procedure = Some(Procedure {
+        let mut procedure = Procedure {
             items,
             recorded: true,
             autostart_removed: open.autostart_removed,
-        });
+        };
+        // M10 T16 review I-3: a token stored since (entered after the failed effect) is what the
+        // live table says, not the record: that item is "not deleted, not answered" with the
+        // identity shown now, and the recorded choices no longer describe the procedure.
+        reconcile(&mut procedure, views, false);
+        inner.procedure = Some(procedure);
         // A backup made in this process before the first hydrating call (the Audit window's "Back
         // up now") belongs to the open procedure too.
         inner.backup_made |= open.backup;
+    }
+
+    /// The command layer's step before a removal call (PD-176): `read` is [`read_log`]'s answer,
+    /// `views` the live instance list. A closed store is `not_ready`, and the log is read again by
+    /// the next call; any other error resumes nothing (logged by class), so the procedure starts
+    /// over as before PD-176, and the log is not read again in this process.
+    pub fn hydrate_from(
+        &self,
+        read: Result<LogFacts, AuditError>,
+        views: &[InstanceView],
+    ) -> Result<(), CommandError> {
+        let facts = match read {
+            Ok(facts) => facts,
+            Err(AuditError::Closed) => return Err(CommandError::NotReady),
+            Err(_) => {
+                tracing::warn!(event = LOG_EVENT_REMOVAL_FAILED, error_class = "audit");
+                LogFacts::default()
+            }
+        };
+        self.hydrate(facts, views);
+        Ok(())
     }
 
     /// A removal call is running now (the credential window must not open meanwhile).
@@ -562,10 +615,18 @@ async fn confirmed(confirmer: &Arc<dyn NativeConfirmer>, text: String) -> Result
 /// PD-176: the newest `CONFIG_CHANGED {source: app, key: prepare_for_removal}` of `store`, read
 /// back. Newest first over the `CONFIG_CHANGED` headers, decrypting each (the key is in the payload
 /// only), at most [`MAX_LOG_SCAN_RECORDS`]; on the way it notes the newest `autostart` record newer
-/// than that record. A store that cannot be read is the caller's to handle.
+/// than that record. A `RESTORE` newer than that record ends the scan with no procedure (M10 T16
+/// review M-6): a choices record older than a restore came in with the restored backup (another
+/// machine's procedure, §8.7, or one the rollback took back), and is not resumed. A store that
+/// cannot be read is the caller's to handle.
 pub fn read_log(store: &Store) -> Result<LogFacts, AuditError> {
+    read_log_capped(store, MAX_LOG_SCAN_RECORDS)
+}
+
+/// [`read_log`] with at most `cap` payloads decrypted (tests lower it).
+pub(crate) fn read_log_capped(store: &Store, cap: usize) -> Result<LogFacts, AuditError> {
     let filter = AuditFilter {
-        event_types: vec![EventType::CONFIG_CHANGED],
+        event_types: vec![EventType::CONFIG_CHANGED, EventType::RESTORE],
         ..AuditFilter::default()
     };
     let mut cursor = AuditCursor::first(MAX_AUDIT_PAGE_ROWS);
@@ -575,7 +636,10 @@ pub fn read_log(store: &Store) -> Result<LogFacts, AuditError> {
     loop {
         let page = store.query(&filter, cursor)?;
         for header in &page.rows {
-            if read == MAX_LOG_SCAN_RECORDS {
+            if header.event_type == EventType::RESTORE {
+                return Ok(LogFacts::default());
+            }
+            if read == cap {
                 tracing::warn!(
                     event = LOG_EVENT_REMOVAL_FAILED,
                     error_class = "log_scan_limit"
@@ -651,6 +715,11 @@ fn open_procedure(new: &Value, autostart_removed: bool) -> Option<OpenProcedure>
             })
         })
         .collect::<Option<Vec<_>>>()?;
+    // `finish` names each instance once (M10 T16 review M-9).
+    let mut seen = std::collections::HashSet::new();
+    if !items.iter().all(|i| seen.insert(i.alias.as_str())) {
+        return None;
+    }
     Some(OpenProcedure {
         backup: new.get("backup").and_then(Value::as_bool).unwrap_or(false),
         items,
@@ -680,13 +749,15 @@ pub fn export(
 
 /// plan text (M6 T28, T28 m-2; the step is §12.5's): what `begin` asks. `targets` are the instances
 /// whose token is deleted, each with whether the instance table knows the stored token's identity.
-/// Aliases are Rust-validated names (`A-Za-z0-9._-`); no server text (no identity) is in the text.
+/// Aliases are Rust-validated names (`A-Za-z0-9._-`, at most 64); no server text (no identity) is
+/// in the text. At most [`DIALOG_LIST_MAX`] are named, the rest counted (M10 T16 review M-10).
 pub fn begin_text(targets: &[(String, bool)]) -> String {
     let tokens = if targets.is_empty() {
         "No instance is set up, so no token is deleted.".to_owned()
     } else {
-        let list = targets
+        let mut list = targets
             .iter()
+            .take(DIALOG_LIST_MAX)
             .map(|(alias, known)| {
                 if *known {
                     alias.clone()
@@ -696,9 +767,15 @@ pub fn begin_text(targets: &[(String, bool)]) -> String {
             })
             .collect::<Vec<_>>()
             .join(", ");
+        if targets.len() > DIALOG_LIST_MAX {
+            list.push_str(&format!(" and {} more", targets.len() - DIALOG_LIST_MAX));
+        }
+        // M10 T16 review I-1: such an instance is on the next step's list too, to be skipped
+        // there when it never had a token.
         let unknown = if targets.iter().any(|(_, known)| !known) {
             "An instance marked \"identity unknown\" has no token identity on record: a token \
-             stored for it is deleted too. "
+             stored for it is deleted too, and the next step lists it as well (skip it there if \
+             it never had a token). "
         } else {
             ""
         };
@@ -740,19 +817,21 @@ pub fn backup(
     Ok(BackupAnswer { saved })
 }
 
-/// `begin` (§12.5 step 2): refuses while the credential window is open for a token (a submit in
-/// flight could store one after the delete; T20 m-9); confirms natively; deletes the stored
-/// tokens. A second `begin` deletes only what is still stored (a failed delete, or a token entered
-/// since) and shows the same dialog again. `ShuttingDown` ends the call at once.
+/// `begin` (§12.5 step 2): refuses (`busy`) while `held_off` says the credential window is open
+/// for a token (a submit in flight could store one after the delete; T20 m-9) or the serving
+/// state's job slot is held (a restore could take the log back meanwhile; M10 T16 review M-6),
+/// before the dialog and again after it; confirms natively; deletes the stored tokens. A second
+/// `begin` deletes only what is still stored (a failed delete, or a token entered since) and shows
+/// the same dialog again. `ShuttingDown` ends the call at once.
 pub async fn begin(
     state: &RemovalState,
     instances: Arc<dyn InstanceAdmin>,
     confirmer: Arc<dyn NativeConfirmer>,
-    pat_window_open: impl Fn() -> bool,
+    held_off: impl Fn() -> bool,
     retention: Retention,
 ) -> Result<RemovalDto, CommandError> {
     let _claim = state.claim()?;
-    if pat_window_open() {
+    if held_off() {
         return Err(CommandError::Busy);
     }
     let views = {
@@ -782,6 +861,10 @@ pub async fn begin(
         })
         .collect();
     confirmed(&confirmer, begin_text(&named)).await?;
+    // The dialog may have been up for minutes: a job that took the slot meanwhile holds it off.
+    if held_off() {
+        return Err(CommandError::Busy);
+    }
     {
         let mut inner = state.lock();
         let procedure = inner.procedure.get_or_insert_with(Procedure::default);
@@ -802,8 +885,26 @@ pub async fn begin(
                 item.deleted = true;
                 item.error = None;
             }
-            // Not on the checklist, and nothing (left) stored.
-            (Ok(_), None) => {}
+            // M10 T16 review I-1: an instance off the checklist (unconfirmed, or `http://`, with no
+            // identity on record: a table that failed closed lists none of them) whose token was
+            // deleted, if one was stored: it joins the checklist as deleted, identity unknown, so
+            // its revoke step is offered before the procedure completes; the user skips it when it
+            // never had a token. (Only a first run gets here: afterwards `reconcile` already put
+            // every target on the checklist.)
+            (Ok(_), None) => {
+                if let Some(v) = views.iter().find(|v| v.alias == alias) {
+                    p.recorded = false;
+                    p.items.push(Item {
+                        alias,
+                        product: product_str(v.product),
+                        origin: v.origin.clone(),
+                        identity: v.executes_as.clone(),
+                        deleted: true,
+                        error: None,
+                        choice: Choice::Pending,
+                    });
+                }
+            }
             (Err(e), Some(item)) => item.error = Some(e.to_string()),
             // An instance off the checklist whose delete failed may still hold a token: it joins
             // the checklist as not deleted, so `finish` waits for a `begin` that deletes it.
@@ -984,8 +1085,9 @@ async fn recheck_tokens(
 }
 
 /// `finish` (§12.5 steps 2 to 4): refused until every listed instance is ticked or skipped with
-/// its token deleted, and while the credential window is open; a token found stored again flips
-/// its item back to "not deleted" and removes nothing. Then the native confirmation, one
+/// its token deleted, and while `held_off` (as for [`begin`]: the credential window open for a
+/// token, the job slot held; again after the dialog); a token found stored again flips its item
+/// back to "not deleted" and removes nothing. Then the native confirmation, one
 /// `CONFIG_CHANGED {key: prepare_for_removal}` with the choices (once: a retry after a failed
 /// effect does not repeat it), autostart, the CLI. Nothing here touches the KEK, the anchors or
 /// the DB. A failed effect leaves the procedure in place for a retry.
@@ -999,10 +1101,10 @@ pub async fn finish(
     ops: Arc<dyn PlatformOps>,
     layout: Result<Layout, InstallError>,
     fallback: Option<Layout>,
-    pat_window_open: impl Fn() -> bool,
+    held_off: impl Fn() -> bool,
 ) -> Result<FinishAnswer, CommandError> {
     let _claim = state.claim()?;
-    if pat_window_open() {
+    if held_off() {
         return Err(CommandError::Busy);
     }
     {
@@ -1024,6 +1126,9 @@ pub async fn finish(
     // are held off by the claim, but a submit already under way is not).
     recheck_tokens(state, &instances).await?;
     confirmed(&confirmer, finish_text()).await?;
+    if held_off() {
+        return Err(CommandError::Busy);
+    }
     recheck_tokens(state, &instances).await?;
     let (items, recorded, backup_made) = {
         let inner = state.lock();
@@ -1315,6 +1420,7 @@ mod tests {
             text.contains("\"identity unknown\" has no token identity on record"),
             "{text}"
         );
+        assert!(text.contains("the next step lists it as well"), "{text}");
         assert!(text.contains("stays valid"), "{text}");
         assert!(!text.contains('\u{201C}'), "no quoted identity: {text}");
         let none = begin_text(&[]);
@@ -1324,6 +1430,30 @@ mod tests {
             none.contains("audit log, its keys and anchors are kept"),
             "{none}"
         );
+    }
+
+    /// M10 T16 review M-10: the begin dialog names at most [`DIALOG_LIST_MAX`] instances and
+    /// counts the rest; the "identity unknown" sentence stays when only an uncounted one is so.
+    #[test]
+    fn begin_dialog_is_bounded() {
+        let alias = |i: usize| format!("{i:02}-{}", "a".repeat(60));
+        let mut targets: Vec<(String, bool)> =
+            (0..DIALOG_LIST_MAX + 5).map(|i| (alias(i), true)).collect();
+        if let Some(last) = targets.last_mut() {
+            last.1 = false;
+        }
+        let text = begin_text(&targets);
+        assert!(text.contains(&alias(DIALOG_LIST_MAX - 1)), "{text}");
+        assert!(!text.contains(&alias(DIALOG_LIST_MAX)), "{text}");
+        assert!(text.contains(" and 5 more."), "{text}");
+        assert!(text.contains("\"identity unknown\" has no token identity"));
+        assert!(
+            text.chars().count() < DIALOG_LIST_MAX * (MAX_ALIAS_CHARS + 20) + 1_000,
+            "{} characters",
+            text.chars().count()
+        );
+        let exactly = begin_text(&targets[..DIALOG_LIST_MAX]);
+        assert!(!exactly.contains("more"), "{exactly}");
     }
 
     /// A `CONFIG_CHANGED {source: app}` as `SettingsAdmin::record_app_change` writes it.
@@ -1540,6 +1670,268 @@ mod tests {
         own.hydrate(facts, &views);
         assert!(own.dto(ret).instances.is_empty());
         assert!(!own.dto(ret).recorded);
+    }
+
+    /// M10 T16 review I-3: a token stored since the choices record (entered after the failed
+    /// effect) is taken from the live table, not from the record: that item is "not deleted, not
+    /// answered" with the identity shown now, and the choices are open again; the others keep
+    /// their recorded answers.
+    #[test]
+    fn hydrate_takes_a_token_stored_since_from_the_live_table() {
+        let facts = LogFacts {
+            open: Some(OpenProcedure {
+                backup: false,
+                autostart_removed: false,
+                items: vec![
+                    RecordedItem {
+                        alias: "ok".into(),
+                        product: "jira",
+                        identity: Some("Alice".into()),
+                        choice: Choice::Done,
+                    },
+                    RecordedItem {
+                        alias: "wiki".into(),
+                        product: "confluence",
+                        identity: None,
+                        choice: Choice::Skipped,
+                    },
+                ],
+            }),
+        };
+        let views = [
+            view("ok", "ok", Some("Bob")),
+            view("wiki", "needs_token", None),
+        ];
+        let st = RemovalState::default();
+        st.hydrate(facts, &views);
+        let dto = st.dto(Retention::of(92, false, None, UtcInstant(0)));
+        assert!(dto.active && !dto.recorded, "{dto:?}");
+        let shown: Vec<(&str, bool, Choice, Option<&str>)> = dto
+            .instances
+            .iter()
+            .map(|i| {
+                (
+                    i.alias.as_str(),
+                    i.token_deleted,
+                    i.choice,
+                    i.identity.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("ok", false, Choice::Pending, Some("Bob")),
+                ("wiki", true, Choice::Skipped, None),
+            ]
+        );
+    }
+
+    /// M10 T16 review M-1, the command layer's reading of the log: a closed store is `not_ready`
+    /// and the log is read again by the next call; any other read error resumes nothing, and the
+    /// log is not read again in this process; a readable log resumes its procedure.
+    #[test]
+    fn hydrate_from_reads_the_log_once_unless_the_store_is_closed() {
+        let views = [view("ok", "needs_token", None)];
+        let st = RemovalState::default();
+        assert_eq!(
+            st.hydrate_from(Err(AuditError::Closed), &views),
+            Err(CommandError::NotReady)
+        );
+        assert!(st.needs_log(), "read again by the next call");
+        assert_eq!(
+            st.hydrate_from(Err(AuditError::Invalid("unreadable")), &views),
+            Ok(())
+        );
+        assert!(!st.needs_log(), "not read again");
+        assert!(!st.dto(Retention::of(92, false, None, UtcInstant(0))).active);
+        let open = LogFacts {
+            open: Some(OpenProcedure {
+                backup: false,
+                autostart_removed: false,
+                items: vec![RecordedItem {
+                    alias: "ok".into(),
+                    product: "jira",
+                    identity: None,
+                    choice: Choice::Skipped,
+                }],
+            }),
+        };
+        let fresh = RemovalState::default();
+        assert_eq!(fresh.hydrate_from(Ok(open), &views), Ok(()));
+        assert!(
+            fresh
+                .dto(Retention::of(92, false, None, UtcInstant(0)))
+                .active
+        );
+    }
+
+    /// PD-176, M10 T16 review M-1: past the scan's cap of decrypted `CONFIG_CHANGED` payloads the
+    /// log is taken to hold no open procedure; within it the procedure is found. A store that is
+    /// closed is an error for the caller.
+    #[test]
+    fn read_log_stops_at_its_cap() -> Result<(), Box<dyn std::error::Error>> {
+        let r = crate::commands::audit::tests::rig(0)?;
+        app_change(
+            &r.store,
+            KEY_REMOVAL,
+            json!({"prepared": false}),
+            choices(false),
+        )?;
+        for i in 0..3 {
+            app_change(
+                &r.store,
+                "cli_install",
+                json!({"a": i}),
+                json!({"a": i + 1}),
+            )?;
+        }
+        assert!(
+            read_log_capped(&r.store, 4)?.open.is_some(),
+            "the 4th is it"
+        );
+        assert_eq!(read_log_capped(&r.store, 3)?, LogFacts::default());
+        assert!(read_log(&r.store)?.open.is_some());
+        r.store.shutdown();
+        assert!(matches!(read_log(&r.store), Err(AuditError::Closed)));
+        Ok(())
+    }
+
+    /// M10 T16 review M-6: a choices record older than a `RESTORE` came in with the restored
+    /// backup (another machine's procedure, or one the rollback took back) and is not resumed; a
+    /// procedure begun after the restore is.
+    #[test]
+    fn read_log_resumes_nothing_from_before_a_restore() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::commands::audit::tests::{Answers, Events, PASS, chosen, count};
+        let r = crate::commands::audit::tests::rig(0)?;
+        app_change(
+            &r.store,
+            KEY_REMOVAL,
+            json!({"prepared": false}),
+            choices(true),
+        )?;
+        let bundle = r.store.backup(chosen(&r.out))?.bundle_dir;
+        // The restore, then the rollback of the `BACKUP` record that followed the snapshot.
+        crate::restore_flow::run_live_restore(
+            &r.store,
+            &Answers::new(&[Confirm::Ok, Confirm::Ok]),
+            || Some(chosen(&bundle)),
+            |_| Ok(secrecy::SecretString::from(PASS.to_owned())),
+            &crate::serve::StoreCall::default(),
+            &AtomicBool::new(false),
+            &Events::default(),
+        )?;
+        assert_eq!(count(&r.store, EventType::RESTORE)?, 1, "premise");
+        assert_eq!(read_log(&r.store)?, LogFacts::default());
+        app_change(
+            &r.store,
+            KEY_REMOVAL,
+            json!({"prepared": false}),
+            choices(false),
+        )?;
+        let open = read_log(&r.store)?.open.ok_or("no open procedure")?;
+        assert!(!open.backup, "the newer record");
+        Ok(())
+    }
+
+    /// M10 T16 review M-9: a choices record that names an instance twice is not one `finish`
+    /// wrote: nothing is resumed.
+    #[test]
+    fn read_log_refuses_a_record_with_an_alias_twice() -> Result<(), Box<dyn std::error::Error>> {
+        let r = crate::commands::audit::tests::rig(0)?;
+        let item = json!({"alias": "a", "product": "jira", "identity": null, "revoke": "done"});
+        app_change(
+            &r.store,
+            KEY_REMOVAL,
+            json!({"prepared": false}),
+            json!({"prepared": false, "backup": false, "instances": [item.clone(), item]}),
+        )?;
+        assert_eq!(read_log(&r.store)?, LogFacts::default());
+        Ok(())
+    }
+
+    /// §12.5 step 1, PD-176, M10 T16 review M-2: the remaining retention is counted from the log's
+    /// head (the newest record), not from an older one; a head that cannot be read shows the
+    /// setting itself (display only, the call goes on), and nothing under a legal hold.
+    #[test]
+    fn retention_reads_the_newest_record() -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::{Duration, Instant, SystemTime};
+        let start = at("2026-10-01T12:00:00.000Z");
+        let (_tmp, _lock, clock, store) = fake_clock_store(start)?;
+        let observe = |clock: &atlas_duck_audit::testing::FakeClock| {
+            let now = atlas_duck_audit::Clock::now_utc(clock);
+            let ms = u64::try_from(now.0).unwrap_or(0);
+            store.observe_server_date(
+                "jira-main",
+                SystemTime::UNIX_EPOCH + Duration::from_millis(ms),
+                Instant::now(),
+            );
+        };
+        // The oldest records (GENESIS) have no epoch: no date was corroborated yet.
+        observe(&clock);
+        app_change(&store, "cli_install", json!({"a": 1}), json!({"a": 2}))?;
+        clock.advance(Duration::from_secs(10 * 86_400));
+        observe(&clock);
+        app_change(&store, "cli_install", json!({"a": 2}), json!({"a": 3}))?;
+        assert_eq!(newest_epoch(&store)?.as_deref(), Some("2026-10-11"));
+        let today = at("2026-10-21T12:00:00.000Z");
+        assert_eq!(
+            retention_shown(92, false, newest_epoch(&store), today).left_days,
+            Some(82)
+        );
+        let unreadable = retention_shown(92, false, Err(AuditError::Closed), today);
+        assert_eq!((unreadable.days, unreadable.left_days), (92, Some(92)));
+        assert_eq!(
+            retention_shown(92, true, Err(AuditError::Closed), today).left_days,
+            None
+        );
+        store.shutdown();
+        Ok(())
+    }
+
+    /// A new store over a [`atlas_duck_audit::testing::FakeClock`] standing at `start`.
+    #[allow(clippy::type_complexity)]
+    fn fake_clock_store(
+        start: UtcInstant,
+    ) -> Result<
+        (
+            tempfile::TempDir,
+            atlas_duck_audit::lock::InstanceLock,
+            Arc<atlas_duck_audit::testing::FakeClock>,
+            Store,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        use atlas_duck_audit::testing::{FakeClock, FreeSpaceStub, MemKeyStore, MemKeyring};
+        use atlas_duck_ipc::paths::{DataDirResolution, check_data_dir};
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path().join("data");
+        std::fs::create_dir(&dir)?;
+        let DataDirResolution::Local(data) = check_data_dir(&dir)? else {
+            return Err("the temp dir is not a local data dir".into());
+        };
+        let lock = atlas_duck_audit::lock::InstanceLock::acquire(&data, "thishost")?;
+        let (install_id, chain_id) = atlas_duck_audit::new_ids()?;
+        let clock = Arc::new(FakeClock::new(start));
+        let keys = Arc::new(MemKeyStore::new(MemKeyring::new(), &install_id));
+        let mut cfg = atlas_duck_audit::OpenConfig::new(clock.clone(), keys);
+        cfg.free_space = Some(FreeSpaceStub::new(u64::MAX));
+        let pass = crate::commands::audit::tests::PASS;
+        let store = atlas_duck_audit::create_new_store(
+            &data,
+            &lock,
+            cfg,
+            atlas_duck_audit::FirstRunInput {
+                install_id,
+                chain_id,
+                passphrase: secrecy::SecretString::from(pass.to_owned()),
+                passphrase_confirm: secrecy::SecretString::from(pass.to_owned()),
+                archived_db: None,
+                anchor_dir: None,
+                archive_confirmed: None,
+            },
+        )?;
+        Ok((tmp, lock, clock, store))
     }
 
     /// §12.5 step 1 (PD-176): "Prepare for removal" offers the compliance export: the Audit

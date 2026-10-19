@@ -261,8 +261,8 @@ describe('Removal', () => {
       ['autostart', 'The login item could not be read or removed'],
       ['no_procedure', 'Delete the stored tokens first'],
       ['recorded', 'The answers are already recorded: finish the removal'],
-      // M10 T16 (T28 m-8): another removal step runs (not `busy`).
-      ['running', 'Another removal step is running: wait for it to end, then try again'],
+      // M10 T16 (T28 m-8): another removal step, or a backup in its claim, runs (not `busy`).
+      ['running', 'Another removal step or a backup is running: wait for it to end, then try again'],
     ]) {
       vi.mocked(removalState).mockClear();
       vi.mocked(removalFinish).mockRejectedValue({ kind: 'removal', error: { kind } });

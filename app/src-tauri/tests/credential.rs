@@ -1222,6 +1222,99 @@ async fn recovery_flows_and_the_credential_window_exclude_each_other() -> TestRe
     stop(&state).await
 }
 
+/// M10 T16 review M-1, I-2, M-6: "Prepare for removal" over a serving state, through Settings.
+/// The first removal call reads the log back (a choices record with no outcome record resumes
+/// its procedure, recorded). While another job holds the serving state's slot, `removal_backup`,
+/// `removal_begin` and `removal_finish` answer `busy` before any dialog. `removal_backup` is the
+/// Audit window's backup job: inside the removal claim (`removal {running}` while a removal call
+/// holds it), and refused once the quit path froze the state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removal_commands_resume_from_the_log_and_wait_for_the_job_slot() -> TestResult {
+    use atlas_duck_app_lib::removal::RemovalState;
+    let w = World::new()?;
+    let ring = MemKeyring::new();
+    let install_id = w.provision(&ring, PASSPHRASE)?;
+    let confirmer = Answers::new(vec![]);
+    let state = start_with(w.inputs(
+        Some(install_id),
+        MemKeys::new(ring, true),
+        confirmer.clone(),
+        vec![],
+    ))
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let app = w.app(&state)?;
+    app.manage(RemovalState::default());
+    let settings = window(&app, "settings")?;
+    let core = state.core.get().cloned().ok_or("no core serves")?;
+
+    // A choices record with no outcome record after it: the first call resumes it.
+    let admin = core.settings();
+    tokio::task::spawn_blocking(move || {
+        admin.record_app_change(
+            "prepare_for_removal",
+            json!({"prepared": false}),
+            json!({"prepared": false, "backup": true, "instances": [
+                {"alias": "jira-main", "product": "jira", "identity": "Alice", "revoke": "done"}
+            ]}),
+        )
+    })
+    .await??;
+    let dto = call(&settings, "removal_state", json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    assert_eq!(
+        (&dto["active"], &dto["recorded"], &dto["backup_made"]),
+        (&json!(true), &json!(true), &json!(true)),
+        "{dto}"
+    );
+    assert_eq!(
+        dto["instances"],
+        json!([{"alias": "jira-main", "product": "jira", "origin": null, "identity": "Alice",
+                "token_deleted": true, "error": null, "choice": "done"}])
+    );
+
+    // A job holds the slot: no removal step runs beside it, no dialog is shown.
+    let (go_tx, go) = std::sync::mpsc::channel::<()>();
+    let job = state
+        .spawn_recovery_job(move |_| go.recv_timeout(WAIT).is_ok())
+        .map_err(|e| format!("{e:?}"))?;
+    for cmd in ["removal_backup", "removal_begin", "removal_finish"] {
+        assert_eq!(
+            call(&settings, cmd, json!({})).await,
+            Err(json!({"kind": "busy"})),
+            "{cmd}"
+        );
+    }
+    assert!(confirmer.texts().is_empty(), "{:?}", confirmer.texts());
+    go_tx.send(())?;
+    assert!(tokio::time::timeout(WAIT, job).await??);
+    let s = state.clone();
+    eventually("the slot is free", move || !s.job_running()).await?;
+
+    // The backup job runs inside the removal claim, and ends.
+    {
+        let removal = app.state::<RemovalState>();
+        let claim = removal.claim()?;
+        assert_eq!(
+            call(&settings, "removal_backup", json!({})).await,
+            Err(json!({"kind": "removal", "error": {"kind": "running"}}))
+        );
+        drop(claim);
+    }
+    let s = state.clone();
+    eventually("the backup job ended", move || !s.job_running()).await?;
+
+    // The quit path began: no backup starts.
+    state.freeze();
+    assert_eq!(
+        call(&settings, "removal_backup", json!({})).await,
+        Err(json!({"kind": "not_ready"}))
+    );
+    assert!(confirmer.texts().is_empty(), "{:?}", confirmer.texts());
+    stop(&state).await
+}
+
 /// M10 T14 review I-3: the recovery note is offered only by the window whose change committed. A
 /// change marked for another window's generation (the window was closed and another opened while
 /// Argon2id ran) or for a window that is gone marks nothing and offers no note.

@@ -637,12 +637,12 @@ export const SETTINGS_TEXT = {
     token_stored: 'A token is stored again for an instance: delete it again, then finish',
     autostart: 'The login item could not be read or removed',
     recorded: 'The answers are already recorded: finish the removal',
-    running: 'Another removal step is running: wait for it to end, then try again',
+    running: 'Another removal step or a backup is running: wait for it to end, then try again',
   } as Readonly<Record<string, string>>,
   working: 'Working',
   /** Fixed answers for a refused or failed command, by error kind. */
   errors: {
-    busy: 'The credential window is open, or another task is running (an export, a backup or a restore): close the window or wait, then try again',
+    busy: 'The credential window is open, or another task is running (an export, a backup, a restore or a removal step): close the window or wait, then try again',
     not_found: 'That instance no longer exists',
     not_ready: 'The app is still starting: try again in a moment',
     internal: 'The command failed',
