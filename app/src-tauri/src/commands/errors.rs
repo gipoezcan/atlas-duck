@@ -34,15 +34,17 @@ pub enum CommandError {
     /// "error": {"kind": "invalid", "key": ..}}`. Fixed kinds, keys and the config banner; no text.
     Settings(SettingsError),
     /// M6 T25: the credential window is open for something else (`WindowError::Busy`); close it
-    /// first. Nothing was changed.
+    /// first. M10: also another job holding the serving state's slot (an export, a backup, a
+    /// restore, a recovery-tier flow). Nothing was changed. A removal call's own claim is
+    /// `removal {running}` (T28 m-8).
     Busy,
     /// M6 T27 (§12.3): "Install CLI to PATH" or its removal could not be done; the kind says why
     /// (`no_stable_path`, `unsafe_path`, `occupied`, `registry`, ...). Nested like `Admin`: `{"kind":
     /// "cli_install", "error": {"kind": "occupied"}}`. No path and no OS text.
     CliInstall(InstallError),
     /// M6 T28 (§12.5): "Prepare for removal" refused or failed (`no_procedure`, `unticked`,
-    /// `token_stored`, `autostart`). Nested like `Admin`: `{"kind": "removal", "error": {"kind":
-    /// "unticked"}}`. No text.
+    /// `token_stored`, `autostart`, `recorded`; M10 T16: `running`, another removal call runs).
+    /// Nested like `Admin`: `{"kind": "removal", "error": {"kind": "unticked"}}`. No text.
     Removal(RemovalError),
     /// M5 M-11 (T7 review H1): the candidate could not be built, so a preview or a Raw page has
     /// nothing to show. The text is the core constant, chosen here so the UI never maps an error

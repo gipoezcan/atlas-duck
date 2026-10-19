@@ -490,6 +490,11 @@ describe('fixtures validate against their TS types', () => {
     expect(isRemovalState({ ...removal, instances: [{ ...removal?.instances[0], extra: 1 }] })).toBe(false);
     expect(isRemovalState({ ...removal, instances: [{ ...removal?.instances[0], product: 'bitbucket' }] })).toBe(false);
     expect(isRemovalState({ ...removal, instances: [{ ...removal?.instances[0], identity: 5 }] })).toBe(false);
+    // M10 T16 (PD-176): `recorded` is a flag, the remaining days a number or null (legal hold).
+    expect(isRemovalState({ ...removal, recorded: 'yes' })).toBe(false);
+    expect(isRemovalState({ ...removal, retention_left_days: '80' })).toBe(false);
+    expect(isRemovalState({ ...removal, retention_left_days: null })).toBe(true);
+    expect(isRemovalState({ ...removal, recorded: undefined })).toBe(false);
     expect(isRemovalBackupAnswer({ saved: true })).toBe(true);
     expect(isRemovalBackupAnswer({ saved: 1 })).toBe(false);
     expect(isRemovalBackupAnswer({ saved: true, path: '/x' })).toBe(false);

@@ -263,6 +263,12 @@
     "kind": "removal"
   },
   {
+    "error": {
+      "kind": "running"
+    },
+    "kind": "removal"
+  },
+  {
     "kind": "release_blocked",
     "text": "release blocked: the candidate could not be built exactly (internal); deny it, or drop the flagged items"
   },

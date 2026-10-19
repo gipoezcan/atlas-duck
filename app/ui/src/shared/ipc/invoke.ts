@@ -274,6 +274,14 @@ export function removalBackup(): Promise<RemovalBackupAnswer> {
   return call('removal_backup', {}, isRemovalBackupAnswer);
 }
 
+/**
+ * Step 1 (M10 T16, PD-176): the compliance export over the full range; Rust shows the PD-161
+ * warning and its own folder dialog, progress arrives as `audit_job`, `exportCancel` stops it.
+ */
+export function removalExport(): Promise<ExportDone> {
+  return call('removal_export', {}, isExportDone);
+}
+
 /** Step 2: Rust confirms natively, then deletes the stored tokens; answers the checklist. */
 export function removalBegin(): Promise<RemovalState> {
   return call('removal_begin', {}, isRemovalState);

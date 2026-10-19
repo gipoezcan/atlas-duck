@@ -4,14 +4,18 @@
     "backup_made": false,
     "instances": [],
     "legal_hold": false,
-    "retention_days": 92
+    "recorded": false,
+    "retention_days": 92,
+    "retention_left_days": 92
   },
   {
     "active": false,
     "backup_made": true,
     "instances": [],
     "legal_hold": true,
-    "retention_days": 365
+    "recorded": false,
+    "retention_days": 365,
+    "retention_left_days": null
   },
   {
     "active": true,
@@ -55,6 +59,8 @@
       }
     ],
     "legal_hold": false,
-    "retention_days": 92
+    "recorded": true,
+    "retention_days": 92,
+    "retention_left_days": 80
   }
 ]

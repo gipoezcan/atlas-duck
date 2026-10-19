@@ -62,12 +62,14 @@ export const WINDOW_COMMANDS = {
     "prune_backlog_now",
     "cli_install",
     "cli_uninstall",
-    // M6 T28 (PD-88): the "Prepare for removal" step machine's five commands.
+    // M6 T28 (PD-88): the "Prepare for removal" step machine's five commands; M10 T16 (PD-176):
+    // its compliance export (the Audit window's export flow over the full range).
     "removal_state",
     "removal_backup",
     "removal_begin",
     "removal_mark",
     "removal_finish",
+    "removal_export",
     "app_status",
     // M10 T13 (Δ-M10-3, PD-168): "Back up now" (the Audit window's trigger) and "Restore backup…".
     "backup_trigger",

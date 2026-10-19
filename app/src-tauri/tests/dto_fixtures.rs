@@ -709,6 +709,8 @@ fn command_errors() -> Vec<CommandError> {
         CommandError::Removal(RemovalError::TokenStored),
         CommandError::Removal(RemovalError::Autostart),
         CommandError::Removal(RemovalError::Recorded),
+        // M10 T16 (T28 m-8): another removal call runs.
+        CommandError::Removal(RemovalError::Running),
         // The T7 review H1 banner: its text is the core constant, put on the wire by Rust.
         CommandError::ReleaseBlocked,
         // M10 T12: the Audit window's kinds (a name, never a path; no error text).
@@ -1558,13 +1560,16 @@ fn cli_install_answers() -> Vec<CliInstallAnswer> {
     .collect()
 }
 
-/// `removal_state` (M6 T28): before `begin`, and a checklist with every answer and a failed delete.
+/// `removal_state` (M6 T28): before `begin` (M10 T16: the newest record's remaining days; none
+/// under a legal hold), and a checklist with every answer and a failed delete, recorded (PD-176).
 fn removal_states() -> Vec<RemovalDto> {
     let idle = RemovalDto {
         active: false,
+        recorded: false,
         backup_made: false,
         retention_days: 92,
         legal_hold: false,
+        retention_left_days: Some(92),
         instances: vec![],
     };
     let item =
@@ -1585,11 +1590,14 @@ fn removal_states() -> Vec<RemovalDto> {
             backup_made: true,
             retention_days: 365,
             legal_hold: true,
+            retention_left_days: None,
             ..idle.clone()
         },
         RemovalDto {
             active: true,
+            recorded: true,
             backup_made: true,
+            retention_left_days: Some(80),
             instances: vec![
                 item("work", "jira", Some("jdoe"), true, None, Choice::Pending),
                 item(

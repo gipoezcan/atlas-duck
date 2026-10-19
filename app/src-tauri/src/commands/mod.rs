@@ -94,6 +94,7 @@ pub fn register<R: Runtime>(builder: Builder<R>) -> Builder<R> {
         settings::recovery_passphrase_change,
         settings::removal_backup,
         settings::removal_begin,
+        settings::removal_export,
         settings::removal_finish,
         settings::removal_mark,
         settings::removal_state,

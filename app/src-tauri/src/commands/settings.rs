@@ -17,7 +17,8 @@
 //! M10 adds "Back up now" and "Restore backup…" (T13) and the recovery tier and the anchor
 //! directory (T14: `recovery_passphrase_change`, `anchor_dir_set`, `anchor_dir_remove`,
 //! `re_anchor`, `orphan_installs`, `forget_install`; the flows are `recovery_tier`'s, the dialogs
-//! Rust's, no path or secret comes in).
+//! Rust's, no path or secret comes in) and "Prepare for removal"'s compliance export (T16:
+//! `removal_export`, the Audit window's export flow over the full range).
 
 use std::io::Read;
 use std::path::Path;
@@ -45,7 +46,8 @@ use crate::cli_install::{
 use crate::credential::{self, PatOpenError};
 use crate::recovery_tier;
 use crate::removal::{
-    self, BackupAnswer, Choice, FinishAnswer, PluginAutostart, RemovalDto, RemovalState, Retention,
+    self, BackupAnswer, Choice, FinishAnswer, PluginAutostart, RemovalDto, RemovalError,
+    RemovalState, Retention,
 };
 use crate::restore_flow;
 use crate::sandbox_probe::{floor_label, mode_label, probe_id_name, scripts_state};
@@ -377,6 +379,12 @@ pub struct RemovalMarkArgs {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemovalFinishArgs {}
+
+/// `removal_export {}` (M10 T16, PD-176): no key. The range is the full one; Rust shows the PD-161
+/// warning and its own folder dialog; the webview names no path and no range.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemovalExportArgs {}
 
 // ---------- responses ----------
 
@@ -996,9 +1004,10 @@ pub async fn credential_window_open<R: Runtime>(
 ) -> Result<(), CommandError> {
     let Args(CredentialWindowOpenArgs { alias, purpose }) = args;
     // T28 (T20 m-9): not while a removal call deletes tokens (a token entered then would outlive
-    // the delete; `removal_finish` looks again before it removes anything).
+    // the delete; `removal_finish` looks again before it removes anything). No window is open
+    // then: the answer says a removal step runs (T28 m-8).
     if app.try_state::<RemovalState>().is_some_and(|r| r.busy()) {
-        let response = Err(CommandError::Busy);
+        let response = Err(CommandError::Removal(RemovalError::Running));
         note_failure(&response);
         return finish(&app, response);
     }
@@ -1106,6 +1115,8 @@ struct Served {
     instances: Arc<dyn InstanceAdmin>,
     settings: Arc<dyn SettingsAdmin>,
     confirmer: Arc<dyn atlas_duck_core::NativeConfirmer>,
+    /// The open store: the newest record's epoch and the procedure's records (PD-176).
+    store: atlas_duck_audit::Store,
 }
 
 fn served<R: Runtime>(app: &AppHandle<R>) -> Result<Served, CommandError> {
@@ -1115,24 +1126,67 @@ fn served<R: Runtime>(app: &AppHandle<R>) -> Result<Served, CommandError> {
         .ok_or(CommandError::NotReady)?;
     let core = state.core.get().cloned().ok_or(CommandError::NotReady)?;
     let confirmer = state.confirmer().ok_or(CommandError::NotReady)?;
+    let store = state.open_store().ok_or(CommandError::NotReady)?;
     Ok(Served {
         instances: core.instances(),
         settings: core.settings(),
         confirmer,
+        store,
     })
 }
 
-/// The retention facts beside the backup offer (§12.5 step 1).
-async fn retention_of(settings: &Arc<dyn SettingsAdmin>) -> Result<Retention, CommandError> {
-    let settings = settings.clone();
+/// The retention facts beside the backup offer (§12.5 step 1, PD-176): the setting, and the
+/// newest record's remaining days from its `epoch` and today's UTC date.
+async fn retention_of(served: &Served) -> Result<Retention, CommandError> {
+    let (settings, store) = (served.settings.clone(), served.store.clone());
     blocking(move || {
+        use atlas_duck_audit::Clock as _;
         let view = settings.view();
-        Ok(Retention {
-            days: view.retention_days,
-            legal_hold: view.legal_hold,
-        })
+        let newest = store
+            .query(
+                &atlas_duck_audit::AuditFilter::default(),
+                atlas_duck_audit::AuditCursor::first(1),
+            )
+            .map_err(|e| match e {
+                atlas_duck_audit::AuditError::Closed => CommandError::NotReady,
+                _ => CommandError::Audit(super::AuditReadFailure::Failed),
+            })?;
+        let epoch = newest.rows.first().and_then(|h| h.epoch.clone());
+        Ok(Retention::of(
+            view.retention_days,
+            view.legal_hold,
+            epoch.as_deref(),
+            atlas_duck_audit::SystemClock::new().now_utc(),
+        ))
     })
     .await
+}
+
+/// PD-176: before the first removal call of a process, the audit log is read back for an open
+/// procedure. A closed store is `not_ready`; a log that cannot be read resumes nothing (logged by
+/// class): the procedure then starts over, as before PD-176.
+async fn hydrate(state: &RemovalState, served: &Served) -> Result<(), CommandError> {
+    if !state.needs_log() {
+        return Ok(());
+    }
+    let (store, admin) = (served.store.clone(), served.instances.clone());
+    let (facts, views) = blocking(move || {
+        let facts = match removal::read_log(&store) {
+            Ok(facts) => facts,
+            Err(atlas_duck_audit::AuditError::Closed) => return Err(CommandError::NotReady),
+            Err(_) => {
+                tracing::warn!(
+                    event = removal::LOG_EVENT_REMOVAL_FAILED,
+                    error_class = "audit"
+                );
+                removal::LogFacts::default()
+            }
+        };
+        Ok((facts, admin.list()))
+    })
+    .await?;
+    state.hydrate(facts, &views);
+    Ok(())
 }
 
 /// The credential window is open for a token (add or replace).
@@ -1154,7 +1208,8 @@ fn conclude_removal<R: Runtime, T: Serialize>(
     finish(app, response)
 }
 
-/// `removal_state {}` (§12.5): the checklist of this process (`active: false` before `begin`).
+/// `removal_state {}` (§12.5, PD-176): the procedure under way (`active: false` before `begin`),
+/// also one the audit log records from before a restart.
 #[tauri::command]
 pub async fn removal_state<R: Runtime>(
     app: AppHandle<R>,
@@ -1163,11 +1218,47 @@ pub async fn removal_state<R: Runtime>(
     let Args(RemovalStateArgs {}) = args;
     let response = async {
         let served = served(&app)?;
-        let retention = retention_of(&served.settings).await?;
+        let retention = retention_of(&served).await?;
         let state = app
             .try_state::<RemovalState>()
             .ok_or(CommandError::NotReady)?;
+        hydrate(&state, &served).await?;
         Ok::<_, CommandError>(state.dto(retention))
+    }
+    .await;
+    conclude_removal(&app, response, false)
+}
+
+/// `removal_export {}` (§12.5 step 1, PD-176): the compliance export the procedure offers, the
+/// Audit window's export flow (M10 T12) over the full range: the PD-161 warning and the folder
+/// dialog in Rust, then the export as the serving state's one job (`busy` while another runs;
+/// `export_cancel` and Quit cancel it, PD-181), `audit_job` progress; answers the recipient's facts.
+#[tauri::command]
+pub async fn removal_export<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<RemovalExportArgs>,
+) -> Result<super::audit::ExportDoneDto, CommandError> {
+    let Args(RemovalExportArgs {}) = args;
+    let response = async {
+        let state = app
+            .try_state::<ServeSlot>()
+            .and_then(|slot| slot.get().cloned())
+            .ok_or(CommandError::NotReady)?;
+        let store = state.open_store().ok_or(CommandError::NotReady)?;
+        let confirmer = state.confirmer().ok_or(CommandError::NotReady)?;
+        let handle = app.clone();
+        let rx = state
+            .spawn_audit_job(crate::serve::AuditJobKind::Export, move |cancel| {
+                removal::export(
+                    &store,
+                    &*confirmer,
+                    || super::audit::pick_export_folder(&handle),
+                    &cancel,
+                    &handle,
+                )
+            })
+            .map_err(super::audit::job_refused)?;
+        rx.await.map_err(|_| CommandError::Internal)?
     }
     .await;
     conclude_removal(&app, response, false)
@@ -1242,10 +1333,11 @@ pub async fn removal_begin<R: Runtime>(
     let Args(RemovalBeginArgs {}) = args;
     let response = async {
         let served = served(&app)?;
-        let retention = retention_of(&served.settings).await?;
+        let retention = retention_of(&served).await?;
         let state = app
             .try_state::<RemovalState>()
             .ok_or(CommandError::NotReady)?;
+        hydrate(&state, &served).await?;
         removal::begin(
             &state,
             served.instances,
@@ -1268,10 +1360,11 @@ pub async fn removal_mark<R: Runtime>(
     let Args(RemovalMarkArgs { alias, choice }) = args;
     let response = async {
         let served = served(&app)?;
-        let retention = retention_of(&served.settings).await?;
+        let retention = retention_of(&served).await?;
         let state = app
             .try_state::<RemovalState>()
             .ok_or(CommandError::NotReady)?;
+        hydrate(&state, &served).await?;
         removal::mark(&state, alias.as_str(), choice.0, retention)
     }
     .await;
@@ -1293,6 +1386,7 @@ pub async fn removal_finish<R: Runtime>(
         let state = app
             .try_state::<RemovalState>()
             .ok_or(CommandError::NotReady)?;
+        hydrate(&state, &served).await?;
         removal::finish(
             &state,
             served.instances,

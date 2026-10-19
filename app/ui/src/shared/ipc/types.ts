@@ -482,14 +482,22 @@ export interface RemovalItem {
   choice: RemovalChoice;
 }
 
-/** `removal_state` (and `removal_begin`, `removal_mark`): the checklist of this process. */
+/** `removal_state` (and `removal_begin`, `removal_mark`): the checklist of the procedure under way. */
 export interface RemovalState {
-  /** `begin` ran in this process and `finish` has not completed. */
+  /**
+   * A procedure is under way: `begin` ran in this process, or the audit log holds its answers and
+   * no outcome (M10 T16, PD-176: it survives a restart); `finish` has not completed.
+   */
   active: boolean;
+  /** The answers are in the audit log (a failed step left the procedure): they are final (T28 m-4). */
+  recorded: boolean;
   /** A full backup was made in this procedure. */
   backup_made: boolean;
+  /** The retention setting. */
   retention_days: number;
   legal_hold: boolean;
+  /** The newest record's remaining retention in days (PD-176); `null` while a legal hold is on. */
+  retention_left_days: number | null;
   instances: RemovalItem[];
 }
 
@@ -836,10 +844,14 @@ export type CommandError =
   | { kind: 'cli_install'; error: CoreError }
   /**
    * "Prepare for removal" refused or failed (T28): `error.kind` is `no_procedure`, `unticked`,
-   * `token_stored` or `autostart`; no text.
+   * `token_stored`, `autostart`, `recorded` or (M10 T16) `running` (another removal step runs); no
+   * text.
    */
   | { kind: 'removal'; error: CoreError }
-  /** The credential window is open for something else (T25): close it first. */
+  /**
+   * The credential window is open for something else (T25): close it first; or (M10) another job
+   * (an export, a backup, a restore) runs.
+   */
   | { kind: 'busy' }
   /** The candidate could not be built (M5 M-11); `text` is the app-generated banner. */
   | { kind: 'release_blocked'; text: string }

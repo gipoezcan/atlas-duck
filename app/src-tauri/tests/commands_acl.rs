@@ -1695,6 +1695,8 @@ fn settings_bodies() -> Vec<(&'static str, Value, &'static [&'static str])> {
             SETTINGS,
         ),
         ("removal_finish", json!({}), SETTINGS),
+        // M10 T16 (PD-176): its compliance export, Settings only (the Audit window has its own).
+        ("removal_export", json!({}), SETTINGS),
     ]
 }
 
@@ -1810,14 +1812,18 @@ fn settings_commands_granted_to_settings_and_setup_only() -> TestResult {
     }
     // M6 T28: the removal commands take no path, origin, token or force flag: only `removal_mark`
     // has fields (a Rust-validated alias and one of three words); everything else is refused as an
-    // unknown field before the handler runs.
+    // unknown field before the handler runs. M10 T16: the export takes no folder and no range
+    // either (the full range, Rust's folder dialog).
     for cmd in [
         "removal_state",
         "removal_backup",
         "removal_begin",
         "removal_finish",
+        "removal_export",
     ] {
-        for key in ["path", "dir", "alias", "token", "force", "origin"] {
+        for key in [
+            "path", "dir", "alias", "token", "force", "origin", "folder", "from_utc", "to_utc",
+        ] {
             assert_eq!(
                 invoke(settings, cmd, json!({ key: "x" })),
                 Err(json!({"kind": "invalid_argument", "field": "payload"})),
@@ -1844,8 +1850,9 @@ fn settings_commands_granted_to_settings_and_setup_only() -> TestResult {
 }
 
 /// M6 T28 (T20 m-9): while a removal call runs (its dialog, its token deletes), the credential
-/// window for a token cannot be opened from Settings: `busy`, before the core is even asked. With
-/// no call running the command reaches its handler (`not_ready` without a serving core).
+/// window for a token cannot be opened from Settings: `removal {running}` (no window is open, so
+/// not `busy`, T28 m-8), before the core is even asked. With no call running the command reaches
+/// its handler (`not_ready` without a serving core).
 #[test]
 fn credential_window_open_is_refused_while_a_removal_call_runs() -> TestResult {
     use atlas_duck_app_lib::removal::RemovalState;
@@ -1861,7 +1868,7 @@ fn credential_window_open_is_refused_while_a_removal_call_runs() -> TestResult {
     let claim = state.claim()?;
     assert_eq!(
         invoke(&w, "credential_window_open", body.clone()),
-        Err(json!({"kind": "busy"}))
+        Err(json!({"kind": "removal", "error": {"kind": "running"}}))
     );
     drop(claim);
     assert_eq!(
@@ -3129,6 +3136,7 @@ mod settings_commands {
     const RET: Retention = Retention {
         days: 92,
         legal_hold: false,
+        left_days: Some(92),
     };
 
     /// This machine's login item and CLI: both installed.
@@ -3495,20 +3503,22 @@ mod settings_commands {
         // m-3: `prepared: true` only once every effect succeeded.
         assert_eq!(removal[0]["new"]["prepared"], false);
         assert_eq!(removal[0]["new"]["backup"], false);
+        // PD-176: each instance's product and token identity too, so the checklist survives a
+        // restart; no origin (the live table has it).
         assert_eq!(
             removal[0]["new"]["instances"],
             json!([
-                {"alias": "jira-main", "revoke": "done"},
-                {"alias": "wiki", "revoke": "skipped"},
+                {"alias": "jira-main", "product": "jira", "identity": TEST_USER, "revoke": "done"},
+                {"alias": "wiki", "product": "confluence", "identity": TEST_USER,
+                 "revoke": "skipped"},
             ])
         );
         assert_eq!(
             removal[1]["new"],
             json!({"prepared": true, "cli": "removed"})
         );
-        // No token identity or origin in the record: the choices only.
         let text = removal[0].to_string();
-        assert!(!text.contains(TEST_USER), "{text}");
+        assert!(!text.contains("https://"), "no origin: {text}");
         assert!(!m.autostart.is_on());
         assert_eq!(m.ops.state(), State::default(), "no CLI, no cli.toml");
         assert!(!st.dto(RET).active, "the procedure is over");
@@ -3937,8 +3947,22 @@ mod settings_commands {
         let m = machine(&h).await?;
         let dto = begin_with(&h, &st, false).await?;
         assert!(dto.active && dto.instances.is_empty(), "{dto:?}");
-        // Confirmed after `begin`, it holds the stored token (the harness keychain has one).
-        let view = h.instances().confirm_config_instance("jira-main")?;
+        // Confirmed after `begin`, and given a token then (M10 T16, T28 m-1: `begin` deleted the
+        // harness's stored one although the instance was not listed).
+        h.instances().confirm_config_instance("jira-main")?;
+        let mock = h.mock("jira-main").ok_or("mock")?;
+        mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+            .await;
+        mock.jira_server_info("9.12.0").await;
+        h.instances()
+            .set_token("jira-main", secrecy::SecretString::from("fresh-pat"), None)
+            .await?;
+        let view = h
+            .instances()
+            .list()
+            .into_iter()
+            .find(|v| v.alias == "jira-main")
+            .ok_or("instance")?;
         assert!(view.executes_as.is_some(), "premise: a token is stored");
         let installed = m.ops.state();
         let dialogs = h.confirmer().texts().len();
@@ -4032,8 +4056,264 @@ mod settings_commands {
         Ok(())
     }
 
-    /// The step machine takes one call at a time: a call that starts while another runs is `busy`,
-    /// and the claim is released afterwards (also after a failure).
+    // ---- M10 T16: "Prepare for removal" completion (PD-176, L130, L217) ----
+
+    /// The process restarted: a fresh procedure object that reads the audit log back, as the
+    /// command layer does before the first removal call (PD-176).
+    async fn restarted(h: &Harness) -> Result<RemovalState, Boxed> {
+        let st = RemovalState::default();
+        assert!(st.needs_log());
+        let (store, admin) = (h.store(), h.instances());
+        let (facts, views) =
+            blocking(move || removal::read_log(&store).map(|facts| (facts, admin.list())))
+                .await??;
+        st.hydrate(facts, &views);
+        Ok(st)
+    }
+
+    /// The procedure of [`two`] up to a `finish` whose autostart step fails: the choices are in
+    /// the log, the effects are not done.
+    async fn finish_failed_on_autostart(h: &Harness, m: &Machine) -> Result<RemovalState, Boxed> {
+        let st = RemovalState::default();
+        begin_with(h, &st, false).await?;
+        answer_all(&st, &["jira-main"], Choice::Done)?;
+        answer_all(&st, &["wiki"], Choice::Skipped)?;
+        m.autostart.fail_disable.store(true, Ordering::SeqCst);
+        assert_eq!(
+            finish_with(h, &st, m, false).await.err(),
+            Some(CommandError::Removal(RemovalError::Autostart))
+        );
+        m.autostart.fail_disable.store(false, Ordering::SeqCst);
+        Ok(st)
+    }
+
+    /// T28 m-4: once the choices are in the log (a failed effect left the procedure for a retry),
+    /// the checklist says so: the page offers no answer the step machine would refuse.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_effect_exposes_recorded() -> TestResult {
+        let h = two(vec![Confirm::Ok, Confirm::Ok, Confirm::Ok]).await?;
+        let m = machine(&h).await?;
+        let st = RemovalState::default();
+        begin_with(&h, &st, false).await?;
+        answer_all(&st, &["jira-main", "wiki"], Choice::Done)?;
+        assert!(!st.dto(RET).recorded, "nothing recorded before finish");
+        m.autostart.fail_disable.store(true, Ordering::SeqCst);
+        assert!(finish_with(&h, &st, &m, false).await.is_err());
+        let dto = st.dto(RET);
+        assert!(dto.active && dto.recorded, "{dto:?}");
+        assert_eq!(
+            serde_json::to_value(&dto)?["recorded"],
+            json!(true),
+            "on the wire"
+        );
+        assert_eq!(
+            removal::mark(&st, "wiki", Choice::Skipped, RET).err(),
+            Some(CommandError::Removal(RemovalError::Recorded))
+        );
+        m.autostart.fail_disable.store(false, Ordering::SeqCst);
+        finish_with(&h, &st, &m, false).await?;
+        assert!(!st.dto(RET).recorded && !st.dto(RET).active);
+        Ok(())
+    }
+
+    /// PD-176 (L130): the procedure survives a restart through the log. After a failed effect,
+    /// a new process resumes it (active, recorded, every answer and the backup flag), and the
+    /// retried `finish` records the choices no second time; once it ended, a further restart finds
+    /// no procedure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn removal_state_survives_restart() -> TestResult {
+        let h = two(vec![Confirm::Ok, Confirm::Ok, Confirm::Ok]).await?;
+        let m = machine(&h).await?;
+        let before = finish_failed_on_autostart(&h, &m).await?.dto(RET);
+        let st = restarted(&h).await?;
+        let dto = st.dto(RET);
+        assert!(dto.active && dto.recorded, "{dto:?}");
+        assert_eq!(dto.instances, before.instances, "the same checklist");
+        let choices: Vec<(&str, Choice, bool)> = dto
+            .instances
+            .iter()
+            .map(|i| (i.alias.as_str(), i.choice, i.token_deleted))
+            .collect();
+        assert_eq!(
+            choices,
+            [
+                ("jira-main", Choice::Done, true),
+                ("wiki", Choice::Skipped, true)
+            ]
+        );
+        assert_eq!(
+            removal::mark(&st, "wiki", Choice::Done, RET).err(),
+            Some(CommandError::Removal(RemovalError::Recorded))
+        );
+        let answer = finish_with(&h, &st, &m, false).await?;
+        assert_eq!(answer.cli, "removed");
+        assert!(!m.autostart.is_on());
+        let keys = config_keys(&h).await?;
+        assert_eq!(
+            keys.iter().filter(|k| *k == "prepare_for_removal").count(),
+            2,
+            "the choices once (before the restart), the outcome once: {keys:?}"
+        );
+        let after = restarted(&h).await?.dto(RET);
+        assert!(!after.active && !after.recorded && after.instances.is_empty());
+        Ok(())
+    }
+
+    /// PD-176 (T28 m-13): the choices record carries each token's identity, so the checklist
+    /// still names it after a restart (core cleared it from the table at the delete).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn identity_known_after_restart() -> TestResult {
+        let h = two(vec![Confirm::Ok, Confirm::Ok]).await?;
+        let m = machine(&h).await?;
+        let identities: Vec<(String, Option<String>)> = h
+            .instances()
+            .list()
+            .iter()
+            .map(|v| (v.alias.clone(), v.executes_as.clone()))
+            .collect();
+        assert!(identities.iter().all(|(_, i)| i.is_some()), "premise");
+        finish_failed_on_autostart(&h, &m).await?;
+        assert!(
+            h.instances().list().iter().all(|v| v.executes_as.is_none()),
+            "premise: the table no longer knows them"
+        );
+        let dto = restarted(&h).await?.dto(RET);
+        for (alias, identity) in &identities {
+            let item = dto
+                .instances
+                .iter()
+                .find(|i| &i.alias == alias)
+                .ok_or("not listed")?;
+            assert_eq!(&item.identity, identity, "{alias}");
+        }
+        Ok(())
+    }
+
+    /// M6 M-12, T28 m-5: a `finish` that removed autostart and then failed at the CLI step answers
+    /// `removed` for autostart on its retry (it is off by then), in the same process and after a
+    /// restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retried_finish_keeps_autostart_removed() -> TestResult {
+        for restart in [false, true] {
+            let h = two(vec![Confirm::Ok, Confirm::Ok, Confirm::Ok]).await?;
+            let m = machine(&h).await?;
+            let st = RemovalState::default();
+            begin_with(&h, &st, false).await?;
+            answer_all(&st, &["jira-main", "wiki"], Choice::Done)?;
+            // The choices record, the autostart record, then the CLI step's record fails.
+            let seen = h.plan().attempts(EventType::CONFIG_CHANGED);
+            h.plan().fail_nth(EventType::CONFIG_CHANGED, seen + 3);
+            let res = finish_with(&h, &st, &m, false).await;
+            assert!(res.is_err(), "{res:?}");
+            assert!(!m.autostart.is_on(), "premise: autostart went");
+            assert!(!m.ops.state().files.is_empty(), "premise: the CLI stayed");
+            let st = if restart { restarted(&h).await? } else { st };
+            let answer = finish_with(&h, &st, &m, false).await?;
+            assert_eq!(answer.autostart, "removed", "restart: {restart}");
+            assert_eq!(answer.cli, "removed", "restart: {restart}");
+        }
+        Ok(())
+    }
+
+    /// T28 m-1, m-2: the first `begin` deletes the token of every instance, also one the checklist
+    /// does not list (an unconfirmed instance holds the harness's stored token): no keychain entry
+    /// outlives the procedure. Its dialog names every such instance and marks the ones whose token
+    /// identity is unknown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn begin_covers_every_instance_with_a_token() -> TestResult {
+        let h = Harness::builder()
+            .jira("jira-main")
+            .confluence("wiki")
+            .unconfirmed()
+            .confirm(vec![Confirm::Ok])
+            .start()
+            .await?;
+        let ids: Vec<String> = ["jira-main", "wiki"]
+            .iter()
+            .map(|a| h.instance(a).map(|i| i.id.clone()).ok_or("instance"))
+            .collect::<Result<_, _>>()?;
+        assert!(
+            ids.iter().all(|id| h.credentials().contains(id)),
+            "premise: tokens are stored"
+        );
+        assert!(
+            h.instances().list().iter().all(|v| v.executes_as.is_none()),
+            "premise: the table shows no identity"
+        );
+        let st = RemovalState::default();
+        let dto = begin_with(&h, &st, false).await?;
+        for id in &ids {
+            assert!(!h.credentials().contains(id), "{id}: the token is gone");
+        }
+        assert!(dto.active && dto.instances.is_empty(), "{dto:?}");
+        let texts = h.confirmer().texts();
+        let text = texts.last().ok_or("no dialog")?;
+        assert!(
+            text.contains("jira-main (identity unknown), wiki (identity unknown)"),
+            "{text}"
+        );
+        Ok(())
+    }
+
+    /// T28 m-2: after a restart, `begin` names the instances whose tokens are already gone with
+    /// "identity unknown" instead of a dialog that says nothing is deleted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn begin_dialog_names_unknown_identity() -> TestResult {
+        let h = two(vec![Confirm::Ok, Confirm::Ok]).await?;
+        begin_with(&h, &RemovalState::default(), false).await?;
+        let first = h.confirmer().texts().last().cloned().ok_or("no dialog")?;
+        assert!(first.contains("jira-main, wiki."), "{first}");
+        let st = restarted(&h).await?;
+        assert!(!st.dto(RET).active, "begin alone records nothing");
+        begin_with(&h, &st, false).await?;
+        let texts = h.confirmer().texts();
+        let text = texts.last().ok_or("no dialog")?;
+        assert!(
+            text.contains("jira-main (identity unknown), wiki (identity unknown)"),
+            "{text}"
+        );
+        Ok(())
+    }
+
+    /// T28 m-8: the refusals say which wait it is. Another removal call running is `removal
+    /// {running}` (also for the credential window, which is not open then); another job holding
+    /// the serving state's slot (an export, a backup, a restore) is plain `busy`, and so is the
+    /// credential window open for a token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn busy_kinds_distinguished() -> TestResult {
+        let h = two(vec![Confirm::Ok]).await?;
+        let st = RemovalState::default();
+        let running = Some(CommandError::Removal(RemovalError::Running));
+        let claim = st.claim()?;
+        assert_eq!(begin_with(&h, &st, false).await.err(), running);
+        assert_eq!(removal::mark(&st, "wiki", Choice::Done, RET).err(), running);
+        assert_eq!(removal::backup(&st, || Ok(true)).err(), running);
+        drop(claim);
+        assert_eq!(
+            begin_with(&h, &st, true).await.err(),
+            Some(CommandError::Busy),
+            "the credential window is open"
+        );
+        assert_eq!(
+            atlas_duck_app_lib::commands::audit::job_refused(
+                atlas_duck_app_lib::serve::JobRefused::Busy
+            ),
+            CommandError::Busy,
+            "another job holds the slot"
+        );
+        assert_eq!(
+            serde_json::to_value(CommandError::Removal(RemovalError::Running))?,
+            json!({"kind": "removal", "error": {"kind": "running"}})
+        );
+        assert_eq!(
+            serde_json::to_value(CommandError::Busy)?,
+            json!({"kind": "busy"})
+        );
+        Ok(())
+    }
+
+    /// The step machine takes one call at a time: a call that starts while another runs is
+    /// `removal {running}`, and the claim is released afterwards (also after a failure).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn one_removal_call_at_a_time() -> TestResult {
         let st = RemovalState::default();
@@ -4041,11 +4321,11 @@ mod settings_commands {
             assert!(st.busy());
             assert_eq!(
                 removal::mark(&st, "x", Choice::Done, RET).err(),
-                Some(CommandError::Busy)
+                Some(CommandError::Removal(RemovalError::Running))
             );
             assert_eq!(
                 removal::backup(&st, || Ok(true)).err(),
-                Some(CommandError::Busy)
+                Some(CommandError::Removal(RemovalError::Running))
             );
             Err(CommandError::Internal)
         });
@@ -4452,6 +4732,8 @@ const S09_GRANTS: [(&str, &[&str]); 7] = [
             "removal_begin",
             "removal_mark",
             "removal_finish",
+            // M10 T16 (PD-176): the removal's compliance export.
+            "removal_export",
             "app_status",
             // M10 T13 (Δ-M10-3, PD-168): "Back up now" and "Restore backup…".
             "backup_trigger",
@@ -4747,6 +5029,8 @@ fn s09_new_commands_outside_grant_rejected() -> TestResult {
         ("wizard_anchor_dir", json!({}), &["setup"]),
         ("wizard_anchor_dir_clear", json!({}), &["setup"]),
         ("wizard_restore", json!({}), &["setup"]),
+        // M10 T16 (PD-176): "Prepare for removal"'s compliance export, Settings only.
+        ("removal_export", json!({}), &["settings"]),
     ]);
     for (cmd, body, want) in table {
         assert!(COMMANDS.contains(&cmd), "{cmd} is not in COMMANDS");
@@ -5251,6 +5535,7 @@ fn s09_cases() -> Vec<S09Case> {
         ),
         case("removal_backup", "settings", json!({}), whole(), pad()),
         case("removal_begin", "settings", json!({}), whole(), pad()),
+        case("removal_export", "settings", json!({}), whole(), pad()),
         case("removal_finish", "settings", json!({}), whole(), pad()),
         case(
             "removal_mark",

@@ -120,9 +120,11 @@ beforeEach(() => {
     .mockReset()
     .mockResolvedValue({
       active: false,
+      recorded: false,
       backup_made: false,
       retention_days: 92,
       legal_hold: false,
+      retention_left_days: 92,
       instances: [],
     });
 });
@@ -763,7 +765,7 @@ describe('Settings', () => {
     vi.mocked(credentialWindowOpen).mockRejectedValue({ kind: 'busy' });
     fireEvent.click(screen.getByRole('button', { name: 'Replace token' }));
     await flush();
-    expect(screen.getByText(/credential window is open, or a removal step is running/)).toBeTruthy();
+    expect(screen.getByText(/credential window is open, or another task is running/)).toBeTruthy();
   });
 
   it('a failed read shows a retry', async () => {

@@ -50,6 +50,7 @@ pub const COMMANDS: &[&str] = &[
     "redaction_preview",
     "removal_backup",
     "removal_begin",
+    "removal_export",
     "removal_finish",
     "removal_mark",
     "removal_state",

@@ -9,11 +9,17 @@
 //! autostart, the PATH entry / link / wrapper / launcher and `cli.toml`; (4) the KEK, the anchors
 //! and the audit DB are never touched: nothing in this module opens a key, an anchor or a database.
 //!
-//! The checklist lives in memory (one procedure per process; a second concurrent call is `busy`).
-//! It is resumable by idempotence, not by a progress file: after a restart, `begin` again deletes
-//! only what is still stored and logs nothing for what is gone, and the checklist lists *every*
-//! confirmed instance, so a token deleted before the restart is still offered for revocation
-//! (its identity is no longer known: `delete_token` clears it, so the page says so).
+//! The checklist lives in memory (one procedure per process; a second concurrent call is
+//! `removal {running}`). It survives a restart through the audit log, not a progress file (PD-176):
+//! the first removal call of a process reads the newest `CONFIG_CHANGED {key:
+//! prepare_for_removal}` back ([`read_log`], [`RemovalState::hydrate`]); a choices record that no
+//! outcome record followed is a procedure whose effects did not all run, and it is resumed with its
+//! answers, token identities and backup flag, recorded (a retried `finish` does not record the
+//! choices again). Before that record exists, the procedure is resumable by idempotence: after a
+//! restart, `begin` again deletes only what is still stored and logs nothing for what is gone, and
+//! the checklist lists *every* confirmed instance, so a token deleted before the restart is still
+//! offered for revocation (its identity is no longer known: `delete_token` clears it, so the page
+//! says so).
 //!
 //! Core decides, the page asks: nothing here takes a path, an origin or a token from a webview.
 //! Every dialog is drawn by Rust through the injected [`NativeConfirmer`] on the blocking pool.
@@ -23,7 +29,12 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use atlas_duck_core::config::instances::product_str;
+use atlas_duck_audit::types::RustChosenPath;
+use atlas_duck_audit::{
+    AuditCursor, AuditError, AuditFilter, EventType, MAX_AUDIT_PAGE_ROWS, Store, TimeRange,
+    UtcInstant,
+};
+use atlas_duck_core::config::instances::{MAX_ALIAS_CHARS, product_str};
 use atlas_duck_core::{
     AdminError, Confirm, InstanceAdmin, InstanceView, NativeConfirmer, SettingsAdmin, SettingsError,
 };
@@ -32,7 +43,9 @@ use serde_json::{Value, json};
 
 use crate::cli_install::{self, InstallError, Kind, Layout, PlatformOps};
 use crate::commands::CommandError;
+use crate::commands::audit::{ExportDoneDto, run_export};
 use crate::commands::settings::cli_uninstall_dto;
+use crate::ui_sink::EventOut;
 
 /// §12.5 step 2 (verbatim): shown per instance with its alias and token identity.
 pub const REVOKE_STEP: &str =
@@ -45,6 +58,19 @@ pub const KEY_AUTOSTART: &str = "autostart";
 
 /// Log event of a refused or failed removal call (kind only).
 pub const LOG_EVENT_REMOVAL_FAILED: &str = "removal_failed";
+
+/// PD-176: the most `CONFIG_CHANGED` payloads [`read_log`] decrypts looking for the newest
+/// `prepare_for_removal` record. The key is in the encrypted payload only (§8.2 keeps `target` for
+/// its listed values), so the records newer than it are read too; past this many the log is taken to
+/// hold no open procedure (logged).
+pub const MAX_LOG_SCAN_RECORDS: usize = 10_000;
+
+/// PD-176: the most instances a choices record is read back with; a longer list is not resumed.
+const MAX_RECORDED_ITEMS: usize = 1_024;
+
+/// PD-176: the longest token identity (in characters) the choices record keeps per instance, so the
+/// record stays far below core's bound on an app record's value.
+pub const MAX_RECORDED_IDENTITY_CHARS: usize = 128;
 
 /// The user's answer for one instance's revoke step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -66,6 +92,15 @@ impl Choice {
             Choice::Skipped => "skipped",
         }
     }
+
+    /// The answer a choices record names (`done` or `skipped`); anything else is not an answer.
+    fn from_recorded(s: &str) -> Option<Choice> {
+        match s {
+            "done" => Some(Choice::Done),
+            "skipped" => Some(Choice::Skipped),
+            _ => None,
+        }
+    }
 }
 
 /// Why a removal call was refused, beyond the errors core and the command layer already have.
@@ -83,6 +118,10 @@ pub enum RemovalError {
     /// `mark` after the choices were written to the audit log (a failed effect left the procedure
     /// in place for a retry): the recorded answers are not changed afterwards.
     Recorded,
+    /// Another removal call runs (its dialog, its token deletes): wait for it (T28 m-8). Also the
+    /// answer of `credential_window_open` meanwhile. Another *job* holding the serving state's slot
+    /// (an export, a backup, a restore) is plain `busy`.
+    Running,
 }
 
 impl RemovalError {
@@ -93,6 +132,7 @@ impl RemovalError {
             Self::TokenStored => "token_stored",
             Self::Autostart => "autostart",
             Self::Recorded => "recorded",
+            Self::Running => "running",
         }
     }
 }
@@ -150,12 +190,37 @@ impl<R: tauri::Runtime> AutostartPort for PluginAutostart<R> {
     }
 }
 
-/// The retention facts the page shows beside the backup offer (§12.5 step 1). The newest record is
-/// the one written at this moment, so its remaining retention is the setting itself.
+/// The retention facts the page shows beside the backup offer (§12.5 step 1: "the remaining
+/// retention days of the newest record").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Retention {
+    /// The setting.
     pub days: u32,
     pub legal_hold: bool,
+    /// The newest record's remaining retention in days (PD-176): `days` less the age in days of its
+    /// effective epoch, at least 0; `None` while a legal hold is on (kept indefinitely).
+    pub left_days: Option<u32>,
+}
+
+impl Retention {
+    /// PD-176: `newest_epoch` is the newest record's `epoch` column (`YYYY-MM-DD`), `today` the
+    /// current UTC time. That record has no later record to take an effective epoch from, so a
+    /// `NULL` epoch (written while the clock was behind) has none: it is not prunable until a later
+    /// record has one (L36), and the setting itself is the truthful "at least". So is an epoch after
+    /// today.
+    pub fn of(days: u32, legal_hold: bool, newest_epoch: Option<&str>, today: UtcInstant) -> Self {
+        let age = newest_epoch
+            .and_then(atlas_duck_audit::clock::parse_epoch)
+            .map_or(0, |epoch| {
+                today.date().signed_duration_since(epoch).num_days().max(0)
+            });
+        let left = i64::from(days).saturating_sub(age).max(0);
+        Retention {
+            days,
+            legal_hold,
+            left_days: (!legal_hold).then(|| u32::try_from(left).unwrap_or(0)),
+        }
+    }
 }
 
 /// One instance of the checklist as the page sees it.
@@ -177,12 +242,20 @@ pub struct ItemDto {
 /// `removal_state`'s answer (and what `removal_begin`, `removal_mark` answer).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RemovalDto {
-    /// `begin` ran in this process and `finish` has not completed.
+    /// A procedure is under way: `begin` ran in this process, or the audit log holds its choices
+    /// record and no outcome record (PD-176); `finish` has not completed.
     pub active: bool,
+    /// The answers are in the audit log (a failed effect left the procedure for a retry): they are
+    /// final, `removal_mark` is refused (T28 m-4).
+    pub recorded: bool,
     /// A full backup was made in this procedure.
     pub backup_made: bool,
+    /// The retention setting.
     pub retention_days: u32,
     pub legal_hold: bool,
+    /// [`Retention::left_days`]: the newest record's remaining retention; `null` while a legal hold
+    /// is on.
+    pub retention_left_days: Option<u32>,
     pub instances: Vec<ItemDto>,
 }
 
@@ -220,12 +293,47 @@ struct Procedure {
     items: Vec<Item>,
     /// `prepare_for_removal` is in the log: a retried `finish` does not record it again.
     recorded: bool,
+    /// An earlier `finish` of this procedure removed autostart (its later step failed): a retry
+    /// finds it off and still answers `removed` (M6 M-12, T28 m-5).
+    autostart_removed: bool,
 }
 
 #[derive(Debug, Default)]
 struct Inner {
     backup_made: bool,
     procedure: Option<Procedure>,
+    /// The audit log was read back for an open procedure (PD-176), once per process.
+    hydrated: bool,
+}
+
+/// What the audit log says about the procedure (PD-176), from its newest `CONFIG_CHANGED {key:
+/// prepare_for_removal}`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogFacts {
+    /// That record is a choices record (written before the effects) and no outcome record followed:
+    /// the procedure it records did not end.
+    pub open: Option<OpenProcedure>,
+}
+
+/// A procedure the audit log records as not ended (PD-176).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenProcedure {
+    /// A full backup was made in it.
+    pub backup: bool,
+    pub items: Vec<RecordedItem>,
+    /// The newest `autostart` record after the choices record says it was removed (and no undo
+    /// followed): the next `finish` finds it off and answers `removed`.
+    pub autostart_removed: bool,
+}
+
+/// One instance of a choices record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedItem {
+    pub alias: String,
+    pub product: &'static str,
+    /// The token's identity when the token was deleted (bounded, PD-176).
+    pub identity: Option<String>,
+    pub choice: Choice,
 }
 
 /// The one procedure of this process, managed by Tauri (`app.manage`). A call that changes it holds
@@ -249,10 +357,57 @@ impl RemovalState {
     /// `Busy` while another removal call runs.
     pub fn claim(&self) -> Result<Claim<'_>, CommandError> {
         if self.busy.swap(true, Ordering::SeqCst) {
-            Err(CommandError::Busy)
+            Err(CommandError::Removal(RemovalError::Running))
         } else {
             Ok(Claim(&self.busy))
         }
+    }
+
+    /// The audit log has not been read back for an open procedure yet (PD-176): the command layer
+    /// reads it ([`read_log`]) and calls [`RemovalState::hydrate`] before the call.
+    pub fn needs_log(&self) -> bool {
+        !self.lock().hydrated
+    }
+
+    /// PD-176: resumes the procedure the audit log records as not ended, unless this process
+    /// already holds one; `views` (the live instance list) give each item its origin. Once per
+    /// process.
+    pub fn hydrate(&self, facts: LogFacts, views: &[InstanceView]) {
+        let mut inner = self.lock();
+        if inner.hydrated {
+            return;
+        }
+        inner.hydrated = true;
+        let Some(open) = facts.open else {
+            return;
+        };
+        if inner.procedure.is_some() {
+            return;
+        }
+        let items = open
+            .items
+            .into_iter()
+            .map(|r| Item {
+                origin: views
+                    .iter()
+                    .find(|v| v.alias == r.alias)
+                    .and_then(|v| v.origin.clone()),
+                alias: r.alias,
+                product: r.product,
+                identity: r.identity,
+                // `finish` wrote the record only once every token was deleted; a token stored
+                // since is found by the next `begin` or `finish` (`reconcile`).
+                deleted: true,
+                error: None,
+                choice: r.choice,
+            })
+            .collect();
+        inner.procedure = Some(Procedure {
+            items,
+            recorded: true,
+            autostart_removed: open.autostart_removed,
+        });
+        inner.backup_made = open.backup;
     }
 
     /// A removal call is running now (the credential window must not open meanwhile).
@@ -269,9 +424,11 @@ impl RemovalState {
         let inner = self.lock();
         RemovalDto {
             active: inner.procedure.is_some(),
+            recorded: inner.procedure.as_ref().is_some_and(|p| p.recorded),
             backup_made: inner.backup_made,
             retention_days: retention.days,
             legal_hold: retention.legal_hold,
+            retention_left_days: retention.left_days,
             instances: inner
                 .procedure
                 .as_ref()
@@ -310,16 +467,14 @@ fn listed(view: &InstanceView) -> bool {
     !matches!(view.state, "instance_unconfirmed" | "insecure_scheme") || token_stored(view)
 }
 
-/// The aliases `begin` deletes the token of. No procedure yet: every listed instance. Otherwise
+/// The aliases `begin` deletes the token of. No procedure yet: every instance, listed or not (T28
+/// m-1: a table that lost an identity, or failed closed with every instance unconfirmed, must not
+/// leave a keychain entry behind; `delete_token` logs nothing when nothing is stored). Otherwise
 /// what is not deleted, every instance whose token the table shows (a token entered since), and
 /// every listed instance the checklist does not have yet.
 fn begin_targets(procedure: Option<&Procedure>, views: &[InstanceView]) -> Vec<String> {
     let Some(p) = procedure else {
-        return views
-            .iter()
-            .filter(|v| listed(v))
-            .map(|v| v.alias.clone())
-            .collect();
+        return views.iter().map(|v| v.alias.clone()).collect();
     };
     let mut targets: Vec<String> = Vec::new();
     let mut add = |alias: &str| {
@@ -344,9 +499,11 @@ fn begin_targets(procedure: Option<&Procedure>, views: &[InstanceView]) -> Vec<S
 /// deleted, not answered" with the identity the table shows now (a new token is a new thing to
 /// revoke: an earlier tick is stale), and one the checklist lacks joins it (`add_unstored`: every
 /// listed instance; otherwise only one holding a token). `true` when a token was found stored. The
-/// choices written to the audit log earlier no longer describe the procedure then.
+/// choices written to the audit log earlier no longer describe the procedure then, nor once an
+/// instance joined (it needs an answer, which `mark` refuses for recorded choices: M10 T16).
 fn reconcile(p: &mut Procedure, views: &[InstanceView], add_unstored: bool) -> bool {
     let mut found = false;
+    let mut joined = false;
     for v in views {
         let stored = token_stored(v);
         match p.items.iter_mut().find(|i| i.alias == v.alias) {
@@ -369,11 +526,12 @@ fn reconcile(p: &mut Procedure, views: &[InstanceView], add_unstored: bool) -> b
                     choice: Choice::Pending,
                 });
                 found |= stored;
+                joined = true;
             }
             None => {}
         }
     }
-    if found {
+    if found || joined {
         p.recorded = false;
     }
     found
@@ -399,23 +557,163 @@ async fn confirmed(confirmer: &Arc<dyn NativeConfirmer>, text: String) -> Result
     }
 }
 
-/// §12.5: what `begin` asks. Aliases are Rust-validated names (`A-Za-z0-9._-`), no server text.
-pub fn begin_text(aliases: &[String]) -> String {
-    let list = if aliases.is_empty() {
-        "none".to_owned()
+/// PD-176: the newest `CONFIG_CHANGED {source: app, key: prepare_for_removal}` of `store`, read
+/// back. Newest first over the `CONFIG_CHANGED` headers, decrypting each (the key is in the payload
+/// only), at most [`MAX_LOG_SCAN_RECORDS`]; on the way it notes the newest `autostart` record newer
+/// than that record. A store that cannot be read is the caller's to handle.
+pub fn read_log(store: &Store) -> Result<LogFacts, AuditError> {
+    let filter = AuditFilter {
+        event_types: vec![EventType::CONFIG_CHANGED],
+        ..AuditFilter::default()
+    };
+    let mut cursor = AuditCursor::first(MAX_AUDIT_PAGE_ROWS);
+    // The newest `autostart` record seen so far (so: newer than any removal record still ahead).
+    let mut autostart_enabled: Option<bool> = None;
+    let mut read = 0usize;
+    loop {
+        let page = store.query(&filter, cursor)?;
+        for header in &page.rows {
+            if read == MAX_LOG_SCAN_RECORDS {
+                tracing::warn!(
+                    event = LOG_EVENT_REMOVAL_FAILED,
+                    error_class = "log_scan_limit"
+                );
+                return Ok(LogFacts::default());
+            }
+            read += 1;
+            let bytes = store.read_payload(header.seq)?;
+            let Ok(payload) = serde_json::from_slice::<Value>(&bytes) else {
+                continue;
+            };
+            if payload.get("source").and_then(Value::as_str) != Some("app") {
+                continue;
+            }
+            match payload.get("key").and_then(Value::as_str) {
+                Some(KEY_AUTOSTART) if autostart_enabled.is_none() => {
+                    autostart_enabled = payload
+                        .get("new")
+                        .and_then(|n| n.get("enabled"))
+                        .and_then(Value::as_bool);
+                }
+                Some(KEY_REMOVAL) => {
+                    let open = payload
+                        .get("new")
+                        .and_then(|new| open_procedure(new, autostart_enabled == Some(false)));
+                    return Ok(LogFacts { open });
+                }
+                _ => {}
+            }
+        }
+        match page.next {
+            Some(next) => cursor = next,
+            None => return Ok(LogFacts::default()),
+        }
+    }
+}
+
+/// A choices record's `new` value (`{prepared: false, backup, instances: [{alias, product,
+/// identity, revoke}]}`) as the procedure it records; `None` for an outcome record (no
+/// `instances`) and for one this version cannot read whole: it is read as data, bounded, and every
+/// field must have the shape `finish` writes.
+fn open_procedure(new: &Value, autostart_removed: bool) -> Option<OpenProcedure> {
+    let instances = new.get("instances")?.as_array()?;
+    if instances.len() > MAX_RECORDED_ITEMS {
+        return None;
+    }
+    let items = instances
+        .iter()
+        .map(|item| {
+            let alias = item.get("alias")?.as_str()?;
+            let alias_ok = (1..=MAX_ALIAS_CHARS).contains(&alias.len())
+                && alias
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+            if !alias_ok {
+                return None;
+            }
+            let product = match item.get("product")?.as_str()? {
+                "jira" => "jira",
+                "confluence" => "confluence",
+                _ => return None,
+            };
+            let identity = match item.get("identity") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(bounded_identity(s)),
+                Some(_) => return None,
+            };
+            Some(RecordedItem {
+                alias: alias.to_owned(),
+                product,
+                identity,
+                choice: Choice::from_recorded(item.get("revoke")?.as_str()?)?,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(OpenProcedure {
+        backup: new.get("backup").and_then(Value::as_bool).unwrap_or(false),
+        items,
+        autostart_removed,
+    })
+}
+
+/// A token identity as the choices record keeps it: at most [`MAX_RECORDED_IDENTITY_CHARS`]
+/// characters (server text; the page shows it as such).
+fn bounded_identity(s: &str) -> String {
+    s.chars().take(MAX_RECORDED_IDENTITY_CHARS).collect()
+}
+
+/// §12.5 step 1: the compliance export the procedure offers next to the backup: the Audit window's
+/// export (PD-159..PD-161, M10 T12) over the full range, the PD-161 warning and the folder dialog
+/// drawn by Rust, run as the serving state's one job by the caller (`removal_export`). It changes
+/// no token, so it needs no removal claim.
+pub fn export(
+    store: &Store,
+    confirmer: &dyn NativeConfirmer,
+    pick: impl FnOnce() -> Option<RustChosenPath>,
+    cancel: &AtomicBool,
+    out: &dyn EventOut,
+) -> Result<ExportDoneDto, CommandError> {
+    run_export(store, confirmer, pick, TimeRange::all(), cancel, out)
+}
+
+/// plan text (M6 T28, T28 m-2; the step is §12.5's): what `begin` asks. `targets` are the instances
+/// whose token is deleted, each with whether the instance table knows the stored token's identity.
+/// Aliases are Rust-validated names (`A-Za-z0-9._-`); no server text (no identity) is in the text.
+pub fn begin_text(targets: &[(String, bool)]) -> String {
+    let tokens = if targets.is_empty() {
+        "No instance is set up, so no token is deleted.".to_owned()
     } else {
-        aliases.join(", ")
+        let list = targets
+            .iter()
+            .map(|(alias, known)| {
+                if *known {
+                    alias.clone()
+                } else {
+                    format!("{alias} (identity unknown)")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let unknown = if targets.iter().any(|(_, known)| !known) {
+            "An instance marked \"identity unknown\" has no token identity on record: a token \
+             stored for it is deleted too. "
+        } else {
+            ""
+        };
+        format!(
+            "The stored token of each of these instances will be deleted: {list}. {unknown}A \
+             deleted token stays valid on the Jira/Confluence server until you revoke it there; \
+             the next step lists each one."
+        )
     };
     format!(
-        "Prepare atlas-duck for removal?\n\n\
-         The stored tokens of these instances will be deleted: {list}. A deleted token stays valid \
-         on the Jira/Confluence server until you revoke it there; the next step lists each one.\n\n\
+        "Prepare atlas-duck for removal?\n\n{tokens}\n\n\
          The audit log, its keys and anchors are kept, so the log stays verifiable until its \
          retention period has passed."
     )
 }
 
-/// §12.5 step 3: what `finish` asks.
+/// plan text (M6 T28; the step is §12.5 step 3's): what `finish` asks.
 pub fn finish_text() -> String {
     "Finish removal?\n\n\
      atlas-duck will stop starting at login, and its command-line launcher will be removed (the \
@@ -460,11 +758,11 @@ pub async fn begin(
         run_blocking(move || admin.list()).await?
     };
     let first_run = state.lock().procedure.is_none();
-    // `delete_token` is called for every listed instance on a first run, not only for those the
-    // table says hold a token: it is idempotent and logs nothing when nothing is stored, and a
-    // keychain entry must not outlive the delete because the table lost the identity. Afterwards a
-    // run retries what is not deleted, and looks at the live list again: an instance added or
-    // confirmed since, or one given a token since, is deleted too.
+    // `delete_token` is called for every instance on a first run, listed or not, not only for
+    // those the table says hold a token: it is idempotent and logs nothing when nothing is stored,
+    // and a keychain entry must not outlive the delete because the table lost the identity (T28
+    // m-1). Afterwards a run retries what is not deleted, and looks at the live list again: an
+    // instance added or confirmed since, or one given a token since, is deleted too.
     let targets = {
         let inner = state.lock();
         begin_targets(inner.procedure.as_ref(), &views)
@@ -472,13 +770,16 @@ pub async fn begin(
     if !first_run && targets.is_empty() {
         return Ok(state.dto(retention));
     }
-    // The dialog names what is actually stored.
-    let stored: Vec<String> = views
+    // The dialog names every instance whose token is deleted, and which of them has no identity on
+    // record (T28 m-2).
+    let named: Vec<(String, bool)> = targets
         .iter()
-        .filter(|v| targets.contains(&v.alias) && token_stored(v))
-        .map(|v| v.alias.clone())
+        .map(|alias| {
+            let known = views.iter().any(|v| &v.alias == alias && token_stored(v));
+            (alias.clone(), known)
+        })
         .collect();
-    confirmed(&confirmer, begin_text(&stored)).await?;
+    confirmed(&confirmer, begin_text(&named)).await?;
     {
         let mut inner = state.lock();
         let procedure = inner.procedure.get_or_insert_with(Procedure::default);
@@ -486,24 +787,38 @@ pub async fn begin(
     }
     for alias in targets {
         let result = instances.delete_token(&alias).await;
+        if let Err(AdminError::ShuttingDown) = result {
+            return Err(CommandError::Admin(AdminError::ShuttingDown));
+        }
         let mut inner = state.lock();
-        let Some(item) = inner
-            .procedure
-            .as_mut()
-            .and_then(|p| p.items.iter_mut().find(|i| i.alias == alias))
-        else {
+        let Some(p) = inner.procedure.as_mut() else {
             continue;
         };
-        match result {
+        match (result, p.items.iter_mut().find(|i| i.alias == alias)) {
             // Core answered without an error: no token is stored for the instance now.
-            Ok(_) => {
+            (Ok(_), Some(item)) => {
                 item.deleted = true;
                 item.error = None;
             }
-            Err(AdminError::ShuttingDown) => {
-                return Err(CommandError::Admin(AdminError::ShuttingDown));
+            // Not on the checklist, and nothing (left) stored.
+            (Ok(_), None) => {}
+            (Err(e), Some(item)) => item.error = Some(e.to_string()),
+            // An instance off the checklist whose delete failed may still hold a token: it joins
+            // the checklist as not deleted, so `finish` waits for a `begin` that deletes it.
+            (Err(e), None) => {
+                if let Some(v) = views.iter().find(|v| v.alias == alias) {
+                    p.recorded = false;
+                    p.items.push(Item {
+                        alias,
+                        product: product_str(v.product),
+                        origin: v.origin.clone(),
+                        identity: v.executes_as.clone(),
+                        deleted: false,
+                        error: Some(e.to_string()),
+                        choice: Choice::Pending,
+                    });
+                }
             }
-            Err(e) => item.error = Some(e.to_string()),
         }
     }
     Ok(state.dto(retention))
@@ -721,9 +1036,18 @@ pub async fn finish(
         )
     };
     if !recorded {
+        // PD-176: product and token identity per instance too (bounded), so a restart before the
+        // outcome record resumes the checklist as it is; no origin (the live table has it).
         let choices: Vec<Value> = items
             .iter()
-            .map(|i| json!({"alias": i.alias, "revoke": i.choice.recorded()}))
+            .map(|i| {
+                json!({
+                    "alias": i.alias,
+                    "product": i.product,
+                    "identity": i.identity.as_deref().map(bounded_identity),
+                    "revoke": i.choice.recorded(),
+                })
+            })
             .collect();
         let admin = settings.clone();
         // Audit before effect: a record that cannot be written stops the call, nothing is removed.
@@ -741,14 +1065,25 @@ pub async fn finish(
             p.recorded = true;
         }
     }
-    let (autostart_removed, cli) = {
+    let removed_now = {
         let settings = settings.clone();
-        run_blocking(move || -> Result<(bool, CliStep), CommandError> {
-            let removed = remove_autostart(&*settings, &*autostart)?;
-            let cli = remove_cli(&*settings, &*ops, layout, fallback)?;
-            Ok((removed, cli))
-        })
-        .await??
+        run_blocking(move || remove_autostart(&*settings, &*autostart)).await??
+    };
+    // Kept on the procedure the moment it is done: a later step that fails leaves the procedure
+    // for a retry, which finds autostart off and must still answer `removed` (M6 M-12).
+    let autostart_removed = {
+        let mut inner = state.lock();
+        match inner.procedure.as_mut() {
+            Some(p) => {
+                p.autostart_removed |= removed_now;
+                p.autostart_removed
+            }
+            None => removed_now,
+        }
+    };
+    let cli = {
+        let settings = settings.clone();
+        run_blocking(move || remove_cli(&*settings, &*ops, layout, fallback)).await??
     };
     // Every effect is done (or the CLI step says what it could not do): the record that says so.
     // Its own failure cannot undo the effects; the log then keeps `prepared: false`, the safe side.
@@ -768,7 +1103,13 @@ pub async fn finish(
             error_kind = e.to_string().as_str()
         );
     }
-    *state.lock() = Inner::default();
+    // The procedure ended in this process: the log is not read back for it again (if the outcome
+    // record failed, the next process resumes it from the choices record, PD-176, and its retry
+    // finds every effect done).
+    *state.lock() = Inner {
+        hydrated: true,
+        ..Inner::default()
+    };
     Ok(FinishAnswer {
         cli: cli.cli,
         cli_reason: cli.reason,
@@ -807,14 +1148,13 @@ mod tests {
 
     #[test]
     fn the_dialogs_say_what_goes_and_what_stays() {
-        let begin = begin_text(&["a".into(), "b".into()]);
+        let begin = begin_text(&[("a".into(), true), ("b".into(), true)]);
         assert!(begin.contains("a, b"), "{begin}");
         assert!(begin.contains("stays valid"), "{begin}");
         assert!(
             begin.contains("audit log, its keys and anchors are kept"),
             "{begin}"
         );
-        assert!(begin_text(&[]).contains("none"));
         let finish = finish_text();
         assert!(finish.contains("stop starting at login"), "{finish}");
         assert!(finish.contains("cli.toml"), "{finish}");
@@ -832,6 +1172,7 @@ mod tests {
             (RemovalError::TokenStored, "token_stored"),
             (RemovalError::Autostart, "autostart"),
             (RemovalError::Recorded, "recorded"),
+            (RemovalError::Running, "running"),
         ] {
             assert_eq!(e.to_string(), kind);
             assert_eq!(serde_json::to_value(e).ok(), Some(json!({ "kind": kind })));
@@ -840,5 +1181,401 @@ mod tests {
             serde_json::to_value(Choice::Skipped).ok(),
             Some(json!("skipped"))
         );
+    }
+
+    fn at(ts: &str) -> UtcInstant {
+        UtcInstant::parse_rfc3339_ms(ts).unwrap_or(UtcInstant(0))
+    }
+
+    /// §12.5 step 1, PD-176: the remaining retention is the newest record's, from its effective
+    /// epoch: the setting less the record's age in days, never below 0. A record with no epoch
+    /// (written while the clock was behind) or one dated after today keeps the whole setting.
+    #[test]
+    fn retention_from_newest_record() {
+        let today = at("2026-10-19T12:00:00.000Z");
+        let left = |epoch: Option<&str>| Retention::of(92, false, epoch, today).left_days;
+        assert_eq!(left(Some("2026-10-19")), Some(92), "written today");
+        assert_eq!(left(Some("2026-10-09")), Some(82), "ten days old");
+        assert_eq!(left(Some("2026-07-19")), Some(0), "exactly the setting old");
+        assert_eq!(left(Some("2025-01-01")), Some(0), "older than the setting");
+        assert_eq!(left(None), Some(92), "no effective epoch yet");
+        assert_eq!(left(Some("2026-10-25")), Some(92), "dated after today");
+        assert_eq!(left(Some("not a date")), Some(92));
+        let r = Retention::of(92, false, Some("2026-10-09"), today);
+        assert_eq!((r.days, r.legal_hold), (92, false), "the setting is kept");
+        // The page gets both: the setting and the newest record's remaining days.
+        let dto = RemovalState::default().dto(r);
+        assert_eq!(
+            (dto.retention_days, dto.retention_left_days),
+            (92, Some(82))
+        );
+    }
+
+    /// PD-176: while a legal hold is on the newest record is kept indefinitely: no day count.
+    #[test]
+    fn legal_hold_shows_indefinite() {
+        let today = at("2026-10-19T12:00:00.000Z");
+        for epoch in [Some("2026-10-09"), None, Some("2020-01-01")] {
+            let r = Retention::of(92, true, epoch, today);
+            assert_eq!(r.left_days, None, "{epoch:?}");
+            assert!(r.legal_hold);
+        }
+        let dto = RemovalState::default().dto(Retention::of(30, true, None, today));
+        assert!(dto.legal_hold);
+        assert_eq!(dto.retention_left_days, None);
+        assert_eq!(
+            serde_json::to_value(&dto)
+                .ok()
+                .map(|v| v["retention_left_days"].clone()),
+            Some(Value::Null)
+        );
+    }
+
+    /// A row of the instance table as the removal sees it.
+    fn view(alias: &str, state: &'static str, identity: Option<&str>) -> InstanceView {
+        InstanceView {
+            alias: alias.into(),
+            product: atlas_duck_core::Product::Jira,
+            origin: Some(format!("https://{alias}.example")),
+            state,
+            executes_as: identity.map(str::to_owned),
+            expires_at: None,
+            pac_configured: false,
+            proxy_effective: None,
+            pending_url_change: None,
+            note: None,
+            expiry_warning: None,
+            days_left: None,
+        }
+    }
+
+    /// T28 m-1: the first `begin` deletes the token of *every* instance, not only of the ones the
+    /// checklist lists: a table that lost an identity (or failed closed, every instance
+    /// `instance_unconfirmed`) must not leave a keychain entry behind. `delete_token` is idempotent
+    /// and logs nothing when nothing is stored.
+    #[test]
+    fn begin_covers_every_instance_with_a_token() {
+        let views = [
+            view("ok", "ok", Some("Alice")),
+            view("lost", "instance_unconfirmed", None),
+            view("plain", "insecure_scheme", None),
+            view("waiting", "needs_token", None),
+        ];
+        let mut targets = begin_targets(None, &views);
+        targets.sort();
+        assert_eq!(targets, ["lost", "ok", "plain", "waiting"]);
+        // The checklist still lists only what can have been given a PAT (or shows an identity).
+        let mut p = Procedure::default();
+        reconcile(&mut p, &views, true);
+        let mut listed: Vec<&str> = p.items.iter().map(|i| i.alias.as_str()).collect();
+        listed.sort_unstable();
+        assert_eq!(listed, ["ok", "waiting"]);
+    }
+
+    /// A procedure whose choices are recorded (resumed after a restart, PD-176, or after a failed
+    /// effect) that gains an instance (added or confirmed since) needs an answer for it, which
+    /// `mark` refuses while the choices are recorded: the join reopens them, and `finish` records
+    /// the choices again with the new instance.
+    #[test]
+    fn an_instance_joining_reopens_recorded_choices() {
+        let mut p = Procedure {
+            items: vec![Item {
+                alias: "ok".into(),
+                product: "jira",
+                origin: None,
+                identity: Some("Alice".into()),
+                deleted: true,
+                error: None,
+                choice: Choice::Done,
+            }],
+            recorded: true,
+            autostart_removed: false,
+        };
+        let old = [view("ok", "needs_token", None)];
+        assert!(!reconcile(&mut p, &old, true));
+        assert!(p.recorded, "the same instances: still recorded");
+        let new = [
+            view("ok", "needs_token", None),
+            view("new", "needs_token", None),
+        ];
+        assert!(!reconcile(&mut p, &new, true), "no token was found");
+        assert!(!p.recorded, "the new instance needs an answer");
+    }
+
+    /// T28 m-2: the begin dialog names every instance whose token is deleted, marks the ones with
+    /// no identity on record, and says so in a sentence of its own; with no instance at all it
+    /// does not claim a deletion. No identity (server text) is in the dialog.
+    #[test]
+    fn begin_dialog_names_unknown_identity() {
+        let text = begin_text(&[("ok".into(), true), ("lost".into(), false)]);
+        assert!(text.contains("ok, lost (identity unknown)"), "{text}");
+        assert!(
+            text.contains("\"identity unknown\" has no token identity on record"),
+            "{text}"
+        );
+        assert!(text.contains("stays valid"), "{text}");
+        assert!(!text.contains('\u{201C}'), "no quoted identity: {text}");
+        let none = begin_text(&[]);
+        assert!(none.contains("No instance is set up"), "{none}");
+        assert!(!none.contains("deleted:"), "{none}");
+        assert!(
+            none.contains("audit log, its keys and anchors are kept"),
+            "{none}"
+        );
+    }
+
+    /// A `CONFIG_CHANGED {source: app}` as `SettingsAdmin::record_app_change` writes it.
+    fn app_change(store: &Store, key: &str, old: Value, new: Value) -> Result<u64, AuditError> {
+        Ok(store
+            .append(atlas_duck_audit::NewEvent {
+                event_type: EventType::CONFIG_CHANGED,
+                request_id: None,
+                op_id: None,
+                op_class: None,
+                instance_id: None,
+                target: None,
+                actor: atlas_duck_audit::Actor::default(),
+                decision: None,
+                flags: atlas_duck_audit::EventFlags::default(),
+                payload: json!({"source": "app", "key": key, "old": old, "new": new,
+                                "applied": true}),
+            })?
+            .seq)
+    }
+
+    fn choices(backup: bool) -> Value {
+        json!({"prepared": false, "backup": backup, "instances": [
+            {"alias": "jira-main", "product": "jira", "identity": "Alice Example", "revoke": "done"},
+            {"alias": "wiki", "product": "confluence", "identity": null, "revoke": "skipped"},
+        ]})
+    }
+
+    /// PD-176: the newest `prepare_for_removal` record decides. A choices record with no outcome
+    /// after it is an open procedure (its answers, identities and backup flag); an outcome record
+    /// ends it; other keys' records in between are passed over, except the newest `autostart`
+    /// after the choices, which says whether an earlier `finish` removed the login item.
+    #[test]
+    fn read_log_finds_the_open_procedure() -> Result<(), Box<dyn std::error::Error>> {
+        let r = crate::commands::audit::tests::rig(2)?;
+        assert_eq!(read_log(&r.store)?, LogFacts::default(), "no record");
+        app_change(
+            &r.store,
+            KEY_REMOVAL,
+            json!({"prepared": false}),
+            choices(true),
+        )?;
+        app_change(&r.store, "cli_install", json!({"a": 1}), json!({"a": 2}))?;
+        let open = read_log(&r.store)?.open.ok_or("no open procedure")?;
+        assert!(open.backup);
+        assert!(!open.autostart_removed);
+        assert_eq!(
+            open.items,
+            [
+                RecordedItem {
+                    alias: "jira-main".into(),
+                    product: "jira",
+                    identity: Some("Alice Example".into()),
+                    choice: Choice::Done,
+                },
+                RecordedItem {
+                    alias: "wiki".into(),
+                    product: "confluence",
+                    identity: None,
+                    choice: Choice::Skipped,
+                },
+            ]
+        );
+        let (on, off) = (json!({"enabled": true}), json!({"enabled": false}));
+        app_change(&r.store, KEY_AUTOSTART, on.clone(), off.clone())?;
+        let open = read_log(&r.store)?.open.ok_or("no open procedure")?;
+        assert!(open.autostart_removed, "removed after the choices");
+        // Its undo (the disable failed) follows: not removed.
+        app_change(&r.store, KEY_AUTOSTART, off.clone(), on.clone())?;
+        let open = read_log(&r.store)?.open.ok_or("no open procedure")?;
+        assert!(!open.autostart_removed, "undone");
+        // The outcome record ends the procedure.
+        app_change(
+            &r.store,
+            KEY_REMOVAL,
+            json!({"prepared": false}),
+            json!({"prepared": true, "cli": "removed"}),
+        )?;
+        assert_eq!(read_log(&r.store)?, LogFacts::default(), "ended");
+        // An autostart record before a later procedure's choices is not that procedure's.
+        app_change(&r.store, KEY_AUTOSTART, on, off)?;
+        app_change(
+            &r.store,
+            KEY_REMOVAL,
+            json!({"prepared": false}),
+            choices(false),
+        )?;
+        let open = read_log(&r.store)?.open.ok_or("no open procedure")?;
+        assert!(!open.autostart_removed);
+        assert!(!open.backup);
+        Ok(())
+    }
+
+    /// PD-176: a choices record this version cannot read whole (an unknown product or answer, an
+    /// alias that is no alias, an overlong list) resumes nothing; an overlong identity is cut.
+    #[test]
+    fn read_log_resumes_only_a_well_formed_record() -> Result<(), Box<dyn std::error::Error>> {
+        let r = crate::commands::audit::tests::rig(0)?;
+        let one = |item: Value| json!({"prepared": false, "backup": false, "instances": [item]});
+        for bad in [
+            json!({"alias": "a", "product": "bitbucket", "identity": null, "revoke": "done"}),
+            json!({"alias": "a", "product": "jira", "identity": null, "revoke": "pending"}),
+            json!({"alias": "a b", "product": "jira", "identity": null, "revoke": "done"}),
+            json!({"alias": "", "product": "jira", "identity": null, "revoke": "done"}),
+            json!({"alias": "a", "product": "jira", "identity": 7, "revoke": "done"}),
+            json!("a"),
+        ] {
+            app_change(
+                &r.store,
+                KEY_REMOVAL,
+                json!({"prepared": false}),
+                one(bad.clone()),
+            )?;
+            assert_eq!(read_log(&r.store)?, LogFacts::default(), "{bad}");
+        }
+        let many: Vec<Value> = (0..=MAX_RECORDED_ITEMS)
+            .map(|i| {
+                json!({"alias": format!("a{i}"), "product": "jira", "identity": null,
+                            "revoke": "done"})
+            })
+            .collect();
+        app_change(
+            &r.store,
+            KEY_REMOVAL,
+            json!({"prepared": false}),
+            json!({"prepared": false, "backup": false, "instances": many}),
+        )?;
+        assert_eq!(read_log(&r.store)?, LogFacts::default(), "too many");
+        let long = "x".repeat(MAX_RECORDED_IDENTITY_CHARS + 50);
+        app_change(
+            &r.store,
+            KEY_REMOVAL,
+            json!({"prepared": false}),
+            one(json!({"alias": "a", "product": "jira", "identity": long, "revoke": "done"})),
+        )?;
+        let open = read_log(&r.store)?.open.ok_or("no open procedure")?;
+        let shown = open.items[0].identity.clone().unwrap_or_default();
+        assert_eq!(
+            shown.chars().count(),
+            MAX_RECORDED_IDENTITY_CHARS,
+            "{shown}"
+        );
+        Ok(())
+    }
+
+    /// PD-176: the resumed procedure is recorded, its items deleted with their answers and
+    /// identities, their origins from the live table (none for an instance gone since); a process
+    /// that holds a procedure of its own keeps it; the log is read once.
+    #[test]
+    fn hydrate_resumes_the_recorded_procedure() {
+        let facts = LogFacts {
+            open: Some(OpenProcedure {
+                backup: true,
+                autostart_removed: true,
+                items: vec![
+                    RecordedItem {
+                        alias: "ok".into(),
+                        product: "jira",
+                        identity: Some("Alice".into()),
+                        choice: Choice::Done,
+                    },
+                    RecordedItem {
+                        alias: "gone".into(),
+                        product: "confluence",
+                        identity: None,
+                        choice: Choice::Skipped,
+                    },
+                ],
+            }),
+        };
+        let views = [view("ok", "needs_token", None)];
+        let st = RemovalState::default();
+        assert!(st.needs_log());
+        st.hydrate(facts.clone(), &views);
+        assert!(!st.needs_log());
+        let ret = Retention::of(92, false, None, UtcInstant(0));
+        let dto = st.dto(ret);
+        assert!(dto.active && dto.recorded && dto.backup_made);
+        assert_eq!(
+            dto.instances,
+            [
+                ItemDto {
+                    alias: "ok".into(),
+                    product: "jira",
+                    origin: Some("https://ok.example".into()),
+                    identity: Some("Alice".into()),
+                    token_deleted: true,
+                    error: None,
+                    choice: Choice::Done,
+                },
+                ItemDto {
+                    alias: "gone".into(),
+                    product: "confluence",
+                    origin: None,
+                    identity: None,
+                    token_deleted: true,
+                    error: None,
+                    choice: Choice::Skipped,
+                },
+            ]
+        );
+        // A procedure begun in this process is not replaced by the log's.
+        let own = RemovalState::default();
+        own.lock().procedure = Some(Procedure::default());
+        own.hydrate(facts, &views);
+        assert!(own.dto(ret).instances.is_empty());
+        assert!(!own.dto(ret).recorded);
+    }
+
+    /// §12.5 step 1 (PD-176): "Prepare for removal" offers the compliance export: the Audit
+    /// window's flow (the PD-161 warning, then Rust's folder dialog) over the full range, every
+    /// record up to the head, logged by one `EXPORT`.
+    #[test]
+    fn removal_offers_export() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::commands::audit::tests::{Answers, Events, chosen, count, entries, rig};
+        let r = rig(4)?;
+        let confirmer = Answers::new(&[Confirm::Ok]);
+        let events = Events::default();
+        let done = export(
+            &r.store,
+            &confirmer,
+            || Some(chosen(&r.out)),
+            &AtomicBool::new(false),
+            &events,
+        )?;
+        assert_eq!(
+            confirmer.texts(),
+            [crate::commands::audit::EXPORT_WARNING_TEXT]
+        );
+        let (head, _, _) = r.store.head();
+        assert_eq!(done.rows + 1, head, "every record before the EXPORT");
+        assert_eq!(entries(&r.out), std::slice::from_ref(&done.dir_name));
+        assert_eq!(count(&r.store, EventType::EXPORT)?, 1);
+        assert_eq!(
+            events.phases().last().map(String::as_str),
+            Some("done"),
+            "{:?}",
+            events.all()
+        );
+        // The warning cancelled: no folder dialog, nothing written, nothing logged.
+        let asked = AtomicBool::new(false);
+        let res = export(
+            &r.store,
+            &Answers::new(&[Confirm::Cancel]),
+            || {
+                asked.store(true, Ordering::SeqCst);
+                Some(chosen(&r.out))
+            },
+            &AtomicBool::new(false),
+            &Events::default(),
+        );
+        assert_eq!(res, Err(CommandError::Cancelled));
+        assert!(!asked.load(Ordering::SeqCst), "the folder dialog opened");
+        assert_eq!(count(&r.store, EventType::EXPORT)?, 1);
+        Ok(())
     }
 }

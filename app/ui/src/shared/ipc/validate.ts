@@ -442,11 +442,13 @@ const isRemovalItem = (v: unknown): v is RemovalItem =>
 export const isRemovalState = (v: unknown): v is RemovalState =>
   fields(v, {
     active: isBool,
+    recorded: isBool,
     backup_made: isBool,
     retention_days: isNum,
     legal_hold: isBool,
+    retention_left_days: numOrNull,
     instances: arrayOf(isRemovalItem),
-  }) && Object.keys(v).length === 5;
+  }) && Object.keys(v).length === 7;
 
 export const isVerifyNow = (v: unknown): v is VerifyNow => {
   if (!rec(v)) return false;

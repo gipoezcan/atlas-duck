@@ -571,7 +571,10 @@ export const SETTINGS_TEXT = {
   removal: 'Prepare for removal',
   removal_intro:
     'Before you uninstall atlas-duck: make a backup if you want one, delete the stored tokens, revoke each token on its server, and remove the command line and the login item. The audit log, its keys and its anchors are kept, so the log stays verifiable until its retention period has passed.',
-  /** spec 12.5 step 1: the remaining retention of the newest record is the setting itself. */
+  /**
+   * spec 12.5 step 1, shown with the setting until Task 21 shows `retention_left_days` (the newest
+   * record's remaining days, `null` while a legal hold is on; M10 T16, PD-176).
+   */
   removal_retention: (days: number, hold: boolean) =>
     `The newest audit record is kept ${hold ? 'until the legal hold is lifted, then for' : 'for'} at least ${days} more ${days === 1 ? 'day' : 'days'}.`,
   removal_backup: 'Create a full backup',
@@ -634,11 +637,12 @@ export const SETTINGS_TEXT = {
     token_stored: 'A token is stored again for an instance: delete it again, then finish',
     autostart: 'The login item could not be read or removed',
     recorded: 'The answers are already recorded: finish the removal',
+    running: 'Another removal step is running: wait for it to end, then try again',
   } as Readonly<Record<string, string>>,
   working: 'Working',
   /** Fixed answers for a refused or failed command, by error kind. */
   errors: {
-    busy: 'The credential window is open, or a removal step is running: close the window or wait, then try again',
+    busy: 'The credential window is open, or another task is running (an export, a backup or a restore): close the window or wait, then try again',
     not_found: 'That instance no longer exists',
     not_ready: 'The app is still starting: try again in a moment',
     internal: 'The command failed',

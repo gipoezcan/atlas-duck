@@ -22,6 +22,7 @@
     "allow-recovery-passphrase-change",
     "allow-removal-backup",
     "allow-removal-begin",
+    "allow-removal-export",
     "allow-removal-finish",
     "allow-removal-mark",
     "allow-removal-state",

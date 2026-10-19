@@ -300,6 +300,8 @@ function answer(cmd: string, args: Record<string, unknown>): Promise<Json> {
     case 'removal_begin':
     case 'removal_mark': return reply(cmd, 'removal_state');
     case 'removal_backup': return reply(cmd, 'removal_backup_answer');
+    // M10 T16 (PD-176): the removal's export; its UI is Task 21's.
+    case 'removal_export': return reply(cmd, 'export_done');
     case 'removal_finish': return reply(cmd, 'removal_finish_answer', (l) => l.find((a) => (a as { cli_reason?: unknown }).cli_reason != null) ?? l[0]);
     case 'verify_now': return reply(cmd, 'verify_now');
     case 'running_list': return Promise.resolve(fx('running_script'));

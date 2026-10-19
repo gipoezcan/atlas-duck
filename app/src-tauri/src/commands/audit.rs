@@ -793,9 +793,10 @@ pub fn run_backup(
     }
 }
 
-/// Rust's folder dialog for the export (no window holds the dialog plugin's commands, §10.3);
-/// `None` when cancelled. Blocks until the user answers: the audit job's thread only.
-fn pick_export_folder<R: Runtime>(app: &AppHandle<R>) -> Option<RustChosenPath> {
+/// Rust's folder dialog for the export (no window holds the dialog plugin's commands, §10.3; also
+/// "Prepare for removal"'s export, M10 T16); `None` when cancelled. Blocks until the user answers:
+/// the audit job's thread only.
+pub(crate) fn pick_export_folder<R: Runtime>(app: &AppHandle<R>) -> Option<RustChosenPath> {
     use tauri_plugin_dialog::DialogExt;
     let chosen = app
         .dialog()
@@ -820,7 +821,10 @@ fn open_store<R: Runtime>(app: &AppHandle<R>) -> Result<Store, CommandError> {
     serving(app)?.open_store().ok_or(CommandError::NotReady)
 }
 
-fn job_refused(e: JobRefused) -> CommandError {
+/// Why a job did not start, as the windows see it: another job holds the serving state's slot is
+/// `busy` (not `removal {running}`, which is a removal call's own claim, T28 m-8); the quit path
+/// began is `not_ready`.
+pub fn job_refused(e: JobRefused) -> CommandError {
     match e {
         JobRefused::Busy => CommandError::Busy,
         JobRefused::ShuttingDown => CommandError::NotReady,
