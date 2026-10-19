@@ -282,7 +282,9 @@ impl RebuildError {
             | AuditError::AnchorOutcomeUnknown
             | AuditError::NeedsConfirmation(_)
             | AuditError::Restore(_)
-            | AuditError::Cancelled => RebuildError::Transient(e),
+            | AuditError::Cancelled
+            | AuditError::ExportLeftover { .. }
+            | AuditError::ExportNotRenamed(_) => RebuildError::Transient(e),
             AuditError::Decrypt { .. }
             | AuditError::PayloadHash { .. }
             | AuditError::InvalidRecord { .. }

@@ -1,14 +1,16 @@
 //! Compliance export (§8.10, PD-159..PD-161, PD-181; T7): `Store::export` writes
 //! `events.jsonl`, `prune_log.jsonl` and `manifest.json` (last) into a new subdirectory it
-//! creates itself, then the store-owned `EXPORT {manifest_sha256, first_seq, last_seq, rows}`.
-//! Every failure, a cancel and a failed final append leave no directory and no `EXPORT`.
+//! creates itself under a `.partial` staging name, then the store-owned `EXPORT
+//! {manifest_sha256, first_seq, last_seq, rows}`, then renames the directory to its final name.
+//! Every failure, a cancel and a failed final append leave no directory and no `EXPORT`, or
+//! name the staging directory they could not remove.
 
 mod common;
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -64,6 +66,11 @@ fn export(store: &Store, out: &Path, range: TimeRange) -> Result<ExportReceipt, 
 
 fn dir_name(chain_id: &str, first: u64, last: u64) -> String {
     format!("atlas-duck-export-{chain_id}-{first}-{last}-{STAMP}")
+}
+
+/// The name the export directory has until the `EXPORT` record is logged.
+fn staging_name(chain_id: &str, first: u64, last: u64) -> String {
+    format!("{}.partial", dir_name(chain_id, first, last))
 }
 
 /// The entries of `out` (the chosen directory).
@@ -198,20 +205,24 @@ fn export_writes_three_files_manifest_last() {
     let (head, head_hash, chain) = store.head();
     let out = tempfile::tempdir().expect("out");
     let dir = out.path().join(dir_name(&chain, 1, head));
+    let staging = out.path().join(staging_name(&chain, 1, head));
 
-    // At every progress call only events.jsonl exists; at the final append all three do.
+    // At every progress call only events.jsonl exists; at the final append all three do, all
+    // in the staging directory: the final name appears only after the EXPORT is logged.
     let seen = Arc::new(Mutex::new(Vec::new()));
     let at_append = Arc::new(Mutex::new(None));
     {
-        let dir = dir.clone();
+        let (dir, staging) = (dir.clone(), staging.clone());
         let at_append = at_append.clone();
         faults.on_hit(FaultPoint::ExportBeforeAppend, move || {
-            *at_append.lock().expect("lock") = Some(file_names(&dir));
+            assert!(!dir.exists(), "no final name before the EXPORT");
+            *at_append.lock().expect("lock") = Some(file_names(&staging));
         });
     }
     let cancel = AtomicBool::new(false);
     let progress = |_: u64, _: u64| {
-        seen.lock().expect("lock").push(file_names(&dir));
+        assert!(!dir.exists(), "no final name before the EXPORT");
+        seen.lock().expect("lock").push(file_names(&staging));
     };
     let r = store
         .export(
@@ -542,21 +553,86 @@ fn export_refuses_existing_dir_name() {
     let (store, f) = new_store(fake_clock(START), MemKeyring::new());
     store.append_batch(mixed(3)).expect("append");
     let (head, _, chain) = store.head();
-    let out = tempfile::tempdir().expect("out");
-    let taken = out.path().join(dir_name(&chain, 1, head));
-    std::fs::create_dir(&taken).expect("dir");
-    std::fs::write(taken.join("keep.txt"), b"mine").expect("marker");
-    assert!(matches!(
-        export(&store, out.path(), TimeRange::all()),
-        Err(AuditError::Invalid(_))
-    ));
-    assert_eq!(entries(out.path()), vec![taken.clone()]);
-    assert_eq!(file_names(&taken), BTreeSet::from(["keep.txt".to_string()]));
-    assert_eq!(
-        std::fs::read(taken.join("keep.txt")).expect("marker"),
-        b"mine"
-    );
+    // The final name and the staging name: neither is written into, renamed or removed.
+    for name in [dir_name(&chain, 1, head), staging_name(&chain, 1, head)] {
+        let out = tempfile::tempdir().expect("out");
+        let taken = out.path().join(&name);
+        std::fs::create_dir(&taken).expect("dir");
+        std::fs::write(taken.join("keep.txt"), b"mine").expect("marker");
+        assert_eq!(
+            export(&store, out.path(), TimeRange::all()),
+            Err(AuditError::Invalid(
+                "an export directory of this name already exists"
+            )),
+            "{name}"
+        );
+        assert_eq!(entries(out.path()), vec![taken.clone()], "{name}");
+        assert_eq!(file_names(&taken), BTreeSet::from(["keep.txt".to_string()]));
+        assert_eq!(
+            std::fs::read(taken.join("keep.txt")).expect("marker"),
+            b"mine"
+        );
+    }
     assert_eq!(count(&f, EventType::EXPORT), 0);
+}
+
+/// The final name appears after the `EXPORT` was logged, before the rename: the user's entry is
+/// not touched (an empty directory included, which `rename(2)` would replace) and the complete
+/// export stays under its staging name (`ExportNotRenamed`).
+#[test]
+fn export_final_name_taken_before_rename_is_not_touched() {
+    for marker in [true, false] {
+        let faults = Faults::new();
+        let (store, f) = new_store_with(fake_clock(START), MemKeyring::new(), |c| {
+            c.hooks.faults = Some(faults.clone());
+        });
+        store.append_batch(mixed(3)).expect("append");
+        let (head, _, chain) = store.head();
+        let out = tempfile::tempdir().expect("out");
+        let taken = out.path().join(dir_name(&chain, 1, head));
+        let staging = out.path().join(staging_name(&chain, 1, head));
+        {
+            let taken = taken.clone();
+            faults.on_hit(FaultPoint::ExportBeforeAppend, move || {
+                std::fs::create_dir(&taken).expect("dir");
+                if marker {
+                    std::fs::write(taken.join("keep.txt"), b"mine").expect("marker");
+                }
+            });
+        }
+        let r = match export(&store, out.path(), TimeRange::all()) {
+            Err(AuditError::ExportNotRenamed(r)) => r,
+            other => panic!("not ExportNotRenamed: {other:?}"),
+        };
+        assert_eq!(r.dir_name, staging_name(&chain, 1, head));
+        assert_eq!((r.first_seq, r.last_seq, r.export_seq), (1, head, head + 1));
+        assert_eq!(count(&f, EventType::EXPORT), 1, "the export is logged");
+        assert_eq!(entries(out.path()), vec![taken.clone(), staging.clone()]);
+        if marker {
+            assert_eq!(file_names(&taken), BTreeSet::from(["keep.txt".to_string()]));
+            assert_eq!(
+                std::fs::read(taken.join("keep.txt")).expect("marker"),
+                b"mine"
+            );
+        } else {
+            assert!(file_names(&taken).is_empty(), "the empty dir stays empty");
+        }
+        check_complete(&staging, &r);
+    }
+}
+
+/// `staging` holds the three files of the logged export `r`.
+fn check_complete(staging: &Path, r: &ExportReceipt) {
+    assert_eq!(
+        file_names(staging),
+        BTreeSet::from([
+            "events.jsonl".to_string(),
+            "manifest.json".to_string(),
+            "prune_log.jsonl".to_string(),
+        ])
+    );
+    let bytes = std::fs::read(staging.join("manifest.json")).expect("manifest");
+    assert_eq!(r.manifest_sha256, sha256(&bytes));
 }
 
 #[test]
@@ -565,16 +641,19 @@ fn export_location_must_be_an_absolute_directory() {
     let out = tempfile::tempdir().expect("out");
     let file = out.path().join("a-file");
     std::fs::write(&file, b"x").expect("file");
-    for bad in [
-        file.clone(),
-        PathBuf::from("relative-dir"),
-        out.path().join("missing"),
+    let not_a_dir = "the export location is not a directory";
+    for (bad, why) in [
+        (file.clone(), not_a_dir),
+        // Refused for being relative, whether or not it resolves to a directory.
+        (
+            PathBuf::from("relative-dir"),
+            "the export location is not an absolute path",
+        ),
+        (out.path().join("missing"), not_a_dir),
     ] {
-        assert!(
-            matches!(
-                export(&store, &bad, TimeRange::all()),
-                Err(AuditError::Invalid(_))
-            ),
+        assert_eq!(
+            export(&store, &bad, TimeRange::all()),
+            Err(AuditError::Invalid(why)),
             "{bad:?}"
         );
     }
@@ -914,7 +993,12 @@ fn prune_between_batches_aborts_and_cleans_up() {
         matches!(pruned.lock().expect("lock").as_ref(), Some(Ok(_))),
         "the prune ran"
     );
-    assert!(e.is_err(), "{e:?}");
+    assert_eq!(
+        e,
+        Err(AuditError::Invalid(
+            "a record of the export range is missing"
+        ))
+    );
     assert!(entries(out.path()).is_empty(), "the partial dir is removed");
     assert_eq!(count(&f, EventType::EXPORT), 0);
 }
@@ -994,7 +1078,12 @@ fn export_aborts_when_exported_rows_change() {
         },
     );
     assert!(*tampered.lock().expect("lock"), "row 2 was changed");
-    assert!(matches!(e, Err(AuditError::Invalid(_))), "{e:?}");
+    assert_eq!(
+        e,
+        Err(AuditError::Invalid(
+            "the exported records changed during the export"
+        ))
+    );
     assert!(entries(out.path()).is_empty());
     assert_eq!(count(&f, EventType::EXPORT), 0);
 }
@@ -1039,6 +1128,251 @@ fn export_refuses_a_chain_id_that_is_not_an_id() {
     );
     assert!(entries(out.path()).is_empty());
     assert_eq!(count(&f, EventType::EXPORT), 0);
+}
+
+/// I-1: the cleanup of a failed export cannot remove its directory. `manifest.json` is unlinked
+/// first all the same, and the error names the leftover (it holds decrypted records).
+#[test]
+fn export_cleanup_failure_names_the_leftover() {
+    let faults = Faults::new();
+    let (store, f) = new_store_with(fake_clock(START), MemKeyring::new(), |c| {
+        c.hooks.faults = Some(faults.clone());
+    });
+    store.append_batch(mixed(3)).expect("append");
+    let (head, _, chain) = store.head();
+    faults.fail(FaultPoint::ExportBeforeAppend, 1);
+    let out = tempfile::tempdir().expect("out");
+    testing::fail_remove_dir_under(out.path());
+    let e = export(&store, out.path(), TimeRange::all());
+    let (dir_name, cause) = match e {
+        Err(AuditError::ExportLeftover { dir_name, cause }) => (dir_name, cause),
+        other => panic!("not ExportLeftover: {other:?}"),
+    };
+    assert_eq!(dir_name, staging_name(&chain, 1, head));
+    assert!(
+        matches!(*cause, AuditError::AppendFailed(_)),
+        "the export's own error: {cause:?}"
+    );
+    let left = out.path().join(&dir_name);
+    assert_eq!(entries(out.path()), vec![left.clone()]);
+    assert_eq!(
+        file_names(&left),
+        BTreeSet::from(["events.jsonl".to_string(), "prune_log.jsonl".to_string()]),
+        "manifest.json is gone: the leftover never reads as an export"
+    );
+    assert_eq!(count(&f, EventType::EXPORT), 0);
+}
+
+/// I-3 (PD-181 quit): a cancel set while a batch runs ends the export before the next row of
+/// that batch, not at the batch's end.
+#[test]
+fn export_cancel_mid_batch_stops_before_the_next_row() {
+    let faults = Faults::new();
+    let (store, f) = new_store_with(fake_clock(START), MemKeyring::new(), |c| {
+        c.hooks.faults = Some(faults.clone());
+        c.hooks.export_batch_rows = Some(10);
+    });
+    store.append_batch(mixed(5)).expect("append");
+    assert_eq!(store.head().0, 6, "one batch holds every row");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let hits = Arc::new(AtomicU32::new(0));
+    {
+        let (cancel, hits) = (cancel.clone(), hits.clone());
+        faults.on_hit(FaultPoint::ExportRow, move || {
+            if hits.fetch_add(1, Ordering::SeqCst) + 1 == 3 {
+                cancel.store(true, Ordering::SeqCst);
+            }
+        });
+    }
+    let progress_calls = AtomicU32::new(0);
+    let progress = |_: u64, _: u64| {
+        progress_calls.fetch_add(1, Ordering::SeqCst);
+    };
+    let out = tempfile::tempdir().expect("out");
+    let e = store.export(
+        TimeRange::all(),
+        chosen(out.path()),
+        &ExportControl {
+            progress: &progress,
+            cancel: &cancel,
+        },
+    );
+    assert_eq!(e, Err(AuditError::Cancelled));
+    assert_eq!(hits.load(Ordering::SeqCst), 3, "no row after the cancel");
+    assert_eq!(
+        progress_calls.load(Ordering::SeqCst),
+        0,
+        "the cancel was taken inside the batch"
+    );
+    assert!(entries(out.path()).is_empty(), "no partial dir");
+    let types = testing::event_types(&f.data).expect("event types");
+    assert!(!types.iter().any(|t| t == "EXPORT"), "{types:?}");
+}
+
+/// M-10: a restore (the store file generation moves on) between batches ends the export.
+#[test]
+fn export_restore_between_batches_aborts() {
+    let (store, f) = new_store_with(fake_clock(START), MemKeyring::new(), |c| {
+        c.hooks.export_batch_rows = Some(2);
+    });
+    store.append_batch(mixed(5)).expect("append");
+    let progress = |done: u64, _: u64| {
+        if done == 2 {
+            store.testing_bump_generation();
+        }
+    };
+    let cancel = AtomicBool::new(false);
+    let out = tempfile::tempdir().expect("out");
+    let e = store.export(
+        TimeRange::all(),
+        chosen(out.path()),
+        &ExportControl {
+            progress: &progress,
+            cancel: &cancel,
+        },
+    );
+    assert_eq!(
+        e,
+        Err(AuditError::Invalid(
+            "the store was restored while the export ran"
+        ))
+    );
+    assert!(entries(out.path()).is_empty());
+    assert_eq!(count(&f, EventType::EXPORT), 0);
+}
+
+/// M-10: a restore after the last check, right before the append: the writer refuses the
+/// `EXPORT` computed from the old store file, and the directory goes.
+#[test]
+fn export_restore_before_append_is_refused_by_the_writer() {
+    let faults = Faults::new();
+    let (store, f) = new_store_with(fake_clock(START), MemKeyring::new(), |c| {
+        c.hooks.faults = Some(faults.clone());
+    });
+    store.append_batch(mixed(3)).expect("append");
+    let handle = Mutex::new(Some(store.clone()));
+    faults.on_hit(FaultPoint::ExportBeforeAppend, move || {
+        if let Some(s) = handle.lock().expect("lock").take() {
+            s.testing_bump_generation();
+        }
+    });
+    let out = tempfile::tempdir().expect("out");
+    assert_eq!(
+        export(&store, out.path(), TimeRange::all()),
+        Err(AuditError::Invalid(
+            "the store was restored while this record was prepared"
+        ))
+    );
+    assert!(entries(out.path()).is_empty());
+    assert_eq!(count(&f, EventType::EXPORT), 0);
+}
+
+/// M-10: a configured anchor dir that cannot be read anchors nothing: every row is marked.
+#[test]
+fn export_with_unreadable_anchor_dir_marks_every_row() {
+    let (store, _f) = new_store(fake_clock(START), MemKeyring::new());
+    let gone = tempfile::tempdir().expect("parent");
+    let missing = gone.path().join("offline-share");
+    store
+        .testing_set_anchor_dir(Some(missing.to_string_lossy().into_owned()), confirmed())
+        .expect("anchor dir");
+    store.append_batch(mixed(3)).expect("append");
+    let (head, _, _) = store.head();
+    let out = tempfile::tempdir().expect("out");
+    let r = export(&store, out.path(), TimeRange::all()).expect("export");
+    assert_eq!(r.unanchored_from, Some(1));
+    let dir = out.path().join(&r.dir_name);
+    let ls = lines(&dir);
+    assert_eq!(ls.len() as u64, head);
+    assert!(ls.iter().all(|l| l["unanchored"] == true));
+    let m = manifest(&dir);
+    assert_eq!(m["anchor_dir_configured"], true);
+    assert_eq!(m["last_anchored_seq"], Value::Null);
+}
+
+/// M-10: a line with the right seq and `record_hash`, but in another chain's file, anchors
+/// nothing.
+#[test]
+fn export_line_of_another_chain_does_not_anchor() {
+    let anchor = tempfile::tempdir().expect("anchor dir");
+    let clock = fake_clock(START);
+    let (store, f) = new_store(clock.clone(), MemKeyring::new());
+    clock.advance(Duration::from_secs(3600));
+    let later = atlas_duck_audit::UtcInstant(at(START).0 + 3_600_000);
+    store
+        .change_anchor_dir(Some(chosen(anchor.path())), confirmed())
+        .expect("anchor dir");
+    assert!(store.testing_anchor_dir_drain());
+    store.append_batch(mixed(3)).expect("append");
+    assert!(store.testing_anchor_dir_drain());
+    assert_eq!(store.head().0, 5);
+    // Seq 1 (outside the exported range: its payload no longer decrypts) now names another
+    // chain, so that chain's file is read too.
+    let other = "f".repeat(32);
+    raw_conn(&f)
+        .execute("UPDATE events SET chain_id = ?1 WHERE seq = 1", [&other])
+        .expect("tamper");
+    let rows = dump_rows(&f);
+    let line = to_line(&AnchorLine::Record {
+        seq: 5,
+        record_hash: rows[4].record_hash,
+        epoch: None,
+        clock_behind: false,
+    });
+    std::fs::write(anchor.path().join(file_name(&other)), format!("{line}\n")).expect("line");
+
+    let out = tempfile::tempdir().expect("out");
+    let r = export(
+        &store,
+        out.path(),
+        TimeRange {
+            from_utc: later,
+            to_utc: atlas_duck_audit::UtcInstant(i64::MAX),
+        },
+    )
+    .expect("export");
+    assert_eq!((r.first_seq, r.last_seq), (2, 5));
+    assert_eq!(r.unanchored_from, Some(3), "seq 5 is not anchored");
+    assert_eq!(
+        manifest(&out.path().join(&r.dir_name))["last_anchored_seq"],
+        2
+    );
+}
+
+/// M-10: a hole in the seqs that was always there ends the export, at a batch start and inside a
+/// batch, with a message that does not claim a removal during the export.
+#[test]
+fn export_seq_gap_fails_closed() {
+    for (batch_rows, want) in [
+        (
+            2,
+            AuditError::Invalid("a record of the export range is missing"),
+        ),
+        (
+            10,
+            AuditError::InvalidRecord {
+                seq: 3,
+                what: "the record is missing",
+            },
+        ),
+    ] {
+        let (store, f) = new_store_with(fake_clock(START), MemKeyring::new(), |c| {
+            c.hooks.export_batch_rows = Some(batch_rows);
+        });
+        store.append_batch(mixed(5)).expect("append");
+        let n = raw_conn(&f)
+            .execute("DELETE FROM events WHERE seq = 3", [])
+            .expect("hole");
+        assert_eq!(n, 1);
+        let out = tempfile::tempdir().expect("out");
+        assert_eq!(
+            export(&store, out.path(), TimeRange::all()),
+            Err(want),
+            "batches of {batch_rows}"
+        );
+        assert!(entries(out.path()).is_empty());
+        assert_eq!(count(&f, EventType::EXPORT), 0);
+    }
 }
 
 #[test]

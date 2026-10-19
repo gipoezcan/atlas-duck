@@ -1,7 +1,8 @@
 #![cfg(feature = "testing")]
 //! X-06 through the compliance export (SC2, §8.10, M10 T7): every payload kind the core writes,
 //! fetched, released, denied, edited, delivered and executed, is in `events.jsonl` decrypted,
-//! byte for byte what the audit API decrypts.
+//! byte for byte what the audit API decrypts (the API's parsed value, re-encoded as the JCS the
+//! store wrote, against the exported plaintext bytes).
 
 mod common;
 
@@ -13,6 +14,7 @@ use atlas_duck_audit::{EventType, ExportControl, RustChosenPath, TimeRange};
 use atlas_duck_core::Edits;
 use atlas_duck_core::testing::Harness;
 use atlas_duck_ipc::envelope::Status;
+use atlas_duck_ipc::jcs::to_jcs_vec;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use common::jira::mount_create_stages;
@@ -148,11 +150,16 @@ async fn x06_six_payload_kinds_in_export() -> TestResult {
             .map(|(_, p)| p)
             .collect();
         assert!(!api.is_empty(), "no {kind:?} for {id}");
-        let in_export: Vec<Value> = rows
+        // The store writes every payload as JCS: the API's value re-encoded is the stored bytes.
+        let api: Vec<Vec<u8>> = api
+            .iter()
+            .map(|v| to_jcs_vec(v).map_err(|e| format!("jcs: {e:?}")))
+            .collect::<Result<_, _>>()?;
+        let in_export: Vec<Vec<u8>> = rows
             .iter()
             .filter(|(t, r, _)| t == kind.as_str() && r.as_deref() == Some(id.as_str()))
-            .map(|(_, _, p)| serde_json::from_slice(p))
-            .collect::<Result<_, _>>()?;
+            .map(|(_, _, p)| p.clone())
+            .collect();
         assert_eq!(in_export, api, "{kind:?} of {id}");
     }
     let one = |id: &str, kind: EventType| -> Result<String, TestError> {

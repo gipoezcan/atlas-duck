@@ -1,7 +1,9 @@
 //! Compliance export (§8.10, PD-159..PD-161, PD-181): a time range of the log, decrypted, in a
 //! new directory `<chosen>/atlas-duck-export-<chain_id>-<first_seq>-<last_seq>-<utc stamp>/`
 //! (`chain_id` of the first exported row; created `0700` on Unix, every file `0600` and
-//! create-new; on Windows the files inherit the chosen folder's ACL). Its files:
+//! create-new; on Windows the files inherit the chosen folder's ACL). The directory is written
+//! under the staging name `<name>.partial` and gets its final name only after the `EXPORT`
+//! record is logged (below). Its files:
 //!
 //! - `events.jsonl`: one JCS line per row, `first_seq..=last_seq`, each ending in `\n`. Keys:
 //!   the 29 `FIELD_LIST` columns under their §8.2 names, every one present (`null` for NULL;
@@ -13,10 +15,11 @@
 //!   anchored row of the range). There is no `record_hash` key: the verifier recomputes it. Base64
 //!   is RFC 4648 standard with padding. A line is at most [`MAX_EXPORT_LINE_BYTES`] (without its
 //!   newline).
-//! - `prune_log.jsonl`: every `prune_log` row at the time of the export, one JCS line each, keys
-//!   `prune_seq`, `range_start`, `cutoff_epoch`, `last_pruned_record_hash`,
-//!   `first_retained_seq`, `prev_row_hash`, `row_hash` (hashes as lowercase hex). Empty when the
-//!   store was never pruned.
+//! - `prune_log.jsonl`: every `prune_log` row when the events are written, read in its own
+//!   transaction after them (so a prune committed during the export is in it, with a
+//!   `prune_seq` beyond `last_seq`), one JCS line each, keys `prune_seq`, `range_start`,
+//!   `cutoff_epoch`, `last_pruned_record_hash`, `first_retained_seq`, `prev_row_hash`, `row_hash`
+//!   (hashes as lowercase hex). Empty when the store was never pruned.
 //! - `manifest.json`, written last (JCS): `format`, `app_version`, `build_id`, `exported_at`,
 //!   `install {install_id, host, os_user}`, `requested_range {from_utc, to_utc}`, `first_seq`,
 //!   `last_seq`, `rows`, `boundary_prev_hash` (`prev_hash` of the first row), `head {seq,
@@ -25,15 +28,38 @@
 //!   (or `null`), `events_sha256`, `prune_log_sha256` (SHA-256 of the two files' bytes, so the
 //!   manifest's hash binds every byte of the export) and `accountability` (§2.4).
 //!
-//! Then `EXPORT {manifest_sha256, first_seq, last_seq, rows}` is appended (store-owned). Every
-//! failure before it, a cancel and a failed append remove the directory; a crash between the
-//! manifest and the append leaves an export without its `EXPORT` (L186).
+//! `manifest.json` is written as `manifest.json.tmp`, fsynced and renamed, so a manifest that
+//! exists is complete. Then `EXPORT {manifest_sha256, first_seq, last_seq, rows}` is appended
+//! (store-owned) and only then the directory is renamed from `<name>.partial` to `<name>`.
+//!
+//! **Failures (L186).** Every failure before the rename (a cancel, a failed append included)
+//! unlinks `manifest.json` first (a directory without one is never an export, even if the
+//! removal is interrupted) and then removes the staging directory; if that removal fails, the
+//! export returns [`AuditError::ExportLeftover`] naming it. A process that dies while the export
+//! runs (crash, kill, power loss, an app exit that did not wait for `Store::export` to return)
+//! leaves the `.partial` directory with whatever was written, decrypted `events.jsonl`
+//! included, and no `EXPORT`: nothing cleans it up later (the store does not keep the path).
+//! It never carries the final name, so it never looks like a complete export. If the rename
+//! itself fails after the `EXPORT` was logged, the export is complete under the staging name:
+//! [`AuditError::ExportNotRenamed`]. Names are checked before anything is created and again
+//! before the rename: an existing entry of the final or the staging name is never written,
+//! renamed over or removed (a same-user race between the check and the rename is outside
+//! §2.4, as is a swap between `mkdir` and the file creation).
 //!
 //! The export reads through its own read-only connection and data-key cache, as a full
 //! verification does, in batches of [`EXPORT_BATCH_ROWS`] rows, each in its own read
 //! transaction (a long snapshot would hold back the WAL truncation after a prune), so it never
 //! blocks an append; only the final `EXPORT` goes through the writer. Between batches it checks
 //! that the store still holds what it already wrote.
+//!
+//! **Working set.** For one row of the largest size the export holds at once: the `payload_ct`
+//! blob of the SQLite row (at most [`MAX_EXPORT_CT_LEN`], about 97 MiB), the decrypted
+//! plaintext (at most `MAX_PAYLOAD_LEN`, 96 MiB, zeroized on drop), the line buffer (at most
+//! [`MAX_EXPORT_LINE_BYTES`], about 258 MiB, zeroized on drop) and, briefly, the decompression
+//! input: about 450 MiB in all. Rows below 1 MiB add the JCS check of `payload` (a parsed copy
+//! and its re-encoding, at most a few MiB). Known limits: the 8 KiB `BufWriter` of a file and
+//! serde_json's scratch buffers keep fragments of plaintext that are not zeroized (the same
+//! bytes are on disk).
 
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
@@ -72,6 +98,16 @@ pub const EXPORT_FORMAT: &str = "atlas-duck-export/1";
 pub const EVENTS_FILE: &str = "events.jsonl";
 pub const PRUNE_LOG_FILE: &str = "prune_log.jsonl";
 pub const MANIFEST_FILE: &str = "manifest.json";
+/// `manifest.json` while it is written; renamed once complete and fsynced.
+const MANIFEST_TMP_FILE: &str = "manifest.json.tmp";
+
+/// The suffix of the export directory's name until the `EXPORT` record is logged.
+pub const PARTIAL_SUFFIX: &str = ".partial";
+
+/// Attempts of the final rename (a scanner may hold a just-closed file of the directory for a
+/// moment, which makes Windows refuse to rename the directory), [`RENAME_RETRY_PAUSE`] apart.
+const RENAME_ATTEMPTS: u32 = 5;
+const RENAME_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// A manifest is at most this long (the verifier's bound, PD-162).
 pub const MAX_EXPORT_MANIFEST_BYTES: u64 = 1024 * 1024;
@@ -323,6 +359,52 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
     b.create(path)
 }
 
+/// Whether `path` names an entry of any kind (a dangling link or junction counts).
+fn entry_exists(path: &Path) -> io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Removes a failed export's staging directory: `manifest.json` (and its temporary file) first,
+/// so that an interrupted removal never leaves a directory with a manifest; then the rest.
+fn remove_staging(dir: &Path) -> io::Result<()> {
+    for f in [MANIFEST_FILE, MANIFEST_TMP_FILE] {
+        match std::fs::remove_file(dir.join(f)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    let _ = sync_dir(dir);
+    #[cfg(any(test, feature = "testing"))]
+    if crate::testing::remove_dir_fault(dir) {
+        return Err(io::Error::other("injected removal failure"));
+    }
+    std::fs::remove_dir_all(dir)
+}
+
+/// Renames the logged export from its staging name to `final_dir`, never over an existing
+/// entry: the name is checked before every attempt (`rename(2)` would replace an empty
+/// directory). A refused rename is tried again a few times (a scanner holding a file).
+fn publish(dir: &Path, final_dir: &Path) -> io::Result<()> {
+    let mut attempt = 1;
+    loop {
+        if entry_exists(final_dir)? {
+            return Err(io::ErrorKind::AlreadyExists.into());
+        }
+        match std::fs::rename(dir, final_dir) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt >= RENAME_ATTEMPTS => return Err(e),
+            Err(_) => {
+                attempt += 1;
+                std::thread::sleep(RENAME_RETRY_PAUSE);
+            }
+        }
+    }
+}
+
 /// A file written once, hashed as written.
 struct HashedFile {
     w: BufWriter<File>,
@@ -406,6 +488,17 @@ fn int_val(seq: u64, v: u64) -> Result<Val<'static>, AuditError> {
     Ok(Val::Text(v.to_string().into_bytes()))
 }
 
+/// Whether `plain` is JSON text in its JCS form, so it can be embedded in a line as is: the
+/// store writes every payload through `to_jcs_vec`, but a line must never depend on that (a raw
+/// newline would split the line, unsorted keys would break its JCS form).
+fn is_jcs(plain: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(plain)
+        .ok()
+        .and_then(|v| to_jcs_vec(&v).ok())
+        .map(Zeroizing::new)
+        .is_some_and(|j| j.as_slice() == plain)
+}
+
 /// The `events.jsonl` line of one row (without its newline): JCS, keys in byte order (all keys
 /// are ASCII, so that is RFC 8785's UTF-16 order). Built in one buffer of its exact size, which
 /// is zeroized on drop (it holds the plaintext).
@@ -450,9 +543,7 @@ fn event_line(
         ("prev_hash", hex_val(f.prev_hash)),
         ("payload_b64", Val::B64(plain)),
     ];
-    if plain.len() as u64 <= MAX_EXPORT_PAYLOAD_FIELD_BYTES
-        && serde_json::from_slice::<serde::de::IgnoredAny>(plain).is_ok()
-    {
+    if plain.len() as u64 <= MAX_EXPORT_PAYLOAD_FIELD_BYTES && is_jcs(plain) {
         parts.push(("payload", Val::Json(plain)));
     }
     if unanchored {
@@ -531,7 +622,9 @@ fn decrypt_error(seq: u64, e: &DecryptError) -> AuditError {
 /// be there (a prune between batches that removed rows of the range ends the export). The cancel
 /// flag is also checked before each row: a batch of large payloads can take far longer than the
 /// shutdown path waits for the store (PD-181 quit).
+#[allow(clippy::too_many_arguments)]
 fn batch(
+    store: &Store,
     conn: &Connection,
     deks: &mut Deks<'_>,
     plan: &Plan,
@@ -540,6 +633,8 @@ fn batch(
     out: &mut HashedFile,
     ctl: &ExportControl<'_>,
 ) -> Result<(), AuditError> {
+    #[cfg(not(any(test, feature = "testing")))]
+    let _ = store;
     let tx = conn.unchecked_transaction().map_err(sql)?;
     if let Some(last) = w.last_hash {
         let boundary: Option<Option<Vec<u8>>> = tx
@@ -571,6 +666,8 @@ fn batch(
         .map_err(sql)?;
     let mut first = true;
     while let Some(row) = rows.next().map_err(sql)? {
+        #[cfg(any(test, feature = "testing"))]
+        store.fault(crate::testing::FaultPoint::ExportRow)?;
         check_cancel(ctl)?;
         let expected = w.next;
         let f = RowFields::from_row(row).map_err(|_| AuditError::InvalidRecord {
@@ -578,8 +675,10 @@ fn batch(
             what: "the record's columns are unreadable",
         })?;
         if f.seq != expected {
+            // At a batch start this is a prune of not-yet-exported rows during the export, or a
+            // hole that was always there; the export cannot tell them apart.
             return Err(if first {
-                AuditError::Invalid("records of the export range were removed during the export")
+                AuditError::Invalid(MISSING_RECORD)
             } else {
                 AuditError::InvalidRecord {
                     seq: expected,
@@ -617,12 +716,13 @@ fn batch(
         w.next = f.seq + 1;
     }
     if first {
-        return Err(AuditError::Invalid(
-            "records of the export range were removed during the export",
-        ));
+        return Err(AuditError::Invalid(MISSING_RECORD));
     }
     Ok(())
 }
+
+/// A batch found the first record it expected missing.
+const MISSING_RECORD: &str = "a record of the export range is missing";
 
 /// Every `prune_log` row, all columns, one JCS line each.
 fn write_prune_log(conn: &Connection, out: &mut HashedFile) -> Result<(), AuditError> {
@@ -674,14 +774,18 @@ impl Store {
     /// of `out` (see the module documentation for the format). The range resolves to the
     /// contiguous seqs from the first record with `ts_utc >= from` to the last with `ts_utc <=
     /// to`; [`TimeRange::all`] exports the first retained record to the head. `Invalid` when the
-    /// range holds no record or `out` is not an absolute directory, or when a directory of that
-    /// name exists (nothing is written into it). Every row must decrypt (else `Decrypt` /
-    /// `PayloadHash`, and no export): an export cannot omit a payload.
+    /// range holds no record or `out` is not an absolute directory, or when an entry of the
+    /// export's final or staging (`.partial`) name exists (nothing is written into it). Every
+    /// row must decrypt (else `Decrypt` / `PayloadHash`, and no export): an export cannot omit a
+    /// payload.
     ///
     /// `ctl.progress` runs after each batch; a set `ctl.cancel` ends the export before the next
-    /// row (between batches too) or before the manifest with `Cancelled`. A prune that removes not-yet-exported rows, a
-    /// restore, `shutdown()` and a failed `EXPORT` append also end it. On every `Err` the new
-    /// directory is removed and no `EXPORT` is logged.
+    /// row (between batches too) or before the manifest with `Cancelled`. A prune that removes
+    /// not-yet-exported rows, a restore, `shutdown()` and a failed `EXPORT` append also end it.
+    /// On every `Err` but [`AuditError::ExportNotRenamed`] no `EXPORT` is logged and the staging
+    /// directory is removed, or, when that fails, the error is [`AuditError::ExportLeftover`].
+    /// A caller that quits the process must set `ctl.cancel` and wait for this call to return
+    /// (PD-181): a process that exits while it runs leaves the staging directory behind.
     pub fn export(
         &self,
         range: TimeRange,
@@ -717,7 +821,14 @@ impl Store {
             plan.last_seq,
             compact_stamp(&exported_at)
         );
-        let dir = out.join(&name);
+        let final_dir = out.join(&name);
+        let staging_name = format!("{name}{PARTIAL_SUFFIX}");
+        let dir = out.join(&staging_name);
+        if entry_exists(&final_dir).map_err(io)? {
+            return Err(AuditError::Invalid(
+                "an export directory of this name already exists",
+            ));
+        }
         create_private_dir(&dir).map_err(|e| {
             if e.kind() == io::ErrorKind::AlreadyExists {
                 AuditError::Invalid("an export directory of this name already exists")
@@ -738,11 +849,29 @@ impl Store {
             ctl,
         );
         drop(conn);
-        if r.is_err() {
+        let receipt = match r {
+            Ok(receipt) => receipt,
             // Every file of the export is closed by now (Windows cannot remove an open one).
-            let _ = std::fs::remove_dir_all(&dir);
+            Err(e) => {
+                return Err(match remove_staging(&dir) {
+                    Ok(()) => e,
+                    Err(_) => AuditError::ExportLeftover {
+                        dir_name: staging_name,
+                        cause: Box::new(e),
+                    },
+                });
+            }
+        };
+        // The `EXPORT` is logged: only now does the directory get its final name.
+        if publish(&dir, &final_dir).is_err() {
+            return Err(AuditError::ExportNotRenamed(Box::new(ExportReceipt {
+                dir_name: staging_name,
+                ..receipt
+            })));
         }
-        r
+        // Best effort, as above.
+        let _ = sync_dir(out);
+        Ok(receipt)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -772,6 +901,7 @@ impl Store {
             check_cancel(ctl)?;
             self.serving(parts.generation)?;
             batch(
+                self,
                 conn,
                 &mut deks,
                 plan,
@@ -820,10 +950,13 @@ impl Store {
         if manifest.len() as u64 > MAX_EXPORT_MANIFEST_BYTES {
             return Err(AuditError::Invalid("the manifest is longer than 1 MiB"));
         }
-        let mut f = create_private(&dir.join(MANIFEST_FILE)).map_err(io)?;
+        // Written aside and renamed, as a backup bundle's: a `manifest.json` that exists is whole.
+        let tmp = dir.join(MANIFEST_TMP_FILE);
+        let mut f = create_private(&tmp).map_err(io)?;
         f.write_all(&manifest).map_err(io)?;
         f.sync_all().map_err(io)?;
         drop(f);
+        std::fs::rename(&tmp, dir.join(MANIFEST_FILE)).map_err(io)?;
         // Best effort, as for a backup bundle (T2 ruling): every file is written and fsynced, and
         // a share or FAT target that cannot flush a directory must not fail the export.
         let _ = sync_dir(dir);
@@ -871,6 +1004,71 @@ mod tests {
     fn line_cap_is_about_257_mib() {
         let mib = MAX_EXPORT_LINE_BYTES / (1024 * 1024);
         assert!((257..=258).contains(&mib), "{mib} MiB");
+    }
+
+    /// M-2: a plaintext that is JSON but not JCS (a raw newline, unsorted keys, spaces) gets no
+    /// `payload` field; the line stays one JCS line and `payload_b64` carries the bytes.
+    #[test]
+    fn payload_field_only_for_jcs_plaintext() {
+        let (hash, nonce) = ([1u8; 32], [2u8; 12]);
+        let f = RowFields {
+            seq: 7,
+            format_version: 1,
+            chain_id: "0123456789abcdef0123456789abcdef",
+            ts_utc: "2026-10-08T12:00:00.000Z",
+            epoch: None,
+            request_id: None,
+            event_type: "APP_START",
+            op_id: None,
+            op_class: None,
+            instance_id: None,
+            target: None,
+            agent_name: None,
+            agent_name_source: None,
+            client_kind: None,
+            connection_id: None,
+            peer_pid: None,
+            peer_exe: None,
+            peer_origin_exe: None,
+            os_user: None,
+            atlassian_user: None,
+            atlassian_user_key: None,
+            decision: None,
+            flags: 0,
+            payload_len: 0,
+            payload_sha256: &hash,
+            key_id: 1,
+            nonce: &nonce,
+            payload_ct: b"ct",
+            prev_hash: &hash,
+        };
+        let line = |plain: &[u8]| -> Value {
+            let l = event_line(&f, plain, false).expect("line");
+            assert!(!l.contains(&b'\n'), "one line");
+            let v: Value = serde_json::from_slice(&l).expect("JSON");
+            assert_eq!(to_jcs_vec(&v).expect("jcs"), l.to_vec(), "the line is JCS");
+            v
+        };
+        let jcs = br#"{"a":1,"b":[true,null,"x"]}"#;
+        assert_eq!(
+            line(jcs)["payload"],
+            json!({"a": 1, "b": [true, null, "x"]})
+        );
+        for bad in [
+            &b"{\"a\":1}\n"[..],
+            b"\n{\"a\":1}",
+            b"{\"b\":1,\"a\":2}",
+            b"{ \"a\":1}",
+            b"not json",
+        ] {
+            let v = line(bad);
+            assert!(
+                v.get("payload").is_none(),
+                "{:?}",
+                String::from_utf8_lossy(bad)
+            );
+            assert_eq!(v["payload_b64"], STANDARD.encode(bad));
+        }
     }
 
     #[test]

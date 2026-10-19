@@ -4,6 +4,7 @@
 use std::fmt;
 
 use crate::keystore::KeyStoreError;
+use crate::types::ExportReceipt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestoreError {
@@ -160,9 +161,24 @@ pub enum AuditError {
     KeyStore(KeyStoreError),
     Restore(RestoreError),
     Io(String),
-    /// A long job (the compliance export) was cancelled through its control (PD-181); it left
-    /// nothing behind.
+    /// A long job (the compliance export) was cancelled through its control (PD-181). The
+    /// export's staging directory was removed; when that removal fails the export returns
+    /// [`AuditError::ExportLeftover`] instead.
     Cancelled,
+    /// A failed or cancelled export could not remove its staging directory `dir_name` (a
+    /// `….partial` subdirectory of the chosen directory; its `manifest.json` is gone or never
+    /// existed). It may hold decrypted records and is never a valid export: the user must
+    /// delete it. `cause` is why the export ended; no `EXPORT` was logged.
+    ExportLeftover {
+        dir_name: String,
+        cause: Box<AuditError>,
+    },
+    /// The export is complete and logged (`receipt.export_seq`), but its directory could not be
+    /// renamed from the staging name to its final name (the final name appeared meanwhile, or
+    /// the chosen directory refused the rename): it is still called `receipt.dir_name` (ending
+    /// in `.partial`) and is a valid export under that name. Not to be retried as a failure:
+    /// a retry logs another `EXPORT`.
+    ExportNotRenamed(Box<ExportReceipt>),
 }
 
 impl fmt::Display for AuditError {
@@ -190,6 +206,17 @@ impl fmt::Display for AuditError {
             AuditError::Restore(e) => write!(f, "{e}"),
             AuditError::Io(m) => write!(f, "i/o error: {m}"),
             AuditError::Cancelled => f.write_str("cancelled"),
+            AuditError::ExportLeftover { dir_name, cause } => write!(
+                f,
+                "the failed export directory {dir_name} could not be removed and may hold \
+                 decrypted records; delete it ({cause})"
+            ),
+            AuditError::ExportNotRenamed(r) => write!(
+                f,
+                "the export is complete and logged (record {}) but its directory is still \
+                 named {}",
+                r.export_seq, r.dir_name
+            ),
         }
     }
 }

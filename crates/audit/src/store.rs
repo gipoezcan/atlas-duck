@@ -1721,6 +1721,13 @@ impl Store {
         self.inner.shared.anchor_dir.disable();
     }
 
+    /// Bumps the store file generation as a restore commit does, without replacing the file
+    /// (feature `testing`): work computed from the old generation is refused from now on.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn testing_bump_generation(&self) {
+        self.inner.shared.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// `testing::insert_fake_prune` (feature `testing`).
     #[cfg(any(test, feature = "testing"))]
     pub(crate) fn testing_fake_prune(

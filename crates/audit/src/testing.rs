@@ -283,6 +283,9 @@ pub enum FaultPoint {
     /// Export: every file is written and flushed, `manifest.json` last; the `EXPORT` record is
     /// not appended yet. An armed failure fails that append.
     ExportBeforeAppend,
+    /// Export: at the top of each row of a batch, before the row's cancel check. An armed
+    /// failure ends the export there.
+    ExportRow,
 }
 
 /// Runs when a [`FaultPoint`] is reached (see [`Faults::on_hit`]).
@@ -420,6 +423,20 @@ pub(crate) fn sync_dir_fault(dir: &Path) -> bool {
 /// share or a drop folder that refuses it). Scoped by path: parallel tests are not affected.
 pub fn fail_sync_dir_under(dir: &Path) {
     lock(&SYNC_DIR_FAULTS).push(dir.to_path_buf());
+}
+
+/// Directories under which the removal of a failed export's staging directory fails.
+static REMOVE_DIR_FAULTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+pub(crate) fn remove_dir_fault(dir: &Path) -> bool {
+    lock(&REMOVE_DIR_FAULTS).iter().any(|p| dir.starts_with(p))
+}
+
+/// From now on a failed export cannot remove its staging directory under `dir` (a scanner holds
+/// a file in it). Only the directory removal fails: `manifest.json` is still unlinked first.
+/// Scoped by path: parallel tests are not affected.
+pub fn fail_remove_dir_under(dir: &Path) {
+    lock(&REMOVE_DIR_FAULTS).push(dir.to_path_buf());
 }
 
 /// The store's rename (Windows: `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`).
