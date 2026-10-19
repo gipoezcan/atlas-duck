@@ -160,6 +160,23 @@ jobs:
           grep -E 'V28 socket_dir=' "$RUNNER_TEMP/v28.log" | tee -a "$GITHUB_STEP_SUMMARY"
           grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/v28.log" || { echo "::error::v28_ did not run exactly once"; exit 1; }
 
+      # M10 T7/T8: the largest payload the store takes (96 MiB) exported and verified (both tests
+      # #[ignore]d: up to about 0.5 GiB of heap each), and the export-verifier garbage run at 4096 cases
+      # (256 in the workspace Test step). Each must run exactly once.
+      - name: M10 large-payload export step (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          once() {
+            grep -q 'test result: ok. 1 passed' "$1" || { echo "::error::$2 did not run exactly once"; exit 1; }
+          }
+          cargo test -p atlas-duck-audit --locked --test export -- --ignored --exact export_line_cap_holds_for_max_payload --nocapture 2>&1 | tee "$RUNNER_TEMP/export-max.log"
+          once "$RUNNER_TEMP/export-max.log" export_line_cap_holds_for_max_payload
+          cargo test -p atlas-duck-audit --locked --test verify_export -- --ignored --exact max_size_payload_round_trips --nocapture 2>&1 | tee "$RUNNER_TEMP/verify-export-max.log"
+          once "$RUNNER_TEMP/verify-export-max.log" max_size_payload_round_trips
+          ATLAS_DUCK_VERIFY_EXPORT_CASES=4096 cargo test -p atlas-duck-audit --locked --test verify_export -- --exact verify_export_garbage_never_panics --nocapture 2>&1 | tee "$RUNNER_TEMP/verify-export-garbage.log"
+          once "$RUNNER_TEMP/verify-export-garbage.log" verify_export_garbage_never_panics
+
       # T9 handoff: what a full unix-socket backlog answers to a non-blocking connect. Linux says
       # EAGAIN (the client maps it to busy, exit 11); BSD/macOS may say ECONNREFUSED, which the CLI
       # reads as "no app running" and then tries to launch a second one (contained by the launch

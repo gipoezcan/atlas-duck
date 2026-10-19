@@ -307,7 +307,7 @@ pub(crate) struct StartupInputs<'a> {
 // Findings collector
 
 #[derive(Default)]
-struct Findings {
+pub(crate) struct Findings {
     list: Vec<VerifyFinding>,
     /// Per kind in order of first appearance.
     counts: Vec<KindCount>,
@@ -322,7 +322,7 @@ struct KindCount {
 }
 
 impl Findings {
-    fn push(&mut self, f: VerifyFinding) {
+    pub(crate) fn push(&mut self, f: VerifyFinding) {
         let idx = match self.counts.iter().position(|c| c.kind == f.kind) {
             Some(i) => i,
             None => {
@@ -351,7 +351,7 @@ impl Findings {
 
     /// The listed findings, then one summary per capped kind naming how many were omitted
     /// and the lowest (`expected_seq`) and highest (`observed_seq`) seq among them.
-    fn finish(mut self) -> Vec<VerifyFinding> {
+    pub(crate) fn finish(mut self) -> Vec<VerifyFinding> {
         for c in &self.counts {
             if c.n > MAX_FINDINGS_PER_KIND {
                 let mut s = VerifyFinding::new(
@@ -776,14 +776,16 @@ fn walk(
 // ---------------------------------------------------------------------------------------
 // prune_log (§8.5, F.9)
 
+/// One `prune_log` row (all fields `pub(crate)`: the export verifier builds them from
+/// `prune_log.jsonl`).
 pub(crate) struct PruneLogRow {
     pub(crate) prune_seq: u64,
     pub(crate) range_start: u64,
     pub(crate) cutoff_epoch: String,
     pub(crate) last_pruned: [u8; 32],
     pub(crate) first_retained_seq: u64,
-    prev_row_hash: [u8; 32],
-    row_hash: [u8; 32],
+    pub(crate) prev_row_hash: [u8; 32],
+    pub(crate) row_hash: [u8; 32],
 }
 
 /// All rows by `prune_seq`; a row with a malformed column is a `PruneLogBroken` finding and
@@ -819,7 +821,7 @@ fn load_prune_log(conn: &Connection, out: &mut Findings) -> rusqlite::Result<Vec
 }
 
 /// Row-hash chain from `ZERO_HASH` (L51) and contiguity from seq 1 (§8.5).
-fn check_prune_log(log: &[PruneLogRow], out: &mut Findings) {
+pub(crate) fn check_prune_log(log: &[PruneLogRow], out: &mut Findings) {
     let mut prev_hash = ZERO_HASH;
     let mut prev_first = 1u64;
     let mut prev_last = ZERO_HASH;

@@ -300,6 +300,50 @@ impl<'a> RowFields<'a> {
     }
 }
 
+/// `record_hash` fed frame by frame, for the export verifier, which streams the `payload_ct`
+/// frame from its base64 text instead of holding the column and `canonical_bytes` (PD-162). The
+/// same input as [`record_hash`] over [`canonical_bytes`]; a field longer than `u32::MAX` bytes is
+/// refused as [`push_frame`] refuses it.
+pub(crate) struct RecordHasher(Sha256);
+
+impl RecordHasher {
+    pub(crate) fn new(format_version: u64, prev_hash: &[u8; 32]) -> RecordHasher {
+        let mut h = Sha256::new();
+        h.update(record_domain(format_version));
+        h.update(prev_hash);
+        RecordHasher(h)
+    }
+
+    /// One whole frame.
+    pub(crate) fn frame(&mut self, f: &Field<'_>) -> Result<(), AuditError> {
+        match f {
+            Field::Bytes(b) => {
+                self.bytes_header(b.len() as u64)?;
+                self.bytes(b);
+            }
+            _ => hash_frame(&mut self.0, f),
+        }
+        Ok(())
+    }
+
+    /// The header of a present field of `len` bytes; the bytes follow through [`Self::bytes`].
+    pub(crate) fn bytes_header(&mut self, len: u64) -> Result<(), AuditError> {
+        let len =
+            u32::try_from(len).map_err(|_| AuditError::Invalid("field longer than u32::MAX"))?;
+        self.0.update([1u8]);
+        self.0.update(len.to_be_bytes());
+        Ok(())
+    }
+
+    pub(crate) fn bytes(&mut self, b: &[u8]) {
+        self.0.update(b);
+    }
+
+    pub(crate) fn finish(self) -> [u8; 32] {
+        self.0.finalize().into()
+    }
+}
+
 /// `canonical_bytes` = the 29 frames of `FIELD_LIST[1]`, concatenated, no count prefix (§8.4).
 pub fn canonical_bytes(r: &RowFields<'_>) -> Result<Vec<u8>, AuditError> {
     let mut out = Vec::with_capacity(512 + r.payload_ct.len());
@@ -450,4 +494,60 @@ pub fn os_path_from_bytes(b: &[u8]) -> Result<std::path::PathBuf, AuditError> {
 pub fn os_path_from_bytes(b: &[u8]) -> Result<std::path::PathBuf, AuditError> {
     use std::os::unix::ffi::OsStrExt;
     Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The streamed hash (the `payload_ct` frame fed in pieces) equals `RowFields::record_hash`.
+    #[test]
+    fn record_hasher_equals_record_hash() {
+        let (hash, nonce) = ([3u8; 32], [4u8; 12]);
+        let ct: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        let f = RowFields {
+            seq: 7,
+            format_version: FORMAT_VERSION,
+            chain_id: "0123456789abcdef0123456789abcdef",
+            ts_utc: "2026-10-08T12:00:00.000Z",
+            epoch: Some("2026-10-08"),
+            request_id: None,
+            event_type: "READ_FETCHED",
+            op_id: Some("jira.search"),
+            op_class: None,
+            instance_id: Some("i1"),
+            target: None,
+            agent_name: Some("agent"),
+            agent_name_source: None,
+            client_kind: None,
+            connection_id: None,
+            peer_pid: Some(42),
+            peer_exe: Some(b"/usr/bin/x"),
+            peer_origin_exe: None,
+            os_user: Some("alice"),
+            atlassian_user: None,
+            atlassian_user_key: None,
+            decision: None,
+            flags: 64,
+            payload_len: 9,
+            payload_sha256: &hash,
+            key_id: 1,
+            nonce: &nonce,
+            payload_ct: &ct,
+            prev_hash: &hash,
+        };
+        let mut h = RecordHasher::new(f.format_version, f.prev_hash);
+        for (i, frame) in f.frames().iter().enumerate() {
+            if i == 27 {
+                h.bytes_header(ct.len() as u64).expect("header");
+                for piece in ct.chunks(77) {
+                    h.bytes(piece);
+                }
+            } else {
+                h.frame(frame).expect("frame");
+            }
+        }
+        assert_eq!(FIELD_LIST[27], "payload_ct");
+        assert_eq!(h.finish(), f.record_hash().expect("record_hash"));
+    }
 }

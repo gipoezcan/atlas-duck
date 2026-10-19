@@ -315,6 +315,40 @@ impl fmt::Debug for ExportControl<'_> {
     }
 }
 
+/// What `verify_export` found (C.3, PD-162, PD-163), with the §12.1 exit code of each variant.
+/// `report` is the report for stdout, one line each; its last line is the verdict text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportVerdict {
+    /// Exit 0: verified against a supplied trust root (`--manifest-sha256`, `--anchor-dir`).
+    Verified { report: Vec<String> },
+    /// Exit 20: internally consistent, but no supplied trust root covers the whole export.
+    NoTrustRoot { report: Vec<String> },
+    /// Exit 21: tamper or fork detected.
+    TamperOrFork { report: Vec<String> },
+    /// Exit 22: usage or I/O error; the input cannot be read as an export.
+    UsageOrIo { report: Vec<String> },
+}
+
+impl ExportVerdict {
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            ExportVerdict::Verified { .. } => 0,
+            ExportVerdict::NoTrustRoot { .. } => 20,
+            ExportVerdict::TamperOrFork { .. } => 21,
+            ExportVerdict::UsageOrIo { .. } => 22,
+        }
+    }
+
+    pub fn report(&self) -> &[String] {
+        match self {
+            ExportVerdict::Verified { report }
+            | ExportVerdict::NoTrustRoot { report }
+            | ExportVerdict::TamperOrFork { report }
+            | ExportVerdict::UsageOrIo { report } => report,
+        }
+    }
+}
+
 /// A path chosen in a native file dialog. Only the native-dialog paths in M3/M6/M10 may
 /// construct one (audit cannot depend on `core`/`app`; an M10 grep check enforces it).
 #[derive(Debug, Clone, PartialEq, Eq)]

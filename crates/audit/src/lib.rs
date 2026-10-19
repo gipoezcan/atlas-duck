@@ -70,6 +70,7 @@ pub mod types;
 pub mod verify;
 #[cfg(not(any(test, feature = "testing")))]
 mod verify;
+pub mod verify_export;
 mod writer;
 
 pub use admission::FreeSpaceProbe;
@@ -99,9 +100,10 @@ pub use settings::{
 pub use store::{Hooks, OpenConfig, Store, StoreHealth};
 pub use types::{
     Actor, Committed, Confirmed, DecisionColumn, EventFlags, EventHeader, EventType, ExportControl,
-    ExportReceipt, NewEvent, QueryKind, RustChosenPath, TimeRange, UtcInstant,
+    ExportReceipt, ExportVerdict, NewEvent, QueryKind, RustChosenPath, TimeRange, UtcInstant,
 };
 pub use verify::{FindingKind, VerifyFinding, VerifyOutcome};
+pub use verify_export::verify_export;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

@@ -617,3 +617,156 @@ pub fn apply_startup(
 ) -> Result<crate::verify::VerifyOutcome, AuditError> {
     store.apply_startup(verdict)
 }
+
+/// The compliance-export fixtures of S-03 (T8; used by T28's CLI flow and T31's AppImage step).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixtureKind {
+    /// An honest export: exit 0 with its `manifest_sha256`.
+    Pass,
+    /// One row of `events.jsonl` changed after the export: exit 21 with the `manifest_sha256`.
+    Tamper,
+    /// An honest export verified without a trust root: exit 20.
+    NoTrustRoot,
+}
+
+/// A fixture [`export_fixture`] wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixtureInfo {
+    /// The export directory (inside the `out` given).
+    pub dir: PathBuf,
+    /// SHA-256 of the honest `manifest.json` (what `EXPORT` logged).
+    pub manifest_sha256: [u8; 32],
+    /// What `verify-export` exits with: with `--manifest-sha256` for `Pass` and `Tamper`,
+    /// without any trust root for `NoTrustRoot`.
+    pub expected_exit: u8,
+}
+
+/// Writes an export fixture of `kind` into the existing directory `out`: a throwaway store
+/// (in-memory keyring, fixed clock) in `out/atlas-duck-fixture-store` with a few records of
+/// several kinds, its full-range export, then the store is closed and its directory removed.
+/// The generated files are never committed (`tests/fixtures/export/*/README.md`).
+pub fn export_fixture(kind: FixtureKind, out: &Path) -> std::io::Result<FixtureInfo> {
+    use atlas_duck_ipc::paths::{DataDirResolution, check_data_dir};
+    use serde_json::json;
+
+    use crate::request_set::{RequestRecord, request_set_hash, requests_to_json};
+    use crate::types::{EventType, ExportControl, NewEvent, RustChosenPath, TimeRange};
+
+    let fail = |what: &str| std::io::Error::other(format!("export fixture: {what}"));
+    let store_dir = out.join("atlas-duck-fixture-store");
+    std::fs::create_dir(&store_dir)?;
+    let data = match check_data_dir(&store_dir) {
+        Ok(DataDirResolution::Local(d)) => d,
+        _ => return Err(fail("the store directory is not a local data dir")),
+    };
+    let lock = crate::lock::InstanceLock::acquire(&data, "fixture-host")
+        .map_err(|_| fail("instance.lock"))?;
+    let (install_id, chain_id) = crate::open::new_ids().map_err(|_| fail("ids"))?;
+    let start =
+        UtcInstant::parse_rfc3339_ms("2026-10-08T12:00:00.000Z").ok_or_else(|| fail("clock"))?;
+    let cfg = crate::store::OpenConfig::new(
+        Arc::new(FakeClock::new(start)),
+        Arc::new(MemKeyStore::new(MemKeyring::new(), &install_id)),
+    );
+    let pass = secrecy::SecretString::from("export fixture passphrase".to_string());
+    let store = crate::open::create_new_store(
+        &data,
+        &lock,
+        cfg,
+        crate::open::FirstRunInput {
+            install_id,
+            chain_id,
+            passphrase: pass.clone(),
+            passphrase_confirm: pass,
+            archived_db: None,
+            anchor_dir: None,
+            archive_confirmed: None,
+        },
+    )
+    .map_err(|_| fail("create the store"))?;
+    let ev = |t: EventType, payload: serde_json::Value| NewEvent {
+        event_type: t,
+        request_id: Some("fixture-request".into()),
+        op_id: None,
+        op_class: None,
+        instance_id: None,
+        target: None,
+        actor: Default::default(),
+        decision: None,
+        flags: Default::default(),
+        payload,
+    };
+    let requests = vec![RequestRecord {
+        index: 0,
+        method: "POST".into(),
+        resolved_url: "https://jira.example/rest/api/2/issue".into(),
+        content_type: Some("application/json".into()),
+        body_bytes: b"{\"fields\":{}}".to_vec(),
+    }];
+    let events = vec![
+        ev(EventType::REQUEST_RECEIVED, json!({"op": "jira.search"})),
+        ev(EventType::READ_FETCHED, json!({"status": 200, "body": "x"})),
+        ev(EventType::READ_RELEASED, json!({"summary": "one issue"})),
+        ev(EventType::DELIVERED, json!({"ok": true})),
+        ev(
+            EventType::WRITE_APPROVED,
+            json!({
+                "candidate_rev": 1,
+                "request_set_hash": hex::encode(request_set_hash(&requests)),
+                "requests": requests_to_json(&requests),
+            }),
+        ),
+    ];
+    let exported = store
+        .append_batch(events)
+        .map_err(|_| fail("append"))
+        .and_then(|_| {
+            let cancel = AtomicBool::new(false);
+            let progress = |_: u64, _: u64| {};
+            store
+                .export(
+                    TimeRange::all(),
+                    RustChosenPath::from_native_dialog(out.to_path_buf()),
+                    &ExportControl {
+                        progress: &progress,
+                        cancel: &cancel,
+                    },
+                )
+                .map_err(|_| fail("export"))
+        });
+    store.shutdown();
+    drop(store);
+    drop(lock);
+    std::fs::remove_dir_all(&store_dir)?;
+    let receipt = exported?;
+    let dir = out.join(&receipt.dir_name);
+    if kind == FixtureKind::Tamper {
+        let events = dir.join(crate::export::EVENTS_FILE);
+        let text = std::fs::read(&events)?;
+        let mut lines: Vec<serde_json::Value> = text
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(serde_json::from_slice)
+            .collect::<Result<_, _>>()
+            .map_err(|_| fail("read events.jsonl"))?;
+        let row = lines.get_mut(2).ok_or_else(|| fail("too few rows"))?;
+        row["target"] = json!("tampered");
+        let mut text = Vec::new();
+        for l in &lines {
+            text.extend(
+                atlas_duck_ipc::jcs::to_jcs_vec(l).map_err(|_| fail("encode events.jsonl"))?,
+            );
+            text.push(b'\n');
+        }
+        std::fs::write(&events, text)?;
+    }
+    Ok(FixtureInfo {
+        dir,
+        manifest_sha256: receipt.manifest_sha256,
+        expected_exit: match kind {
+            FixtureKind::Pass => 0,
+            FixtureKind::Tamper => 21,
+            FixtureKind::NoTrustRoot => 20,
+        },
+    })
+}

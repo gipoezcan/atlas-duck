@@ -58,9 +58,10 @@ pub const MAX_BAD_LINES_REPORTED: usize = 16;
 /// bound as the export verifier's, PD-162); an anchor dir holding more is refused.
 pub const MAX_FIRST_RUN_CHAIN_FILES: usize = 256;
 
-/// What a first run reads of a chain file before it knows whose it is: the header, also after a
-/// run of torn lines (each at most [`MAX_LINE_BYTES`]), lies far inside it.
-const HEADER_PROBE_BYTES: u64 = 64 * 1024;
+/// What a first run (and the export verifier) reads of a chain file before it knows whose it is:
+/// the header, also after a run of torn lines (each at most [`MAX_LINE_BYTES`]), lies far inside
+/// it.
+pub(crate) const HEADER_PROBE_BYTES: u64 = 64 * 1024;
 
 /// The end of a chain file a first run did not parse to the end, read for its last anchored
 /// line.
@@ -709,8 +710,9 @@ impl TornRun {
 /// as if the line had never been written. A run that is not tolerated is bad lines like any
 /// other. At most [`MAX_BAD_LINES_REPORTED`] bad (and torn) lines are reported one by one, the
 /// rest in one summary, and at most [`MAX_LINES`] lines are read, so a file of garbage costs
-/// bounded memory and time.
-fn parse_file(
+/// bounded memory and time. Pure (bytes in, lines out): the export verifier reads the files
+/// itself and parses them here.
+pub(crate) fn parse_file(
     name: &str,
     chain: &str,
     bytes: &[u8],
@@ -1016,7 +1018,7 @@ fn last_named_in_tail(file: &mut std::fs::File) -> std::io::Result<Option<Anchor
 }
 
 /// `bytes` up to and including its last newline (empty without one).
-fn complete_lines(bytes: &[u8]) -> &[u8] {
+pub(crate) fn complete_lines(bytes: &[u8]) -> &[u8] {
     bytes
         .iter()
         .rposition(|b| *b == b'\n')
@@ -1089,7 +1091,7 @@ impl LostSpan {
         })
     }
 
-    fn covers(&self, chain: &str, seq: u64) -> bool {
+    pub(crate) fn covers(&self, chain: &str, seq: u64) -> bool {
         self.chain_id == chain && seq > self.after && seq <= self.up_to
     }
 }

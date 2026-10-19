@@ -125,7 +125,8 @@ pub const MAX_EXPORT_PAYLOAD_FIELD_BYTES: u64 = 1024 * 1024;
 
 /// The share of [`MAX_EXPORT_LINE_BYTES`] for every column but the two base64 fields and
 /// `payload`, with the JSON framing of the line. The exporter asserts only the total line
-/// length; whether the verifier also caps this share is the verifier's rule (T8).
+/// length, and the verifier caps no column by this share either (several columns, the hex OS
+/// paths among them, have no bound of their own; `verify_export` module doc).
 pub const MAX_EXPORT_OTHER_BYTES: u64 = 64 * 1024;
 
 const fn base64_len(n: u64) -> u64 {
