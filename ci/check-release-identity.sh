@@ -18,20 +18,24 @@
 # files. It spawns nothing beyond coreutils, sed, grep, tr and sha256sum or shasum.
 set -euo pipefail
 
+self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
 fail() { echo "::error::check-release-identity: $*" >&2; exit 1; }
 
 placeholder_id="dev.atlasduck.desktop"
-conf="app/src-tauri/tauri.conf.json"
-paths_rs="crates/ipc/src/paths/mod.rs"
-icons_dir="app/src-tauri/icons"
-list="ci/placeholder-icons.sha256"
+# The four inputs can be redirected with env vars (relative paths resolve from the repo root) so
+# --self-test can drive the real main flow below over fixture files. CI never sets them.
+conf="${RELEASE_IDENTITY_CONF:-app/src-tauri/tauri.conf.json}"
+paths_rs="${RELEASE_IDENTITY_PATHS_RS:-crates/ipc/src/paths/mod.rs}"
+icons_dir="${RELEASE_IDENTITY_ICONS_DIR:-app/src-tauri/icons}"
+list="${RELEASE_IDENTITY_LIST:-ci/placeholder-icons.sha256}"
 
-# Text helpers shared by both modes.
-extract_identifier() { sed -n 's/^[[:space:]]*"identifier"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1; }
-extract_folder() { sed -n 's/^pub const APP_DIR_NAME: &str = "\([^"]*\)";.*/\1/p' | head -n 1; }
+# Text helpers shared by both modes. `sed -n 1p` (not `head -n 1`) reads all input, so no SIGPIPE
+# under pipefail.
+extract_identifier() { sed -n 's/^[[:space:]]*"identifier"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n 1p; }
+extract_folder() { sed -n 's/^pub const APP_DIR_NAME: &str = "\([^"]*\)";.*/\1/p' | sed -n 1p; }
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 is_placeholder_id() { [ "$1" = "$placeholder_id" ]; }
 same_as_folder() { [ "$(lower "$1")" = "$(lower "$2")" ]; }
@@ -54,6 +58,21 @@ if [ "${1:-}" = "--self-test" ]; then
     if [ "$2" = "$3" ]; then echo "  ok   $1"; else echo "  FAIL $1 (want '$2', got '$3')" >&2; st_fail=1; fi
   }
   all_entries_wellformed() { ! grep -qvE '^[0-9a-f]{64}  app/src-tauri/icons/[^ ]+$' "$list"; }
+  # Every listed file must exist in the repo.
+  all_listed_files_exist() {
+    local h p
+    while read -r h p; do [ -f "$p" ] || { echo "  listed file missing: $p" >&2; return 1; }; done < "$list"
+  }
+  # At least one listed hash still equals the current bytes of its file.
+  some_listed_hash_matches() {
+    local h p
+    while read -r h p; do [ -f "$p" ] && [ "$(sha256_of "$p")" = "$h" ] && return 0; done < "$list"
+    return 1
+  }
+  # Run the real main flow of this script over fixture inputs; succeeds when it exits 0.
+  run_main() { RELEASE_IDENTITY_CONF="$fx/conf.json" RELEASE_IDENTITY_PATHS_RS="$fx/paths.rs" \
+    RELEASE_IDENTITY_ICONS_DIR="$fx/icons" RELEASE_IDENTITY_LIST="$fx/list.sha256" bash "$self" >/dev/null 2>&1; }
+  set_fixture_id() { printf '  "identifier": "%s",\n' "$1" > "$fx/conf.json"; }
 
   echo "check-release-identity --self-test"
   expect_eq "identifier read from a tauri.conf.json line" "dev.atlasduck.desktop" \
@@ -83,6 +102,41 @@ if [ "${1:-}" = "--self-test" ]; then
 
   expect "placeholder list exists and is not empty" 0 test -s "$list"
   expect "every placeholder entry is '<64 hex>  app/src-tauri/icons/<name>'" 0 all_entries_wellformed
+
+  # I-1: the list must not drift from the placeholder icons. While the identifier is still the
+  # placeholder (the lead has not yet replaced identifier and icons, human decision Q4), every
+  # listed file must exist and at least one listed hash must match its current file, so a typo or
+  # a line-ending/binary change that silently disables check b fails here. Once the identifier is
+  # replaced the icons are legitimately replaced too (stale hashes are the point), so only the
+  # existence of the listed files is still required and the hash-match assertion is lifted.
+  expect "every listed icon file exists" 0 all_listed_files_exist
+  if is_placeholder_id "$repo_id"; then
+    expect "a listed placeholder hash matches its current icon (list has not drifted)" 0 some_listed_hash_matches
+  else
+    echo "  skip listed-hash match: identifier $repo_id is no longer the placeholder"
+  fi
+
+  # M-2: drive the real main flow on fixtures.
+  fx="$(mktemp -d)"
+  trap 'rm -rf "$fx"' EXIT
+  mkdir "$fx/icons"
+  printf '%s\n' 'pub const APP_DIR_NAME: &str = "atlas-duck";' > "$fx/paths.rs"
+  printf 'placeholder icon bytes\n' > "$fx/icons/listed.png"
+  printf 'replaced icon bytes\n' > "$fx/icons/replaced.png"
+  printf '%s  %s\n' "$(sha256_of "$fx/icons/listed.png")" "app/src-tauri/icons/listed.png" > "$fx/list.sha256"
+  rm "$fx/icons/listed.png"
+
+  set_fixture_id "dev.atlasduck.desktop"
+  expect "main flow: placeholder identifier fails" 1 run_main
+  set_fixture_id "example.release.app"
+  expect "main flow: replaced identifier and replaced icons passes" 0 run_main
+  set_fixture_id "Atlas-Duck"
+  expect "main flow: identifier equal to the folder name (other case) fails" 1 run_main
+  set_fixture_id "example.release.app"
+  printf 'placeholder icon bytes\n' > "$fx/icons/listed.png"
+  expect "main flow: a listed placeholder icon fails" 1 run_main
+  rm "$fx/icons/listed.png" "$fx/icons/replaced.png"
+  expect "main flow: no icon files fails" 1 run_main
 
   if [ "$st_fail" -ne 0 ]; then fail "self-test failed"; fi
   echo "check-release-identity: self-test passed"
