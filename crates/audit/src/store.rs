@@ -46,6 +46,13 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// `Invalid` text of [`Store::change_anchor_dir`]: the new dir's chain file could not be created
+/// or opened for append (the writability check, PD-166); nothing was committed.
+pub const ANCHOR_DIR_NOT_WRITABLE: &str = "the anchor directory cannot be written";
+/// `Invalid` text of [`Store::change_anchor_dir`]: the anchor-dir thread holds the file lock (a
+/// hung share), so the new dir was not tried; nothing was committed.
+pub const ANCHOR_DIR_WRITER_BUSY: &str = "the anchor-dir writer is busy; try again";
+
 /// What `open()` and `create_new_store()` are given (C.3 fields first, then additions).
 pub struct OpenConfig {
     pub clock: Arc<dyn Clock>,
@@ -855,7 +862,7 @@ impl Store {
             dir.as_deref().map(Path::new),
             self.settings().anchor_dir.as_deref().map(Path::new),
         ) {
-            return Err(AuditError::Invalid("the setting already has this value"));
+            return Err(AuditError::Invalid(settings::SETTING_UNCHANGED));
         }
         if let Some(p) = &new {
             let (_, _, chain_id) = self.head();
@@ -867,9 +874,9 @@ impl Store {
                     AuditError::Invalid(if e.kind() == std::io::ErrorKind::TimedOut {
                         // The anchor-dir thread holds the file lock (a hung share): the new dir
                         // was not tried.
-                        "the anchor-dir writer is busy; try again"
+                        ANCHOR_DIR_WRITER_BUSY
                     } else {
-                        "the anchor directory cannot be written"
+                        ANCHOR_DIR_NOT_WRITABLE
                     })
                 })?;
         }

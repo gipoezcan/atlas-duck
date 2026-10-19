@@ -5,9 +5,10 @@
 //! What a call may do is decided by the purpose Rust opened the window for
 //! (`credential::Purpose`), never by an argument. A secret arrives only in `submit_secret`, is a
 //! `secrecy::SecretString` from the DTO on ([`Secret`]: no `Serialize`, a redacting `Debug`,
-//! zeroized on drop) and goes to `InstanceAdmin::set_token`, the wizard's channel or the audit
-//! store; no response, event, log line or capture record holds it. A PAT's answer is the
-//! connection test's outcome only (§10.3).
+//! zeroized on drop) and goes to `InstanceAdmin::set_token`, the wizard's channel, a waiting
+//! restore or the audit store (M10 T14: the new recovery passphrase of purpose
+//! `change_recovery_passphrase`, typed twice); no response, event, log line or capture record holds
+//! it. A PAT's answer is the connection test's outcome only (§10.3).
 
 use std::fmt;
 use std::sync::Arc;
@@ -333,9 +334,57 @@ fn note_available<R: Runtime>(
     purpose: &Purpose,
     serve: Option<&ServeState>,
 ) -> bool {
-    *purpose == Purpose::RecoveryPassphrase
-        && credential::handed_over(app)
-        && serve.is_some_and(|s| s.note_facts().is_some())
+    note_offered(app, purpose) && serve.is_some_and(|s| s.note_facts().is_some())
+}
+
+/// The window offers the recovery note (§8.6): after the first-run passphrase went to the wizard,
+/// and (M10 T14, PD-169) after this window's recovery-passphrase change committed.
+fn note_offered<R: Runtime>(app: &AppHandle<R>, purpose: &Purpose) -> bool {
+    match purpose {
+        Purpose::RecoveryPassphrase => credential::handed_over(app),
+        Purpose::ChangeRecoveryPassphrase => credential::passphrase_changed(app),
+        _ => false,
+    }
+}
+
+/// plan text (T14): the class of a recovery-passphrase change the store refused for another reason
+/// than the two entries (a restore replaced the KEK meanwhile, a failed write): nothing changed.
+pub const CLASS_PASSPHRASE_NOT_CHANGED: &str = "passphrase_not_changed";
+
+/// "Change recovery passphrase" (M10 T14, PD-169, §8.6): the window's own check of the pair, then
+/// `Store::change_recovery_passphrase` on the blocking pool (two Argon2id runs, seconds on a slow
+/// machine; T9 handoff), which re-wraps the KEK and commits the `recovery` row with its
+/// `CREDENTIAL_CHANGED {change: recovery_passphrase}`. A refused pair or a refused change is a
+/// `failed` outcome with nothing changed; a closed store is `not_ready`. The answer holds no secret.
+pub async fn change_passphrase_dto(
+    store: atlas_duck_audit::Store,
+    args: SubmitSecretArgs,
+) -> Result<SubmitOutcome, CommandError> {
+    use atlas_duck_audit::{AuditError, PASSPHRASE_MISMATCH, PASSPHRASE_TOO_SHORT};
+    let pair = match passphrase_pair(args)? {
+        Ok(pair) => pair,
+        Err(failed) => return Ok(failed),
+    };
+    let changed = blocking(move || {
+        let FirstRunPassphrase {
+            passphrase,
+            confirm,
+        } = pair;
+        Ok(store.change_recovery_passphrase(&passphrase, &confirm))
+    })
+    .await?;
+    let class = match changed {
+        Ok(_) => return Ok(SubmitOutcome::Accepted {}),
+        Err(AuditError::Closed) => return Err(CommandError::NotReady),
+        Err(AuditError::Invalid(PASSPHRASE_TOO_SHORT)) => {
+            credential::PassphraseRefusal::TooShort.class()
+        }
+        Err(AuditError::Invalid(PASSPHRASE_MISMATCH)) => {
+            credential::PassphraseRefusal::Mismatch.class()
+        }
+        Err(_) => CLASS_PASSPHRASE_NOT_CHANGED,
+    };
+    Ok(SubmitOutcome::Failed(SubmitFailure::class(class)))
 }
 
 /// A PAT for `target` (§7.1, §10.3): the instance must still be the one the window shows
@@ -500,6 +549,21 @@ async fn submit<R: Runtime>(
             }
             Ok(SubmitOutcome::Accepted {})
         }
+        Purpose::ChangeRecoveryPassphrase => {
+            let state = serve_state(app).ok_or(CommandError::NotReady)?;
+            let store = state.open_store().ok_or(CommandError::NotReady)?;
+            // Not once the quit path began (no record after `APP_STOP`).
+            if state.shutting_down() {
+                return Err(CommandError::NotReady);
+            }
+            let outcome = change_passphrase_dto(store, args).await?;
+            if matches!(outcome, SubmitOutcome::Accepted {}) {
+                // The window offers the recovery note now (if it is still this window).
+                credential::mark_passphrase_changed(app, generation);
+                crate::ui_sink::emit_settings_changed(app);
+            }
+            Ok(outcome)
+        }
         // `keychain_unavailable`: nothing to type in v1 (L39); "Retry keychain" instead.
         Purpose::Unlock => Err(CommandError::NotReady),
     }
@@ -535,12 +599,46 @@ pub async fn save_recovery_note<R: Runtime>(
 }
 
 async fn save_note<R: Runtime>(app: &AppHandle<R>) -> Result<NoteSaved, CommandError> {
-    let purpose = credential::current_purpose(app);
-    let serve = serve_state(app);
-    if purpose != Some(Purpose::RecoveryPassphrase) || !credential::handed_over(app) {
+    let handle = app.clone();
+    save_note_with(app, move || pick_note_file(&handle)).await
+}
+
+/// Rust's save dialog for the recovery note; `None` when cancelled. Blocks until the user answers:
+/// the blocking pool only.
+fn pick_note_file<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Result<Option<std::path::PathBuf>, CommandError> {
+    use tauri_plugin_dialog::DialogExt;
+    let Some(chosen) = app
+        .dialog()
+        .file()
+        .set_title(NOTE_DIALOG_TITLE)
+        .set_file_name(credential::NOTE_FILE_NAME)
+        .add_filter(NOTE_FILTER, &["txt"])
+        .blocking_save_file()
+    else {
+        return Ok(None);
+    };
+    chosen
+        .into_path()
+        .map(Some)
+        .map_err(|_| CommandError::Internal)
+}
+
+/// `save_recovery_note` with its save dialog passed in (`pick`, M10 T14: the tests' seam, so the
+/// note written is the one this path builds): only while the window offers the note, built from
+/// facts that hold no secret ([`credential::note_text`]), written where `pick` answered. `pick`
+/// runs on the blocking pool.
+pub async fn save_note_with<R, F>(app: &AppHandle<R>, pick: F) -> Result<NoteSaved, CommandError>
+where
+    R: Runtime,
+    F: FnOnce() -> Result<Option<std::path::PathBuf>, CommandError> + Send + 'static,
+{
+    let offered = credential::current_purpose(app).is_some_and(|p| note_offered(app, &p));
+    if !offered {
         return Err(CommandError::NotReady);
     }
-    let (install_id, chain_id, data) = serve
+    let (install_id, chain_id, data) = serve_state(app)
         .and_then(|s| s.note_facts())
         .ok_or(CommandError::NotReady)?;
     let facts = NoteFacts {
@@ -550,21 +648,11 @@ async fn save_note<R: Runtime>(app: &AppHandle<R>) -> Result<NoteSaved, CommandE
         chain_id,
         data_dir: data.display().to_string(),
     };
-    let handle = app.clone();
     // The dialog blocks until the user answers: on the blocking pool, never the main thread.
     blocking(move || {
-        use tauri_plugin_dialog::DialogExt;
-        let Some(chosen) = handle
-            .dialog()
-            .file()
-            .set_title(NOTE_DIALOG_TITLE)
-            .set_file_name(credential::NOTE_FILE_NAME)
-            .add_filter(NOTE_FILTER, &["txt"])
-            .blocking_save_file()
-        else {
+        let Some(path) = pick()? else {
             return Ok(NoteSaved { saved: false });
         };
-        let path = chosen.into_path().map_err(|_| CommandError::Internal)?;
         std::fs::write(&path, credential::note_text(&facts)).map_err(|_| CommandError::Internal)?;
         Ok(NoteSaved { saved: true })
     })

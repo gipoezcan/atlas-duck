@@ -16,8 +16,9 @@ use atlas_duck_app_lib::commands::audit::{
     DeliveriesDto, EventHeaderDto, ExportCancelDto, ExportDoneDto, IncidentDto,
 };
 use atlas_duck_app_lib::commands::credential::{
-    ArchiveOutcome, CLASS_CONTEXT_CHANGED, Connected, CredentialContextDto, NoteSaved,
-    RetryStarted, SubmitFailure, SubmitOutcome, connection_failure, context_dto,
+    ArchiveOutcome, CLASS_CONTEXT_CHANGED, CLASS_PASSPHRASE_NOT_CHANGED, Connected,
+    CredentialContextDto, NoteSaved, RetryStarted, SubmitFailure, SubmitOutcome,
+    connection_failure, context_dto,
 };
 use atlas_duck_app_lib::commands::dto::{StatusLevel, StatusLineDto};
 use atlas_duck_app_lib::commands::onboarding::OnboardingTextDto;
@@ -27,8 +28,14 @@ use atlas_duck_app_lib::commands::settings::{
     OUTCOME_ALREADY_ON_PATH, OUTCOME_INSTALLED, OUTCOME_INSTALLED_LOCAL_BIN, OUTCOME_REMOVED,
     RestoreCancelDto, RestoreDoneDto, RetestOutcome, SettingsGet,
 };
-use atlas_duck_app_lib::commands::{AuditReadFailure, CommandError, ExportFailure, RestoreFailure};
+use atlas_duck_app_lib::commands::{
+    AnchorDirFailure, AuditReadFailure, CommandError, ExportFailure, ForgetFailure,
+    ReAnchorFailure, RestoreFailure,
+};
 use atlas_duck_app_lib::credential::{PatTarget, Purpose};
+use atlas_duck_app_lib::recovery_tier::{
+    AnchorDirDto, ForgottenDto, OrphanInstallDto, ReAnchoredDto,
+};
 use atlas_duck_app_lib::removal::{
     BackupAnswer, Choice, FinishAnswer, ItemDto, RemovalDto, RemovalError,
 };
@@ -726,7 +733,95 @@ fn command_errors() -> Vec<CommandError> {
         CommandError::Restore(RestoreFailure::CommittedIncomplete),
         CommandError::Restore(RestoreFailure::Keychain),
         CommandError::Restore(RestoreFailure::Failed),
+        // M10 T14 (PD-166, PD-170): the anchor directory, re-anchor and "Forget old install".
+        CommandError::AnchorDir(AnchorDirFailure::NotWritable),
+        CommandError::AnchorDir(AnchorDirFailure::WriterBusy),
+        CommandError::AnchorDir(AnchorDirFailure::Unchanged),
+        CommandError::AnchorDir(AnchorDirFailure::NotSet),
+        CommandError::AnchorDir(AnchorDirFailure::Failed),
+        CommandError::ReAnchor(ReAnchorFailure::NothingMissing),
+        CommandError::ReAnchor(ReAnchorFailure::Held),
+        CommandError::ReAnchor(ReAnchorFailure::DoesNotVerify),
+        CommandError::ReAnchor(ReAnchorFailure::Restored),
+        CommandError::ReAnchor(ReAnchorFailure::Keychain),
+        CommandError::ReAnchor(ReAnchorFailure::Failed),
+        CommandError::Forget(ForgetFailure::Unreadable),
+        CommandError::Forget(ForgetFailure::Keychain {
+            deleted: vec!["pat/0b9d3f62-4c1a-4f0e-9a51-7f2a6c3e8d11".into()],
+            not_deleted: vec![
+                "pat/0b9d3f62-4c1a-4f0e-9a51-7f2a6c3e8d12".into(),
+                "canary".into(),
+            ],
+        }),
+        CommandError::Forget(ForgetFailure::Failed),
         CommandError::Internal,
+    ]
+}
+
+/// `anchor_dir_set` / `anchor_dir_remove` (M10 T14): a directory in force (a share, display
+/// text), and none.
+fn anchor_dir_answers() -> Vec<AnchorDirDto> {
+    vec![
+        AnchorDirDto {
+            anchor_dir: Some("\\\\nas\\audit\\anchors".into()),
+        },
+        AnchorDirDto { anchor_dir: None },
+    ]
+}
+
+/// `re_anchor` (M10 T14, PD-170): the `re_anchored` incident's seq.
+fn re_anchoreds() -> Vec<ReAnchoredDto> {
+    vec![ReAnchoredDto { verify_seq: 58 }]
+}
+
+/// `orphan_installs` (M10 T14, PD-170): an install with tokens and keys left, named by two
+/// archives (one instance id with an invisible character, display-escaped by Rust); one with its
+/// keys only.
+fn orphan_installs() -> Vec<OrphanInstallDto> {
+    vec![
+        OrphanInstallDto {
+            install_id: "0123456789abcdef0123456789abcdef".into(),
+            archived_files: vec![
+                format!("archived/audit-{CHAIN}-42-20261015T093000123Z.db"),
+                format!("archived/audit-{CHAIN}-97-20261018T101500000Z.db"),
+            ],
+            entries: vec![
+                "first_retained_anchor".into(),
+                "head_anchor".into(),
+                "kek".into(),
+                "pat/0b9d3f62-4c1a-4f0e-9a51-7f2a6c3e8d11".into(),
+                "pat/old\u{27E8}U+202E\u{27E9}".into(),
+            ],
+        },
+        OrphanInstallDto {
+            install_id: "fedcba9876543210fedcba9876543210".into(),
+            archived_files: vec![format!("archived/audit-{CHAIN}-3-20260901T080000000Z.db")],
+            entries: vec!["kek".into()],
+        },
+    ]
+}
+
+/// `forget_install` (M10 T14, PD-170): the tokens only (keys kept), and everything.
+fn forgottens() -> Vec<ForgottenDto> {
+    vec![
+        ForgottenDto {
+            install_id: "0123456789abcdef0123456789abcdef".into(),
+            deleted: vec![
+                "pat/0b9d3f62-4c1a-4f0e-9a51-7f2a6c3e8d11".into(),
+                "canary".into(),
+            ],
+            keys_deleted: false,
+        },
+        ForgottenDto {
+            install_id: "fedcba9876543210fedcba9876543210".into(),
+            deleted: vec![
+                "canary".into(),
+                "first_retained_anchor".into(),
+                "head_anchor".into(),
+                "kek".into(),
+            ],
+            keys_deleted: true,
+        },
     ]
 }
 
@@ -853,7 +948,7 @@ fn audit_statuses() -> Vec<AuditStatusDto> {
         storage_low: false,
         anchor_write_failing: false,
         anchor_thread_dead: false,
-        anchors_blocked: false,
+        anchors_blocked: failing,
         open_incidents: incidents,
         prune_backlog_days: 0,
         prune_backlog: None,
@@ -862,6 +957,9 @@ fn audit_statuses() -> Vec<AuditStatusDto> {
         settings_unreadable: false,
         anchor_dir_write_failing: failing,
         anchor_dir_lines_pending: u32::from(failing) * 12,
+        // M10 T14: a missing head anchor held by a barrier: named, not offered.
+        anchors_missing: failing.then_some("head"),
+        re_anchor_offered: false,
     };
     vec![
         AuditStatusDto {
@@ -1142,6 +1240,8 @@ fn submit_outcomes() -> Vec<SubmitOutcome> {
         // T13 review M-2: the chosen backup, not the locked log, failed its check.
         SubmitOutcome::Failed(SubmitFailure::class("broken")),
         SubmitOutcome::Failed(SubmitFailure::class("anchor_dir_mismatch")),
+        // M10 T14: a recovery-passphrase change the store refused (not the two entries).
+        SubmitOutcome::Failed(SubmitFailure::class(CLASS_PASSPHRASE_NOT_CHANGED)),
     ]
 }
 
@@ -1218,6 +1318,9 @@ fn settings_views() -> Vec<SettingsView> {
         // M10 T12: the anchor directory's write state; both ends in the fixtures.
         anchor_dir_write_failing: low,
         anchor_dir_lines_pending: u32::from(low) * 3,
+        // M10 T14 (PD-170): a missing anchor entry and the "Re-anchor" offer; both ends.
+        anchors_missing: low.then_some("first_retained"),
+        re_anchor_offered: low,
     };
     vec![
         SettingsView {
@@ -1635,6 +1738,7 @@ fn value<T: Serialize>(items: &[T]) -> Result<Value, serde_json::Error> {
 fn all() -> Result<Vec<(&'static str, Value)>, serde_json::Error> {
     Ok(vec![
         ("acknowledged", value(&acknowledged())?),
+        ("anchor_dir_answer", value(&anchor_dir_answers())?),
         ("archive_outcome", value(&archive_outcomes())?),
         ("audit_job", value(&audit_jobs())?),
         ("audit_page", value(&audit_pages())?),
@@ -1649,15 +1753,18 @@ fn all() -> Result<Vec<(&'static str, Value)>, serde_json::Error> {
         ("deny_count", value(&deny_counts())?),
         ("export_cancel", value(&export_cancels())?),
         ("export_done", value(&export_dones())?),
+        ("forgotten", value(&forgottens())?),
         ("instance_view", value(&instance_views())?),
         ("kill_answer", value(&kill_answers())?),
         ("note_saved", value(&note_saved())?),
         ("onboarding_text", value(&onboarding_texts())?),
+        ("orphan_install", value(&orphan_installs())?),
         ("preview", value(&previews())?),
         ("prune_report", value(&prune_reports())?),
         ("queue_detail", value(&queue_details())?),
         ("queue_item", value(&queue_items())?),
         ("raw_page", value(&raw_pages())?),
+        ("re_anchored", value(&re_anchoreds())?),
         ("recent_item", value(&recent_items())?),
         ("redaction_context", value(&redaction_contexts())?),
         ("redaction_report", value(&redaction_reports())?),

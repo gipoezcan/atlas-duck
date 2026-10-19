@@ -1,5 +1,7 @@
 import type {
   Acknowledged,
+  AnchorDirAnswer,
+  AnchorDirFailure,
   AuditFlag,
   AuditIncident,
   AuditJobEvent,
@@ -26,10 +28,13 @@ import type {
   ExportCancelAnswer,
   ExportDone,
   ExportFailure,
+  ForgetFailure,
+  Forgotten,
   InputKind,
   InstanceView,
   KillAnswer,
   OnboardingText,
+  OrphanInstall,
   PlainInputKind,
   Preview,
   PreviewFetchResponse,
@@ -38,6 +43,8 @@ import type {
   QueueDetail,
   QueueItem,
   RawPage,
+  ReAnchored,
+  ReAnchorFailure,
   RecentItem,
   RedactionContext,
   RedactionOp,
@@ -346,6 +353,8 @@ const isHealth = (v: unknown): boolean =>
     settings_unreadable: isBool,
     anchor_dir_write_failing: isBool,
     anchor_dir_lines_pending: isNum,
+    anchors_missing: (m) => m === null || oneOf('head', 'first_retained', 'both')(m),
+    re_anchor_offered: isBool,
   });
 
 export const isSettingsView = (v: unknown): v is SettingsView =>
@@ -642,6 +651,53 @@ export const isRestoreFailure = (v: unknown): v is RestoreFailure =>
     ),
   });
 
+/** `anchor_dir_set` / `anchor_dir_remove` (M10 T14): the directory in force, display text. */
+export const isAnchorDirAnswer = (v: unknown): v is AnchorDirAnswer =>
+  closed(v, { anchor_dir: strOrNull });
+
+/** `re_anchor` (M10 T14): the incident's seq only. */
+export const isReAnchored = (v: unknown): v is ReAnchored => closed(v, { verify_seq: isNum });
+
+/** One `orphan_installs` row (M10 T14): an install id in the store's form, names only. */
+export const isOrphanInstall = (v: unknown): v is OrphanInstall =>
+  closed(v, {
+    install_id: (i) => isStr(i) && /^[0-9a-f]{32}$/.test(i),
+    archived_files: arrayOf(isStr),
+    entries: arrayOf(isStr),
+  });
+
+/** `forget_install` (M10 T14). */
+export const isForgotten = (v: unknown): v is Forgotten =>
+  closed(v, {
+    install_id: (i) => isStr(i) && /^[0-9a-f]{32}$/.test(i),
+    deleted: arrayOf(isStr),
+    keys_deleted: isBool,
+  });
+
+/** `anchor_dir`'s nested error: one of the fixed kinds, nothing else. */
+export const isAnchorDirFailure = (v: unknown): v is AnchorDirFailure =>
+  closed(v, { kind: oneOf('not_writable', 'writer_busy', 'unchanged', 'not_set', 'failed') });
+
+/** `re_anchor`'s nested error: one of the fixed kinds, nothing else. */
+export const isReAnchorFailure = (v: unknown): v is ReAnchorFailure =>
+  closed(v, {
+    kind: oneOf('nothing_missing', 'held', 'does_not_verify', 'restored', 'keychain', 'failed'),
+  });
+
+/** `forget`'s nested error, closed per kind: only `keychain` names entries. */
+export const isForgetFailure = (v: unknown): v is ForgetFailure => {
+  if (!rec(v)) return false;
+  switch (v.kind) {
+    case 'unreadable':
+    case 'failed':
+      return closed(v, { kind: isStr });
+    case 'keychain':
+      return closed(v, { kind: isStr, deleted: arrayOf(isStr), not_deleted: arrayOf(isStr) });
+    default:
+      return false;
+  }
+};
+
 /** Maps whatever a rejected invoke carried to a `CommandError`. */
 export function toCommandError(raw: unknown): CommandError {
   if (rec(raw) && isStr(raw.kind)) {
@@ -671,6 +727,15 @@ export function toCommandError(raw: unknown): CommandError {
         break;
       case 'restore':
         if (isRestoreFailure(raw.error)) return { kind: 'restore', error: raw.error };
+        break;
+      case 'anchor_dir':
+        if (isAnchorDirFailure(raw.error)) return { kind: 'anchor_dir', error: raw.error };
+        break;
+      case 're_anchor':
+        if (isReAnchorFailure(raw.error)) return { kind: 're_anchor', error: raw.error };
+        break;
+      case 'forget':
+        if (isForgetFailure(raw.error)) return { kind: 'forget', error: raw.error };
         break;
       case 'release_blocked':
         if (isStr(raw.text)) return { kind: 'release_blocked', text: raw.text };

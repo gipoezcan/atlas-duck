@@ -28,7 +28,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use atlas_duck_audit::{
-    AuditError, Confirmed, NewEvent, PruneOutcome, PruneSkip, SettingChange, Store, StoreHealth,
+    AuditError, Confirmed, MissingAnchor, NewEvent, PruneOutcome, PruneSkip, SettingChange, Store,
+    StoreHealth,
 };
 use atlas_duck_ipc::sandbox::ScriptLimits;
 use serde::ser::SerializeMap;
@@ -319,6 +320,28 @@ pub struct StoreHealthView {
     pub anchor_dir_write_failing: bool,
     /// Anchor-directory lines waiting to be written (PD-156).
     pub anchor_dir_lines_pending: u32,
+    /// Which keychain anchor entry is missing (`head`, `first_retained` or `both`; Δ-M10-1,
+    /// PD-170); `null` when none is, and during an interrupted restore.
+    pub anchors_missing: Option<&'static str>,
+    /// Settings offers "Re-anchor" ([`re_anchor_offered`], M10 T14).
+    pub re_anchor_offered: bool,
+}
+
+/// "Re-anchor" is offered (PD-170, M10 T14): an anchor entry is missing and no prune's, restore's
+/// or re-anchor's barrier holds the anchors (behind one, `Store::re_anchor` refuses with
+/// `RE_ANCHOR_HELD`; T9 review M-6). The Settings view and the `re_anchor` command's check
+/// before its dialog are this one rule.
+pub fn re_anchor_offered(h: &StoreHealth) -> bool {
+    h.anchors_missing.is_some() && h.anchors_blocked.is_none()
+}
+
+/// The wire name of a missing anchor entry (`StoreHealthView.anchors_missing`).
+fn missing_name(m: MissingAnchor) -> &'static str {
+    match m {
+        MissingAnchor::Head => "head",
+        MissingAnchor::FirstRetained => "first_retained",
+        MissingAnchor::Both => "both",
+    }
 }
 
 impl StoreHealthView {
@@ -338,6 +361,8 @@ impl StoreHealthView {
             settings_unreadable: h.settings_unreadable,
             anchor_dir_write_failing: h.anchor_dir_write_failing,
             anchor_dir_lines_pending: h.anchor_dir_lines_pending,
+            anchors_missing: h.anchors_missing.map(missing_name),
+            re_anchor_offered: re_anchor_offered(h),
         }
     }
 }
@@ -349,7 +374,9 @@ pub struct SettingsView {
     pub attention_mode: AttentionMode,
     pub retention_days: u32,
     pub legal_hold: bool,
-    /// Display only (M10 changes it).
+    /// The anchor directory in force (display only: Settings changes it through `anchor_dir_set` /
+    /// `anchor_dir_remove`, which draw their own dialogs and call `Store::change_anchor_dir`, M10
+    /// T14; never through `apply`).
     pub anchor_dir: Option<String>,
     /// "Allow scripts with degraded confinement" as the audit settings hold it (M8 Δ6, PD-141).
     /// On the wire since M8 Task 23, like `limits.script`.
@@ -1288,6 +1315,43 @@ mod tests {
         assert_eq!(wire["anchor_dir_lines_pending"], json!(7));
         assert!(!wire.to_string().contains("a/path"), "{wire}");
         assert!(!StoreHealthView::of(&StoreHealth::default()).anchor_dir_write_failing);
+    }
+
+    /// M10 T14 (PD-170, T9 review M-6): the view names the missing anchor entry, and "Re-anchor"
+    /// is offered only while one is missing and no barrier holds the anchors.
+    #[test]
+    fn health_view_names_the_missing_anchor_and_offers_re_anchor() {
+        use atlas_duck_audit::{BarrierKind, MissingAnchor};
+        let with = |missing, blocked| StoreHealth {
+            anchors_missing: missing,
+            anchors_blocked: blocked,
+            ..StoreHealth::default()
+        };
+        for (missing, name) in [
+            (MissingAnchor::Head, "head"),
+            (MissingAnchor::FirstRetained, "first_retained"),
+            (MissingAnchor::Both, "both"),
+        ] {
+            let v = StoreHealthView::of(&with(Some(missing), None));
+            assert_eq!(v.anchors_missing, Some(name));
+            assert!(v.re_anchor_offered, "{name}");
+            let wire = serde_json::to_value(&v).unwrap_or_default();
+            assert_eq!(wire["anchors_missing"], json!(name));
+            assert_eq!(wire["re_anchor_offered"], json!(true));
+            // Behind a barrier `Store::re_anchor` refuses: not offered (still named).
+            for kind in [BarrierKind::Prune, BarrierKind::Restore] {
+                let held = with(Some(missing), Some(kind));
+                assert!(!re_anchor_offered(&held), "{name} {kind:?}");
+                assert_eq!(StoreHealthView::of(&held).anchors_missing, Some(name));
+            }
+        }
+        let none = StoreHealthView::of(&StoreHealth::default());
+        assert_eq!(none.anchors_missing, None);
+        assert!(!none.re_anchor_offered);
+        assert_eq!(
+            serde_json::to_value(&none).unwrap_or_default()["anchors_missing"],
+            Value::Null
+        );
     }
 
     #[test]

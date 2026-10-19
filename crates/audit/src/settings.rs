@@ -456,10 +456,14 @@ fn check_text(s: &Option<String>) -> Result<(), AuditError> {
     }
 }
 
+/// `Invalid` text: the change would leave the setting as it is (nothing to log). Also
+/// `Store::change_anchor_dir`'s for the dir already in force (M10 T14 maps it by this const).
+pub const SETTING_UNCHANGED: &str = "the setting already has this value";
+
 /// What `change` does to `s`, and what it needs. A change that leaves the value as it is is
 /// `Invalid` (nothing to log).
 fn plan(s: &Settings, change: &SettingChange) -> Result<Planned, AuditError> {
-    let unchanged = AuditError::Invalid("the setting already has this value");
+    let unchanged = AuditError::Invalid(SETTING_UNCHANGED);
     let instance_change =
         |id: &str, field: Field, old: Option<&String>, new: &Option<String>, confirm: bool| {
             if id.is_empty() {
@@ -467,7 +471,7 @@ fn plan(s: &Settings, change: &SettingChange) -> Result<Planned, AuditError> {
             }
             check_text(new)?;
             if old == new.as_ref() {
-                return Err(AuditError::Invalid("the setting already has this value"));
+                return Err(AuditError::Invalid(SETTING_UNCHANGED));
             }
             Ok(Planned {
                 event_type: EventType::CONFIG_CHANGED,

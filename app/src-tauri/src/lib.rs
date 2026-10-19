@@ -16,6 +16,7 @@ pub mod csp;
 pub mod diag;
 pub mod early_argv;
 pub mod os_hooks;
+pub mod recovery_tier;
 pub mod removal;
 pub mod restore_flow;
 pub mod sandbox_probe;

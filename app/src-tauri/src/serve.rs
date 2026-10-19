@@ -486,6 +486,10 @@ impl StoreCall {
     }
 }
 
+/// [`ServeState::live_keys`]: the data dir and the open store install's keystore (or why the
+/// keychain could not be reached).
+pub type LiveKeys = (LocalDataDir, Result<Arc<dyn KeyStore>, KeyStoreError>);
+
 /// What `restore_cancel` did (PD-181).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestoreCancel {
@@ -671,6 +675,25 @@ impl ServeState {
     /// The open store handle (M6 T28: the full backup); `None` while no store is open.
     pub fn open_store(&self) -> Option<Store> {
         lock(&self.store).clone()
+    }
+
+    /// The data dir and a keystore of the open store's install (M10 T14: "Forget old install"
+    /// lists and deletes another install's entries through it, `KeyStore::for_install`), built by
+    /// this start's keystore factory as every open is. `None` while no store is open; `Some(Err)`
+    /// when the keychain cannot be reached.
+    pub fn live_keys(&self) -> Option<LiveKeys> {
+        let restart = self.restart.get()?;
+        let install_id = lock(&self.store).as_ref()?.install_id().to_owned();
+        Some((
+            restart.opener.data.clone(),
+            restart.opener.keys.keys(&install_id),
+        ))
+    }
+
+    /// The quit path began (the freeze, or the shutdown signal): a command whose native dialog was
+    /// answered after that changes nothing (M10 T14; the store calls of the recovery tier).
+    pub fn shutting_down(&self) -> bool {
+        !self.swaps_allowed(*lock(&self.frozen))
     }
 
     /// PD-35: the kept gate handler's refused count; `None` while `Core` serves.

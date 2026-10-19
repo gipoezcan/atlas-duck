@@ -418,8 +418,13 @@ const SLICE = [
   ACK,
   // M10 T13: the restore's two native confirmations and its source dialog.
   "app/src-tauri/src/restore_flow.rs",
+  // M10 T14: the recovery tier's confirmations and the anchor directory's folder dialog.
+  "app/src-tauri/src/recovery_tier.rs",
+  "app/src-tauri/src/commands/settings.rs",
 ];
 const RESTORE = "app/src-tauri/src/restore_flow.rs";
+const RECOVERY = "app/src-tauri/src/recovery_tier.rs";
+const SETTINGS_COMMANDS = "app/src-tauri/src/commands/settings.rs";
 
 function withSliceCopy(mutate, run) {
   const base = process.env.CHECK_DIALOG_PROOFS_SCRATCH ?? join(REPO, "target", "check-dialog-proofs-scratch");
@@ -487,6 +492,26 @@ test("M10 T13: the restore's confirmations and source dialog are load-bearing on
     ],
   ]) {
     const r = withSliceCopy((rel, t) => (rel === RESTORE ? replaceOnce(t, from, to) : t), cli);
+    assert.equal(r.status, 1, from);
+    assert.match(r.stdout, flagged);
+  }
+});
+
+test("M10 T14: the recovery tier's confirmations and the anchor folder dialog are load-bearing on the real files", () => {
+  for (const [file, from, to, flagged] of [
+    // The anchor-directory confirmation (PD-166, L54) ignored: the first such test is set_anchor_dir's.
+    [RECOVERY, "if confirmer.confirm(&text) != Confirm::Ok {", "if false {", /recovery_tier\.rs:\d+: proof helper confirmed_by called from fn set_anchor_dir/],
+    // The second "Forget old install" dialog (the archived log's keys, PD-170) ignored.
+    [RECOVERY, "if confirmer.confirm(&text) == Confirm::Ok {", "if true {", /recovery_tier\.rs:\d+: proof helper confirmed_by called from fn ask_keys/],
+    // An anchor directory that no folder dialog returned.
+    [
+      SETTINGS_COMMANDS,
+      "RustChosenPath::from_native_dialog(folder)",
+      'RustChosenPath::from_native_dialog(std::path::PathBuf::from("/tmp/anchors"))',
+      /settings\.rs:\d+: RustChosenPath::from_native_dialog outside a function that opens a folder or file dialog/,
+    ],
+  ]) {
+    const r = withSliceCopy((rel, t) => (rel === file ? replaceOnce(t, from, to) : t), cli);
     assert.equal(r.status, 1, from);
     assert.match(r.stdout, flagged);
   }

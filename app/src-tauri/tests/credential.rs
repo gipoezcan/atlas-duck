@@ -32,8 +32,8 @@ use atlas_duck_app_lib::windows::{
 use atlas_duck_audit::lock::InstanceLock;
 use atlas_duck_audit::testing::{FreeSpaceStub, MemKeyStore, MemKeyring};
 use atlas_duck_audit::{
-    FirstRunInput, KeyStore, KeyStoreError, LockedReason, OpenConfig, SystemClock,
-    create_new_store, new_ids,
+    AuditCursor, AuditFilter, EventType, FirstRunInput, KeyStore, KeyStoreError, LockedReason,
+    MAX_AUDIT_PAGE_ROWS, OpenConfig, SystemClock, create_new_store, new_ids,
 };
 use atlas_duck_core::{
     AdminError, Confirm, GateState, InstanceView, NativeConfirmer, UiEvent, UiSink,
@@ -989,52 +989,173 @@ async fn first_run_passphrase_mismatch_commits_nothing() -> TestResult {
     Ok(())
 }
 
-/// §8.6: the recovery note (offered once the new store serves) names the install and the data
-/// dir and never the passphrase, whatever passphrase went through the window.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn recovery_note_has_no_passphrase() -> TestResult {
-    let canary = "canary-note-passphrase-5d1e";
+/// The `CREDENTIAL_CHANGED {change: recovery_passphrase}` records of the serving store, and every
+/// record's decrypted payload as text.
+fn passphrase_changes(
+    state: &ServeState,
+) -> Result<(usize, Vec<String>), Box<dyn std::error::Error>> {
+    let store = state.open_store().ok_or("no store")?;
+    let page = store.query(
+        &AuditFilter::default(),
+        AuditCursor::first(MAX_AUDIT_PAGE_ROWS),
+    )?;
+    let mut changes = 0;
+    let mut payloads = Vec::new();
+    for row in &page.rows {
+        let text = String::from_utf8(store.read_payload(row.seq)?.to_vec())?;
+        if row.event_type == EventType::CREDENTIAL_CHANGED
+            && text.contains("\"recovery_passphrase\"")
+        {
+            changes += 1;
+        }
+        payloads.push(text);
+    }
+    Ok((changes, payloads))
+}
+
+/// The serving world of a provisioned store (recovery passphrase [`PASSPHRASE`]), with the mock
+/// app over it.
+async fn serving_world()
+-> Result<(World, Arc<ServeState>, App<MockRuntime>), Box<dyn std::error::Error>> {
     let w = World::new()?;
     let ring = MemKeyring::new();
-    let install_id = w.provision(&ring, canary)?;
+    let install_id = w.provision(&ring, PASSPHRASE)?;
     let keys = MemKeys::new(ring, true);
-    let state = start_with(w.inputs(Some(install_id.clone()), keys, Answers::new(vec![]), vec![]))
+    let state = start_with(w.inputs(Some(install_id), keys, Answers::new(vec![]), vec![]))
         .await
         .map_err(|e| format!("{e:?}"))?;
     let app = w.app(&state)?;
+    Ok((w, state, app))
+}
+
+/// §8.6, PD-169 (M10 T14): Settings "Change recovery passphrase…" opens the credential window for
+/// `change_recovery_passphrase` (no secret in the trigger); the new passphrase enters there only,
+/// twice: a mismatch or a short one changes nothing, a good pair re-wraps the KEK (one
+/// `CREDENTIAL_CHANGED {change: recovery_passphrase}`) and the window offers the recovery note.
+/// While it is open the trigger is `busy`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn passphrase_change_opens_credential_purpose_and_offers_note() -> TestResult {
+    let (_w, state, app) = serving_world().await?;
     let handle = app.handle().clone();
-    let mut rx = credential::request_recovery_passphrase(&handle, Show::Focus)?;
+    let settings = window(&app, "settings")?;
+    assert_eq!(
+        call(&settings, "recovery_passphrase_change", json!({})).await,
+        Ok(Value::Null)
+    );
+    assert_eq!(
+        credential::current_purpose(&handle),
+        Some(Purpose::ChangeRecoveryPassphrase)
+    );
     let win = window(&app, "credential")?;
-    let note_available = |c: &Result<Value, Value>| {
-        c.as_ref()
-            .ok()
-            .and_then(|c| c.get("note_available").cloned())
-    };
-    let before = call(&win, "credential_context", json!({})).await;
-    assert_eq!(note_available(&before), Some(json!(false)));
+    let context = call(&win, "credential_context", json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    assert_eq!(context["purpose"], "change_recovery_passphrase");
+    assert_eq!(context["note_available"], json!(false));
+    // Asked again: the same window is shown again (its purpose and state stay).
+    assert_eq!(
+        call(&settings, "recovery_passphrase_change", json!({})).await,
+        Ok(Value::Null)
+    );
+
+    let new = "a new recovery passphrase t14";
+    for (body, class) in [
+        (
+            json!({"secret": new, "secret_confirm": "a new recovery passphrase T14"}),
+            "passphrase_mismatch",
+        ),
+        (
+            json!({"secret": "eleven-char", "secret_confirm": "eleven-char"}),
+            "passphrase_too_short",
+        ),
+    ] {
+        assert_eq!(
+            call(&win, "submit_secret", body).await,
+            Ok(json!({"failed": {"class": class}}))
+        );
+    }
+    assert_eq!(
+        call(&win, "submit_secret", json!({ "secret": new })).await,
+        Err(json!({"kind": "invalid_argument", "field": "secret_confirm"}))
+    );
+    assert_eq!(passphrase_changes(&state)?.0, 0, "nothing changed yet");
+    assert_eq!(
+        call(&win, "save_recovery_note", json!({})).await,
+        Err(json!({"kind": "not_ready"})),
+        "no note before the change"
+    );
+
     assert_eq!(
         call(
             &win,
             "submit_secret",
-            json!({"secret": canary, "secret_confirm": canary})
+            json!({"secret": new, "secret_confirm": new})
         )
         .await,
         Ok(json!({"accepted": {}}))
     );
-    assert!(rx.try_recv().is_ok());
-    let after = call(&win, "credential_context", json!({})).await;
-    assert_eq!(note_available(&after), Some(json!(true)));
+    assert_eq!(passphrase_changes(&state)?.0, 1);
+    let context = call(&win, "credential_context", json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    assert_eq!(context["note_available"], json!(true));
+    assert_eq!(
+        credential::current_purpose(&handle),
+        Some(Purpose::ChangeRecoveryPassphrase),
+        "the window stays for the note"
+    );
+    // A window open for something else refuses the trigger.
+    credential::close(&handle);
+    let tmp = scratch()?;
+    let other = app_with_data_dir(tmp.path())?;
+    let other_handle = other.handle().clone();
+    let _restore = credential::request_restore_passphrase(&other_handle, Show::Focus)?;
+    let slot = ServeSlot::default();
+    slot.set(state.clone());
+    other.manage(slot);
+    let other_settings = window(&other, "settings")?;
+    assert_eq!(
+        call(&other_settings, "recovery_passphrase_change", json!({})).await,
+        Err(json!({"kind": "busy"}))
+    );
+    assert_eq!(
+        credential::current_purpose(&other_handle),
+        Some(Purpose::RestoreBackup)
+    );
+    stop(&state).await
+}
 
-    let (id, chain_id, data) = state.note_facts().ok_or("no store facts")?;
-    assert_eq!(id, install_id);
-    let text = credential::note_text(&credential::NoteFacts {
-        host: HOST.into(),
-        os_user: credential::os_user(),
-        install_id: id.clone(),
-        chain_id: chain_id.clone(),
-        data_dir: data.display().to_string(),
-    });
+/// §8.6 (M6 final review M-13: the old test rendered the note from facts it built itself): the
+/// recovery note is written through `save_recovery_note`'s own path (its save dialog replaced by a
+/// temp file) after a real recovery-passphrase change with a canary passphrase through the window.
+/// The note names the install, the chain and the data dir and never the passphrase; neither does
+/// any answer or any record of the log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovery_note_has_no_passphrase() -> TestResult {
+    let canary = "canary-note-passphrase-5d1e";
+    let (w, state, app) = serving_world().await?;
+    let handle = app.handle().clone();
+    let settings = window(&app, "settings")?;
+    let opened = call(&settings, "recovery_passphrase_change", json!({})).await;
+    assert_eq!(opened, Ok(Value::Null));
+    let win = window(&app, "credential")?;
+    let answer = call(
+        &win,
+        "submit_secret",
+        json!({"secret": canary, "secret_confirm": canary}),
+    )
+    .await;
+    assert_eq!(answer, Ok(json!({"accepted": {}})));
+    let context = call(&win, "credential_context", json!({})).await;
+    assert!(!format!("{context:?}").contains(canary));
+
+    let note = w.tmp.path().join("note.txt");
+    let target = note.clone();
+    let saved = commands::credential::save_note_with(&handle, move || Ok(Some(target))).await;
+    assert_eq!(saved.map(|s| s.saved), Ok(true));
+    let text = std::fs::read_to_string(&note)?;
     assert!(!text.contains(canary), "{text}");
+    let (id, chain_id, data) = state.note_facts().ok_or("no store facts")?;
     for want in [
         id.as_str(),
         chain_id.as_str(),
@@ -1043,6 +1164,15 @@ async fn recovery_note_has_no_passphrase() -> TestResult {
     ] {
         assert!(text.contains(want), "{want}");
     }
+    let (changes, payloads) = passphrase_changes(&state)?;
+    assert_eq!(changes, 1, "the note followed a real change");
+    assert!(
+        payloads.iter().all(|p| !p.contains(canary)),
+        "a record holds the passphrase"
+    );
+    // A cancelled save dialog writes nothing.
+    let unsaved = commands::credential::save_note_with(&handle, || Ok(None)).await;
+    assert_eq!(unsaved.map(|s| s.saved), Ok(false));
     stop(&state).await
 }
 

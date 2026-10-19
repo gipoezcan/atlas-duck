@@ -63,8 +63,137 @@ pub enum CommandError {
     /// M10 T13 (PD-168): a restore was refused or failed. Nested like `Admin`: `{"kind":
     /// "restore", "error": {"kind": "wrong_passphrase"}}`. No path, no text.
     Restore(RestoreFailure),
+    /// M10 T14 (PD-166): the anchor directory was not changed. Nested: `{"kind": "anchor_dir",
+    /// "error": {"kind": "not_writable"}}`. No path, no text.
+    AnchorDir(AnchorDirFailure),
+    /// M10 T14 (PD-170): "Re-anchor" did nothing (the store's refusal, by kind). Nested like
+    /// `AnchorDir`. No text.
+    ReAnchor(ReAnchorFailure),
+    /// M10 T14 (PD-170): "Forget old install" stopped. Nested like `AnchorDir`; a keychain error
+    /// names what was and was not deleted (account names, display-escaped).
+    Forget(ForgetFailure),
     /// A blocking task died, or a state the command layer cannot explain.
     Internal,
+}
+
+/// Why the anchor directory was not changed (M10 T14, PD-166). Nothing was committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorDirFailure {
+    /// The chosen folder's chain file could not be created or opened for append: "This folder
+    /// cannot be written" (plan text, the UI's).
+    NotWritable,
+    /// The anchor-dir writer is stuck on the current directory (a hung share): try again.
+    WriterBusy,
+    /// The chosen folder is the anchor directory already.
+    Unchanged,
+    /// "Remove" with no anchor directory set.
+    NotSet,
+    /// Anything else (a path that is not absolute or not UTF-8, an unreadable settings row, a
+    /// closed store).
+    Failed,
+}
+
+impl AnchorDirFailure {
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::NotWritable => "not_writable",
+            Self::WriterBusy => "writer_busy",
+            Self::Unchanged => "unchanged",
+            Self::NotSet => "not_set",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl Serialize for AnchorDirFailure {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(Some(1))?;
+        m.serialize_entry("kind", self.kind())?;
+        m.end()
+    }
+}
+
+/// Why "Re-anchor" did nothing (M10 T14, PD-170): the store's refusals by kind
+/// (`RE_ANCHOR_*`, `anchors::BARRIER_TAKEN`), the keychain, the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReAnchorFailure {
+    /// No keychain anchor entry is missing (also the check before the dialog).
+    NothingMissing,
+    /// A prune's, restore's or re-anchor's barrier holds the anchors (also the check before the
+    /// dialog).
+    Held,
+    /// The store has another integrity incident: it is not re-anchored (that verification is
+    /// logged).
+    DoesNotVerify,
+    /// A restore replaced the store while it ran, or took its barrier: nothing was written.
+    Restored,
+    /// The keychain could not be read or written (after the `re_anchored` incident: it stands,
+    /// the anchors stay missing).
+    Keychain,
+    Failed,
+}
+
+impl ReAnchorFailure {
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::NothingMissing => "nothing_missing",
+            Self::Held => "held",
+            Self::DoesNotVerify => "does_not_verify",
+            Self::Restored => "restored",
+            Self::Keychain => "keychain",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl Serialize for ReAnchorFailure {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(Some(1))?;
+        m.serialize_entry("kind", self.kind())?;
+        m.end()
+    }
+}
+
+/// Why "Forget old install" stopped (M10 T14, PD-170).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForgetFailure {
+    /// The keychain or an archived store could not be read for the list: nothing was deleted.
+    Unreadable,
+    /// A keychain delete failed: `deleted` went, `not_deleted` (the failed one first) stay; a
+    /// retry deletes the rest. Account names (`pat/<instance_id>`, `canary`, `kek`, ...),
+    /// display-escaped.
+    Keychain {
+        deleted: Vec<String>,
+        not_deleted: Vec<String>,
+    },
+    /// Anything else (nothing was deleted).
+    Failed,
+}
+
+impl ForgetFailure {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Unreadable => "unreadable",
+            Self::Keychain { .. } => "keychain",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl Serialize for ForgetFailure {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(None)?;
+        m.serialize_entry("kind", self.kind())?;
+        if let Self::Keychain {
+            deleted,
+            not_deleted,
+        } = self
+        {
+            m.serialize_entry("deleted", deleted)?;
+            m.serialize_entry("not_deleted", not_deleted)?;
+        }
+        m.end()
+    }
 }
 
 /// How a compliance export ended when it did not simply succeed (Δ-M10-3, PD-159, PD-181).
@@ -214,6 +343,9 @@ impl CommandError {
             Self::Backup => "backup",
             Self::Audit(_) => "audit",
             Self::Restore(_) => "restore",
+            Self::AnchorDir(_) => "anchor_dir",
+            Self::ReAnchor(_) => "re_anchor",
+            Self::Forget(_) => "forget",
             Self::Internal => "internal",
         }
     }
@@ -242,6 +374,9 @@ impl Serialize for CommandError {
             Self::Export(e) => m.serialize_entry("error", e)?,
             Self::Audit(e) => m.serialize_entry("error", e)?,
             Self::Restore(e) => m.serialize_entry("error", e)?,
+            Self::AnchorDir(e) => m.serialize_entry("error", e)?,
+            Self::ReAnchor(e) => m.serialize_entry("error", e)?,
+            Self::Forget(e) => m.serialize_entry("error", e)?,
             Self::ReleaseBlocked => m.serialize_entry("text", RELEASE_BLOCKED_INTERNAL)?,
             Self::NotFound
             | Self::NotReady
@@ -454,5 +589,57 @@ mod tests {
             );
             assert_eq!(e.to_string(), "restore");
         }
+    }
+
+    /// M10 T14 (PD-166, PD-170): the recovery-tier refusals are one fixed kind each, nested; only a
+    /// partial forget names the account names it did and did not delete.
+    #[test]
+    fn recovery_tier_kinds_wire_shape() {
+        for (f, kind) in [
+            (AnchorDirFailure::NotWritable, "not_writable"),
+            (AnchorDirFailure::WriterBusy, "writer_busy"),
+            (AnchorDirFailure::Unchanged, "unchanged"),
+            (AnchorDirFailure::NotSet, "not_set"),
+            (AnchorDirFailure::Failed, "failed"),
+        ] {
+            let e = CommandError::AnchorDir(f);
+            assert_eq!(
+                serde_json::to_value(&e).ok(),
+                Some(json!({"kind": "anchor_dir", "error": {"kind": kind}}))
+            );
+            assert_eq!(e.to_string(), "anchor_dir");
+        }
+        for (f, kind) in [
+            (ReAnchorFailure::NothingMissing, "nothing_missing"),
+            (ReAnchorFailure::Held, "held"),
+            (ReAnchorFailure::DoesNotVerify, "does_not_verify"),
+            (ReAnchorFailure::Restored, "restored"),
+            (ReAnchorFailure::Keychain, "keychain"),
+            (ReAnchorFailure::Failed, "failed"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(CommandError::ReAnchor(f)).ok(),
+                Some(json!({"kind": "re_anchor", "error": {"kind": kind}}))
+            );
+        }
+        for (f, kind) in [
+            (ForgetFailure::Unreadable, "unreadable"),
+            (ForgetFailure::Failed, "failed"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(CommandError::Forget(f)).ok(),
+                Some(json!({"kind": "forget", "error": {"kind": kind}}))
+            );
+        }
+        let partial = CommandError::Forget(ForgetFailure::Keychain {
+            deleted: vec!["pat/i1".into()],
+            not_deleted: vec!["pat/i2".into(), "canary".into()],
+        });
+        assert_eq!(
+            serde_json::to_value(&partial).ok(),
+            Some(json!({"kind": "forget", "error": {"kind": "keychain",
+                "deleted": ["pat/i1"], "not_deleted": ["pat/i2", "canary"]}}))
+        );
+        assert_eq!(partial.to_string(), "forget");
     }
 }

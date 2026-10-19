@@ -144,6 +144,13 @@ impl KeyStore for FileKeyStore {
             },
         }
     }
+
+    /// As `OsKeyStore` (M10 T14, "Forget old install"): the same dir and mode file under another
+    /// install's names; `None` for anything but an install id (32 lowercase hex).
+    fn for_install(&self, install_id: &str) -> Option<Box<dyn KeyStore>> {
+        atlas_duck_audit::open::is_id(install_id)
+            .then(|| Box::new(FileKeyStore::open(&self.dir, install_id)) as Box<dyn KeyStore>)
+    }
 }
 
 #[cfg(unix)]
@@ -309,6 +316,41 @@ mod tests {
         // A missing mode file is `ok`.
         fs::remove_file(dir.join(MODE_FILE))?;
         assert!(ks.get(&pat)?.is_some());
+        Ok(())
+    }
+
+    /// M10 T14 (T9 handoff): another install's entries in the same dir, its own names, the same
+    /// mode file; anything but an install id addresses nothing.
+    #[test]
+    fn for_install_addresses_install_ids_only() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path().join("keys");
+        let ks = provision(&dir, ID)?;
+        let other_id = "0123456789abcdef0123456789abcdef";
+        let other = ks
+            .for_install(other_id)
+            .ok_or("no keystore for an install id")?;
+        assert_eq!(other.install_id(), other_id);
+        other.set(&EntryName::Kek, b"other kek")?;
+        assert_eq!(ks.get(&EntryName::Kek)?, None, "not this install's entry");
+        assert_eq!(
+            FileKeyStore::open(&dir, other_id)
+                .get(&EntryName::Kek)?
+                .as_deref()
+                .map(Vec::as_slice),
+            Some(&b"other kek"[..])
+        );
+        set_mode(&dir, MODE_LOCKED)?;
+        assert_eq!(other.get(&EntryName::Kek), Err(KeyStoreError::Locked));
+        for bad in [
+            "",
+            "other",
+            "../x",
+            "0123456789ABCDEF0123456789ABCDEF",
+            &"a".repeat(33),
+        ] {
+            assert!(ks.for_install(bad).is_none(), "{bad}");
+        }
         Ok(())
     }
 

@@ -323,6 +323,13 @@ function answer(cmd: string, args: Record<string, unknown>): Promise<Json> {
     // M10 T13 (PD-168): Settings "Restore backup…"; its UI is Task 21's.
     case 'restore_begin': return reply(cmd, 'restore_done');
     case 'restore_cancel': return reply(cmd, 'restore_cancel');
+    // M10 T14 (PD-166, PD-170): the recovery tier and the anchor directory; their UI is Task 21's.
+    case 'recovery_passphrase_change': return Promise.resolve(null);
+    case 'anchor_dir_set':
+    case 'anchor_dir_remove': return reply(cmd, 'anchor_dir_answer');
+    case 're_anchor': return reply(cmd, 're_anchored');
+    case 'orphan_installs': return Promise.resolve(fx('orphan_install'));
+    case 'forget_install': return reply(cmd, 'forgotten');
     default: return Promise.reject('command not allowed');
   }
 }
@@ -330,11 +337,12 @@ function answer(cmd: string, args: Record<string, unknown>): Promise<Json> {
 /**
  * Fixtures of M10 T12's Audit-window answers that no window renders yet: the Audit window's UI is
  * Task 20, which removes each name here as its window comes to consume it (`audit_job` is an event
- * payload, so it stays until events are driven here too). M10 T13's restore answers likewise wait for
- * the Settings UI (Task 21).
+ * payload, so it stays until events are driven here too). M10 T13's restore answers and M10 T14's
+ * recovery-tier answers likewise wait for the Settings UI (Task 21).
  */
 const NOT_YET_RENDERED = [
   'acknowledged',
+  'anchor_dir_answer',
   'audit_job',
   'audit_page',
   'audit_payload',
@@ -342,6 +350,9 @@ const NOT_YET_RENDERED = [
   'audit_trail',
   'export_cancel',
   'export_done',
+  'forgotten',
+  'orphan_install',
+  're_anchored',
   'restore_cancel',
   'restore_done',
 ];

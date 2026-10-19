@@ -55,5 +55,10 @@
     "failed": {
       "class": "anchor_dir_mismatch"
     }
+  },
+  {
+    "failed": {
+      "class": "passphrase_not_changed"
+    }
   }
 ]

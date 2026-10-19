@@ -32,7 +32,10 @@ use serde::Serialize;
 use tauri::{AppHandle, Builder, Manager, Runtime};
 
 pub use blocking::blocking;
-pub use errors::{AuditReadFailure, CommandError, ExportFailure, RestoreFailure};
+pub use errors::{
+    AnchorDirFailure, AuditReadFailure, CommandError, ExportFailure, ForgetFailure,
+    ReAnchorFailure, RestoreFailure,
+};
 pub use names::COMMANDS;
 
 use crate::state::ServeSlot;
@@ -74,15 +77,21 @@ pub fn register<R: Runtime>(builder: Builder<R>) -> Builder<R> {
         onboarding::onboarding_text,
         running::running_kill,
         running::running_list,
+        settings::anchor_dir_remove,
+        settings::anchor_dir_set,
         settings::cli_install,
         settings::cli_uninstall,
         settings::credential_window_open,
+        settings::forget_install,
         settings::instance_accept_url_change,
         settings::instance_add,
         settings::instance_change_url,
         settings::instance_confirm_config,
         settings::instance_set_proxy,
+        settings::orphan_installs,
         settings::prune_backlog_now,
+        settings::re_anchor,
+        settings::recovery_passphrase_change,
         settings::removal_backup,
         settings::removal_begin,
         settings::removal_finish,

@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 
 import type {
   Acknowledged,
+  AnchorDirAnswer,
   AuditCursor,
   AuditFilter,
   AuditPage,
@@ -15,15 +16,18 @@ import type {
   DenyCount,
   ExportCancelAnswer,
   ExportDone,
+  Forgotten,
   InstanceAddArgs,
   InstanceView,
   KillAnswer,
   OnboardingText,
+  OrphanInstall,
   PreviewFetchResponse,
   PruneReport,
   QueueDetail,
   QueueItem,
   RawPage,
+  ReAnchored,
   RecentItem,
   RedactionOp,
   RedactionReport,
@@ -46,6 +50,7 @@ import type {
 import {
   arrayOf,
   isAcknowledged,
+  isAnchorDirAnswer,
   isAuditPage,
   isAuditPayload,
   isAuditStatus,
@@ -56,14 +61,17 @@ import {
   isDenyCount,
   isExportCancelAnswer,
   isExportDone,
+  isForgotten,
   isInstanceView,
   isKillAnswer,
   isOnboardingText,
+  isOrphanInstall,
   isPreviewFetchResponse,
   isPruneReport,
   isQueueDetail,
   isQueueItem,
   isRawPage,
+  isReAnchored,
   isRecentItem,
   isRedactionReport,
   isRemovalBackupAnswer,
@@ -352,6 +360,46 @@ export function restoreBegin(): Promise<RestoreDone> {
 /** Ends a restore before its store call (PD-181); `busy` once the restore runs. */
 export function restoreCancel(): Promise<RestoreCancelAnswer> {
   return call('restore_cancel', {}, isRestoreCancelAnswer);
+}
+
+/**
+ * "Change recovery passphrase…" (8.6, PD-169, M10 T14): Rust opens the credential window, where the
+ * new passphrase is entered twice and the recovery note is offered after; `busy` while that window
+ * is open for something else. No secret passes here.
+ */
+export function recoveryPassphraseChange(): Promise<null | undefined> {
+  return call('recovery_passphrase_change', {}, isNothing);
+}
+
+/**
+ * "Change anchor directory…" (8.5, PD-166): Rust confirms natively, opens its own folder dialog and
+ * checks the folder can be written (`anchor_dir {not_writable}`: "This folder cannot be written").
+ */
+export function anchorDirSet(): Promise<AnchorDirAnswer> {
+  return call('anchor_dir_set', {}, isAnchorDirAnswer);
+}
+
+/** "Remove anchor directory" (PD-166): Rust confirms natively; `anchor_dir {not_set}` when none is set. */
+export function anchorDirRemove(): Promise<AnchorDirAnswer> {
+  return call('anchor_dir_remove', {}, isAnchorDirAnswer);
+}
+
+/** "Re-anchor" (PD-170): offered only while `health.re_anchor_offered`; Rust confirms natively. */
+export function reAnchor(): Promise<ReAnchored> {
+  return call('re_anchor', {}, isReAnchored);
+}
+
+/** The installs only archived logs name, with the keychain entries they still have (PD-170). */
+export function orphanInstalls(): Promise<OrphanInstall[]> {
+  return call('orphan_installs', {}, arrayOf(isOrphanInstall));
+}
+
+/**
+ * "Forget" one install of `orphanInstalls` (PD-170): Rust asks two native dialogs (the tokens, then
+ * the archived log's keys; Cancel there keeps them) and records before it deletes.
+ */
+export function forgetInstall(installId: string): Promise<Forgotten> {
+  return call('forget_install', { install_id: installId }, isForgotten);
 }
 
 /** The live script runs (PD-81, 9.6), oldest first. */

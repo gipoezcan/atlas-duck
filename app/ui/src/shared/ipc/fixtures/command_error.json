@@ -368,6 +368,97 @@
     "kind": "restore"
   },
   {
+    "error": {
+      "kind": "not_writable"
+    },
+    "kind": "anchor_dir"
+  },
+  {
+    "error": {
+      "kind": "writer_busy"
+    },
+    "kind": "anchor_dir"
+  },
+  {
+    "error": {
+      "kind": "unchanged"
+    },
+    "kind": "anchor_dir"
+  },
+  {
+    "error": {
+      "kind": "not_set"
+    },
+    "kind": "anchor_dir"
+  },
+  {
+    "error": {
+      "kind": "failed"
+    },
+    "kind": "anchor_dir"
+  },
+  {
+    "error": {
+      "kind": "nothing_missing"
+    },
+    "kind": "re_anchor"
+  },
+  {
+    "error": {
+      "kind": "held"
+    },
+    "kind": "re_anchor"
+  },
+  {
+    "error": {
+      "kind": "does_not_verify"
+    },
+    "kind": "re_anchor"
+  },
+  {
+    "error": {
+      "kind": "restored"
+    },
+    "kind": "re_anchor"
+  },
+  {
+    "error": {
+      "kind": "keychain"
+    },
+    "kind": "re_anchor"
+  },
+  {
+    "error": {
+      "kind": "failed"
+    },
+    "kind": "re_anchor"
+  },
+  {
+    "error": {
+      "kind": "unreadable"
+    },
+    "kind": "forget"
+  },
+  {
+    "error": {
+      "deleted": [
+        "pat/0b9d3f62-4c1a-4f0e-9a51-7f2a6c3e8d11"
+      ],
+      "kind": "keychain",
+      "not_deleted": [
+        "pat/0b9d3f62-4c1a-4f0e-9a51-7f2a6c3e8d12",
+        "canary"
+      ]
+    },
+    "kind": "forget"
+  },
+  {
+    "error": {
+      "kind": "failed"
+    },
+    "kind": "forget"
+  },
+  {
     "kind": "internal"
   }
 ]

@@ -374,6 +374,8 @@ mod tests {
             settings_unreadable: false,
             anchor_dir_write_failing: false,
             anchor_dir_lines_pending: 0,
+            anchors_missing: None,
+            re_anchor_offered: false,
         }
     }
 

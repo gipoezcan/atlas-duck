@@ -105,9 +105,11 @@ pub use restore::{RestoreReport, finish_restore, live_store_blocks_restore, rest
 pub use schema::{DB_FILE, SCHEMA_HEAD};
 pub use settings::{
     FilePolicy, InstancePolicy, KEY_ALLOW_DEGRADED_SCRIPTS, RETENTION_DEFAULT, RETENTION_MIN,
-    SettingChange, Settings, is_policy_key,
+    SETTING_UNCHANGED, SettingChange, Settings, is_policy_key,
 };
-pub use store::{Hooks, OpenConfig, Store, StoreHealth};
+pub use store::{
+    ANCHOR_DIR_NOT_WRITABLE, ANCHOR_DIR_WRITER_BUSY, Hooks, OpenConfig, Store, StoreHealth,
+};
 pub use types::{
     Actor, AuditCursor, AuditFilter, AuditPage, AuditTrail, Committed, Confirmed, DecisionColumn,
     DeliverySummary, EventFlags, EventHeader, EventType, ExportControl, ExportReceipt,

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import acknowledged from './fixtures/acknowledged.json';
+import anchorDirAnswer from './fixtures/anchor_dir_answer.json';
 import auditJob from './fixtures/audit_job.json';
 import auditPage from './fixtures/audit_page.json';
 import auditPayload from './fixtures/audit_payload.json';
@@ -13,15 +14,18 @@ import decisionOutcome from './fixtures/decision_outcome.json';
 import denyCount from './fixtures/deny_count.json';
 import exportCancel from './fixtures/export_cancel.json';
 import exportDone from './fixtures/export_done.json';
+import forgotten from './fixtures/forgotten.json';
 import instanceView from './fixtures/instance_view.json';
 import killAnswer from './fixtures/kill_answer.json';
 import noteSaved from './fixtures/note_saved.json';
 import onboardingText from './fixtures/onboarding_text.json';
+import orphanInstall from './fixtures/orphan_install.json';
 import preview from './fixtures/preview.json';
 import pruneReport from './fixtures/prune_report.json';
 import queueDetail from './fixtures/queue_detail.json';
 import queueItem from './fixtures/queue_item.json';
 import rawPage from './fixtures/raw_page.json';
+import reAnchored from './fixtures/re_anchored.json';
 import recentItem from './fixtures/recent_item.json';
 import redactionContext from './fixtures/redaction_context.json';
 import redactionReport from './fixtures/redaction_report.json';
@@ -40,6 +44,7 @@ import wizardState from './fixtures/wizard_state.json';
 import {
   arrayOf,
   isAcknowledged,
+  isAnchorDirAnswer,
   isAuditJobEvent,
   isAuditPage,
   isAuditPayload,
@@ -52,15 +57,18 @@ import {
   isEventHeader,
   isExportCancelAnswer,
   isExportDone,
+  isForgotten,
   isInstanceView,
   isKillAnswer,
   isOnboardingText,
+  isOrphanInstall,
   isPreview,
   isPruneReport,
   isQueueDetail,
   isQueueItem,
   isRawPage,
   isPreviewFetchResponse,
+  isReAnchored,
   isRecentItem,
   isRedactionContext,
   isRedactionOp,
@@ -115,6 +123,10 @@ describe('fixtures validate against their TS types', () => {
     ['audit_job', auditJob, arrayOf(isAuditJobEvent)],
     ['restore_done', restoreDone, arrayOf(isRestoreDone)],
     ['restore_cancel', restoreCancel, arrayOf(isRestoreCancelAnswer)],
+    ['anchor_dir_answer', anchorDirAnswer, arrayOf(isAnchorDirAnswer)],
+    ['re_anchored', reAnchored, arrayOf(isReAnchored)],
+    ['orphan_install', orphanInstall, arrayOf(isOrphanInstall)],
+    ['forgotten', forgotten, arrayOf(isForgotten)],
   ] as const)('%s', (_name, fixture, validate) => {
     expect(fixture.length).toBeGreaterThan(0);
     expect(validate(fixture)).toBe(true);
@@ -263,6 +275,41 @@ describe('fixtures validate against their TS types', () => {
     expect(restore({ kind: 'committed_incomplete' })).toBe('restore');
     for (const bad of [{ kind: 'other' }, { kind: 'failed', message: 'os text' }, { kind: 'broken', path: '/x' }, 'failed', null]) {
       expect(restore(bad)).toBe('refused');
+    }
+  });
+
+  // M10 T14 (PD-166, PD-170): the recovery tier's answers are closed shapes (names, no path but the
+  // display text of the anchor directory), its errors fixed kinds; only a partial forget names entries.
+  it('recovery-tier answers and errors: closed shapes, fixed kinds', () => {
+    expect(anchorDirAnswer.map((a) => a.anchor_dir === null)).toEqual([false, true]);
+    expect(isAnchorDirAnswer({ anchor_dir: '/x', path: '/x' })).toBe(false);
+    expect(isReAnchored({ verify_seq: '58' })).toBe(false);
+    expect(isOrphanInstall({ ...orphanInstall[0], install_id: 'ABC' })).toBe(false);
+    expect(isOrphanInstall({ ...orphanInstall[0], archived_file: 'x' })).toBe(false);
+    expect(isForgotten({ ...forgotten[0], keys_deleted: 'no' })).toBe(false);
+    expect(forgotten.map((f) => f.keys_deleted)).toEqual([false, true]);
+    // The health names the missing anchor and the offer, both ends present.
+    const healths = settingsGet.map((s) => s.settings.health);
+    expect(new Set(healths.map((h) => h.re_anchor_offered))).toEqual(new Set([true, false]));
+    expect(healths.some((h) => h.anchors_missing === null)).toBe(true);
+    const health = healths[0];
+    expect(isAuditStatus({ ...auditStatus[0], health: { ...health, anchors_missing: 'kek' } })).toBe(false);
+    expect(isAuditStatus({ ...auditStatus[0], health: { ...health, re_anchor_offered: 1 } })).toBe(false);
+    const kinds = (k: string) =>
+      commandError.filter((e) => e.kind === k).map((e) => (e as unknown as { error: { kind: string } }).error.kind);
+    expect(kinds('anchor_dir')).toEqual(['not_writable', 'writer_busy', 'unchanged', 'not_set', 'failed']);
+    expect(kinds('re_anchor')).toEqual(['nothing_missing', 'held', 'does_not_verify', 'restored', 'keychain', 'failed']);
+    expect(kinds('forget')).toEqual(['unreadable', 'keychain', 'failed']);
+    const mapped = (kind: string, error: unknown) => toCommandError({ kind, error }).kind;
+    for (const [kind, bad] of [
+      ['anchor_dir', { kind: 'not_writable', path: '/x' }],
+      ['anchor_dir', { kind: 'other' }],
+      ['re_anchor', { kind: 'held', text: 'x' }],
+      ['forget', { kind: 'keychain', deleted: ['kek'] }],
+      ['forget', { kind: 'keychain', deleted: [1], not_deleted: [] }],
+      ['forget', { kind: 'unreadable', deleted: [] }],
+    ] as const) {
+      expect(mapped(kind, bad)).toBe('refused');
     }
   });
 

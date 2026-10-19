@@ -240,12 +240,69 @@ struct Proxy {
 pub struct ProxyKeyStore {
     install_id: String,
     inner: Mutex<Proxy>,
+    /// How this proxy was started, for another install's proxy ([`KeyStore::for_install`]).
+    respawn: Respawn,
+}
+
+/// The command a proxy was started with: program, arguments, explicit environment and working
+/// directory (M10 T14). A proxy serves one install id, so [`KeyStore::for_install`] starts another
+/// one with the same command, the install id argument replaced. Its environment is the explicit
+/// one only (cleared first), as the `cli_flows` harness builds every proxy command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Respawn {
+    program: OsString,
+    args: Vec<OsString>,
+    envs: Vec<(OsString, OsString)>,
+    current_dir: Option<PathBuf>,
+}
+
+impl Respawn {
+    /// What `cmd` would run (read before it is spawned).
+    pub fn of(cmd: &Command) -> Respawn {
+        Respawn {
+            program: cmd.get_program().to_owned(),
+            args: cmd.get_args().map(OsStr::to_owned).collect(),
+            envs: cmd
+                .get_envs()
+                .filter_map(|(k, v)| v.map(|v| (k.to_owned(), v.to_owned())))
+                .collect(),
+            current_dir: cmd.get_current_dir().map(std::path::Path::to_path_buf),
+        }
+    }
+
+    /// The command of the proxy for `install_id`, from the one that serves `current`: `None` for
+    /// anything but an install id (32 lowercase hex), and when no argument names `current`.
+    pub fn command(&self, current: &str, install_id: &str) -> Option<Command> {
+        if !atlas_duck_audit::open::is_id(install_id)
+            || !self
+                .args
+                .iter()
+                .any(|a| a.as_os_str() == OsStr::new(current))
+        {
+            return None;
+        }
+        let mut cmd = Command::new(&self.program);
+        cmd.args(self.args.iter().map(|a| {
+            if a.as_os_str() == OsStr::new(current) {
+                OsString::from(install_id)
+            } else {
+                a.clone()
+            }
+        }))
+        .env_clear()
+        .envs(self.envs.iter().map(|(k, v)| (k, v)));
+        if let Some(dir) = &self.current_dir {
+            cmd.current_dir(dir);
+        }
+        Some(cmd)
+    }
 }
 
 impl ProxyKeyStore {
     /// Spawns `cmd` (the app executable with [`MARKER`] and `install_id` as its arguments and the
     /// test environment) with piped stdin and stdout; its stderr is inherited.
     pub fn spawn(mut cmd: Command, install_id: &str) -> io::Result<ProxyKeyStore> {
+        let respawn = Respawn::of(&cmd);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -273,6 +330,7 @@ impl ProxyKeyStore {
                 replies,
                 broken: false,
             }),
+            respawn,
         })
     }
 
@@ -331,6 +389,16 @@ impl KeyStore for ProxyKeyStore {
             },
         }
     }
+
+    /// Another proxy process, started like this one for `install_id` ([`Respawn::command`]; the
+    /// serving side refuses anything but a `7e570000` test id). `None` for a non-id, and when the
+    /// proxy cannot be started (the caller cannot tell the two apart; both fail closed).
+    fn for_install(&self, install_id: &str) -> Option<Box<dyn KeyStore>> {
+        let cmd = self.respawn.command(&self.install_id, install_id)?;
+        ProxyKeyStore::spawn(cmd, install_id)
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn KeyStore>)
+    }
 }
 
 impl Drop for ProxyKeyStore {
@@ -369,6 +437,41 @@ mod tests {
             run_if_requested(&os(&["atlas-duck-app", "__cli", MARKER])),
             None
         );
+    }
+
+    /// M10 T14 (T9 handoff): another install's proxy is the same command with the install id
+    /// argument replaced, its explicit environment only; nothing for a non-id or a command that
+    /// names no install id. (Built only: nothing is spawned here.)
+    #[test]
+    fn for_install_respawns_the_same_command_for_another_id() {
+        let other = "7e570000fedcba9876543210fedcba98";
+        let mut cmd = Command::new("atlas-duck-app");
+        cmd.args([MARKER, ID])
+            .env_clear()
+            .env("ATLAS_DUCK_TEST_HOME", "/home/t")
+            .current_dir("/home/t");
+        let r = Respawn::of(&cmd);
+        let next = r.command(ID, other).expect("a command for an install id");
+        assert_eq!(next.get_program(), OsStr::new("atlas-duck-app"));
+        let args: Vec<&OsStr> = next.get_args().collect();
+        assert_eq!(args, [OsStr::new(MARKER), OsStr::new(other)]);
+        let envs: Vec<(&OsStr, Option<&OsStr>)> = next.get_envs().collect();
+        assert!(
+            envs.contains(&(
+                OsStr::new("ATLAS_DUCK_TEST_HOME"),
+                Some(OsStr::new("/home/t"))
+            )),
+            "{envs:?}"
+        );
+        assert_eq!(
+            next.get_current_dir(),
+            Some(std::path::Path::new("/home/t"))
+        );
+        for bad in ["", "other", "7E570000FEDCBA9876543210FEDCBA98", "7e570000"] {
+            assert!(r.command(ID, bad).is_none(), "{bad:?}");
+        }
+        // A command whose arguments do not name the current id cannot be redirected.
+        assert!(r.command(other, ID).is_none());
     }
 
     #[test]

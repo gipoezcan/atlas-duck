@@ -4443,6 +4443,14 @@ const S09_GRANTS: [(&str, &[&str]); 7] = [
             "backup_trigger",
             "restore_begin",
             "restore_cancel",
+            // M10 T14 (Δ-M10-3, PD-166, PD-169, PD-170): the recovery tier and the anchor
+            // directory.
+            "recovery_passphrase_change",
+            "anchor_dir_set",
+            "anchor_dir_remove",
+            "re_anchor",
+            "orphan_installs",
+            "forget_install",
         ],
     ),
     (
@@ -4705,6 +4713,17 @@ fn s09_new_commands_outside_grant_rejected() -> TestResult {
         ("restore_begin", json!({}), &["settings"] as &[&str]),
         ("restore_cancel", json!({}), &["settings"]),
         ("restore_from_backup", json!({}), &["credential"]),
+        // M10 T14: the recovery tier and the anchor directory, Settings only.
+        ("recovery_passphrase_change", json!({}), &["settings"]),
+        ("anchor_dir_set", json!({}), &["settings"]),
+        ("anchor_dir_remove", json!({}), &["settings"]),
+        ("re_anchor", json!({}), &["settings"]),
+        ("orphan_installs", json!({}), &["settings"]),
+        (
+            "forget_install",
+            json!({"install_id": "0123456789abcdef0123456789abcdef"}),
+            &["settings"],
+        ),
     ]);
     for (cmd, body, want) in table {
         assert!(COMMANDS.contains(&cmd), "{cmd} is not in COMMANDS");
@@ -5027,6 +5046,8 @@ fn s09_cases() -> Vec<S09Case> {
             num("note"),
             (Some("note"), huge()),
         ),
+        case("anchor_dir_remove", "settings", json!({}), whole(), pad()),
+        case("anchor_dir_set", "settings", json!({}), whole(), pad()),
         case("app_status", "approvals", json!({}), whole(), pad()),
         case(
             "archive_and_start_fresh",
@@ -5115,6 +5136,13 @@ fn s09_cases() -> Vec<S09Case> {
             (Some("from_utc"), huge()),
         ),
         case(
+            "forget_install",
+            "settings",
+            json!({"install_id": "0123456789abcdef0123456789abcdef"}),
+            num("install_id"),
+            (Some("install_id"), huge()),
+        ),
+        case(
             "instance_accept_url_change",
             "settings",
             json!({"alias": "work"}),
@@ -5150,6 +5178,7 @@ fn s09_cases() -> Vec<S09Case> {
             (Some("proxy"), huge()),
         ),
         case("onboarding_text", "onboarding", json!({}), whole(), pad()),
+        case("orphan_installs", "settings", json!({}), whole(), pad()),
         case(
             "open_window",
             "approvals",
@@ -5181,7 +5210,15 @@ fn s09_cases() -> Vec<S09Case> {
             (Some("page"), json!("0")),
             (Some("request_id"), json!("r".repeat(1 << 16))),
         ),
+        case("re_anchor", "settings", json!({}), whole(), pad()),
         case("recent_list", "approvals", json!({}), whole(), pad()),
+        case(
+            "recovery_passphrase_change",
+            "settings",
+            json!({}),
+            whole(),
+            pad(),
+        ),
         case(
             "redaction_preview",
             "approvals",

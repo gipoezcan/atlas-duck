@@ -1,0 +1,25 @@
+[
+  {
+    "archived_files": [
+      "archived/audit-0b9d3f62-4c1a-4f0e-9a51-7f2a6c3e8d10-42-20261015T093000123Z.db",
+      "archived/audit-0b9d3f62-4c1a-4f0e-9a51-7f2a6c3e8d10-97-20261018T101500000Z.db"
+    ],
+    "entries": [
+      "first_retained_anchor",
+      "head_anchor",
+      "kek",
+      "pat/0b9d3f62-4c1a-4f0e-9a51-7f2a6c3e8d11",
+      "pat/old⟨U+202E⟩"
+    ],
+    "install_id": "0123456789abcdef0123456789abcdef"
+  },
+  {
+    "archived_files": [
+      "archived/audit-0b9d3f62-4c1a-4f0e-9a51-7f2a6c3e8d10-3-20260901T080000000Z.db"
+    ],
+    "entries": [
+      "kek"
+    ],
+    "install_id": "fedcba9876543210fedcba9876543210"
+  }
+]

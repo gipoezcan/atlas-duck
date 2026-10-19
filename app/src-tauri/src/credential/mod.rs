@@ -13,7 +13,10 @@
 //! and leave Rust never: a PAT goes to `InstanceAdmin::set_token`, the first-run recovery
 //! passphrase to the wizard through [`request_recovery_passphrase`]'s in-memory channel (Task 23),
 //! the passphrase of "Recover this log" / "Finish restore" to the audit store
-//! (`serve::unlock`). The recovery note ([`note_text`]) is built from facts that hold no secret.
+//! (`serve::unlock`), a backup's passphrase to the waiting restore (M10 T13), and the new
+//! recovery passphrase of Settings' "Change recovery passphrase…" to
+//! `Store::change_recovery_passphrase` (M10 T14). The recovery note ([`note_text`]) is built from
+//! facts that hold no secret.
 //!
 //! The window also follows what is served behind its back ([`follow`], M6 T22: the retry turning
 //! one lock state into another, a core that started) and a gate's refused requests raise it at
@@ -75,6 +78,10 @@ pub enum Purpose {
     /// locked window's "Restore a backup instead". Not a lock state: the window follows no gate
     /// while it waits (the restore that opened it ends it).
     RestoreBackup,
+    /// M10 T14 (PD-169, §8.6): Settings "Change recovery passphrase…" in a serving app: the new
+    /// passphrase, entered twice, re-wraps the store's KEK (`Store::change_recovery_passphrase`);
+    /// the recovery note is offered right after. Not a lock state.
+    ChangeRecoveryPassphrase,
 }
 
 impl Purpose {
@@ -88,6 +95,7 @@ impl Purpose {
             Purpose::RecoverThisLog => "recover_this_log",
             Purpose::FinishRestore => "finish_restore",
             Purpose::RestoreBackup => "restore_backup",
+            Purpose::ChangeRecoveryPassphrase => "change_recovery_passphrase",
         }
     }
 
@@ -196,6 +204,9 @@ pub struct CredentialState {
     /// which it goes back to when that restore ends without a store; `None` for a window
     /// Settings opened.
     restore_return: Option<Purpose>,
+    /// M10 T14 (PD-169): this window's recovery-passphrase change committed (the recovery note is
+    /// offered from then on).
+    passphrase_changed: bool,
 }
 
 /// Identifies one credential window (its purpose and its passphrase request).
@@ -214,6 +225,7 @@ impl CredentialState {
         self.handed_over = false;
         self.restore = None;
         self.restore_return = None;
+        self.passphrase_changed = false;
     }
 }
 
@@ -461,6 +473,32 @@ pub fn current_window<R: Runtime>(app: &AppHandle<R>) -> Option<(Purpose, Genera
 /// True once the first-run passphrase went to the wizard (this window).
 pub fn handed_over<R: Runtime>(app: &AppHandle<R>) -> bool {
     registry(app).is_ok_and(|r| r.credential_state().handed_over)
+}
+
+/// The recovery-passphrase change of window `generation` committed (M10 T14, PD-169): from now on
+/// it offers the recovery note. False (nothing marked) when that window is gone or has another
+/// purpose: the change took minutes of Argon2id on a slow machine, and the window may have closed.
+pub fn mark_passphrase_changed<R: Runtime>(app: &AppHandle<R>, generation: Generation) -> bool {
+    let Ok(r) = registry(app) else {
+        return false;
+    };
+    let mut st = r.credential_state();
+    if st.generation != generation || st.purpose != Some(Purpose::ChangeRecoveryPassphrase) {
+        return false;
+    }
+    st.passphrase_changed = true;
+    true
+}
+
+/// True once this window's recovery-passphrase change committed (M10 T14).
+pub fn passphrase_changed<R: Runtime>(app: &AppHandle<R>) -> bool {
+    registry(app).is_ok_and(|r| r.credential_state().passphrase_changed)
+}
+
+/// Opens the window for [`Purpose::ChangeRecoveryPassphrase`] (Settings "Change recovery
+/// passphrase…", M10 T14): `Busy` while it is open for anything else. Never on the main thread.
+pub fn open_for_passphrase_change<R: Runtime>(app: &AppHandle<R>) -> Result<(), WindowError> {
+    open(app, Purpose::ChangeRecoveryPassphrase, Show::Focus)
 }
 
 /// Hands a checked first-run pair to the wizard. `Err(pair)` when no wizard waits (no request, or
@@ -766,10 +804,16 @@ mod tests {
             Purpose::FinishRestore,
             // M10 T13: not a lock state (the restore that opened it ends it, no gate moves it).
             Purpose::RestoreBackup,
+            // M10 T14: Settings opens it in a serving app; no gate moves it either.
+            Purpose::ChangeRecoveryPassphrase,
         ];
         let names: std::collections::BTreeSet<&str> = all.iter().map(Purpose::as_str).collect();
         assert_eq!(names.len(), all.len());
         assert_eq!(Purpose::RestoreBackup.as_str(), "restore_backup");
+        assert_eq!(
+            Purpose::ChangeRecoveryPassphrase.as_str(),
+            "change_recovery_passphrase"
+        );
         let lock: Vec<&str> = all
             .iter()
             .filter(|p| p.is_lock_state())

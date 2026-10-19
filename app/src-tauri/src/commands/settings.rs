@@ -13,6 +13,11 @@
 //! core shows in its own confirmation (§10.3, M3 review I-5). The synchronous core calls run on
 //! the blocking pool (a native dialog may be open meanwhile, M3 PD-13); `retest_token` is async.
 //! Core's errors pass through nested (`CommandError::Admin` / `Settings`), logged by kind only.
+//!
+//! M10 adds "Back up now" and "Restore backup…" (T13) and the recovery tier and the anchor
+//! directory (T14: `recovery_passphrase_change`, `anchor_dir_set`, `anchor_dir_remove`,
+//! `re_anchor`, `orphan_installs`, `forget_install`; the flows are `recovery_tier`'s, the dialogs
+//! Rust's, no path or secret comes in).
 
 use std::io::Read;
 use std::path::Path;
@@ -38,6 +43,7 @@ use crate::cli_install::{
     self, APP_CHANGE_KEY, Inputs, InstallError, Kind, Layout, PlatformOps, SystemOps,
 };
 use crate::credential::{self, PatOpenError};
+use crate::recovery_tier;
 use crate::removal::{
     self, BackupAnswer, Choice, FinishAnswer, PluginAutostart, RemovalDto, RemovalState, Retention,
 };
@@ -765,6 +771,9 @@ pub fn failure_class(e: &CommandError) -> Option<(String, Option<String>)> {
         CommandError::CliInstall(c) => Some(c.to_string()),
         CommandError::Removal(r) => Some(r.to_string()),
         CommandError::Restore(r) => Some(r.kind().to_owned()),
+        CommandError::AnchorDir(a) => Some(a.kind().to_owned()),
+        CommandError::ReAnchor(r) => Some(r.kind().to_owned()),
+        CommandError::Forget(f) => Some(f.kind().to_owned()),
         _ => None,
     };
     Some((e.to_string(), inner))
@@ -1471,6 +1480,264 @@ pub async fn restore_cancel<R: Runtime>(
     finish(&app, response)
 }
 
+// ---------- the recovery tier and the anchor directory (M10 T14; PD-166, PD-169, PD-170) ----------
+
+/// `recovery_passphrase_change {}`: Rust opens the credential window; the passphrase enters there.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryPassphraseChangeArgs {}
+
+/// `anchor_dir_set {}`: Rust confirms natively and opens its own folder dialog; no path comes in.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnchorDirSetArgs {}
+
+/// `anchor_dir_remove {}`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnchorDirRemoveArgs {}
+
+/// `re_anchor {}`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReAnchorArgs {}
+
+/// `orphan_installs {}` (read-only).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrphanInstallsArgs {}
+
+/// `install_id` of `forget_install`: 32 lowercase hex digits (the audit store's id form). Which
+/// install it names is checked against a fresh `orphan_installs` list in Rust.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallIdDto(pub String);
+
+impl<'de> Deserialize<'de> for InstallIdDto {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = text(d, "install_id")?;
+        if atlas_duck_audit::open::is_id(&s) {
+            Ok(InstallIdDto(s))
+        } else {
+            Err(refuse("install_id"))
+        }
+    }
+}
+
+/// `forget_install {install_id}`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForgetInstallArgs {
+    pub install_id: InstallIdDto,
+}
+
+/// What the recovery-tier commands need of the serving state: the state (its freeze), the open
+/// store and the native confirmer.
+type RecoveryInputs = (
+    Arc<crate::serve::ServeState>,
+    atlas_duck_audit::Store,
+    Arc<dyn atlas_duck_core::NativeConfirmer>,
+);
+
+/// [`RecoveryInputs`]; `not_ready` while no store is open.
+fn recovery_inputs<R: Runtime>(app: &AppHandle<R>) -> Result<RecoveryInputs, CommandError> {
+    let state = app
+        .try_state::<ServeSlot>()
+        .and_then(|slot| slot.get().cloned())
+        .ok_or(CommandError::NotReady)?;
+    let store = state.open_store().ok_or(CommandError::NotReady)?;
+    let confirmer = state.confirmer().ok_or(CommandError::NotReady)?;
+    Ok((state, store, confirmer))
+}
+
+/// Rust's folder dialog for the anchor directory (§8.5: no §7.7 local-filesystem check, a share is
+/// what it is for); `None` when cancelled, or when the answer names no filesystem path. Blocks
+/// until the user answers: the blocking pool only.
+fn pick_anchor_folder<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Option<atlas_duck_audit::types::RustChosenPath> {
+    use atlas_duck_audit::types::RustChosenPath;
+    use tauri_plugin_dialog::DialogExt;
+    let chosen = app
+        .dialog()
+        .file()
+        .set_title(recovery_tier::ANCHOR_DIR_DIALOG_TITLE)
+        .blocking_pick_folder()?;
+    let folder = chosen.into_path().ok()?;
+    Some(RustChosenPath::from_native_dialog(folder))
+}
+
+/// `recovery_passphrase_change {}` (§8.6, PD-169; also the offer after a restore, §8.11 step 2):
+/// opens the credential window for `change_recovery_passphrase` (`busy` while it is open for
+/// anything else, `not_ready` while no store is open). The new passphrase, entered twice, enters
+/// there only (`submit_secret`); the window then offers the recovery note.
+#[tauri::command]
+pub async fn recovery_passphrase_change<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<RecoveryPassphraseChangeArgs>,
+) -> Result<(), CommandError> {
+    let Args(RecoveryPassphraseChangeArgs {}) = args;
+    let response = match recovery_inputs(&app) {
+        Ok(_) => {
+            let handle = app.clone();
+            blocking(move || {
+                credential::open_for_passphrase_change(&handle).map_err(|e| match e {
+                    WindowError::Busy => CommandError::Busy,
+                    _ => CommandError::Internal,
+                })
+            })
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    note_failure(&response);
+    finish(&app, response)
+}
+
+/// `anchor_dir_set {}` (§8.5, PD-166): Rust's native confirmation, then its folder dialog, then
+/// `Store::change_anchor_dir` (its writability check: `anchor_dir {not_writable}` is "This folder
+/// cannot be written"). See `recovery_tier::set_anchor_dir`.
+#[tauri::command]
+pub async fn anchor_dir_set<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<AnchorDirSetArgs>,
+) -> Result<recovery_tier::AnchorDirDto, CommandError> {
+    let Args(AnchorDirSetArgs {}) = args;
+    let response = match recovery_inputs(&app) {
+        Ok((state, store, confirmer)) => {
+            let handle = app.clone();
+            blocking(move || {
+                recovery_tier::set_anchor_dir(
+                    &store,
+                    &*confirmer,
+                    || pick_anchor_folder(&handle),
+                    &|| state.shutting_down(),
+                    &handle,
+                )
+            })
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    note_failure(&response);
+    finish(&app, response)
+}
+
+/// `anchor_dir_remove {}` (§8.5, PD-166): Rust's native confirmation, then
+/// `Store::change_anchor_dir(None)`. See `recovery_tier::remove_anchor_dir`.
+#[tauri::command]
+pub async fn anchor_dir_remove<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<AnchorDirRemoveArgs>,
+) -> Result<recovery_tier::AnchorDirDto, CommandError> {
+    let Args(AnchorDirRemoveArgs {}) = args;
+    let response = match recovery_inputs(&app) {
+        Ok((state, store, confirmer)) => {
+            let handle = app.clone();
+            blocking(move || {
+                recovery_tier::remove_anchor_dir(
+                    &store,
+                    &*confirmer,
+                    &|| state.shutting_down(),
+                    &handle,
+                )
+            })
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    note_failure(&response);
+    finish(&app, response)
+}
+
+/// `re_anchor {}` (§8.7, PD-170): only while Settings offers it (a keychain anchor entry missing,
+/// no barrier); Rust's native confirmation, then `Store::re_anchor` (an integrity incident). See
+/// `recovery_tier::re_anchor`.
+#[tauri::command]
+pub async fn re_anchor<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<ReAnchorArgs>,
+) -> Result<recovery_tier::ReAnchoredDto, CommandError> {
+    let Args(ReAnchorArgs {}) = args;
+    let response = match recovery_inputs(&app) {
+        Ok((state, store, confirmer)) => {
+            let handle = app.clone();
+            blocking(move || {
+                recovery_tier::re_anchor(&store, &*confirmer, &|| state.shutting_down(), &handle)
+            })
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    note_failure(&response);
+    finish(&app, response)
+}
+
+/// The data dir and the live keystore of the serving store (`forget {unreadable}` when the
+/// keychain cannot be reached).
+fn live_keys<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Result<
+    (
+        atlas_duck_ipc::paths::LocalDataDir,
+        Arc<dyn atlas_duck_audit::KeyStore>,
+    ),
+    CommandError,
+> {
+    let (state, _, _) = recovery_inputs(app)?;
+    let (data, keys) = state.live_keys().ok_or(CommandError::NotReady)?;
+    let keys =
+        keys.map_err(|_| CommandError::Forget(crate::commands::ForgetFailure::Unreadable))?;
+    Ok((data, keys))
+}
+
+/// `orphan_installs {}` (PD-170, L116, T20 m-9): the installs only archived stores name, with the
+/// keychain entries they still have (reading them may raise a macOS keychain prompt for items an
+/// older or re-signed build wrote). See `recovery_tier::orphans`.
+#[tauri::command]
+pub async fn orphan_installs<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<OrphanInstallsArgs>,
+) -> Result<Vec<recovery_tier::OrphanInstallDto>, CommandError> {
+    let Args(OrphanInstallsArgs {}) = args;
+    let response = match live_keys(&app) {
+        Ok((data, keys)) => blocking(move || recovery_tier::orphans(&data, &*keys)).await,
+        Err(e) => Err(e),
+    };
+    note_failure(&response);
+    finish(&app, response)
+}
+
+/// `forget_install {install_id}` (PD-170): only an install of a fresh `orphan_installs` list; two
+/// native dialogs (the tokens, then the archived log's keys); `CONFIG_CHANGED {key:
+/// forget_install}` through core before anything is deleted. See `recovery_tier::forget`.
+#[tauri::command]
+pub async fn forget_install<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<ForgetInstallArgs>,
+) -> Result<recovery_tier::ForgottenDto, CommandError> {
+    let Args(ForgetInstallArgs { install_id }) = args;
+    let response = match (live_keys(&app), recovery_inputs(&app), core(&app)) {
+        (Ok((data, keys)), Ok((state, _, confirmer)), Ok(core)) => {
+            let (handle, settings) = (app.clone(), core.settings());
+            blocking(move || {
+                recovery_tier::forget(
+                    &data,
+                    &*keys,
+                    &|key, old, new| settings.record_app_change(key, old, new),
+                    &*confirmer,
+                    &install_id.0,
+                    &|| state.shutting_down(),
+                    &handle,
+                )
+            })
+            .await
+        }
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
+    };
+    note_failure(&response);
+    finish(&app, response)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -1671,6 +1938,8 @@ mod tests {
             "unlock",
             "recover_this_log",
             "recovery_passphrase",
+            "restore_backup",
+            "change_recovery_passphrase",
             "",
             "Add_pat",
         ] {
@@ -1910,6 +2179,63 @@ mod tests {
             serde_json::to_value(&retest).unwrap_or_default(),
             json!({"failed": {"class": "other_user"}})
         );
+    }
+
+    /// M10 T14 (§10.3): the recovery-tier commands take no path, no passphrase and no flag: an
+    /// empty body, or for `forget_install` an install id in the store's id form only.
+    #[test]
+    fn recovery_tier_args_take_nothing_but_an_install_id() {
+        let id = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            parse::<ForgetInstallArgs>(&json!({ "install_id": id })).map(|a| a.install_id),
+            Ok(InstallIdDto(id.into()))
+        );
+        for bad in [
+            json!(""),
+            json!("0123456789ABCDEF0123456789ABCDEF"),
+            json!("0123456789abcdef0123456789abcde"),
+            json!("0123456789abcdef0123456789abcdef0"),
+            json!("../../0123456789abcdef0123456789"),
+            json!(7),
+            json!(null),
+        ] {
+            assert_eq!(
+                field::<ForgetInstallArgs>(json!({ "install_id": bad.clone() })),
+                Some("install_id"),
+                "{bad}"
+            );
+        }
+        for body in [
+            json!({"install_id": id, "with_keys": true}),
+            json!({"install_id": id, "entries": ["kek"]}),
+        ] {
+            assert_eq!(field::<ForgetInstallArgs>(body), Some(FIELD_PAYLOAD));
+        }
+        for body in [
+            json!({"path": "/tmp/anchors"}),
+            json!({"passphrase": "x"}),
+            json!({"dir": null}),
+        ] {
+            assert_eq!(field::<AnchorDirSetArgs>(body.clone()), Some(FIELD_PAYLOAD));
+            assert_eq!(
+                field::<AnchorDirRemoveArgs>(body.clone()),
+                Some(FIELD_PAYLOAD)
+            );
+            assert_eq!(field::<ReAnchorArgs>(body.clone()), Some(FIELD_PAYLOAD));
+            assert_eq!(
+                field::<OrphanInstallsArgs>(body.clone()),
+                Some(FIELD_PAYLOAD)
+            );
+            assert_eq!(
+                field::<RecoveryPassphraseChangeArgs>(body),
+                Some(FIELD_PAYLOAD)
+            );
+        }
+        assert_eq!(
+            parse::<AnchorDirSetArgs>(&json!({})),
+            Ok(AnchorDirSetArgs {})
+        );
+        assert_eq!(parse::<ReAnchorArgs>(&json!({})), Ok(ReAnchorArgs {}));
     }
 
     /// T13 review I-4: a failed `Core::after_restore` is never answered as a plain success: the

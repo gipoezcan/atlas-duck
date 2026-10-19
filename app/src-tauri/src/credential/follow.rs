@@ -217,6 +217,17 @@ mod tests {
                 AppSnapshot::Gate(GateState::Locked(LockedReason::KeychainUnavailable)),
                 Follow::Leave,
             ),
+            // M10 T14: the passphrase change is Settings', in a serving app; never closed by it.
+            (
+                Purpose::ChangeRecoveryPassphrase,
+                AppSnapshot::Serving,
+                Follow::Leave,
+            ),
+            (
+                Purpose::ChangeRecoveryPassphrase,
+                AppSnapshot::StoreUnavailable,
+                Follow::Leave,
+            ),
         ];
         for (current, snapshot, want) in table {
             assert_eq!(

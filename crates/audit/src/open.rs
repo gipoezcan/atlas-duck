@@ -145,7 +145,9 @@ pub fn new_ids() -> Result<(String, String), OpenError> {
     Ok((random_id()?, random_id()?))
 }
 
-pub(crate) fn is_id(s: &str) -> bool {
+/// An `install_id` / `chain_id` as `new_ids` makes them: 32 lowercase hex digits. Public for the
+/// app's checks of an install id it is handed (M10 T14: `forget_install`, `KeyStore::for_install`).
+pub fn is_id(s: &str) -> bool {
     s.len() == 32
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))

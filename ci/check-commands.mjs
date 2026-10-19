@@ -73,6 +73,14 @@ export const WINDOW_COMMANDS = {
     "backup_trigger",
     "restore_begin",
     "restore_cancel",
+    // M10 T14 (Δ-M10-3, PD-166, PD-169, PD-170): the recovery passphrase change (its secret enters
+    // the credential window), the anchor directory, re-anchor and "Forget old install".
+    "recovery_passphrase_change",
+    "anchor_dir_set",
+    "anchor_dir_remove",
+    "re_anchor",
+    "orphan_installs",
+    "forget_install",
   ],
   // M6: `verify_now` (P8); M10 T12 (Δ-M10-3, L201): the queries, the payload view, the incident
   // acknowledgement and the export/backup triggers (`backup_trigger` also in settings, T13).

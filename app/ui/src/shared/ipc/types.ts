@@ -321,7 +321,10 @@ export interface SettingsView {
   attention_mode: AttentionMode;
   retention_days: number;
   legal_hold: boolean;
-  /** Display only. */
+  /**
+   * The anchor directory in force, display text only: Settings changes it with `anchor_dir_set` /
+   * `anchor_dir_remove` (Rust's own dialogs, M10 T14), never through `settings_apply`.
+   */
   anchor_dir: string | null;
   /** "Allow scripts with degraded confinement" as the audit settings hold it (PD-141). */
   allow_degraded_scripts: boolean;
@@ -341,6 +344,10 @@ export interface SettingsView {
     anchor_dir_write_failing: boolean;
     /** Anchor-directory lines waiting to be written. */
     anchor_dir_lines_pending: number;
+    /** Which keychain anchor entry is missing (PD-170); `null` when none (also during an interrupted restore). */
+    anchors_missing: 'head' | 'first_retained' | 'both' | null;
+    /** Settings shows "Re-anchor" only while this is true (an entry missing, no barrier holding the anchors). */
+    re_anchor_offered: boolean;
   };
   config_read_only: ConfigBanner | null;
   /** Keys whose config.toml value applies at the next start ("applies after restart"). */
@@ -720,6 +727,53 @@ export type RestoreFailure = {
     | 'failed';
 };
 
+/** `anchor_dir_set` / `anchor_dir_remove` (M10 T14, PD-166): the anchor directory in force now (display text). */
+export interface AnchorDirAnswer {
+  anchor_dir: string | null;
+}
+
+/** `re_anchor` (M10 T14, PD-170): the `re_anchored` integrity incident it recorded (acknowledged in Audit). */
+export interface ReAnchored {
+  verify_seq: number;
+}
+
+/**
+ * One `orphan_installs` row (M10 T14, PD-170): an install only archived logs name, those files
+ * (`archived/<name>`) and its keychain entries left (`kek`, `head_anchor`, `first_retained_anchor`,
+ * `canary`, `pat/<instance_id>`). Every string is display-escaped by Rust; an instance id is data.
+ */
+export interface OrphanInstall {
+  install_id: string;
+  archived_files: string[];
+  entries: string[];
+}
+
+/** `forget_install` (M10 T14): the entries deleted, and whether the archived log's keys went too. */
+export interface Forgotten {
+  install_id: string;
+  deleted: string[];
+  keys_deleted: boolean;
+}
+
+/** Why the anchor directory was not changed (Rust `AnchorDirFailure`): `not_writable` is "This folder cannot be written". */
+export type AnchorDirFailure = {
+  kind: 'not_writable' | 'writer_busy' | 'unchanged' | 'not_set' | 'failed';
+};
+
+/** Why "Re-anchor" did nothing (Rust `ReAnchorFailure`). `does_not_verify` and `keychain` left an incident. */
+export type ReAnchorFailure = {
+  kind: 'nothing_missing' | 'held' | 'does_not_verify' | 'restored' | 'keychain' | 'failed';
+};
+
+/**
+ * Why "Forget old install" stopped (Rust `ForgetFailure`, closed shapes): `keychain` names what was and
+ * was not deleted (account names, display-escaped); a retry deletes the rest.
+ */
+export type ForgetFailure =
+  | { kind: 'unreadable' }
+  | { kind: 'keychain'; deleted: string[]; not_deleted: string[] }
+  | { kind: 'failed' };
+
 /** The `audit_job` event: row counts with `progress` only (an export); a backup or restore is indeterminate. */
 export interface AuditJobEvent {
   job: AuditJobKind;
@@ -790,4 +844,10 @@ export type CommandError =
   | { kind: 'audit'; error: AuditReadFailure }
   /** A restore was refused or failed (see `RestoreFailure`). */
   | { kind: 'restore'; error: RestoreFailure }
+  /** The anchor directory was not changed (see `AnchorDirFailure`). */
+  | { kind: 'anchor_dir'; error: AnchorDirFailure }
+  /** "Re-anchor" did nothing (see `ReAnchorFailure`). */
+  | { kind: 're_anchor'; error: ReAnchorFailure }
+  /** "Forget old install" stopped (see `ForgetFailure`). */
+  | { kind: 'forget'; error: ForgetFailure }
   | { kind: 'refused'; message: string };
