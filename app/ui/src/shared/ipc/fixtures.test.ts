@@ -152,6 +152,10 @@ describe('fixtures validate against their TS types', () => {
     expect(new Set(auditStatus.map((s) => s.health.anchor_dir_write_failing))).toEqual(new Set([true, false]));
     expect(isAuditStatus({ ...quiet, health: { ...quiet?.health, anchor_dir_lines_pending: '0' } })).toBe(false);
     expect(isExportDone({ ...exportDone[0], path: '/x' })).toBe(false);
+    // M10 T20: the Audit window shows this hash for the recipient, so it is checked like `not_renamed`'s.
+    for (const hash of ['5e'.repeat(31), '5E'.repeat(32), `${'5e'.repeat(31)}5g`, 5]) {
+      expect(isExportDone({ ...exportDone[0], manifest_sha256: hash })).toBe(false);
+    }
     expect(exportCancel.map((c) => c.cancelled)).toEqual([true, false]);
     expect(auditJob.map((e) => e.phase)).toContain('progress');
     expect(isAuditJobEvent({ job: 'export', phase: 'progress', done: 1 })).toBe(false);

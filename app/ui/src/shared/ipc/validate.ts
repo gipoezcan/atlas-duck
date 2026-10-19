@@ -595,8 +595,11 @@ export const isAuditStatus = (v: unknown): v is AuditStatus =>
 export const isAcknowledged = (v: unknown): v is Acknowledged =>
   closed(v, { verify_seq: isNum, ack_seq: isNum });
 
+const isSha256Hex = (v: unknown): v is string => isStr(v) && /^[0-9a-f]{64}$/.test(v);
+
+/** `export_trigger`: the hash is shown to the user, who hands it on (64 lowercase hex digits). */
 export const isExportDone = (v: unknown): v is ExportDone =>
-  closed(v, { manifest_sha256: isStr, dir_name: isStr, rows: isNum });
+  closed(v, { manifest_sha256: isSha256Hex, dir_name: isStr, rows: isNum });
 
 export const isExportCancelAnswer = (v: unknown): v is ExportCancelAnswer =>
   closed(v, { cancelled: isBool });
@@ -610,8 +613,6 @@ export const isAuditJobEvent = (v: unknown): v is AuditJobEvent => {
 };
 
 const isCoreError = (v: unknown): v is CoreError => fields(v, { kind: isStr });
-
-const isSha256Hex = (v: unknown): v is string => isStr(v) && /^[0-9a-f]{64}$/.test(v);
 
 /** `export`'s nested error, closed per kind: `not_renamed`'s hash is shown to the user, who hands it on. */
 export const isExportFailure = (v: unknown): v is ExportFailure => {

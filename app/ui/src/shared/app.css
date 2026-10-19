@@ -70,3 +70,24 @@
 .batch-actions, .batch-session { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 0.25rem 0; }
 .batch-confirm ul, .batch-excluded ul, .batch-blocked ul { max-height: 12rem; overflow: auto; margin: 0.25rem 0; }
 .onboarding-text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 32rem; overflow: auto; padding: 0.5rem; border: 1px solid #8886; }
+/* The Audit window (M10 T20). A list row is two one-line rows (2 rem each) plus its border: ROW_REM 4.25 in EventList.tsx. */
+.audit section { margin: 0.75rem 0; }
+.audit-fields { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; }
+.audit-field { display: flex; flex-direction: column; gap: 0.2rem; }
+.audit-field-error { font-size: 0.9em; font-weight: 600; }
+.audit-flags { display: flex; flex-wrap: wrap; gap: 0.25rem 1rem; margin: 0.5rem 0; border: 1px solid #8886; }
+.audit-actions, .audit-job, .audit-ack { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 0.5rem 0; }
+.audit-ack { flex-direction: column; align-items: flex-start; padding: 0.5rem; border: 1px solid #8886; }
+.audit-ack textarea { width: 100%; max-width: 40rem; min-height: 4rem; }
+.audit-line { display: flex; flex-wrap: nowrap; align-items: center; gap: 0.5rem; height: 2rem; overflow: hidden; white-space: nowrap; }
+.audit-line > * { flex: none; }
+.audit-line > .agent-text, .audit-line > .target { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.audit-row button[aria-current="true"] { font-weight: 700; }
+.audit-record { padding: 0.5rem; border: 1px solid #8886; }
+.audit-record dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.2rem 1rem; }
+.audit-record dl > div { display: contents; }
+.audit-record dt { font-weight: 600; }
+.audit-record dd { margin: 0; overflow-wrap: anywhere; }
+.audit-record .agent-text-value { max-width: none; white-space: pre-wrap; overflow: visible; }
+.audit-payload iframe { display: block; width: 100%; height: 28rem; border: 1px solid #8886; }
+.audit-export-result code { overflow-wrap: anywhere; }

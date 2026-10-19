@@ -51,6 +51,8 @@ const DISCRIMINANTS = new Set([
   'kind', 'class', 'status', 'level', 'step', 'state', 'product', 'purpose', 'choice', 'result',
   'outcome', 'mode', 'op', 'scope', 'preset', 'method', 'cli', 'autostart',
   'attention_mode', 'anchors_missing', 'secret_service', 'code', 'field', 'conn', 'error', 'preselect', 'scripts',
+  // M10 T20: an audit header's flags (closed 8.2 names) and the `audit_job` event's job and phase.
+  'flags', 'job', 'phase',
 ]);
 
 /** The one discriminator path a `free` run poisons as well (the per-path prototype pass), or null. */
@@ -318,7 +320,10 @@ function answer(cmd: string, args: Record<string, unknown>): Promise<Json> {
     case 'wizard_anchor_dir_clear':
     case 'wizard_restore': return reply(cmd, 'wizard_state');
     // M10 T12 (Δ-M10-3): the Audit window's commands; its UI (T20) renders their answers.
-    case 'audit_query': return reply(cmd, 'audit_page');
+    // The first page has rows and a `next`; the page after it is the empty last one. So a window
+    // whose list was read again (a filter applied or cleared) reaches the rows again, whichever
+    // call refuses (the path a run takes must not depend on whether a payload filter was refused).
+    case 'audit_query': return reply(cmd, 'audit_page', (l) => (args['cursor'] === undefined ? l[0] : l[l.length - 1]));
     case 'audit_trail': return reply(cmd, 'audit_trail');
     case 'audit_payload': return reply(cmd, 'audit_payload');
     case 'audit_status': return pinned('audit_status');
@@ -341,21 +346,12 @@ function answer(cmd: string, args: Record<string, unknown>): Promise<Json> {
 }
 
 /**
- * Fixtures of M10 T12's Audit-window answers that no window renders yet: the Audit window's UI is
- * Task 20, which removes each name here as its window comes to consume it (`audit_job` is an event
- * payload, so it stays until events are driven here too). M10 T13's restore answers and M10 T14's
- * recovery-tier answers likewise wait for the Settings UI (Task 21).
+ * Fixtures no window renders yet: M10 T13's restore answers and M10 T14's recovery-tier answers
+ * wait for the Settings UI (Task 21), which removes each name here as its window comes to consume
+ * it. (M10 T20's Audit window consumes the Audit answers and, driven below, `audit_job`.)
  */
 const NOT_YET_RENDERED = [
-  'acknowledged',
   'anchor_dir_answer',
-  'audit_job',
-  'audit_page',
-  'audit_payload',
-  'audit_status',
-  'audit_trail',
-  'export_cancel',
-  'export_done',
   'forgotten',
   'orphan_install',
   're_anchored',
@@ -363,10 +359,25 @@ const NOT_YET_RENDERED = [
   'restore_done',
 ];
 
+/** The handlers the windows registered through `on`, by event name: a scenario may drive events. */
+let handlers = new Map<string, ((payload: unknown) => void)[]>();
+
 function wire(): void {
   counters = new Map();
-  vi.mocked(on).mockImplementation(() => Promise.resolve(() => undefined));
+  handlers = new Map();
+  vi.mocked(on).mockImplementation((name, handler) => {
+    handlers.set(name, [...(handlers.get(name) ?? []), handler as (payload: unknown) => void]);
+    return Promise.resolve(() => undefined);
+  });
   bridge.invoke = answer;
+}
+
+/** Sends `payload` as event `name` to every window that listens, as Rust's emit would. */
+async function emit(name: string, payload: Json): Promise<void> {
+  await act(async () => {
+    for (const handler of handlers.get(name) ?? []) handler(payload);
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+  });
 }
 
 // ---- driving a window ----
@@ -458,6 +469,8 @@ interface Scenario {
   element?: () => ReactElement;
   mount?: (root: HTMLElement) => () => void;
   before?: () => void;
+  /** Runs once the window rendered, before it is explored (events Rust would send). */
+  after?: () => Promise<void>;
 }
 
 /** The first state of a window also runs in the `all` pass; its validators leave the others little to show. */
@@ -533,6 +546,18 @@ const SCENARIOS: Scenario[] = [
   { name: 'settings removal', modes: ['free', 'all'], element: () => <Settings />, before: () => void ((variant = 'removal'), (pin = 1)) },
   ...[0, 1, 2, 3, 4].map((i): Scenario => ({ name: `setup ${i}`, cheap: true, modes: only(i), element: () => <Wizard />, before: () => void (pin = i) })),
   { name: 'audit', cheap: true, element: () => <Audit /> },
+  // M10 T20: every `audit_job` fixture reaches the window, then the export's progress again, so the
+  // explorer finds a running export (its bar and Cancel, `export_cancel`), and `audit_changed`.
+  {
+    name: 'audit jobs',
+    element: () => <Audit />,
+    after: async () => {
+      const jobs = fx('audit_job');
+      for (const job of jobs) await emit('audit_job', job);
+      await emit('audit_job', jobs.find((j) => (j as { phase?: unknown }).phase === 'progress') ?? null);
+      await emit('audit_changed', null);
+    },
+  },
   { name: 'running_scripts', cheap: true, element: () => <Running /> },
   { name: 'onboarding', cheap: true, element: () => <Onboarding /> },
   ...[0, 1, 2, 3, 4, 5, 6, 7].map(credential),
@@ -557,6 +582,7 @@ async function run(scenario: Scenario): Promise<string[]> {
     stop = scenario.mount(root);
   }
   await settle();
+  await scenario.after?.();
   const where = `${mode}/${scenario.name}`;
   const found = await explore(where);
   if (learning) benignUsed.set(where, current);
