@@ -371,6 +371,98 @@ impl ExportVerdict {
     }
 }
 
+/// The Audit window's filter (§8.10): exact matches on plaintext columns, `target` by prefix;
+/// there is no payload search (L38). `None` and an empty list mean "no constraint"; `from_utc`
+/// and `to_utc` are both inclusive; `flags_any` and `event_types` match any of their entries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuditFilter {
+    pub from_utc: Option<UtcInstant>,
+    pub to_utc: Option<UtcInstant>,
+    pub agent_name: Option<String>,
+    pub op_id: Option<String>,
+    pub op_class: Option<String>,
+    pub instance_id: Option<String>,
+    /// Prefix match, byte-exact (no wildcards, case-sensitive).
+    pub target: Option<String>,
+    pub decision: Option<DecisionColumn>,
+    /// A row matches when it has at least one of these bits (`flags` is a bitset, F.2); every
+    /// entry must be a defined flag bit.
+    pub flags_any: Vec<EventFlags>,
+    pub event_types: Vec<EventType>,
+}
+
+/// Keyset position of an Audit window page: rows with `seq < before_seq` (all rows when
+/// `None`), newest first, at most `limit` (1..=[`MAX_AUDIT_PAGE_ROWS`]) of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditCursor {
+    pub before_seq: Option<u64>,
+    pub limit: u32,
+}
+
+/// The most rows one [`AuditPage`] holds.
+pub const MAX_AUDIT_PAGE_ROWS: u32 = 500;
+
+impl AuditCursor {
+    /// The first page.
+    pub fn first(limit: u32) -> AuditCursor {
+        AuditCursor {
+            before_seq: None,
+            limit,
+        }
+    }
+}
+
+/// One page of matching headers, `seq` descending. `next` is `Some` exactly when more matching
+/// rows follow. `scanned` is the number of rows this page read (equal to `rows.len()`: the
+/// query is index-assisted keyset paging, not a counted full scan).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditPage {
+    pub rows: Vec<EventHeader>,
+    pub next: Option<AuditCursor>,
+    pub scanned: u64,
+}
+
+/// The `DELIVERED` facts of one request (§8.10 highlight; advisory, §3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliverySummary {
+    pub count: u64,
+    /// Some `DELIVERED` went to a peer other than the submitter's: the origin executable
+    /// (`peer_origin_exe`) or the origin start time differs.
+    pub to_other_peer: bool,
+}
+
+/// Every retained header of one request, seq ascending, plus its delivery summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditTrail {
+    pub headers: Vec<EventHeader>,
+    pub deliveries: DeliverySummary,
+}
+
+/// The most bytes one [`PayloadPage`] carries.
+pub const PAYLOAD_PAGE_BYTES: usize = 256 * 1024;
+
+/// One page of a decrypted payload (plaintext JCS bytes; a page boundary may fall inside a
+/// UTF-8 sequence). `Debug` never prints the bytes, which are zeroized on drop.
+pub struct PayloadPage {
+    pub seq: u64,
+    pub page: u32,
+    pub page_count: u32,
+    pub total_bytes: u64,
+    pub bytes: zeroize::Zeroizing<Vec<u8>>,
+}
+
+impl fmt::Debug for PayloadPage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PayloadPage")
+            .field("seq", &self.seq)
+            .field("page", &self.page)
+            .field("page_count", &self.page_count)
+            .field("total_bytes", &self.total_bytes)
+            .field("bytes", &"<redacted>")
+            .finish()
+    }
+}
+
 /// A path chosen in a native file dialog. Only the native-dialog paths in M3/M6/M10 may
 /// construct one (audit cannot depend on `core`/`app`; an M10 grep check enforces it).
 #[derive(Debug, Clone, PartialEq, Eq)]

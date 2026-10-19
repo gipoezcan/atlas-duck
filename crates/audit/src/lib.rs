@@ -48,6 +48,7 @@ pub mod keystore;
 pub mod open;
 mod passphrase;
 mod prune;
+mod query;
 mod reanchor;
 pub mod recover;
 // The recovery blob (Argon2id, the KEK it seals): crate-internal in production, like `crypto`.
@@ -107,9 +108,10 @@ pub use settings::{
 };
 pub use store::{Hooks, OpenConfig, Store, StoreHealth};
 pub use types::{
-    Actor, Committed, Confirmed, DecisionColumn, EventFlags, EventHeader, EventType, ExportControl,
-    ExportReceipt, ExportVerdict, MissingAnchor, NewEvent, QueryKind, RustChosenPath, TimeRange,
-    UtcInstant,
+    Actor, AuditCursor, AuditFilter, AuditPage, AuditTrail, Committed, Confirmed, DecisionColumn,
+    DeliverySummary, EventFlags, EventHeader, EventType, ExportControl, ExportReceipt,
+    ExportVerdict, MAX_AUDIT_PAGE_ROWS, MissingAnchor, NewEvent, PAYLOAD_PAGE_BYTES, PayloadPage,
+    QueryKind, RustChosenPath, TimeRange, UtcInstant,
 };
 pub use verify::{FindingKind, VerifyFinding, VerifyOutcome};
 pub use verify_export::verify_export;

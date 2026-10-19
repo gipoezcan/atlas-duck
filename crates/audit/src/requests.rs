@@ -79,7 +79,7 @@ pub struct ReconcileReport {
     pub abandoned: Vec<String>,
 }
 
-const HEADER_COLUMNS: &str = "seq, ts_utc, epoch, chain_id, event_type, request_id, op_id, \
+pub(crate) const HEADER_COLUMNS: &str = "seq, ts_utc, epoch, chain_id, event_type, request_id, op_id, \
      op_class, instance_id, target, decision, flags, agent_name, agent_name_source, \
      client_kind, connection_id, peer_pid, peer_exe, peer_origin_exe, os_user, \
      atlassian_user, atlassian_user_key, payload_len, key_id";
@@ -98,7 +98,7 @@ fn db_path(row: &Row<'_>, i: usize) -> Result<Option<std::path::PathBuf>, AuditE
     b.as_deref().map(os_path_from_bytes).transpose()
 }
 
-fn header_from_row(row: &Row<'_>) -> Result<EventHeader, AuditError> {
+pub(crate) fn header_from_row(row: &Row<'_>) -> Result<EventHeader, AuditError> {
     let text = |i: usize| -> Result<Option<String>, AuditError> { row.get(i).map_err(io) };
     let event_type = text(4)?
         .as_deref()
