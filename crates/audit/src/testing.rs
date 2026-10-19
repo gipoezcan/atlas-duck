@@ -240,8 +240,10 @@ impl KeyStore for MemKeyStore {
         lock(&self.ring.locality).clone()
     }
 
+    /// As `OsKeyStore`: `None` for anything but an install id.
     fn for_install(&self, install_id: &str) -> Option<Box<dyn KeyStore>> {
-        Some(Box::new(MemKeyStore::new(self.ring.clone(), install_id)))
+        crate::open::is_id(install_id)
+            .then(|| Box::new(MemKeyStore::new(self.ring.clone(), install_id)) as Box<dyn KeyStore>)
     }
 }
 
@@ -293,6 +295,15 @@ pub enum FaultPoint {
     /// Recovery-passphrase change: inside its transaction, after the `recovery` row was
     /// rewritten and before its `CREDENTIAL_CHANGED` is inserted. An armed failure rolls both back.
     RecoveryRowWritten,
+    /// Re-anchor: its full verification ran, nothing is logged or read for the rewrite yet. An
+    /// armed failure ends the re-anchor there.
+    ReAnchorVerified,
+    /// Re-anchor: its `re_anchored` `VERIFY` committed and the anchors to write are read; the
+    /// completion is not handed to the anchor thread yet. An armed failure ends it there.
+    ReAnchorBeforeComplete,
+    /// Restore (live store): its barrier replaced whatever was installed; the keychain is not
+    /// read yet and nothing is committed. An armed failure fails the restore there.
+    RestoreBarrierHeld,
 }
 
 /// Runs when a [`FaultPoint`] is reached (see [`Faults::on_hit`]).

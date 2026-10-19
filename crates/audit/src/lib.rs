@@ -84,7 +84,7 @@ pub use clock::{Clock, SystemClock};
 pub use crypto::MAX_PAYLOAD_LEN;
 pub use error::{AuditError, OpenError, RestoreError};
 pub use export::{MAX_EXPORT_CT_LEN, MAX_EXPORT_LINE_BYTES};
-pub use forget::{ForgetReport, OrphanInstall, forget_install, orphan_installs};
+pub use forget::{ForgetError, ForgetReport, OrphanInstall, forget_install, orphan_installs};
 pub use keystore::{EntryName, KeyStore, KeyStoreError, KeyringLocality, OsKeyStore};
 pub use open::{
     ArchivedDb, FirstRunInput, LockedReason, RecoveryOffer, StartupOutcome, create_new_store,
@@ -92,6 +92,9 @@ pub use open::{
 };
 pub use passphrase::{PASSPHRASE_MISMATCH, PASSPHRASE_TOO_SHORT};
 pub use prune::{PruneOutcome, PruneSkip};
+pub use reanchor::{
+    RE_ANCHOR_DOES_NOT_VERIFY, RE_ANCHOR_HELD, RE_ANCHOR_NOTHING_MISSING, RE_ANCHOR_RESTORED,
+};
 pub use recover::{RecoverReport, archive_and_start_fresh, latest_archived, recover_this_log};
 pub use recovery::MIN_PASSPHRASE_CHARS;
 pub use request_set::{RequestRecord, request_set_hash};

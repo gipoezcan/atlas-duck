@@ -90,7 +90,8 @@ pub trait KeyStore: Send + Sync {
     /// The same keyring addressed as install `install_id` (`atlas-duck/<install_id>/…`): "forget
     /// old install" (PD-170) reads and deletes the entries of an install that only an archived
     /// store names. `None` (the default) when this keystore cannot address another install; its
-    /// callers then refuse (fail closed).
+    /// callers then refuse (fail closed). An implementation returns `None` for anything but an
+    /// install id (32 lowercase hex), so a name never reaches another service name's shape.
     fn for_install(&self, install_id: &str) -> Option<Box<dyn KeyStore>> {
         let _ = install_id;
         None

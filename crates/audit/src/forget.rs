@@ -67,6 +67,34 @@ pub struct ForgetReport {
     pub keys_deleted: bool,
 }
 
+/// Why [`forget_install`] stopped, and what it had done by then: the caller's corrective record
+/// names both lists. `deleted` and `not_deleted` together are every entry it was to delete, in
+/// order.
+#[derive(Debug)]
+pub struct ForgetError {
+    /// `Invalid`: refused before anything was deleted (the live install, a keystore that cannot
+    /// address another install). `KeyStore`: the deletion of `not_deleted[0]` failed.
+    pub error: OpenError,
+    /// The account names deleted before it stopped, in order.
+    pub deleted: Vec<String>,
+    /// The account names not deleted: the one that failed first, then those not attempted.
+    pub not_deleted: Vec<String>,
+}
+
+impl std::fmt::Display for ForgetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ({} of {} entries deleted)",
+            self.error,
+            self.deleted.len(),
+            self.deleted.len() + self.not_deleted.len()
+        )
+    }
+}
+
+impl std::error::Error for ForgetError {}
+
 /// The installs named by an `archived/audit-<chain_id>-<head_seq>-<stamp>.db` store and not by
 /// `keys` (the live install), with the keychain entries they still have (C.3, Δ-M10-1, PD-170).
 /// An archive names the installs in the plaintext `target` of its `GENESIS`, `RESTORE` and
@@ -136,25 +164,40 @@ pub fn orphan_installs(
 /// its native confirmation: deletes its `pat/<instance_id>` entries and its `canary`; with
 /// `keys_confirmed` (the second confirmation, "also delete the archived log's keys") also its
 /// `first_retained_anchor`, `head_anchor` and, last, `kek`. Never the live install (`keys`'):
-/// `Invalid`. The first keychain error ends it (`KeyStore`); what was deleted before stays deleted
-/// and a retry deletes the rest. Logging the change is the caller's.
+/// `Invalid`. The first keychain error ends it (`KeyStore`); what was deleted before stays
+/// deleted, the error lists what was and was not, and a retry deletes the rest. Logging the
+/// change is the caller's.
 pub fn forget_install(
     keys: &dyn KeyStore,
     orphan: &OrphanInstall,
     confirmed: Confirmed,
     keys_confirmed: Option<Confirmed>,
-) -> Result<ForgetReport, OpenError> {
+) -> Result<ForgetReport, ForgetError> {
     let _ = confirmed;
+    let with_keys = keys_confirmed.is_some();
+    let todo = candidates(&orphan.instance_ids, with_keys);
+    let refused = |error| ForgetError {
+        error,
+        deleted: Vec::new(),
+        not_deleted: todo.iter().map(EntryName::account).collect(),
+    };
     if orphan.install_id == keys.install_id() || !is_id(&orphan.install_id) {
-        return Err(OpenError::Invalid("the live install is never forgotten"));
+        return Err(refused(OpenError::Invalid(
+            "the live install is never forgotten",
+        )));
     }
     let ks = keys
         .for_install(&orphan.install_id)
-        .ok_or(OpenError::Invalid(NO_OTHER_INSTALL))?;
-    let with_keys = keys_confirmed.is_some();
+        .ok_or_else(|| refused(OpenError::Invalid(NO_OTHER_INSTALL)))?;
     let mut deleted = Vec::new();
-    for e in candidates(&orphan.instance_ids, with_keys) {
-        ks.delete(&e)?;
+    for (i, e) in todo.iter().enumerate() {
+        if let Err(err) = ks.delete(e) {
+            return Err(ForgetError {
+                error: err.into(),
+                deleted,
+                not_deleted: todo[i..].iter().map(EntryName::account).collect(),
+            });
+        }
         deleted.push(e.account());
     }
     Ok(ForgetReport {

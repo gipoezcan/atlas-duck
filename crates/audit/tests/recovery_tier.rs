@@ -6,23 +6,30 @@
 
 mod common;
 
+use std::io::Write;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use atlas_duck_audit::anchors::{BarrierKind, FirstRetainedAnchor, HeadAnchor};
+use atlas_duck_audit::anchor_dir::{AnchorLine, file_name, to_line};
+use atlas_duck_audit::anchors::{BARRIER_TAKEN, BarrierKind, FirstRetainedAnchor, HeadAnchor};
 use atlas_duck_audit::crypto::Kek;
 use atlas_duck_audit::encoding::ZERO_HASH;
 use atlas_duck_audit::error::{AuditError, OpenError, RestoreError};
 use atlas_duck_audit::keystore::{EntryName, KeyStore, KeyStoreError, service_name};
 use atlas_duck_audit::recovery::open_recovery;
-use atlas_duck_audit::testing::{self, FaultPoint, Faults, KeyOpKind, MemKeyStore, MemKeyring};
+use atlas_duck_audit::testing::{
+    self, FakePrune, FaultPoint, Faults, KeyOpKind, MemKeyStore, MemKeyring,
+};
 use atlas_duck_audit::types::{Confirmed, EventFlags, EventType, RustChosenPath};
 use atlas_duck_audit::{
-    ArchivedDb, FindingKind, LockedReason, MissingAnchor, OpenConfig, PASSPHRASE_MISMATCH,
-    PASSPHRASE_TOO_SHORT, StartupOutcome, Store, VerifyFinding, VerifyOutcome,
-    archive_and_start_fresh, create_new_store, forget_install, new_ids, open, orphan_installs,
-    recover_this_log, restore_from_source,
+    ArchivedDb, FindingKind, ForgetError, LockedReason, MissingAnchor, OpenConfig,
+    PASSPHRASE_MISMATCH, PASSPHRASE_TOO_SHORT, RE_ANCHOR_DOES_NOT_VERIFY,
+    RE_ANCHOR_NOTHING_MISSING, RE_ANCHOR_RESTORED, Settings, StartupOutcome, Store, VerifyFinding,
+    VerifyOutcome, archive_and_start_fresh, create_new_store, forget_install, new_ids, open,
+    orphan_installs, recover_this_log, restore_from_source,
 };
 use common::*;
 use secrecy::SecretString;
@@ -105,6 +112,111 @@ fn wait_for(what: &str, cond: impl Fn() -> bool) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Where a thread reaching fault point `p` stops until the test lets it go: `wait` returns once
+/// it got there, `open` lets it (and every later hit) go on. The thread waits at most 60 s, and
+/// dropping the `Gate` lets it go at once, so a failing assertion never leaves it blocked.
+struct Gate {
+    reached: Receiver<()>,
+    go: Option<SyncSender<()>>,
+}
+
+fn gate(faults: &Faults, p: FaultPoint) -> Gate {
+    let (reached_tx, reached) = sync_channel(8);
+    let (go, go_rx) = sync_channel::<()>(1);
+    let go_rx = Mutex::new(go_rx);
+    faults.on_hit(p, move || {
+        let _ = reached_tx.try_send(());
+        let _ = go_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recv_timeout(Duration::from_secs(60));
+    });
+    Gate {
+        reached,
+        go: Some(go),
+    }
+}
+
+impl Gate {
+    fn wait(&self, what: &str) {
+        assert!(
+            self.reached.recv_timeout(Duration::from_secs(60)).is_ok(),
+            "{what} was never reached"
+        );
+    }
+
+    /// The sender goes away: the waiting thread's `recv_timeout` returns at once.
+    fn open(&mut self) {
+        self.go = None;
+    }
+}
+
+/// A store whose first-retained keychain entry was deleted, reopened with `faults`: re-anchor
+/// is offered. Returns it with a backup taken before (an older snapshot of the same chain).
+fn first_retained_lost(
+    faults: &Arc<Faults>,
+) -> (Store, Fixture, std::path::PathBuf, tempfile::TempDir) {
+    let (store, f) = new_store_with(fake_clock(START), MemKeyring::new(), |cfg| {
+        cfg.hooks.faults = Some(faults.clone());
+    });
+    store.append_batch(mixed(6)).expect("append");
+    store.flush_head_anchor().expect("flush");
+    let out = tempfile::tempdir().expect("out dir");
+    let bundle = store.backup(chosen(out.path())).expect("backup").bundle_dir;
+    store.shutdown();
+    f.keys()
+        .delete(&EntryName::FirstRetainedAnchor)
+        .expect("delete");
+    let mut cfg = f.config();
+    cfg.hooks.faults = Some(faults.clone());
+    let (s, _) = ready(open(&f.data, &f.lock, cfg).expect("open"));
+    assert_eq!(
+        s.health().anchors_missing,
+        Some(MissingAnchor::FirstRetained)
+    );
+    (s, f, bundle, out)
+}
+
+/// A prune of every record below `first_retained_seq` (`GENESIS` included), its first-retained
+/// anchor written as a real prune writes it. The `PRUNE` gets a corroborated epoch (a prune
+/// without one is an incident).
+fn prune_below(store: &Store, first_retained_seq: u64) {
+    corroborate(store);
+    testing::insert_fake_prune(
+        store,
+        FakePrune {
+            first_retained_seq,
+            cutoff: "2026-06-01".into(),
+            settings: Settings {
+                retention_days: 92,
+                ..Settings::default()
+            }
+            .to_json(),
+            update_first_retained: true,
+        },
+    )
+    .expect("fake prune");
+    store.flush_head_anchor().expect("flush");
+}
+
+/// `(first_retained_seq, last_pruned_record_hash)` of the latest `prune_log` row.
+fn latest_prune_values(f: &Fixture) -> (u64, [u8; 32]) {
+    raw_conn(f)
+        .query_row(
+            "SELECT first_retained_seq, last_pruned_record_hash FROM prune_log \
+             ORDER BY prune_seq DESC LIMIT 1",
+            [],
+            |r| {
+                let prev: Vec<u8> = r.get(1)?;
+                Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    prev.try_into().expect("32 bytes"),
+                ))
+            },
+        )
+        .expect("a prune_log row")
 }
 
 /// A record naming instance `id` in its plaintext `instance_id` column.
@@ -342,6 +454,35 @@ fn passphrase_change_prepared_before_a_restore_is_refused() {
 }
 
 #[test]
+fn passphrase_change_sealed_for_another_kek_is_refused() {
+    let faults = Faults::new();
+    let (store, f) = new_store_with(fake_clock(START), MemKeyring::new(), |cfg| {
+        cfg.hooks.faults = Some(faults.clone());
+    });
+    let head = store.head();
+    let blob = recovery_blob(&f);
+
+    // The KEK in force changes while the generation stays: the blob seals a KEK no longer used.
+    let resume = Resume(faults.clone());
+    faults.pause_writer();
+    let s2 = store.clone();
+    let change =
+        std::thread::spawn(move || s2.change_recovery_passphrase(&pass(NEW_PASS), &pass(NEW_PASS)));
+    assert!(
+        faults.wait_writer_paused(Duration::from_secs(60)),
+        "the change never reached the writer"
+    );
+    let old = store.testing_swap_kek(Kek::generate().expect("kek"));
+    drop(resume);
+    let r = change.join().expect("change thread");
+    store.testing_swap_kek(old);
+    assert!(matches!(r, Err(AuditError::Invalid(_))), "{r:?}");
+    assert_eq!(store.head(), head);
+    assert_eq!(recovery_blob(&f), blob);
+    assert!(rows_of(&f, EventType::CREDENTIAL_CHANGED).is_empty());
+}
+
+#[test]
 fn append_refuses_the_recovery_passphrase_change_only() {
     let (store, f) = new_store(fake_clock(START), MemKeyring::new());
     let head = store.head();
@@ -490,10 +631,13 @@ fn re_anchor_refused_when_anchors_present_or_restore_interrupted() {
     let head = store.head();
     let fr = keychain_first_retained(&f.ring, &f.install_id);
     assert_eq!(store.health().anchors_missing, None);
-    assert!(matches!(
+    let ops = f.ring.ops().len();
+    assert_eq!(
         store.re_anchor(confirmed()),
-        Err(AuditError::Invalid(_))
-    ));
+        Err(AuditError::Invalid(RE_ANCHOR_NOTHING_MISSING))
+    );
+    // Refused before any work: no verification ran (it would read the keychain anchors).
+    assert_eq!(f.ring.ops().len(), ops);
     assert_eq!(store.head(), head);
     assert_eq!(keychain_first_retained(&f.ring, &f.install_id), fr);
 
@@ -530,10 +674,11 @@ fn re_anchor_refused_when_anchors_present_or_restore_interrupted() {
     assert_eq!(h.anchors_blocked, Some(BarrierKind::Restore));
     assert_eq!(h.anchors_missing, None);
     let head = s.head();
-    assert!(matches!(
+    // Nothing is missing (the reset is due), which is checked before the barrier.
+    assert_eq!(
         s.re_anchor(confirmed()),
-        Err(AuditError::Invalid(_))
-    ));
+        Err(AuditError::Invalid(RE_ANCHOR_NOTHING_MISSING))
+    );
     assert_eq!(s.head(), head);
     assert!(verify_results(&s, &fb, "re_anchored").is_empty());
     s.shutdown();
@@ -566,10 +711,10 @@ fn re_anchor_refused_when_the_store_does_not_verify() {
     );
     let before = s.head().0;
 
-    assert!(matches!(
+    assert_eq!(
         s.re_anchor(confirmed()),
-        Err(AuditError::Invalid(_))
-    ));
+        Err(AuditError::Invalid(RE_ANCHOR_DOES_NOT_VERIFY))
+    );
     // The verification that refused it is recorded as a full verification, and nothing else.
     assert!(verify_results(&s, &f, "re_anchored").is_empty());
     let after: Vec<RawRow> = dump_rows(&f)
@@ -659,8 +804,336 @@ fn anchors_missing_none_during_interrupted_restore() {
     s.shutdown();
 }
 
+#[test]
+fn re_anchor_after_prune_rewrites_the_prune_values() {
+    let (store, f) = new_store(fake_clock(START), MemKeyring::new());
+    store.append_batch(mixed(8)).expect("append");
+    prune_below(&store, 5);
+    assert!(!dump_rows(&f).iter().any(|r| r.seq < 5), "GENESIS pruned");
+    let (first_retained_seq, last_pruned) = latest_prune_values(&f);
+    assert_eq!(first_retained_seq, 5);
+    store.shutdown();
+    // The first-retained entry is lost after the prune (PD-170): only `prune_log` still knows it.
+    f.keys()
+        .delete(&EntryName::FirstRetainedAnchor)
+        .expect("delete");
+
+    let (s, v) = ready(open(&f.data, &f.lock, f.config()).expect("open"));
+    assert_eq!(
+        kinds(&v.findings)
+            .into_iter()
+            .filter(|k| k.is_incident())
+            .collect::<Vec<_>>(),
+        vec![FindingKind::AnchorMissing]
+    );
+    assert_eq!(
+        s.health().anchors_missing,
+        Some(MissingAnchor::FirstRetained)
+    );
+    let c = s.re_anchor(confirmed()).expect("re-anchor");
+    // The latest prune_log row's values; GENESIS and every first-retained entry of the chain are
+    // gone, so the genesis hash is zero (informational once GENESIS is pruned, as recover writes).
+    assert_eq!(
+        keychain_first_retained(&f.ring, &f.install_id),
+        Some(FirstRetainedAnchor {
+            chain_id: f.chain_id.clone(),
+            genesis_hash: ZERO_HASH,
+            first_retained_seq,
+            first_retained_prev_hash: last_pruned,
+        })
+    );
+    assert!(
+        keychain_head(&f.ring, &f.install_id)
+            .expect("head anchor")
+            .seq
+            >= c.seq
+    );
+    assert_eq!(s.health().anchors_missing, None);
+    s.flush_head_anchor().expect("flush");
+    s.shutdown();
+
+    let (s, v) = ready(open(&f.data, &f.lock, f.config()).expect("open"));
+    assert_eq!(v.findings, vec![]);
+    assert_eq!(s.health().anchors_missing, None);
+    s.shutdown();
+}
+
+#[test]
+fn re_anchor_keeps_a_surviving_first_retained_entry_and_fails_closed_on_its_read() {
+    let faults = Faults::new();
+    let (store, f) = new_store(fake_clock(START), MemKeyring::new());
+    store.append_batch(mixed(8)).expect("append");
+    let genesis = dump_rows(&f)[0].record_hash;
+    prune_below(&store, 5);
+    let fr = keychain_first_retained(&f.ring, &f.install_id).expect("first-retained anchor");
+    assert_eq!((fr.genesis_hash, fr.first_retained_seq), (genesis, 5));
+    store.shutdown();
+    // Only the head entry is lost; the batch window keeps the start from rewriting it.
+    f.keys().delete(&EntryName::HeadAnchor).expect("delete");
+    let mut cfg = f.config();
+    cfg.hooks.faults = Some(faults.clone());
+    cfg.hooks.anchor_batch_window = Some(Duration::from_secs(3600));
+    let (s, _) = ready(open(&f.data, &f.lock, cfg).expect("open"));
+    assert_eq!(s.health().anchors_missing, Some(MissingAnchor::Head));
+
+    // The surviving entry cannot be read after the verification: nothing is logged or written
+    // (a zero genesis hash must never replace the one it holds).
+    let (ring, once) = (f.ring.clone(), AtomicBool::new(true));
+    faults.on_hit(FaultPoint::ReAnchorVerified, move || {
+        if once.swap(false, Ordering::SeqCst) {
+            ring.fail_next(
+                KeyOpKind::Get,
+                Some(EntryName::FirstRetainedAnchor),
+                KeyStoreError::Unavailable,
+                1,
+            );
+        }
+    });
+    assert_eq!(
+        s.re_anchor(confirmed()),
+        Err(AuditError::KeyStore(KeyStoreError::Unavailable))
+    );
+    assert!(verify_results(&s, &f, "re_anchored").is_empty());
+    assert_eq!(
+        keychain_first_retained(&f.ring, &f.install_id),
+        Some(fr.clone())
+    );
+    assert_eq!(keychain_head(&f.ring, &f.install_id), None);
+    assert_eq!(s.health().anchors_blocked, None);
+
+    // A retry takes the genesis hash from the surviving entry of this chain.
+    let c = s.re_anchor(confirmed()).expect("re-anchor");
+    assert_eq!(verify_results(&s, &f, "re_anchored"), vec![c.seq]);
+    assert_eq!(keychain_first_retained(&f.ring, &f.install_id), Some(fr));
+    assert!(
+        keychain_head(&f.ring, &f.install_id)
+            .expect("head anchor")
+            .seq
+            >= c.seq
+    );
+    assert_eq!(s.health().anchors_missing, None);
+    s.shutdown();
+}
+
+#[test]
+fn rolled_back_store_without_anchor_dir_is_re_anchored() {
+    let (store, f) = new_store(fake_clock(START), MemKeyring::new());
+    store.append_batch(mixed(8)).expect("append");
+    store.flush_head_anchor().expect("flush");
+    let head = store.head().0;
+    store.shutdown();
+    // The tail and both keychain entries are deleted: the prefix verifies, and nothing but the
+    // keychain knew the tail. This is the accepted PD-170 answer: without an anchor dir the
+    // rollback is re-anchored, and the rewrite stands in the log as its own incident.
+    raw_conn(&f)
+        .execute("DELETE FROM events WHERE seq > ?1", [(head - 3) as i64])
+        .expect("truncate");
+    for e in [EntryName::HeadAnchor, EntryName::FirstRetainedAnchor] {
+        f.keys().delete(&e).expect("delete");
+    }
+    let (s, v) = ready(open(&f.data, &f.lock, f.config()).expect("open"));
+    assert_eq!(
+        kinds(&v.findings)
+            .into_iter()
+            .filter(|k| k.is_incident())
+            .collect::<Vec<_>>(),
+        vec![FindingKind::AnchorMissing, FindingKind::AnchorMissing]
+    );
+    let c = s.re_anchor(confirmed()).expect("re-anchor");
+    assert_eq!(verify_results(&s, &f, "re_anchored"), vec![c.seq]);
+    assert!(s.open_incidents().contains(&c.seq));
+    s.shutdown();
+}
+
+#[test]
+fn rolled_back_store_with_anchor_dir_is_not_re_anchored() {
+    let (store, f) = new_store(fake_clock(START), MemKeyring::new());
+    let dir = tempfile::tempdir().expect("anchor dir");
+    store
+        .change_anchor_dir(Some(chosen(dir.path())), confirmed())
+        .expect("anchor dir setting");
+    store.append_batch(mixed(8)).expect("append");
+    store.flush_head_anchor().expect("flush");
+    assert!(store.testing_anchor_dir_drain(), "anchor-dir lines written");
+    store.shutdown();
+    // The anchor dir holds a line for the head (as a daily or APP_STOP line would).
+    let rows = dump_rows(&f);
+    let last = rows.last().expect("rows");
+    let line = to_line(&AnchorLine::Record {
+        seq: last.seq,
+        record_hash: last.record_hash,
+        epoch: last.epoch.clone(),
+        clock_behind: false,
+    });
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.path().join(file_name(&f.chain_id)))
+        .and_then(|mut file| file.write_all(format!("{line}\n").as_bytes()))
+        .expect("append line");
+    raw_conn(&f)
+        .execute("DELETE FROM events WHERE seq > ?1", [(last.seq - 3) as i64])
+        .expect("truncate");
+    for e in [EntryName::HeadAnchor, EntryName::FirstRetainedAnchor] {
+        f.keys().delete(&e).expect("delete");
+    }
+    let (s, _) = ready(open(&f.data, &f.lock, f.config()).expect("open"));
+    assert!(s.health().anchors_missing.is_some());
+    let before = s.head().0;
+
+    assert_eq!(
+        s.re_anchor(confirmed()),
+        Err(AuditError::Invalid(RE_ANCHOR_DOES_NOT_VERIFY))
+    );
+    let after: Vec<RawRow> = dump_rows(&f)
+        .into_iter()
+        .filter(|r| r.seq > before)
+        .collect();
+    assert_eq!(after.len(), 1);
+    let p = payload(&s, after[0].seq);
+    assert_eq!(p["scope"], "full");
+    assert!(
+        p["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .any(|x| x["kind"] == "anchor_dir_mismatch"),
+        "{p}"
+    );
+    assert!(verify_results(&s, &f, "re_anchored").is_empty());
+    assert_eq!(keychain_first_retained(&f.ring, &f.install_id), None);
+    s.shutdown();
+}
+
+#[test]
+fn re_anchor_loses_to_a_restore_that_took_its_barrier() {
+    let faults = Faults::new();
+    let (s, f, bundle, _out) = first_retained_lost(&faults);
+    // The re-anchor stops right before its completion; a restore of the older backup (a
+    // confirmed rollback) takes the barrier slot and stops before it reads the keychain.
+    let mut re_anchor_gate = gate(&faults, FaultPoint::ReAnchorBeforeComplete);
+    let mut restore_gate = gate(&faults, FaultPoint::RestoreBarrierHeld);
+    let s2 = s.clone();
+    let re_anchor = std::thread::spawn(move || s2.re_anchor(confirmed()));
+    re_anchor_gate.wait("the re-anchor completion");
+    let s3 = s.clone();
+    let restore = std::thread::spawn(move || {
+        s3.restore(chosen(&bundle), &pass(PASSPHRASE), Some(confirmed()))
+    });
+    restore_gate.wait("the restore barrier");
+
+    // The re-anchor's barrier is gone: it writes nothing and leaves the restore's barrier.
+    re_anchor_gate.open();
+    assert_eq!(
+        re_anchor.join().expect("re-anchor thread"),
+        Err(AuditError::Invalid(BARRIER_TAKEN))
+    );
+    assert_eq!(keychain_first_retained(&f.ring, &f.install_id), None);
+    assert_eq!(s.health().anchors_blocked, Some(BarrierKind::Restore));
+    restore_gate.open();
+    let report = restore
+        .join()
+        .expect("restore thread")
+        .expect("the restore completes");
+
+    // The keychain holds the restored chain's anchors.
+    wait_for("the restore's anchor reset", || {
+        s.health().anchors_blocked.is_none()
+    });
+    assert_eq!(s.head().2, report.new_chain_id);
+    assert_eq!(
+        keychain_head(&f.ring, &f.install_id).map(|a| a.chain_id),
+        Some(report.new_chain_id.clone())
+    );
+    assert_eq!(
+        keychain_first_retained(&f.ring, &f.install_id).map(|a| a.chain_id),
+        Some(report.new_chain_id.clone())
+    );
+    assert_eq!(s.health().anchors_missing, None);
+    s.flush_head_anchor().expect("flush");
+    s.shutdown();
+    let (s, v) = ready(open(&f.data, &f.lock, f.config()).expect("open"));
+    assert!(
+        !v.findings.iter().any(|x| x.kind.is_incident()),
+        "{:?}",
+        v.findings
+    );
+    s.shutdown();
+}
+
+#[test]
+fn a_restore_failing_after_it_took_the_re_anchor_barrier_leaves_no_barrier() {
+    let faults = Faults::new();
+    let (s, f, bundle, _out) = first_retained_lost(&faults);
+    let mut re_anchor_gate = gate(&faults, FaultPoint::ReAnchorBeforeComplete);
+    let mut restore_gate = gate(&faults, FaultPoint::RestoreBarrierHeld);
+    // The restore fails right after it took the slot (before its commit).
+    faults.fail(FaultPoint::RestoreBarrierHeld, 1);
+    let s2 = s.clone();
+    let re_anchor = std::thread::spawn(move || s2.re_anchor(confirmed()));
+    re_anchor_gate.wait("the re-anchor completion");
+    let s3 = s.clone();
+    let restore = std::thread::spawn(move || {
+        s3.restore(chosen(&bundle), &pass(PASSPHRASE), Some(confirmed()))
+    });
+    restore_gate.wait("the restore barrier");
+    re_anchor_gate.open();
+    assert_eq!(
+        re_anchor.join().expect("re-anchor thread"),
+        Err(AuditError::Invalid(BARRIER_TAKEN))
+    );
+    restore_gate.open();
+    assert!(restore.join().expect("restore thread").is_err());
+
+    // The re-anchor's barrier does not come back with the restore's failure: nothing holds
+    // the anchors, and a new re-anchor goes through.
+    assert_eq!(s.health().anchors_blocked, None);
+    assert_eq!(
+        s.health().anchors_missing,
+        Some(MissingAnchor::FirstRetained)
+    );
+    s.re_anchor(confirmed()).expect("re-anchor");
+    assert_eq!(
+        keychain_first_retained(&f.ring, &f.install_id).map(|a| a.chain_id),
+        Some(f.chain_id.clone())
+    );
+    s.shutdown();
+}
+
+#[test]
+fn re_anchor_refused_when_the_store_was_replaced_before_its_completion() {
+    let faults = Faults::new();
+    let (s, f, _bundle, _out) = first_retained_lost(&faults);
+    let mut g = gate(&faults, FaultPoint::ReAnchorBeforeComplete);
+    let s2 = s.clone();
+    let re_anchor = std::thread::spawn(move || s2.re_anchor(confirmed()));
+    g.wait("the re-anchor completion");
+    // As a restore commit does.
+    s.testing_bump_generation();
+    g.open();
+    assert_eq!(
+        re_anchor.join().expect("re-anchor thread"),
+        Err(AuditError::Invalid(RE_ANCHOR_RESTORED))
+    );
+    assert_eq!(keychain_first_retained(&f.ring, &f.install_id), None);
+    // Its own barrier is lifted.
+    assert_eq!(s.health().anchors_blocked, None);
+    s.shutdown();
+}
+
 // ---------------------------------------------------------------------------------------
 // Forget old install (PD-170, T20 m-9)
+
+#[test]
+fn for_install_addresses_install_ids_only() {
+    let (id, _) = new_ids().expect("ids");
+    let (other, _) = new_ids().expect("ids");
+    let ks = MemKeyStore::new(MemKeyring::new(), &id);
+    assert!(ks.for_install(&other).is_some());
+    let (upper, longer) = ("A".repeat(32), format!("{other}0"));
+    for bad in ["", "not an install id", upper.as_str(), longer.as_str()] {
+        assert!(ks.for_install(bad).is_none(), "{bad:?}");
+    }
+}
 
 #[test]
 fn orphan_installs_lists_archived_install_ids_only() {
@@ -718,10 +1191,17 @@ fn forget_install_deletes_pats_keeps_kek_by_default() {
 
     // Never the live install: a keystore of install A refuses A's orphan entry.
     let a_store = MemKeyStore::new(t.f.ring.clone(), &a_id);
-    assert!(matches!(
-        forget_install(&a_store, o, confirmed(), None),
-        Err(OpenError::Invalid(_))
-    ));
+    match forget_install(&a_store, o, confirmed(), None) {
+        Err(ForgetError {
+            error: OpenError::Invalid(_),
+            deleted,
+            not_deleted,
+        }) => {
+            assert!(deleted.is_empty());
+            assert_eq!(not_deleted, ["pat/i1", "pat/i2", "canary"]);
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
     assert!(raw(&t.f.ring, &a_id, "pat/i1").is_some());
 
     let report = forget_install(&*t.b_keys, o, confirmed(), None).expect("forget");
@@ -748,6 +1228,54 @@ fn forget_install_deletes_pats_keeps_kek_by_default() {
     left.sort();
     assert_eq!(orphans.len(), 1);
     assert_eq!(orphans[0].entries(), left.as_slice());
+    t.live.shutdown();
+}
+
+#[test]
+fn forget_install_failure_reports_what_was_and_was_not_deleted() {
+    let t = two_installs();
+    let a_id = t.f.install_id.clone();
+    let orphans = orphan_installs(&t.f.data, &*t.b_keys).expect("orphan_installs");
+    // The second deletion fails: the caller's corrective record needs both lists.
+    t.f.ring.fail_next(
+        KeyOpKind::Delete,
+        Some(EntryName::Pat("i2".into())),
+        KeyStoreError::Unavailable,
+        1,
+    );
+    match forget_install(&*t.b_keys, &orphans[0], confirmed(), Some(confirmed())) {
+        Err(ForgetError {
+            error: OpenError::KeyStore(KeyStoreError::Unavailable),
+            deleted,
+            not_deleted,
+        }) => {
+            assert_eq!(deleted, ["pat/i1"]);
+            assert_eq!(
+                not_deleted,
+                [
+                    "pat/i2",
+                    "canary",
+                    "first_retained_anchor",
+                    "head_anchor",
+                    "kek"
+                ]
+            );
+        }
+        other => panic!("expected a keychain failure, got {other:?}"),
+    }
+    assert_eq!(raw(&t.f.ring, &a_id, "pat/i1"), None);
+    for a in ["pat/i2"].iter().chain(ANCHOR_ACCOUNTS.iter()) {
+        assert!(raw(&t.f.ring, &a_id, a).is_some(), "{a}");
+    }
+    // A retry deletes the rest.
+    let orphans = orphan_installs(&t.f.data, &*t.b_keys).expect("orphan_installs");
+    let report =
+        forget_install(&*t.b_keys, &orphans[0], confirmed(), Some(confirmed())).expect("retry");
+    assert!(report.keys_deleted);
+    assert_eq!(
+        orphan_installs(&t.f.data, &*t.b_keys).expect("orphan_installs"),
+        vec![]
+    );
     t.live.shutdown();
 }
 

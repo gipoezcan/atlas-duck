@@ -196,6 +196,11 @@ fn os_forget_install_deletes_pats_keeps_kek_by_default() {
         std::slice::from_ref(&t.archived.file)
     );
 
+    // `for_install` addresses install ids only, whatever its caller checked.
+    for bad in ["", "not an install id", "7E570000000000000000000000000000"] {
+        assert!(t.b_keys.for_install(bad).is_none(), "{bad:?}");
+    }
+
     let report = forget_install(&*t.b_keys, &orphans[0], confirmed(), None).expect("forget");
     assert_eq!(report.deleted, ["pat/i1", "pat/i2", "canary"]);
     for i in INSTANCES {

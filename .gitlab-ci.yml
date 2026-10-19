@@ -99,6 +99,8 @@ rust:audit-keychain:
     - mkdir -p "$TMPDIR" "$XDG_DATA_HOME"
     - bash ci/keyring-ci.sh
     # M10 Task 9: the recovery-tier store APIs on the same Secret Service (all #[ignore]d).
+    # Unlike GitHub, no check-no-skips here (this image has no Node), as for the os_keystore run
+    # above: the GitHub legs are the gate that every listed test ran and passed.
     - KEYRING_CI_TEST=recovery_tier_os bash ci/keyring-ci.sh
 
 node:ci-checks:

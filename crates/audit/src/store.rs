@@ -717,17 +717,27 @@ impl Store {
         self.inner.shared.anchors.clear_barrier();
     }
 
-    /// The restore completion step: writes both anchors and lifts the restore barrier (also
-    /// the anchor rebuild of "Recover this log").
+    /// Holds the anchors for a one-shot rewrite (re-anchor, "Recover this log"): a
+    /// [`Barrier::ReAnchor`] at `seq` that only `guard`'s completion or the guard itself lifts.
+    pub(crate) fn install_rewrite_barrier(&self, seq: u64) -> Result<BarrierGuard, AuditError> {
+        self.inner.shared.anchors.install_owned(seq)
+    }
+
+    /// The completion of `guard`'s rewrite barrier: writes both anchors and lifts it, or
+    /// `Invalid(BARRIER_TAKEN)` (nothing written) when a restore took the slot.
     pub(crate) fn complete_restore_anchors(
         &self,
+        guard: &BarrierGuard,
         head: HeadAnchor,
         first_retained: FirstRetainedAnchor,
     ) -> Result<(), AuditError> {
+        let owner = guard
+            .owner()
+            .ok_or(AuditError::Invalid(crate::anchors::BARRIER_TAKEN))?;
         self.inner
             .shared
             .anchors
-            .complete_restore(head, first_retained)
+            .complete_restore(owner, head, first_retained)
     }
 
     pub fn health(&self) -> StoreHealth {
@@ -1099,6 +1109,12 @@ impl Store {
     /// `Invalid(PASSPHRASE_TOO_SHORT | PASSPHRASE_MISMATCH)`: nothing written. The derivation runs
     /// on the calling thread, never on the writer; a restore that replaced the KEK meanwhile makes
     /// the writer refuse the blob (`Invalid`). The caller offers the recovery note afterwards.
+    ///
+    /// Blocking: two Argon2id derivations (64 MiB each, seconds on a slow machine). An async
+    /// caller runs it off its executor (`spawn_blocking`). Not a revocation: the SAME KEK is
+    /// re-wrapped, so a backup taken before (its `recovery.bin`) and the old blob (left in the WAL
+    /// until the next checkpoint) still open with the old passphrase; changing it after a leak
+    /// does not take away data the leaker could copy (KEK rotation is out of scope).
     pub fn change_recovery_passphrase(
         &self,
         new: &SecretString,
@@ -1116,7 +1132,11 @@ impl Store {
     /// result: re_anchored, dialog_text_sha256}` flagged `integrity_incident` is appended, then
     /// both anchors are written from the verified store (first-retained, then head). Returns that
     /// `VERIFY`. A keychain failure after it is the error; the incident stands and the anchors
-    /// stay missing (a retry logs another one).
+    /// stay missing (a retry logs another one); a failed read of the values to write refuses
+    /// before the incident. The anchors are held by a barrier of this call's own: a restore that
+    /// takes the slot meanwhile makes it `Invalid(anchors::BARRIER_TAKEN)` (or
+    /// `RE_ANCHOR_RESTORED` once it committed), nothing written. Refusal texts: the `RE_ANCHOR_*`
+    /// consts.
     pub fn re_anchor(&self, confirmed: Confirmed) -> Result<Committed, AuditError> {
         crate::reanchor::re_anchor(self, confirmed)
     }
@@ -1237,8 +1257,9 @@ impl Store {
         first_retained: FirstRetainedAnchor,
     ) -> Result<(), AuditError> {
         let (seq, record_hash, chain_id) = self.head();
-        let guard = self.install_barrier(Barrier::Restore { seq, reset: None })?;
+        let guard = self.install_rewrite_barrier(seq)?;
         self.complete_restore_anchors(
+            &guard,
             HeadAnchor {
                 chain_id,
                 seq,
@@ -1812,6 +1833,13 @@ impl Store {
         self.inner.shared.generation.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Replaces the KEK this handle serves without bumping the generation, returning the old
+    /// one (feature `testing`): a blob sealed for the old KEK is refused from now on.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn testing_swap_kek(&self, kek: Kek) -> Kek {
+        std::mem::replace(&mut lock(&self.inner.shared.keys).kek, kek)
+    }
+
     /// `testing::insert_fake_prune` (feature `testing`).
     #[cfg(any(test, feature = "testing"))]
     pub(crate) fn testing_fake_prune(
@@ -1864,14 +1892,21 @@ impl Store {
         self.clear_barrier();
     }
 
+    /// A re-anchor's (owned) barrier at `seq` (feature `testing`).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn testing_rewrite_barrier(&self, seq: u64) -> Result<BarrierGuard, AuditError> {
+        self.install_rewrite_barrier(seq)
+    }
+
     /// `complete_restore_anchors` for integration tests (feature `testing`).
     #[cfg(any(test, feature = "testing"))]
     pub fn testing_complete_restore_anchors(
         &self,
+        guard: &BarrierGuard,
         head: HeadAnchor,
         first_retained: FirstRetainedAnchor,
     ) -> Result<(), AuditError> {
-        self.complete_restore_anchors(head, first_retained)
+        self.complete_restore_anchors(guard, head, first_retained)
     }
 
     /// A pragma as the writer connection reports it (feature `testing`).

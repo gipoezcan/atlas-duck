@@ -850,6 +850,7 @@ impl Writer {
             anchors: &shared.anchors,
             old: Some(old),
         };
+        crash!(&self.st.hooks, RestoreBarrierHeld)?;
         let prior = read_prior(&*req.keys)?;
         let live = LiveHead {
             seq: self.st.head.seq,

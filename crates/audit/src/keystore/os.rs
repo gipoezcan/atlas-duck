@@ -177,8 +177,12 @@ impl KeyStore for OsKeyStore {
         }
     }
 
-    /// The same platform store and locality dirs under another install's service name.
+    /// The same platform store and locality dirs under another install's service name; `None`
+    /// for anything but an install id (32 lowercase hex), whatever the caller checked.
     fn for_install(&self, install_id: &str) -> Option<Box<dyn KeyStore>> {
+        if !crate::open::is_id(install_id) {
+            return None;
+        }
         Some(Box::new(OsKeyStore {
             install_id: install_id.to_string(),
             service: service_name(install_id),

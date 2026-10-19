@@ -236,8 +236,7 @@ pub(crate) enum Barrier {
     /// from before the `RESTORE` would describe the replaced DB. `reset` is the completion
     /// (the anchors of the restored store): once set, the anchor thread writes it, retrying with
     /// backoff like a prune's first-retained update, and lifts the barrier on success (§8.11
-    /// step 5). `None` while the restore is still running (or for "Recover this log", whose
-    /// one-shot `complete_restore` writes the anchors).
+    /// step 5). `None` while the restore is still running.
     Restore {
         seq: u64,
         reset: Option<RestoreReset>,
@@ -257,7 +256,23 @@ pub(crate) enum Barrier {
     /// after the commit and before the new head is published. Caps and writes nothing (nothing
     /// past the current head is published meanwhile).
     PruneReserved,
+    /// Re-anchor, or the anchor rebuild of "Recover this log": no head write until its one-shot
+    /// completion ([`AnchorShared::complete_restore`]) wrote both entries from the store at
+    /// `seq` or later. Owned: only the completion and the guard of `owner` lift it. A restore may
+    /// take the slot from it ([`AnchorShared::swap_barrier`]) and never puts it back, so its owner
+    /// then fails at the completion and writes nothing.
+    ReAnchor { seq: u64, owner: u64 },
 }
+
+/// The slot holds the [`Barrier::ReAnchor`] of `owner`.
+fn owns(b: &Option<Barrier>, owner: u64) -> bool {
+    matches!(b, Some(Barrier::ReAnchor { owner: o, .. }) if *o == owner)
+}
+
+/// `Invalid` text: the completion of a re-anchor (or of "Recover this log"'s anchor rebuild)
+/// found another barrier than its own, i.e. a restore took the slot: nothing was written.
+pub const BARRIER_TAKEN: &str =
+    "the anchor barrier of this rewrite was taken by a restore: nothing was written";
 
 /// The anchors a restore completion writes: first-retained, then head (§8.11 step 5).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,7 +287,9 @@ impl Barrier {
             Barrier::Prune { .. } | Barrier::Hold { .. } | Barrier::PruneReserved => {
                 BarrierKind::Prune
             }
-            Barrier::Restore { .. } | Barrier::RestoreHold => BarrierKind::Restore,
+            Barrier::Restore { .. } | Barrier::RestoreHold | Barrier::ReAnchor { .. } => {
+                BarrierKind::Restore
+            }
         }
     }
 }
@@ -287,6 +304,8 @@ pub enum BarrierKind {
 }
 
 struct RestoreJob {
+    /// The owner of the [`Barrier::ReAnchor`] it completes.
+    owner: u64,
     head: HeadAnchor,
     first_retained: FirstRetainedAnchor,
     reply: SyncSender<Result<(), AuditError>>,
@@ -320,11 +339,14 @@ pub(crate) struct AnchorState {
     head_missing: bool,
     /// The same for the first-retained entry (only prune, a restore or re-anchor write it).
     first_retained_missing: bool,
+    /// The owner the next [`Barrier::ReAnchor`] gets.
+    next_owner: u64,
 }
 
 impl AnchorState {
     fn new() -> AnchorState {
         AnchorState {
+            next_owner: 1,
             head_missing: false,
             first_retained_missing: false,
             window: BATCH_WINDOW,
@@ -354,7 +376,7 @@ impl AnchorState {
             return None;
         }
         match &self.barrier {
-            Some(Barrier::Restore { .. } | Barrier::RestoreHold) => None,
+            Some(Barrier::Restore { .. } | Barrier::RestoreHold | Barrier::ReAnchor { .. }) => None,
             Some(
                 Barrier::Prune {
                     seq, record_hash, ..
@@ -490,14 +512,21 @@ pub(crate) struct AnchorHealth {
 /// Releases an installed barrier when dropped, unless [`BarrierGuard::complete`] says the
 /// operation went through (the anchor thread, or the restore completion, lifts it then). Hold
 /// it across the `PRUNE`/`RESTORE` work so an error path cannot leave the anchors blocked.
+/// The guard of a [`Barrier::ReAnchor`] lifts only that barrier, never one that replaced it.
 pub struct BarrierGuard {
     shared: Option<Arc<AnchorShared>>,
+    owner: Option<u64>,
 }
 
 impl BarrierGuard {
     /// The operation succeeded: the barrier stays until its update/reset lifts it.
     pub fn complete(mut self) {
         self.shared = None;
+    }
+
+    /// The owner of the [`Barrier::ReAnchor`] this guard holds.
+    pub(crate) fn owner(&self) -> Option<u64> {
+        self.owner
     }
 
     /// Replaces the reserved slot of [`AnchorShared::reserve_prune_barrier`] with `b`.
@@ -512,7 +541,10 @@ impl BarrierGuard {
 impl Drop for BarrierGuard {
     fn drop(&mut self) {
         if let Some(s) = self.shared.take() {
-            s.clear_barrier();
+            match self.owner {
+                Some(owner) => s.clear_owned(owner),
+                None => s.clear_barrier(),
+            }
         }
     }
 }
@@ -595,7 +627,48 @@ impl AnchorShared {
         self.cv.notify_all();
         Ok(BarrierGuard {
             shared: Some(self.clone()),
+            owner: None,
         })
+    }
+
+    /// Installs a [`Barrier::ReAnchor`] at `seq` with a new owner, refused like any second
+    /// barrier. The guard lifts it only while it is still installed.
+    pub(crate) fn install_owned(self: &Arc<Self>, seq: u64) -> Result<BarrierGuard, AuditError> {
+        let owner = {
+            let mut st = lock(&self.state);
+            if st.stop || st.dead {
+                return Err(st.unusable());
+            }
+            if st.barrier.is_some() {
+                return Err(AuditError::Invalid(
+                    "an anchor barrier is already installed",
+                ));
+            }
+            let owner = st.next_owner;
+            st.next_owner += 1;
+            st.barrier = Some(Barrier::ReAnchor { seq, owner });
+            st.clear_failure();
+            owner
+        };
+        self.cv.notify_all();
+        Ok(BarrierGuard {
+            shared: Some(self.clone()),
+            owner: Some(owner),
+        })
+    }
+
+    /// Lifts the [`Barrier::ReAnchor`] of `owner` if it is still installed; anything else that
+    /// holds the slot (a restore took it) stays.
+    fn clear_owned(&self, owner: u64) {
+        {
+            let mut st = lock(&self.state);
+            if !owns(&st.barrier, owner) {
+                return;
+            }
+            st.barrier = None;
+            st.clear_failure();
+        }
+        self.cv.notify_all();
     }
 
     /// Takes the barrier slot for a prune before its transaction (see
@@ -615,6 +688,7 @@ impl AnchorShared {
         }
         Ok(BarrierGuard {
             shared: Some(self.clone()),
+            owner: None,
         })
     }
 
@@ -640,7 +714,9 @@ impl AnchorShared {
     /// if it fails before its commit (a prune's pending first-retained update, a deferred
     /// reconciliation): the restore replaces the store those barriers belong to (N-6, owned
     /// deliberately). Waits until a keychain write already in flight has returned, so the
-    /// keychain does not change behind the caller once this returns `Ok`.
+    /// keychain does not change behind the caller once this returns `Ok`. A
+    /// [`Barrier::ReAnchor`] it replaces is not returned, so it never comes back: its owner,
+    /// still running, then fails at the completion ([`BARRIER_TAKEN`]) and writes nothing.
     pub(crate) fn swap_barrier(&self, b: Option<Barrier>) -> Result<Option<Barrier>, AuditError> {
         let old = {
             let mut st = lock(&self.state);
@@ -649,7 +725,7 @@ impl AnchorShared {
             }
             let old = std::mem::replace(&mut st.barrier, b);
             st.clear_failure();
-            old
+            old.filter(|o| !matches!(o, Barrier::ReAnchor { .. }))
         };
         self.cv.notify_all();
         // A flush is answered by the thread's next turn, i.e. after any write in flight.
@@ -766,10 +842,13 @@ impl AnchorShared {
         }
     }
 
-    /// The restore completion step: writes both entries (on the anchor thread) and lifts the
-    /// restore barrier. `head` must be at or past the barrier's `RESTORE` record.
+    /// The one-shot completion of the [`Barrier::ReAnchor`] of `owner` (re-anchor, "Recover this
+    /// log"): writes both entries (on the anchor thread) and lifts that barrier. Refused with
+    /// [`BARRIER_TAKEN`] when the slot holds anything else, checked here and again when the
+    /// anchor thread takes the job. `head` must be at or past the barrier's `seq`.
     pub(crate) fn complete_restore(
         &self,
+        owner: u64,
         head: HeadAnchor,
         first_retained: FirstRetainedAnchor,
     ) -> Result<(), AuditError> {
@@ -783,17 +862,20 @@ impl AnchorShared {
                 return Err(AuditError::Invalid("restore anchors name different chains"));
             }
             match &st.barrier {
-                Some(Barrier::Restore { seq, reset: None }) if head.seq >= *seq => {}
-                _ => {
-                    return Err(AuditError::Invalid(
-                        "no restore barrier for this head anchor",
-                    ));
+                Some(Barrier::ReAnchor { seq, owner: o }) if *o == owner => {
+                    if head.seq < *seq {
+                        return Err(AuditError::Invalid(
+                            "the head anchor is older than its barrier",
+                        ));
+                    }
                 }
+                _ => return Err(AuditError::Invalid(BARRIER_TAKEN)),
             }
             if st.restore_job.is_some() {
                 return Err(AuditError::Invalid("a restore completion is in progress"));
             }
             st.restore_job = Some(RestoreJob {
+                owner,
                 head,
                 first_retained,
                 reply,
@@ -946,15 +1028,25 @@ fn run_loop(shared: &AnchorShared, keys: &dyn KeyStore, scale_div: u32) {
             // Never a write on the way out; `flush` callers learn the store closed.
             break;
         }
-        // A restore completion writes both entries on its own.
+        // A re-anchor completion writes both entries on its own, but only while its barrier
+        // holds the slot (a restore may have taken it since the job was queued).
         if let Some(job) = st.restore_job.take() {
+            let owned = |b: &Option<Barrier>| owns(b, job.owner);
+            if !owned(&st.barrier) {
+                let _ = job.reply.send(Err(AuditError::Invalid(BARRIER_TAKEN)));
+                continue;
+            }
             drop(st);
             let r = set_first_retained(keys, &job.first_retained)
                 .and_then(|()| set_head(keys, &job.head));
             st = lock(&shared.state);
             let reply = match r {
                 Ok(()) => {
-                    st.barrier = None;
+                    // Only its own barrier: a restore that took the slot during the write keeps
+                    // its own (it reads the keychain only after this write returned).
+                    if owned(&st.barrier) {
+                        st.barrier = None;
+                    }
                     // A published head newer than the restore head (same chain) stays the head
                     // and is anchored next; the keychain now holds the restore head.
                     let newer = matches!(&st.head, Some(h)

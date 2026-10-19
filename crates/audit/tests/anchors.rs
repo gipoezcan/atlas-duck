@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use atlas_duck_audit::anchors::{AnchorEntryError, BarrierKind, FirstRetainedAnchor, HeadAnchor};
+use atlas_duck_audit::anchors::{
+    AnchorEntryError, BARRIER_TAKEN, BarrierKind, FirstRetainedAnchor, HeadAnchor,
+};
 use atlas_duck_audit::error::AuditError;
 use atlas_duck_audit::keystore::{
     EntryName, KeyStore, KeyStoreError, KeyringLocality, service_name,
@@ -291,7 +293,7 @@ fn restore_barrier_blocks_head() {
     append_n(&store, 2);
     store.flush_head_anchor().expect("flush");
     let heads = sets_of(&f, EntryName::HeadAnchor);
-    let guard = store.testing_restore_barrier(3).expect("barrier");
+    let guard = store.testing_rewrite_barrier(3).expect("barrier");
     assert_eq!(store.health().anchors_blocked, Some(BarrierKind::Restore));
     append_n(&store, 3);
     std::thread::sleep(Duration::from_millis(1300));
@@ -312,7 +314,7 @@ fn restore_barrier_blocks_head() {
         ..head.clone()
     };
     assert!(matches!(
-        store.testing_complete_restore_anchors(stale, fr.clone()),
+        store.testing_complete_restore_anchors(&guard, stale, fr.clone()),
         Err(AuditError::Invalid(_))
     ));
     // Both anchors must name one chain.
@@ -321,13 +323,12 @@ fn restore_barrier_blocks_head() {
         ..fr.clone()
     };
     assert!(matches!(
-        store.testing_complete_restore_anchors(head.clone(), other_chain),
+        store.testing_complete_restore_anchors(&guard, head.clone(), other_chain),
         Err(AuditError::Invalid(_))
     ));
     store
-        .testing_complete_restore_anchors(head.clone(), fr.clone())
+        .testing_complete_restore_anchors(&guard, head.clone(), fr.clone())
         .expect("complete restore");
-    guard.complete();
     assert_eq!(keychain_head(&f), head);
     assert_eq!(keychain_first_retained(&f), fr);
     assert_eq!(store.health().anchors_blocked, None);
@@ -338,10 +339,22 @@ fn restore_barrier_blocks_head() {
         .seq
         == 7));
     // And a second completion has no barrier to lift.
-    assert!(matches!(
-        store.testing_complete_restore_anchors(head, fr),
-        Err(AuditError::Invalid(_))
-    ));
+    assert_eq!(
+        store.testing_complete_restore_anchors(&guard, head.clone(), fr.clone()),
+        Err(AuditError::Invalid(BARRIER_TAKEN))
+    );
+
+    // Neither the completion nor the guard of a rewrite touch a barrier that is not theirs (a
+    // restore's, which took the slot).
+    let restore = store.testing_restore_barrier(7).expect("restore barrier");
+    assert_eq!(
+        store.testing_complete_restore_anchors(&guard, head, fr.clone()),
+        Err(AuditError::Invalid(BARRIER_TAKEN))
+    );
+    drop(guard);
+    assert_eq!(store.health().anchors_blocked, Some(BarrierKind::Restore));
+    drop(restore);
+    assert_eq!(store.health().anchors_blocked, None);
 }
 
 #[test]
@@ -573,11 +586,11 @@ fn restore_completion_timeout_takes_the_job_back() {
         store.flush_head_anchor(),
         Err(AuditError::AnchorFlushTimeout)
     );
-    let _guard = store.testing_restore_barrier(1).expect("barrier");
+    let guard = store.testing_rewrite_barrier(1).expect("barrier");
     let (head, fr) = restore_args(&store);
     // Not started: the job is taken back, nothing is written later, a retry is possible.
     assert_eq!(
-        store.testing_complete_restore_anchors(head.clone(), fr.clone()),
+        store.testing_complete_restore_anchors(&guard, head.clone(), fr.clone()),
         Err(AuditError::AnchorFlushTimeout)
     );
     block_set.store(false, Ordering::SeqCst);
@@ -588,7 +601,7 @@ fn restore_completion_timeout_takes_the_job_back() {
     assert_eq!(store.health().anchors_blocked, Some(BarrierKind::Restore));
     assert_ne!(keychain_first_retained(&f), fr);
     store
-        .testing_complete_restore_anchors(head.clone(), fr.clone())
+        .testing_complete_restore_anchors(&guard, head.clone(), fr.clone())
         .expect("retry");
     assert_eq!(keychain_head(&f), head);
     assert_eq!(keychain_first_retained(&f), fr);
@@ -602,17 +615,17 @@ fn restore_completion_timeout_while_writing_is_outcome_unknown() {
         MemKeyring::new(),
         gated(&panic_set, &block_set),
     );
-    let _guard = store.testing_restore_barrier(1).expect("barrier");
+    let guard = store.testing_rewrite_barrier(1).expect("barrier");
     let (head, fr) = restore_args(&store);
     block_set.store(true, Ordering::SeqCst);
     // The thread takes the job and blocks inside its first keychain write.
     assert_eq!(
-        store.testing_complete_restore_anchors(head.clone(), fr.clone()),
+        store.testing_complete_restore_anchors(&guard, head.clone(), fr.clone()),
         Err(AuditError::AnchorOutcomeUnknown)
     );
     // A retry does not see "in progress" (it queues behind the stuck write and times out).
     assert!(!matches!(
-        store.testing_complete_restore_anchors(head.clone(), fr.clone()),
+        store.testing_complete_restore_anchors(&guard, head.clone(), fr.clone()),
         Err(AuditError::Invalid(_))
     ));
     block_set.store(false, Ordering::SeqCst);

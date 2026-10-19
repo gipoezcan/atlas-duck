@@ -3,7 +3,9 @@
 //! compared before anything is written, and the `recovery` row and its `CREDENTIAL_CHANGED
 //! {change: recovery_passphrase}` commit in one writer transaction, so neither exists without the
 //! other. The two Argon2id runs (64 MiB each) happen on the caller's thread and never hold up
-//! appends; the writer only checks that the blob seals the KEK still in force.
+//! appends (an async caller moves the call off its executor); the writer only checks that the
+//! blob seals the KEK still in force. The KEK itself stays: backups taken before still open with
+//! the old passphrase (see `Store::change_recovery_passphrase`).
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
