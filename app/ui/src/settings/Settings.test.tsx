@@ -626,6 +626,8 @@ describe('Settings', () => {
     for (const outcome of [
       'installed',
       'installed_local_bin',
+      'installed_local_bin_on_path',
+      'replaced_stale_entry',
       'already_installed',
       'removed',
       'already_on_path',
@@ -642,12 +644,21 @@ describe('Settings', () => {
         expect(text).toContain('~/.local/bin');
         expect(text).toMatch(/does not find the atlas-duck command/);
         expect(text).toMatch(/log out and in again/);
+        expect(text).toContain('not on your PATH');
+      } else if (outcome === 'installed_local_bin_on_path') {
+        // PD-177: the directory is on the PATH, so the text claims nothing to fix.
+        expect(text).toContain('~/.local/bin, which is on your PATH');
+        expect(text).not.toContain('not on your PATH');
+        expect(text).not.toMatch(/log out and in again/);
       } else {
         expect(text).not.toContain('~/.local/bin');
       }
+      if (outcome === 'replaced_stale_entry') {
+        expect(text).toMatch(/earlier atlas-duck folder that no longer exists was removed/);
+      }
       unmount();
     }
-    expect(seen.size).toBe(5);
+    expect(seen.size).toBe(7);
   });
 
   it('deb/rpm: no removal button, the package sentence is the status', async () => {
@@ -674,6 +685,7 @@ describe('Settings', () => {
       path_too_long: /user PATH is too long/,
       io: /command file could not be written or removed/,
       cli_toml: /records where the app is/,
+      newer_version: /installed by a newer atlas-duck/,
     };
     for (const [kind, text] of Object.entries(texts)) {
       vi.mocked(cliInstall).mockRejectedValue({ kind: 'cli_install', error: { kind } });

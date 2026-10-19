@@ -234,6 +234,12 @@
   },
   {
     "error": {
+      "kind": "newer_version"
+    },
+    "kind": "cli_install"
+  },
+  {
+    "error": {
       "kind": "no_procedure"
     },
     "kind": "removal"

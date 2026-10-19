@@ -3,6 +3,7 @@
 //! and by the mock-runtime tests in `tests/`; nothing here touches the machine.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -31,6 +32,8 @@ pub struct FakeOps {
     broadcasts: Mutex<usize>,
     /// `write_file` of this path fails (undo tests).
     fail_write: Mutex<Option<PathBuf>>,
+    /// What `session_path` answers (none by default: the `PATH` of the test process is not read).
+    session_path: Mutex<Option<OsString>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -74,6 +77,10 @@ impl FakeOps {
 
     pub fn fail_writes_to(&self, p: &Path) {
         *lock(&self.fail_write) = Some(p.to_path_buf());
+    }
+
+    pub fn set_session_path(&self, v: Option<OsString>) {
+        *lock(&self.session_path) = v;
     }
 
     pub fn mode_of(&self, p: &Path) -> Option<u32> {
@@ -159,5 +166,9 @@ impl PlatformOps for FakeOps {
 
     fn read_cli_toml(&self, p: &Path) -> Result<Option<CliToml>, PinnedError> {
         Ok(lock(&self.state).cli_tomls.get(p).cloned())
+    }
+
+    fn session_path(&self) -> Option<OsString> {
+        lock(&self.session_path).clone()
     }
 }

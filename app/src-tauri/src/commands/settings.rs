@@ -41,7 +41,7 @@ use super::credential::{Connected, SubmitFailure, connection_failure};
 use super::dto::{Args, refuse};
 use super::{CommandError, blocking, core, finish};
 use crate::cli_install::{
-    self, APP_CHANGE_KEY, Inputs, InstallError, Kind, Layout, PlatformOps, SystemOps,
+    self, APP_CHANGE_KEY, Artifact, Inputs, InstallError, Kind, Layout, PlatformOps, SystemOps,
 };
 use crate::credential::{self, PatOpenError};
 use crate::recovery_tier;
@@ -481,11 +481,15 @@ pub enum RetestOutcome {
 }
 
 /// `cli_install` / `cli_uninstall`'s answer (§12.3): what happened, as a fixed word the page maps
-/// to its own text: `installed`, `installed_local_bin`, `already_installed`, `removed`, or
-/// `already_on_path` (deb/rpm have the CLI in `/usr/bin`; nothing is installed or removed).
-/// `installed_local_bin` is the answer where the CLI went to `~/.local/bin` (macOS, AppImage): that
-/// directory is not on every default PATH (macOS has none, Ubuntu adds it at login only when it
-/// existed), and the app cannot read the session PATH (§7.7), so the text says what to check.
+/// to its own text: `installed`, `installed_local_bin`, `installed_local_bin_on_path`,
+/// `replaced_stale_entry`, `already_installed`, `removed`, or `already_on_path` (deb/rpm have the
+/// CLI in `/usr/bin`; nothing is installed or removed).
+/// `installed_local_bin` is the answer where the CLI went to `~/.local/bin` (macOS, AppImage) and
+/// that directory is not on this process's PATH (it is not on every default PATH: macOS has none,
+/// Ubuntu adds it at login only when it existed), so the text says what to check; with the
+/// directory on the PATH the word is `installed_local_bin_on_path` (PD-177; the PATH is read only
+/// for this hint, §7.7). `replaced_stale_entry` is a Windows install that also removed the PATH
+/// entry of an earlier, since moved, install folder of this app.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CliInstallAnswer {
     pub outcome: &'static str,
@@ -493,6 +497,8 @@ pub struct CliInstallAnswer {
 
 pub const OUTCOME_INSTALLED: &str = "installed";
 pub const OUTCOME_INSTALLED_LOCAL_BIN: &str = "installed_local_bin";
+pub const OUTCOME_INSTALLED_LOCAL_BIN_ON_PATH: &str = "installed_local_bin_on_path";
+pub const OUTCOME_REPLACED_STALE_ENTRY: &str = "replaced_stale_entry";
 pub const OUTCOME_ALREADY_INSTALLED: &str = "already_installed";
 pub const OUTCOME_REMOVED: &str = "removed";
 pub const OUTCOME_ALREADY_ON_PATH: &str = "already_on_path";
@@ -589,9 +595,18 @@ pub fn cli_install_dto(
     }
     settings.record_app_change(APP_CHANGE_KEY, installed(false), installed(true))?;
     match cli_install::install(ops, &layout) {
-        Ok(_) => Ok(CliInstallAnswer {
+        Ok(report) => Ok(CliInstallAnswer {
             outcome: match layout.kind {
-                Kind::Macos { .. } | Kind::AppImage { .. } => OUTCOME_INSTALLED_LOCAL_BIN,
+                Kind::Macos { .. } | Kind::AppImage { .. } => {
+                    if cli_install::cli_dir_on_path(ops, &layout) == Some(true) {
+                        OUTCOME_INSTALLED_LOCAL_BIN_ON_PATH
+                    } else {
+                        OUTCOME_INSTALLED_LOCAL_BIN
+                    }
+                }
+                Kind::Windows { .. } if report.changed.contains(&Artifact::StaleEntry) => {
+                    OUTCOME_REPLACED_STALE_ENTRY
+                }
                 Kind::Windows { .. } | Kind::Packaged => OUTCOME_INSTALLED,
             },
         }),

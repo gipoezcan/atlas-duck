@@ -467,10 +467,20 @@ export type PruneReport =
 /**
  * `cli_install` / `cli_uninstall` (spec 12.3): what happened, as a fixed word. `already_on_path` is
  * deb/rpm, where the CLI is in `/usr/bin` and nothing is installed or removed. `installed_local_bin`
- * is macOS and the AppImage: the CLI is in `~/.local/bin`, which is not on every default PATH.
+ * is macOS and the AppImage: the CLI is in `~/.local/bin`, which is not on the PATH of the app
+ * (not on every default PATH); `installed_local_bin_on_path` is the same with the directory on it
+ * (PD-177). `replaced_stale_entry` is a Windows install that also removed the PATH entry of an
+ * earlier, since moved, install folder.
  */
 export interface CliInstallAnswer {
-  outcome: 'installed' | 'installed_local_bin' | 'already_installed' | 'removed' | 'already_on_path';
+  outcome:
+    | 'installed'
+    | 'installed_local_bin'
+    | 'installed_local_bin_on_path'
+    | 'replaced_stale_entry'
+    | 'already_installed'
+    | 'removed'
+    | 'already_on_path';
 }
 
 /** The user's answer for one instance's revoke step (`removal_mark`). */
@@ -845,8 +855,8 @@ export type CommandError =
   | { kind: 'settings'; error: CoreError }
   /**
    * "Install CLI to PATH" or its removal failed (T27): `error.kind` is `no_stable_path`,
-   * `unsafe_path`, `occupied`, `unsupported`, `registry`, `path_too_long`, `io` or `cli_toml`; no
-   * path, no OS text.
+   * `unsafe_path`, `occupied`, `unsupported`, `registry`, `path_too_long`, `io`, `cli_toml` or
+   * `newer_version` (a file a newer atlas-duck wrote); no path, no OS text.
    */
   | { kind: 'cli_install'; error: CoreError }
   /**

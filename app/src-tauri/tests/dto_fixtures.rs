@@ -25,7 +25,8 @@ use atlas_duck_app_lib::commands::onboarding::{OnboardingSectionDto, OnboardingT
 use atlas_duck_app_lib::commands::running::KillAnswer;
 use atlas_duck_app_lib::commands::settings::{
     CliInstallAnswer, ConfinementDto, ExtraLayerDto, OUTCOME_ALREADY_INSTALLED,
-    OUTCOME_ALREADY_ON_PATH, OUTCOME_INSTALLED, OUTCOME_INSTALLED_LOCAL_BIN, OUTCOME_REMOVED,
+    OUTCOME_ALREADY_ON_PATH, OUTCOME_INSTALLED, OUTCOME_INSTALLED_LOCAL_BIN,
+    OUTCOME_INSTALLED_LOCAL_BIN_ON_PATH, OUTCOME_REMOVED, OUTCOME_REPLACED_STALE_ENTRY,
     RestoreCancelDto, RestoreDoneDto, RetestOutcome, SettingsGet,
 };
 use atlas_duck_app_lib::commands::{
@@ -703,6 +704,8 @@ fn command_errors() -> Vec<CommandError> {
         CommandError::CliInstall(InstallError::PathTooLong),
         CommandError::CliInstall(InstallError::Io),
         CommandError::CliInstall(InstallError::CliToml),
+        // M10 T19 (PD-177): a wrapper or launcher a newer atlas-duck wrote.
+        CommandError::CliInstall(InstallError::NewerVersion),
         // M6 T28: "Prepare for removal" refusals, the kind only.
         CommandError::Removal(RemovalError::NoProcedure),
         CommandError::Removal(RemovalError::Unticked),
@@ -1563,6 +1566,8 @@ fn cli_install_answers() -> Vec<CliInstallAnswer> {
     [
         OUTCOME_INSTALLED,
         OUTCOME_INSTALLED_LOCAL_BIN,
+        OUTCOME_INSTALLED_LOCAL_BIN_ON_PATH,
+        OUTCOME_REPLACED_STALE_ENTRY,
         OUTCOME_ALREADY_INSTALLED,
         OUTCOME_REMOVED,
         OUTCOME_ALREADY_ON_PATH,

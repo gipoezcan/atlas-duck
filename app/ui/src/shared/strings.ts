@@ -547,7 +547,11 @@ export const SETTINGS_TEXT = {
     installed:
       'Installed. Open a new terminal, and restart your MCP clients, so they find the atlas-duck command.',
     installed_local_bin:
-      'Installed in ~/.local/bin. If a new terminal does not find the atlas-duck command, add ~/.local/bin to the PATH of your shell (on Ubuntu, log out and in again), and restart your MCP clients afterwards.',
+      'Installed to ~/.local/bin (not on your PATH). If a new terminal does not find the atlas-duck command, add ~/.local/bin to the PATH of your shell (on Ubuntu, log out and in again), and restart your MCP clients afterwards.',
+    installed_local_bin_on_path:
+      'Installed to ~/.local/bin, which is on your PATH. Open a new terminal, and restart your MCP clients, so they find the atlas-duck command.',
+    replaced_stale_entry:
+      'Installed. The PATH entry of an earlier atlas-duck folder that no longer exists was removed. Open a new terminal, and restart your MCP clients, so they find the atlas-duck command.',
     already_installed: 'The atlas-duck command was already installed.',
     removed: 'Removed. New terminals no longer find the atlas-duck command.',
     already_on_path:
@@ -566,6 +570,8 @@ export const SETTINGS_TEXT = {
     path_too_long: 'Your user PATH is too long to add the atlas-duck folder: shorten it and try again',
     io: 'The command file could not be written or removed',
     cli_toml: 'The file that records where the app is could not be written',
+    newer_version:
+      'The command file was installed by a newer atlas-duck and was left alone: use that version, or remove the file and try again',
     other: 'The command line could not be installed or removed',
   } as Readonly<Record<string, string>>,
   removal: 'Prepare for removal',

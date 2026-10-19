@@ -6,6 +6,12 @@
     "outcome": "installed_local_bin"
   },
   {
+    "outcome": "installed_local_bin_on_path"
+  },
+  {
+    "outcome": "replaced_stale_entry"
+  },
+  {
     "outcome": "already_installed"
   },
   {

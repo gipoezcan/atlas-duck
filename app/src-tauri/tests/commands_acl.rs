@@ -2989,12 +2989,53 @@ mod settings_commands {
             appdir: None,
         })
         .map_err(|e| format!("{e:?}"))?;
-        for (layout, word) in [(windows, "installed"), (mac, "installed_local_bin")] {
+        for (layout, word) in [
+            (windows.clone(), "installed"),
+            (mac.clone(), "installed_local_bin"),
+        ] {
             let ops = std::sync::Arc::new(FakeOps::new());
             let (s, o) = (h.core().settings(), ops.clone());
             let res = blocking(move || cli_install_dto(&*s, &*o, Ok(layout))).await??;
             assert_eq!(res.outcome, word);
         }
+
+        // PD-177: with `~/.local/bin` on the PATH of this process the text says so; another PATH
+        // keeps the "not on your PATH" word.
+        for (session_path, word) in [
+            (
+                std::env::join_paths(["/usr/bin", "/Users/u/.local/bin"])?,
+                "installed_local_bin_on_path",
+            ),
+            (
+                std::env::join_paths(["/usr/bin", "/Users/other/.local/bin"])?,
+                "installed_local_bin",
+            ),
+        ] {
+            let ops = std::sync::Arc::new(FakeOps::new());
+            ops.set_session_path(Some(session_path));
+            let (s, o, l) = (h.core().settings(), ops.clone(), mac.clone());
+            let res = blocking(move || cli_install_dto(&*s, &*o, Ok(l))).await??;
+            assert_eq!(res.outcome, word);
+        }
+
+        // M-11: an install that replaced the entry of a moved install folder says so.
+        let ops = std::sync::Arc::new(FakeOps::with_path(r"C:\Windows"));
+        let old = Layout {
+            kind: Kind::Windows {
+                install_dir: r"C:\Old\atlas-duck".into(),
+            },
+            app_path: r"C:\Old\atlas-duck\atlas-duck-app.exe".into(),
+            cli_toml: windows.cli_toml.clone(),
+        };
+        for (layout, word) in [(old, "installed"), (windows, "replaced_stale_entry")] {
+            let (s, o) = (h.core().settings(), ops.clone());
+            let res = blocking(move || cli_install_dto(&*s, &*o, Ok(layout))).await??;
+            assert_eq!(res.outcome, word);
+        }
+        assert_eq!(
+            ops.state().path.as_deref(),
+            Some(r"C:\Windows;C:\Program Files\atlas-duck")
+        );
         Ok(())
     }
 

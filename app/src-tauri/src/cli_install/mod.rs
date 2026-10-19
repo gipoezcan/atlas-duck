@@ -57,6 +57,15 @@ pub trait PlatformOps: Send + Sync {
     /// `cli.toml` (§7.7): atomic, newer-schema files are refused.
     fn write_cli_toml(&self, p: &Path, c: &CliToml) -> Result<(), PinnedError>;
     fn read_cli_toml(&self, p: &Path) -> Result<Option<CliToml>, PinnedError>;
+    /// Whether a file exists at `p` (a directory or a missing path is `false`). Reads nothing.
+    fn file_exists(&self, p: &Path) -> io::Result<bool> {
+        Ok(self.read_file(p)?.is_some())
+    }
+    /// The `PATH` this process runs with, as a hint for the install text only (§7.7: nothing is
+    /// located or executed through it). `None` when unset.
+    fn session_path(&self) -> Option<OsString> {
+        None
+    }
 }
 
 /// Why nothing was (or could not be) installed. The kind only: no path, no OS text.
@@ -80,6 +89,9 @@ pub enum InstallError {
     Io,
     /// `cli.toml` could not be written (unparsable or newer-schema file, I/O).
     CliToml,
+    /// A wrapper or launcher in the way carries a marker of a newer layout: a newer atlas-duck
+    /// installed it, so this one leaves it alone (PD-177).
+    NewerVersion,
 }
 
 impl InstallError {
@@ -93,6 +105,7 @@ impl InstallError {
             Self::PathTooLong => "path_too_long",
             Self::Io => "io",
             Self::CliToml => "cli_toml",
+            Self::NewerVersion => "newer_version",
         }
     }
 }
@@ -234,12 +247,16 @@ impl Layout {
                 Ok(layout)
             }
             Platform::Macos => {
-                if macos::unstable(&i.current_exe) {
+                let cli = exe_dir.join("atlas-duck");
+                // M-10: the link points at `cli`, and removal only takes links whose target is a
+                // bundle's CLI; a build that is not an app bundle never makes a link it refuses
+                // to remove.
+                if macos::unstable(&i.current_exe) || !macos::is_ours(&cli) {
                     return Err(InstallError::NoStablePath);
                 }
                 mk(
                     Kind::Macos {
-                        cli: exe_dir.join("atlas-duck"),
+                        cli,
                         link: macos::link_path(&i.home),
                     },
                     i.current_exe.clone(),
@@ -334,6 +351,9 @@ impl Inputs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Artifact {
     PathEntry,
+    /// Install only: the PATH entry of an earlier install folder that is gone (Windows, PD-177).
+    /// `uninstall` never lists it.
+    StaleEntry,
     Symlink,
     Wrapper,
     Launcher,
@@ -365,7 +385,9 @@ fn install_steps(
     done: &mut Report,
 ) -> Result<(), InstallError> {
     match &layout.kind {
-        Kind::Windows { .. } => windows::install(ops, &layout.kind, done)?,
+        Kind::Windows { .. } => {
+            windows::install(ops, &layout.kind, &layout.app_path, &layout.cli_toml, done)?;
+        }
         Kind::Macos { .. } => macos::install(ops, &layout.kind, done)?,
         Kind::AppImage { .. } => linux::install(ops, &layout.kind, done)?,
         // §12.3: deb/rpm are already on PATH; nothing to write, not even `cli.toml`.
@@ -431,6 +453,28 @@ pub fn is_installed(ops: &dyn PlatformOps, layout: &Layout) -> bool {
             ops.read_cli_toml(&layout.cli_toml),
             Ok(Some(CliToml { app_path: Some(p) })) if p == layout.app_path
         )
+}
+
+/// `dir` is one of the absolute entries of `path` (PD-177). A relative or empty entry is the
+/// current directory, not `dir`; a trailing separator does not matter.
+pub fn local_bin_on_path(path: Option<&std::ffi::OsStr>, dir: &Path) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    looks_absolute(dir)
+        && std::env::split_paths(path).any(|entry| looks_absolute(&entry) && entry == dir)
+}
+
+/// Whether the folder this layout puts the CLI in (`~/.local/bin`) is on the PATH of this
+/// process: `None` where the CLI does not go to such a folder (Windows edits the user PATH itself,
+/// deb/rpm are in `/usr/bin`).
+pub fn cli_dir_on_path(ops: &dyn PlatformOps, layout: &Layout) -> Option<bool> {
+    let dir = match &layout.kind {
+        Kind::Macos { link, .. } => link.parent(),
+        Kind::AppImage { wrapper, .. } => wrapper.parent(),
+        Kind::Windows { .. } | Kind::Packaged => return None,
+    };
+    Some(dir.is_some_and(|d| local_bin_on_path(ops.session_path().as_deref(), d)))
 }
 
 // ---------- the real ops ----------
@@ -569,6 +613,18 @@ impl PlatformOps for SystemOps {
 
     fn read_cli_toml(&self, p: &Path) -> Result<Option<CliToml>, PinnedError> {
         atlas_duck_ipc::paths::read_cli_toml(p)
+    }
+
+    fn file_exists(&self, p: &Path) -> io::Result<bool> {
+        match std::fs::metadata(p) {
+            Ok(m) => Ok(m.is_file()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn session_path(&self) -> Option<OsString> {
+        std::env::var_os("PATH")
     }
 }
 

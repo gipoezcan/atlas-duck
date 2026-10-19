@@ -423,6 +423,8 @@ export const isCliInstallAnswer = (v: unknown): v is CliInstallAnswer =>
     outcome: oneOf(
       'installed',
       'installed_local_bin',
+      'installed_local_bin_on_path',
+      'replaced_stale_entry',
       'already_installed',
       'removed',
       'already_on_path',

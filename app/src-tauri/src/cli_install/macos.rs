@@ -23,7 +23,7 @@ pub fn link_path(home: &Path) -> PathBuf {
 }
 
 /// The target is the CLI inside an app bundle: `*.app/Contents/MacOS/atlas-duck`.
-fn is_ours(target: &Path) -> bool {
+pub(super) fn is_ours(target: &Path) -> bool {
     let names: Vec<&str> = target
         .components()
         .rev()

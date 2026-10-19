@@ -13,10 +13,55 @@ use serde_json::{Map, Value};
 
 use super::{Artifact, InstallError, Kind, PlatformOps, Report, io_error};
 
+/// The layout version this build writes (the `vN` of both markers). A reader accepts every version
+/// up to this one (a table of known layouts, v1 first) and refuses a newer one (PD-177).
+pub const MARKER_VERSION: u32 = 1;
+/// The wrapper's marker without its version.
+pub const WRAPPER_MARKER_NAME: &str = "# atlas-duck-cli-wrapper";
+/// The launcher's marker without its version.
+pub const LAUNCHER_MARKER_NAME: &str = "# atlas-duck-launcher";
 /// The wrapper's second line: what makes the file ours.
 pub const WRAPPER_MARKER: &str = "# atlas-duck-cli-wrapper v1";
 /// The launcher's second line.
 pub const LAUNCHER_MARKER: &str = "# atlas-duck-launcher v1";
+
+/// Whose a file is, by its marker line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Marker {
+    /// A marker of a version this build knows (up to its own): ours to replace and to remove.
+    Ours,
+    /// A marker of a newer version: a newer atlas-duck wrote it; it is neither replaced nor removed.
+    Newer,
+    /// No marker of this name and a plain version number: not ours.
+    Foreign,
+}
+
+/// Classifies `bytes` by the line `<name> v<N>` (exact line, `N` plain decimal digits without a
+/// leading zero, 1 or more). A newer marker anywhere wins over an older one in the same file.
+pub fn marker_state(bytes: &[u8], name: &str, current: u32) -> Marker {
+    let text = String::from_utf8_lossy(bytes);
+    let mut state = Marker::Foreign;
+    for line in text.lines() {
+        let Some(digits) = line
+            .strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix(" v"))
+        else {
+            continue;
+        };
+        if digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        // Empty or too large for a `u32`: no version this build can name, so not a marker.
+        let Ok(version) = digits.parse::<u32>() else {
+            continue;
+        };
+        if version > current {
+            return Marker::Newer;
+        }
+        state = Marker::Ours;
+    }
+    state
+}
 
 /// `~/.local/bin/atlas-duck`.
 pub fn wrapper_path(home: &Path) -> PathBuf {
@@ -100,8 +145,8 @@ pub fn launcher_text(appimage: &str) -> String {
     )
 }
 
-fn has_marker(bytes: &[u8], marker: &str) -> bool {
-    String::from_utf8_lossy(bytes).lines().any(|l| l == marker)
+fn marker_of(bytes: &[u8], name: &str) -> Marker {
+    marker_state(bytes, name, MARKER_VERSION)
 }
 
 /// A symlink at `p`, dangling or not, is never ours: this module writes regular files. `read_file`
@@ -115,25 +160,49 @@ fn is_symlink(ops: &dyn PlatformOps, p: &Path) -> Result<bool, InstallError> {
     }
 }
 
-/// Writes `bytes` to `p` unless it is already so; refuses a file without `marker` and any symlink.
+/// What `install` finds at `p`.
+enum Slot {
+    /// Nothing, or a file with a marker of a known version: written (replacing it).
+    Write,
+    /// Already exactly `bytes`.
+    Same,
+}
+
+/// Looks at `p` before anything is written: a symlink or a file without a marker of a known
+/// version is `Occupied`, one with a newer marker is `NewerVersion`.
+fn inspect(
+    ops: &dyn PlatformOps,
+    p: &Path,
+    bytes: &[u8],
+    name: &str,
+) -> Result<Slot, InstallError> {
+    if is_symlink(ops, p)? {
+        return Err(InstallError::Occupied);
+    }
+    match ops.read_file(p) {
+        Ok(None) => Ok(Slot::Write),
+        Ok(Some(existing)) if existing == bytes => Ok(Slot::Same),
+        Ok(Some(existing)) => match marker_of(&existing, name) {
+            Marker::Ours => Ok(Slot::Write),
+            Marker::Newer => Err(InstallError::NewerVersion),
+            Marker::Foreign => Err(InstallError::Occupied),
+        },
+        Err(e) => Err(io_error(&e)),
+    }
+}
+
+/// Writes `bytes` to `p` unless it is already so; refuses what [`inspect`] refuses.
 fn write_owned(
     ops: &dyn PlatformOps,
     p: &Path,
     bytes: &[u8],
     mode: u32,
-    marker: &str,
+    name: &str,
     artifact: Artifact,
     done: &mut Report,
 ) -> Result<(), InstallError> {
-    if is_symlink(ops, p)? {
-        return Err(InstallError::Occupied);
-    }
-    match ops.read_file(p) {
-        Ok(None) => {}
-        Ok(Some(existing)) if existing == bytes => return Ok(()),
-        Ok(Some(existing)) if has_marker(&existing, marker) => {}
-        Ok(Some(_)) => return Err(InstallError::Occupied),
-        Err(e) => return Err(io_error(&e)),
+    if matches!(inspect(ops, p, bytes, name)?, Slot::Same) {
+        return Ok(());
     }
     ops.write_file(p, bytes, mode).map_err(|e| io_error(&e))?;
     done.changed.push(artifact);
@@ -151,31 +220,37 @@ pub fn install(ops: &dyn PlatformOps, kind: &Kind, done: &mut Report) -> Result<
     };
     check_appimage_path(appimage)?;
     let image = appimage.to_str().ok_or(InstallError::UnsafePath)?;
+    let wrapper_bytes = wrapper_script(image).into_bytes();
+    let launcher_bytes = launcher_text(image).into_bytes();
+    // Both files are looked at first: a refusal for the second leaves the first untouched.
+    inspect(ops, wrapper, &wrapper_bytes, WRAPPER_MARKER_NAME)?;
+    inspect(ops, launcher, &launcher_bytes, LAUNCHER_MARKER_NAME)?;
     write_owned(
         ops,
         wrapper,
-        wrapper_script(image).as_bytes(),
+        &wrapper_bytes,
         0o755,
-        WRAPPER_MARKER,
+        WRAPPER_MARKER_NAME,
         Artifact::Wrapper,
         done,
     )?;
     write_owned(
         ops,
         launcher,
-        launcher_text(image).as_bytes(),
+        &launcher_bytes,
         0o644,
-        LAUNCHER_MARKER,
+        LAUNCHER_MARKER_NAME,
         Artifact::Launcher,
         done,
     )
 }
 
-/// Removes `p` when it carries `marker` (never a symlink).
+/// Removes `p` when it carries a marker of a known version (never a symlink, never a file of a
+/// newer version or without a marker).
 fn remove_owned(
     ops: &dyn PlatformOps,
     p: &Path,
-    marker: &str,
+    name: &str,
     artifact: Artifact,
     removed: &mut Vec<Artifact>,
 ) -> Result<(), InstallError> {
@@ -183,12 +258,12 @@ fn remove_owned(
         return Ok(());
     }
     match ops.read_file(p) {
-        Ok(Some(existing)) if has_marker(&existing, marker) => {
+        Ok(Some(existing)) if marker_of(&existing, name) == Marker::Ours => {
             ops.remove(p).map_err(|e| io_error(&e))?;
             removed.push(artifact);
             Ok(())
         }
-        // Not ours or not there: left alone.
+        // Not ours, newer, or not there: left alone.
         Ok(_) => Ok(()),
         Err(e) => Err(io_error(&e)),
     }
@@ -207,10 +282,22 @@ pub fn uninstall(
         return Err(InstallError::Unsupported);
     };
     if wanted(Artifact::Wrapper) {
-        remove_owned(ops, wrapper, WRAPPER_MARKER, Artifact::Wrapper, removed)?;
+        remove_owned(
+            ops,
+            wrapper,
+            WRAPPER_MARKER_NAME,
+            Artifact::Wrapper,
+            removed,
+        )?;
     }
     if wanted(Artifact::Launcher) {
-        remove_owned(ops, launcher, LAUNCHER_MARKER, Artifact::Launcher, removed)?;
+        remove_owned(
+            ops,
+            launcher,
+            LAUNCHER_MARKER_NAME,
+            Artifact::Launcher,
+            removed,
+        )?;
     }
     Ok(())
 }

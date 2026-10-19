@@ -8,6 +8,8 @@
 //! order; the only text it can change besides the removed segment is a trailing `;` that
 //! `install` swallowed when it appended.
 
+use std::path::Path;
+
 use super::{Artifact, InstallError, Kind, PlatformOps, Report, registry_error};
 
 /// `Some(dir)` of a Windows layout, as the PATH entry text: no trailing separator, and nothing a
@@ -83,18 +85,86 @@ pub fn path_remove(current: &str, dir: &str) -> Option<String> {
     Some(kept.join(";"))
 }
 
-pub fn install(ops: &dyn PlatformOps, kind: &Kind, done: &mut Report) -> Result<(), InstallError> {
+pub fn install(
+    ops: &dyn PlatformOps,
+    kind: &Kind,
+    app_path: &Path,
+    cli_toml: &Path,
+    done: &mut Report,
+) -> Result<(), InstallError> {
     let dir = entry(kind)?;
     let current = ops.user_path_get().map_err(|e| registry_error(&e))?;
-    if let Some(next) = path_append(current.as_deref(), &dir) {
+    // An earlier install of this app, since moved: its entry goes in the same write.
+    let without_stale = stale_entry(ops, app_path, cli_toml, &dir)
+        .zip(current.as_deref())
+        .and_then(|(stale, path)| path_remove(path, &stale));
+    let replaced = without_stale.is_some();
+    let base = without_stale.or(current);
+    let appended = path_append(base.as_deref(), &dir);
+    let next = match (&appended, replaced) {
+        (Some(next), _) => Some(next.clone()),
+        (None, true) => base,
+        (None, false) => None,
+    };
+    if let Some(next) = next {
         if next.encode_utf16().count() > MAX_PATH_UNITS {
             return Err(InstallError::PathTooLong);
         }
         ops.user_path_set(&next).map_err(|e| registry_error(&e))?;
-        done.changed.push(Artifact::PathEntry);
+        if replaced {
+            done.changed.push(Artifact::StaleEntry);
+        }
+        if appended.is_some() {
+            done.changed.push(Artifact::PathEntry);
+        }
         ops.broadcast_setting_change();
     }
     Ok(())
+}
+
+/// A drive path: `X:\` or `X:/` and more. UNC names are not followed (a `stat` on an unreachable
+/// server blocks for a long time).
+fn drive_path(text: &str) -> bool {
+    let b = text.as_bytes();
+    b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')
+}
+
+/// The PATH entry of the folder an earlier install of this app lived in, when that install is
+/// provably ours and gone (PD-177, M-11): `cli.toml` (written by `install`, one per host) names the
+/// old app file; the file is a drive path with the same file name as this app's, in a folder that
+/// can be a PATH entry other than this install's, with no `.`/`..` segment, and it no longer
+/// exists. Anything else (no `cli.toml`, another program, an unreadable answer) leaves every entry
+/// alone.
+fn stale_entry(
+    ops: &dyn PlatformOps,
+    app_path: &Path,
+    cli_toml: &Path,
+    current_dir: &str,
+) -> Option<String> {
+    let recorded = ops.read_cli_toml(cli_toml).ok().flatten()?.app_path?;
+    let text = recorded.to_str()?;
+    if !drive_path(text) {
+        return None;
+    }
+    let (parent, name) = text.rsplit_once(['\\', '/'])?;
+    let own_name = app_path.to_str()?.rsplit(['\\', '/']).next()?;
+    if name.is_empty() || !name.eq_ignore_ascii_case(own_name) {
+        return None;
+    }
+    if parent.split(['\\', '/']).any(|s| s == "." || s == "..") {
+        return None;
+    }
+    let old = entry(&Kind::Windows {
+        install_dir: parent.into(),
+    })
+    .ok()?;
+    if normalized(&old) == normalized(current_dir) {
+        return None;
+    }
+    match ops.file_exists(&recorded) {
+        Ok(false) => Some(old),
+        _ => None,
+    }
 }
 
 pub fn uninstall(
