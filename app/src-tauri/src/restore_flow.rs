@@ -370,7 +370,7 @@ pub fn restore_without_store(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Mutex;
     use std::sync::mpsc::sync_channel;
 
@@ -687,7 +687,7 @@ mod tests {
     }
 
     /// The diagnostic lines `f` writes on this thread, through the allowlist (§7.7).
-    fn diag_lines<T>(f: impl FnOnce() -> T) -> (T, String) {
+    pub(crate) fn diag_lines<T>(f: impl FnOnce() -> T) -> (T, String) {
         use tracing_subscriber::Registry;
         use tracing_subscriber::layer::SubscriberExt;
 

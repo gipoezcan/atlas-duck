@@ -280,6 +280,17 @@ fn anchor_dir_changed(store: &Store, out: &dyn EventOut) -> AnchorDirDto {
     }
 }
 
+/// diag event (§7.7): a confirmation was answered Ok, but a fact its text named changed while it was
+/// up, so nothing was done and the answer is `cancelled` (T14 review I-2); `reason` names the flow.
+pub const LOG_EVENT_TEXT_STALE: &str = "recovery_text_stale";
+
+/// The answer when a fact the confirmation named changed during it: logged (a `cancelled` is
+/// otherwise not), then `cancelled`.
+fn stale(flow: &'static str) -> CommandError {
+    tracing::info!(event = LOG_EVENT_TEXT_STALE, reason = flow);
+    CommandError::Cancelled
+}
+
 /// What a confirmation of the anchor directory named of the store: the directory in force and the
 /// chain whose file goes there. Read again after the dialog: a text that no longer holds changes
 /// nothing (T14 review I-2).
@@ -333,7 +344,7 @@ pub fn set_anchor_dir(
         return Err(CommandError::NotReady);
     }
     if anchor_dir_facts(store) != facts {
-        return Err(CommandError::Cancelled);
+        return Err(stale("anchor_dir_set"));
     }
     store
         .change_anchor_dir(Some(dir), confirmed)
@@ -364,7 +375,7 @@ pub fn remove_anchor_dir(
         return Err(CommandError::NotReady);
     }
     if anchor_dir_facts(store) != facts {
-        return Err(CommandError::Cancelled);
+        return Err(stale("anchor_dir_remove"));
     }
     store
         .change_anchor_dir(None, confirmed)
@@ -421,7 +432,7 @@ pub fn re_anchor(
         return Err(CommandError::NotReady);
     }
     if re_anchor_gate(store)? != missing {
-        return Err(CommandError::Cancelled);
+        return Err(stale("re_anchor"));
     }
     match store.re_anchor(confirmed) {
         Ok(verify) => {
@@ -564,7 +575,7 @@ pub fn forget(
         return Err(CommandError::Cancelled);
     }
     if listed_orphan(data, keys, install_id)?.as_ref() != Some(&orphan) {
-        return Err(CommandError::Cancelled);
+        return Err(stale("forget_install"));
     }
     // `forget_install` deletes every candidate (an absent one "succeeds"): name only those there.
     let present = |names: &[String]| -> Vec<String> {
@@ -766,14 +777,21 @@ mod tests {
                 .store
                 .testing_set_anchor_dir(Some(b_text.clone()), confirmed_test());
         });
-        let got = set_anchor_dir(
-            &r.store,
-            &set_meanwhile,
-            || Some(chosen(&a)),
-            &never,
-            &Events::default(),
-        );
+        let (got, log) = crate::restore_flow::tests::diag_lines(|| {
+            set_anchor_dir(
+                &r.store,
+                &set_meanwhile,
+                || Some(chosen(&a)),
+                &never,
+                &Events::default(),
+            )
+        });
         assert_eq!(got, Err(CommandError::Cancelled));
+        // Unlike a user's Cancel, the refusal is in the diagnostic log (its flow only).
+        assert!(
+            log.contains(LOG_EVENT_TEXT_STALE) && log.contains("anchor_dir_set"),
+            "{log}"
+        );
         assert_eq!(
             r.store.settings().anchor_dir.as_deref(),
             Some(b_text.as_str())
@@ -2046,6 +2064,8 @@ mod tests {
 
         // The keystore cannot address the install when the deletion begins: the first record
         // stands, the corrective one says nothing was deleted.
+        // Two answers: the listing before the dialogs and the one after them; the deletion's own
+        // `for_install` is the third call, and gets none.
         let addressable = Addressable {
             inner: o.b_keys.clone(),
             left: AtomicU32::new(2),
