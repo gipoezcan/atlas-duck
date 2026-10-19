@@ -1423,6 +1423,11 @@ fn restore_job<R: Runtime>(
     call: &StoreCall,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<RestoreDoneDto, CommandError> {
+    // Read again now that the job holds the slot (T14 review I-2): a recovery-passphrase change
+    // window opened since the check in `restore_begin` would otherwise run beside the restore.
+    if credential::current_purpose(app).is_some() {
+        return Err(CommandError::Busy);
+    }
     let report = restore_flow::run_live_restore(
         store,
         confirmer,
@@ -1549,6 +1554,43 @@ fn recovery_inputs<R: Runtime>(app: &AppHandle<R>) -> Result<RecoveryInputs, Com
     Ok((state, store, confirmer))
 }
 
+/// Runs a recovery-tier `flow` (its dialogs and its store call) as the serving state's one job
+/// (T14 review I-2, `ServeState::spawn_recovery_job`): `busy` while an export, a backup, a restore
+/// or another flow holds the slot, or while the credential window is open (as `restore_begin`);
+/// `not_ready` once the quit path began. The slot is claimed first and the credential window read
+/// second (its open for a passphrase change reads the slot under its own lock), so a flow and that
+/// window never run side by side. `flow` gets its `stop`: the quit path's freeze or the job's
+/// cancel flag, which the quit path sets before it waits for the flow.
+async fn recovery_job<R, T, F>(app: &AppHandle<R>, flow: F) -> Result<T, CommandError>
+where
+    R: Runtime,
+    T: Send + 'static,
+    F: FnOnce(&AppHandle<R>, &RecoveryInputs, &dyn Fn() -> bool) -> Result<T, CommandError>
+        + Send
+        + 'static,
+{
+    let inputs = recovery_inputs(app)?;
+    if credential::current_purpose(app).is_some() {
+        return Err(CommandError::Busy);
+    }
+    let handle = app.clone();
+    let state = inputs.0.clone();
+    let rx = state
+        .spawn_recovery_job(move |cancel| {
+            if credential::current_purpose(&handle).is_some() {
+                return Err(CommandError::Busy);
+            }
+            let stop =
+                || cancel.load(std::sync::atomic::Ordering::SeqCst) || inputs.0.shutting_down();
+            flow(&handle, &inputs, &stop)
+        })
+        .map_err(|e| match e {
+            JobRefused::Busy => CommandError::Busy,
+            JobRefused::ShuttingDown => CommandError::NotReady,
+        })?;
+    rx.await.map_err(|_| CommandError::Internal)?
+}
+
 /// Rust's folder dialog for the anchor directory (§8.5: no §7.7 local-filesystem check, a share is
 /// what it is for); `None` when cancelled, or when the answer names no filesystem path. Blocks
 /// until the user answers: the blocking pool only.
@@ -1568,8 +1610,10 @@ fn pick_anchor_folder<R: Runtime>(
 
 /// `recovery_passphrase_change {}` (§8.6, PD-169; also the offer after a restore, §8.11 step 2):
 /// opens the credential window for `change_recovery_passphrase` (`busy` while it is open for
-/// anything else, `not_ready` while no store is open). The new passphrase, entered twice, enters
-/// there only (`submit_secret`); the window then offers the recovery note.
+/// anything else or while the job slot is held: a recovery-tier flow, an export, a backup or a
+/// restore, T14 review I-2; `not_ready` while no store is open or once the quit path began, M-7).
+/// The new passphrase, entered twice, enters there only (`submit_secret`); the window then offers
+/// the recovery note.
 #[tauri::command]
 pub async fn recovery_passphrase_change<R: Runtime>(
     app: AppHandle<R>,
@@ -1577,6 +1621,7 @@ pub async fn recovery_passphrase_change<R: Runtime>(
 ) -> Result<(), CommandError> {
     let Args(RecoveryPassphraseChangeArgs {}) = args;
     let response = match recovery_inputs(&app) {
+        Ok((state, _, _)) if state.shutting_down() => Err(CommandError::NotReady),
         Ok(_) => {
             let handle = app.clone();
             blocking(move || {
@@ -1593,81 +1638,60 @@ pub async fn recovery_passphrase_change<R: Runtime>(
     finish(&app, response)
 }
 
-/// `anchor_dir_set {}` (§8.5, PD-166): Rust's native confirmation, then its folder dialog, then
-/// `Store::change_anchor_dir` (its writability check: `anchor_dir {not_writable}` is "This folder
-/// cannot be written"). See `recovery_tier::set_anchor_dir`.
+/// `anchor_dir_set {}` (§8.5, PD-166): Rust's folder dialog, then its native confirmation naming
+/// the folder chosen, then `Store::change_anchor_dir` (its writability check: `anchor_dir
+/// {not_writable}` is "This folder cannot be written"), as the serving state's one job. See
+/// `recovery_tier::set_anchor_dir`.
 #[tauri::command]
 pub async fn anchor_dir_set<R: Runtime>(
     app: AppHandle<R>,
     args: Args<AnchorDirSetArgs>,
 ) -> Result<recovery_tier::AnchorDirDto, CommandError> {
     let Args(AnchorDirSetArgs {}) = args;
-    let response = match recovery_inputs(&app) {
-        Ok((state, store, confirmer)) => {
-            let handle = app.clone();
-            blocking(move || {
-                recovery_tier::set_anchor_dir(
-                    &store,
-                    &*confirmer,
-                    || pick_anchor_folder(&handle),
-                    &|| state.shutting_down(),
-                    &handle,
-                )
-            })
-            .await
-        }
-        Err(e) => Err(e),
-    };
+    let response = recovery_job(&app, |handle, (_, store, confirmer), stop| {
+        recovery_tier::set_anchor_dir(
+            store,
+            &**confirmer,
+            || pick_anchor_folder(handle),
+            stop,
+            handle,
+        )
+    })
+    .await;
     note_failure(&response);
     finish(&app, response)
 }
 
 /// `anchor_dir_remove {}` (§8.5, PD-166): Rust's native confirmation, then
-/// `Store::change_anchor_dir(None)`. See `recovery_tier::remove_anchor_dir`.
+/// `Store::change_anchor_dir(None)`, as the serving state's one job. See
+/// `recovery_tier::remove_anchor_dir`.
 #[tauri::command]
 pub async fn anchor_dir_remove<R: Runtime>(
     app: AppHandle<R>,
     args: Args<AnchorDirRemoveArgs>,
 ) -> Result<recovery_tier::AnchorDirDto, CommandError> {
     let Args(AnchorDirRemoveArgs {}) = args;
-    let response = match recovery_inputs(&app) {
-        Ok((state, store, confirmer)) => {
-            let handle = app.clone();
-            blocking(move || {
-                recovery_tier::remove_anchor_dir(
-                    &store,
-                    &*confirmer,
-                    &|| state.shutting_down(),
-                    &handle,
-                )
-            })
-            .await
-        }
-        Err(e) => Err(e),
-    };
+    let response = recovery_job(&app, |handle, (_, store, confirmer), stop| {
+        recovery_tier::remove_anchor_dir(store, &**confirmer, stop, handle)
+    })
+    .await;
     note_failure(&response);
     finish(&app, response)
 }
 
 /// `re_anchor {}` (§8.7, PD-170): only while Settings offers it (a keychain anchor entry missing,
-/// no barrier); Rust's native confirmation, then `Store::re_anchor` (an integrity incident). See
-/// `recovery_tier::re_anchor`.
+/// no barrier); Rust's native confirmation, then `Store::re_anchor` (an integrity incident), as
+/// the serving state's one job. See `recovery_tier::re_anchor`.
 #[tauri::command]
 pub async fn re_anchor<R: Runtime>(
     app: AppHandle<R>,
     args: Args<ReAnchorArgs>,
 ) -> Result<recovery_tier::ReAnchoredDto, CommandError> {
     let Args(ReAnchorArgs {}) = args;
-    let response = match recovery_inputs(&app) {
-        Ok((state, store, confirmer)) => {
-            let handle = app.clone();
-            blocking(move || {
-                recovery_tier::re_anchor(&store, &*confirmer, &|| state.shutting_down(), &handle)
-            })
-            .await
-        }
-        Err(e) => Err(e),
-    };
+    let response = recovery_job(&app, |handle, (_, store, confirmer), stop| {
+        recovery_tier::re_anchor(store, &**confirmer, stop, handle)
+    })
+    .await;
     note_failure(&response);
     finish(&app, response)
 }
@@ -1709,30 +1733,31 @@ pub async fn orphan_installs<R: Runtime>(
 
 /// `forget_install {install_id}` (PD-170): only an install of a fresh `orphan_installs` list; two
 /// native dialogs (the tokens, then the archived log's keys); `CONFIG_CHANGED {key:
-/// forget_install}` through core before anything is deleted. See `recovery_tier::forget`.
+/// forget_install}` through core before anything is deleted; as the serving state's one job. See
+/// `recovery_tier::forget`.
 #[tauri::command]
 pub async fn forget_install<R: Runtime>(
     app: AppHandle<R>,
     args: Args<ForgetInstallArgs>,
 ) -> Result<recovery_tier::ForgottenDto, CommandError> {
     let Args(ForgetInstallArgs { install_id }) = args;
-    let response = match (live_keys(&app), recovery_inputs(&app), core(&app)) {
-        (Ok((data, keys)), Ok((state, _, confirmer)), Ok(core)) => {
-            let (handle, settings) = (app.clone(), core.settings());
-            blocking(move || {
+    let response = match (live_keys(&app), core(&app)) {
+        (Ok((data, keys)), Ok(core)) => {
+            let settings = core.settings();
+            recovery_job(&app, move |handle, (_, _, confirmer), stop| {
                 recovery_tier::forget(
                     &data,
                     &*keys,
                     &|key, old, new| settings.record_app_change(key, old, new),
-                    &*confirmer,
+                    &**confirmer,
                     &install_id.0,
-                    &|| state.shutting_down(),
-                    &handle,
+                    stop,
+                    handle,
                 )
             })
             .await
         }
-        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
+        (Err(e), _) | (_, Err(e)) => Err(e),
     };
     note_failure(&response);
     finish(&app, response)

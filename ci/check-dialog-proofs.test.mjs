@@ -499,8 +499,13 @@ test("M10 T13: the restore's confirmations and source dialog are load-bearing on
 
 test("M10 T14: the recovery tier's confirmations and the anchor folder dialog are load-bearing on the real files", () => {
   for (const [file, from, to, flagged] of [
-    // The anchor-directory confirmation (PD-166, L54) ignored: the first such test is set_anchor_dir's.
-    [RECOVERY, "if confirmer.confirm(&text) != Confirm::Ok {", "if false {", /recovery_tier\.rs:\d+: proof helper confirmed_by called from fn set_anchor_dir/],
+    // The anchor-directory confirmation after the folder dialog (PD-166, L54; T14 review I-1:
+    // the one that names the folder chosen, and the proof the store records) ignored.
+    [RECOVERY, "if confirmer.confirm(&set_text) != Confirm::Ok {", "if false {", /recovery_tier\.rs:\d+: proof helper confirmed_by called from fn set_anchor_dir/],
+    // "Remove anchor directory", "Re-anchor" and the first "Forget old install" dialog ignored.
+    [RECOVERY, "if confirmer.confirm(&remove_text) != Confirm::Ok {", "if false {", /recovery_tier\.rs:\d+: proof helper confirmed_by called from fn remove_anchor_dir/],
+    [RECOVERY, "if confirmer.confirm(&re_text) != Confirm::Ok {", "if false {", /recovery_tier\.rs:\d+: proof helper confirmed_by called from fn re_anchor/],
+    [RECOVERY, "if confirmer.confirm(&first_text) != Confirm::Ok {", "if false {", /recovery_tier\.rs:\d+: proof helper confirmed_by called from fn forget/],
     // The second "Forget old install" dialog (the archived log's keys, PD-170) ignored.
     [RECOVERY, "if confirmer.confirm(&text) == Confirm::Ok {", "if true {", /recovery_tier\.rs:\d+: proof helper confirmed_by called from fn ask_keys/],
     // An anchor directory that no folder dialog returned.
@@ -515,6 +520,23 @@ test("M10 T14: the recovery tier's confirmations and the anchor folder dialog ar
     assert.equal(r.status, 1, from);
     assert.match(r.stdout, flagged);
   }
+});
+
+// T14 review I-1: the anchor-directory proof is of the text that names the folder chosen, so the
+// confirmation comes after Rust's folder dialog, and set_anchor_dir asks no other confirmation
+// (a prompt before the pick could not name the folder). The checker sees a proof on an Ok path,
+// not the order: this pins it on the real file.
+test("M10 T14: set_anchor_dir asks its one confirmation after the folder dialog", () => {
+  const src = readFileSync(join(REPO, ...RECOVERY.split("/")), "utf8");
+  const start = src.indexOf("pub fn set_anchor_dir(");
+  assert.ok(start >= 0, "set_anchor_dir not found");
+  const end = src.indexOf("\n}\n", start);
+  const body = src.slice(start, end);
+  const pick = body.indexOf("pick()");
+  const asks = [...body.matchAll(/confirmer\.confirm\(/g)].map((m) => m.index);
+  assert.ok(pick >= 0, "no folder dialog in set_anchor_dir");
+  assert.equal(asks.length, 1, "set_anchor_dir asks exactly one confirmation");
+  assert.ok(pick < asks[0], "the confirmation comes before the folder dialog");
 });
 
 test("rule 5: removing the acknowledgement's dialog test in the real caller fails the check", () => {

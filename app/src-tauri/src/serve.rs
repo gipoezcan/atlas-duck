@@ -398,8 +398,9 @@ pub struct ServeState {
     store_failed: AtomicBool,
     hooks: ServeHooks,
     /// The one long audit job (M10 T12/T13, PD-181): an export, a backup or a Settings restore,
-    /// from its dialogs to its end. The quit path sets its cancel flag (and cancels a restore's
-    /// store call that has not begun) and waits for it before the core's shutdown.
+    /// from its dialogs to its end; or (M10 T14 review I-2) a recovery-tier flow of Settings. The
+    /// quit path sets its cancel flag (and cancels a restore's store call that has not begun) and
+    /// waits for it before the core's shutdown.
     audit_job: Mutex<Option<AuditJob>>,
 }
 
@@ -412,19 +413,30 @@ pub enum AuditJobKind {
     Restore,
 }
 
-/// One running Audit-window job: its blocking task, the cancel flag its `ExportControl` reads and,
-/// for a restore, its store call.
+/// What holds the job slot: an Audit-window job (reported as `audit_job`), or a recovery-tier flow
+/// of Settings (change or remove the anchor directory, re-anchor, forget an old install; M10 T14
+/// review I-2), which reports no `audit_job`: its dialogs and its store call run one at a time and
+/// never beside an export, a backup or a restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobKind {
+    Audit(AuditJobKind),
+    RecoveryTier,
+}
+
+/// The job holding the slot: its blocking task, the cancel flag its `ExportControl` (or its
+/// `stop`) reads and, for a restore, its store call.
 struct AuditJob {
-    kind: AuditJobKind,
+    kind: JobKind,
     cancel: Arc<AtomicBool>,
     call: Option<Arc<StoreCall>>,
     task: JoinHandle<()>,
 }
 
-/// Why an Audit-window job did not start.
+/// Why an Audit-window job (or a recovery-tier flow) did not start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobRefused {
-    /// Another export or backup runs (one job at a time, PD-181).
+    /// Another job holds the slot: an export, a backup, a restore or a recovery-tier flow (one
+    /// job at a time, PD-181).
     Busy,
     /// The quit path began.
     ShuttingDown,
@@ -558,7 +570,7 @@ impl ServeState {
         T: Send + 'static,
         F: FnOnce(Arc<AtomicBool>) -> T + Send + 'static,
     {
-        self.spawn_job(kind, None, move |cancel, _| work(cancel))
+        self.spawn_job(JobKind::Audit(kind), None, move |cancel, _| work(cancel))
     }
 
     /// A Settings restore as the one audit job (M10 T13, PD-181), like [`ServeState::spawn_audit_job`]:
@@ -574,15 +586,39 @@ impl ServeState {
     {
         let call = Arc::new(StoreCall::default());
         self.spawn_job(
-            AuditJobKind::Restore,
+            JobKind::Audit(AuditJobKind::Restore),
             Some(call.clone()),
             move |cancel, _| work(cancel, call),
         )
     }
 
+    /// A recovery-tier flow of Settings (M10 T14 review I-2) in the same slot as the audit job,
+    /// like [`ServeState::spawn_audit_job`]: `Busy` while an export, a backup, a restore or another
+    /// flow holds it, and none of those starts while it runs (a double click, a restore while an
+    /// anchor-dir dialog is up). `work` gets the job's cancel flag, which the quit path sets; the
+    /// quit path also waits for the flow (bounded) before the core's shutdown.
+    pub fn spawn_recovery_job<T, F>(
+        &self,
+        work: F,
+    ) -> Result<tokio::sync::oneshot::Receiver<T>, JobRefused>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<AtomicBool>) -> T + Send + 'static,
+    {
+        self.spawn_job(JobKind::RecoveryTier, None, move |cancel, _| work(cancel))
+    }
+
+    /// A job holds the slot (an Audit-window job or a recovery-tier flow): the credential window is
+    /// not opened for a recovery-passphrase change meanwhile (M10 T14 review I-2).
+    pub fn job_running(&self) -> bool {
+        lock(&self.audit_job)
+            .as_ref()
+            .is_some_and(|job| !job.task.is_finished())
+    }
+
     fn spawn_job<T, F>(
         &self,
-        kind: AuditJobKind,
+        kind: JobKind,
         call: Option<Arc<StoreCall>>,
         work: F,
     ) -> Result<tokio::sync::oneshot::Receiver<T>, JobRefused>
@@ -621,7 +657,9 @@ impl ServeState {
     pub fn cancel_export(&self) -> bool {
         let slot = lock(&self.audit_job);
         match slot.as_ref() {
-            Some(job) if job.kind == AuditJobKind::Export && !job.task.is_finished() => {
+            Some(job)
+                if job.kind == JobKind::Audit(AuditJobKind::Export) && !job.task.is_finished() =>
+            {
                 job.cancel.store(true, Ordering::SeqCst);
                 true
             }
@@ -636,7 +674,7 @@ impl ServeState {
         let slot = lock(&self.audit_job);
         match slot.as_ref() {
             Some(AuditJob {
-                kind: AuditJobKind::Restore,
+                kind: JobKind::Audit(AuditJobKind::Restore),
                 cancel,
                 call: Some(call),
                 task,
@@ -1547,7 +1585,10 @@ where
     // passphrase ends at once); once `Store::restore` runs it is waited for the same way. If it
     // still runs when the process exits: before its commit rename the live store is unchanged
     // (the staging file goes at the next start), after it the next start completes the restore
-    // (§8.7 interrupted restore, or "Finish restore" when the KEK was not re-sealed yet).
+    // (§8.7 interrupted restore, or "Finish restore" when the KEK was not re-sealed yet). A
+    // recovery-tier flow of Settings (M10 T14) answered after the flag changes nothing; one whose
+    // store call already runs (an anchor-dir change, a re-anchor, a forget's record) is waited for
+    // the same way, so its record lands before `APP_STOP`.
     let job = state.stop_audit_job();
     if let Some(job) = job {
         bounded(job, STORE_WAIT, deadline, "audit_job").await;
@@ -3034,6 +3075,172 @@ mod tests {
             state.spawn_audit_job(AuditJobKind::Export, |_| ()).err(),
             Some(JobRefused::ShuttingDown)
         );
+        Ok(())
+    }
+
+    // ---- the recovery-tier flows in the job slot (M10 T14 review I-2) ----
+
+    /// A native dialog that tells `asked` it is up, then stays up (bounded, 30 s) until `go` is set
+    /// and answers `answer`.
+    struct HeldDialog {
+        asked: Mutex<std::sync::mpsc::Sender<()>>,
+        go: Arc<AtomicBool>,
+        answer: Confirm,
+    }
+
+    impl NativeConfirmer for HeldDialog {
+        fn confirm(&self, _text: &str) -> Confirm {
+            if let Ok(tx) = self.asked.lock() {
+                let _ = tx.send(());
+            }
+            let until = std::time::Instant::now() + Duration::from_secs(30);
+            while !self.go.load(Ordering::SeqCst) && std::time::Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            self.answer
+        }
+    }
+
+    /// T14 review I-2: an anchor-dir change runs in the serving state's one job slot, from its
+    /// folder dialog to its store call. While its confirmation is up a second flow (a double
+    /// click) is refused before it shows any dialog, and so are a restore, an export and a backup
+    /// (neither cancel touches the flow); after it ended the slot is free again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recovery_flow_holds_the_job_slot() -> Result<(), Box<dyn std::error::Error>> {
+        let rig = rig(1)?;
+        let state = serving_store(&rig);
+        let dir = rig.out.join("anchors");
+        std::fs::create_dir(&dir)?;
+        let go = Arc::new(AtomicBool::new(false));
+        let (asked_tx, asked) = std::sync::mpsc::channel();
+        let held = HeldDialog {
+            asked: Mutex::new(asked_tx),
+            go: go.clone(),
+            answer: Confirm::Ok,
+        };
+        let (store, d) = (rig.store.clone(), dir.clone());
+        let first = state
+            .spawn_recovery_job(move |cancel| {
+                crate::recovery_tier::set_anchor_dir(
+                    &store,
+                    &held,
+                    || Some(chosen(&d)),
+                    &|| cancel.load(Ordering::SeqCst),
+                    &Events::default(),
+                )
+            })
+            .map_err(|e| format!("{e:?}"))?;
+        asked.recv_timeout(Duration::from_secs(30))?;
+        assert!(state.job_running());
+
+        let second = Arc::new(Answers::new(&[Confirm::Ok]));
+        let shown = second.clone();
+        assert_eq!(
+            state
+                .spawn_recovery_job(move |_| shown.confirm("a second anchor-dir change"))
+                .err(),
+            Some(JobRefused::Busy),
+            "a double click"
+        );
+        assert!(
+            second.texts().is_empty(),
+            "the second flow showed no dialog"
+        );
+        assert_eq!(
+            state.spawn_restore_job(|_, _| ()).err(),
+            Some(JobRefused::Busy),
+            "a restore while the anchor-dir dialog is up"
+        );
+        for kind in [AuditJobKind::Export, AuditJobKind::Backup] {
+            assert_eq!(
+                state.spawn_audit_job(kind, |_| ()).err(),
+                Some(JobRefused::Busy),
+                "{kind:?}"
+            );
+        }
+        assert_eq!(state.cancel_restore(), RestoreCancel::Cancelled(false));
+        assert!(!state.cancel_export());
+
+        go.store(true, Ordering::SeqCst);
+        let done = tokio::time::timeout(Duration::from_secs(30), first).await??;
+        assert!(done.is_ok(), "{done:?}");
+        assert_eq!(
+            rig.store.settings().anchor_dir.as_deref(),
+            dir.to_str(),
+            "the flow committed"
+        );
+        let until = Instant::now() + Duration::from_secs(30);
+        let next = loop {
+            match state.spawn_restore_job(|_, _| 7) {
+                Err(JobRefused::Busy) if Instant::now() < until => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                other => break other.map_err(|e| format!("{e:?}"))?,
+            }
+        };
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(30), next).await??,
+            7
+        );
+        // The task is reported finished shortly after its answer was sent.
+        let until = Instant::now() + Duration::from_secs(30);
+        while state.job_running() && Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!state.job_running());
+        Ok(())
+    }
+
+    /// T14 review I-2, M-8: Quit while an anchor-dir confirmation is up sets the flow's cancel
+    /// flag and waits for it before the core's shutdown (the flow has ended when the core stage
+    /// starts, so nothing it does can land after `APP_STOP`); the user's Ok after that changes
+    /// nothing (`not_ready`, the folder untouched).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quit_waits_for_a_recovery_flow_whose_ok_then_changes_nothing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rig = rig(1)?;
+        let state = serving_store(&rig);
+        let dir = rig.out.join("anchors");
+        std::fs::create_dir(&dir)?;
+        let (asked_tx, asked) = std::sync::mpsc::channel();
+        let finished = Arc::new(AtomicBool::new(false));
+        let (store, d, ended) = (rig.store.clone(), dir.clone(), finished.clone());
+        let flow = state
+            .spawn_recovery_job(move |cancel| {
+                // The user answers Ok once the quit path set the flag.
+                let held = HeldDialog {
+                    asked: Mutex::new(asked_tx),
+                    go: cancel.clone(),
+                    answer: Confirm::Ok,
+                };
+                let answer = crate::recovery_tier::set_anchor_dir(
+                    &store,
+                    &held,
+                    || Some(chosen(&d)),
+                    &|| cancel.load(Ordering::SeqCst),
+                    &Events::default(),
+                );
+                std::thread::sleep(Duration::from_millis(50));
+                ended.store(true, Ordering::SeqCst);
+                answer
+            })
+            .map_err(|e| format!("{e:?}"))?;
+        asked.recv_timeout(Duration::from_secs(30))?;
+
+        let at_core_stage: OnceLock<bool> = OnceLock::new();
+        let started = Instant::now();
+        shutdown_with(&state, started + Duration::from_secs(60), |_| {
+            let _ = at_core_stage.set(finished.load(Ordering::SeqCst));
+            Some(std::future::ready(ShutdownReport::default()))
+        })
+        .await;
+        assert_eq!(at_core_stage.get(), Some(&true), "the flow ended first");
+        assert!(started.elapsed() < STORE_WAIT, "{:?}", started.elapsed());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(30), flow).await??,
+            Err(CommandError::NotReady)
+        );
+        assert!(entries(&dir).is_empty(), "the folder is untouched");
         Ok(())
     }
 

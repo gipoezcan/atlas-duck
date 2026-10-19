@@ -1125,6 +1125,137 @@ async fn passphrase_change_opens_credential_purpose_and_offers_note() -> TestRes
     stop(&state).await
 }
 
+/// M10 T14 review I-2: the recovery-tier flows of Settings and the credential window never run side
+/// by side, nor beside another job of the serving state. While the window is open (here for a
+/// passphrase change) every flow answers `busy` before any dialog; while a job holds the slot (a
+/// flow, an export, a backup, a restore) the trigger of a passphrase change answers `busy` and no
+/// window opens, and so do a flow and a restore. Once the job ended the window opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovery_flows_and_the_credential_window_exclude_each_other() -> TestResult {
+    let (_w, state, app) = serving_world().await?;
+    let handle = app.handle().clone();
+    let settings = window(&app, "settings")?;
+    let flows = [
+        ("anchor_dir_set", json!({})),
+        ("anchor_dir_remove", json!({})),
+        ("re_anchor", json!({})),
+        (
+            "forget_install",
+            json!({"install_id": "0123456789abcdef0123456789abcdef"}),
+        ),
+    ];
+
+    // The window is open: every flow is refused before any dialog, and the slot stays free.
+    assert_eq!(
+        call(&settings, "recovery_passphrase_change", json!({})).await,
+        Ok(Value::Null)
+    );
+    for (cmd, body) in &flows {
+        assert_eq!(
+            call(&settings, cmd, body.clone()).await,
+            Err(json!({"kind": "busy"})),
+            "{cmd}"
+        );
+    }
+    assert!(!state.job_running());
+    credential::close(&handle);
+
+    // A job holds the slot (another app, so a fresh credential window can be built).
+    let tmp = scratch()?;
+    let other = app_with_data_dir(tmp.path())?;
+    let slot = ServeSlot::default();
+    slot.set(state.clone());
+    other.manage(slot);
+    let other_handle = other.handle().clone();
+    let other_settings = window(&other, "settings")?;
+    let (go_tx, go) = std::sync::mpsc::channel::<()>();
+    let job = state
+        .spawn_recovery_job(move |_| go.recv_timeout(WAIT).is_ok())
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        call(&other_settings, "recovery_passphrase_change", json!({})).await,
+        Err(json!({"kind": "busy"}))
+    );
+    assert_eq!(
+        credential::current_purpose(&other_handle),
+        None,
+        "no window"
+    );
+    for (cmd, body) in flows.iter().chain([("restore_begin", json!({}))].iter()) {
+        assert_eq!(
+            call(&other_settings, cmd, body.clone()).await,
+            Err(json!({"kind": "busy"})),
+            "{cmd}"
+        );
+    }
+    go_tx.send(())?;
+    assert!(tokio::time::timeout(WAIT, job).await??);
+    let s = state.clone();
+    eventually("the slot is free", move || !s.job_running()).await?;
+    assert_eq!(
+        call(&other_settings, "recovery_passphrase_change", json!({})).await,
+        Ok(Value::Null)
+    );
+    assert_eq!(
+        credential::current_purpose(&other_handle),
+        Some(Purpose::ChangeRecoveryPassphrase)
+    );
+
+    // The quit path began (T14 review M-7): no window opens, no flow starts.
+    credential::close(&other_handle);
+    state.freeze();
+    for (cmd, body) in [("recovery_passphrase_change", json!({}))]
+        .iter()
+        .chain(flows.iter())
+    {
+        assert_eq!(
+            call(&other_settings, cmd, body.clone()).await,
+            Err(json!({"kind": "not_ready"})),
+            "{cmd}"
+        );
+    }
+    assert_eq!(
+        credential::current_purpose(&other_handle),
+        None,
+        "no window"
+    );
+    stop(&state).await
+}
+
+/// M10 T14 review I-3: the recovery note is offered only by the window whose change committed. A
+/// change marked for another window's generation (the window was closed and another opened while
+/// Argon2id ran) or for a window that is gone marks nothing and offers no note.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_note_is_offered_only_by_the_window_that_changed_the_passphrase() -> TestResult {
+    let (_w, state, app) = serving_world().await?;
+    let handle = app.handle().clone();
+    let settings = window(&app, "settings")?;
+    assert_eq!(
+        call(&settings, "recovery_passphrase_change", json!({})).await,
+        Ok(Value::Null)
+    );
+    let (purpose, generation) = credential::current_window(&handle).ok_or("no window")?;
+    assert_eq!(purpose, Purpose::ChangeRecoveryPassphrase);
+    let win = window(&app, "credential")?;
+    let note = |c: &Result<Value, Value>| c.as_ref().ok().map(|c| c["note_available"].clone());
+
+    assert!(!credential::mark_passphrase_changed(
+        &handle,
+        generation.wrapping_add(1)
+    ));
+    let context = call(&win, "credential_context", json!({})).await;
+    assert_eq!(note(&context), Some(json!(false)), "{context:?}");
+    assert!(credential::mark_passphrase_changed(&handle, generation));
+    let context = call(&win, "credential_context", json!({})).await;
+    assert_eq!(note(&context), Some(json!(true)), "{context:?}");
+
+    // Gone: nothing to mark.
+    credential::close(&handle);
+    assert!(!credential::mark_passphrase_changed(&handle, generation));
+    assert!(!credential::passphrase_changed(&handle));
+    stop(&state).await
+}
+
 /// §8.6 (M6 final review M-13: the old test rendered the note from facts it built itself): the
 /// recovery note is written through `save_recovery_note`'s own path (its save dialog replaced by a
 /// temp file) after a real recovery-passphrase change with a canary passphrase through the window.
@@ -2055,7 +2186,7 @@ mod canary {
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
 
-    use super::{Answers, TestResult, World, call, eventually, stop, window};
+    use super::{Answers, TestResult, World, call, eventually, serving_world, stop, window};
 
     const PAT_CANARY: &str = "canary-pat-S16-91c2e4";
     const PASS_CANARY: &str = "canary-pass-S16-7a3b5f";
@@ -2306,6 +2437,76 @@ mod canary {
         .await?;
         assert!(diag.text().contains(CONTROL_CANARY));
         assert!(raw.text().contains(CONTROL_CANARY));
+        stop(&state).await
+    }
+
+    /// M10 T14 review I-3 (S-16 for PD-169, beside `recovery_note_has_no_passphrase`): a
+    /// recovery-passphrase change through the credential window (a refused pair, then the
+    /// change, then the note saved) leaves the new passphrase in no answer, no event payload, no
+    /// capture record and no log line. The event channel is not blind: the committed change is
+    /// announced there (`settings_changed`, and `audit_changed` for its `CREDENTIAL_CHANGED`
+    /// record, T14 review M-6).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn passphrase_change_canary_in_no_event_or_log() -> TestResult {
+        const CHANGE_CANARY: &str = "canary-change-S16-3f9d0a";
+        let (diag, raw) = logs();
+        let (w, state, app) = serving_world().await?;
+        let cap = commands::capture::bounded();
+        assert!(commands::capture::install(app.handle(), cap.clone()));
+        let handle = app.handle().clone();
+        let settings = window(&app, "settings")?;
+        let mut responses: Vec<String> = Vec::new();
+        let r = call(&settings, "recovery_passphrase_change", json!({})).await;
+        assert_eq!(r, Ok(Value::Null));
+        responses.push(format!("{r:?}"));
+        let win = window(&app, "credential")?;
+        let r = call(
+            &win,
+            "submit_secret",
+            json!({"secret": CHANGE_CANARY, "secret_confirm": format!("{CHANGE_CANARY}-x")}),
+        )
+        .await;
+        assert_eq!(r, Ok(json!({"failed": {"class": "passphrase_mismatch"}})));
+        responses.push(format!("{r:?}"));
+        let r = call(
+            &win,
+            "submit_secret",
+            json!({"secret": CHANGE_CANARY, "secret_confirm": CHANGE_CANARY}),
+        )
+        .await;
+        assert_eq!(r, Ok(json!({"accepted": {}})));
+        responses.push(format!("{r:?}"));
+        responses.push(format!(
+            "{:?}",
+            call(&win, "credential_context", json!({})).await
+        ));
+        let note = w.tmp.path().join("change-note.txt");
+        let target = note.clone();
+        let saved = commands::credential::save_note_with(&handle, move || Ok(Some(target))).await;
+        assert_eq!(saved.as_ref().map(|s| s.saved), Ok(true));
+        responses.push(format!("{saved:?}"));
+        let note_text = std::fs::read_to_string(&note)?;
+
+        let events = cap.on(Channel::TauriEvent);
+        for announced in ["settings_changed", "audit_changed"] {
+            assert!(
+                events.iter().any(|e| e.json.contains(announced)),
+                "{announced} was not emitted: {events:?}"
+            );
+        }
+        let logs_text = format!("{}\n{}", diag.text(), raw.text());
+        assert!(!note_text.contains(CHANGE_CANARY), "the note holds it");
+        for rec in cap.records() {
+            assert!(
+                !rec.json.contains(CHANGE_CANARY),
+                "capture record holds it: {}",
+                rec.json
+            );
+        }
+        for resp in &responses {
+            assert!(!resp.contains(CHANGE_CANARY), "a response holds it: {resp}");
+        }
+        assert!(!logs_text.contains(CHANGE_CANARY), "a log line holds it");
         stop(&state).await
     }
 }

@@ -462,8 +462,10 @@ pub(crate) fn resolve(setting: Option<&str>, configured: Option<&Path>) -> Optio
 
 /// Whether two anchor dirs name the same directory as far as their text tells: trailing
 /// separators do not count, and on Windows neither does ASCII case nor `/` against `\`
-/// (`C:\Anchors` and `c:\anchors\` are one dir there). No file system access.
-pub(crate) fn same_dir(a: Option<&Path>, b: Option<&Path>) -> bool {
+/// (`C:\Anchors` and `c:\anchors\` are one dir there). No file system access. Public for the
+/// app's "Change anchor directory…", which refuses the dir in force before its confirmation
+/// (`Store::change_anchor_dir` applies the same rule).
+pub fn same_dir(a: Option<&Path>, b: Option<&Path>) -> bool {
     fn norm(p: &Path) -> String {
         let s = p.to_string_lossy();
         let s = if cfg!(windows) {

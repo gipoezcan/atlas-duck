@@ -558,9 +558,11 @@ async fn submit<R: Runtime>(
             }
             let outcome = change_passphrase_dto(store, args).await?;
             if matches!(outcome, SubmitOutcome::Accepted {}) {
-                // The window offers the recovery note now (if it is still this window).
+                // The window offers the recovery note now (if it is still this window); Settings
+                // and the Audit window (the `CREDENTIAL_CHANGED` record, T14 review M-6) re-read.
                 credential::mark_passphrase_changed(app, generation);
                 crate::ui_sink::emit_settings_changed(app);
+                crate::ui_sink::emit_audit_changed(app);
             }
             Ok(outcome)
         }
@@ -1036,5 +1038,40 @@ mod tests {
         let locked = context_dto(&Purpose::RecoverThisLog, Some(6), false);
         assert_eq!(locked.refused_count, Some(6));
         assert_eq!(locked.alias, None);
+    }
+
+    /// M10 T14 review I-3 (PD-169): a pair the window accepts but the store does not commit (the
+    /// writer refuses or fails: a restore that replaced the store meanwhile, a failed write) is
+    /// the failed outcome `passphrase_not_changed`, with nothing recorded and the old passphrase
+    /// still the one; a store that no longer serves is `not_ready`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_change_the_store_does_not_commit_is_passphrase_not_changed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use atlas_duck_audit::EventType;
+        use atlas_duck_audit::testing::FaultPoint;
+
+        use crate::commands::audit::tests::{count, rig};
+        let r = rig(0)?;
+        let pair = || {
+            parse::<SubmitSecretArgs>(
+                &json!({"secret": "a changed passphrase", "secret_confirm": "a changed passphrase"}),
+            )
+        };
+        let before = count(&r.store, EventType::CREDENTIAL_CHANGED)?;
+        r.faults.fail(FaultPoint::RecoveryRowWritten, 1);
+        assert_eq!(
+            change_passphrase_dto(r.store.clone(), pair()?).await,
+            Ok(SubmitOutcome::Failed(SubmitFailure::class(
+                CLASS_PASSPHRASE_NOT_CHANGED
+            )))
+        );
+        assert_eq!(count(&r.store, EventType::CREDENTIAL_CHANGED)?, before);
+
+        r.store.shutdown();
+        assert_eq!(
+            change_passphrase_dto(r.store.clone(), pair()?).await,
+            Err(CommandError::NotReady)
+        );
+        Ok(())
     }
 }

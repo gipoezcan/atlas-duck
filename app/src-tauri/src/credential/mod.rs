@@ -308,6 +308,21 @@ fn open_inner<R: Runtime>(
             }
             (_, true) => Decide::Busy,
         };
+        // M10 T14 review I-2, the window half of the recovery-tier interlock: a window for a
+        // recovery-passphrase change is not opened while the serving state's job slot is held (a
+        // recovery-tier flow, an export, a backup or a restore). Checked here, under the
+        // credential-state lock, right before the purpose is set; a flow claims the slot first
+        // and reads the purpose (through the same lock) second, so one of the two always sees
+        // the other. The window already open for it is shown again (nothing new is set).
+        if matches!(decide, Decide::New)
+            && purpose == Purpose::ChangeRecoveryPassphrase
+            && app
+                .try_state::<crate::state::ServeSlot>()
+                .and_then(|slot| slot.get().cloned())
+                .is_some_and(|state| state.job_running())
+        {
+            return Err(WindowError::Busy);
+        }
         match decide {
             Decide::Busy => return Err(WindowError::Busy),
             Decide::Same => {}
