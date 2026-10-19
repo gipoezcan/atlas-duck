@@ -186,7 +186,7 @@ pub fn restore_failure(e: &AuditError) -> RestoreFailure {
 }
 
 /// What the three questions before the store call gave.
-struct Asked {
+pub(crate) struct Asked {
     source: RustChosenPath,
     passphrase: SecretString,
     confirmed: Confirmed,
@@ -195,7 +195,7 @@ struct Asked {
 /// The native "Restore backup" confirmation, then the source dialog, then the passphrase (in this
 /// order, PD-168). An error as soon as one is cancelled or cannot be asked, or `stop` answers
 /// true between them; nothing was changed then.
-fn ask_restore(
+pub(crate) fn ask_restore(
     confirmer: &dyn NativeConfirmer,
     pick: impl FnOnce() -> Option<RustChosenPath>,
     passphrase: impl FnOnce(&dyn Fn() -> bool) -> Result<SecretString, NotAsked>,
@@ -336,11 +336,30 @@ pub fn restore_without_store(
     if live_store_blocks_restore(data) {
         return Err(UnlockFailure::ArchiveFirst);
     }
-    let asked = ask_restore(confirmer, pick, passphrase, stop).map_err(|n| match n {
+    let asked = ask_restore(confirmer, pick, passphrase, stop).map_err(not_asked_failure)?;
+    restore_asked(data, lock, config, confirmer, &asked, stop)
+}
+
+/// The [`UnlockFailure`] of a question [`ask_restore`] got no answer to (nothing was changed).
+pub(crate) fn not_asked_failure(n: NotAsked) -> UnlockFailure {
+    match n {
         NotAsked::Cancelled => UnlockFailure::Cancelled,
         NotAsked::Busy => UnlockFailure::Busy,
         NotAsked::NoWindow => UnlockFailure::Io,
-    })?;
+    }
+}
+
+/// The store half of [`restore_without_store`], once the questions were answered (the wizard's
+/// restore takes its ids in between, M10 T15 fix-q): `restore_from_source` with a fresh `config()`
+/// per attempt, and the rollback confirmation when it asks.
+pub(crate) fn restore_asked(
+    data: &LocalDataDir,
+    lock: &InstanceLock,
+    config: &dyn Fn() -> OpenConfig,
+    confirmer: &dyn NativeConfirmer,
+    asked: &Asked,
+    stop: &dyn Fn() -> bool,
+) -> Result<(Store, RestoreReport), UnlockFailure> {
     let mut rollback = None;
     loop {
         match restore_from_source(

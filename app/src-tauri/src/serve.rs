@@ -571,6 +571,14 @@ impl ServeState {
             .map(|(_, confirmed)| *confirmed)
     }
 
+    /// Tests: the archived file whose confirmation is kept (PD-171), if any.
+    #[doc(hidden)]
+    pub fn testing_archive_confirmation_file(&self) -> Option<String> {
+        lock(&self.archive_confirmation)
+            .as_ref()
+            .map(|(file, _)| file.clone())
+    }
+
     /// Starts `work` on the blocking pool as the Audit window's one job (PD-181), unless another
     /// one runs (`Busy`) or the quit path froze the state (`ShuttingDown`). `work` gets the job's
     /// cancel flag (`export_cancel` and the quit path set it); its answer comes through the
@@ -1381,7 +1389,12 @@ impl FirstStoreFailure {
         }
     }
 
+    /// Logs [`LOG_EVENT_FIRST_STORE_FAILED`]; a restore the user cancelled is no failure (T15
+    /// review M-3).
     fn log(self) {
+        if self == FirstStoreFailure::Restore(UnlockFailure::Cancelled) {
+            return;
+        }
         tracing::warn!(
             event = LOG_EVENT_FIRST_STORE_FAILED,
             error_class = self.class()
@@ -1427,12 +1440,18 @@ pub(crate) fn pin_store_id(pin: &PinWriter, install_id: &str) -> bool {
 /// previous_chain_found` (the only incident a new store can hold).
 fn previous_chain_found(store: &Store) -> bool {
     store.open_incidents().into_iter().any(|seq| {
-        store
-            .read_payload(seq)
-            .ok()
-            .and_then(|p| serde_json::from_slice::<serde_json::Value>(&p).ok())
-            .is_some_and(|v| v["result"] == FindingKind::PreviousChainFound.as_str())
+        let payload = store.read_payload(seq).ok();
+        names_previous_chain(payload.as_deref().map(|p| p.as_slice()))
     })
+}
+
+/// Whether a new store's open incident, by its payload, is the previous-chain one. A payload that
+/// cannot be read or parsed counts as it (T15 review M-8): a new store holds no other incident, and
+/// the notice must not go missing.
+fn names_previous_chain(payload: Option<&[u8]>) -> bool {
+    payload
+        .and_then(|p| serde_json::from_slice::<serde_json::Value>(p).ok())
+        .is_none_or(|v| v["result"] == FindingKind::PreviousChainFound.as_str())
 }
 
 /// The first store's preconditions: only while the first-run gate serves with no core, one at a
@@ -1552,15 +1571,17 @@ pub async fn create_first_store(
 
 /// The wizard's "Restore from a backup" (§2.5 (1b), §8.11, PD-168; M10 T15), the alternative to
 /// `GENESIS` while the first-run gate serves with no core, under [`create_first_store`]'s rules
-/// (one at a time, awaited by the quit path). On a blocking thread: the pinned file loses any
-/// `install_id`, new ids (`new_ids()` before every attempt, L109: `restore_from_source` re-seals the
-/// backup's KEK under the install of its keystore, which the restored store keeps), the keystore
-/// for them, then `restore_flow::restore_without_store` (the native "Restore backup" confirmation,
-/// `pick`, `passphrase`, `restore_from_source`; `stop` = the quit path's freeze), then the pinned
-/// file names that `install_id`. Then [`start_first_store`]'s core start with the report's
-/// `pats_deleted` (`APP_START` logs them, PD-28; the core start reconciles the config file). The
-/// wizard's anchor dir is not given to the restore: the restored store keeps the backup's own
-/// anchor-dir setting (§8.11).
+/// (one at a time, awaited by the quit path). On a blocking thread: the restore's questions (the
+/// native "Restore backup" confirmation, `pick`, `passphrase`; `stop` = the quit path's freeze),
+/// and only once all three were answered the pinned file loses any `install_id`, new ids
+/// (`new_ids()` before every attempt, L109: `restore_from_source` re-seals the backup's KEK under
+/// the install of its keystore, which the restored store keeps) and the keystore for them; then
+/// `restore_from_source`, then the pinned file names that `install_id` (also when the restore
+/// committed but did not complete: the store is then failed until a restart, which completes it).
+/// Then [`start_first_store`]'s core start with the report's `pats_deleted` (`APP_START` logs them,
+/// PD-28; the core start reconciles the config file). The wizard's anchor dir is not given to the
+/// restore: the restored store keeps the backup's own anchor-dir setting (§8.11). A cancel is the
+/// user's choice and is not logged.
 pub async fn restore_first_store(
     state: &Arc<ServeState>,
     pick: Box<dyn FnOnce() -> Option<RustChosenPath> + Send>,
@@ -1591,7 +1612,14 @@ pub async fn restore_first_store(
             *lock(&state.archive_confirmation) = None;
             Ok(first)
         }
-        Err(f) => failed(f),
+        Err(f) => {
+            if f == FirstStoreFailure::Restore(UnlockFailure::CommittedIncomplete) {
+                // `audit.db` exists now and only the next start completes it: no `first_run`
+                // answer any more (PD-06, as after a failed core start).
+                state.mark_store_failed();
+            }
+            failed(f)
+        }
     }
 }
 
@@ -2353,9 +2381,11 @@ impl Opener {
         Ok((store, keys, Vec::new(), first))
     }
 
-    /// The blocking half of [`restore_first_store`] (see there for the order). The config of each
-    /// store call holds the new install's keystore and no pinned id (nothing is pinned yet, and
-    /// after an archive `Opener::pinned_install_id` names the old store).
+    /// The blocking half of [`restore_first_store`] (see there for the order). The ids come only
+    /// after the questions: a cancel at any of them leaves the pinned file (an archived store's id
+    /// included), the keyring and the data dir as they were (M10 T15 fix-q, review I-2). The config
+    /// of each store call holds the new install's keystore and no pinned id (nothing is pinned yet,
+    /// and after an archive `Opener::pinned_install_id` names the old store).
     fn restore_first_blocking(
         &self,
         confirmer: &dyn NativeConfirmer,
@@ -2364,12 +2394,28 @@ impl Opener {
         stop: &dyn Fn() -> bool,
         pin: &PinWriter,
     ) -> Result<FirstStoreMade, FirstStoreFailure> {
+        use crate::restore_flow::{ask_restore, not_asked_failure, restore_asked};
+        if atlas_duck_audit::live_store_blocks_restore(&self.data) {
+            return Err(FirstStoreFailure::Restore(UnlockFailure::ArchiveFirst));
+        }
+        let asked = ask_restore(confirmer, pick, passphrase, stop)
+            .map_err(|n| FirstStoreFailure::Restore(not_asked_failure(n)))?;
         let (install_id, _chain_id, keys) = self.first_store_ids(pin)?;
         let config = || OpenConfig::new(Arc::new(SystemClock::new()), keys.clone());
-        let (store, report) = crate::restore_flow::restore_without_store(
-            &self.data, &self.lock, &config, confirmer, pick, passphrase, stop,
-        )
-        .map_err(FirstStoreFailure::Restore)?;
+        let (store, report) =
+            match restore_asked(&self.data, &self.lock, &config, confirmer, &asked, stop) {
+                Ok(restored) => restored,
+                Err(UnlockFailure::CommittedIncomplete) => {
+                    // `audit.db` is the restored store under this install (its `RESTORE` row
+                    // names it): the pinned file names it too, so the next start cross-checks it
+                    // (PD-41) while it completes the restore (review I-1).
+                    pin_store_id(pin, &install_id);
+                    return Err(FirstStoreFailure::Restore(
+                        UnlockFailure::CommittedIncomplete,
+                    ));
+                }
+                Err(f) => return Err(FirstStoreFailure::Restore(f)),
+            };
         // The restore committed: the pinned file names the install the restored store keeps
         // (`RESTORE.install_id`, §8.11 step 3; L109).
         let first = FirstStore {
@@ -4444,5 +4490,35 @@ mod tests {
             (restore.class(), restore.text()),
             ("wrong_passphrase", None)
         );
+    }
+
+    /// T15 review M-3: a wizard restore the user cancelled is not logged as a failed first store;
+    /// a restore that failed is.
+    #[test]
+    fn a_cancelled_restore_is_not_a_failed_first_store() {
+        let ((), log) = crate::restore_flow::tests::diag_lines(|| {
+            FirstStoreFailure::Restore(UnlockFailure::Cancelled).log();
+        });
+        assert!(!log.contains(LOG_EVENT_FIRST_STORE_FAILED), "{log}");
+        let ((), log) = crate::restore_flow::tests::diag_lines(|| {
+            FirstStoreFailure::Restore(UnlockFailure::WrongPassphrase).log();
+        });
+        assert!(
+            log.contains("event=first_store_failed error_class=wrong_passphrase"),
+            "{log}"
+        );
+    }
+
+    /// T15 review M-8: the PD-167 notice is shown for the previous-chain incident, and for an
+    /// incident whose payload cannot be read or parsed (a new store holds no other); not for an
+    /// incident that names another finding.
+    #[test]
+    fn an_unreadable_incident_still_names_the_previous_chain() {
+        let found = serde_json::json!({"result": "previous_chain_found"}).to_string();
+        assert!(names_previous_chain(Some(found.as_bytes())));
+        assert!(names_previous_chain(None), "unreadable");
+        assert!(names_previous_chain(Some(b"not json")), "unparseable");
+        let other = serde_json::json!({"result": "chain_broken"}).to_string();
+        assert!(!names_previous_chain(Some(other.as_bytes())));
     }
 }

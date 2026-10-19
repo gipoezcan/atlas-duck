@@ -343,6 +343,8 @@ function Panel({
           <h2 tabIndex={-1}>{T.pin_heading}</h2>
           {/* Rust's fixed text, shown as a plain text node. */}
           <p role="alert">{state.step_text ?? T.errors.other}</p>
+          {/* A failed retry (`pinned_write`) says so: it does not look like the first failure. */}
+          <StepError error={state.error} />
           <button type="button" disabled={pending} onClick={() => step(() => wizardBegin())}>
             {T.pin_retry}
           </button>

@@ -37,8 +37,9 @@ use atlas_duck_audit::lock::InstanceLock;
 use atlas_duck_audit::testing::{KeyOpKind, MemKeyStore, MemKeyring, event_types, recovery_row};
 use atlas_duck_audit::types::RustChosenPath;
 use atlas_duck_audit::{
-    AuditCursor, AuditFilter, EventType, FirstRunInput, KeyStore, KeyStoreError, KeyringLocality,
-    MAX_AUDIT_PAGE_ROWS, OpenConfig, SystemClock, create_new_store, new_ids,
+    ArchivedDb, AuditCursor, AuditFilter, EntryName, EventType, FirstRunInput, KeyStore,
+    KeyStoreError, KeyringLocality, MAX_AUDIT_PAGE_ROWS, OpenConfig, SystemClock, create_new_store,
+    new_ids,
 };
 use atlas_duck_core::{Confirm, GateState, NativeConfirmer, ShutdownReason, UiEvent, UiSink};
 use atlas_duck_ipc::build_info::BUILD_ID;
@@ -189,16 +190,26 @@ impl UiSink for NoUi {
     fn emit(&self, _: UiEvent) {}
 }
 
-/// Native confirmations: always Ok, every text recorded.
+/// Native confirmations: Ok, except the next `.1` ones (Cancel); every text recorded.
 #[derive(Default)]
-struct Answers(Mutex<Vec<String>>);
+struct Answers(Mutex<Vec<String>>, AtomicU32);
 
 impl NativeConfirmer for Answers {
     fn confirm(&self, text: &str) -> Confirm {
         if let Ok(mut t) = self.0.lock() {
             t.push(text.to_owned());
         }
-        Confirm::Ok
+        let cancel = self
+            .1
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        if cancel { Confirm::Cancel } else { Confirm::Ok }
+    }
+}
+
+impl Answers {
+    fn texts(&self) -> Vec<String> {
+        self.0.lock().map(|t| t.clone()).unwrap_or_default()
     }
 }
 
@@ -1422,13 +1433,20 @@ async fn begin_waits_for_the_first_run_gate() -> TestResult {
     assert_eq!(s["step"], "anchor_dir");
     assert_eq!(s["refused_count"], Value::Null, "nothing serves yet");
     assert_eq!(windows::snapshot(app.handle()), AppSnapshot::BeforeFirstRun);
-    for cmd in ["wizard_begin", "wizard_restore"] {
+    // Nor does the anchor-dir dialog come up before the gate serves (T15 review M-9).
+    for cmd in [
+        "wizard_begin",
+        "wizard_restore",
+        "wizard_anchor_dir",
+        "wizard_anchor_dir_clear",
+    ] {
         assert_eq!(
             call(&setup, cmd, json!({})).await,
             Err(json!({"kind": "not_ready"})),
             "{cmd}"
         );
     }
+    assert_eq!(m.anchor_dialogs.load(Ordering::SeqCst), 0);
     assert_eq!(credential::current_purpose(app.handle()), None);
     assert_eq!(wizard_state(&setup).await?["passphrase_window"], false);
     Ok(())
@@ -1767,6 +1785,23 @@ async fn anchor_dir_step_before_passphrase() -> TestResult {
     let s = run(&setup, "wizard_anchor_dir").await?;
     assert_eq!(s["error"]["class"], "anchor_dir_invalid", "{s}");
     assert_eq!(s["anchor_dir"], Value::Null);
+    // The data dir, or a folder inside it: refused with a fixed text, nothing kept (§8.5, T15
+    // review M-11: a log anchored in its own data dir proves nothing).
+    let inside = m.default_dir.join("anchors");
+    std::fs::create_dir(&inside)?;
+    for refused in [m.default_dir.clone(), inside] {
+        *m.pick_anchor.lock().map_err(|_| "poisoned")? = Some(refused.clone());
+        let s = run(&setup, "wizard_anchor_dir").await?;
+        assert_eq!(
+            (s["error"].clone(), s["anchor_dir"].clone()),
+            (
+                json!({"class": "anchor_dir", "text": wizard::ANCHOR_DIR_IN_DATA_DIR}),
+                Value::Null
+            ),
+            "{}",
+            refused.display()
+        );
+    }
     // A folder: shown as text, no native confirmation, nothing written there yet.
     *m.pick_anchor.lock().map_err(|_| "poisoned")? = Some(anchors.clone());
     let s = run(&setup, "wizard_anchor_dir").await?;
@@ -1809,7 +1844,7 @@ async fn anchor_dir_step_before_passphrase() -> TestResult {
     }
     assert_eq!(
         m.anchor_dialogs.load(Ordering::SeqCst),
-        4,
+        6,
         "no dialog after Begin"
     );
     assert!(entries(&anchors)?.is_empty(), "nothing before GENESIS");
@@ -2133,12 +2168,18 @@ async fn restored_by_wizard(
     let s = run(&setup, "wizard_restore").await?;
     assert_eq!(s["step"], "restore", "{s}");
     let w = restore_window(&app).await?;
-    // While it runs, the other (1b) commands wait.
-    for cmd in ["wizard_begin", "wizard_anchor_dir", "wizard_restore"] {
-        let r = call(&setup, cmd, json!({})).await;
-        assert!(
-            r == Err(json!({"kind": "busy"})) || r == Err(json!({"kind": "not_ready"})),
-            "{cmd}: {r:?}"
+    // While it runs, the other (1b) commands wait: Begin is told the restore runs, the anchor-dir
+    // and restore commands belong to a step that is not shown (T15 review M-4).
+    for (cmd, kind) in [
+        ("wizard_begin", "busy"),
+        ("wizard_anchor_dir", "not_ready"),
+        ("wizard_anchor_dir_clear", "not_ready"),
+        ("wizard_restore", "not_ready"),
+    ] {
+        assert_eq!(
+            call(&setup, cmd, json!({})).await,
+            Err(json!({ "kind": kind })),
+            "{cmd}"
         );
     }
     assert_eq!(
@@ -2287,6 +2328,10 @@ async fn a_cancelled_wizard_restore_changes_nothing() -> TestResult {
         read_pinned(&m.pinned_file)?.and_then(|p| p.install_id),
         None
     );
+    // The ids come only after the last question (T15 review I-2): no keystore was built and the
+    // pinned file was written by step 0 only.
+    assert!(m.keys.ids().is_empty(), "{:?}", m.keys.ids());
+    assert_eq!(m.pins().len(), 1, "{:?}", m.pins());
     // Begin still leads to the passphrase.
     let s = run(&setup, "wizard_begin").await?;
     assert_eq!(s["step"], "passphrase", "{s}");
@@ -2359,4 +2404,370 @@ async fn wizard_restore_calls_new_ids_before_every_attempt() -> TestResult {
         Some(ids[1].clone())
     );
     stop(&app).await
+}
+
+// ---------- T15 review fixes: the archive proof, cancelled and incomplete restores ----------
+
+/// A pinned start (`Ready`) of the machine's store after "Archive old DB and start fresh".
+struct ArchivedStart {
+    app: App<MockRuntime>,
+    setup: WebviewWindow<MockRuntime>,
+    state: Arc<ServeState>,
+    /// The archived store's `install_id` (the pinned file still names it).
+    old_id: String,
+    archived: ArchivedDb,
+}
+
+/// A store whose keychain entries are gone (`keychain_lost`), started as a pinned start does, then
+/// archived as the locked window's "Archive old DB and start fresh" does: its serve half (the
+/// native confirmation answered Ok, the proof kept by the serving state) and the archive kept for
+/// the wizard (`credential::set_archived`, as the command keeps it). The archive goes straight
+/// through serve, so the mock app's one credential window is left for the wizard.
+async fn archived_start(m: &Machine) -> Result<ArchivedStart, Box<dyn std::error::Error>> {
+    let old_id = m.provision(&m.default_dir)?;
+    m.ring.wipe_install(&old_id);
+    let pinned = PinnedPaths {
+        schema_version: paths::PINNED_SCHEMA_VERSION,
+        data_dir: m.default_dir.clone(),
+        config_dir: m.config_dir.clone(),
+        install_id: Some(old_id.clone()),
+    };
+    paths::write_pinned(&m.pinned_file, &pinned)?;
+    let context = tauri::generate_context!(assets = tauri::test::noop_assets(), test = true);
+    let app = commands::register(mock_builder()).build(context)?;
+    app.manage(WindowRegistry::new(
+        NavPolicy::for_this_platform(None),
+        StartupRoute::completed(),
+    ));
+    app.manage(AppState::new(StartupSummary::Ready, None));
+    app.manage(Wizard::new(m.env(), Some(pinned.clone())));
+    let data = local(&m.default_dir)?;
+    let lock = Arc::new(InstanceLock::acquire(&data, m.host)?);
+    app.manage(DataDirHold::new(data.clone(), lock.clone()));
+    app.manage(ServeSlot::default());
+    let inputs = m.starter().inputs(app.handle(), data, lock, &pinned)?;
+    let state = start_with(inputs).await.map_err(|e| format!("{e:?}"))?;
+    if let Some(slot) = app.try_state::<ServeSlot>() {
+        slot.set(state.clone());
+    }
+    let archived = serve::archive_and_start_fresh(&state)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    credential::set_archived(app.handle(), archived.clone());
+    assert_eq!(state.gate_state(), Some(GateState::FirstRun));
+    let setup = window(&app, "setup")?;
+    until(&setup, "the anchor-dir step", step_is("anchor_dir")).await?;
+    Ok(ArchivedStart {
+        app,
+        setup,
+        state,
+        old_id,
+        archived,
+    })
+}
+
+/// The `GENESIS` payload of the store `state` serves.
+fn genesis_payload(state: &ServeState) -> Result<Value, Box<dyn std::error::Error>> {
+    let store = state.open_store().ok_or("no store")?;
+    Ok(serde_json::from_slice(&store.read_payload(1)?)?)
+}
+
+fn pair() -> FirstRunPassphrase {
+    FirstRunPassphrase {
+        passphrase: SecretString::from(PASSPHRASE),
+        confirm: SecretString::from(PASSPHRASE),
+    }
+}
+
+/// T15 review I-2 (PD-168, PD-171): after "Archive old DB and start fresh" the pinned file still
+/// names the archived store. A wizard restore cancelled at its first question (the native "Restore
+/// backup" confirmation) leaves it, the keyring, the data dir and the kept archive confirmation as
+/// they were: the ids are taken only after the last question. A restore that then goes through
+/// pins the restored store's id and drops the kept confirmation (no `GENESIS` will record it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restore_cancelled_after_an_archive_keeps_the_pinned_id() -> TestResult {
+    let tmp = scratch()?;
+    let m = Machine::new(&tmp, "host-a", None, MemKeyring::new())?;
+    let bundle = m.backup_elsewhere()?;
+    let a = archived_start(&m).await?;
+    let kept = Some(a.archived.file.clone());
+    assert_eq!(a.state.testing_archive_confirmation_file(), kept);
+    let ids = m.keys.ids();
+    m.confirmer.1.store(1, Ordering::SeqCst);
+    let s = run(&a.setup, "wizard_restore").await?;
+    assert_eq!(s["step"], "restore", "{s}");
+    let s = until(&a.setup, "the restore ended", |s| s["step"] != "restore").await?;
+    assert_eq!(
+        (s["step"].clone(), s["error"].clone()),
+        (json!("anchor_dir"), Value::Null),
+        "{s}"
+    );
+    assert_eq!(
+        m.restore_dialogs.load(Ordering::SeqCst),
+        0,
+        "cancelled at the confirmation"
+    );
+    assert_eq!(
+        m.confirmer.texts().last().map(String::as_str),
+        Some(atlas_duck_app_lib::restore_flow::RESTORE_CONFIRM_TEXT)
+    );
+    assert_eq!(
+        read_pinned(&m.pinned_file)?.and_then(|p| p.install_id),
+        Some(a.old_id.clone())
+    );
+    assert!(m.pins().is_empty(), "{:?}", m.pins());
+    assert_eq!(m.keys.ids(), ids, "no keystore built");
+    let data = local(&m.default_dir)?;
+    assert!(!data.path().join("audit.db").exists());
+    assert_eq!(a.state.testing_archive_confirmation_file(), kept);
+
+    // The restore goes through: the restored store's id is pinned, the kept proof is dropped.
+    *m.pick_restore.lock().map_err(|_| "poisoned")? = Some(bundle);
+    run(&a.setup, "wizard_restore").await?;
+    let w = restore_window(&a.app).await?;
+    assert_eq!(
+        call(&w, "submit_secret", json!({ "secret": PASSPHRASE })).await,
+        Ok(json!({"accepted": {}}))
+    );
+    until(&a.setup, "the restored store serves", step_is("instances")).await?;
+    let live = a.state.note_facts().map(|f| f.0).ok_or("no store")?;
+    assert_eq!(
+        read_pinned(&m.pinned_file)?.and_then(|p| p.install_id),
+        Some(live.clone())
+    );
+    assert_eq!(
+        m.pins()
+            .iter()
+            .map(|p| p.install_id.clone())
+            .collect::<Vec<_>>(),
+        [None, Some(live)]
+    );
+    assert_eq!(a.state.testing_archive_confirmation_file(), None);
+    serve::shutdown(&a.state, ShutdownReason::Quit, WAIT).await;
+    Ok(())
+}
+
+/// T15 review I-1 (§8.7, PD-41): a wizard restore that committed but did not complete (here the
+/// keychain refuses the KEK's re-seal, the first keyring write after the commit rename) leaves
+/// `audit.db` as the restored store under the new install. The pinned file names that install, the
+/// store is failed until a restart (which completes the restore), and the wizard stops with the
+/// restart text: neither Begin nor another restore is offered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_incomplete_wizard_restore_stops_with_the_new_id_pinned() -> TestResult {
+    let tmp = scratch()?;
+    let m = Machine::new(&tmp, "host-a", None, MemKeyring::new())?;
+    let bundle = m.backup_elsewhere()?;
+    let (app, setup) = at_anchor_step(&m).await?;
+    let state = serving(&app).ok_or("not serving")?;
+    *m.pick_restore.lock().map_err(|_| "poisoned")? = Some(bundle);
+    m.ring.fail_next(
+        KeyOpKind::Set,
+        Some(EntryName::Kek),
+        KeyStoreError::Unavailable,
+        1,
+    );
+    run(&setup, "wizard_restore").await?;
+    let w = restore_window(&app).await?;
+    call(&w, "submit_secret", json!({ "secret": PASSPHRASE }))
+        .await
+        .map_err(|e| format!("submit_secret: {e}"))?;
+    let s = until(&setup, "the restore ended", |s| s["step"] != "restore").await?;
+    assert_eq!(
+        (s["step"].clone(), s["stopped_text"].clone()),
+        (
+            json!("stopped"),
+            json!(wizard::MSG_RESTORE_COMMITTED_INCOMPLETE)
+        ),
+        "{s}"
+    );
+    let data = local(&m.default_dir)?;
+    assert!(
+        data.path().join("audit.db").exists(),
+        "the restore committed"
+    );
+    let ids = m.keys.ids();
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    assert_eq!(
+        read_pinned(&m.pinned_file)?.and_then(|p| p.install_id),
+        Some(ids[0].clone())
+    );
+    assert_eq!(
+        m.pins()
+            .iter()
+            .map(|p| p.install_id.clone())
+            .collect::<Vec<_>>(),
+        [None, None, Some(ids[0].clone())]
+    );
+    assert!(state.store_failed(), "no first_run answer any more");
+    for cmd in ["wizard_begin", "wizard_restore", "wizard_anchor_dir"] {
+        assert_eq!(
+            call(&setup, cmd, json!({})).await,
+            Err(json!({"kind": "not_ready"})),
+            "{cmd}"
+        );
+    }
+    stop(&app).await
+}
+
+/// PD-171, T15 review I-3: the kept archive confirmation is recorded only next to the archive it
+/// was given for. When the archive the wizard derives again from the archive folder is another file
+/// (here a newer copy of it), `GENESIS` names that file and no `CONFIG_CHANGED {key:
+/// archive_and_start_fresh}` follows; the kept proof is dropped after the first store either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_archive_proof_names_only_its_own_file() -> TestResult {
+    let tmp = scratch()?;
+    let m = Machine::new(&tmp, "host-a", None, MemKeyring::new())?;
+    let a = archived_start(&m).await?;
+    // The answer the credential window kept is gone (the wizard derives the archive again).
+    assert_eq!(
+        credential::take_archived(a.app.handle()),
+        Some(a.archived.clone())
+    );
+    let folder = local(&m.default_dir)?.path().join("archived");
+    let kept = a
+        .archived
+        .file
+        .strip_prefix("archived/")
+        .ok_or("not in archived/")?;
+    let (stem, _stamp) = kept.rsplit_once('-').ok_or("no stamp")?;
+    let newer = format!("{stem}-99991231T235959Z.db");
+    for suffix in ["", "-wal"] {
+        let from = folder.join(format!("{kept}{suffix}"));
+        if from.exists() {
+            std::fs::copy(&from, folder.join(format!("{newer}{suffix}")))?;
+        }
+    }
+    run(&a.setup, "wizard_begin").await?;
+    assert_eq!(
+        type_passphrase(&a.app, PASSPHRASE).await,
+        Ok(json!({"accepted": {}}))
+    );
+    until(&a.setup, "GENESIS", step_is("recovery_note")).await?;
+    let genesis = genesis_payload(&a.state)?;
+    assert_eq!(
+        genesis["archived_db"]["file"],
+        format!("archived/{newer}"),
+        "{genesis}"
+    );
+    assert!(
+        config_changed(&a.state, "archive_and_start_fresh").is_err(),
+        "the proof of another archive was recorded"
+    );
+    assert_eq!(a.state.testing_archive_confirmation_file(), None);
+    serve::shutdown(&a.state, ShutdownReason::Quit, WAIT).await;
+    Ok(())
+}
+
+/// PD-171, T15 review I-3 (the realistic retry): a first `GENESIS` attempt that fails has taken the
+/// archive the credential window kept, and the kept confirmation stays; the next attempt derives
+/// the archive again from the archive folder and still records the confirmation next to it, which
+/// is then dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_archive_proof_survives_a_failed_first_attempt() -> TestResult {
+    let tmp = scratch()?;
+    let m = Machine::new(&tmp, "host-a", None, MemKeyring::new())?;
+    let a = archived_start(&m).await?;
+    let data = local(&m.default_dir)?;
+    // Attempt 1 through the wizard's own GENESIS (as its window hands the pair over; the mock app
+    // builds one credential window): the keychain refuses the new install's canary, nothing is
+    // created.
+    m.ring
+        .fail_next(KeyOpKind::Set, None, KeyStoreError::Unavailable, 1);
+    assert_eq!(
+        wizard::testing_genesis(a.app.handle(), pair()).await,
+        Err(FirstStoreFailure::KeychainUnavailable)
+    );
+    assert_eq!(
+        credential::take_archived(a.app.handle()),
+        None,
+        "the first attempt took it"
+    );
+    assert!(!data.path().join("audit.db").exists());
+    assert_eq!(
+        a.state.testing_archive_confirmation_file(),
+        Some(a.archived.file.clone())
+    );
+    // Attempt 2 through the setup and credential windows.
+    run(&a.setup, "wizard_begin").await?;
+    assert_eq!(
+        type_passphrase(&a.app, PASSPHRASE).await,
+        Ok(json!({"accepted": {}}))
+    );
+    until(&a.setup, "GENESIS", step_is("recovery_note")).await?;
+    let genesis = genesis_payload(&a.state)?;
+    assert_eq!(genesis["archived_db"]["file"], a.archived.file, "{genesis}");
+    let record = config_changed(&a.state, "archive_and_start_fresh")?;
+    assert_eq!(record["archived_db_file"], a.archived.file, "{record}");
+    assert_eq!(
+        record["dialog_text_sha256"],
+        atlas_duck_core::payloads::sha256_hex(serve::archive_confirm_text(&data).as_bytes()),
+        "{record}"
+    );
+    assert_eq!(a.state.testing_archive_confirmation_file(), None);
+    serve::shutdown(&a.state, ShutdownReason::Quit, WAIT).await;
+    Ok(())
+}
+
+/// T13 ruling 5, T15 review M-1: while the credential window is open for anything, "Restore from a
+/// backup" answers `busy` before any dialog: no confirmation, no file dialog, no ids.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wizard_restore_is_busy_while_the_credential_window_is_open() -> TestResult {
+    let tmp = scratch()?;
+    let m = Machine::new(&tmp, "host-a", None, MemKeyring::new())?;
+    let (app, setup) = at_anchor_step(&m).await?;
+    let handle = app.handle().clone();
+    tokio::task::spawn_blocking(move || {
+        credential::open(&handle, Purpose::RecoveryPassphrase, windows::Show::Focus)
+    })
+    .await?
+    .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        call(&setup, "wizard_restore", json!({})).await,
+        Err(json!({"kind": "busy"}))
+    );
+    assert!(m.confirmer.texts().is_empty());
+    assert_eq!(m.restore_dialogs.load(Ordering::SeqCst), 0);
+    assert!(m.keys.ids().is_empty());
+    assert_eq!(wizard_state(&setup).await?["step"], "anchor_dir");
+    stop(&app).await
+}
+
+/// §8.6 (L39), T15 review M-2: the restore stops where Begin would, before any dialog. With no
+/// usable Secret Service, or a keyring not on a local disk, the wizard shows the same stop text
+/// (Quit only): no confirmation, no file dialog, no keyring call, no id, no window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_restore_stops_where_begin_would() -> TestResult {
+    let tmp = scratch()?;
+    for (host, text) in [
+        ("host-a", MSG_NEEDS_SECRET_SERVICE),
+        ("host-b", MSG_KEYRING_NOT_LOCAL),
+    ] {
+        let mut m = Machine::new(&tmp, host, None, MemKeyring::new())?;
+        if text == MSG_NEEDS_SECRET_SERVICE {
+            m.secret_service = Some(SecretService::Missing);
+        } else {
+            m.ring.set_locality(KeyringLocality::NotLocal {
+                dir: m.root.join("home-on-nfs"),
+            });
+        }
+        let (app, setup) = at_anchor_step(&m).await?;
+        let s = run(&setup, "wizard_restore").await?;
+        assert_eq!(
+            (s["step"].clone(), s["stopped_text"].clone()),
+            (json!("stopped"), json!(text)),
+            "{host}: {s}"
+        );
+        assert!(m.confirmer.texts().is_empty(), "{host}");
+        assert_eq!(m.restore_dialogs.load(Ordering::SeqCst), 0, "{host}");
+        assert!(m.ring.ops().is_empty(), "{host}: no keyring call");
+        assert!(m.keys.ids().is_empty(), "{host}");
+        assert_eq!(credential::current_purpose(app.handle()), None, "{host}");
+        assert_eq!(
+            call(&setup, "wizard_restore", json!({})).await,
+            Err(json!({"kind": "not_ready"})),
+            "{host}"
+        );
+        stop(&app).await?;
+    }
+    Ok(())
 }

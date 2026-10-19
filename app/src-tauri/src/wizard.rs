@@ -108,6 +108,16 @@ pub const CLASS_ANCHOR_DIR_INVALID: &str = "anchor_dir_invalid";
 /// [`WizardError::class`] of a failed retry of the pinned file.
 pub const CLASS_PINNED_WRITE: &str = "pinned_write";
 
+/// [`WizardError::text`] (class `anchor_dir`) of an anchor directory that is the data dir or inside
+/// it (T15 review M-11, §8.5): a log anchored in its own data dir proves nothing.
+pub const ANCHOR_DIR_IN_DATA_DIR: &str = "the anchor directory is inside the data directory";
+
+/// The wizard stops with this text (and a Quit button) when its restore committed but did not
+/// complete (T15 review I-1): `audit.db` is the restored store, which the next start completes
+/// (the locked window's `COMMITTED_INCOMPLETE_TEXT`, with what to do now).
+pub const MSG_RESTORE_COMMITTED_INCOMPLETE: &str =
+    "Restore will be completed at the next start. Quit atlas-duck and start it again.";
+
 /// How long the move of the setup window waits for Tauri to forget the old one.
 const RELOCATE_WAIT: Duration = Duration::from_secs(2);
 
@@ -1001,24 +1011,10 @@ async fn request_passphrase<R: Runtime>(app: &AppHandle<R>) -> Result<(), Comman
                 .map(|()| Asked::Waiting)
                 .map_err(window_error);
         }
-        let found = check.check();
-        if matches!(found, Some(SecretService::Missing | SecretService::Locked)) {
-            return Ok(Asked::Stopped {
-                found,
-                text: MSG_NEEDS_SECRET_SERVICE,
-                reason: found.map_or("", SecretService::as_str),
-            });
-        }
-        // §8.6 (L39): the keyring's directories are checked before the passphrase is asked for
-        // (no keyring call). `Unknown` goes on: the store's own check at `GENESIS` is the backstop
-        // and a retry can succeed.
-        if matches!(locality(), KeyringLocality::NotLocal { .. }) {
-            return Ok(Asked::Stopped {
-                found,
-                text: MSG_KEYRING_NOT_LOCAL,
-                reason: REASON_KEYRING_NOT_LOCAL,
-            });
-        }
+        let found = match keyring_stop(&*check, &*locality) {
+            Ok(found) => found,
+            Err(stop) => return Ok(Asked::Stopped(stop)),
+        };
         credential::request_recovery_passphrase(&handle, Show::Focus)
             .map(|rx| Asked::Window { found, rx })
             .map_err(window_error)
@@ -1027,18 +1023,8 @@ async fn request_passphrase<R: Runtime>(app: &AppHandle<R>) -> Result<(), Comman
     let w = wizard(app)?;
     match asked {
         Ok(Asked::Waiting) => Ok(()),
-        Ok(Asked::Stopped {
-            found,
-            text,
-            reason,
-        }) => {
-            let mut p = w.progress();
-            if found.is_some() {
-                p.secret_service = found;
-            }
-            tracing::warn!(event = LOG_EVENT_STOPPED, reason);
-            p.stopped = Some(text);
-            p.in_flight = None;
+        Ok(Asked::Stopped(stop)) => {
+            stopped(&mut w.progress(), stop);
             Ok(())
         }
         Ok(Asked::Window { found, rx }) => {
@@ -1066,17 +1052,57 @@ async fn request_passphrase<R: Runtime>(app: &AppHandle<R>) -> Result<(), Comman
 enum Asked {
     /// The credential window waited already and was brought back.
     Waiting,
-    /// The wizard stops (Quit only): `text` is shown, `reason` is logged.
-    Stopped {
-        found: Option<SecretService>,
-        text: &'static str,
-        reason: &'static str,
-    },
+    /// The wizard stops (Quit only).
+    Stopped(KeyringStop),
     /// The credential window waits for the pair.
     Window {
         found: Option<SecretService>,
         rx: oneshot::Receiver<FirstRunPassphrase>,
     },
+}
+
+/// Why the wizard stops before anything secret is asked (§8.6): `text` is shown, `reason` is
+/// logged.
+struct KeyringStop {
+    found: Option<SecretService>,
+    text: &'static str,
+    reason: &'static str,
+}
+
+/// The §8.6 checks before a passphrase is asked for, by Begin and by the restore alike (T15 review
+/// M-2): Linux with no usable Secret Service, then the keyring's directories (L39; no keyring
+/// call). `Unknown` goes on: the store's own check is the backstop and a retry can succeed. `Ok`:
+/// the Secret Service answer, to show. Blocks (a D-Bus call): the blocking pool only.
+fn keyring_stop(
+    check: &dyn SecretServiceCheck,
+    locality: &(dyn Fn() -> KeyringLocality + Send + Sync),
+) -> Result<Option<SecretService>, KeyringStop> {
+    let found = check.check();
+    if matches!(found, Some(SecretService::Missing | SecretService::Locked)) {
+        return Err(KeyringStop {
+            found,
+            text: MSG_NEEDS_SECRET_SERVICE,
+            reason: found.map_or("", SecretService::as_str),
+        });
+    }
+    if matches!(locality(), KeyringLocality::NotLocal { .. }) {
+        return Err(KeyringStop {
+            found,
+            text: MSG_KEYRING_NOT_LOCAL,
+            reason: REASON_KEYRING_NOT_LOCAL,
+        });
+    }
+    Ok(found)
+}
+
+/// The wizard stops at `stop` (logged; nothing runs any more).
+fn stopped(p: &mut Progress, stop: KeyringStop) {
+    if stop.found.is_some() {
+        p.secret_service = stop.found;
+    }
+    tracing::warn!(event = LOG_EVENT_STOPPED, reason = stop.reason);
+    p.stopped = Some(stop.text);
+    p.in_flight = None;
 }
 
 fn window_error(e: WindowError) -> CommandError {
@@ -1135,13 +1161,15 @@ async fn retry_pin<R: Runtime>(app: &AppHandle<R>) {
 /// here with [`CLASS_ANCHOR_DIR_INVALID`] and nothing is kept; whether the folder can be read is
 /// the store's check at `GENESIS` (PD-167; its refusal comes back to this step). No confirmation:
 /// at first run nothing is weakened, and `GENESIS` records the setting (`CONFIG_CHANGED {key:
-/// anchor_dir, old: null}`). A cancelled dialog changes nothing; a second request while the dialog
-/// is up is `busy`; elsewhere `not_ready`.
+/// anchor_dir, old: null}`). The data dir itself, or a folder inside it, is refused (class
+/// `anchor_dir` with [`ANCHOR_DIR_IN_DATA_DIR`], §8.5: a log anchored in its own data dir proves
+/// nothing). A cancelled dialog changes nothing; a second request while the dialog is up is
+/// `busy`; elsewhere, also while the start after step 0 still opens the data dir, `not_ready`.
 pub async fn anchor_dir<R: Runtime>(app: &AppHandle<R>) -> Result<WizardState, CommandError> {
-    let pick = {
+    let (pick, data) = {
         let w = wizard(app)?;
         let mut p = w.progress();
-        if current_step(app, &mut p, None) != WizardStep::AnchorDir {
+        if !at_first_run_anchor_step(app, &mut p) {
             return Err(CommandError::NotReady);
         }
         if p.in_flight.is_some() {
@@ -1149,24 +1177,41 @@ pub async fn anchor_dir<R: Runtime>(app: &AppHandle<R>) -> Result<WizardState, C
         }
         p.in_flight = Some(InFlight::AnchorDir);
         p.error = None;
-        w.env.pick_anchor_dir.clone()
+        let data = app
+            .try_state::<DataDirHold>()
+            .map(|h| h.data().path().to_path_buf());
+        (w.env.pick_anchor_dir.clone(), data)
     };
     let handle = app.clone();
-    // The dialog blocks until the user answers: the blocking pool, never the main thread.
-    let picked = tauri::async_runtime::spawn_blocking(move || pick(&handle))
-        .await
-        .unwrap_or(None);
+    // The dialog blocks until the user answers (and the comparison may resolve a share's path):
+    // the blocking pool, never the main thread.
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        pick(&handle).map(|dir| {
+            let inside = data
+                .as_deref()
+                .is_some_and(|data| within_data_dir(dir.path(), data));
+            (dir, inside)
+        })
+    })
+    .await
+    .unwrap_or(None);
     {
         let w = wizard(app)?;
         let mut p = w.progress();
         p.in_flight = None;
         match picked {
             None => {}
-            Some(dir) if usable_anchor_dir(dir.path()) => p.anchor_dir = Some(dir),
-            Some(_) => {
+            Some((dir, false)) if usable_anchor_dir(dir.path()) => p.anchor_dir = Some(dir),
+            Some((_, false)) => {
                 p.error = Some(WizardError {
                     class: CLASS_ANCHOR_DIR_INVALID,
                     text: None,
+                });
+            }
+            Some((_, true)) => {
+                p.error = Some(WizardError {
+                    class: FirstStoreFailure::AnchorDir(ANCHOR_DIR_IN_DATA_DIR).class(),
+                    text: Some(ANCHOR_DIR_IN_DATA_DIR.to_owned()),
                 });
             }
         }
@@ -1174,9 +1219,28 @@ pub async fn anchor_dir<R: Runtime>(app: &AppHandle<R>) -> Result<WizardState, C
     answer(app).await
 }
 
+/// The anchor-dir step while the first-run gate serves (T15 review M-9: not while the start after
+/// step 0 still opens the data dir).
+fn at_first_run_anchor_step<R: Runtime>(app: &AppHandle<R>, p: &mut Progress) -> bool {
+    current_step(app, p, None) == WizardStep::AnchorDir
+        && windows::snapshot(app) == AppSnapshot::Gate(GateState::FirstRun)
+}
+
 /// What `create_new_store` takes as the wizard's anchor dir: absolute, non-empty UTF-8 text.
 fn usable_anchor_dir(dir: &Path) -> bool {
     dir.is_absolute() && dir.to_str().is_some_and(|s| !s.is_empty())
+}
+
+/// `dir` is the data dir `data` or inside it: compared as given, and where both resolve, as their
+/// canonical paths (another spelling, a link).
+fn within_data_dir(dir: &Path, data: &Path) -> bool {
+    if dir.starts_with(data) {
+        return true;
+    }
+    match (std::fs::canonicalize(dir), std::fs::canonicalize(data)) {
+        (Ok(dir), Ok(data)) => dir.starts_with(data),
+        _ => false,
+    }
 }
 
 /// `wizard_anchor_dir_clear {}` (M10 T15): at the anchor-dir step, no anchor directory for
@@ -1185,7 +1249,7 @@ pub async fn anchor_dir_clear<R: Runtime>(app: &AppHandle<R>) -> Result<WizardSt
     {
         let w = wizard(app)?;
         let mut p = w.progress();
-        if current_step(app, &mut p, None) != WizardStep::AnchorDir {
+        if !at_first_run_anchor_step(app, &mut p) {
             return Err(CommandError::NotReady);
         }
         if p.in_flight.is_some() {
@@ -1203,28 +1267,51 @@ pub async fn anchor_dir_clear<R: Runtime>(app: &AppHandle<R>) -> Result<WizardSt
 /// file dialog, the backup's passphrase in the credential window, purpose `restore_backup`, new
 /// ids, `restore_from_source`, the pinned `install_id`, the core start) while the wizard shows
 /// `restore`; afterwards it goes on at the instances (no `GENESIS`, no first-run passphrase, no
-/// recovery note). The answer is the state at once. A cancel at any question comes back to the
-/// anchor-dir step with nothing changed, a failure with its class. `busy` while another step runs;
-/// elsewhere `not_ready`.
+/// recovery note). Before any dialog, Begin's §8.6 checks (no usable Secret Service, a keyring not
+/// on a local disk) stop the wizard with their texts (T15 review M-2). The answer is the state at
+/// once. A cancel at any question comes back to the anchor-dir step with nothing changed (the ids
+/// and the pinned file are touched only after the last question); a failure with its class; a
+/// restore that committed but did not complete stops the wizard with
+/// [`MSG_RESTORE_COMMITTED_INCOMPLETE`] (Quit only). `busy` while another step runs or the
+/// credential window is open for anything (before any dialog, T13 ruling 5); elsewhere `not_ready`.
 pub async fn restore<R: Runtime>(app: &AppHandle<R>) -> Result<WizardState, CommandError> {
-    let state = {
+    let (state, check, locality) = {
         let w = wizard(app)?;
         let mut p = w.progress();
-        if current_step(app, &mut p, None) != WizardStep::AnchorDir
-            || windows::snapshot(app) != AppSnapshot::Gate(GateState::FirstRun)
-        {
+        if !at_first_run_anchor_step(app, &mut p) {
             return Err(CommandError::NotReady);
         }
-        if p.in_flight.is_some() {
+        if p.in_flight.is_some() || credential::current_purpose(app).is_some() {
             return Err(CommandError::Busy);
         }
         let state = serving_state(app).ok_or(CommandError::NotReady)?;
         p.in_flight = Some(InFlight::Restore);
         p.error = None;
-        state
+        (
+            state,
+            w.env.secret_service.clone(),
+            w.env.keyring_locality.clone(),
+        )
     };
-    let handle = app.clone();
-    tauri::async_runtime::spawn(async move { run_restore(handle, state).await });
+    let checked = blocking(move || Ok(keyring_stop(&*check, &*locality))).await;
+    {
+        let w = wizard(app)?;
+        let mut p = w.progress();
+        match checked {
+            Ok(Ok(found)) => {
+                if found.is_some() {
+                    p.secret_service = found;
+                }
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move { run_restore(handle, state).await });
+            }
+            Ok(Err(stop)) => stopped(&mut p, stop),
+            Err(e) => {
+                p.in_flight = None;
+                return Err(e);
+            }
+        }
+    }
     answer(app).await
 }
 
@@ -1257,6 +1344,11 @@ async fn run_restore<R: Runtime>(app: AppHandle<R>, state: Arc<serve::ServeState
             }
             // The user's choice: back at the anchor-dir step, no error.
             Err(FirstStoreFailure::Restore(UnlockFailure::Cancelled)) => {}
+            // `audit.db` is the restored store; only a restart completes it. Neither Begin nor
+            // another restore may be offered (T15 review I-1).
+            Err(FirstStoreFailure::Restore(UnlockFailure::CommittedIncomplete)) => {
+                p.stopped = Some(MSG_RESTORE_COMMITTED_INCOMPLETE);
+            }
             Err(f) => p.error = Some(failure_error(f)),
         }
     }
@@ -1374,6 +1466,20 @@ async fn genesis<R: Runtime>(
             .unwrap_or(None),
     };
     serve::create_first_store(&state, pair, archived, anchor_dir, pin).await
+}
+
+/// Tests: [`genesis`] with `pair` as if the credential window had handed it over (the mock runtime
+/// builds one credential window per app, so a second attempt cannot come through a window). The
+/// wizard's progress is not touched.
+#[doc(hidden)]
+pub async fn testing_genesis<R: Runtime>(
+    app: &AppHandle<R>,
+    pair: FirstRunPassphrase,
+) -> Result<FirstStore, FirstStoreFailure> {
+    let w = app
+        .try_state::<Wizard<R>>()
+        .ok_or(FirstStoreFailure::NotFirstRun)?;
+    genesis(app, &w, pair).await
 }
 
 /// The archive [`latest_archived`] finds (T20 review I-1); an unreadable folder names none (the
@@ -1770,6 +1876,26 @@ mod tests {
             let raw = std::ffi::OsStr::from_bytes(b"/mnt/\xff-anchors");
             assert!(!usable_anchor_dir(Path::new(raw)));
         }
+    }
+
+    /// T15 review M-11 (§8.5): the data dir and every folder inside it, also spelled another way,
+    /// are no anchor dir; a sibling whose name starts like the data dir's is.
+    #[test]
+    fn the_data_dir_is_no_anchor_dir() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(data.join("anchors"))?;
+        std::fs::create_dir(tmp.path().join("elsewhere"))?;
+        std::fs::create_dir(tmp.path().join("data-anchors"))?;
+        assert!(within_data_dir(&data, &data));
+        assert!(within_data_dir(&data.join("anchors"), &data));
+        assert!(within_data_dir(
+            &tmp.path().join("elsewhere").join("..").join("data"),
+            &data
+        ));
+        assert!(!within_data_dir(&tmp.path().join("elsewhere"), &data));
+        assert!(!within_data_dir(&tmp.path().join("data-anchors"), &data));
+        Ok(())
     }
 
     #[test]
