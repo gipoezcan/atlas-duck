@@ -87,6 +87,11 @@ finally {
   Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# Spec 12.5 (CI-06): the bundle identifier must differ from the data-dir folder name. The NSIS
+# script inspection is ci/check-installers.ps1, a separate bundle.yml step.
+& node ci/check-installers-lib.mjs identifier app/src-tauri/tauri.conf.json crates/ipc/src/paths/mod.rs
+if ($LASTEXITCODE -ne 0) { $failures += 'bundle identifier equals the data-dir folder name' }
+
 if ($failures.Count -gt 0) {
   $failures | ForEach-Object { Write-Error $_ -ErrorAction Continue }
   throw "check-windows-bundle: $($failures.Count) failure(s)"

@@ -54,6 +54,15 @@ echo "Contents/MacOS: ${bins//$'\n'/ }"
 main_exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
 [ "$main_exe" = "atlas-duck-app" ] || fail "CFBundleExecutable is '$main_exe', expected atlas-duck-app"
 
+# Spec §12.5 (CI-06): the built bundle's identifier is the configured one and differs from the
+# data-dir folder name (case-insensitively).
+bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")"
+conf_id="$(sed -n 's/^[[:space:]]*"identifier"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' app/src-tauri/tauri.conf.json | head -n 1)"
+echo "CFBundleIdentifier: $bundle_id (tauri.conf.json: $conf_id)"
+[ "$bundle_id" = "$conf_id" ] || fail "CFBundleIdentifier '$bundle_id' differs from tauri.conf.json identifier '$conf_id'"
+node ci/check-installers-lib.mjs identifier-value "$bundle_id" crates/ipc/src/paths/mod.rs ||
+  fail "CFBundleIdentifier equals the data-dir folder name"
+
 for b in atlas-duck-app atlas-duck atlas-duck-sandbox; do
   f="$macos_dir/$b"
   if [ ! -f "$f" ]; then

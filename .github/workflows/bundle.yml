@@ -117,6 +117,13 @@ jobs:
         shell: pwsh
         run: ./ci/check-windows-bundle.ps1 -BundleDir "target/$($env:TARGET)/release/bundle/nsis"
 
+      # CI-06 (spec §12.5, V19): the generated installer.nsi deletes app data only through the opt-in
+      # checkbox and only the bundle-identifier folder; PREINSTALL/PREUNINSTALL hooks are present.
+      # The step prints the matched app-data deletion lines: the first run records them as V19 evidence.
+      - name: Inspect the generated installer.nsi (app-data deletion, hooks, identifier)
+        shell: pwsh
+        run: ./ci/check-installers.ps1 -NsisDir "target/$($env:TARGET)/release/nsis/x64"
+
       - name: Upload bundle-x86_64-pc-windows-msvc
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -419,6 +426,10 @@ jobs:
 
       - name: Check the packages (bins, launcher, Exec without arguments)
         run: bash ci/check-linux-packages.sh "target/$TARGET/release/bundle"
+
+      # CI-06 (spec §12.5, L35): no deb or rpm maintainer script removes user data; the launcher is in all three.
+      - name: Inspect the maintainer scripts (no removal of user data) and the launcher
+        run: bash ci/check-installers.sh "target/$TARGET/release/bundle"
 
       - name: Upload bundle-x86_64-unknown-linux-gnu
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

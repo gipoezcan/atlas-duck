@@ -8,7 +8,9 @@
 #   * deb, rpm and AppImage ship exactly one launcher, /usr/share/applications/atlas-duck.desktop,
 #     whose only Exec line is `Exec=atlas-duck-app` (no arguments), equal to the repository file
 #   * the AppImage embeds that launcher (also at the AppDir root) and the three bins in usr/bin
-# Run from the repository root. Needs dpkg-deb, rpm, rpm2cpio, cpio.
+#   * the bundle identifier differs from the data-dir folder name (ci/check-installers-lib.mjs)
+# The maintainer-script inspection is ci/check-installers.sh (CI-06), a separate bundle.yml step.
+# Run from the repository root. Needs dpkg-deb, rpm, rpm2cpio, cpio, node.
 set -euo pipefail
 export LC_ALL=C
 
@@ -138,6 +140,10 @@ root_launchers="$(cd "$appdir" && ls -1A -- *.desktop 2>/dev/null | sort || true
   fail "AppImage: AppDir root launchers are '${root_launchers//$'\n'/ }', expected exactly $launcher"
 check_desktop "$appdir/$launcher" "AppImage (AppDir root)"
 check_tree "$appdir" "AppImage" contains
+
+# Spec §12.5 (CI-06): the bundle identifier must differ from the data-dir folder name.
+node ci/check-installers-lib.mjs identifier app/src-tauri/tauri.conf.json crates/ipc/src/paths/mod.rs ||
+  fail "bundle identifier equals the data-dir folder name"
 
 if [ "$failures" -ne 0 ]; then
   echo "check-linux-packages: $failures failure(s)" >&2
