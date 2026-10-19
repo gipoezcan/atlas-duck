@@ -43,11 +43,13 @@ pub(crate) fn child_command(app: &Path, rest: &[OsString]) -> Command {
     command
 }
 
-/// The exit code for a child's `code` (`None`: ended by a signal), reporting an abnormal end.
+/// The exit code for a child's `code` (`None`: ended by a signal). Only 0, 20, 21 and 22 are the
+/// app's answers; anything else (a signal, a Windows abort status, a panic's 101) is an abnormal
+/// end and is reported as such.
 pub(crate) fn exit_code_of(code: Option<i32>, stderr: &mut dyn Write) -> i32 {
     match code {
-        Some(code) => code,
-        None => {
+        Some(code @ (0 | 20 | 21 | 22)) => code,
+        _ => {
             let _ = writeln!(stderr, "{MSG_ABNORMAL}");
             VERIFY_EXPORT_USAGE_IO
         }
@@ -226,11 +228,26 @@ mod tests {
             String::from_utf8(err).expect("UTF-8"),
             "verify-export ended abnormally\n"
         );
-        // Every code the app returns (and any other) passes through, silently.
-        for code in [0, 1, 20, 21, 22, 101, -1] {
+        // The four codes the app returns pass through, silently.
+        for code in [0, 20, 21, 22] {
             let mut err = Vec::new();
             assert_eq!(exit_code_of(Some(code), &mut err), code);
             assert!(err.is_empty(), "code {code}");
+        }
+    }
+
+    /// M-1: a crashed app (a Windows abort status such as 0xC0000409, a panic's 101) is not one of
+    /// the documented codes: 22 with the abnormal-end line.
+    #[test]
+    fn undocumented_exit_codes_map_to_22() {
+        for code in [1, 2, 19, 23, 101, 255, -1, 0xC0000409_u32 as i32] {
+            let mut err = Vec::new();
+            assert_eq!(exit_code_of(Some(code), &mut err), 22, "code {code}");
+            assert_eq!(
+                String::from_utf8(err).expect("UTF-8"),
+                "verify-export ended abnormally\n",
+                "code {code}"
+            );
         }
     }
 

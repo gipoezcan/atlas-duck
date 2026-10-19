@@ -172,11 +172,23 @@ where
         parsed.anchor_dir.as_deref(),
         parsed.manifest_sha256,
     );
-    for line in verdict.report() {
-        let _ = writeln!(stdout, "{line}");
+    let written = verdict
+        .report()
+        .iter()
+        .try_for_each(|line| writeln!(stdout, "{line}"))
+        .and_then(|()| stdout.flush());
+    let code = i32::from(verdict.exit_code());
+    if written.is_err() {
+        // A closed or full stdout: never exit 0 (or 20) with no report. Tampering stays 21.
+        let _ = writeln!(
+            stderr,
+            "verify-export: could not write the report to stdout"
+        );
+        if code != 21 {
+            return VERIFY_EXPORT_USAGE_IO;
+        }
     }
-    let _ = stdout.flush();
-    i32::from(verdict.exit_code())
+    code
 }
 
 /// [`run_verify_export`] on the real verifier and the process's stdio.
@@ -440,6 +452,58 @@ mod tests {
 
     fn lines(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// A writer that refuses everything (a closed pipe, a full disk).
+    struct Broken;
+
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    /// M-3: a report that could not be written never leaves exit 0 (or 20) behind with no report;
+    /// a tamper verdict keeps 21, which is already the loudest answer.
+    #[test]
+    fn unwritable_report_is_exit_22_unless_tampered() {
+        let cases = [
+            (
+                ExportVerdict::Verified {
+                    report: lines(&["ok"]),
+                },
+                22,
+            ),
+            (
+                ExportVerdict::NoTrustRoot {
+                    report: lines(&["ok"]),
+                },
+                22,
+            ),
+            (
+                ExportVerdict::UsageOrIo {
+                    report: lines(&["no"]),
+                },
+                22,
+            ),
+            (
+                ExportVerdict::TamperOrFork {
+                    report: lines(&["bad"]),
+                },
+                21,
+            ),
+        ];
+        for (verdict, expected) in cases {
+            let mut err = Vec::new();
+            let code = run_verify_export(&os(&["d"]), |_, _, _| verdict, &mut Broken, &mut err);
+            assert_eq!(code, expected);
+            let text = String::from_utf8(err).expect("UTF-8");
+            assert!(text.contains("could not write the report"), "{text}");
+        }
     }
 
     #[test]

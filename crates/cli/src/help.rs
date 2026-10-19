@@ -60,6 +60,8 @@ Flags:
   --help                        show this help
 
 verify-export must be the first argument; the global flags do not apply to it.
+A --help or -h anywhere shows this help, so a directory named like a flag needs a path prefix
+(./--help).
 A directory ending in .partial is an incomplete export and is refused: rename it after an
 interrupted export once you know it is complete.
 
@@ -98,6 +100,12 @@ fn top_level() -> String {
         .iter()
         .map(|g| format!("{:<16} {}", g.path.join(" "), g.summary))
         .collect();
+    let mut generic = generic;
+    // Not a registry command (the app's verifier runs as a child process, §12.1).
+    generic.push(format!(
+        "{:<16} verify an audit export directory offline; the global flags do not apply (atlas-duck verify-export --help)",
+        "verify-export"
+    ));
     push_section(&mut out, "Commands", &generic);
     let ops: Vec<String> = all().iter().map(|s| s.cli.noun_path.join(" ")).collect();
     push_section(
@@ -231,6 +239,29 @@ mod tests {
         ] {
             assert!(text.contains(needle), "{needle}");
         }
+    }
+
+    /// I-1: `verify-export` is not a registry command, but the top-level help names it, and says
+    /// the global flags do not apply to it.
+    #[test]
+    fn top_level_lists_verify_export() {
+        let text = help_text(&[]).unwrap_or_default();
+        let line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("verify-export"))
+            .unwrap_or_default();
+        assert!(line.contains("verify-export --help"), "{text}");
+        assert!(line.contains("global flags do not apply"), "{line}");
+        // In the Commands section, before the operations.
+        let at = |needle: &str| text.find(needle).unwrap_or(usize::MAX);
+        assert!(at("verify-export") < at("Operations"), "{text}");
+    }
+
+    /// M-6: a directory named like a flag needs `./`.
+    #[test]
+    fn verify_export_help_says_flag_like_directories_need_a_dot_slash() {
+        let text = help_text(&path(&["verify-export"])).unwrap_or_default();
+        assert!(text.contains("./--help"), "{text}");
     }
 
     #[test]

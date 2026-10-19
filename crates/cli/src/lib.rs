@@ -331,7 +331,11 @@ mod tests {
             &["--help"],
             &["jira", "issue", "get", "--help"],
             &["mcp", "--help"],
-            &["verify-export", "dir"],
+            // `verify-export` as the first argument never reaches `execute` (`run` spawns the app
+            // from `verify_export::is_call`; that path is covered in `verify_export`'s tests), so
+            // the entry here is the form that does reach it: after a global flag it is refused
+            // locally.
+            &["--output", "text", "verify-export", "dir"],
             &["bogus"],
             &["--timeout", "x", "instances"],
         ] {
