@@ -24,6 +24,7 @@ use atlas_duck_atlassian::testing::fixtures::{self, JIRA_COMMENT};
 use atlas_duck_atlassian::testing::{MockDc, TEST_USER, UserKind};
 use atlas_duck_audit::request_set::requests_from_json;
 use atlas_duck_audit::{EventType, RequestRecord};
+use atlas_duck_core::payloads::body_from_json;
 use atlas_duck_ipc::envelope::Status;
 use atlas_duck_ipc::paths::ENDPOINT_FILE;
 use atlas_duck_registry::Product;
@@ -65,6 +66,20 @@ const X05_DROPPED: &str = "CANARY-X05-DROPPED-91c4d7e8";
 const X05_CONTROL: &str = "CANARY-X05-CONTROL-0a53b6f2";
 /// The scripted approver's drop of the redacted read (`atlas-test:release-redacted <path>`).
 const X05_REDACT_REASON: &str = "atlas-test:release-redacted fields.description";
+/// The full walk's canaries: `X05_PAGE` sits in the body of the Confluence page (released by
+/// `confluence.page.get` and by the script that returns it); `X05_SCRIPT_KEPT` sits in the `summary`
+/// and `X05_SCRIPT_DROPPED` in the `description` of `ABC-9`, which the script reads and returns only
+/// the summary of: the description never leaves the sandbox.
+const X05_PAGE: &str = "CANARY-X05-PAGE-5e07b1c3";
+const X05_SCRIPT_KEPT: &str = "CANARY-X05-SCRIPT-KEPT-3a9d62f4";
+const X05_SCRIPT_DROPPED: &str = "CANARY-X05-SCRIPT-DROPPED-d84b10e7";
+/// The canaries that reach the agent only inside released bytes, and the ones that never reach it.
+const X05_RELEASED_CANARIES: [&str; 5] =
+    [X05_SEARCH, X05_KEPT, X05_CONTROL, X05_PAGE, X05_SCRIPT_KEPT];
+const X05_DROPPED_CANARIES: [&str; 2] = [X05_DROPPED, X05_SCRIPT_DROPPED];
+/// The calls one front end makes in the full walk: seven on Jira (`x05_walk`), three on Confluence
+/// (a read, an approved and a denied update) and one script.
+const X05_FULL_CALLS: usize = 7 + 3 + 1;
 /// The field list of the app's start fill of the field-name cache (as `jira_flows`).
 const X05_FIELDS: &str = r#"[{"id":"summary","name":"Summary","custom":false,"schema":{"type":"string","system":"summary"}},{"id":"customfield_10200","name":"Team","custom":true,"schema":{"type":"option","custom":"com.atlassian.jira.plugin.system.customfieldtypes:select","customId":10200}}]"#;
 
@@ -1114,6 +1129,41 @@ impl Front<'_> {
             }
         }
     }
+
+    /// A script run through this front end, released by the approver (`reason`): `script run
+    /// <file>` (the source is written under the test root as `name`) or `script_run`. The wait is
+    /// `ATLAS_DUCK_MCP_TIMEOUT` of the MCP child, [`SCRIPT_TIMEOUT`], and the CLI's `--timeout`.
+    async fn script(&mut self, name: &str, source: &str, reason: &str) -> Result<Value> {
+        let file = match self {
+            Front::Cli { world, .. } => {
+                let dir = world.root().join("scripts");
+                std::fs::create_dir_all(&dir)?;
+                let path = dir.join(name);
+                std::fs::write(&path, source)?;
+                Some(path.to_string_lossy().into_owned())
+            }
+            Front::Mcp(_) => None,
+        };
+        let cli: Vec<&str> = match &file {
+            Some(file) => vec![
+                "script",
+                "run",
+                file.as_str(),
+                "--reason",
+                reason,
+                "--timeout",
+                SCRIPT_TIMEOUT,
+            ],
+            None => Vec::new(),
+        };
+        self.run(
+            &cli,
+            "script_run",
+            json!({"source": source, "reason": reason}),
+            true,
+        )
+        .await
+    }
 }
 
 /// The writes the mock received so far, in arrival order: every request that is neither a `GET`
@@ -1346,6 +1396,48 @@ fn x05_approved(records: &[(EventType, Value)]) -> Result<Vec<RequestRecord>> {
     Ok(all)
 }
 
+/// The writes of one mock against the approvals that covered them: `origins` lists, in order, the
+/// origin (`"<who> <what>"`, part of every written body as `x05 <origin>`) and the endpoint of each
+/// write. The mock received exactly these writes, in this order, and each one's bytes are the
+/// approved request's (method, URL, body).
+fn x05_assert_writes(
+    mock: &MockDc,
+    approved: &[&RequestRecord],
+    sent: &[(String, String, Vec<u8>)],
+    origins: &[(&str, &str)],
+) {
+    assert_eq!(
+        approved.len(),
+        origins.len(),
+        "approved request sets: {approved:?}"
+    );
+    assert_eq!(
+        sent.len(),
+        origins.len(),
+        "the mock received {} writes",
+        sent.len()
+    );
+    for ((request, (method, path, body)), (origin, endpoint)) in
+        approved.iter().zip(sent).zip(origins)
+    {
+        assert_eq!(&request.method, method, "{origin}");
+        assert_eq!(
+            request.resolved_url,
+            format!("{}{endpoint}", mock.base_url()),
+            "{origin}: the approved URL; the mock saw {path}"
+        );
+        assert_eq!(
+            &request.body_bytes, body,
+            "{origin}: the bytes on the wire are not the approved bytes"
+        );
+        assert!(
+            String::from_utf8_lossy(body).contains(&format!("x05 {origin}")),
+            "{origin}: the written body is {:?}",
+            String::from_utf8_lossy(body)
+        );
+    }
+}
+
 /// X-05, Jira half (SC1, §13 canary sweep), through the CLI and through MCP against the same app
 /// and the same mock Jira. Each front end runs the same walk: `jira.search` released, `jira.issue.get`
 /// released with `fields.description` dropped by the approver, `jira.issue.create` and
@@ -1361,7 +1453,8 @@ fn x05_approved(records: &[(EventType, Value)]) -> Result<Vec<RequestRecord>> {
 /// Source: `jira_flows` (`md_comment_sent_as_wiki`, `i36_edit_conflict_denied_exit3`), `cli_flows`
 /// `i03_write_approve_flow`, the approver directives of `testing/approver.rs`, audit
 /// `request_set.rs` (`requests_to_json`). The app is started first, so both front ends use one
-/// app; the audit log is read after the app quit. Confluence and script legs are Task 24.
+/// app; the audit log is read after the app quit. The Confluence and script legs are
+/// `x05_sc1_walk_full_cli_and_mcp`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn x05_sc1_walk_jira_cli_and_mcp() -> Result<()> {
     if !opted_in("x05_sc1_walk_jira_cli_and_mcp") {
@@ -1417,33 +1510,13 @@ async fn x05_sc1_walk_jira_cli_and_mcp() -> Result<()> {
     quit_app(&world).await?;
     let records = world.audit_records()?;
     let approved = x05_approved(&records)?;
-    assert_eq!(approved.len(), 4, "approved request sets: {approved:?}");
-    assert_eq!(sent.len(), 4, "the mock received {} writes", sent.len());
     let origins = [
         ("cli create", "/rest/api/2/issue"),
         ("cli edit", "/rest/api/2/issue/ABC-1"),
         ("mcp create", "/rest/api/2/issue"),
         ("mcp edit", "/rest/api/2/issue/ABC-1"),
     ];
-    for ((request, (method, path, body)), (origin, endpoint)) in
-        approved.iter().zip(&sent).zip(origins)
-    {
-        assert_eq!(&request.method, method, "{origin}");
-        assert_eq!(
-            request.resolved_url,
-            format!("{}{endpoint}", mock.base_url()),
-            "{origin}: the approved URL; the mock saw {path}"
-        );
-        assert_eq!(
-            &request.body_bytes, body,
-            "{origin}: the bytes on the wire are not the approved bytes"
-        );
-        assert!(
-            String::from_utf8_lossy(body).contains(&format!("x05 {origin}")),
-            "{origin}: the written body is {:?}",
-            String::from_utf8_lossy(body)
-        );
-    }
+    x05_assert_writes(mock, &approved.iter().collect::<Vec<_>>(), &sent, &origins);
     let denied = records
         .iter()
         .filter(|(kind, _)| *kind == EventType::WRITE_DENIED)
@@ -2257,6 +2330,480 @@ async fn i41_sandbox_replaced_is_error_with_retryable() -> Result<()> {
             .iter()
             .any(|p| p["reason"] == json!("protocol_violation")),
         "a protocol violation in the audit: {failed:?}"
+    );
+    Ok(())
+}
+
+// ---- X-05 complete: Jira, Confluence and script through the CLI and MCP (Task 24) ---------------------
+
+/// [`jira_world`] plus the Confluence instance `wiki`. Each product has one instance, so a call
+/// without `instance` routes to it (as `e2e`'s `jira_and_wiki_world`).
+async fn full_world() -> Result<World> {
+    let mut world = World::new(WorldOpts::default())?;
+    world
+        .provision_store(&[("jira-main", Product::Jira), ("wiki", Product::Confluence)])
+        .await?;
+    Ok(world)
+}
+
+/// [`x05_mount`] plus what the Confluence and script legs need: `ABC-9` for the script (summary
+/// `X05_SCRIPT_KEPT`, description `X05_SCRIPT_DROPPED`) and the Confluence page `65537` with
+/// `X05_PAGE` in its body, ahead of the fixture's page. The answer is for any method, so the `PUT`
+/// of an update is answered by it as well (the declared success is any 2xx with a JSON body); a
+/// write's receipt projects listed fields only, so none of the body reaches an update's answer.
+async fn x05_mount_full(jira: &MockDc, confluence: &MockDc) -> Result<()> {
+    x05_mount(jira).await?;
+    jira.json(
+        "/rest/api/2/issue/ABC-9",
+        200,
+        &x05_issue(
+            "ABC-9",
+            &format!("Nine {X05_SCRIPT_KEPT}"),
+            &format!("Script private {X05_SCRIPT_DROPPED}"),
+        )?,
+    )
+    .await;
+    let mut page: Value = serde_json::from_str(fixtures::CONFLUENCE_PAGE)?;
+    page["body"]["storage"]["value"] = json!(format!("<p>Check the build. {X05_PAGE}</p>"));
+    confluence
+        .json_first(WIKI_PAGE_PATH, 200, &page.to_string())
+        .await;
+    Ok(())
+}
+
+/// How many `GET`s the mock saw whose path ends with `suffix`.
+async fn x05_gets(mock: &MockDc, suffix: &str) -> usize {
+    mock.received()
+        .await
+        .iter()
+        .filter(|r| r.method.as_str() == "GET" && r.url.path().ends_with(suffix))
+        .count()
+}
+
+/// The multi-call read script of the walk: two Jira reads and a Confluence read. It returns the
+/// summary of `ABC-9` (not its description), the page's title and Markdown body, and the
+/// description of `ABC-8` (the control: a description does reach a script's result).
+const X05_SCRIPT: &str = "const issue = await atlas.call('jira.issue.get', {key: 'ABC-9'});\n\
+                          const page = await atlas.call('confluence.page.get', {id: '65537'});\n\
+                          const control = await atlas.call('jira.issue.get', {key: 'ABC-8'});\n\
+                          return {summary: issue.fields.summary, title: page.title, \
+                          body: page.body.value, control: control.fields.description};\n";
+
+/// The Confluence half of one front end's walk: `confluence.page.get` released (the page's canary
+/// is in the released Markdown), an approved `confluence.page.update` (the mock receives one `PUT`
+/// at the page's endpoint) and a denied one (the mock hears nothing). `who` is part of the written
+/// body, so the bytes the mock received name their origin.
+async fn x05_wiki_walk(front: &mut Front<'_>, wiki: &MockDc, who: &str) -> Result<()> {
+    let env = front
+        .run(
+            &[
+                "confluence",
+                "page",
+                "get",
+                WIKI_PAGE_ID,
+                "--reason",
+                "atlas-test:release",
+            ],
+            "confluence_page_get",
+            json!({"id": WIKI_PAGE_ID, "reason": "atlas-test:release"}),
+            true,
+        )
+        .await?;
+    assert_eq!(status_of(&env), "released", "{who} page get: {env}");
+    assert_eq!(
+        env["data"]["result"]["body"]["format"],
+        json!("markdown"),
+        "{who} page get: {env}"
+    );
+    assert!(
+        env["data"]["result"]["body"]["value"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(X05_PAGE),
+        "{who} page get: the released canary is missing: {env}"
+    );
+
+    let before = x05_writes(wiki).await.len();
+    let body = format!("x05 {who} page update");
+    let env = front
+        .run(
+            &[
+                "confluence",
+                "page",
+                "update",
+                WIKI_PAGE_ID,
+                "--base-version",
+                "7",
+                "--body",
+                &body,
+                "--reason",
+                "atlas-test:approve",
+            ],
+            "confluence_page_update",
+            json!({"id": WIKI_PAGE_ID, "base_version": 7, "body": body,
+                   "reason": "atlas-test:approve"}),
+            true,
+        )
+        .await?;
+    assert_eq!(status_of(&env), "succeeded", "{who} page update: {env}");
+    let writes = x05_writes(wiki).await;
+    assert_eq!(writes.len(), before + 1, "{who} page update: {writes:?}");
+    assert_eq!(
+        writes[before].0, "PUT",
+        "{who} page update: the mock saw {writes:?}"
+    );
+    assert_eq!(
+        writes[before].1,
+        wiki.path(WIKI_PAGE_PATH),
+        "{who} page update"
+    );
+    let put: Value = serde_json::from_slice(&writes[before].2)?;
+    assert_eq!(
+        put["body"]["storage"]["representation"],
+        json!("storage"),
+        "{who} page update: {put}"
+    );
+    assert!(
+        put["body"]["storage"]["value"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&body),
+        "{who} page update: the stored body is not the approved one: {put}"
+    );
+    assert_eq!(
+        put["version"]["number"],
+        json!(8),
+        "{who} page update: {put}"
+    );
+
+    let before = writes.len();
+    let env = front
+        .run(
+            &[
+                "confluence",
+                "page",
+                "update",
+                WIKI_PAGE_ID,
+                "--base-version",
+                "7",
+                "--body",
+                "x05 denied page update",
+                "--reason",
+                "atlas-test:deny",
+            ],
+            "confluence_page_update",
+            json!({"id": WIKI_PAGE_ID, "base_version": 7, "body": "x05 denied page update",
+                   "reason": "atlas-test:deny"}),
+            false,
+        )
+        .await?;
+    assert_eq!(status_of(&env), "denied", "{who} denied page update: {env}");
+    assert_eq!(
+        x05_writes(wiki).await.len(),
+        before,
+        "{who}: a denied page update reached the mock"
+    );
+    Ok(())
+}
+
+/// The script leg of one front end's walk: [`X05_SCRIPT`] released by the approver. The result has
+/// the released canaries (the summary, the page body, the control description), the dropped
+/// description's canary is nowhere in the envelope, and each of the script's three reads reached the
+/// mock exactly once.
+async fn x05_script_walk(
+    front: &mut Front<'_>,
+    jira: &MockDc,
+    wiki: &MockDc,
+    who: &str,
+) -> Result<()> {
+    let nine = x05_gets(jira, "/issue/ABC-9").await;
+    let eight = x05_gets(jira, "/issue/ABC-8").await;
+    let page = x05_gets(wiki, WIKI_PAGE_PATH).await;
+    let env = front
+        .script(&format!("x05_{who}.js"), X05_SCRIPT, "atlas-test:release")
+        .await?;
+    assert_eq!(status_of(&env), "released", "{who} script: {env}");
+    assert!(env["data"]["script_error"].is_null(), "{who} script: {env}");
+    let result = &env["data"]["result"];
+    for (field, canary) in [
+        ("summary", X05_SCRIPT_KEPT),
+        ("body", X05_PAGE),
+        ("control", X05_CONTROL),
+    ] {
+        assert!(
+            result[field].as_str().unwrap_or_default().contains(canary),
+            "{who} script: {field} lacks its released canary: {env}"
+        );
+    }
+    assert_eq!(
+        result["title"],
+        json!("Release checklist"),
+        "{who} script: {env}"
+    );
+    assert!(
+        !env.to_string().contains(X05_SCRIPT_DROPPED),
+        "{who} script: the dropped canary is in the envelope: {env}"
+    );
+    assert_eq!(
+        x05_gets(jira, "/issue/ABC-9").await,
+        nine + 1,
+        "{who} script: reads of ABC-9"
+    );
+    assert_eq!(
+        x05_gets(jira, "/issue/ABC-8").await,
+        eight + 1,
+        "{who} script: reads of ABC-8"
+    );
+    assert_eq!(
+        x05_gets(wiki, WIKI_PAGE_PATH).await,
+        page + 1,
+        "{who} script: reads of the page"
+    );
+    Ok(())
+}
+
+/// The whole walk of one front end: the Jira half ([`x05_walk`]), the Confluence half and the
+/// script, [`X05_FULL_CALLS`] calls in all.
+async fn x05_full_walk(
+    front: &mut Front<'_>,
+    jira: &MockDc,
+    wiki: &MockDc,
+    who: &str,
+) -> Result<()> {
+    x05_walk(front, jira, who).await?;
+    x05_wiki_walk(front, wiki, who).await?;
+    x05_script_walk(front, jira, wiki, who).await
+}
+
+/// The released payloads of the audit log, as the bytes the release committed (the `released` of
+/// every `READ_RELEASED` and `SCRIPT_RELEASED` that has one; an outcome item has none) and as the
+/// JSON they parse to.
+fn x05_released(records: &[(EventType, Value)]) -> Result<Vec<(Value, String)>> {
+    let mut all = Vec::new();
+    for (kind, payload) in records {
+        if *kind != EventType::READ_RELEASED && *kind != EventType::SCRIPT_RELEASED {
+            continue;
+        }
+        let Some(released) = payload.get("released") else {
+            continue;
+        };
+        let bytes = body_from_json(released)
+            .ok_or_else(|| format!("{kind:?}: `released` is no body: {payload}"))?;
+        let text = String::from_utf8(bytes)?;
+        let value: Value = serde_json::from_str(&text)?;
+        all.push((value, text));
+    }
+    Ok(all)
+}
+
+/// The canary sweep of the full walk over every channel in `seen` (`name`, text: one CLI stream or
+/// one MCP stdout line, or the MCP stderr), against the released payloads of the audit log:
+/// - every released canary is in some released payload, no dropped canary is in any (so the
+///   released bytes are the ones the sweep reasons about);
+/// - the PAT and the dropped canaries are on no channel;
+/// - a released canary is on a channel only as the released bytes themselves: the channel is one
+///   envelope (a CLI stdout, or the `structuredContent` of an MCP result whose text blocks that
+///   carry it are that envelope), `released`, and its `data` is the parse of a released payload
+///   (`data.result` for a read, `data` for a script).
+fn x05_sweep(seen: &[(String, String)], released: &[(Value, String)]) -> Result<()> {
+    for canary in X05_RELEASED_CANARIES {
+        if !released.iter().any(|(_, text)| text.contains(canary)) {
+            return Err(format!("{canary} is in no released payload of the audit log").into());
+        }
+    }
+    for canary in X05_DROPPED_CANARIES {
+        if let Some((_, text)) = released.iter().find(|(_, text)| text.contains(canary)) {
+            return Err(format!("{canary} is in a released payload: {text}").into());
+        }
+    }
+    for (name, text) in seen {
+        if text.contains(PAT_CANARY) {
+            return Err(format!("the PAT canary is in {name}").into());
+        }
+        for canary in X05_DROPPED_CANARIES {
+            if text.contains(canary) {
+                return Err(format!("the dropped canary {canary} is in {name}: {text}").into());
+            }
+        }
+        let carried: Vec<&str> = X05_RELEASED_CANARIES
+            .into_iter()
+            .filter(|canary| text.contains(canary))
+            .collect();
+        if carried.is_empty() {
+            continue;
+        }
+        let line: Value = serde_json::from_str(text.trim())
+            .map_err(|e| format!("{name} carries {carried:?} but is no JSON: {e}"))?;
+        let env = if line.get("jsonrpc").is_some() {
+            let result = &line["result"];
+            let env = result["structuredContent"].clone();
+            if !env.is_object() {
+                return Err(
+                    format!("{name} carries {carried:?} outside an envelope: {text}").into(),
+                );
+            }
+            for block in result["content"].as_array().into_iter().flatten() {
+                let block_text = block["text"].as_str().unwrap_or_default();
+                if !carried.iter().any(|canary| block_text.contains(canary)) {
+                    continue;
+                }
+                let parsed: Value = serde_json::from_str(block_text)
+                    .map_err(|e| format!("{name}: a text block carries a canary, no JSON: {e}"))?;
+                if parsed != env {
+                    return Err(format!(
+                        "{name}: a text block carries a canary, not the envelope: {text}"
+                    )
+                    .into());
+                }
+            }
+            env
+        } else {
+            line
+        };
+        if status_of(&env) != "released" {
+            return Err(
+                format!("{name}: {carried:?} is in a result that is not released: {env}").into(),
+            );
+        }
+        let data = &env["data"];
+        if !released
+            .iter()
+            .any(|(value, _)| *value == data["result"] || value == data)
+        {
+            return Err(format!(
+                "{name}: {carried:?} is in bytes that equal no released payload: {env}"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// X-05 complete (SC1, §13 canary sweep): the Jira walk of `x05_sc1_walk_jira_cli_and_mcp` plus
+/// `confluence.page.get` (released), an approved and a denied `confluence.page.update` and a
+/// multi-call read script over Jira and Confluence (released), through the CLI and then through MCP,
+/// against one app, one mock Jira and one mock Confluence.
+///
+/// What it proves: (1) the canaries of the dropped fields (the description the approver drops from
+/// `ABC-7`, the description of `ABC-9` that the script reads and does not return) are in no CLI
+/// stdout or stderr byte, no MCP message and no MCP stderr line, and not in any released payload of
+/// the audit log, while the canaries of the released fields (search summary, kept summary, page
+/// body, script summary) and the two controls (an issue description released whole, the same
+/// description in a script's result) are in released bytes, so the absence is not vacuous; (2) a
+/// canary of a released field is on a channel only as the released bytes (`x05_sweep`); (3) the
+/// mock Jira and the mock Confluence received exactly the approved writes: each mock's writes, in
+/// order, are the `requests` of the `WRITE_APPROVED` records of its URLs (method, URL, body bytes),
+/// there are no others and every one has its `WRITE_EXECUTED`; (4) a denied write sent nothing
+/// (per write and by the counts of `WRITE_DENIED` and of the mock's writes).
+///
+/// Source: `x05_sc1_walk_jira_cli_and_mcp` (the Jira half, `Front`, the writes), `confluence_flows`
+/// (`md_page_update_sent_as_storage`), `script_flows` (`script_flows_smoke`,
+/// `confluence_page_get_in_script_real_worker`), `engine/deliver.rs` `released` (read: `data.result`
+/// is the parse of the released bytes; script: `data` is). The MCP child waits as the script flows
+/// do ([`SCRIPT_TIMEOUT`]; the first script of an app waits for the sandbox probe), the driver a
+/// little longer ([`SCRIPT_ANSWER_WITHIN`]); the CLI script runs get `--timeout`. The audit log is
+/// read after the app quit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn x05_sc1_walk_full_cli_and_mcp() -> Result<()> {
+    if !opted_in("x05_sc1_walk_full_cli_and_mcp") {
+        return Ok(());
+    }
+    let world = full_world().await?;
+    let mock = jira(&world)?;
+    let confluence = wiki(&world)?;
+    x05_mount_full(mock, confluence).await?;
+    let _app = world.start_app().await?;
+
+    // The CLI half.
+    let mut seen: Vec<(String, String)> = Vec::new();
+    {
+        let mut cli = Front::Cli {
+            world: &world,
+            seen: &mut seen,
+        };
+        x05_full_walk(&mut cli, mock, confluence, "cli").await?;
+    }
+
+    // The MCP half, the same walk.
+    let mut mcp = mcp_client(&world, "mcp-flows-x05-full", SCRIPT_TIMEOUT)
+        .await?
+        .with_timeout(SCRIPT_ANSWER_WITHIN);
+    x05_full_walk(&mut Front::Mcp(&mut mcp), mock, confluence, "mcp").await?;
+    mcp.close_stdin();
+    let exit = mcp.wait_exit().await?;
+    assert!(exit.success(), "{exit}\n{}", mcp.transcript());
+    // Read the rest of stdout up to its end, so a late line does not go unscanned.
+    mcp.wait_stdout_eof(Duration::from_secs(10)).await?;
+    for (n, line) in mcp.raw_stdout_lines().into_iter().enumerate() {
+        seen.push((format!("atlas-duck mcp stdout line {n}"), line));
+    }
+    seen.push(("atlas-duck mcp stderr".into(), mcp.stderr_text()));
+    // The CLI's stdout and stderr of every call, the MCP stdout lines (the initialize response and
+    // one per call) and the MCP stderr.
+    assert_eq!(
+        seen.len(),
+        2 * X05_FULL_CALLS + (1 + X05_FULL_CALLS) + 1,
+        "the sweep saw {} channels",
+        seen.len()
+    );
+
+    // The mock received exactly what the approvals covered.
+    let jira_sent = x05_writes(mock).await;
+    let wiki_sent = x05_writes(confluence).await;
+    quit_app(&world).await?;
+    let records = world.audit_records()?;
+    x05_sweep(&seen, &x05_released(&records)?)?;
+    let approved = x05_approved(&records)?;
+    let (jira_base, wiki_base) = (mock.base_url(), confluence.base_url());
+    let jira_approved: Vec<&RequestRecord> = approved
+        .iter()
+        .filter(|r| r.resolved_url.starts_with(&jira_base))
+        .collect();
+    let wiki_approved: Vec<&RequestRecord> = approved
+        .iter()
+        .filter(|r| r.resolved_url.starts_with(&wiki_base))
+        .collect();
+    assert_eq!(
+        jira_approved.len() + wiki_approved.len(),
+        approved.len(),
+        "an approved request set is for neither mock: {approved:?}"
+    );
+    x05_assert_writes(
+        mock,
+        &jira_approved,
+        &jira_sent,
+        &[
+            ("cli create", "/rest/api/2/issue"),
+            ("cli edit", "/rest/api/2/issue/ABC-1"),
+            ("mcp create", "/rest/api/2/issue"),
+            ("mcp edit", "/rest/api/2/issue/ABC-1"),
+        ],
+    );
+    x05_assert_writes(
+        confluence,
+        &wiki_approved,
+        &wiki_sent,
+        &[
+            ("cli page update", WIKI_PAGE_PATH),
+            ("mcp page update", WIKI_PAGE_PATH),
+        ],
+    );
+    let count = |kind: EventType| records.iter().filter(|(k, _)| *k == kind).count();
+    assert_eq!(
+        count(EventType::WRITE_EXECUTED),
+        approved.len(),
+        "WRITE_EXECUTED records"
+    );
+    assert_eq!(count(EventType::WRITE_DENIED), 6, "WRITE_DENIED records");
+    assert_eq!(
+        count(EventType::SCRIPT_STARTED),
+        2,
+        "SCRIPT_STARTED records"
+    );
+    assert_eq!(
+        count(EventType::SCRIPT_RELEASED),
+        2,
+        "SCRIPT_RELEASED records"
     );
     Ok(())
 }
