@@ -314,6 +314,32 @@ pub struct StoreHealthView {
     pub shred_checkpoint_pending: bool,
     /// A settings row of the log could not be read: prune and setting changes are refused.
     pub settings_unreadable: bool,
+    /// The latest append to the anchor directory failed; retried, never an incident (§8.5, PD-156;
+    /// M10 T4 review handoff, shown by the Audit window's `audit_status`).
+    pub anchor_dir_write_failing: bool,
+    /// Anchor-directory lines waiting to be written (PD-156).
+    pub anchor_dir_lines_pending: u32,
+}
+
+impl StoreHealthView {
+    /// The view of the store's own health (no error text: `last_prune_error` becomes a flag).
+    pub fn of(h: &StoreHealth) -> StoreHealthView {
+        StoreHealthView {
+            storage_low: h.storage_low,
+            anchor_write_failing: h.anchor_write_failing,
+            anchor_thread_dead: h.anchor_thread_dead,
+            anchors_blocked: h.anchors_blocked.is_some(),
+            open_incidents: u64::try_from(h.open_incidents).unwrap_or(u64::MAX),
+            prune_backlog_days: h.prune_backlog_days,
+            prune_backlog: (h.prune_backlog_days > 0)
+                .then(|| format!("pruning is {} days behind", h.prune_backlog_days)),
+            last_prune_failed: h.last_prune_error.is_some(),
+            shred_checkpoint_pending: h.shred_checkpoint_pending,
+            settings_unreadable: h.settings_unreadable,
+            anchor_dir_write_failing: h.anchor_dir_write_failing,
+            anchor_dir_lines_pending: h.anchor_dir_lines_pending,
+        }
+    }
 }
 
 /// What the Settings window shows (Δ3).
@@ -841,22 +867,6 @@ fn store_change(req: &SettingChangeReq) -> Option<SettingChange> {
     }
 }
 
-fn health_view(h: &StoreHealth) -> StoreHealthView {
-    StoreHealthView {
-        storage_low: h.storage_low,
-        anchor_write_failing: h.anchor_write_failing,
-        anchor_thread_dead: h.anchor_thread_dead,
-        anchors_blocked: h.anchors_blocked.is_some(),
-        open_incidents: u64::try_from(h.open_incidents).unwrap_or(u64::MAX),
-        prune_backlog_days: h.prune_backlog_days,
-        prune_backlog: (h.prune_backlog_days > 0)
-            .then(|| format!("pruning is {} days behind", h.prune_backlog_days)),
-        last_prune_failed: h.last_prune_error.is_some(),
-        shred_checkpoint_pending: h.shred_checkpoint_pending,
-        settings_unreadable: h.settings_unreadable,
-    }
-}
-
 /// The core's `SettingsAdmin`.
 pub struct CoreSettings {
     engine: Arc<Engine>,
@@ -1135,7 +1145,7 @@ impl SettingsAdmin for CoreSettings {
             legal_hold: settings.legal_hold,
             anchor_dir: settings.anchor_dir,
             allow_degraded_scripts: settings.allow_degraded_scripts,
-            health: health_view(&self.store.health()),
+            health: StoreHealthView::of(&self.store.health()),
             config_read_only: banner(&cfg),
             restart_pending: self.restart_pending(&cur, &cfg),
         }
@@ -1256,6 +1266,29 @@ impl SettingsAdmin for CoreSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M10 T12 (T4 review handoff): the view carries the anchor directory's write state, so
+    /// Settings and the Audit window can show a failing directory (§8.5); no error text.
+    #[test]
+    fn health_view_carries_the_anchor_dir_state() {
+        let h = StoreHealth {
+            anchor_dir_write_failing: true,
+            anchor_dir_lines_pending: 7,
+            open_incidents: 2,
+            last_prune_error: Some("a/path/that/must/not/leak".into()),
+            ..StoreHealth::default()
+        };
+        let v = StoreHealthView::of(&h);
+        assert!(v.anchor_dir_write_failing);
+        assert_eq!(v.anchor_dir_lines_pending, 7);
+        assert_eq!(v.open_incidents, 2);
+        assert!(v.last_prune_failed);
+        let wire = serde_json::to_value(&v).unwrap_or_default();
+        assert_eq!(wire["anchor_dir_write_failing"], json!(true));
+        assert_eq!(wire["anchor_dir_lines_pending"], json!(7));
+        assert!(!wire.to_string().contains("a/path"), "{wire}");
+        assert!(!StoreHealthView::of(&StoreHealth::default()).anchor_dir_write_failing);
+    }
 
     #[test]
     fn change_requests_are_tagged_and_strict() {

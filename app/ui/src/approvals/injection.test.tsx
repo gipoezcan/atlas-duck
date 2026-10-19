@@ -311,9 +311,34 @@ function answer(cmd: string, args: Record<string, unknown>): Promise<Json> {
     case 'wizard_begin':
     case 'wizard_skip_instances':
     case 'wizard_finish': return reply(cmd, 'wizard_state');
+    // M10 T12 (Δ-M10-3): the Audit window's commands; its UI (T20) renders their answers.
+    case 'audit_query': return reply(cmd, 'audit_page');
+    case 'audit_trail': return reply(cmd, 'audit_trail');
+    case 'audit_payload': return reply(cmd, 'audit_payload');
+    case 'audit_status': return pinned('audit_status');
+    case 'acknowledge_incident': return reply(cmd, 'acknowledged');
+    case 'export_trigger': return reply(cmd, 'export_done');
+    case 'export_cancel': return reply(cmd, 'export_cancel');
+    case 'backup_trigger': return reply(cmd, 'removal_backup_answer');
     default: return Promise.reject('command not allowed');
   }
 }
+
+/**
+ * Fixtures of M10 T12's Audit-window answers that no window renders yet: the Audit window's UI is
+ * Task 20, which removes each name here as its window comes to consume it (`audit_job` is an event
+ * payload, so it stays until events are driven here too).
+ */
+const NOT_YET_RENDERED = [
+  'acknowledged',
+  'audit_job',
+  'audit_page',
+  'audit_payload',
+  'audit_status',
+  'audit_trail',
+  'export_cancel',
+  'export_done',
+];
 
 function wire(): void {
   counters = new Map();
@@ -644,7 +669,7 @@ describe('s06_injection_payloads_every_field_every_tab', () => {
     mode = 'free';
     payload = 'benign text';
     await runAll();
-    const unused = [...FIXTURES.keys()].filter((name) => !used.has(name));
-    expect(unused).toEqual([]);
+    const unused = [...FIXTURES.keys()].filter((name) => !used.has(name)).sort();
+    expect(unused).toEqual(NOT_YET_RENDERED);
   }, 300_000);
 });

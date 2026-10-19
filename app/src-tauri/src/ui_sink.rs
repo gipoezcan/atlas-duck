@@ -65,6 +65,51 @@ pub fn emit_wizard_changed<R: Runtime>(app: &AppHandle<R>) {
     EventOut::emit(app, EVENT_WIZARD_CHANGED, Value::Null);
 }
 
+/// The event of an Audit-window job (Δ-M10-3, PD-181): `{job, phase, done?, total?}`. App-owned,
+/// not a core event; counts only.
+pub const EVENT_AUDIT_JOB: &str = "audit_job";
+/// The event the Audit window re-reads its status and list on (Δ-M10-3): the window appended a
+/// record (an acknowledgement, an export, a backup). No payload.
+pub const EVENT_AUDIT_CHANGED: &str = "audit_changed";
+
+/// `audit_job`'s `job` (`export|backup`; `restore` is Task 13's).
+pub fn audit_job_name(kind: crate::serve::AuditJobKind) -> &'static str {
+    match kind {
+        crate::serve::AuditJobKind::Export => "export",
+        crate::serve::AuditJobKind::Backup => "backup",
+    }
+}
+
+/// The payload of `audit_job`: `phase` is `started|progress|done|failed|cancelled`; `done` and
+/// `total` (row counts) only with `progress`.
+pub fn audit_job_payload(
+    kind: crate::serve::AuditJobKind,
+    phase: &'static str,
+    rows: Option<(u64, u64)>,
+) -> Value {
+    let mut v = json!({ "job": audit_job_name(kind), "phase": phase });
+    if let (Some((done, total)), Some(m)) = (rows, v.as_object_mut()) {
+        m.insert("done".into(), json!(done));
+        m.insert("total".into(), json!(total));
+    }
+    v
+}
+
+/// Tells every listening window how an Audit-window job goes (recorded like every payload, S-16).
+pub fn emit_audit_job(
+    out: &dyn EventOut,
+    kind: crate::serve::AuditJobKind,
+    phase: &'static str,
+    rows: Option<(u64, u64)>,
+) {
+    out.emit(EVENT_AUDIT_JOB, audit_job_payload(kind, phase, rows));
+}
+
+/// Tells every listening window that the Audit window appended a record (no payload).
+pub fn emit_audit_changed(out: &dyn EventOut) {
+    out.emit(EVENT_AUDIT_CHANGED, Value::Null);
+}
+
 /// Tells every listening window that a status line may have changed (`status_banner`, no line
 /// named): the header reads `app_status` again. For the lines the app derives itself
 /// (`scripts_degraded` when the probe report lands or the degraded setting flips,
@@ -295,6 +340,37 @@ mod tests {
             all_events()
         );
         assert_eq!(out.0.lock().unwrap_or_else(|e| e.into_inner()).len(), 9);
+    }
+
+    /// Δ-M10-3: `audit_job` carries the job, the phase and, for `progress` only, row counts;
+    /// `audit_changed` carries nothing. Ids and counts only.
+    #[test]
+    fn audit_events_carry_counts_only() {
+        use crate::serve::AuditJobKind;
+        let out = Recorder::default();
+        emit_audit_job(&out, AuditJobKind::Export, "started", None);
+        emit_audit_job(&out, AuditJobKind::Export, "progress", Some((10, 40)));
+        emit_audit_job(&out, AuditJobKind::Backup, "done", None);
+        emit_audit_changed(&out);
+        let got = out.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "audit_job".to_owned(),
+                    json!({"job": "export", "phase": "started"})
+                ),
+                (
+                    "audit_job".to_owned(),
+                    json!({"job": "export", "phase": "progress", "done": 10, "total": 40})
+                ),
+                (
+                    "audit_job".to_owned(),
+                    json!({"job": "backup", "phase": "done"})
+                ),
+                ("audit_changed".to_owned(), Value::Null),
+            ]
+        );
     }
 
     #[test]

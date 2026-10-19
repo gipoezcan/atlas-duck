@@ -54,6 +54,8 @@
         "text": "config written by v9.9.0; settings read-only until you upgrade"
       },
       "health": {
+        "anchor_dir_lines_pending": 3,
+        "anchor_dir_write_failing": true,
         "anchor_thread_dead": false,
         "anchor_write_failing": false,
         "anchors_blocked": false,
@@ -124,6 +126,8 @@
       "attention_mode": "show_without_activating",
       "config_read_only": null,
       "health": {
+        "anchor_dir_lines_pending": 0,
+        "anchor_dir_write_failing": false,
         "anchor_thread_dead": false,
         "anchor_write_failing": false,
         "anchors_blocked": false,
@@ -174,6 +178,8 @@
       "attention_mode": "show_without_activating",
       "config_read_only": null,
       "health": {
+        "anchor_dir_lines_pending": 0,
+        "anchor_dir_write_failing": false,
         "anchor_thread_dead": false,
         "anchor_write_failing": false,
         "anchors_blocked": false,
@@ -229,6 +235,8 @@
         "text": "config written by v9.9.0; settings read-only until you upgrade"
       },
       "health": {
+        "anchor_dir_lines_pending": 3,
+        "anchor_dir_write_failing": true,
         "anchor_thread_dead": false,
         "anchor_write_failing": false,
         "anchors_blocked": false,

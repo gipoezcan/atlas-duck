@@ -337,6 +337,10 @@ export interface SettingsView {
     last_prune_failed: boolean;
     shred_checkpoint_pending: boolean;
     settings_unreadable: boolean;
+    /** The latest append to the anchor directory failed (retried, never an incident; 8.5). */
+    anchor_dir_write_failing: boolean;
+    /** Anchor-directory lines waiting to be written. */
+    anchor_dir_lines_pending: number;
   };
   config_read_only: ConfigBanner | null;
   /** Keys whose config.toml value applies at the next start ("applies after restart"). */
@@ -536,6 +540,153 @@ export interface WizardState {
   instances: InstanceView[];
 }
 
+/** The store health as Settings and the Audit window show it. */
+export type StoreHealth = SettingsView['health'];
+
+/** The 8.2 flag names (`flags_any` of a filter, `flags` of a header). */
+export type AuditFlag =
+  | 'edited'
+  | 'redacted'
+  | 'batch'
+  | 'stale'
+  | 'clock_backwards'
+  | 'clock_forward'
+  | 'clock_behind'
+  | 'integrity_incident';
+
+/**
+ * One event's plaintext columns (`audit_query`, `audit_trail`; spec 8.2, 8.10). Rust display-escapes
+ * every string; agent, peer and Atlassian strings are still untrusted data, shown as text only.
+ * There is no payload here: `audit_payload` is the one way to it.
+ */
+export interface EventHeader {
+  seq: number;
+  /** RFC 3339 UTC, ms. */
+  ts_utc: string;
+  epoch: string | null;
+  chain_id: string;
+  event_type: string;
+  request_id: string | null;
+  op_id: string | null;
+  op_class: string | null;
+  instance_id: string | null;
+  target: string | null;
+  decision: string | null;
+  flags: AuditFlag[];
+  agent_name: string | null;
+  agent_name_source: string | null;
+  client_kind: string | null;
+  connection_id: string | null;
+  peer_pid: number | null;
+  peer_exe: string | null;
+  peer_origin_exe: string | null;
+  os_user: string | null;
+  atlassian_user: string | null;
+  atlassian_user_key: string | null;
+  payload_len: number;
+  key_id: number;
+}
+
+/** A page's keyset position: send back the `next` an `AuditPage` carried. */
+export interface AuditCursor {
+  before_seq: number | null;
+  /** 1 to 500. */
+  limit: number;
+}
+
+/**
+ * `audit_query`'s filter (spec 8.10): exact matches on plaintext columns, `target` by prefix; no
+ * payload search (L38). Absent or null is no constraint. Times are `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+ */
+export interface AuditFilter {
+  from_utc?: string | null;
+  to_utc?: string | null;
+  agent_name?: string | null;
+  op_id?: string | null;
+  op_class?: string | null;
+  instance_id?: string | null;
+  target?: string | null;
+  decision?: string | null;
+  flags_any?: AuditFlag[];
+  event_types?: string[];
+}
+
+/**
+ * One page, newest first. `next` is set while more rows may follow, also after an empty page (the
+ * store's row budget ended the scan): follow it until it is null.
+ */
+export interface AuditPage {
+  rows: EventHeader[];
+  next: AuditCursor | null;
+  /** Rows the store examined for this page. */
+  scanned: number;
+}
+
+/**
+ * A request's retained headers, oldest first, and its deliveries (8.10, advisory): `count > 1` is
+ * "delivered more than once", `to_other_peer` "delivered to a different program".
+ */
+export interface AuditTrail {
+  headers: EventHeader[];
+  deliveries: { count: number; to_other_peer: boolean };
+}
+
+/**
+ * One page of a record's decrypted payload: `srcdoc` goes into an `<iframe sandbox="">` only;
+ * `display` is the page as Rust-projected text (escapes and whitespace marked).
+ */
+export interface AuditPayload {
+  srcdoc: string;
+  page: number;
+  page_count: number;
+  total_bytes: number;
+  display: string;
+}
+
+/** An open integrity incident; `result` and `detected_at` are null when its record is unreadable. */
+export interface AuditIncident {
+  verify_seq: number;
+  result: string | null;
+  detected_at: string | null;
+}
+
+/** `audit_status`: open incidents (at most 100, newest first), their count, health, anchor dir (display only). */
+export interface AuditStatus {
+  open_incidents: AuditIncident[];
+  incident_count: number;
+  health: StoreHealth;
+  anchor_dir: string | null;
+}
+
+/** `acknowledge_incident`: the incident and the `INTEGRITY_ACK` that closed it. */
+export interface Acknowledged {
+  verify_seq: number;
+  ack_seq: number;
+}
+
+/** `export_trigger`: the recipient's trust root, the new directory's name (never a path), the rows. */
+export interface ExportDone {
+  manifest_sha256: string;
+  dir_name: string;
+  rows: number;
+}
+
+/** `export_cancel`: false when no export ran. */
+export interface ExportCancelAnswer {
+  cancelled: boolean;
+}
+
+export type AuditJobKind = 'export' | 'backup';
+export type AuditJobPhase = 'started' | 'progress' | 'done' | 'failed' | 'cancelled';
+
+/** The `audit_job` event: row counts with `progress` only (an export); a backup is indeterminate. */
+export interface AuditJobEvent {
+  job: AuditJobKind;
+  phase: AuditJobPhase;
+  done?: number;
+  total?: number;
+}
+
 /** A tagged error object from core (`DecisionError` / `AdminError` / `SettingsError`). */
 export interface CoreError {
   kind: string;
@@ -571,4 +722,16 @@ export type CommandError =
   | { kind: 'busy' }
   /** The candidate could not be built (M5 M-11); `text` is the app-generated banner. */
   | { kind: 'release_blocked'; text: string }
+  /** A native confirmation or folder dialog was cancelled (or an export's cancel): nothing happened. */
+  | { kind: 'cancelled' }
+  /**
+   * The export did not simply succeed: `error.kind` is `empty_range`, `leftover` (+`dir_name`, a
+   * partial directory to delete), `not_renamed` (+`manifest_sha256`, `dir_name`, `rows`: complete
+   * and logged, rename it without `.partial`; never retry) or `failed`.
+   */
+  | { kind: 'export'; error: CoreError }
+  /** The backup failed; nothing to undo. */
+  | { kind: 'backup' }
+  /** An Audit-window read failed: `error.kind` is `unreadable` (+`seq`) or `failed`. */
+  | { kind: 'audit'; error: CoreError }
   | { kind: 'refused'; message: string };

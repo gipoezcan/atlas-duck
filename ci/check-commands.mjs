@@ -70,8 +70,19 @@ export const WINDOW_COMMANDS = {
     "removal_finish",
     "app_status",
   ],
-  // M6: `verify_now` only (P8); the rest of the Audit window's commands are M10's.
-  audit: ["verify_now"],
+  // M6: `verify_now` (P8); M10 T12 (Δ-M10-3, L201): the queries, the payload view, the incident
+  // acknowledgement and the export/backup triggers (`backup_trigger` also in settings from T13).
+  audit: [
+    "verify_now",
+    "audit_query",
+    "audit_payload",
+    "audit_trail",
+    "audit_status",
+    "acknowledge_incident",
+    "export_trigger",
+    "export_cancel",
+    "backup_trigger",
+  ],
   running_scripts: ["running_list", "running_kill"],
   onboarding: ["onboarding_text"],
   credential: [
@@ -101,8 +112,11 @@ export const WINDOW_COMMANDS = {
   ],
 };
 
-/** The windows that listen to events (C.10 + Δ1 events): they, and only they, get both. */
-export const LISTENING_WINDOWS = ["approvals", "settings", "running_scripts", "credential", "setup"];
+/**
+ * The windows that listen to events (C.10 + Δ1 events): they, and only they, get both. The Audit
+ * window since M10 T12 (Δ-M10-3: `audit_job` progress, `audit_changed`).
+ */
+export const LISTENING_WINDOWS = ["approvals", "settings", "audit", "running_scripts", "credential", "setup"];
 
 /** The only non-app permissions a capability file may hold, and the IPC command each grants. */
 export const EVENT_PERMISSIONS = {

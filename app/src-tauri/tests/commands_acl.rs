@@ -4441,7 +4441,22 @@ const S09_GRANTS: [(&str, &[&str]); 7] = [
             "app_status",
         ],
     ),
-    ("audit", &["verify_now"]),
+    (
+        "audit",
+        &[
+            "verify_now",
+            // M10 T12 (Δ-M10-3, L201): the Audit row's queries, payload view, acknowledgement
+            // and export/backup triggers.
+            "audit_query",
+            "audit_payload",
+            "audit_trail",
+            "audit_status",
+            "acknowledge_incident",
+            "export_trigger",
+            "export_cancel",
+            "backup_trigger",
+        ],
+    ),
     ("running_scripts", &["running_list", "running_kill"]),
     ("onboarding", &["onboarding_text"]),
     (
@@ -4576,9 +4591,17 @@ fn s09_command_outside_grant_rejected_every_window() -> TestResult {
     assert_eq!(refusals, 8 * COMMANDS.len() - grants);
 
     // The event commands follow the same authority: the windows that listen hold both, the others
-    // neither.
+    // neither. The Audit window listens since M10 T12 (`audit_job` progress, `audit_changed`).
     let listen = json!({"event": "queue_changed", "target": {"kind": "Any"}, "handler": 0});
-    for label in ["audit", "onboarding", "unknown"] {
+    let audit = s09_window(&app, "audit")?;
+    let r = invoke(&audit, "plugin:event|listen", listen.clone());
+    assert!(
+        !r.as_ref()
+            .err()
+            .is_some_and(|e| e.as_str().is_some_and(|s| s.contains("not allowed"))),
+        "audit: plugin:event|listen {r:?}"
+    );
+    for label in ["onboarding", "unknown"] {
         let w = s09_window(&app, label)?;
         let r = invoke(&w, "plugin:event|listen", listen.clone());
         assert!(
@@ -4636,6 +4659,251 @@ fn s09_running_scripts_grants_unchanged() -> TestResult {
     Ok(())
 }
 
+/// The Δ-M10-3 Audit commands and a valid body each (M10 T12).
+fn audit_window_bodies() -> Vec<(&'static str, Value)> {
+    vec![
+        ("audit_query", json!({"filter": {}})),
+        ("audit_payload", json!({"seq": 1})),
+        (
+            "audit_trail",
+            json!({"request_id": "req_0123456789abcdefghij"}),
+        ),
+        ("audit_status", json!({})),
+        ("acknowledge_incident", json!({"verify_seq": 3, "note": ""})),
+        ("export_trigger", json!({"from_utc": null, "to_utc": null})),
+        ("export_cancel", json!({})),
+        ("backup_trigger", json!({})),
+    ]
+}
+
+/// §13 / §10.3 (S-09), M10 T12 (Δ-M10-3, L201): the Audit window's new commands are granted to
+/// `audit` and to no other window (Tauri's ACL refuses them there, before any handler); in `audit`
+/// a valid body reaches its handler (`not_ready` without a serving store; `export_cancel` answers
+/// that nothing was cancelled). Task 13 extends the table with `backup_trigger` in `settings`.
+#[test]
+fn s09_new_commands_outside_grant_rejected() -> TestResult {
+    let app = app()?;
+    for (cmd, body) in audit_window_bodies() {
+        assert!(COMMANDS.contains(&cmd), "{cmd} is not in COMMANDS");
+        let holders: Vec<&str> = S09_GRANTS
+            .iter()
+            .filter(|(_, cmds)| cmds.contains(&cmd))
+            .map(|(l, _)| *l)
+            .collect();
+        assert_eq!(holders, ["audit"], "{cmd}");
+        for label in S09_LABELS.into_iter().chain(["unknown"]) {
+            let r = invoke(&s09_window(&app, label)?, cmd, body.clone());
+            if label != "audit" {
+                assert!(acl_refused(&r), "{label}: {cmd} {r:?}");
+            } else if cmd == "export_cancel" {
+                assert_eq!(r, Ok(json!({"cancelled": false})), "{cmd}");
+            } else {
+                assert_eq!(r, Err(json!({"kind": "not_ready"})), "{cmd}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// §10.3 (M10 T12): the Audit commands' bodies are closed and bounded. Each refusal comes before
+/// the handler and names the argument (or `payload` for a structural one): an unknown key, a value
+/// of the wrong type, a value past its bound, a name outside its closed set, a time that is not the
+/// `ts_utc` text, an export range that ends before it starts.
+#[test]
+fn audit_args_unknown_field_wrong_type_out_of_bounds_rejected() -> TestResult {
+    let app = app()?;
+    let w = s09_window(&app, "audit")?;
+    let refused = |field: &str| Err(json!({"kind": "invalid_argument", "field": field}));
+    let text = |n: usize| json!("x".repeat(n));
+    let cases: Vec<(&str, Value, &str)> = vec![
+        // audit_query: the filter's keys, the cursor's bounds.
+        ("audit_query", json!({}), "payload"),
+        (
+            "audit_query",
+            json!({"filter": {"payload": "x"}}),
+            "payload",
+        ),
+        ("audit_query", json!({"filter": {}, "extra": 1}), "payload"),
+        ("audit_query", json!({"filter": 7}), "payload"),
+        (
+            "audit_query",
+            json!({"filter": {"agent_name": text(2049)}}),
+            "filter",
+        ),
+        ("audit_query", json!({"filter": {"target": 5}}), "filter"),
+        (
+            "audit_query",
+            json!({"filter": {"op_id": "a\u{0}b"}}),
+            "filter",
+        ),
+        (
+            "audit_query",
+            json!({"filter": {"decision": "approved"}}),
+            "filter",
+        ),
+        (
+            "audit_query",
+            json!({"filter": {"flags_any": ["edited", "loud"]}}),
+            "filter",
+        ),
+        (
+            "audit_query",
+            json!({"filter": {"flags_any": vec!["edited"; 9]}}),
+            "filter",
+        ),
+        (
+            "audit_query",
+            json!({"filter": {"event_types": ["NO_SUCH_EVENT"]}}),
+            "filter",
+        ),
+        (
+            "audit_query",
+            json!({"filter": {"event_types": vec!["VERIFY"; 100]}}),
+            "filter",
+        ),
+        (
+            "audit_query",
+            json!({"filter": {"from_utc": "2026-10-19T10:00:00Z"}}),
+            "filter",
+        ),
+        (
+            "audit_query",
+            json!({"filter": {"to_utc": "yesterday"}}),
+            "filter",
+        ),
+        (
+            "audit_query",
+            json!({"filter": {}, "cursor": {"limit": 0}}),
+            "cursor",
+        ),
+        (
+            "audit_query",
+            json!({"filter": {}, "cursor": {"limit": 501}}),
+            "cursor",
+        ),
+        (
+            "audit_query",
+            json!({"filter": {}, "cursor": {"limit": 10, "after_seq": 3}}),
+            "payload",
+        ),
+        (
+            "audit_query",
+            json!({"filter": {}, "cursor": {"limit": 10, "before_seq": -1}}),
+            "payload",
+        ),
+        // audit_payload: a seq and a page, nothing else.
+        ("audit_payload", json!({}), "payload"),
+        ("audit_payload", json!({"seq": "1"}), "payload"),
+        ("audit_payload", json!({"seq": -1}), "payload"),
+        ("audit_payload", json!({"seq": 1, "page": "0"}), "payload"),
+        (
+            "audit_payload",
+            json!({"seq": 1, "page": 1u64 << 33}),
+            "payload",
+        ),
+        (
+            "audit_payload",
+            json!({"seq": 1, "bytes": "AA=="}),
+            "payload",
+        ),
+        // audit_trail: the PD-66 request id.
+        (
+            "audit_trail",
+            json!({"request_id": "req_short"}),
+            "request_id",
+        ),
+        ("audit_trail", json!({"request_id": 5}), "request_id"),
+        (
+            "audit_trail",
+            json!({"request_id": text(1 << 16)}),
+            "request_id",
+        ),
+        // audit_status: nothing.
+        ("audit_status", json!({"all": true}), "payload"),
+        // acknowledge_incident: a seq and a note of at most 1 000 characters.
+        ("acknowledge_incident", json!({"verify_seq": 3}), "note"),
+        (
+            "acknowledge_incident",
+            json!({"verify_seq": 3, "note": "é".repeat(1001)}),
+            "note",
+        ),
+        (
+            "acknowledge_incident",
+            json!({"verify_seq": 3, "note": "a\u{0}"}),
+            "note",
+        ),
+        (
+            "acknowledge_incident",
+            json!({"verify_seq": "3", "note": ""}),
+            "payload",
+        ),
+        (
+            "acknowledge_incident",
+            json!({"verify_seq": 3, "note": "", "os_user": "root"}),
+            "payload",
+        ),
+        // export_trigger: two `ts_utc` texts or null, in order; no folder.
+        (
+            "export_trigger",
+            json!({"from_utc": "2026-10-19", "to_utc": null}),
+            "from_utc",
+        ),
+        (
+            "export_trigger",
+            json!({"from_utc": null, "to_utc": 5}),
+            "to_utc",
+        ),
+        (
+            "export_trigger",
+            json!({"from_utc": "2026-10-19T10:00:00.000Z", "to_utc": "2026-10-18T10:00:00.000Z"}),
+            "to_utc",
+        ),
+        (
+            "export_trigger",
+            json!({"from_utc": null, "to_utc": null, "dir": "C:\\x"}),
+            "payload",
+        ),
+        // export_cancel and backup_trigger: nothing.
+        ("export_cancel", json!({"all": true}), "payload"),
+        ("backup_trigger", json!({"folder": "/tmp"}), "payload"),
+        ("backup_trigger", json!([]), "payload"),
+    ];
+    for (cmd, body, field) in cases {
+        assert_eq!(
+            invoke(&w, cmd, body.clone()),
+            refused(field),
+            "{cmd} {body}"
+        );
+    }
+    // The bounds themselves pass (and reach the handler: no serving store here).
+    for (cmd, body) in [
+        (
+            "audit_query",
+            json!({"filter": {"agent_name": text(2048), "flags_any": ["integrity_incident", "clock_behind"],
+                              "event_types": ["VERIFY", "INTEGRITY_ACK"], "decision": "release_redacted",
+                              "from_utc": "2026-10-19T10:00:00.000Z", "to_utc": null},
+                   "cursor": {"before_seq": 9, "limit": 500}}),
+        ),
+        ("audit_payload", json!({"seq": 1, "page": 3})),
+        (
+            "acknowledge_incident",
+            json!({"verify_seq": 3, "note": "é".repeat(1000)}),
+        ),
+        (
+            "export_trigger",
+            json!({"from_utc": "2026-10-19T10:00:00.000Z", "to_utc": "2026-10-19T10:00:00.000Z"}),
+        ),
+        ("export_trigger", json!({})),
+    ] {
+        assert_eq!(
+            invoke(&w, cmd, body.clone()),
+            Err(json!({"kind": "not_ready"})),
+            "{cmd} {body}"
+        );
+    }
+    Ok(())
+}
+
 /// A body and where it goes: the window that holds the command, and per case the edit that must be
 /// refused before the handler.
 struct S09Case {
@@ -4671,6 +4939,13 @@ fn s09_cases() -> Vec<S09Case> {
             (Some("request_ids"), json!("x")),
             (Some("request_ids"), many(json!(id))),
         ),
+        case(
+            "acknowledge_incident",
+            "audit",
+            json!({"verify_seq": 3, "note": "seen"}),
+            num("note"),
+            (Some("note"), huge()),
+        ),
         case("app_status", "approvals", json!({}), whole(), pad()),
         case(
             "archive_and_start_fresh",
@@ -4679,6 +4954,29 @@ fn s09_cases() -> Vec<S09Case> {
             whole(),
             pad(),
         ),
+        case(
+            "audit_payload",
+            "audit",
+            json!({"seq": 1, "page": 0}),
+            (Some("page"), json!("0")),
+            (Some("seq"), json!(-1)),
+        ),
+        case(
+            "audit_query",
+            "audit",
+            json!({"filter": {}, "cursor": {"before_seq": null, "limit": 50}}),
+            (Some("filter"), json!("x")),
+            (Some("filter"), json!({"target": "t".repeat(1 << 16)})),
+        ),
+        case("audit_status", "audit", json!({}), whole(), pad()),
+        case(
+            "audit_trail",
+            "audit",
+            json!({"request_id": id}),
+            num("request_id"),
+            (Some("request_id"), huge()),
+        ),
+        case("backup_trigger", "audit", json!({}), whole(), pad()),
         case("cli_install", "settings", json!({}), whole(), pad()),
         case("cli_uninstall", "settings", json!({}), whole(), pad()),
         case("close_credential", "credential", json!({}), whole(), pad()),
@@ -4726,6 +5024,14 @@ fn s09_cases() -> Vec<S09Case> {
             json!({"session_id": "ab".repeat(32), "reason": "no"}),
             num("session_id"),
             (Some("reason"), huge()),
+        ),
+        case("export_cancel", "audit", json!({}), whole(), pad()),
+        case(
+            "export_trigger",
+            "audit",
+            json!({"from_utc": "2026-10-01T00:00:00.000Z", "to_utc": null}),
+            num("to_utc"),
+            (Some("from_utc"), huge()),
         ),
         case(
             "instance_accept_url_change",

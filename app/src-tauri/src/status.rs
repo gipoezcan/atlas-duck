@@ -372,6 +372,8 @@ mod tests {
             last_prune_failed: false,
             shred_checkpoint_pending: false,
             settings_unreadable: false,
+            anchor_dir_write_failing: false,
+            anchor_dir_lines_pending: 0,
         }
     }
 

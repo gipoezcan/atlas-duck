@@ -68,7 +68,8 @@ pub const LOG_EVENT_KEYCHAIN_RETRY_EXHAUSTED: &str = "keychain_retry_exhausted";
 pub const LOG_EVENT_START_CANCELLED: &str = "serve_start_cancelled";
 /// PD-25: the 6-hourly touch of the socket file and its dir failed (Unix).
 pub const LOG_EVENT_TOUCH_FAILED: &str = "ipc_touch_failed";
-/// The quit path stopped waiting for a step; `reason` = `start|retry|unlock|core|served|store`.
+/// The quit path stopped waiting for a step; `reason` =
+/// `start|retry|unlock|audit_job|core|served|store`.
 pub const LOG_EVENT_QUIT_WAIT_EXPIRED: &str = "quit_wait_expired";
 /// M6 T20: an unlock, archive or manual retry from the credential window did nothing;
 /// `error_class` = [`UnlockFailure::class`]. Never a passphrase, a path or an error text.
@@ -352,8 +353,8 @@ pub enum StartupFailure {
 /// after it; with no core the cell answers `app_shutting_down`); take the handle out of `retry`
 /// and await it with a bound, the `Mutex` guard dropped before the await. Never `abort()` the
 /// retry task: it owns a store or core it is starting and ends them itself once it sees the
-/// freeze. Then the core's shutdown, `shutdown.cancel()`, `served` (<= 2 s) and
-/// `Store::shutdown` on a blocking thread.
+/// freeze. Then the Audit window's job (cancelled and awaited, PD-181), the core's shutdown,
+/// `shutdown.cancel()`, `served` (<= 2 s) and `Store::shutdown` on a blocking thread.
 pub struct ServeState {
     pub cell: Arc<HandlerCell>,
     pub shutdown: ShutdownSignal,
@@ -395,6 +396,32 @@ pub struct ServeState {
     /// retry, and (M9 Δ4) serves the `StoreFailed` gate. Only a restart clears it.
     store_failed: AtomicBool,
     hooks: ServeHooks,
+    /// The Audit window's one long job (M10 T12, PD-181): an export or a backup, from its dialogs
+    /// to its end. The quit path sets its cancel flag and waits for it before the core's shutdown.
+    audit_job: Mutex<Option<AuditJob>>,
+}
+
+/// The kind of an Audit-window job (`audit_job {job}`, PD-181).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditJobKind {
+    Export,
+    Backup,
+}
+
+/// One running Audit-window job: its blocking task and the cancel flag its `ExportControl` reads.
+struct AuditJob {
+    kind: AuditJobKind,
+    cancel: Arc<AtomicBool>,
+    task: JoinHandle<()>,
+}
+
+/// Why an Audit-window job did not start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobRefused {
+    /// Another export or backup runs (one job at a time, PD-181).
+    Busy,
+    /// The quit path began.
+    ShuttingDown,
 }
 
 /// The store opener and the core starter of this start (M6 T20): the data dir, `instance.lock`,
@@ -437,7 +464,64 @@ impl ServeState {
             retrying: AtomicBool::new(false),
             store_failed: AtomicBool::new(false),
             hooks,
+            audit_job: Mutex::new(None),
         }
+    }
+
+    /// Starts `work` on the blocking pool as the Audit window's one job (PD-181), unless another
+    /// one runs (`Busy`) or the quit path froze the state (`ShuttingDown`). `work` gets the job's
+    /// cancel flag (`export_cancel` and the quit path set it); its answer comes through the
+    /// receiver. The handle is stored under the `frozen` lock, so a freeze either comes first
+    /// (and nothing starts) or finds the job and waits for it.
+    pub fn spawn_audit_job<T, F>(
+        &self,
+        kind: AuditJobKind,
+        work: F,
+    ) -> Result<tokio::sync::oneshot::Receiver<T>, JobRefused>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<AtomicBool>) -> T + Send + 'static,
+    {
+        let frozen = lock(&self.frozen);
+        if !self.swaps_allowed(*frozen) {
+            return Err(JobRefused::ShuttingDown);
+        }
+        let mut slot = lock(&self.audit_job);
+        if slot.as_ref().is_some_and(|job| !job.task.is_finished()) {
+            return Err(JobRefused::Busy);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            let _ = tx.send(work(flag));
+        });
+        *slot = Some(AuditJob { kind, cancel, task });
+        drop(slot);
+        drop(frozen);
+        Ok(rx)
+    }
+
+    /// `export_cancel` (PD-181): sets the cancel flag of a running export; `false` when none runs
+    /// (a backup cannot be cancelled).
+    pub fn cancel_export(&self) -> bool {
+        let slot = lock(&self.audit_job);
+        match slot.as_ref() {
+            Some(job) if job.kind == AuditJobKind::Export && !job.task.is_finished() => {
+                job.cancel.store(true, Ordering::SeqCst);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The quit path's part (PD-181): the running job's cancel flag is set (an export ends before
+    /// its next row and removes its partial directory) and its task is handed over to be waited
+    /// for. Called after the freeze, so no job starts afterwards.
+    fn stop_audit_job(&self) -> Option<JoinHandle<()>> {
+        let job = lock(&self.audit_job).take()?;
+        job.cancel.store(true, Ordering::SeqCst);
+        Some(job.task)
     }
 
     /// The native confirmer the core was started with (M6 T28: "Prepare for removal" draws its own
@@ -1172,6 +1256,14 @@ where
     let unlock = lock(&state.unlock_task).take();
     if let Some(unlock) = unlock {
         bounded(unlock, RETRY_WAIT, deadline, "unlock").await;
+    }
+    // M10 T12 (PD-181): an Audit-window export ends before its next row once its cancel flag is
+    // set, and removes its partial directory; waiting for it here, before the core's shutdown,
+    // lets that cleanup run and keeps `APP_STOP` after any record the job appends. A backup has
+    // no cancel and is waited for the same way. Bounded by `STORE_WAIT`.
+    let job = state.stop_audit_job();
+    if let Some(job) = job {
+        bounded(job, STORE_WAIT, deadline, "audit_job").await;
     }
 
     let (report, timed_out) = match core_stage(core) {
@@ -2477,6 +2569,181 @@ mod tests {
         assert!(read_endpoint_file(&data)?.is_none(), "endpoint file gone");
         assert!(!wal.exists(), "the store was shut down");
         assert_eq!(gate_label(&state).await, "shutting_down");
+        Ok(())
+    }
+
+    // ---- the Audit window's job (M10 T12, PD-181) ----
+
+    use crate::commands::CommandError;
+    use crate::commands::audit::tests::{Answers, Events, Rig, chosen, count, entries, rig};
+    use crate::commands::audit::{ExportDoneDto, run_export};
+
+    /// A serving state (a gate, no endpoint) that holds `rig`'s store, as the quit path finds it.
+    fn serving_store(rig: &Rig) -> ServeState {
+        let ui: Arc<dyn UiSink> = Arc::new(NoUi);
+        let gate = GateHandler::new(GateState::FirstRun, ui.clone());
+        let extras = Arc::new(DoctorExtras {
+            tray_host: None,
+            secret_service: Arc::new(NoCheck),
+            data: None,
+        });
+        ServeState::new(
+            gate.clone(),
+            Some(gate),
+            Some(rig.store.clone()),
+            extras,
+            ui,
+            ServeHooks::default(),
+        )
+    }
+
+    /// The job's answer and a receiver that hears when the export reached its first row.
+    type PausedExport = (
+        tokio::sync::oneshot::Receiver<Result<ExportDoneDto, CommandError>>,
+        std::sync::mpsc::Receiver<()>,
+    );
+
+    /// The export of `rig` as the audit job: its first row waits (bounded, 30 s) until the job's
+    /// cancel flag is set, so the job is known to be inside `Store::export` when the test acts.
+    fn paused_export(
+        state: &ServeState,
+        rig: &Rig,
+    ) -> Result<PausedExport, Box<dyn std::error::Error>> {
+        let flag: Arc<OnceLock<Arc<AtomicBool>>> = Arc::new(OnceLock::new());
+        let (reached_tx, reached) = std::sync::mpsc::channel();
+        let first = Arc::new(AtomicBool::new(true));
+        {
+            let flag = flag.clone();
+            rig.faults.on_hit(
+                atlas_duck_audit::testing::FaultPoint::ExportRow,
+                move || {
+                    if !first.swap(false, Ordering::SeqCst) {
+                        return;
+                    }
+                    let _ = reached_tx.send(());
+                    let until = std::time::Instant::now() + Duration::from_secs(30);
+                    while std::time::Instant::now() < until
+                        && !flag.get().is_some_and(|c| c.load(Ordering::SeqCst))
+                    {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                },
+            );
+        }
+        let (store, out) = (rig.store.clone(), rig.out.clone());
+        let rx = state
+            .spawn_audit_job(AuditJobKind::Export, move |cancel| {
+                let _ = flag.set(cancel.clone());
+                run_export(
+                    &store,
+                    &Answers::new(&[Confirm::Ok]),
+                    || Some(chosen(&out)),
+                    atlas_duck_audit::TimeRange::all(),
+                    &cancel,
+                    &Events::default(),
+                )
+            })
+            .map_err(|e| format!("{e:?}"))?;
+        Ok((rx, reached))
+    }
+
+    /// PD-181 (`export_cancel`): the running export's flag is set through the serving state; the
+    /// export ends at its next row, its partial directory is removed and no `EXPORT` is logged. With
+    /// no export running nothing is cancelled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn export_cancel_removes_partial_dir() -> Result<(), Box<dyn std::error::Error>> {
+        let rig = rig(4)?;
+        let state = serving_store(&rig);
+        assert!(!state.cancel_export(), "nothing runs");
+        let (rx, reached) = paused_export(&state, &rig)?;
+        reached.recv_timeout(Duration::from_secs(30))?;
+        assert_eq!(entries(&rig.out).len(), 1, "the partial directory exists");
+        assert!(state.cancel_export());
+        let answer = tokio::time::timeout(Duration::from_secs(30), rx).await??;
+        assert_eq!(answer, Err(CommandError::Cancelled));
+        assert!(entries(&rig.out).is_empty(), "{:?}", entries(&rig.out));
+        assert_eq!(count(&rig.store, atlas_duck_audit::EventType::EXPORT)?, 0);
+        assert!(!state.cancel_export(), "the job ended");
+        Ok(())
+    }
+
+    /// PD-181: one Audit-window job at a time (`busy`), none after the freeze; the next one starts
+    /// once the first ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_audit_job_at_a_time() -> Result<(), Box<dyn std::error::Error>> {
+        let state = gate_serving(GateState::FirstRun);
+        let (go_tx, go) = std::sync::mpsc::channel::<()>();
+        let first = state
+            .spawn_audit_job(AuditJobKind::Backup, move |_| {
+                go.recv_timeout(Duration::from_secs(30)).is_ok()
+            })
+            .map_err(|e| format!("{e:?}"))?;
+        for kind in [AuditJobKind::Export, AuditJobKind::Backup] {
+            assert_eq!(
+                state.spawn_audit_job(kind, |_| ()).err(),
+                Some(JobRefused::Busy),
+                "{kind:?}"
+            );
+        }
+        assert!(!state.cancel_export(), "a backup is not cancelled");
+        go_tx.send(())?;
+        assert!(tokio::time::timeout(Duration::from_secs(30), first).await??);
+        // The task has ended once its answer is sent; wait for it to be reported finished.
+        let until = Instant::now() + Duration::from_secs(30);
+        let second = loop {
+            match state.spawn_audit_job(AuditJobKind::Export, |_| 7) {
+                Err(JobRefused::Busy) if Instant::now() < until => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                other => break other.map_err(|e| format!("{e:?}"))?,
+            }
+        };
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(30), second).await??,
+            7
+        );
+        state.freeze_for_shutdown();
+        assert_eq!(
+            state.spawn_audit_job(AuditJobKind::Export, |_| ()).err(),
+            Some(JobRefused::ShuttingDown)
+        );
+        Ok(())
+    }
+
+    /// PD-181 (§2.5): Quit while an export runs sets its cancel flag and waits for it before the
+    /// core's shutdown and the store's: the partial directory is gone and the log holds no
+    /// `EXPORT` (the store is opened again to look). The wait ends with the export, far inside
+    /// `STORE_WAIT`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quit_during_export_removes_partial_dir() -> Result<(), Box<dyn std::error::Error>> {
+        let rig = rig(4)?;
+        let state = serving_store(&rig);
+        let (rx, reached) = paused_export(&state, &rig)?;
+        reached.recv_timeout(Duration::from_secs(30))?;
+        assert_eq!(entries(&rig.out).len(), 1, "the partial directory exists");
+
+        let started = Instant::now();
+        let outcome = shutdown_with(&state, started + Duration::from_secs(60), |_| {
+            None::<std::future::Ready<ShutdownReport>>
+        })
+        .await;
+        assert_eq!(outcome.report, None);
+        assert!(started.elapsed() < STORE_WAIT, "{:?}", started.elapsed());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(30), rx).await??,
+            Err(CommandError::Cancelled)
+        );
+        assert!(entries(&rig.out).is_empty(), "{:?}", entries(&rig.out));
+        assert!(lock(&state.store).is_none(), "store shut down");
+
+        let cfg = crate::commands::audit::tests::config(&rig.ring, &rig.install_id, &rig.faults);
+        let StartupOutcome::Ready { store, .. } =
+            atlas_duck_audit::open(&rig.data, &rig.lock, cfg)?
+        else {
+            return Err("the store did not open again".into());
+        };
+        assert_eq!(count(&store, atlas_duck_audit::EventType::EXPORT)?, 0);
+        store.shutdown();
         Ok(())
     }
 

@@ -8,9 +8,12 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 use std::path::{Path, PathBuf};
 
 use atlas_duck_app_lib::cli_install::InstallError;
-use atlas_duck_app_lib::commands::CommandError;
 use atlas_duck_app_lib::commands::approvals::{
     DenyCount, QueueDetail, RawPageDto, RedactionContextDto, preview_fetch_response,
+};
+use atlas_duck_app_lib::commands::audit::{
+    AcknowledgedDto, AuditPageDto, AuditPayloadDto, AuditStatusDto, AuditTrailDto, CursorDto,
+    DeliveriesDto, EventHeaderDto, ExportCancelDto, ExportDoneDto, IncidentDto,
 };
 use atlas_duck_app_lib::commands::credential::{
     ArchiveOutcome, CLASS_CONTEXT_CHANGED, Connected, CredentialContextDto, NoteSaved,
@@ -24,13 +27,15 @@ use atlas_duck_app_lib::commands::settings::{
     OUTCOME_ALREADY_ON_PATH, OUTCOME_INSTALLED, OUTCOME_INSTALLED_LOCAL_BIN, OUTCOME_REMOVED,
     RetestOutcome, SettingsGet,
 };
+use atlas_duck_app_lib::commands::{AuditReadFailure, CommandError, ExportFailure};
 use atlas_duck_app_lib::credential::{PatTarget, Purpose};
 use atlas_duck_app_lib::removal::{
     BackupAnswer, Choice, FinishAnswer, ItemDto, RemovalDto, RemovalError,
 };
+use atlas_duck_app_lib::ui_sink::audit_job_payload;
 use atlas_duck_app_lib::wizard::{MSG_NEEDS_SECRET_SERVICE, WizardError, WizardState, WizardStep};
 use atlas_duck_atlassian::ConnClass;
-use atlas_duck_audit::AuditError;
+use atlas_duck_audit::{Actor, AuditError, DecisionColumn, EventFlags, EventHeader, EventType};
 use atlas_duck_core::engine::write::CONFLICT_DENY_PREFILL;
 use atlas_duck_core::payloads::InvalidReason;
 use atlas_duck_core::redact::{BlockReason, DropScope, RedactionPreset};
@@ -47,12 +52,13 @@ use atlas_duck_ipc::envelope::{ErrorCode, Status};
 use atlas_duck_ipc::sandbox::ScriptLimits;
 use atlas_duck_preview::diff::{DiffLine, DiffOp};
 use atlas_duck_preview::form::{AllowedValues, EditForm, EditInput, InputKind};
+use atlas_duck_preview::render;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{
     BodyView, CommentView, ConfluenceComment, ConstructList, ConversionFacts, DenyOffer,
-    DenyOfferKind, FieldRow, IssueCard, ItemCount, OutcomeKind, PREVIEW_BUILDER_VERSION, Preselect,
-    Preview, PreviewBody, PreviewHeader, ProvenanceRow, RawPager, RequestView, ScriptItemKind,
-    json_tree,
+    DenyOfferKind, FieldRow, IssueCard, ItemCount, OutcomeKind, PREVIEW_BUILDER_VERSION, Platform,
+    Preselect, Preview, PreviewBody, PreviewHeader, ProvenanceRow, RawPager, RequestView,
+    ScriptItemKind, json_tree,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -695,8 +701,225 @@ fn command_errors() -> Vec<CommandError> {
         CommandError::Removal(RemovalError::Recorded),
         // The T7 review H1 banner: its text is the core constant, put on the wire by Rust.
         CommandError::ReleaseBlocked,
+        // M10 T12: the Audit window's kinds (a name, never a path; no error text).
+        CommandError::Cancelled,
+        CommandError::Export(ExportFailure::EmptyRange),
+        CommandError::Export(ExportFailure::Leftover {
+            dir_name: format!("atlas-duck-export-{CHAIN}-1-40-20261019T120000Z.partial"),
+        }),
+        CommandError::Export(ExportFailure::NotRenamed {
+            manifest_sha256: "5e".repeat(32),
+            dir_name: format!("atlas-duck-export-{CHAIN}-1-40-20261019T120000Z.partial"),
+            rows: 40,
+        }),
+        CommandError::Export(ExportFailure::Failed),
+        CommandError::Backup,
+        CommandError::Audit(AuditReadFailure::Unreadable { seq: 17 }),
+        CommandError::Audit(AuditReadFailure::Failed),
         CommandError::Internal,
     ]
+}
+
+/// A chain id in the shape the store writes (a lowercase UUID).
+const CHAIN: &str = "0b9d3f62-4c1a-4f0e-9a51-7f2a6c3e8d10";
+
+/// One header per kind of column the Audit window shows: an agent's request with every actor
+/// column (and an invisible character in the target, display-escaped by Rust), a store-owned
+/// record with flags and no request.
+fn event_headers() -> Vec<EventHeaderDto> {
+    let read = EventHeader {
+        seq: 41,
+        ts_utc: "2026-10-19T08:30:00.125Z".into(),
+        epoch: Some("2026-10-19".into()),
+        chain_id: CHAIN.into(),
+        event_type: EventType::READ_RELEASED,
+        request_id: Some(REQ.into()),
+        op_id: Some("jira.issue.get".into()),
+        op_class: Some("read".into()),
+        instance_id: Some("0b9d3f62-4c1a-4f0e-9a51-7f2a6c3e8d11".into()),
+        target: Some("PROJ-7\u{202E}".into()),
+        decision: Some(DecisionColumn::ReleaseRedacted),
+        flags: EventFlags::REDACTED,
+        actor: Actor {
+            agent_name: Some("claude-code-billing-api".into()),
+            agent_name_source: Some("flag".into()),
+            client_kind: Some("cli".into()),
+            connection_id: Some("c-7".into()),
+            peer_pid: Some(4242),
+            peer_exe: Some(PathBuf::from("C:\\Tools\\atlas-duck.exe")),
+            peer_origin_exe: Some(PathBuf::from("C:\\Tools\\agent.exe")),
+            os_user: Some("alice".into()),
+            atlassian_user: Some("jdoe".into()),
+            atlassian_user_key: Some("JIRAUSER10100".into()),
+        },
+        payload_len: 1834,
+        key_id: 3,
+    };
+    let verify = EventHeader {
+        seq: 42,
+        ts_utc: "2026-10-19T08:31:00.000Z".into(),
+        epoch: None,
+        chain_id: CHAIN.into(),
+        event_type: EventType::VERIFY,
+        request_id: None,
+        op_id: None,
+        op_class: None,
+        instance_id: None,
+        target: None,
+        decision: None,
+        flags: EventFlags::INTEGRITY_INCIDENT | EventFlags::BEHIND,
+        actor: Actor::default(),
+        payload_len: 211,
+        key_id: 3,
+    };
+    vec![EventHeaderDto::of(&read), EventHeaderDto::of(&verify)]
+}
+
+/// `audit_query` (M10 T12): a full page with its next cursor, and the last (empty) page.
+fn audit_pages() -> Vec<AuditPageDto> {
+    vec![
+        AuditPageDto {
+            rows: event_headers(),
+            next: Some(CursorDto {
+                before_seq: Some(41),
+                limit: 2,
+            }),
+            scanned: 3,
+        },
+        AuditPageDto {
+            rows: vec![],
+            next: None,
+            scanned: 0,
+        },
+    ]
+}
+
+/// `audit_trail` (M10 T12): a request with a delivery to another program, and an empty trail.
+fn audit_trails() -> Vec<AuditTrailDto> {
+    vec![
+        AuditTrailDto {
+            headers: event_headers().into_iter().take(1).collect(),
+            deliveries: DeliveriesDto {
+                count: 2,
+                to_other_peer: true,
+            },
+        },
+        AuditTrailDto {
+            headers: vec![],
+            deliveries: DeliveriesDto {
+                count: 0,
+                to_other_peer: false,
+            },
+        },
+    ]
+}
+
+/// `audit_payload` (M10 T12): a one-page payload as a tree, and the second page of a long one.
+fn audit_payloads() -> Vec<AuditPayloadDto> {
+    let json = br#"{"body":"<b>x</b>","n":1}"#;
+    let page = render::raw_display_last("aé\u{200B}".as_bytes(), &[]).text;
+    vec![
+        AuditPayloadDto {
+            srcdoc: render::audit_payload_document(json, Platform::MacOsLinux),
+            page: 0,
+            page_count: 1,
+            total_bytes: 25,
+            display: render::raw_display_last(json, &[]).text,
+        },
+        AuditPayloadDto {
+            srcdoc: render::audit_payload_page_document(&page, Platform::MacOsLinux),
+            page: 1,
+            page_count: 2,
+            total_bytes: 262_150,
+            display: page,
+        },
+    ]
+}
+
+/// `audit_status` (M10 T12): two open incidents (one whose record cannot be read), a failing
+/// anchor directory; and a quiet store without one.
+fn audit_statuses() -> Vec<AuditStatusDto> {
+    let health = |incidents: u64, failing: bool| StoreHealthView {
+        storage_low: false,
+        anchor_write_failing: false,
+        anchor_thread_dead: false,
+        anchors_blocked: false,
+        open_incidents: incidents,
+        prune_backlog_days: 0,
+        prune_backlog: None,
+        last_prune_failed: false,
+        shred_checkpoint_pending: false,
+        settings_unreadable: false,
+        anchor_dir_write_failing: failing,
+        anchor_dir_lines_pending: u32::from(failing) * 12,
+    };
+    vec![
+        AuditStatusDto {
+            open_incidents: vec![
+                IncidentDto {
+                    verify_seq: 42,
+                    result: Some("anchor_missing".into()),
+                    detected_at: Some("2026-10-19T08:31:00.000Z".into()),
+                },
+                IncidentDto {
+                    verify_seq: 7,
+                    result: None,
+                    detected_at: None,
+                },
+            ],
+            incident_count: 2,
+            health: health(2, true),
+            anchor_dir: Some("\\\\nas\\audit\\anchors".into()),
+        },
+        AuditStatusDto {
+            open_incidents: vec![],
+            incident_count: 0,
+            health: health(0, false),
+            anchor_dir: None,
+        },
+    ]
+}
+
+fn acknowledged() -> Vec<AcknowledgedDto> {
+    vec![AcknowledgedDto {
+        verify_seq: 42,
+        ack_seq: 57,
+    }]
+}
+
+fn export_dones() -> Vec<ExportDoneDto> {
+    vec![ExportDoneDto {
+        manifest_sha256: "5e".repeat(32),
+        dir_name: format!("atlas-duck-export-{CHAIN}-1-40-20261019T120000Z"),
+        rows: 40,
+    }]
+}
+
+fn export_cancels() -> Vec<ExportCancelDto> {
+    vec![
+        ExportCancelDto { cancelled: true },
+        ExportCancelDto { cancelled: false },
+    ]
+}
+
+/// The `audit_job` event payloads (Δ-M10-3): every phase of an export, and a backup's.
+fn audit_jobs() -> Vec<Value> {
+    use atlas_duck_app_lib::serve::AuditJobKind::{Backup, Export};
+    let mut all: Vec<Value> = [
+        (Export, "started", None),
+        (Export, "progress", Some((10_000, 25_000))),
+        (Export, "done", None),
+        (Export, "failed", None),
+        (Export, "cancelled", None),
+        (Backup, "started", None),
+        (Backup, "done", None),
+        (Backup, "failed", None),
+    ]
+    .into_iter()
+    .map(|(job, phase, rows)| audit_job_payload(job, phase, rows))
+    .collect();
+    all.dedup();
+    all
 }
 
 fn recent_items() -> Vec<RecentItem> {
@@ -972,6 +1195,9 @@ fn settings_views() -> Vec<SettingsView> {
         last_prune_failed: false,
         shred_checkpoint_pending: false,
         settings_unreadable: false,
+        // M10 T12: the anchor directory's write state; both ends in the fixtures.
+        anchor_dir_write_failing: low,
+        anchor_dir_lines_pending: u32::from(low) * 3,
     };
     vec![
         SettingsView {
@@ -1352,13 +1578,21 @@ fn value<T: Serialize>(items: &[T]) -> Result<Value, serde_json::Error> {
 /// Every fixture: file name (without `.json`) and its value.
 fn all() -> Result<Vec<(&'static str, Value)>, serde_json::Error> {
     Ok(vec![
+        ("acknowledged", value(&acknowledged())?),
         ("archive_outcome", value(&archive_outcomes())?),
+        ("audit_job", value(&audit_jobs())?),
+        ("audit_page", value(&audit_pages())?),
+        ("audit_payload", value(&audit_payloads())?),
+        ("audit_status", value(&audit_statuses())?),
+        ("audit_trail", value(&audit_trails())?),
         ("batch_outcome", value(&batch_outcomes())?),
         ("cli_install_answer", value(&cli_install_answers())?),
         ("command_error", value(&command_errors())?),
         ("credential_context", value(&credential_contexts())?),
         ("decision_outcome", value(&decision_outcomes())?),
         ("deny_count", value(&deny_counts())?),
+        ("export_cancel", value(&export_cancels())?),
+        ("export_done", value(&export_dones())?),
         ("instance_view", value(&instance_views())?),
         ("kill_answer", value(&kill_answers())?),
         ("note_saved", value(&note_saved())?),

@@ -1,10 +1,18 @@
 import { describe, expect, it } from 'vitest';
 
+import acknowledged from './fixtures/acknowledged.json';
+import auditJob from './fixtures/audit_job.json';
+import auditPage from './fixtures/audit_page.json';
+import auditPayload from './fixtures/audit_payload.json';
+import auditStatus from './fixtures/audit_status.json';
+import auditTrail from './fixtures/audit_trail.json';
 import batchOutcome from './fixtures/batch_outcome.json';
 import cliInstallAnswer from './fixtures/cli_install_answer.json';
 import commandError from './fixtures/command_error.json';
 import decisionOutcome from './fixtures/decision_outcome.json';
 import denyCount from './fixtures/deny_count.json';
+import exportCancel from './fixtures/export_cancel.json';
+import exportDone from './fixtures/export_done.json';
 import instanceView from './fixtures/instance_view.json';
 import killAnswer from './fixtures/kill_answer.json';
 import noteSaved from './fixtures/note_saved.json';
@@ -29,10 +37,19 @@ import verifyNow from './fixtures/verify_now.json';
 import wizardState from './fixtures/wizard_state.json';
 import {
   arrayOf,
+  isAcknowledged,
+  isAuditJobEvent,
+  isAuditPage,
+  isAuditPayload,
+  isAuditStatus,
+  isAuditTrail,
   isBatchOutcome,
   isCliInstallAnswer,
   isDecisionOutcome,
   isDenyCount,
+  isEventHeader,
+  isExportCancelAnswer,
+  isExportDone,
   isInstanceView,
   isKillAnswer,
   isOnboardingText,
@@ -84,9 +101,45 @@ describe('fixtures validate against their TS types', () => {
     ['running_script', runningScript, arrayOf(isRunningScriptView)],
     ['kill_answer', killAnswer, arrayOf(isKillAnswer)],
     ['onboarding_text', onboardingText, arrayOf(isOnboardingText)],
+    ['audit_page', auditPage, arrayOf(isAuditPage)],
+    ['audit_trail', auditTrail, arrayOf(isAuditTrail)],
+    ['audit_payload', auditPayload, arrayOf(isAuditPayload)],
+    ['audit_status', auditStatus, arrayOf(isAuditStatus)],
+    ['acknowledged', acknowledged, arrayOf(isAcknowledged)],
+    ['export_done', exportDone, arrayOf(isExportDone)],
+    ['export_cancel', exportCancel, arrayOf(isExportCancelAnswer)],
+    ['audit_job', auditJob, arrayOf(isAuditJobEvent)],
   ] as const)('%s', (_name, fixture, validate) => {
     expect(fixture.length).toBeGreaterThan(0);
     expect(validate(fixture)).toBe(true);
+  });
+
+  // M10 T12 (Δ-M10-3): the Audit window's answers are closed shapes; a header never carries a
+  // payload, a progress event carries counts and nothing else, the flags are the 8.2 names.
+  it('audit DTOs: closed shapes, nulls where Rust sends null, counts only on progress', () => {
+    const [page, last] = auditPage;
+    const header = page?.rows[0];
+    expect(isEventHeader(header)).toBe(true);
+    expect(isEventHeader({ ...header, payload: {} })).toBe(false);
+    expect(isEventHeader({ ...header, flags: ['loud'] })).toBe(false);
+    expect(isEventHeader({ ...header, target: 5 })).toBe(false);
+    expect(page?.rows.some((r) => r.request_id === null)).toBe(true);
+    expect(last?.next).toBeNull();
+    expect(isAuditPage({ ...page, next: { before_seq: 3 } })).toBe(false);
+    expect(isAuditTrail({ ...auditTrail[0], deliveries: { count: 1 } })).toBe(false);
+    expect(isAuditPayload({ ...auditPayload[0], bytes_b64: '' })).toBe(false);
+    const [incidents, quiet] = auditStatus;
+    expect(incidents?.open_incidents.some((i) => i.result === null)).toBe(true);
+    expect(quiet?.anchor_dir).toBeNull();
+    expect(new Set(auditStatus.map((s) => s.health.anchor_dir_write_failing))).toEqual(new Set([true, false]));
+    expect(isAuditStatus({ ...quiet, health: { ...quiet?.health, anchor_dir_lines_pending: '0' } })).toBe(false);
+    expect(isExportDone({ ...exportDone[0], path: '/x' })).toBe(false);
+    expect(exportCancel.map((c) => c.cancelled)).toEqual([true, false]);
+    expect(auditJob.map((e) => e.phase)).toContain('progress');
+    expect(isAuditJobEvent({ job: 'export', phase: 'progress', done: 1 })).toBe(false);
+    expect(isAuditJobEvent({ job: 'backup', phase: 'progress', done: 1, total: 2 })).toBe(false);
+    expect(isAuditJobEvent({ job: 'export', phase: 'done', done: 1, total: 2 })).toBe(false);
+    expect(isAuditJobEvent({ job: 'restore', phase: 'started' })).toBe(false);
   });
 
   it('command_error: every wire shape is recognised, none falls back to refused', () => {

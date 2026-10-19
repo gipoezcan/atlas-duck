@@ -1,0 +1,73 @@
+[
+  {
+    "next": {
+      "before_seq": 41,
+      "limit": 2
+    },
+    "rows": [
+      {
+        "agent_name": "claude-code-billing-api",
+        "agent_name_source": "flag",
+        "atlassian_user": "jdoe",
+        "atlassian_user_key": "JIRAUSER10100",
+        "chain_id": "0b9d3f62-4c1a-4f0e-9a51-7f2a6c3e8d10",
+        "client_kind": "cli",
+        "connection_id": "c-7",
+        "decision": "release_redacted",
+        "epoch": "2026-10-19",
+        "event_type": "READ_RELEASED",
+        "flags": [
+          "redacted"
+        ],
+        "instance_id": "0b9d3f62-4c1a-4f0e-9a51-7f2a6c3e8d11",
+        "key_id": 3,
+        "op_class": "read",
+        "op_id": "jira.issue.get",
+        "os_user": "alice",
+        "payload_len": 1834,
+        "peer_exe": "C:\\Tools\\atlas-duck.exe",
+        "peer_origin_exe": "C:\\Tools\\agent.exe",
+        "peer_pid": 4242,
+        "request_id": "req_0123456789abcdefghij",
+        "seq": 41,
+        "target": "PROJ-7⟨U+202E⟩",
+        "ts_utc": "2026-10-19T08:30:00.125Z"
+      },
+      {
+        "agent_name": null,
+        "agent_name_source": null,
+        "atlassian_user": null,
+        "atlassian_user_key": null,
+        "chain_id": "0b9d3f62-4c1a-4f0e-9a51-7f2a6c3e8d10",
+        "client_kind": null,
+        "connection_id": null,
+        "decision": null,
+        "epoch": null,
+        "event_type": "VERIFY",
+        "flags": [
+          "clock_behind",
+          "integrity_incident"
+        ],
+        "instance_id": null,
+        "key_id": 3,
+        "op_class": null,
+        "op_id": null,
+        "os_user": null,
+        "payload_len": 211,
+        "peer_exe": null,
+        "peer_origin_exe": null,
+        "peer_pid": null,
+        "request_id": null,
+        "seq": 42,
+        "target": null,
+        "ts_utc": "2026-10-19T08:31:00.000Z"
+      }
+    ],
+    "scanned": 3
+  },
+  {
+    "next": null,
+    "rows": [],
+    "scanned": 0
+  }
+]

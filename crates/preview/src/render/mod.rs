@@ -30,10 +30,14 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+mod audit;
 mod body;
 pub mod raw;
 pub mod ws;
 
+pub use audit::{
+    AUDIT_TREE_MAX_BYTES, audit_payload_document, audit_payload_page_document, more_in_raw_text,
+};
 pub use raw::{RawDisplay, raw_display, raw_display_last};
 
 use crate::invisible;
@@ -360,10 +364,21 @@ fn push_escaped_char(out: &mut String, c: char) {
 }
 
 /// The byte length of the `⟨…⟩` escape `rest` starts with: `⟨U+XXXX⟩` (4 to 6 upper-case hex
-/// digits) or [`ws::NO_NEWLINE_AT_END`]; `None` for anything else.
+/// digits), [`ws::NO_NEWLINE_AT_END`], or the PD-68 byte escape `⟨0xHH⟩` of a Raw page (Audit
+/// window, M10 T12; text that went through the display escaping holds no literal `⟨`, so none can
+/// be forged); `None` for anything else.
 fn escape_len(rest: &str) -> Option<usize> {
     if rest.starts_with(ws::NO_NEWLINE_AT_END) {
         return Some(ws::NO_NEWLINE_AT_END.len());
+    }
+    if let Some(inner) = rest.strip_prefix("⟨0x")
+        && inner.len() >= 2
+        && inner.as_bytes()[..2]
+            .iter()
+            .all(|b| matches!(b, b'0'..=b'9' | b'A'..=b'F'))
+        && inner[2..].starts_with('⟩')
+    {
+        return Some("⟨0x".len() + 2 + '⟩'.len_utf8());
     }
     invisible::escape_len(rest)
 }

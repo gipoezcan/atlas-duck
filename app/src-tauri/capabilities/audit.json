@@ -1,8 +1,18 @@
 {
   "identifier": "audit",
-  "description": "the Audit window (Δ1, M6: Verify now only); no decision command",
+  "description": "the Audit window (Δ1, Δ-M10-3): Verify now, the read-only queries and payload view, the incident acknowledgement, the export and backup triggers, the audit_job / audit_changed events; no decision command",
   "windows": ["audit"],
   "permissions": [
-    "allow-verify-now"
+    "allow-acknowledge-incident",
+    "allow-audit-payload",
+    "allow-audit-query",
+    "allow-audit-status",
+    "allow-audit-trail",
+    "allow-backup-trigger",
+    "allow-export-cancel",
+    "allow-export-trigger",
+    "allow-verify-now",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
   ]
 }

@@ -1,11 +1,20 @@
 import { invoke } from '@tauri-apps/api/core';
 
 import type {
+  Acknowledged,
+  AuditCursor,
+  AuditFilter,
+  AuditPage,
+  AuditPayload,
+  AuditStatus,
+  AuditTrail,
   BatchOutcome,
   CandidateRev,
   CliInstallAnswer,
   DecisionOutcome,
   DenyCount,
+  ExportCancelAnswer,
+  ExportDone,
   InstanceAddArgs,
   InstanceView,
   KillAnswer,
@@ -34,10 +43,17 @@ import type {
 } from './types';
 import {
   arrayOf,
+  isAcknowledged,
+  isAuditPage,
+  isAuditPayload,
+  isAuditStatus,
+  isAuditTrail,
   isBatchOutcome,
   isCliInstallAnswer,
   isDecisionOutcome,
   isDenyCount,
+  isExportCancelAnswer,
+  isExportDone,
   isInstanceView,
   isKillAnswer,
   isOnboardingText,
@@ -264,6 +280,59 @@ export function removalFinish(): Promise<RemovalFinishAnswer> {
 /** "Verify now" (8.7, PD-82): one full verification; the answer carries the text to show. */
 export function verifyNow(): Promise<VerifyNow> {
   return call('verify_now', {}, isVerifyNow);
+}
+
+/**
+ * One page of the Audit window's list (8.10): plaintext columns only (no payload search, L38).
+ * Without a cursor the first page; pass the page's `next` for the following one until it is null.
+ */
+export function auditQuery(filter: AuditFilter, cursor?: AuditCursor): Promise<AuditPage> {
+  return call(
+    'audit_query',
+    cursor === undefined ? { filter } : { filter, cursor },
+    isAuditPage,
+  );
+}
+
+/** A request's headers and deliveries (8.10). */
+export function auditTrail(requestId: string): Promise<AuditTrail> {
+  return call('audit_trail', { request_id: requestId }, isAuditTrail);
+}
+
+/** One page of a record's decrypted payload: `srcdoc` for the sandboxed iframe, `display` as text. */
+export function auditPayload(seq: number, page = 0): Promise<AuditPayload> {
+  return call('audit_payload', { seq, page }, isAuditPayload);
+}
+
+/** Open incidents, their count, the store health and the anchor directory. */
+export function auditStatus(): Promise<AuditStatus> {
+  return call('audit_status', {}, isAuditStatus);
+}
+
+/**
+ * "Acknowledge integrity incident" (8.7, PD-180): Rust asks its own native confirmation naming the
+ * incident first; a cancelled dialog rejects with `cancelled`.
+ */
+export function acknowledgeIncident(verifySeq: number, note: string): Promise<Acknowledged> {
+  return call('acknowledge_incident', { verify_seq: verifySeq, note }, isAcknowledged);
+}
+
+/**
+ * The compliance export (8.10, PD-161): Rust shows the warning and its own folder dialog, then
+ * exports the inclusive UTC range (`null`: open on that side); progress arrives as `audit_job`.
+ */
+export function exportTrigger(fromUtc: string | null, toUtc: string | null): Promise<ExportDone> {
+  return call('export_trigger', { from_utc: fromUtc, to_utc: toUtc }, isExportDone);
+}
+
+/** Stops a running export (PD-181): it removes its partial directory and logs nothing. */
+export function exportCancel(): Promise<ExportCancelAnswer> {
+  return call('export_cancel', {}, isExportCancelAnswer);
+}
+
+/** A full backup into a folder Rust's own dialog picks (no token in it); `saved: false` when cancelled. */
+export function backupTrigger(): Promise<RemovalBackupAnswer> {
+  return call('backup_trigger', {}, isRemovalBackupAnswer);
 }
 
 /** The live script runs (PD-81, 9.6), oldest first. */

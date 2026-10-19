@@ -84,7 +84,7 @@ pub use backup::BackupReceipt;
 pub use clock::{Clock, SystemClock};
 pub use crypto::MAX_PAYLOAD_LEN;
 pub use error::{AuditError, OpenError, RestoreError};
-pub use export::{MAX_EXPORT_CT_LEN, MAX_EXPORT_LINE_BYTES};
+pub use export::{EXPORT_NO_RECORDS, MAX_EXPORT_CT_LEN, MAX_EXPORT_LINE_BYTES};
 pub use forget::{ForgetError, ForgetReport, OrphanInstall, forget_install, orphan_installs};
 pub use keystore::{EntryName, KeyStore, KeyStoreError, KeyringLocality, OsKeyStore};
 pub use open::{

@@ -108,6 +108,9 @@ const MANIFEST_TMP_FILE: &str = "manifest.json.tmp";
 /// The suffix of the export directory's name until the `EXPORT` record is logged.
 pub const PARTIAL_SUFFIX: &str = ".partial";
 
+/// The `Invalid` text of a time range that resolves to no record (the Audit window names it, T12).
+pub const EXPORT_NO_RECORDS: &str = "no records in the requested time range";
+
 /// Attempts of the final rename (a scanner may hold a just-closed file of the directory for a
 /// moment, which makes Windows refuse to rename the directory), [`RENAME_RETRY_PAUSE`] apart.
 const RENAME_ATTEMPTS: u32 = 5;
@@ -250,14 +253,10 @@ fn resolve_range(
         )
         .map_err(sql)?;
     let (Some(first_seq), Some(last_seq)) = (seq_of(first)?, seq_of(last)?) else {
-        return Err(AuditError::Invalid(
-            "no records in the requested time range",
-        ));
+        return Err(AuditError::Invalid(EXPORT_NO_RECORDS));
     };
     if first_seq > last_seq {
-        return Err(AuditError::Invalid(
-            "no records in the requested time range",
-        ));
+        return Err(AuditError::Invalid(EXPORT_NO_RECORDS));
     }
     let first_chain: String = tx
         .query_row(

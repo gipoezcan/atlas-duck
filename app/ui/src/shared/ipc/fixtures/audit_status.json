@@ -1,0 +1,51 @@
+[
+  {
+    "anchor_dir": "\\\\nas\\audit\\anchors",
+    "health": {
+      "anchor_dir_lines_pending": 12,
+      "anchor_dir_write_failing": true,
+      "anchor_thread_dead": false,
+      "anchor_write_failing": false,
+      "anchors_blocked": false,
+      "last_prune_failed": false,
+      "open_incidents": 2,
+      "prune_backlog": null,
+      "prune_backlog_days": 0,
+      "settings_unreadable": false,
+      "shred_checkpoint_pending": false,
+      "storage_low": false
+    },
+    "incident_count": 2,
+    "open_incidents": [
+      {
+        "detected_at": "2026-10-19T08:31:00.000Z",
+        "result": "anchor_missing",
+        "verify_seq": 42
+      },
+      {
+        "detected_at": null,
+        "result": null,
+        "verify_seq": 7
+      }
+    ]
+  },
+  {
+    "anchor_dir": null,
+    "health": {
+      "anchor_dir_lines_pending": 0,
+      "anchor_dir_write_failing": false,
+      "anchor_thread_dead": false,
+      "anchor_write_failing": false,
+      "anchors_blocked": false,
+      "last_prune_failed": false,
+      "open_incidents": 0,
+      "prune_backlog": null,
+      "prune_backlog_days": 0,
+      "settings_unreadable": false,
+      "shred_checkpoint_pending": false,
+      "storage_low": false
+    },
+    "incident_count": 0,
+    "open_incidents": []
+  }
+]

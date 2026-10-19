@@ -3487,3 +3487,135 @@ fn render_digest_body_one_line() {
     }
     assert_eq!(section.matches("(not shown)").count(), 1);
 }
+
+// ---- the Audit window's payload view (M10 T12, Δ-M10-3; §8.10, S-06) ---------------------------
+
+/// A decrypted audit payload is a tree of text nodes in the sandboxed document: keys and values are
+/// text (an HTML-looking value stays text), invisible characters are marked escapes, a list past
+/// its row cap ends with the note, and bytes that are no JSON (a Raw page, a non-UTF-8 byte) are a
+/// `<pre>` of display text. Nothing of it is markup.
+#[test]
+fn audit_payload_document_is_sandboxed_text_tree() -> TestResult {
+    let payload = json!({
+        "body": "<script>alert(1)</script>",
+        "count": 5,
+        "items": [true, null, "\u{202E}evil"],
+        "nested": {"k": "  two spaces"},
+    });
+    for platform in [Platform::MacOsLinux, Platform::Windows] {
+        let d = render::audit_payload_document(&serde_json::to_vec(&payload)?, platform);
+        assert_inert(&d, platform);
+        let body = body_of(&d);
+        assert!(body.starts_with("<ul><li>object, 4 keys<ul>"), "{body}");
+        assert!(
+            body.contains(
+                "<li><code><bdi>body</bdi></code>: \"<bdi>&lt;script&gt;alert(1)&lt;/script&gt;</bdi>\"</li>"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("<li><code><bdi>count</bdi></code>: <code><bdi>5</bdi></code></li>"),
+            "{body}"
+        );
+        assert!(
+            body.contains("<li>[0]: <code>true</code></li><li>[1]: <code>null</code></li>"),
+            "{body}"
+        );
+        assert!(body.contains("<mark>⟨U+202E⟩</mark>evil"), "{body}");
+        // Whitespace that would collapse is in a `<pre>`.
+        assert!(
+            body.contains("<pre>\"<bdi>  two spaces</bdi>\"</pre>"),
+            "{body}"
+        );
+        let text = text_outside_tags(body);
+        assert!(text.contains("&lt;script&gt;"), "{text}");
+    }
+
+    // A list past its row cap: the first DOC_MAX_ROWS items, then the note.
+    let many: Vec<u32> = (0..u32::try_from(DOC_MAX_ROWS)? + 3).collect();
+    let d = render::audit_payload_document(&serde_json::to_vec(&many)?, Platform::MacOsLinux);
+    assert_inert(&d, Platform::MacOsLinux);
+    assert!(d.contains(&format!("[{}]: ", DOC_MAX_ROWS - 1)));
+    assert!(!d.contains(&format!("[{}]: ", DOC_MAX_ROWS)));
+    assert!(
+        d.contains(&format!(
+            "<li>{}</li>",
+            render::more_in_raw_text(3, "items")
+        )),
+        "{}",
+        &d[d.len().saturating_sub(400)..]
+    );
+
+    // Not JSON: the bytes as display text in a `<pre>`, an invalid byte as its escape.
+    let d = render::audit_payload_document(b"{\"a\": <b>\xff", Platform::MacOsLinux);
+    assert_inert(&d, Platform::MacOsLinux);
+    assert_eq!(
+        body_of(&d),
+        "<pre><code><bdi>{\"a\": &lt;b&gt;<mark>⟨0xFF⟩</mark></bdi></code></pre>"
+    );
+    // Larger than the tree cap: never parsed, shown as text.
+    let big = serde_json::to_vec(&json!({"s": "x".repeat(render::AUDIT_TREE_MAX_BYTES)}))?;
+    let d = render::audit_payload_document(&big, Platform::MacOsLinux);
+    assert_inert(&d, Platform::MacOsLinux);
+    assert!(
+        body_of(&d).starts_with("<pre><code><bdi>{\"s\":\"xxx"),
+        "not parsed"
+    );
+
+    // A Raw page: the display text the command layer projected, as text.
+    let page = render::raw_display_last("<img src=x onerror=y>\u{200B}".as_bytes(), &[]).text;
+    let d = render::audit_payload_page_document(&page, Platform::Windows);
+    assert_inert(&d, Platform::Windows);
+    assert_eq!(
+        body_of(&d),
+        "<pre><code><bdi>&lt;img src=x onerror=y&gt;<mark>⟨U+200B⟩</mark></bdi></code></pre>"
+    );
+    Ok(())
+}
+
+/// The cut text of an over-long payload is noted at the end, with the Raw text named.
+#[test]
+fn audit_payload_document_notes_a_cut_text() -> TestResult {
+    let long = "y".repeat(DOC_MAX_BYTES + 10);
+    let d = render::audit_payload_page_document(&long, Platform::MacOsLinux);
+    assert_inert(&d, Platform::MacOsLinux);
+    assert!(d.len() < DOC_MAX_BYTES + 64 * 1024, "{}", d.len());
+    let body = body_of(&d);
+    // The budget counts the markup before the text too.
+    let cut = long.len() + "<pre><code><bdi>".len() - DOC_MAX_BYTES;
+    assert!(
+        body.ends_with(&format!(
+            "…</bdi></code></pre><p>{}</p>",
+            render::more_in_raw_text(u64::try_from(cut)?, "bytes")
+        )),
+        "{}",
+        &body[body.len().saturating_sub(300)..]
+    );
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// S-06 (§13, Audit window half): a payload whose keys and values are HTML, script, bidi and
+    /// invisible text renders inert, as a tree and as a Raw page.
+    #[test]
+    fn s06_audit_payload_document_has_no_active_content(
+        strings in prop::collection::vec(text(), 1..8),
+        windows in any::<bool>(),
+    ) {
+        let platform = if windows { Platform::Windows } else { Platform::MacOsLinux };
+        let mut object = serde_json::Map::new();
+        for (i, s) in strings.iter().enumerate() {
+            object.insert(s.clone(), json!([s, i, {"inner": s}]));
+        }
+        let bytes = serde_json::to_vec(&serde_json::Value::Object(object)).unwrap_or_default();
+        let tree = render::audit_payload_document(&bytes, platform);
+        prop_assert!(tree.contains("<ul><li>object, "), "not a tree");
+        assert_inert(&tree, platform);
+        let page = render::raw_display_last(&bytes, &[]).text;
+        assert_inert(&render::audit_payload_page_document(&page, platform), platform);
+        let raw = render::audit_payload_document(strings.concat().as_bytes(), platform);
+        assert_inert(&raw, platform);
+    }
+}

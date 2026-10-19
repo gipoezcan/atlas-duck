@@ -203,8 +203,12 @@ test("non_app_permissions_fail", () => {
 
 test("event_permissions_only_for_listening_windows", () => {
   const caps = capsFor(COMMANDS);
-  caps.audit.permissions.push("core:event:allow-listen");
-  assertFails(errorsOf(surface({ caps })), /audit\.json: this window listens to no event/);
+  caps.onboarding.permissions.push("core:event:allow-listen");
+  assertFails(errorsOf(surface({ caps })), /onboarding\.json: this window listens to no event/);
+  // M10 T12: the Audit window listens (`audit_job`, `audit_changed`), so it needs both.
+  const caps3 = capsFor(COMMANDS);
+  caps3.audit.permissions = caps3.audit.permissions.filter((p) => p !== "core:event:allow-listen");
+  assertFails(errorsOf(surface({ caps: caps3 })), /audit\.json: a listening window needs exactly/);
   const caps2 = capsFor(COMMANDS);
   caps2.approvals.permissions = caps2.approvals.permissions.filter((p) => p !== "core:event:allow-unlisten");
   assertFails(errorsOf(surface({ caps: caps2 })), /approvals\.json: a listening window needs exactly/);

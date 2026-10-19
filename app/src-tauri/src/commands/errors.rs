@@ -48,8 +48,97 @@ pub enum CommandError {
     /// nothing to show. The text is the core constant, chosen here so the UI never maps an error
     /// kind to it; wire `{"kind": "release_blocked", "text": ..}`.
     ReleaseBlocked,
+    /// M10 T12 (PD-180, PD-181): a native confirmation or a folder dialog Rust drew was cancelled
+    /// (or the export's cancel flag was set): nothing was appended, nothing is left on disk.
+    Cancelled,
+    /// M10 T12 (PD-159..PD-161): the compliance export did not end as a plain success. Nested like
+    /// `Admin`: `{"kind": "export", "error": {"kind": "not_renamed", ..}}`. No path, no OS text.
+    Export(ExportFailure),
+    /// M10 T12: `Store::backup` failed (nothing is logged for a failed backup; retry it whole).
+    Backup,
+    /// M10 T12: an Audit-window read failed. Nested: `{"kind": "audit", "error": {"kind":
+    /// "unreadable", "seq": n}}` for a record that does not decrypt or verify, `{"kind": "failed"}`
+    /// otherwise. No error text.
+    Audit(AuditReadFailure),
     /// A blocking task died, or a state the command layer cannot explain.
     Internal,
+}
+
+/// How a compliance export ended when it did not simply succeed (Δ-M10-3, PD-159, PD-181).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportFailure {
+    /// The time range holds no record; nothing was written.
+    EmptyRange,
+    /// The failed or cancelled export's staging directory `dir_name` (a `….partial` subdirectory
+    /// of the folder the user chose; its name only, never a path) could not be removed: it may
+    /// hold decrypted records, no `EXPORT` was logged, and the user must delete it.
+    Leftover { dir_name: String },
+    /// The export is complete and logged, but its directory is still named `dir_name` (ending in
+    /// `.partial`): rename it (drop the suffix) before giving it to a recipient, since
+    /// `verify-export` refuses `.partial` names. Never retried: a retry logs another `EXPORT`.
+    NotRenamed {
+        /// Lowercase hex SHA-256 of `manifest.json` (the recipient's trust root, PD-161).
+        manifest_sha256: String,
+        dir_name: String,
+        rows: u64,
+    },
+    /// Anything else: nothing was logged and nothing is left.
+    Failed,
+}
+
+impl ExportFailure {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::EmptyRange => "empty_range",
+            Self::Leftover { .. } => "leftover",
+            Self::NotRenamed { .. } => "not_renamed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl Serialize for ExportFailure {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(None)?;
+        m.serialize_entry("kind", self.kind())?;
+        match self {
+            Self::Leftover { dir_name } => m.serialize_entry("dir_name", dir_name)?,
+            Self::NotRenamed {
+                manifest_sha256,
+                dir_name,
+                rows,
+            } => {
+                m.serialize_entry("manifest_sha256", manifest_sha256)?;
+                m.serialize_entry("dir_name", dir_name)?;
+                m.serialize_entry("rows", rows)?;
+            }
+            Self::EmptyRange | Self::Failed => {}
+        }
+        m.end()
+    }
+}
+
+/// Why an Audit-window read failed (M10 T12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditReadFailure {
+    /// Record `seq` does not decrypt, does not match its digest or has an unexpected shape.
+    Unreadable { seq: u64 },
+    /// Anything else.
+    Failed,
+}
+
+impl Serialize for AuditReadFailure {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(None)?;
+        match self {
+            Self::Unreadable { seq } => {
+                m.serialize_entry("kind", "unreadable")?;
+                m.serialize_entry("seq", seq)?;
+            }
+            Self::Failed => m.serialize_entry("kind", "failed")?,
+        }
+        m.end()
+    }
 }
 
 impl CommandError {
@@ -65,6 +154,10 @@ impl CommandError {
             Self::CliInstall(_) => "cli_install",
             Self::Removal(_) => "removal",
             Self::ReleaseBlocked => "release_blocked",
+            Self::Cancelled => "cancelled",
+            Self::Export(_) => "export",
+            Self::Backup => "backup",
+            Self::Audit(_) => "audit",
             Self::Internal => "internal",
         }
     }
@@ -90,8 +183,15 @@ impl Serialize for CommandError {
             Self::Settings(e) => m.serialize_entry("error", e)?,
             Self::CliInstall(e) => m.serialize_entry("error", e)?,
             Self::Removal(e) => m.serialize_entry("error", e)?,
+            Self::Export(e) => m.serialize_entry("error", e)?,
+            Self::Audit(e) => m.serialize_entry("error", e)?,
             Self::ReleaseBlocked => m.serialize_entry("text", RELEASE_BLOCKED_INTERNAL)?,
-            Self::NotFound | Self::NotReady | Self::Busy | Self::Internal => {}
+            Self::NotFound
+            | Self::NotReady
+            | Self::Busy
+            | Self::Cancelled
+            | Self::Backup
+            | Self::Internal => {}
         }
         m.end()
     }
@@ -226,5 +326,53 @@ mod tests {
             Some(json!({"kind": "removal", "error": {"kind": "unticked"}}))
         );
         assert_eq!(removal.to_string(), "removal");
+    }
+
+    /// M10 T12: the Audit window's kinds. A leftover or unrenamed export names its directory by
+    /// its name only; nothing carries a path or an error text.
+    #[test]
+    fn audit_window_kinds_wire_shape() {
+        for (e, kind) in [
+            (CommandError::Cancelled, "cancelled"),
+            (CommandError::Backup, "backup"),
+        ] {
+            assert_eq!(serde_json::to_value(&e).ok(), Some(json!({ "kind": kind })));
+        }
+        let leftover = CommandError::Export(ExportFailure::Leftover {
+            dir_name: "atlas-duck-export-c-1-2-x.partial".into(),
+        });
+        assert_eq!(
+            serde_json::to_value(&leftover).ok(),
+            Some(json!({"kind": "export", "error": {"kind": "leftover",
+                        "dir_name": "atlas-duck-export-c-1-2-x.partial"}}))
+        );
+        let renamed = CommandError::Export(ExportFailure::NotRenamed {
+            manifest_sha256: "ab".repeat(32),
+            dir_name: "d.partial".into(),
+            rows: 3,
+        });
+        assert_eq!(
+            serde_json::to_value(&renamed).ok(),
+            Some(json!({"kind": "export", "error": {"kind": "not_renamed",
+                        "manifest_sha256": "ab".repeat(32), "dir_name": "d.partial", "rows": 3}}))
+        );
+        for (f, kind) in [
+            (ExportFailure::EmptyRange, "empty_range"),
+            (ExportFailure::Failed, "failed"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(CommandError::Export(f)).ok(),
+                Some(json!({"kind": "export", "error": {"kind": kind}}))
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(CommandError::Audit(AuditReadFailure::Unreadable { seq: 9 })).ok(),
+            Some(json!({"kind": "audit", "error": {"kind": "unreadable", "seq": 9}}))
+        );
+        assert_eq!(
+            serde_json::to_value(CommandError::Audit(AuditReadFailure::Failed)).ok(),
+            Some(json!({"kind": "audit", "error": {"kind": "failed"}}))
+        );
+        assert_eq!(leftover.to_string(), "export");
     }
 }

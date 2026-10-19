@@ -32,7 +32,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Builder, Manager, Runtime};
 
 pub use blocking::blocking;
-pub use errors::CommandError;
+pub use errors::{AuditReadFailure, CommandError, ExportFailure};
 pub use names::COMMANDS;
 
 use crate::state::ServeSlot;
@@ -55,6 +55,14 @@ pub fn register<R: Runtime>(builder: Builder<R>) -> Builder<R> {
         approvals::raw_page,
         approvals::recent_list,
         approvals::redaction_preview,
+        audit::acknowledge_incident,
+        audit::audit_payload,
+        audit::audit_query,
+        audit::audit_status,
+        audit::audit_trail,
+        audit::backup_trigger,
+        audit::export_cancel,
+        audit::export_trigger,
         audit::verify_now,
         credential::archive_and_start_fresh,
         credential::close_credential,

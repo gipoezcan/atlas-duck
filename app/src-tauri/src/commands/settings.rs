@@ -1187,25 +1187,36 @@ pub async fn removal_backup<R: Runtime>(
 
 /// The folder dialog and the backup into it. Blocks until the user answers: the blocking pool only.
 fn pick_folder_and_back_up<R: Runtime>(app: &AppHandle<R>) -> Result<bool, CommandError> {
-    use atlas_duck_audit::types::RustChosenPath;
-    use tauri_plugin_dialog::DialogExt;
     let store = app
         .try_state::<ServeSlot>()
         .and_then(|slot| slot.get().and_then(|s| s.open_store()))
         .ok_or(CommandError::NotReady)?;
+    let Some(dir) = pick_backup_folder(app)? else {
+        return Ok(false);
+    };
+    store
+        .backup(dir)
+        .map_err(|e| CommandError::Settings(SettingsError::Audit(e)))?;
+    Ok(true)
+}
+
+/// Rust's folder dialog for a backup bundle (§12.5 step 1, and the Audit window's `backup_trigger`,
+/// M10 T12); `None` when cancelled. Blocks until the user answers: the blocking pool only.
+pub(crate) fn pick_backup_folder<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Result<Option<atlas_duck_audit::types::RustChosenPath>, CommandError> {
+    use atlas_duck_audit::types::RustChosenPath;
+    use tauri_plugin_dialog::DialogExt;
     let Some(chosen) = app
         .dialog()
         .file()
         .set_title(BACKUP_DIALOG_TITLE)
         .blocking_pick_folder()
     else {
-        return Ok(false);
+        return Ok(None);
     };
     let path = chosen.into_path().map_err(|_| CommandError::Internal)?;
-    store
-        .backup(RustChosenPath::from_native_dialog(path))
-        .map_err(|e| CommandError::Settings(SettingsError::Audit(e)))?;
-    Ok(true)
+    Ok(Some(RustChosenPath::from_native_dialog(path)))
 }
 
 /// `removal_begin {}` (§12.5 step 2): native confirmation, then the stored tokens are deleted

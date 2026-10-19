@@ -1,4 +1,12 @@
 import type {
+  Acknowledged,
+  AuditFlag,
+  AuditIncident,
+  AuditJobEvent,
+  AuditPage,
+  AuditPayload,
+  AuditStatus,
+  AuditTrail,
   BatchOutcome,
   BlockReason,
   CandidateRev,
@@ -13,6 +21,9 @@ import type {
   DenyOfferKind,
   EditForm,
   EditInput,
+  EventHeader,
+  ExportCancelAnswer,
+  ExportDone,
   InputKind,
   InstanceView,
   KillAnswer,
@@ -328,6 +339,8 @@ const isHealth = (v: unknown): boolean =>
     last_prune_failed: isBool,
     shred_checkpoint_pending: isBool,
     settings_unreadable: isBool,
+    anchor_dir_write_failing: isBool,
+    anchor_dir_lines_pending: isNum,
   });
 
 export const isSettingsView = (v: unknown): v is SettingsView =>
@@ -484,6 +497,90 @@ export const isWizardState = (v: unknown): v is WizardState =>
     instances: (i) => Array.isArray(i) && i.every(isInstanceView),
   });
 
+const AUDIT_FLAGS: readonly unknown[] = [
+  'edited',
+  'redacted',
+  'batch',
+  'stale',
+  'clock_backwards',
+  'clock_forward',
+  'clock_behind',
+  'integrity_incident',
+] satisfies AuditFlag[];
+
+/** One header, closed: a key the Audit window does not know (a payload, say) is refused. */
+export const isEventHeader = (v: unknown): v is EventHeader =>
+  closed(v, {
+    seq: isNum,
+    ts_utc: isStr,
+    epoch: strOrNull,
+    chain_id: isStr,
+    event_type: isStr,
+    request_id: strOrNull,
+    op_id: strOrNull,
+    op_class: strOrNull,
+    instance_id: strOrNull,
+    target: strOrNull,
+    decision: strOrNull,
+    flags: (f) => Array.isArray(f) && f.every((x) => AUDIT_FLAGS.includes(x)),
+    agent_name: strOrNull,
+    agent_name_source: strOrNull,
+    client_kind: strOrNull,
+    connection_id: strOrNull,
+    peer_pid: numOrNull,
+    peer_exe: strOrNull,
+    peer_origin_exe: strOrNull,
+    os_user: strOrNull,
+    atlassian_user: strOrNull,
+    atlassian_user_key: strOrNull,
+    payload_len: isNum,
+    key_id: isNum,
+  });
+
+export const isAuditPage = (v: unknown): v is AuditPage =>
+  closed(v, {
+    rows: arrayOf(isEventHeader),
+    next: (n) => n === null || closed(n, { before_seq: numOrNull, limit: isNum }),
+    scanned: isNum,
+  });
+
+export const isAuditTrail = (v: unknown): v is AuditTrail =>
+  closed(v, {
+    headers: arrayOf(isEventHeader),
+    deliveries: (d) => closed(d, { count: isNum, to_other_peer: isBool }),
+  });
+
+export const isAuditPayload = (v: unknown): v is AuditPayload =>
+  closed(v, { srcdoc: isStr, page: isNum, page_count: isNum, total_bytes: isNum, display: isStr });
+
+const isAuditIncident = (v: unknown): v is AuditIncident =>
+  closed(v, { verify_seq: isNum, result: strOrNull, detected_at: strOrNull });
+
+export const isAuditStatus = (v: unknown): v is AuditStatus =>
+  closed(v, {
+    open_incidents: arrayOf(isAuditIncident),
+    incident_count: isNum,
+    health: isHealth,
+    anchor_dir: strOrNull,
+  });
+
+export const isAcknowledged = (v: unknown): v is Acknowledged =>
+  closed(v, { verify_seq: isNum, ack_seq: isNum });
+
+export const isExportDone = (v: unknown): v is ExportDone =>
+  closed(v, { manifest_sha256: isStr, dir_name: isStr, rows: isNum });
+
+export const isExportCancelAnswer = (v: unknown): v is ExportCancelAnswer =>
+  closed(v, { cancelled: isBool });
+
+/** `audit_job`: row counts belong to `progress` alone (an export's); every other phase has none. */
+export const isAuditJobEvent = (v: unknown): v is AuditJobEvent => {
+  if (!rec(v)) return false;
+  const base = { job: oneOf('export', 'backup'), phase: isStr };
+  if (v.phase === 'progress') return v.job === 'export' && closed(v, { ...base, done: isNum, total: isNum });
+  return oneOf('started', 'done', 'failed', 'cancelled')(v.phase) && closed(v, base);
+};
+
 const isCoreError = (v: unknown): v is CoreError => fields(v, { kind: isStr });
 
 /** Maps whatever a rejected invoke carried to a `CommandError`. */
@@ -496,6 +593,8 @@ export function toCommandError(raw: unknown): CommandError {
       case 'not_found':
       case 'not_ready':
       case 'busy':
+      case 'cancelled':
+      case 'backup':
       case 'internal':
         return { kind: raw.kind };
       case 'decision':
@@ -503,6 +602,8 @@ export function toCommandError(raw: unknown): CommandError {
       case 'settings':
       case 'cli_install':
       case 'removal':
+      case 'export':
+      case 'audit':
         if (isCoreError(raw.error)) return { kind: raw.kind, error: raw.error };
         break;
       case 'release_blocked':

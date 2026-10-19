@@ -1,0 +1,36 @@
+[
+  {
+    "job": "export",
+    "phase": "started"
+  },
+  {
+    "done": 10000,
+    "job": "export",
+    "phase": "progress",
+    "total": 25000
+  },
+  {
+    "job": "export",
+    "phase": "done"
+  },
+  {
+    "job": "export",
+    "phase": "failed"
+  },
+  {
+    "job": "export",
+    "phase": "cancelled"
+  },
+  {
+    "job": "backup",
+    "phase": "started"
+  },
+  {
+    "job": "backup",
+    "phase": "done"
+  },
+  {
+    "job": "backup",
+    "phase": "failed"
+  }
+]

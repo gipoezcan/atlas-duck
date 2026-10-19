@@ -8,8 +8,14 @@
 #[rustfmt::skip]
 pub const COMMANDS: &[&str] = &[
     "acknowledge_attention",
+    "acknowledge_incident",
     "app_status",
     "archive_and_start_fresh",
+    "audit_payload",
+    "audit_query",
+    "audit_status",
+    "audit_trail",
+    "backup_trigger",
     "cli_install",
     "cli_uninstall",
     "close_credential",
@@ -19,6 +25,8 @@ pub const COMMANDS: &[&str] = &[
     "decide_batch",
     "deny_batch",
     "deny_session",
+    "export_cancel",
+    "export_trigger",
     "instance_accept_url_change",
     "instance_add",
     "instance_change_url",
