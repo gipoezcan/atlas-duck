@@ -320,6 +320,9 @@ function answer(cmd: string, args: Record<string, unknown>): Promise<Json> {
     case 'export_trigger': return reply(cmd, 'export_done');
     case 'export_cancel': return reply(cmd, 'export_cancel');
     case 'backup_trigger': return reply(cmd, 'removal_backup_answer');
+    // M10 T13 (PD-168): Settings "Restore backup…"; its UI is Task 21's.
+    case 'restore_begin': return reply(cmd, 'restore_done');
+    case 'restore_cancel': return reply(cmd, 'restore_cancel');
     default: return Promise.reject('command not allowed');
   }
 }
@@ -327,7 +330,8 @@ function answer(cmd: string, args: Record<string, unknown>): Promise<Json> {
 /**
  * Fixtures of M10 T12's Audit-window answers that no window renders yet: the Audit window's UI is
  * Task 20, which removes each name here as its window comes to consume it (`audit_job` is an event
- * payload, so it stays until events are driven here too).
+ * payload, so it stays until events are driven here too). M10 T13's restore answers likewise wait for
+ * the Settings UI (Task 21).
  */
 const NOT_YET_RENDERED = [
   'acknowledged',
@@ -338,6 +342,8 @@ const NOT_YET_RENDERED = [
   'audit_trail',
   'export_cancel',
   'export_done',
+  'restore_cancel',
+  'restore_done',
 ];
 
 function wire(): void {
@@ -455,6 +461,7 @@ function credential(k: number): Scenario {
         archive_and_start_fresh: 'archive_outcome',
         retry_keychain: 'retry_started',
         save_recovery_note: 'note_saved',
+        restore_from_backup: 'submit_outcome',
       };
       return mountCredentialPage(root, {
         invoke: (cmd) => {

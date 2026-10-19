@@ -203,6 +203,20 @@ mod tests {
                 AppSnapshot::Gate(GateState::FirstRun),
                 Follow::Leave,
             ),
+            // M10 T13: a restore's passphrase window, opened from Settings (a core serves) or set
+            // in place of a locked purpose (`keychain_lost`), is left to the restore that opened
+            // it: never closed by a serving core, never moved back to "Recover this log".
+            (Purpose::RestoreBackup, AppSnapshot::Serving, Follow::Leave),
+            (
+                Purpose::RestoreBackup,
+                lost(RecoveryOffer::RecoverThisLog),
+                Follow::Leave,
+            ),
+            (
+                Purpose::RestoreBackup,
+                AppSnapshot::Gate(GateState::Locked(LockedReason::KeychainUnavailable)),
+                Follow::Leave,
+            ),
         ];
         for (current, snapshot, want) in table {
             assert_eq!(

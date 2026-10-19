@@ -32,5 +32,21 @@
   {
     "job": "backup",
     "phase": "failed"
+  },
+  {
+    "job": "restore",
+    "phase": "started"
+  },
+  {
+    "job": "restore",
+    "phase": "done"
+  },
+  {
+    "job": "restore",
+    "phase": "failed"
+  },
+  {
+    "job": "restore",
+    "phase": "cancelled"
   }
 ]

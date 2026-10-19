@@ -32,7 +32,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Builder, Manager, Runtime};
 
 pub use blocking::blocking;
-pub use errors::{AuditReadFailure, CommandError, ExportFailure};
+pub use errors::{AuditReadFailure, CommandError, ExportFailure, RestoreFailure};
 pub use names::COMMANDS;
 
 use crate::state::ServeSlot;
@@ -67,6 +67,7 @@ pub fn register<R: Runtime>(builder: Builder<R>) -> Builder<R> {
         credential::archive_and_start_fresh,
         credential::close_credential,
         credential::credential_context,
+        credential::restore_from_backup,
         credential::retry_keychain,
         credential::save_recovery_note,
         credential::submit_secret,
@@ -87,6 +88,8 @@ pub fn register<R: Runtime>(builder: Builder<R>) -> Builder<R> {
         settings::removal_finish,
         settings::removal_mark,
         settings::removal_state,
+        settings::restore_begin,
+        settings::restore_cancel,
         settings::retest_token,
         settings::settings_apply,
         settings::settings_get,

@@ -175,6 +175,11 @@ pub struct ArchiveAndStartFreshArgs {}
 #[serde(deny_unknown_fields)]
 pub struct RetryKeychainArgs {}
 
+/// `restore_from_backup {}` (M10 T13, PD-168): Rust draws the dialogs; no path, no secret in.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreFromBackupArgs {}
+
 /// `close_credential {}` (M6 T25, T21 review I-4): the page's own Close / Cancel.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -483,6 +488,18 @@ async fn submit<R: Runtime>(
                 Err(f) => Ok(SubmitOutcome::Failed(SubmitFailure::class(f.class()))),
             }
         }
+        Purpose::RestoreBackup => {
+            let passphrase = unlock_passphrase(args)?;
+            match credential::hand_restore_passphrase(app, passphrase) {
+                // A window Settings opened has done its part; the restore answers in Settings.
+                Ok(false) => close_after_answer(app, generation),
+                // Set in place of the locked purpose: `restore_from_backup` answers here.
+                Ok(true) => {}
+                // No restore waits (it ended): the entry is dropped, zeroized.
+                Err(_) => return Err(CommandError::NotReady),
+            }
+            Ok(SubmitOutcome::Accepted {})
+        }
         // `keychain_unavailable`: nothing to type in v1 (L39); "Retry keychain" instead.
         Purpose::Unlock => Err(CommandError::NotReady),
     }
@@ -587,6 +604,57 @@ async fn archive<R: Runtime>(app: &AppHandle<R>) -> Result<ArchiveOutcome, Comma
             Ok(ArchiveOutcome::Archived { archived_file })
         }
         Err(f) => Ok(ArchiveOutcome::Failed(SubmitFailure::class(f.class()))),
+    }
+}
+
+/// `restore_from_backup {}` (M10 T13, PD-168, Δ-M10-3): "Restore a backup instead", only for a
+/// `keychain_lost` window ("Recover this log" / "Finish restore"). Rust shows the native "Restore
+/// backup" confirmation and its file dialog, then sets this window in place to `restore_backup`
+/// (announced) for the backup's passphrase (`submit_secret`), then `restore_from_source` moves the
+/// locked store aside and the core starts on the restored one (`serve::restore_from_backup`). The
+/// answer: `unlocked {}` (the window closes) or `failed {class}` (the window goes back to its
+/// locked purpose; `cancelled`, `archive_first`, `wrong_passphrase`, `not_a_backup`,
+/// `committed_incomplete`, ...).
+#[tauri::command]
+pub async fn restore_from_backup<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<RestoreFromBackupArgs>,
+) -> Result<SubmitOutcome, CommandError> {
+    let Args(RestoreFromBackupArgs {}) = args;
+    let response = restore_in_place(&app).await;
+    finish(&app, response)
+}
+
+async fn restore_in_place<R: Runtime>(app: &AppHandle<R>) -> Result<SubmitOutcome, CommandError> {
+    let window = credential::current_window(app);
+    let Some((Purpose::RecoverThisLog | Purpose::FinishRestore, generation)) = window else {
+        return Err(CommandError::NotReady);
+    };
+    let state = serve_state(app).ok_or(CommandError::NotReady)?;
+    let (pick_app, pass_app) = (app.clone(), app.clone());
+    let restored = serve::restore_from_backup(
+        &state,
+        Box::new(move || crate::restore_flow::pick_restore_source(&pick_app)),
+        Box::new(move |stop| {
+            let request = credential::enter_restore(&pass_app, generation).ok()?;
+            crate::restore_flow::wait_passphrase(&request.rx, stop)
+        }),
+    )
+    .await;
+    match restored {
+        Ok(()) => {
+            close_after_answer(app, generation);
+            Ok(SubmitOutcome::Unlocked {})
+        }
+        Err(f) => {
+            let handle = app.clone();
+            // `leave_restore` waits for `opening`: off the async workers.
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                credential::leave_restore(&handle, generation)
+            })
+            .await;
+            Ok(SubmitOutcome::Failed(SubmitFailure::class(f.class())))
+        }
     }
 }
 

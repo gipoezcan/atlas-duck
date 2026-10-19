@@ -69,9 +69,13 @@ export const WINDOW_COMMANDS = {
     "removal_mark",
     "removal_finish",
     "app_status",
+    // M10 T13 (Δ-M10-3, PD-168): "Back up now" (the Audit window's trigger) and "Restore backup…".
+    "backup_trigger",
+    "restore_begin",
+    "restore_cancel",
   ],
   // M6: `verify_now` (P8); M10 T12 (Δ-M10-3, L201): the queries, the payload view, the incident
-  // acknowledgement and the export/backup triggers (`backup_trigger` also in settings from T13).
+  // acknowledgement and the export/backup triggers (`backup_trigger` also in settings, T13).
   audit: [
     "verify_now",
     "audit_query",
@@ -94,6 +98,8 @@ export const WINDOW_COMMANDS = {
     // M6 T25 (T21 review I-4): the page's own Close / Cancel; credential only, like the OS close.
     "close_credential",
     "quit",
+    // M10 T13 (Δ-M10-3, L201, PD-168): "Restore a backup instead" in the `keychain_lost` state.
+    "restore_from_backup",
   ],
   setup: [
     "wizard_state",

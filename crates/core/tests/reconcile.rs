@@ -519,7 +519,105 @@ fn restore_report(pats_deleted: Vec<String>) -> RestoreReport {
         records_lost: 0,
         pats_lost: true,
         pats_deleted,
+        confirmation_seq: None,
     }
+}
+
+/// `TempStore`'s recovery passphrase (the harness's store; its backup opens with it).
+const STORE_PASSPHRASE: &str = "correct horse battery";
+
+/// A real in-process restore of the harness store's own backup (a same-machine rollback of its
+/// `BACKUP` record, confirmed), as M10's Settings restore runs it.
+fn restore_own_backup(h: &Harness) -> Result<RestoreReport, TestError> {
+    use atlas_duck_audit::types::{Confirmed, RustChosenPath};
+    let out = tempfile::tempdir()?;
+    let store = h.store();
+    let bundle = store
+        .backup(RustChosenPath::from_native_dialog(out.path().to_path_buf()))
+        .map_err(|e| format!("backup: {e}"))?
+        .bundle_dir;
+    let confirmed = Confirmed {
+        dialog_text_sha256: [1; 32],
+    };
+    let report = store
+        .restore(
+            RustChosenPath::from_native_dialog(bundle),
+            &secrecy::SecretString::from(STORE_PASSPHRASE.to_owned()),
+            confirmed,
+            Some(confirmed),
+        )
+        .map_err(|e| format!("restore: {e}"))?;
+    Ok(report)
+}
+
+/// M10 T13 (M2 T16 handoff, PD-28): after a real `Store::restore`, `Core::after_restore` logs one
+/// `INSTANCE_STATE_CHANGED {needs_token}` per instance the report names in `pats_deleted`, and the
+/// runtime follows (the instance answers `needs_token`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restore_report_logs_needs_token_per_pat_deleted() -> TestResult {
+    let plan = FaultPlan::new();
+    plan.record_trail(true);
+    let h = Harness::builder()
+        .jira("jira-main")
+        .faults(plan.clone())
+        .start()
+        .await?;
+    let id = h.instance("jira-main").ok_or("no instance")?.id.clone();
+    let report = restore_own_backup(&h)?;
+    assert_eq!(report.pats_deleted, vec![id.clone()]);
+    // The harness's tokens live in its own credential store, not in the store's keychain entries
+    // the restore deleted: it loses the token the same way.
+    h.credentials().delete(&id).map_err(|e| format!("{e:?}"))?;
+    let before = h.events_of(EventType::INSTANCE_STATE_CHANGED).await?.len();
+    h.core().after_restore(&report).await?;
+    let changed = h.events_of(EventType::INSTANCE_STATE_CHANGED).await?;
+    // One record per deleted PAT (the instance is the record's `instance_id` column).
+    let new: Vec<Value> = changed
+        .get(before..)
+        .unwrap_or_default()
+        .iter()
+        .map(|p| p["state"].clone())
+        .collect();
+    assert_eq!(new, vec![json!("needs_token")]);
+    assert_eq!(
+        h.instances().list().first().map(|i| i.state),
+        Some("needs_token")
+    );
+    Ok(())
+}
+
+/// M10 T13 (M2 T16 handoff): after a real `Store::restore` the config file is reconciled again
+/// (`reconcile_config_file` first, before the `needs_token` records), so prune can run on the
+/// restored store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restore_reruns_reconcile_config_file() -> TestResult {
+    let plan = FaultPlan::new();
+    plan.record_trail(true);
+    let h = Harness::builder()
+        .jira("jira-main")
+        .faults(plan.clone())
+        .start()
+        .await?;
+    let report = restore_own_backup(&h)?;
+    let before = plan.trail().len();
+    h.core().after_restore(&report).await?;
+    let after: Vec<String> = plan
+        .trail()
+        .get(before..)
+        .map(<[String]>::to_vec)
+        .unwrap_or_default();
+    assert_eq!(
+        after.first().map(String::as_str),
+        Some("reconcile_config_file")
+    );
+    assert_eq!(
+        after
+            .iter()
+            .filter(|t| *t == "reconcile_config_file")
+            .count(),
+        1
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

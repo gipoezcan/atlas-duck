@@ -47,8 +47,9 @@ pub(crate) const CHANNEL_BOUND: usize = 64;
 /// bookkeeping or confirmation (C.3, §8.3): chain start, `prune_log`, segment boundary,
 /// incidents and acks, migrations, key recovery/rotation (a DEK in the same transaction),
 /// clock episodes, the legal hold (Rust-drawn confirmation, §8.8), backup and export receipts.
-/// `append` refuses them. `CONFIG_CHANGED` stays appendable by `core`, except with a policy key (`settings.rs`),
-/// and `CREDENTIAL_CHANGED` except with `change: recovery_passphrase` (`passphrase.rs`).
+/// `append` refuses them. `CONFIG_CHANGED` stays appendable by `core`, except with a policy key (`settings.rs`)
+/// or the key `restore_backup` (`restore.rs`), and `CREDENTIAL_CHANGED` except with `change:
+/// recovery_passphrase` (`passphrase.rs`).
 const STORE_OWNED: [EventType; 12] = [
     EventType::GENESIS,
     EventType::PRUNE,
@@ -181,6 +182,16 @@ impl PreparedEvent {
         {
             return Err(AuditError::Invalid(
                 "policy settings change through apply_setting and reconcile_config_file only",
+            ));
+        }
+        // Store-owned for this key only (PD-168): only a completed restore records its
+        // confirmations.
+        if ev.event_type == EventType::CONFIG_CHANGED
+            && ev.payload.get("key").and_then(Value::as_str)
+                == Some(crate::restore::RESTORE_BACKUP_KEY)
+        {
+            return Err(AuditError::Invalid(
+                "the restore confirmation is recorded by the restore only",
             ));
         }
         // Store-owned for this change only (PD-169): logged with the `recovery` row it records.

@@ -72,11 +72,12 @@ pub const EVENT_AUDIT_JOB: &str = "audit_job";
 /// record (an acknowledgement, an export, a backup), or "Verify now" found an incident. No payload.
 pub const EVENT_AUDIT_CHANGED: &str = "audit_changed";
 
-/// `audit_job`'s `job` (`export|backup`; `restore` is Task 13's).
+/// `audit_job`'s `job` (`export|backup|restore`).
 pub fn audit_job_name(kind: crate::serve::AuditJobKind) -> &'static str {
     match kind {
         crate::serve::AuditJobKind::Export => "export",
         crate::serve::AuditJobKind::Backup => "backup",
+        crate::serve::AuditJobKind::Restore => "restore",
     }
 }
 
@@ -351,6 +352,7 @@ mod tests {
         emit_audit_job(&out, AuditJobKind::Export, "started", None);
         emit_audit_job(&out, AuditJobKind::Export, "progress", Some((10, 40)));
         emit_audit_job(&out, AuditJobKind::Backup, "done", None);
+        emit_audit_job(&out, AuditJobKind::Restore, "started", None);
         emit_audit_changed(&out);
         let got = out.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(
@@ -367,6 +369,10 @@ mod tests {
                 (
                     "audit_job".to_owned(),
                     json!({"job": "backup", "phase": "done"})
+                ),
+                (
+                    "audit_job".to_owned(),
+                    json!({"job": "restore", "phase": "started"})
                 ),
                 ("audit_changed".to_owned(), Value::Null),
             ]

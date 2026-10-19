@@ -25,9 +25,9 @@ use atlas_duck_app_lib::commands::running::KillAnswer;
 use atlas_duck_app_lib::commands::settings::{
     CliInstallAnswer, ConfinementDto, ExtraLayerDto, OUTCOME_ALREADY_INSTALLED,
     OUTCOME_ALREADY_ON_PATH, OUTCOME_INSTALLED, OUTCOME_INSTALLED_LOCAL_BIN, OUTCOME_REMOVED,
-    RetestOutcome, SettingsGet,
+    RestoreCancelDto, RestoreDoneDto, RetestOutcome, SettingsGet,
 };
-use atlas_duck_app_lib::commands::{AuditReadFailure, CommandError, ExportFailure};
+use atlas_duck_app_lib::commands::{AuditReadFailure, CommandError, ExportFailure, RestoreFailure};
 use atlas_duck_app_lib::credential::{PatTarget, Purpose};
 use atlas_duck_app_lib::removal::{
     BackupAnswer, Choice, FinishAnswer, ItemDto, RemovalDto, RemovalError,
@@ -717,6 +717,15 @@ fn command_errors() -> Vec<CommandError> {
         CommandError::Backup,
         CommandError::Audit(AuditReadFailure::Unreadable { seq: 17 }),
         CommandError::Audit(AuditReadFailure::Failed),
+        // M10 T13 (PD-168): a refused or failed restore, by kind.
+        CommandError::Restore(RestoreFailure::WrongPassphrase),
+        CommandError::Restore(RestoreFailure::NotABackup),
+        CommandError::Restore(RestoreFailure::Newer),
+        CommandError::Restore(RestoreFailure::Broken),
+        CommandError::Restore(RestoreFailure::AnchorDirMismatch),
+        CommandError::Restore(RestoreFailure::CommittedIncomplete),
+        CommandError::Restore(RestoreFailure::Keychain),
+        CommandError::Restore(RestoreFailure::Failed),
         CommandError::Internal,
     ]
 }
@@ -905,7 +914,7 @@ fn export_cancels() -> Vec<ExportCancelDto> {
 
 /// The `audit_job` event payloads (Δ-M10-3): every phase of an export, and a backup's.
 fn audit_jobs() -> Vec<Value> {
-    use atlas_duck_app_lib::serve::AuditJobKind::{Backup, Export};
+    use atlas_duck_app_lib::serve::AuditJobKind::{Backup, Export, Restore};
     let mut all: Vec<Value> = [
         (Export, "started", None),
         (Export, "progress", Some((10_000, 25_000))),
@@ -915,6 +924,11 @@ fn audit_jobs() -> Vec<Value> {
         (Backup, "started", None),
         (Backup, "done", None),
         (Backup, "failed", None),
+        // M10 T13: a restore is indeterminate too.
+        (Restore, "started", None),
+        (Restore, "done", None),
+        (Restore, "failed", None),
+        (Restore, "cancelled", None),
     ]
     .into_iter()
     .map(|(job, phase, rows)| audit_job_payload(job, phase, rows))
@@ -1123,6 +1137,8 @@ fn submit_outcomes() -> Vec<SubmitOutcome> {
         SubmitOutcome::Failed(SubmitFailure::class("wrong_passphrase")),
         SubmitOutcome::Failed(SubmitFailure::class("passphrase_mismatch")),
         SubmitOutcome::Failed(SubmitFailure::class(CLASS_CONTEXT_CHANGED)),
+        // M10 T13: "Restore a backup instead" on a locked store whose records cannot be read.
+        SubmitOutcome::Failed(SubmitFailure::class("archive_first")),
     ]
 }
 
@@ -1490,6 +1506,32 @@ fn removal_states() -> Vec<RemovalDto> {
     ]
 }
 
+/// `restore_begin` (M10 T13): a restore that gave up records, and one that gave up none.
+fn restore_dones() -> Vec<RestoreDoneDto> {
+    vec![
+        RestoreDoneDto {
+            restore_seq: 51,
+            records_lost: 22,
+            tokens_deleted: 2,
+            offer_passphrase_change: true,
+        },
+        RestoreDoneDto {
+            restore_seq: 9,
+            records_lost: 0,
+            tokens_deleted: 0,
+            offer_passphrase_change: true,
+        },
+    ]
+}
+
+/// `restore_cancel` (M10 T13).
+fn restore_cancels() -> Vec<RestoreCancelDto> {
+    vec![
+        RestoreCancelDto { cancelled: true },
+        RestoreCancelDto { cancelled: false },
+    ]
+}
+
 fn removal_backup_answers() -> Vec<BackupAnswer> {
     vec![BackupAnswer { saved: true }, BackupAnswer { saved: false }]
 }
@@ -1609,6 +1651,8 @@ fn all() -> Result<Vec<(&'static str, Value)>, serde_json::Error> {
         ("removal_backup_answer", value(&removal_backup_answers())?),
         ("removal_finish_answer", value(&removal_finish_answers())?),
         ("removal_state", value(&removal_states())?),
+        ("restore_cancel", value(&restore_cancels())?),
+        ("restore_done", value(&restore_dones())?),
         ("retest_outcome", value(&retest_outcomes())?),
         ("retry_started", value(&retry_started())?),
         ("running_script", value(&running_scripts())?),

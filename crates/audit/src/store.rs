@@ -1699,6 +1699,16 @@ impl Store {
         Ok(())
     }
 
+    /// `restore_from_source`'s confirmation record (PD-168) once its restore completed; best
+    /// effort (the restore is complete whatever this append does). The seq, or `None`.
+    pub(crate) fn log_restore_confirmations(
+        &self,
+        c: &crate::restore::RestoreConfirmations,
+    ) -> Option<u64> {
+        let p = crate::restore::confirmation_event(c).ok()?;
+        self.send_append(vec![p]).ok()?.first().map(|c| c.seq)
+    }
+
     /// Restore-as-continuation (C.3, §8.11) from `source`: a backup bundle directory (with
     /// `manifest.json`) or a single DB file (an `archived/` store), with the backup's recovery
     /// passphrase. Runs on the writer, so no append interleaves. The live store is replaced by
@@ -1708,7 +1718,10 @@ impl Store {
     /// on. A snapshot of this store's chain behind this install's head anchor (or the live
     /// head) is a same-machine rollback and needs `confirm_rollback`
     /// (`RollbackNeedsConfirmation { records_lost }` otherwise, nothing changed). The §10.3
-    /// "restore backup" confirmation is the caller's.
+    /// "restore backup" confirmation is the caller's dialog; its proof `restore_confirmed` and
+    /// `confirm_rollback` are recorded once the restore completed, as `CONFIG_CHANGED {source:
+    /// app, key: restore_backup, dialog_text_sha256, rollback_dialog_text_sha256?}` on the
+    /// restored store (PD-168; `RestoreReport::confirmation_seq`, `None` if that append failed).
     ///
     /// `Err(Restore(CommittedIncomplete { restore_seq, .. }))`: the restore committed but a
     /// later step (PAT deletion, KEK re-seal, the writer's start over) failed; this handle is
@@ -1725,11 +1738,13 @@ impl Store {
         &self,
         source: RustChosenPath,
         passphrase: &SecretString,
+        restore_confirmed: Confirmed,
         confirm_rollback: Option<Confirmed>,
     ) -> Result<RestoreReport, AuditError> {
         let req = RestoreRequest::new(
             &source,
             passphrase,
+            restore_confirmed,
             confirm_rollback,
             self.inner.keys.clone(),
             self.inner.data_dir.clone(),

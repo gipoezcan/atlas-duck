@@ -40,5 +40,10 @@
     "failed": {
       "class": "context_changed"
     }
+  },
+  {
+    "failed": {
+      "class": "archive_first"
+    }
   }
 ]

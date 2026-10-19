@@ -1318,6 +1318,7 @@ fn restored_store() -> (Store, Fixture, tempfile::TempDir, u64, Value) {
         .restore(
             chosen(&bundle.bundle_dir),
             &SecretString::from(PASSPHRASE.to_string()),
+            confirmed(),
             Some(confirmed()),
         )
         .expect("restore");
@@ -1424,6 +1425,7 @@ fn source_chain_file_naming_an_export_row_is_a_fork() {
         .restore(
             chosen(&bundle.bundle_dir),
             &SecretString::from(PASSPHRASE.to_string()),
+            confirmed(),
             Some(confirmed()),
         )
         .expect("restore");

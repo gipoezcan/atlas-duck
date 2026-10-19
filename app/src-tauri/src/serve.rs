@@ -17,9 +17,10 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use atlas_duck_audit::lock::InstanceLock;
+use atlas_duck_audit::types::RustChosenPath;
 use atlas_duck_audit::{
     ArchivedDb, Confirmed, DB_FILE, EntryName, FirstRunInput, KeyStore, KeyStoreError,
-    KeyringLocality, LockedReason, OpenConfig, OpenError, OsKeyStore, RecoveryOffer,
+    KeyringLocality, LockedReason, OpenConfig, OpenError, OsKeyStore, RecoveryOffer, RestoreReport,
     StartupOutcome, Store, SystemClock, keychain_retry_schedule, new_ids, read_store_install_id,
 };
 use atlas_duck_core::{
@@ -401,17 +402,21 @@ pub struct ServeState {
     audit_job: Mutex<Option<AuditJob>>,
 }
 
-/// The kind of an Audit-window job (`audit_job {job}`, PD-181).
+/// The kind of an Audit-window job (`audit_job {job}`, PD-181). A Settings restore (M10 T13) is one
+/// too: one long job at a time, and the quit path treats it the same way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditJobKind {
     Export,
     Backup,
+    Restore,
 }
 
-/// One running Audit-window job: its blocking task and the cancel flag its `ExportControl` reads.
+/// One running Audit-window job: its blocking task, the cancel flag its `ExportControl` reads and,
+/// for a restore, its store call.
 struct AuditJob {
     kind: AuditJobKind,
     cancel: Arc<AtomicBool>,
+    call: Option<Arc<StoreCall>>,
     task: JoinHandle<()>,
 }
 
@@ -422,6 +427,59 @@ pub enum JobRefused {
     Busy,
     /// The quit path began.
     ShuttingDown,
+}
+
+/// A restore job's store call (PD-181, M10 T13): `restore_cancel` and the quit path end the flow
+/// only before it; once the call began it runs to its end (`Store::restore` has no cancel). One
+/// compare-and-swap decides which came first, so a cancel answered `cancelled: true` never races a
+/// call that starts anyway.
+#[derive(Debug, Default)]
+pub struct StoreCall(std::sync::atomic::AtomicU8);
+
+const CALL_OPEN: u8 = 0;
+const CALL_CANCELLED: u8 = 1;
+const CALL_STARTED: u8 = 2;
+
+impl StoreCall {
+    /// The flow is about to call the store: `false` when it was cancelled first (it then calls
+    /// nothing).
+    pub fn begin(&self) -> bool {
+        self.0
+            .compare_exchange(CALL_OPEN, CALL_STARTED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Cancels the flow before its store call: `false` once the call began.
+    pub fn cancel(&self) -> bool {
+        match self.0.compare_exchange(
+            CALL_OPEN,
+            CALL_CANCELLED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => true,
+            Err(now) => now == CALL_CANCELLED,
+        }
+    }
+
+    /// The flow was cancelled before its store call.
+    pub fn cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == CALL_CANCELLED
+    }
+
+    /// The store call began.
+    pub fn started(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == CALL_STARTED
+    }
+}
+
+/// What `restore_cancel` did (PD-181).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreCancel {
+    /// The restore ended before its store call (or no restore runs: `false`).
+    Cancelled(bool),
+    /// The store call runs: it cannot be cancelled.
+    Running,
 }
 
 /// The store opener and the core starter of this start (M6 T20): the data dir, `instance.lock`,
@@ -482,6 +540,38 @@ impl ServeState {
         T: Send + 'static,
         F: FnOnce(Arc<AtomicBool>) -> T + Send + 'static,
     {
+        self.spawn_job(kind, None, move |cancel, _| work(cancel))
+    }
+
+    /// A Settings restore as the one audit job (M10 T13, PD-181), like [`ServeState::spawn_audit_job`]:
+    /// `work` also gets the job's [`StoreCall`], which `restore_cancel` and the quit path cancel
+    /// before the store call begins.
+    pub fn spawn_restore_job<T, F>(
+        &self,
+        work: F,
+    ) -> Result<tokio::sync::oneshot::Receiver<T>, JobRefused>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<AtomicBool>, Arc<StoreCall>) -> T + Send + 'static,
+    {
+        let call = Arc::new(StoreCall::default());
+        self.spawn_job(
+            AuditJobKind::Restore,
+            Some(call.clone()),
+            move |cancel, _| work(cancel, call),
+        )
+    }
+
+    fn spawn_job<T, F>(
+        &self,
+        kind: AuditJobKind,
+        call: Option<Arc<StoreCall>>,
+        work: F,
+    ) -> Result<tokio::sync::oneshot::Receiver<T>, JobRefused>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<AtomicBool>, Option<Arc<StoreCall>>) -> T + Send + 'static,
+    {
         let frozen = lock(&self.frozen);
         if !self.swaps_allowed(*frozen) {
             return Err(JobRefused::ShuttingDown);
@@ -492,11 +582,17 @@ impl ServeState {
         }
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = cancel.clone();
+        let job_call = call.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let task = tokio::task::spawn_blocking(move || {
-            let _ = tx.send(work(flag));
+            let _ = tx.send(work(flag, job_call));
         });
-        *slot = Some(AuditJob { kind, cancel, task });
+        *slot = Some(AuditJob {
+            kind,
+            cancel,
+            call,
+            task,
+        });
         drop(slot);
         drop(frozen);
         Ok(rx)
@@ -515,11 +611,38 @@ impl ServeState {
         }
     }
 
+    /// `restore_cancel` (PD-181, M10 T13): a running Settings restore ends before its store call
+    /// (`Cancelled(true)`: no store call, no `RESTORE`); once the call began it is `Running`.
+    /// `Cancelled(false)` when no restore runs.
+    pub fn cancel_restore(&self) -> RestoreCancel {
+        let slot = lock(&self.audit_job);
+        match slot.as_ref() {
+            Some(AuditJob {
+                kind: AuditJobKind::Restore,
+                cancel,
+                call: Some(call),
+                task,
+            }) if !task.is_finished() => {
+                if call.cancel() {
+                    cancel.store(true, Ordering::SeqCst);
+                    RestoreCancel::Cancelled(true)
+                } else {
+                    RestoreCancel::Running
+                }
+            }
+            _ => RestoreCancel::Cancelled(false),
+        }
+    }
+
     /// The quit path's part (PD-181): the running job's cancel flag is set (an export ends before
-    /// its next row and removes its partial directory) and its task is handed over to be waited
-    /// for. Called after the freeze, so no job starts afterwards.
+    /// its next row and removes its partial directory; a restore that has not called the store
+    /// yet calls nothing) and its task is handed over to be waited for. Called after the freeze,
+    /// so no job starts afterwards.
     fn stop_audit_job(&self) -> Option<JoinHandle<()>> {
         let job = lock(&self.audit_job).take()?;
+        if let Some(call) = &job.call {
+            call.cancel();
+        }
         job.cancel.store(true, Ordering::SeqCst);
         Some(job.task)
     }
@@ -731,6 +854,15 @@ pub enum UnlockFailure {
     Invalid,
     /// The store was recovered but the core did not start (the store was shut down again).
     CoreStart,
+    /// M10 T13 (restore from a backup): the chosen file or folder is not an atlas-duck backup
+    /// (no bundle, or its files do not match its manifest). Nothing changed.
+    NotABackup,
+    /// M10 T13: the restore committed but did not complete; the next start completes it (§8.7,
+    /// plan text "Restore will be completed at the next start").
+    CommittedIncomplete,
+    /// M10 T13 (M2 T16 M-4): the locked store's own records cannot be read, so a restore cannot
+    /// move it aside; "Archive old DB and start fresh" comes first. No dialog was shown.
+    ArchiveFirst,
 }
 
 impl UnlockFailure {
@@ -748,11 +880,23 @@ impl UnlockFailure {
             UnlockFailure::Io => "io",
             UnlockFailure::Invalid => "invalid",
             UnlockFailure::CoreStart => "core_start",
+            UnlockFailure::NotABackup => "not_a_backup",
+            UnlockFailure::CommittedIncomplete => "committed_incomplete",
+            UnlockFailure::ArchiveFirst => "archive_first",
         }
     }
 
-    fn of(e: &OpenError) -> UnlockFailure {
+    pub(crate) fn of(e: &OpenError) -> UnlockFailure {
+        use atlas_duck_audit::RestoreError;
         match e {
+            OpenError::Restore(RestoreError::WrongPassphrase) => UnlockFailure::WrongPassphrase,
+            OpenError::Restore(RestoreError::NotABundle | RestoreError::ManifestMismatch) => {
+                UnlockFailure::NotABackup
+            }
+            OpenError::Restore(RestoreError::SnapshotNewer { .. }) => UnlockFailure::StoreNewer,
+            OpenError::Restore(RestoreError::CommittedIncomplete { .. }) => {
+                UnlockFailure::CommittedIncomplete
+            }
             OpenError::WrongPassphrase => UnlockFailure::WrongPassphrase,
             OpenError::KeyStore(KeyStoreError::NotLocal) => UnlockFailure::KeyringNotLocal,
             OpenError::KeyStore(_) => UnlockFailure::KeychainUnavailable,
@@ -927,8 +1071,88 @@ pub async fn archive_and_start_fresh(state: &Arc<ServeState>) -> Result<Archived
     }
 }
 
-/// The audit store's proof of a native confirmation: the SHA-256 of the dialog text.
-fn confirmed_by(text: &str) -> Confirmed {
+/// The wait for the backup's passphrase (the credential window set in place to `restore_backup`;
+/// `None` when it goes without a submit, or when the argument, the stop test, answers true).
+pub type AwaitPassphrase = Box<dyn FnOnce(&dyn Fn() -> bool) -> Option<SecretString> + Send>;
+
+/// "Restore a backup instead" (M10 T13, PD-168, §8.11, §10.3): only in `keychain_lost` with no core
+/// (one at a time with unlocks and archives). On a blocking thread, `restore_flow::
+/// restore_without_store` (an unreadable locked store first: `archive_first`, M2 T16 M-4; then the
+/// native "Restore backup" confirmation, `pick`, `passphrase` and `restore_from_source` under this
+/// install's id with the locked store moved aside), then `Core::start` with the report's
+/// `pats_deleted` (`APP_START` logs them, PD-28, and the core start reconciles the config file) and
+/// the cell swapped to the core as an unlock does. The quit path awaits it (bounded); a freeze ends
+/// the wait for the passphrase, and a core started after the freeze is shut down again.
+pub async fn restore_from_backup(
+    state: &Arc<ServeState>,
+    pick: Box<dyn FnOnce() -> Option<RustChosenPath> + Send>,
+    passphrase: AwaitPassphrase,
+) -> Result<(), UnlockFailure> {
+    let failed = |f: UnlockFailure| {
+        f.log();
+        Err(f)
+    };
+    let Some(restart) = state.restart.get() else {
+        return failed(UnlockFailure::NotLocked);
+    };
+    let Ok(one) = state.unlocking.clone().try_lock_owned() else {
+        return failed(UnlockFailure::Busy);
+    };
+    if state.keychain_lost().is_none() {
+        return failed(UnlockFailure::NotLocked);
+    }
+    let (st, opener, starter) = (
+        state.clone(),
+        restart.opener.clone(),
+        restart.starter.clone(),
+    );
+    let done = state.spawn_unlock_work(async move {
+        let _one_restore_at_a_time = one;
+        let (frozen, confirmer) = (st.clone(), starter.confirmer.clone());
+        let restored = run_blocking_unlock(move || {
+            let stop = || *lock(&frozen.frozen);
+            opener.restore_blocking(&*confirmer, pick, passphrase, &stop)
+        })
+        .await;
+        let (store, keys, report) = restored?;
+        if *lock(&st.frozen) {
+            shutdown_store(store).await;
+            return Err(UnlockFailure::ShuttingDown);
+        }
+        let core = match starter
+            .start(store.clone(), keys, report.pats_deleted)
+            .await
+        {
+            Ok(core) => core,
+            Err(f) => {
+                f.log();
+                // As after an unlock: the restore took (the keychain holds its KEK), the store
+                // was shut down; the next "Retry keychain" opens it.
+                st.install_gate(GateState::Locked(LockedReason::KeychainUnavailable));
+                return Err(UnlockFailure::CoreStart);
+            }
+        };
+        if !st.install_core(core.clone(), store.clone()) {
+            core.shutdown(ShutdownReason::Quit).await;
+            shutdown_store(store).await;
+            return Err(UnlockFailure::ShuttingDown);
+        }
+        tracing::info!(event = LOG_EVENT_SERVING, serve_state = "core");
+        Ok(())
+    });
+    let result = match done {
+        Ok(rx) => rx.await.unwrap_or(Err(UnlockFailure::Io)),
+        Err(f) => Err(f),
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(f) => failed(f),
+    }
+}
+
+/// The audit store's proof of a native confirmation: the SHA-256 of the dialog text. Every caller
+/// draws that dialog first and calls this on its Ok path (`ci/check-dialog-proofs.mjs` rule 3).
+pub(crate) fn confirmed_by(text: &str) -> Confirmed {
     let hex = atlas_duck_core::payloads::sha256_hex(text.as_bytes());
     let mut digest = [0u8; 32];
     for (i, b) in digest.iter_mut().enumerate() {
@@ -1261,7 +1485,12 @@ where
     // set, and removes its partial directory; waiting for it here, before the core's shutdown,
     // lets that cleanup run and keeps `APP_STOP` after any record the job appends. A backup sees
     // the flag only once its folder dialog was answered (it then backs up nothing); once
-    // `Store::backup` runs it is waited for the same way. Bounded by `STORE_WAIT`.
+    // `Store::backup` runs it is waited for the same way. Bounded by `STORE_WAIT`. A Settings
+    // restore (M10 T13) that has not called the store yet calls nothing (its wait for the
+    // passphrase ends at once); once `Store::restore` runs it is waited for the same way. If it
+    // still runs when the process exits: before its commit rename the live store is unchanged
+    // (the staging file goes at the next start), after it the next start completes the restore
+    // (§8.7 interrupted restore, or "Finish restore" when the KEK was not re-sealed yet).
     let job = state.stop_audit_job();
     if let Some(job) = job {
         bounded(job, STORE_WAIT, deadline, "audit_job").await;
@@ -1759,6 +1988,38 @@ impl Opener {
         unlocked
             .map(|(store, pats_deleted)| (store, keys, pats_deleted))
             .map_err(|e| UnlockFailure::of(&e))
+    }
+
+    /// The blocking half of [`restore_from_backup`]: the keystore of the install id of the first
+    /// attempt (the restored store keeps this install's id, §8.11 step 3), a fresh config per
+    /// store call, then `restore_flow::restore_without_store`. The running store, that keystore
+    /// and the report.
+    fn restore_blocking(
+        &self,
+        confirmer: &dyn NativeConfirmer,
+        pick: Box<dyn FnOnce() -> Option<RustChosenPath> + Send>,
+        passphrase: AwaitPassphrase,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<(Store, Arc<dyn KeyStore>, RestoreReport), UnlockFailure> {
+        let Some(id) = self.install_id.get() else {
+            return Err(UnlockFailure::Integrity);
+        };
+        let keys = self
+            .keys
+            .keys(id)
+            .map_err(|e| match locked_reason_for(&e) {
+                LockedReason::KeyringNotLocal => UnlockFailure::KeyringNotLocal,
+                _ => UnlockFailure::KeychainUnavailable,
+            })?;
+        let config = || {
+            let mut cfg = OpenConfig::new(Arc::new(SystemClock::new()), keys.clone());
+            cfg.pinned_install_id = self.pinned_install_id.clone();
+            cfg
+        };
+        let (store, report) = crate::restore_flow::restore_without_store(
+            &self.data, &self.lock, &config, confirmer, pick, passphrase, stop,
+        )?;
+        Ok((store, keys, report))
     }
 
     /// The blocking half of [`create_first_store`] (see there for the order).
@@ -2576,7 +2837,7 @@ mod tests {
     // ---- the Audit window's job (M10 T12, PD-181) ----
 
     use crate::commands::CommandError;
-    use crate::commands::audit::tests::{Answers, Events, Rig, chosen, count, entries, rig};
+    use crate::commands::audit::tests::{Answers, Events, PASS, Rig, chosen, count, entries, rig};
     use crate::commands::audit::{ExportDoneDto, run_export};
 
     /// A serving state (a gate, no endpoint) that holds `rig`'s store, as the quit path finds it.
@@ -2761,6 +3022,241 @@ mod tests {
         };
         assert_eq!(count(&store, atlas_duck_audit::EventType::EXPORT)?, 0);
         store.shutdown();
+        Ok(())
+    }
+
+    /// PD-181 (`restore_cancel`): a Settings restore ends before its store call (`Cancelled(true)`,
+    /// the job sees its cancel flag and calls nothing); once the call began it is `Running` and the
+    /// job is not cancelled. With no restore running nothing is cancelled, and `export_cancel`
+    /// leaves a restore alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_cancel_after_start_is_busy() -> Result<(), Box<dyn std::error::Error>> {
+        let state = gate_serving(GateState::FirstRun);
+        assert_eq!(state.cancel_restore(), RestoreCancel::Cancelled(false));
+        let (began_tx, began) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go) = std::sync::mpsc::channel::<()>();
+        let running = state
+            .spawn_restore_job(move |cancel, call| {
+                let begun = call.begin();
+                let _ = began_tx.send(());
+                let _ = go.recv_timeout(Duration::from_secs(30));
+                (begun, cancel.load(Ordering::SeqCst))
+            })
+            .map_err(|e| format!("{e:?}"))?;
+        began.recv_timeout(Duration::from_secs(30))?;
+        assert_eq!(state.cancel_restore(), RestoreCancel::Running);
+        assert!(!state.cancel_export(), "not an export");
+        go_tx.send(())?;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(30), running).await??,
+            (true, false),
+            "(the store call began, the job was cancelled)"
+        );
+
+        // Before the store call: the cancel wins and the call never begins.
+        let until = Instant::now() + Duration::from_secs(30);
+        let (waiting_tx, waiting) = std::sync::mpsc::channel::<()>();
+        let waiting_job = loop {
+            let tx = waiting_tx.clone();
+            match state.spawn_restore_job(move |cancel, call| {
+                let _ = tx.send(());
+                let until = std::time::Instant::now() + Duration::from_secs(30);
+                while !call.cancelled() && std::time::Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                (call.begin(), cancel.load(Ordering::SeqCst))
+            }) {
+                Err(JobRefused::Busy) if Instant::now() < until => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                other => break other.map_err(|e| format!("{e:?}"))?,
+            }
+        };
+        waiting.recv_timeout(Duration::from_secs(30))?;
+        assert_eq!(state.cancel_restore(), RestoreCancel::Cancelled(true));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(30), waiting_job).await??,
+            (false, true)
+        );
+        Ok(())
+    }
+
+    /// The answer of a paused restore job, a receiver that hears when it reached its pause, and a
+    /// flag the job sets as its last step.
+    type PausedRestore = (
+        tokio::sync::oneshot::Receiver<Result<RestoreReport, CommandError>>,
+        std::sync::mpsc::Receiver<()>,
+        Arc<AtomicBool>,
+    );
+
+    /// A Settings restore of the bundle `source` into `rig`'s store as the audit job (answers:
+    /// "Restore backup", then the rollback when the bundle is `rig`'s own), held at `point`
+    /// (bounded, 30 s) until the job's cancel flag is set, then failing there as the process
+    /// ending at that point would.
+    fn paused_restore(
+        state: &ServeState,
+        rig: &Rig,
+        source: std::path::PathBuf,
+        point: atlas_duck_audit::testing::FaultPoint,
+    ) -> Result<PausedRestore, Box<dyn std::error::Error>> {
+        let flag: Arc<OnceLock<Arc<AtomicBool>>> = Arc::new(OnceLock::new());
+        let (reached_tx, reached) = std::sync::mpsc::channel();
+        let first = Arc::new(AtomicBool::new(true));
+        {
+            let flag = flag.clone();
+            rig.faults.on_hit(point, move || {
+                if !first.swap(false, Ordering::SeqCst) {
+                    return;
+                }
+                let _ = reached_tx.send(());
+                let until = std::time::Instant::now() + Duration::from_secs(30);
+                while std::time::Instant::now() < until
+                    && !flag.get().is_some_and(|c| c.load(Ordering::SeqCst))
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                // A quit path that does not wait finds the job still running.
+                std::thread::sleep(Duration::from_millis(50));
+            });
+        }
+        rig.faults.fail(point, 1);
+        let store = rig.store.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let ended = finished.clone();
+        let rx = state
+            .spawn_restore_job(move |cancel, call| {
+                let _ = flag.set(cancel.clone());
+                let answer = crate::restore_flow::run_live_restore(
+                    &store,
+                    &Answers::new(&[Confirm::Ok, Confirm::Ok]),
+                    || Some(chosen(&source)),
+                    |_| Some(SecretString::from(PASS.to_owned())),
+                    &call,
+                    &cancel,
+                    &Events::default(),
+                );
+                ended.store(true, Ordering::SeqCst);
+                answer
+            })
+            .map_err(|e| format!("{e:?}"))?;
+        Ok((rx, reached, finished))
+    }
+
+    /// PD-181 (§8.7, §8.11 step 5; T13 Step 0): Quit while a Settings restore runs its store call
+    /// waits for it (the job has ended when the core stage starts), then the process ends. Where
+    /// the process ended decides the next start: before the commit rename the live store is as it
+    /// was (no `RESTORE`, no staging file); after the KEK re-seal (or, for a backup of this store,
+    /// whose KEK the keychain already holds, right after the commit) `open` completes the restore
+    /// (interrupted restore reconciled, no incident); between the commit and the re-seal of
+    /// another store's backup it offers "Finish restore" (the backup's passphrase), which
+    /// completes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quit_during_restore_completes_or_reconciles() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use atlas_duck_audit::testing::FaultPoint;
+        use atlas_duck_audit::{EventType, FindingKind};
+
+        for point in [
+            FaultPoint::RestoreBarrierHeld,
+            FaultPoint::AfterKekReseal,
+            FaultPoint::AfterRestoreCommit,
+        ] {
+            let rig = rig(3)?;
+            // Another store's backup (another KEK) where the re-seal matters.
+            let other = crate::commands::audit::tests::rig(2)?;
+            let source = if point == FaultPoint::AfterRestoreCommit {
+                other.store.backup(chosen(&other.out))?.bundle_dir
+            } else {
+                rig.store.backup(chosen(&rig.out))?.bundle_dir
+            };
+            let state = serving_store(&rig);
+            let before = rig.store.head();
+            let (rx, reached, finished) = paused_restore(&state, &rig, source, point)?;
+            reached.recv_timeout(Duration::from_secs(30))?;
+
+            let at_core_stage: OnceLock<bool> = OnceLock::new();
+            let started = Instant::now();
+            let outcome = shutdown_with(&state, started + Duration::from_secs(60), |_| {
+                let _ = at_core_stage.set(finished.load(Ordering::SeqCst));
+                Some(std::future::ready(ShutdownReport::default()))
+            })
+            .await;
+            assert_eq!(at_core_stage.get(), Some(&true), "{point:?}: job ended");
+            assert_eq!(outcome.report, Some(ShutdownReport::default()));
+            let answer = tokio::time::timeout(Duration::from_secs(30), rx).await??;
+            assert!(lock(&state.store).is_none(), "store shut down");
+            assert!(
+                !rig.data.path().join("audit.db.restoring").exists(),
+                "{point:?}: no staging file"
+            );
+
+            let cfg =
+                crate::commands::audit::tests::config(&rig.ring, &rig.install_id, &rig.faults);
+            match point {
+                FaultPoint::RestoreBarrierHeld => {
+                    assert!(
+                        matches!(answer, Err(CommandError::Restore(_))),
+                        "{answer:?}"
+                    );
+                    let StartupOutcome::Ready { store, .. } =
+                        atlas_duck_audit::open(&rig.data, &rig.lock, cfg)?
+                    else {
+                        return Err("the store did not open again".into());
+                    };
+                    assert_eq!(count(&store, EventType::RESTORE)?, 0);
+                    assert_eq!(store.head().2, before.2, "the same chain");
+                    assert!(store.open_incidents().is_empty());
+                    store.shutdown();
+                }
+                FaultPoint::AfterKekReseal => {
+                    assert_eq!(
+                        answer,
+                        Err(CommandError::Restore(
+                            crate::commands::RestoreFailure::CommittedIncomplete
+                        ))
+                    );
+                    let StartupOutcome::Ready { store, verify, .. } =
+                        atlas_duck_audit::open(&rig.data, &rig.lock, cfg)?
+                    else {
+                        return Err("the restore was not completed at the next start".into());
+                    };
+                    let kinds: Vec<FindingKind> = verify.findings.iter().map(|f| f.kind).collect();
+                    assert_eq!(kinds, [FindingKind::InterruptedRestoreReconciled]);
+                    assert_ne!(store.head().2, before.2, "the restored chain");
+                    assert_eq!(count(&store, EventType::RESTORE)?, 1);
+                    assert!(store.open_incidents().is_empty());
+                    store.shutdown();
+                }
+                _ => {
+                    assert_eq!(
+                        answer,
+                        Err(CommandError::Restore(
+                            crate::commands::RestoreFailure::CommittedIncomplete
+                        ))
+                    );
+                    match atlas_duck_audit::open(&rig.data, &rig.lock, cfg)? {
+                        StartupOutcome::Locked(LockedReason::KeychainLost {
+                            offer: RecoveryOffer::FinishRestore,
+                        }) => {}
+                        other => return Err(format!("expected Finish restore: {other:?}").into()),
+                    }
+                    let cfg = crate::commands::audit::tests::config(
+                        &rig.ring,
+                        &rig.install_id,
+                        &rig.faults,
+                    );
+                    let (store, _, _) = atlas_duck_audit::finish_restore(
+                        &rig.data,
+                        &rig.lock,
+                        cfg,
+                        &SecretString::from(PASS.to_owned()),
+                    )?;
+                    assert_ne!(store.head().2, before.2, "the restored chain");
+                    assert!(store.open_incidents().is_empty());
+                    store.shutdown();
+                }
+            }
+        }
         Ok(())
     }
 

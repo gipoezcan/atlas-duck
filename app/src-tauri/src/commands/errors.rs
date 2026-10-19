@@ -60,6 +60,9 @@ pub enum CommandError {
     /// "unreadable", "seq": n}}` for a record that does not decrypt or verify, `{"kind": "failed"}`
     /// otherwise. No error text.
     Audit(AuditReadFailure),
+    /// M10 T13 (PD-168): a restore was refused or failed. Nested like `Admin`: `{"kind":
+    /// "restore", "error": {"kind": "wrong_passphrase"}}`. No path, no text.
+    Restore(RestoreFailure),
     /// A blocking task died, or a state the command layer cannot explain.
     Internal,
 }
@@ -122,6 +125,53 @@ impl Serialize for ExportFailure {
     }
 }
 
+/// Why a restore did not complete (M10 T13, PD-168; `restore_flow::restore_failure`). Every kind
+/// but `committed_incomplete` means nothing changed and the restore can be tried again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreFailure {
+    /// The backup's recovery passphrase does not open it.
+    WrongPassphrase,
+    /// The chosen file or folder is not a backup (no bundle, or its files do not match its
+    /// manifest).
+    NotABackup,
+    /// The backup was written by a newer atlas-duck.
+    Newer,
+    /// The backup's chain or schema does not verify.
+    Broken,
+    /// The backup does not match the anchor directory's lines.
+    AnchorDirMismatch,
+    /// The restore committed but a later step failed: the store is closed and the next start
+    /// completes the restore (plan text "Restore will be completed at the next start").
+    CommittedIncomplete,
+    /// The keychain could not be read or written.
+    Keychain,
+    /// Anything else.
+    Failed,
+}
+
+impl RestoreFailure {
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::WrongPassphrase => "wrong_passphrase",
+            Self::NotABackup => "not_a_backup",
+            Self::Newer => "newer",
+            Self::Broken => "broken",
+            Self::AnchorDirMismatch => "anchor_dir_mismatch",
+            Self::CommittedIncomplete => "committed_incomplete",
+            Self::Keychain => "keychain",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl Serialize for RestoreFailure {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(Some(1))?;
+        m.serialize_entry("kind", self.kind())?;
+        m.end()
+    }
+}
+
 /// Why an Audit-window read failed (M10 T12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditReadFailure {
@@ -162,6 +212,7 @@ impl CommandError {
             Self::Export(_) => "export",
             Self::Backup => "backup",
             Self::Audit(_) => "audit",
+            Self::Restore(_) => "restore",
             Self::Internal => "internal",
         }
     }
@@ -189,6 +240,7 @@ impl Serialize for CommandError {
             Self::Removal(e) => m.serialize_entry("error", e)?,
             Self::Export(e) => m.serialize_entry("error", e)?,
             Self::Audit(e) => m.serialize_entry("error", e)?,
+            Self::Restore(e) => m.serialize_entry("error", e)?,
             Self::ReleaseBlocked => m.serialize_entry("text", RELEASE_BLOCKED_INTERNAL)?,
             Self::NotFound
             | Self::NotReady
@@ -379,5 +431,27 @@ mod tests {
             Some(json!({"kind": "audit", "error": {"kind": "failed"}}))
         );
         assert_eq!(leftover.to_string(), "export");
+    }
+
+    /// M10 T13 (PD-168): a refused or failed restore is one fixed kind, nested; no path, no text.
+    #[test]
+    fn restore_kinds_wire_shape() {
+        for (f, kind) in [
+            (RestoreFailure::WrongPassphrase, "wrong_passphrase"),
+            (RestoreFailure::NotABackup, "not_a_backup"),
+            (RestoreFailure::Newer, "newer"),
+            (RestoreFailure::Broken, "broken"),
+            (RestoreFailure::AnchorDirMismatch, "anchor_dir_mismatch"),
+            (RestoreFailure::CommittedIncomplete, "committed_incomplete"),
+            (RestoreFailure::Keychain, "keychain"),
+            (RestoreFailure::Failed, "failed"),
+        ] {
+            let e = CommandError::Restore(f);
+            assert_eq!(
+                serde_json::to_value(&e).ok(),
+                Some(json!({"kind": "restore", "error": {"kind": kind}}))
+            );
+            assert_eq!(e.to_string(), "restore");
+        }
     }
 }

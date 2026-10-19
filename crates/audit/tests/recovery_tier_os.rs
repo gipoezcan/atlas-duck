@@ -246,6 +246,7 @@ fn os_forget_install_with_keys_deletes_all_and_archive_still_restores_with_passp
         .restore(
             RustChosenPath::from_native_dialog(t.dir.path().join(&t.archived.file)),
             &pass(PASSPHRASE),
+            confirmed(),
             None,
         )
         .expect("restore the archive with its passphrase");

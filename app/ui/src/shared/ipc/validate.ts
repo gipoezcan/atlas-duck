@@ -47,6 +47,9 @@ import type {
   RemovalItem,
   RemovalState,
   RequestDetail,
+  RestoreCancelAnswer,
+  RestoreDone,
+  RestoreFailure,
   RetestOutcome,
   RunningScriptView,
   SettingsGet,
@@ -578,7 +581,7 @@ export const isExportCancelAnswer = (v: unknown): v is ExportCancelAnswer =>
 /** `audit_job`: row counts belong to `progress` alone (an export's); every other phase has none. */
 export const isAuditJobEvent = (v: unknown): v is AuditJobEvent => {
   if (!rec(v)) return false;
-  const base = { job: oneOf('export', 'backup'), phase: isStr };
+  const base = { job: oneOf('export', 'backup', 'restore'), phase: isStr };
   if (v.phase === 'progress') return v.job === 'export' && closed(v, { ...base, done: isNum, total: isNum });
   return oneOf('started', 'done', 'failed', 'cancelled')(v.phase) && closed(v, base);
 };
@@ -611,6 +614,28 @@ export const isAuditReadFailure = (v: unknown): v is AuditReadFailure => {
   return v.kind === 'failed' && closed(v, { kind: isStr });
 };
 
+/** `restore_begin` (M10 T13): counts only. */
+export const isRestoreDone = (v: unknown): v is RestoreDone =>
+  closed(v, { restore_seq: isNum, records_lost: isNum, tokens_deleted: isNum, offer_passphrase_change: isBool });
+
+export const isRestoreCancelAnswer = (v: unknown): v is RestoreCancelAnswer =>
+  closed(v, { cancelled: isBool });
+
+/** `restore`'s nested error: one of the fixed kinds, nothing else. */
+export const isRestoreFailure = (v: unknown): v is RestoreFailure =>
+  closed(v, {
+    kind: oneOf(
+      'wrong_passphrase',
+      'not_a_backup',
+      'newer',
+      'broken',
+      'anchor_dir_mismatch',
+      'committed_incomplete',
+      'keychain',
+      'failed',
+    ),
+  });
+
 /** Maps whatever a rejected invoke carried to a `CommandError`. */
 export function toCommandError(raw: unknown): CommandError {
   if (rec(raw) && isStr(raw.kind)) {
@@ -637,6 +662,9 @@ export function toCommandError(raw: unknown): CommandError {
         break;
       case 'audit':
         if (isAuditReadFailure(raw.error)) return { kind: 'audit', error: raw.error };
+        break;
+      case 'restore':
+        if (isRestoreFailure(raw.error)) return { kind: 'restore', error: raw.error };
         break;
       case 'release_blocked':
         if (isStr(raw.text)) return { kind: 'release_blocked', text: raw.text };

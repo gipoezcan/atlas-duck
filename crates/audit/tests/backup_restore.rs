@@ -528,6 +528,7 @@ fn restore_on(
         cfg,
         chosen(source),
         &pass(passphrase),
+        confirmed(),
         None,
     )
 }
@@ -710,7 +711,12 @@ fn store_restore_cross_machine_replaces_the_live_store() {
     let b_anchor = keychain_head(&fb.ring, &fb.install_id).expect("head anchor");
 
     let rep = b
-        .restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
+        .restore(
+            chosen(&bundle.bundle_dir),
+            &pass(PASSPHRASE),
+            confirmed(),
+            None,
+        )
         .expect("restore");
     // Live and restored instances lose their tokens.
     assert_eq!(
@@ -743,8 +749,10 @@ fn store_restore_cross_machine_replaces_the_live_store() {
     let archived = fb.dir.path().join(&replaced.file);
     assert_eq!(file_head(&archived), (b_seq, b_hash, b_chain.clone()));
 
-    // This handle now serves the restored store, with A's KEK.
-    assert_eq!(b.head().0, rep.restore_seq);
+    // This handle now serves the restored store, with A's KEK; its head is the confirmation
+    // record after `RESTORE` (PD-168).
+    assert_eq!(rep.confirmation_seq, Some(rep.restore_seq + 1));
+    assert_eq!(b.head().0, rep.restore_seq + 1);
     assert_eq!(b.head().2, rep.new_chain_id);
     b.read_payload(rep.restore_seq).expect("RESTORE decrypts");
     b.read_payload(12).expect("a record of A decrypts");
@@ -838,7 +846,12 @@ fn u16_cross_machine_restore_crash_between_reseal_and_anchor_reset() {
     let b_anchor = keychain_head(&fb.ring, &fb.install_id).expect("head anchor");
     faults.fail(FaultPoint::AfterKekReseal, 1);
     let e = b
-        .restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
+        .restore(
+            chosen(&bundle.bundle_dir),
+            &pass(PASSPHRASE),
+            confirmed(),
+            None,
+        )
         .expect_err("crash");
     assert_eq!(committed_incomplete(&e), Some(bundle.head_seq + 1), "{e:?}");
     drop(b);
@@ -930,7 +943,7 @@ fn u16_archived_db_restored_same_machine() {
     // Restore the archived store with its own passphrase; crash before the anchor reset.
     faults.fail(FaultPoint::AfterKekReseal, 1);
     assert!(
-        y.restore(chosen(&archived_path), &pass(PASSPHRASE), None)
+        y.restore(chosen(&archived_path), &pass(PASSPHRASE), confirmed(), None)
             .is_err()
     );
     drop(y);
@@ -978,8 +991,13 @@ fn finish_restore_after_crash_before_reseal() {
     let b_kek = raw_entry(&fb.ring, &fb.install_id, "kek").expect("kek");
     faults.fail(FaultPoint::AfterRestoreCommit, 1);
     assert!(
-        b.restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
-            .is_err()
+        b.restore(
+            chosen(&bundle.bundle_dir),
+            &pass(PASSPHRASE),
+            confirmed(),
+            None
+        )
+        .is_err()
     );
     drop(b);
     assert_eq!(
@@ -1137,7 +1155,12 @@ fn same_machine_rollback_needs_confirmation() {
     let files = db_files(fa.dir.path());
     let entries = keychain_entries(&fa.ring, &fa.install_id);
     let baseline = fa.ring.ops().len();
-    match a.restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None) {
+    match a.restore(
+        chosen(&bundle.bundle_dir),
+        &pass(PASSPHRASE),
+        confirmed(),
+        None,
+    ) {
         Err(AuditError::Restore(RestoreError::RollbackNeedsConfirmation { records_lost })) => {
             assert_eq!(records_lost, 21)
         }
@@ -1159,6 +1182,7 @@ fn same_machine_rollback_needs_confirmation() {
         .restore(
             chosen(&bundle.bundle_dir),
             &pass(PASSPHRASE),
+            confirmed(),
             Some(confirmed()),
         )
         .expect("restore");
@@ -1170,7 +1194,8 @@ fn same_machine_rollback_needs_confirmation() {
     assert_eq!(p["source_chain_id"], fa.chain_id.as_str());
     assert_eq!(p["replaced_db"]["chain_id"], fa.chain_id.as_str());
     assert_eq!(p["replaced_db"]["head_seq"], 72);
-    assert_eq!(a.head().0, 51);
+    // `RESTORE`, then its confirmation record (PD-168).
+    assert_eq!(a.head().0, 52);
     assert_eq!(a.head().2, rep.new_chain_id);
     assert_eq!(a.full_verify(), vec![]);
 }
@@ -1181,19 +1206,31 @@ fn u15_restore_segments_verify() {
     let out1 = tempfile::tempdir().expect("out dir");
     let b1 = backup_into(&a, out1.path());
     let r1 = a
-        .restore(chosen(&b1.bundle_dir), &pass(PASSPHRASE), Some(confirmed()))
+        .restore(
+            chosen(&b1.bundle_dir),
+            &pass(PASSPHRASE),
+            confirmed(),
+            Some(confirmed()),
+        )
         .expect("restore 1");
     assert_eq!(r1.restore_seq, 22);
     assert_eq!(r1.records_lost, 1, "the BACKUP record itself");
+    // Its confirmation record (PD-168) is seq 23.
+    assert_eq!(r1.confirmation_seq, Some(23));
     a.append_batch(mixed(10)).expect("append_batch");
     a.flush_head_anchor().expect("flush");
     let out2 = tempfile::tempdir().expect("out dir");
     let b2 = backup_into(&a, out2.path());
-    assert_eq!(b2.head_seq, 32);
+    assert_eq!(b2.head_seq, 33);
     let r2 = a
-        .restore(chosen(&b2.bundle_dir), &pass(PASSPHRASE), Some(confirmed()))
+        .restore(
+            chosen(&b2.bundle_dir),
+            &pass(PASSPHRASE),
+            confirmed(),
+            Some(confirmed()),
+        )
         .expect("restore 2");
-    assert_eq!(r2.restore_seq, 33);
+    assert_eq!(r2.restore_seq, 34);
     a.append_batch(mixed(5)).expect("append_batch");
     a.flush_head_anchor().expect("flush");
     assert_eq!(a.full_verify(), vec![]);
@@ -1202,23 +1239,23 @@ fn u15_restore_segments_verify() {
     for r in &rows {
         let want = match r.seq {
             ..=21 => &fa.chain_id,
-            22..=32 => &r1.new_chain_id,
+            22..=33 => &r1.new_chain_id,
             _ => &r2.new_chain_id,
         };
         assert_eq!(&r.chain_id, want, "chain of seq {}", r.seq);
     }
-    assert_eq!(payload(&a, 33)["source_chain_id"], r1.new_chain_id.as_str());
+    assert_eq!(payload(&a, 34)["source_chain_id"], r1.new_chain_id.as_str());
     a.shutdown();
 
     // Tamper the second boundary: RESTORE's prev_hash (an attacker without the KEK rehashes).
     let c = raw_conn(&fa);
-    let mut r = rows[32].clone();
-    assert_eq!((r.seq, r.event_type.as_str()), (33, "RESTORE"));
+    let mut r = rows[33].clone();
+    assert_eq!((r.seq, r.event_type.as_str()), (34, "RESTORE"));
     r.prev_hash = [0x5a; 32];
     r.record_hash = r.recompute();
     write_row(&c, &r);
     drop(c);
-    let head = rehash_from(&fa, 34);
+    let head = rehash_from(&fa, 35);
     set_keychain_head(&fa, &head);
     let (s, _v) = ready(open(&fa.data, &fa.lock, fa.config()).expect("open"));
     let found = kinds(&s.full_verify());
@@ -1248,7 +1285,12 @@ fn restore_refuses_newer_snapshot() {
     let files = db_files(fb.dir.path());
     let entries = keychain_entries(&fb.ring, &fb.install_id);
     let baseline = fb.ring.ops().len();
-    match b.restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None) {
+    match b.restore(
+        chosen(&bundle.bundle_dir),
+        &pass(PASSPHRASE),
+        confirmed(),
+        None,
+    ) {
         Err(AuditError::Restore(RestoreError::SnapshotNewer { found })) => {
             assert!(found.contains("user_version 2"), "{found}")
         }
@@ -1314,8 +1356,11 @@ fn restore_migrates_older_snapshot_after_verify() {
         vec![
             (old_head + 1, "RESTORE".to_string()),
             (old_head + 2, "SCHEMA_MIGRATED".to_string()),
+            // The restore's confirmation record (PD-168) after them.
+            (old_head + 3, "CONFIG_CHANGED".to_string()),
         ]
     );
+    assert_eq!(rep.confirmation_seq, Some(old_head + 3));
     let m = payload(&b, old_head + 2);
     assert_eq!((m["from"].clone(), m["to"].clone()), (json!(1), json!(2)));
     assert_eq!(b.full_verify(), vec![]);
@@ -1361,6 +1406,7 @@ fn restore_wrong_passphrase_writes_nothing() {
     match b.restore(
         chosen(&bundle.bundle_dir),
         &pass("not the right passphrase"),
+        confirmed(),
         None,
     ) {
         Err(AuditError::Restore(RestoreError::WrongPassphrase)) => {}
@@ -1497,8 +1543,13 @@ fn interrupted_restore_reconciles_after_a_session_whose_completion_failed() {
     let b_anchor = keychain_head(&fb.ring, &fb.install_id).expect("anchor");
     faults.fail(FaultPoint::AfterKekReseal, 1);
     assert!(
-        b.restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
-            .is_err()
+        b.restore(
+            chosen(&bundle.bundle_dir),
+            &pass(PASSPHRASE),
+            confirmed(),
+            None
+        )
+        .is_err()
     );
     drop(b);
 
@@ -1559,8 +1610,13 @@ fn deferred_restore_reconciles_at_a_later_start() {
     let b_anchor = keychain_head(&fb.ring, &fb.install_id).expect("anchor");
     faults.fail(FaultPoint::AfterKekReseal, 1);
     assert!(
-        b.restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
-            .is_err()
+        b.restore(
+            chosen(&bundle.bundle_dir),
+            &pass(PASSPHRASE),
+            confirmed(),
+            None
+        )
+        .is_err()
     );
     drop(b);
 
@@ -1646,7 +1702,12 @@ fn refused_restore_puts_back_the_barrier_it_held() {
     assert_eq!(a.health().anchors_blocked, Some(BarrierKind::Prune));
 
     // The restore holds the anchors still, then is refused: the prune barrier is back.
-    match a.restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None) {
+    match a.restore(
+        chosen(&bundle.bundle_dir),
+        &pass(PASSPHRASE),
+        confirmed(),
+        None,
+    ) {
         Err(AuditError::Restore(RestoreError::RollbackNeedsConfirmation { .. })) => {}
         other => panic!("expected RollbackNeedsConfirmation, got {other:?}"),
     }
@@ -1659,6 +1720,7 @@ fn refused_restore_puts_back_the_barrier_it_held() {
         .restore(
             chosen(&bundle.bundle_dir),
             &pass(PASSPHRASE),
+            confirmed(),
             Some(confirmed()),
         )
         .expect("restore");
@@ -1736,6 +1798,7 @@ fn superseded_chain_lines_are_accounted_for_by_records_lost() {
         .restore(
             chosen(&bundle.bundle_dir),
             &pass(PASSPHRASE),
+            confirmed(),
             Some(confirmed()),
         )
         .expect("restore");
@@ -1771,7 +1834,12 @@ fn full_verify_that_raced_a_restore_appends_nothing() {
     let (findings, generation) = b.testing_full_verify_run().expect("run");
     assert_eq!(findings, vec![]);
     let rep = b
-        .restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
+        .restore(
+            chosen(&bundle.bundle_dir),
+            &pass(PASSPHRASE),
+            confirmed(),
+            None,
+        )
         .expect("restore");
     let head = b.head();
     match b.testing_full_verify_append(&findings, generation) {
@@ -1815,7 +1883,12 @@ fn failure_after_the_commit_rename_is_committed_incomplete() {
     let (b, fb) = machine_b(9, &faults);
     faults.fail(FaultPoint::CommitDirSync, 1);
     let e = b
-        .restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
+        .restore(
+            chosen(&bundle.bundle_dir),
+            &pass(PASSPHRASE),
+            confirmed(),
+            None,
+        )
         .expect_err("dir sync fails");
     assert_eq!(committed_incomplete(&e), Some(bundle.head_seq + 1), "{e:?}");
     // The handle does not go on: no append lands anywhere.
@@ -2070,6 +2143,7 @@ fn pats_are_deleted_after_the_commit_and_by_finish_restore() {
     match b.restore(
         chosen(&bundle.bundle_dir),
         &pass("not the right passphrase"),
+        confirmed(),
         None,
     ) {
         Err(AuditError::Restore(RestoreError::WrongPassphrase)) => {}
@@ -2082,7 +2156,12 @@ fn pats_are_deleted_after_the_commit_and_by_finish_restore() {
     // open without "Finish restore", which deletes the restored view's tokens first.
     faults.fail(FaultPoint::AfterRestoreCommit, 1);
     let e = b
-        .restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
+        .restore(
+            chosen(&bundle.bundle_dir),
+            &pass(PASSPHRASE),
+            confirmed(),
+            None,
+        )
         .expect_err("crash");
     assert!(committed_incomplete(&e).is_some(), "{e:?}");
     drop(b);
@@ -2119,7 +2198,12 @@ fn rename_refused_by_an_open_reader_changes_nothing() {
         .expect("a handle without delete sharing");
     let head = b.head();
     let e = b
-        .restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
+        .restore(
+            chosen(&bundle.bundle_dir),
+            &pass(PASSPHRASE),
+            confirmed(),
+            None,
+        )
         .expect_err("rename refused");
     assert_eq!(committed_incomplete(&e), None, "{e:?}");
     // Refused by the check before the link, not by the rename after it.
@@ -2168,6 +2252,7 @@ fn same_kek_restore_stopped_before_its_pat_deletion_opens_without_tokens() {
         .restore(
             chosen(&bundle.bundle_dir),
             &pass(PASSPHRASE),
+            confirmed(),
             Some(confirmed()),
         )
         .expect_err("stop after the commit");
@@ -2263,7 +2348,12 @@ fn committed_incomplete_handle_reads_nothing() {
     let (b, _fb) = machine_b(4, &faults);
     faults.fail(FaultPoint::AfterKekReseal, 1);
     let e = b
-        .restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
+        .restore(
+            chosen(&bundle.bundle_dir),
+            &pass(PASSPHRASE),
+            confirmed(),
+            None,
+        )
         .expect_err("stop");
     assert!(committed_incomplete(&e).is_some(), "{e:?}");
     assert_eq!(b.read_payload(2), Err(AuditError::Closed));
@@ -2274,5 +2364,164 @@ fn committed_incomplete_handle_reads_nothing() {
     match b.try_full_verify() {
         Err(AuditError::Closed) => {}
         other => panic!("expected Closed, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// The restore's confirmation record (PD-168, M10 T13)
+
+/// The native "Restore backup" answer a test restore passes (its text hash is all `0x11`).
+fn restore_dialog() -> Confirmed {
+    Confirmed {
+        dialog_text_sha256: [0x11; 32],
+    }
+}
+
+/// The native rollback answer (§8.11 step 4) a test restore passes.
+fn rollback_dialog() -> Confirmed {
+    Confirmed {
+        dialog_text_sha256: [0x22; 32],
+    }
+}
+
+/// The event types after `seq`, in order.
+fn types_after(f: &Fixture, seq: u64) -> Vec<String> {
+    dump_rows(f)
+        .into_iter()
+        .filter(|r| r.seq > seq)
+        .map(|r| r.event_type)
+        .collect()
+}
+
+/// PD-168 (§10.3 "logged as `CONFIG_CHANGED`", L192): a completed restore records the native
+/// "Restore backup" confirmation, and the rollback confirmation when one was given, as
+/// `CONFIG_CHANGED {source: app, key: restore_backup, dialog_text_sha256,
+/// rollback_dialog_text_sha256?}`: the first record after `RESTORE`, on the restored store, from
+/// both entry points (`Store::restore`, `restore_from_source`). The restored chain verifies with it.
+#[test]
+fn restore_confirmation_recorded_after_restore() {
+    let restore_hash = hex::encode([0x11u8; 32]);
+    // A live store (cross machine): no rollback, so no rollback hash.
+    let (a, _fa) = machine_a();
+    let out = tempfile::tempdir().expect("out dir");
+    let bundle = backup_into(&a, out.path());
+    let faults = Faults::new();
+    let (b, fb) = machine_b(3, &faults);
+    let rep = b
+        .restore(
+            chosen(&bundle.bundle_dir),
+            &pass(PASSPHRASE),
+            restore_dialog(),
+            None,
+        )
+        .expect("restore");
+    let seq = rep.confirmation_seq.expect("the confirmation record");
+    assert_eq!(seq, rep.restore_seq + 1);
+    assert_eq!(
+        types_after(&fb, rep.restore_seq)
+            .first()
+            .map(String::as_str),
+        Some("CONFIG_CHANGED")
+    );
+    assert_eq!(
+        payload(&b, seq),
+        json!({"source": "app", "key": "restore_backup", "dialog_text_sha256": restore_hash})
+    );
+    assert_eq!(b.full_verify(), vec![]);
+
+    // A same-machine rollback: both answers.
+    let (s, _fs) = store_with(9);
+    let out2 = tempfile::tempdir().expect("out dir");
+    let bundle2 = backup_into(&s, out2.path());
+    s.append_batch(mixed(3)).expect("append_batch");
+    let rep2 = s
+        .restore(
+            chosen(&bundle2.bundle_dir),
+            &pass(PASSPHRASE),
+            restore_dialog(),
+            Some(rollback_dialog()),
+        )
+        .expect("restore");
+    assert!(rep2.records_lost > 0);
+    let seq2 = rep2.confirmation_seq.expect("the confirmation record");
+    assert_eq!(seq2, rep2.restore_seq + 1);
+    assert_eq!(
+        payload(&s, seq2),
+        json!({"source": "app", "key": "restore_backup", "dialog_text_sha256": restore_hash,
+               "rollback_dialog_text_sha256": hex::encode([0x22u8; 32])})
+    );
+    assert_eq!(s.full_verify(), vec![]);
+
+    // No live store: `restore_from_source`.
+    let fc = fixture(fake_clock("2026-12-01T09:00:00.000Z"), MemKeyring::new());
+    let (c, rep3) = restore_from_source(
+        &fc.data,
+        &fc.lock,
+        fc.config(),
+        chosen(&bundle.bundle_dir),
+        &pass(PASSPHRASE),
+        restore_dialog(),
+        None,
+    )
+    .expect("restore");
+    let seq3 = rep3.confirmation_seq.expect("the confirmation record");
+    assert_eq!(seq3, rep3.restore_seq + 1);
+    assert_eq!(
+        payload(&c, seq3),
+        json!({"source": "app", "key": "restore_backup", "dialog_text_sha256": restore_hash})
+    );
+    assert_eq!(c.full_verify(), vec![]);
+    c.flush_head_anchor().expect("flush");
+    c.shutdown();
+    let (_c, v) = ready(open(&fc.data, &fc.lock, fc.config()).expect("open"));
+    assert_eq!(v.findings, vec![]);
+}
+
+/// PD-168: the confirmation record is the store's own (only a completed restore writes one):
+/// `append` refuses `CONFIG_CHANGED {key: restore_backup}`, while another app key stays
+/// appendable.
+#[test]
+fn append_refuses_the_restore_confirmation() {
+    let (s, _f) = store_with(1);
+    let forged = s.append(ev(
+        EventType::CONFIG_CHANGED,
+        None,
+        json!({"source": "app", "key": "restore_backup", "dialog_text_sha256": "00"}),
+    ));
+    assert!(matches!(forged, Err(AuditError::Invalid(_))), "{forged:?}");
+    s.append(ev(
+        EventType::CONFIG_CHANGED,
+        None,
+        json!({"source": "app", "key": "autostart", "old": true, "new": false}),
+    ))
+    .expect("another app key");
+}
+
+/// PD-168: a restore that stops after its commit and before the KEK re-seal records no
+/// confirmation, so `RESTORE` stays the newest record and "Finish restore" is offered (§8.7).
+#[test]
+fn no_confirmation_record_before_the_reseal() {
+    let (a, _fa) = machine_a();
+    let out = tempfile::tempdir().expect("out dir");
+    let bundle = backup_into(&a, out.path());
+    let faults = Faults::new();
+    let (b, fb) = machine_b(2, &faults);
+    faults.fail(FaultPoint::AfterRestoreCommit, 1);
+    let e = b
+        .restore(
+            chosen(&bundle.bundle_dir),
+            &pass(PASSPHRASE),
+            restore_dialog(),
+            None,
+        )
+        .expect_err("stop after the commit");
+    let restore_seq = committed_incomplete(&e).expect("committed");
+    drop(b);
+    assert_eq!(types_after(&fb, restore_seq), Vec::<String>::new());
+    match open(&fb.data, &fb.lock, fb.config()).expect("open") {
+        StartupOutcome::Locked(LockedReason::KeychainLost {
+            offer: RecoveryOffer::FinishRestore,
+        }) => {}
+        other => panic!("expected Locked(KeychainLost(FinishRestore)), got {other:?}"),
     }
 }

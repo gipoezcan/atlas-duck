@@ -79,9 +79,9 @@ use crate::recovery::{RecoveryError, open_recovery};
 use crate::schema::{self, DB_FILE};
 use crate::settings;
 use crate::store::{Hooks, OpenConfig, Store};
-use crate::types::{Committed, Confirmed, RustChosenPath};
+use crate::types::{Committed, Confirmed, EventType, RustChosenPath};
 use crate::verify::{self, StartupInputs, VerifyFinding, VerifyOutcome};
-use crate::writer::{Shared, Writer, WriterParts, lock};
+use crate::writer::{PreparedEvent, Shared, Writer, WriterParts, lock};
 
 /// What a restore did (C.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +101,10 @@ pub struct RestoreReport {
     /// included): every one needs its token again. M3 logs `INSTANCE_STATE_CHANGED
     /// {needs_token}` for them.
     pub pats_deleted: Vec<String>,
+    /// The seq of the `CONFIG_CHANGED {key: restore_backup}` that records the native
+    /// confirmations after the restore completed (PD-168); `None` when that append failed
+    /// (the restore itself is complete: accepted residual, like a crash between the two, L192).
+    pub confirmation_seq: Option<u64>,
 }
 
 fn restore_err(e: RestoreError) -> AuditError {
@@ -756,7 +760,36 @@ fn report(staged: &Staged, plan: Plan, written: &Written, pats: Vec<String>) -> 
         records_lost: plan.records_lost,
         pats_lost: true,
         pats_deleted: pats,
+        confirmation_seq: None,
     }
+}
+
+/// The `CONFIG_CHANGED` key of the restore's confirmation record (PD-168). Store-owned: `append`
+/// refuses it, so only a completed restore writes one.
+pub(crate) const RESTORE_BACKUP_KEY: &str = "restore_backup";
+
+/// The native confirmations a restore was given (§10.3 "restore backup", and the same-machine
+/// rollback of §8.11 step 4 when there was one).
+#[derive(Clone, Copy)]
+pub(crate) struct RestoreConfirmations {
+    pub(crate) restore: Confirmed,
+    pub(crate) rollback: Option<Confirmed>,
+}
+
+/// `CONFIG_CHANGED {source: app, key: restore_backup, dialog_text_sha256,
+/// rollback_dialog_text_sha256?}` (PD-168, §10.3 "logged as `CONFIG_CHANGED`"): appended to the
+/// restored store once the restore completed (after the KEK re-seal, so a crash before it still
+/// leaves `RESTORE` the newest record for "Finish restore").
+pub(crate) fn confirmation_event(c: &RestoreConfirmations) -> Result<PreparedEvent, AuditError> {
+    let mut payload = json!({
+        "source": "app",
+        "key": RESTORE_BACKUP_KEY,
+        "dialog_text_sha256": hex::encode(c.restore.dialog_text_sha256),
+    });
+    if let Some(r) = &c.rollback {
+        payload["rollback_dialog_text_sha256"] = json!(hex::encode(r.dialog_text_sha256));
+    }
+    PreparedEvent::system(EventType::CONFIG_CHANGED, &payload)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -766,6 +799,8 @@ fn report(staged: &Staged, plan: Plan, written: &Written, pats: Vec<String>) -> 
 pub(crate) struct RestoreRequest {
     pub(crate) source: PathBuf,
     pub(crate) passphrase: SecretString,
+    /// The native "Restore backup" confirmation (§10.3), recorded after the restore (PD-168).
+    pub(crate) restore_confirmed: Confirmed,
     pub(crate) confirm: Option<Confirmed>,
     pub(crate) keys: Arc<dyn KeyStore>,
     pub(crate) data_dir: PathBuf,
@@ -775,9 +810,11 @@ pub(crate) struct RestoreRequest {
 }
 
 impl RestoreRequest {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         source: &RustChosenPath,
         passphrase: &SecretString,
+        restore_confirmed: Confirmed,
         confirm: Option<Confirmed>,
         keys: Arc<dyn KeyStore>,
         data_dir: PathBuf,
@@ -787,6 +824,7 @@ impl RestoreRequest {
         RestoreRequest {
             source: source.path().to_path_buf(),
             passphrase: SecretString::from(passphrase.expose_secret().to_owned()),
+            restore_confirmed,
             confirm,
             keys,
             data_dir,
@@ -938,12 +976,37 @@ impl Writer {
             return Err(committed(restore_seq, e));
         }
         drop(held);
-        Ok(report(&staged, plan, &written, pats))
+        let mut report = report(&staged, plan, &written, pats);
+        report.confirmation_seq = self.log_confirmations(&RestoreConfirmations {
+            restore: req.restore_confirmed,
+            rollback: req.confirm,
+        });
+        Ok(report)
+    }
+
+    /// The restore's confirmation record (PD-168), on the restored store; best effort: the
+    /// restore is complete whatever this append does.
+    fn log_confirmations(&mut self, c: &RestoreConfirmations) -> Option<u64> {
+        let p = confirmation_event(c).ok()?;
+        self.append_tx(vec![p]).ok()?.first().map(|c| c.seq)
     }
 }
 
 // ---------------------------------------------------------------------------------------
 // restore_from_source (no live store)
+
+/// True when `audit.db` exists and its plaintext head cannot be read (M2 T16 M-4): then
+/// [`restore_from_source`] refuses before anything changes, since the live store cannot be named
+/// and moved aside, and the caller offers "Archive old DB and start fresh" first. Reads the
+/// plaintext columns only, on a read-only connection closed again; no store may be running.
+pub fn live_store_blocks_restore(data: &LocalDataDir) -> bool {
+    let db = schema::db_path(data);
+    match db.try_exists() {
+        Ok(false) => false,
+        Ok(true) => plaintext_head(&db).is_err(),
+        Err(_) => true,
+    }
+}
 
 /// The locality rule before any keyring access (§8.6).
 fn require_local(keys: &dyn KeyStore) -> Result<(), OpenError> {
@@ -1001,12 +1064,17 @@ fn checkpoint_closed(db: &Path) -> Result<(), OpenError> {
 /// the source, `KeyStore` for the keychain, `Invalid` for a lock of another data dir. After the
 /// commit every error is `Restore(CommittedIncomplete { .. })`: the restore must be completed
 /// by the next start (`open`: interrupted restore, or "Finish restore").
+///
+/// `restore_confirmed` is the caller's native "Restore backup" confirmation (§10.3): once the
+/// restore completed it is recorded, with `confirm_rollback`'s, as `CONFIG_CHANGED {key:
+/// restore_backup}` on the restored store (PD-168, `RestoreReport::confirmation_seq`).
 pub fn restore_from_source(
     data: &LocalDataDir,
     lock: &InstanceLock,
     cfg: OpenConfig,
     source: RustChosenPath,
     passphrase: &SecretString,
+    restore_confirmed: Confirmed,
     confirm_rollback: Option<Confirmed>,
 ) -> Result<(Store, RestoreReport), OpenError> {
     if lock.path().parent() != Some(data.path()) {
@@ -1090,7 +1158,11 @@ pub fn restore_from_source(
     }
     // Advisory (§8.13): the restore itself is complete, its report must reach the caller.
     let _ = store.update_written_by();
-    let report = report(&staged, plan, &written, pats);
+    let mut report = report(&staged, plan, &written, pats);
+    report.confirmation_seq = store.log_restore_confirmations(&RestoreConfirmations {
+        restore: restore_confirmed,
+        rollback: confirm_rollback,
+    });
     Ok((store, report))
 }
 

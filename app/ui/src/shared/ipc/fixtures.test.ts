@@ -28,6 +28,8 @@ import redactionReport from './fixtures/redaction_report.json';
 import removalBackupAnswer from './fixtures/removal_backup_answer.json';
 import removalFinishAnswer from './fixtures/removal_finish_answer.json';
 import removalState from './fixtures/removal_state.json';
+import restoreCancel from './fixtures/restore_cancel.json';
+import restoreDone from './fixtures/restore_done.json';
 import retestOutcome from './fixtures/retest_outcome.json';
 import retryStarted from './fixtures/retry_started.json';
 import runningScript from './fixtures/running_script.json';
@@ -66,6 +68,8 @@ import {
   isRemovalBackupAnswer,
   isRemovalFinishAnswer,
   isRemovalState,
+  isRestoreCancelAnswer,
+  isRestoreDone,
   isRetestOutcome,
   isRunningScriptView,
   isSettingsGet,
@@ -109,6 +113,8 @@ describe('fixtures validate against their TS types', () => {
     ['export_done', exportDone, arrayOf(isExportDone)],
     ['export_cancel', exportCancel, arrayOf(isExportCancelAnswer)],
     ['audit_job', auditJob, arrayOf(isAuditJobEvent)],
+    ['restore_done', restoreDone, arrayOf(isRestoreDone)],
+    ['restore_cancel', restoreCancel, arrayOf(isRestoreCancelAnswer)],
   ] as const)('%s', (_name, fixture, validate) => {
     expect(fixture.length).toBeGreaterThan(0);
     expect(validate(fixture)).toBe(true);
@@ -139,7 +145,10 @@ describe('fixtures validate against their TS types', () => {
     expect(isAuditJobEvent({ job: 'export', phase: 'progress', done: 1 })).toBe(false);
     expect(isAuditJobEvent({ job: 'backup', phase: 'progress', done: 1, total: 2 })).toBe(false);
     expect(isAuditJobEvent({ job: 'export', phase: 'done', done: 1, total: 2 })).toBe(false);
-    expect(isAuditJobEvent({ job: 'restore', phase: 'started' })).toBe(false);
+    // M10 T13: a restore is indeterminate like a backup.
+    expect(isAuditJobEvent({ job: 'restore', phase: 'started' })).toBe(true);
+    expect(isAuditJobEvent({ job: 'restore', phase: 'progress', done: 1, total: 2 })).toBe(false);
+    expect(isAuditJobEvent({ job: 'import', phase: 'started' })).toBe(false);
   });
 
   it('command_error: every wire shape is recognised, none falls back to refused', () => {
@@ -221,6 +230,33 @@ describe('fixtures validate against their TS types', () => {
     const badAudit = [{ kind: 'unreadable' }, { kind: 'unreadable', seq: '3' }, { kind: 'failed', seq: 3 }, { kind: 'x' }];
     for (const bad of badAudit) {
       expect(audit(bad)).toBe('refused');
+    }
+  });
+
+  // M10 T13 (PD-168): the restore's answers carry counts only, its errors a fixed kind only.
+  it('restore answers and errors: closed shapes, fixed kinds', () => {
+    expect(restoreDone.map((d) => d.offer_passphrase_change)).toEqual([true, true]);
+    expect(isRestoreDone({ ...restoreDone[0], source: '/x' })).toBe(false);
+    expect(isRestoreDone({ ...restoreDone[0], tokens_deleted: '2' })).toBe(false);
+    expect(restoreCancel.map((c) => c.cancelled)).toEqual([true, false]);
+    expect(isRestoreCancelAnswer({ cancelled: 'yes' })).toBe(false);
+    const kinds = commandError
+      .filter((e) => e.kind === 'restore')
+      .map((e) => (e as unknown as { error: { kind: string } }).error.kind);
+    expect(kinds).toEqual([
+      'wrong_passphrase',
+      'not_a_backup',
+      'newer',
+      'broken',
+      'anchor_dir_mismatch',
+      'committed_incomplete',
+      'keychain',
+      'failed',
+    ]);
+    const restore = (error: unknown) => toCommandError({ kind: 'restore', error }).kind;
+    expect(restore({ kind: 'committed_incomplete' })).toBe('restore');
+    for (const bad of [{ kind: 'other' }, { kind: 'failed', message: 'os text' }, { kind: 'broken', path: '/x' }, 'failed', null]) {
+      expect(restore(bad)).toBe('refused');
     }
   });
 

@@ -1687,6 +1687,7 @@ fn restore_writes_restore_line_to_new_chain_file() {
         .restore(
             chosen(&bundle.bundle_dir),
             &pass(PASSPHRASE),
+            confirmed(),
             Some(confirmed()),
         )
         .expect("restore");
@@ -1704,6 +1705,7 @@ fn restore_writes_restore_line_to_new_chain_file() {
         fb.config(),
         chosen(&bundle.bundle_dir),
         &pass(PASSPHRASE),
+        confirmed(),
         None,
     )
     .expect("restore_from_source");
@@ -1739,8 +1741,13 @@ fn finish_restore_and_interrupted_restore_write_missing_restore_line() {
     let (b, fb) = machine(&faults);
     faults.fail(FaultPoint::AfterKekReseal, 1);
     assert!(
-        b.restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
-            .is_err()
+        b.restore(
+            chosen(&bundle.bundle_dir),
+            &pass(PASSPHRASE),
+            confirmed(),
+            None
+        )
+        .is_err()
     );
     drop(b);
     let (restore_seq, chain) = latest_restore(&fb);
@@ -1769,8 +1776,13 @@ fn finish_restore_and_interrupted_restore_write_missing_restore_line() {
     let (c, fc) = machine(&faults);
     faults.fail(FaultPoint::AfterRestoreCommit, 1);
     assert!(
-        c.restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
-            .is_err()
+        c.restore(
+            chosen(&bundle.bundle_dir),
+            &pass(PASSPHRASE),
+            confirmed(),
+            None
+        )
+        .is_err()
     );
     drop(c);
     match open(&fc.data, &fc.lock, fc.config()).expect("open") {

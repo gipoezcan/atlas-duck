@@ -653,8 +653,13 @@ fn re_anchor_refused_when_anchors_present_or_restore_interrupted() {
     b.flush_head_anchor().expect("flush");
     faults.fail(FaultPoint::AfterKekReseal, 1);
     assert!(
-        b.restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
-            .is_err()
+        b.restore(
+            chosen(&bundle.bundle_dir),
+            &pass(PASSPHRASE),
+            confirmed(),
+            None
+        )
+        .is_err()
     );
     drop(b);
     fb.ring.fail_next(
@@ -761,6 +766,7 @@ fn anchors_missing_none_during_interrupted_restore() {
         cfg,
         chosen(&bundle.bundle_dir),
         &pass(PASSPHRASE),
+        confirmed(),
         None,
     ) {
         Err(OpenError::Restore(RestoreError::CommittedIncomplete { .. })) => {}
@@ -1017,7 +1023,12 @@ fn re_anchor_loses_to_a_restore_that_took_its_barrier() {
     re_anchor_gate.wait("the re-anchor completion");
     let s3 = s.clone();
     let restore = std::thread::spawn(move || {
-        s3.restore(chosen(&bundle), &pass(PASSPHRASE), Some(confirmed()))
+        s3.restore(
+            chosen(&bundle),
+            &pass(PASSPHRASE),
+            confirmed(),
+            Some(confirmed()),
+        )
     });
     restore_gate.wait("the restore barrier");
 
@@ -1073,7 +1084,12 @@ fn a_restore_failing_after_it_took_the_re_anchor_barrier_leaves_no_barrier() {
     re_anchor_gate.wait("the re-anchor completion");
     let s3 = s.clone();
     let restore = std::thread::spawn(move || {
-        s3.restore(chosen(&bundle), &pass(PASSPHRASE), Some(confirmed()))
+        s3.restore(
+            chosen(&bundle),
+            &pass(PASSPHRASE),
+            confirmed(),
+            Some(confirmed()),
+        )
     });
     restore_gate.wait("the restore barrier");
     re_anchor_gate.open();
@@ -1152,6 +1168,7 @@ fn orphan_installs_lists_archived_install_ids_only() {
         .restore(
             chosen(&t.f.dir.path().join(&t.archived.file)),
             &pass(PASSPHRASE),
+            confirmed(),
             None,
         )
         .expect("restore");
@@ -1318,6 +1335,7 @@ fn forget_install_with_keys_deletes_all_and_archive_still_restores_with_passphra
         .restore(
             chosen(&t.f.dir.path().join(&t.archived.file)),
             &pass(PASSPHRASE),
+            confirmed(),
             None,
         )
         .expect("restore the archive");

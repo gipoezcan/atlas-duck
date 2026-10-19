@@ -4439,6 +4439,10 @@ const S09_GRANTS: [(&str, &[&str]); 7] = [
             "removal_mark",
             "removal_finish",
             "app_status",
+            // M10 T13 (Δ-M10-3, PD-168): "Back up now" and "Restore backup…".
+            "backup_trigger",
+            "restore_begin",
+            "restore_cancel",
         ],
     ),
     (
@@ -4469,6 +4473,8 @@ const S09_GRANTS: [(&str, &[&str]); 7] = [
             "retry_keychain",
             "close_credential",
             "quit",
+            // M10 T13 (Δ-M10-3, L201): "Restore a backup instead" in `keychain_lost`.
+            "restore_from_backup",
         ],
     ),
     (
@@ -4676,30 +4682,105 @@ fn audit_window_bodies() -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// §13 / §10.3 (S-09), M10 T12 (Δ-M10-3, L201): the Audit window's new commands are granted to
-/// `audit` and to no other window (Tauri's ACL refuses them there, before any handler); in `audit`
-/// a valid body reaches its handler (`not_ready` without a serving store; `export_cancel` answers
-/// that nothing was cancelled). Task 13 extends the table with `backup_trigger` in `settings`.
+/// §13 / §10.3 (S-09), M10 T12 and T13 (Δ-M10-3, L201): the new commands are granted to exactly
+/// their windows (the Audit window's to `audit`; `backup_trigger` also to `settings`; the restore
+/// commands to `settings`; `restore_from_backup` to `credential`) and refused by Tauri's ACL in
+/// every other window, before any handler; in a holder a valid body reaches its handler
+/// (`not_ready` without a serving store or an open credential window; the two cancels answer that
+/// nothing was cancelled).
 #[test]
 fn s09_new_commands_outside_grant_rejected() -> TestResult {
     let app = app()?;
-    for (cmd, body) in audit_window_bodies() {
+    let mut table: Vec<(&str, Value, &[&str])> = audit_window_bodies()
+        .into_iter()
+        .map(|(cmd, body)| -> (&str, Value, &[&str]) {
+            if cmd == "backup_trigger" {
+                (cmd, body, &["settings", "audit"])
+            } else {
+                (cmd, body, &["audit"])
+            }
+        })
+        .collect();
+    table.extend([
+        ("restore_begin", json!({}), &["settings"] as &[&str]),
+        ("restore_cancel", json!({}), &["settings"]),
+        ("restore_from_backup", json!({}), &["credential"]),
+    ]);
+    for (cmd, body, want) in table {
         assert!(COMMANDS.contains(&cmd), "{cmd} is not in COMMANDS");
         let holders: Vec<&str> = S09_GRANTS
             .iter()
             .filter(|(_, cmds)| cmds.contains(&cmd))
             .map(|(l, _)| *l)
             .collect();
-        assert_eq!(holders, ["audit"], "{cmd}");
+        assert_eq!(holders, want, "{cmd}");
         for label in S09_LABELS.into_iter().chain(["unknown"]) {
             let r = invoke(&s09_window(&app, label)?, cmd, body.clone());
-            if label != "audit" {
+            if !want.contains(&label) {
                 assert!(acl_refused(&r), "{label}: {cmd} {r:?}");
-            } else if cmd == "export_cancel" {
-                assert_eq!(r, Ok(json!({"cancelled": false})), "{cmd}");
+            } else if cmd == "export_cancel" || cmd == "restore_cancel" {
+                assert_eq!(r, Ok(json!({"cancelled": false})), "{label}: {cmd}");
             } else {
-                assert_eq!(r, Err(json!({"kind": "not_ready"})), "{cmd}");
+                assert_eq!(r, Err(json!({"kind": "not_ready"})), "{label}: {cmd}");
             }
+        }
+    }
+    Ok(())
+}
+
+/// §10.3, Δ-M10-3 (M10 T13): "Back up now" is the same command in Settings and in the Audit window,
+/// and in both it takes no folder: an empty body reaches the handler (`not_ready` without a serving
+/// store), any key (a path above all) is refused before it; the folder comes from Rust's dialog.
+#[test]
+fn backup_trigger_rust_dialog_only() -> TestResult {
+    let app = app()?;
+    for label in ["settings", "audit"] {
+        let w = s09_window(&app, label)?;
+        assert_eq!(
+            invoke(&w, "backup_trigger", json!({})),
+            Err(json!({"kind": "not_ready"})),
+            "{label}"
+        );
+        for body in [
+            json!({"folder": "C:\\backups"}),
+            json!({"path": "/tmp"}),
+            json!({"dir": null}),
+            json!([]),
+        ] {
+            assert_eq!(
+                invoke(&w, "backup_trigger", body.clone()),
+                Err(json!({"kind": "invalid_argument", "field": "payload"})),
+                "{label}: {body}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// §10.3 (M10 T13): the restore commands take no argument (Rust draws every dialog, the passphrase
+/// enters only through `submit_secret`): any key, a path or a passphrase above all, and any body
+/// that is not an object are refused before the handler.
+#[test]
+fn restore_args_take_nothing() -> TestResult {
+    let app = app()?;
+    for (cmd, label) in [
+        ("restore_begin", "settings"),
+        ("restore_cancel", "settings"),
+        ("restore_from_backup", "credential"),
+    ] {
+        let w = s09_window(&app, label)?;
+        for body in [
+            json!({"source": "/tmp/backup"}),
+            json!({"passphrase": "correct horse battery"}),
+            json!({"folder": "C:\\backups"}),
+            json!([]),
+            json!("x"),
+        ] {
+            assert_eq!(
+                invoke(&w, cmd, body.clone()),
+                Err(json!({"kind": "invalid_argument", "field": "payload"})),
+                "{label}: {cmd} {body}"
+            );
         }
     }
     Ok(())
@@ -5119,6 +5200,15 @@ fn s09_cases() -> Vec<S09Case> {
             (Some("choice"), huge()),
         ),
         case("removal_state", "settings", json!({}), whole(), pad()),
+        case("restore_begin", "settings", json!({}), whole(), pad()),
+        case("restore_cancel", "settings", json!({}), whole(), pad()),
+        case(
+            "restore_from_backup",
+            "credential",
+            json!({}),
+            whole(),
+            pad(),
+        ),
         case(
             "retest_token",
             "settings",

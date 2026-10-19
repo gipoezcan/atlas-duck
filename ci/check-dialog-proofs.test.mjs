@@ -60,6 +60,27 @@ test("flags_helper_with_a_non_dialog_caller", () => {
   ]);
 });
 
+test("M10 T13: a helper called through its module path is a call; another module's fn of that name is not", () => {
+  const caller = [
+    "fn quiet_restore(text: &str) {",
+    "    let c = crate::serve::confirmed_by(text);",
+    "    let d = serve::confirmed_by(text);",
+    "    let e = redact::confirmed_by(text);",
+    "}",
+  ].join("\n");
+  const found = scanDialogProofs([
+    { path: SERVE, src: `${HELPER}\n${DIALOG_FN}` },
+    { path: OTHER, src: caller },
+  ]);
+  assert.deepEqual(found, [
+    `${OTHER}:2: proof helper confirmed_by called from fn quiet_restore, which is not a dialog function or a listed helper`,
+    `${OTHER}:3: proof helper confirmed_by called from fn quiet_restore, which is not a dialog function or a listed helper`,
+  ]);
+  // On a dialog function's Ok path the module path is accepted.
+  const ok = DIALOG_FN.replace("confirmed_by(&text)", "crate::serve::confirmed_by(&text)");
+  assert.deepEqual(scanDialogProofs([{ path: SERVE, src: HELPER }, { path: OTHER, src: ok }]), []);
+});
+
 test("accepts_listed_helper_called_from_dialog_fn", () => {
   assert.deepEqual(scanDialogProofs([{ path: SERVE, src: `${HELPER}\n${DIALOG_FN}` }]), []);
   // A path dialog function may build the chosen path.
@@ -395,7 +416,10 @@ const SLICE = [
   "crates/core/src/settings/mod.rs",
   "crates/audit/src/store.rs",
   ACK,
+  // M10 T13: the restore's two native confirmations and its source dialog.
+  "app/src-tauri/src/restore_flow.rs",
 ];
+const RESTORE = "app/src-tauri/src/restore_flow.rs";
 
 function withSliceCopy(mutate, run) {
   const base = process.env.CHECK_DIALOG_PROOFS_SCRATCH ?? join(REPO, "target", "check-dialog-proofs-scratch");
@@ -447,6 +471,25 @@ test("M-4: removing the answer test before a real helper call fails the check", 
   const r = withSliceCopy((rel, t) => (rel === SERVE ? replaceOnce(t, "answer != Confirm::Ok", "false") : t), cli);
   assert.equal(r.status, 1);
   assert.match(r.stdout, /serve\.rs:\d+: proof helper confirmed_by called from fn /);
+});
+
+test("M10 T13: the restore's confirmations and source dialog are load-bearing on the real file", () => {
+  for (const [from, to, flagged] of [
+    // The "Restore backup" answer (PD-168, L54) ignored.
+    ["confirmer.confirm(RESTORE_CONFIRM_TEXT) != Confirm::Ok", "false", /restore_flow\.rs:\d+: proof helper confirmed_by called from fn ask_restore/],
+    // The rollback answer (§8.11 step 4) ignored.
+    ["confirmer.confirm(&text) != Confirm::Ok", "false", /restore_flow\.rs:\d+: proof helper confirmed_by called from fn ask_rollback/],
+    // A source path that no dialog returned.
+    [
+      "RustChosenPath::from_native_dialog(source)",
+      'RustChosenPath::from_native_dialog(PathBuf::from("/tmp/backup"))',
+      /restore_flow\.rs:\d+: /,
+    ],
+  ]) {
+    const r = withSliceCopy((rel, t) => (rel === RESTORE ? replaceOnce(t, from, to) : t), cli);
+    assert.equal(r.status, 1, from);
+    assert.match(r.stdout, flagged);
+  }
 });
 
 test("rule 5: removing the acknowledgement's dialog test in the real caller fails the check", () => {

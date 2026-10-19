@@ -184,6 +184,7 @@ fn restore_commit_uses_durable_rename() {
         fb.config(),
         chosen(&bundle.bundle_dir),
         &pass(PASSPHRASE),
+        confirmed(),
         None,
     )
     .expect("restore from source");
@@ -198,8 +199,13 @@ fn restore_commit_uses_durable_rename() {
     // A live store: the same commit, after the replaced store was linked into `archived/`.
     let (c, fc) = new_store(fake_clock(START), MemKeyring::new());
     let first_run = durable_renames_into(fc.data.path());
-    c.restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
-        .expect("live restore");
+    c.restore(
+        chosen(&bundle.bundle_dir),
+        &pass(PASSPHRASE),
+        confirmed(),
+        None,
+    )
+    .expect("live restore");
     let db = fc.data.path().join(DB_FILE);
     let staging = fc.data.path().join("audit.db.restoring");
     let mut expected = first_run;

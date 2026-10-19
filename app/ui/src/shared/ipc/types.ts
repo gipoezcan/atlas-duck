@@ -676,10 +676,44 @@ export interface ExportCancelAnswer {
   cancelled: boolean;
 }
 
-export type AuditJobKind = 'export' | 'backup';
+export type AuditJobKind = 'export' | 'backup' | 'restore';
 export type AuditJobPhase = 'started' | 'progress' | 'done' | 'failed' | 'cancelled';
 
-/** The `audit_job` event: row counts with `progress` only (an export); a backup is indeterminate. */
+/**
+ * `restore_begin` (M10 T13, PD-168): a completed restore, counts only. `tokens_deleted` instances
+ * need their token again; `offer_passphrase_change` is always true (the backup's recovery passphrase
+ * is this log's now: offer "Change recovery passphrase…" right after, §8.11 step 2).
+ */
+export interface RestoreDone {
+  restore_seq: number;
+  records_lost: number;
+  tokens_deleted: number;
+  offer_passphrase_change: boolean;
+}
+
+/** `restore_cancel`: false when no restore ran; once the store call began the answer is `busy`. */
+export interface RestoreCancelAnswer {
+  cancelled: boolean;
+}
+
+/**
+ * Why a restore did not complete (Rust `RestoreFailure`, closed shapes). Every kind but
+ * `committed_incomplete` means nothing changed; `committed_incomplete`: "Restore will be completed
+ * at the next start" (restart).
+ */
+export type RestoreFailure = {
+  kind:
+    | 'wrong_passphrase'
+    | 'not_a_backup'
+    | 'newer'
+    | 'broken'
+    | 'anchor_dir_mismatch'
+    | 'committed_incomplete'
+    | 'keychain'
+    | 'failed';
+};
+
+/** The `audit_job` event: row counts with `progress` only (an export); a backup or restore is indeterminate. */
 export interface AuditJobEvent {
   job: AuditJobKind;
   phase: AuditJobPhase;
@@ -747,4 +781,6 @@ export type CommandError =
   | { kind: 'backup' }
   /** An Audit-window read failed: `error.kind` is `unreadable` (+`seq`) or `failed`. */
   | { kind: 'audit'; error: AuditReadFailure }
+  /** A restore was refused or failed (see `RestoreFailure`). */
+  | { kind: 'restore'; error: RestoreFailure }
   | { kind: 'refused'; message: string };

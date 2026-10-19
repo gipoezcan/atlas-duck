@@ -41,10 +41,12 @@ use crate::credential::{self, PatOpenError};
 use crate::removal::{
     self, BackupAnswer, Choice, FinishAnswer, PluginAutostart, RemovalDto, RemovalState, Retention,
 };
+use crate::restore_flow;
 use crate::sandbox_probe::{floor_label, mode_label, probe_id_name, scripts_state};
+use crate::serve::{JobRefused, RestoreCancel, StoreCall};
 use crate::state::{AppState, ServeSlot};
-use crate::ui_sink::emit_settings_changed;
-use crate::windows::WindowError;
+use crate::ui_sink::{emit_settings_changed, emit_status_changed};
+use crate::windows::{Show, WindowError};
 
 /// §7.1 (verbatim): the fixed hint beside an `http://` base URL. Core refuses the URL
 /// (`insecure_scheme`) and never sends a PAT; the page shows this text for that kind.
@@ -756,11 +758,13 @@ pub fn failure_class(e: &CommandError) -> Option<(String, Option<String>)> {
     let inner = match e {
         CommandError::Admin(AdminError::Cancelled)
         | CommandError::Settings(SettingsError::Cancelled)
+        | CommandError::Cancelled
         | CommandError::NotReady => return None,
         CommandError::Admin(a) => Some(a.to_string()),
         CommandError::Settings(s) => Some(s.to_string()),
         CommandError::CliInstall(c) => Some(c.to_string()),
         CommandError::Removal(r) => Some(r.to_string()),
+        CommandError::Restore(r) => Some(r.kind().to_owned()),
         _ => None,
     };
     Some((e.to_string(), inner))
@@ -1295,6 +1299,154 @@ pub async fn removal_finish<R: Runtime>(
     }
     .await;
     conclude_removal(&app, response, true)
+}
+
+// ---------- "Restore backup…" (M10 T13; §8.11, §10.3, PD-168, PD-181) ----------
+
+/// `restore_begin {}`: Rust draws every dialog and opens the credential window itself; no path and
+/// no secret come in.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreBeginArgs {}
+
+/// `restore_cancel {}`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreCancelArgs {}
+
+/// `restore_begin`'s answer after a completed restore (counts only). `tokens_deleted` instances
+/// need their token again (§8.11 step 3); `offer_passphrase_change` is always true: the backup's
+/// recovery passphrase is this log's now, and §8.11 step 2 offers a change right after.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RestoreDoneDto {
+    pub restore_seq: u64,
+    pub records_lost: u64,
+    pub tokens_deleted: u64,
+    pub offer_passphrase_change: bool,
+}
+
+impl RestoreDoneDto {
+    pub fn of(r: &atlas_duck_audit::RestoreReport) -> RestoreDoneDto {
+        RestoreDoneDto {
+            restore_seq: r.restore_seq,
+            records_lost: r.records_lost,
+            tokens_deleted: r.pats_deleted.len() as u64,
+            offer_passphrase_change: true,
+        }
+    }
+}
+
+/// `restore_cancel`'s answer: true when the restore ended before its store call; false when none
+/// ran. Once the store call began the answer is the error `busy` (PD-181).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RestoreCancelDto {
+    pub cancelled: bool,
+}
+
+/// `restore_begin {}` (§8.11, PD-168, PD-181): the Settings restore as the serving state's one audit
+/// job (`busy` while an export, backup or restore runs; `busy` too while the credential window is
+/// open for something else): `restore_flow::run_live_restore` (the native "Restore backup"
+/// confirmation, Rust's file dialog, the passphrase through the credential window, the rollback
+/// confirmation when the store asks, `Store::restore`), then `Core::after_restore` inside the job
+/// (the config file reconciled again, `needs_token` per deleted PAT; Quit waits for the job before
+/// the core's shutdown, so they precede `APP_STOP`), then `settings_changed` and `status_banner`.
+#[tauri::command]
+pub async fn restore_begin<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<RestoreBeginArgs>,
+) -> Result<RestoreDoneDto, CommandError> {
+    let Args(RestoreBeginArgs {}) = args;
+    let response = async {
+        let state = app
+            .try_state::<ServeSlot>()
+            .and_then(|slot| slot.get().cloned())
+            .ok_or(CommandError::NotReady)?;
+        let core = state.core.get().cloned().ok_or(CommandError::NotReady)?;
+        let store = state.open_store().ok_or(CommandError::NotReady)?;
+        let confirmer = state.confirmer().ok_or(CommandError::NotReady)?;
+        if credential::current_purpose(&app).is_some() {
+            return Err(CommandError::Busy);
+        }
+        let handle = app.clone();
+        let rx = state
+            .spawn_restore_job(move |cancel, call| {
+                restore_job(&handle, &core, &store, &*confirmer, &call, &cancel)
+            })
+            .map_err(|e| match e {
+                JobRefused::Busy => CommandError::Busy,
+                JobRefused::ShuttingDown => CommandError::NotReady,
+            })?;
+        rx.await.map_err(|_| CommandError::Internal)?
+    }
+    .await;
+    note_failure(&response);
+    finish(&app, response)
+}
+
+/// The job of `restore_begin`, on its blocking thread.
+fn restore_job<R: Runtime>(
+    app: &AppHandle<R>,
+    core: &Arc<atlas_duck_core::Core>,
+    store: &atlas_duck_audit::Store,
+    confirmer: &dyn atlas_duck_core::NativeConfirmer,
+    call: &StoreCall,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<RestoreDoneDto, CommandError> {
+    let report = restore_flow::run_live_restore(
+        store,
+        confirmer,
+        || restore_flow::pick_restore_source(app),
+        |stop| restore_passphrase(app, stop),
+        call,
+        cancel,
+        app,
+    )?;
+    // M2 handoff (T16): the restored view must be reconciled with the config file before prune
+    // runs again, and every PAT the restore deleted is logged `needs_token` (PD-28).
+    if tauri::async_runtime::block_on(core.after_restore(&report)).is_err() {
+        tracing::warn!(
+            event = LOG_EVENT_SETTINGS_FAILED,
+            error_class = "restore",
+            error_kind = "after_restore"
+        );
+    }
+    emit_settings_changed(app);
+    emit_status_changed(app);
+    Ok(RestoreDoneDto::of(&report))
+}
+
+/// The backup's passphrase: the credential window opened for `restore_backup` and the one entry its
+/// `submit_secret` hands over (never a command response). A window that goes without a submit, or
+/// `stop` (restore cancel, Quit), is `None`; the window is closed then.
+fn restore_passphrase<R: Runtime>(
+    app: &AppHandle<R>,
+    stop: &dyn Fn() -> bool,
+) -> Option<secrecy::SecretString> {
+    let request = credential::request_restore_passphrase(app, Show::Focus).ok()?;
+    let entered = restore_flow::wait_passphrase(&request.rx, stop);
+    if entered.is_none() {
+        credential::close_if(app, request.generation);
+    }
+    entered
+}
+
+/// `restore_cancel {}` (PD-181): a Settings restore ends before its store call (`{cancelled:
+/// true}`: no store call, no `RESTORE`, the credential window closes); once `Store::restore` runs it
+/// cannot be cancelled (`busy`). `{cancelled: false}` when no restore runs.
+#[tauri::command]
+pub async fn restore_cancel<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<RestoreCancelArgs>,
+) -> Result<RestoreCancelDto, CommandError> {
+    let Args(RestoreCancelArgs {}) = args;
+    let response = match app.try_state::<ServeSlot>().and_then(|s| s.get().cloned()) {
+        None => Ok(RestoreCancelDto { cancelled: false }),
+        Some(state) => match state.cancel_restore() {
+            RestoreCancel::Cancelled(cancelled) => Ok(RestoreCancelDto { cancelled }),
+            RestoreCancel::Running => Err(CommandError::Busy),
+        },
+    };
+    finish(&app, response)
 }
 
 #[cfg(test)]

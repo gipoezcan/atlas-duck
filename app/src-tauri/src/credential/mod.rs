@@ -24,6 +24,8 @@
 pub mod follow;
 pub mod raise;
 
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+
 use atlas_duck_audit::{ArchivedDb, LockedReason, RecoveryOffer};
 use atlas_duck_core::config::instances::product_str;
 use atlas_duck_core::{AdminError, GateState, InstanceView, UiEvent};
@@ -67,6 +69,12 @@ pub enum Purpose {
     RecoverThisLog,
     /// Locked `keychain_lost` after an unfinished restore: "Finish restore" (§8.7).
     FinishRestore,
+    /// M10 T13 (PD-168): the recovery passphrase of the backup a restore runs from, one entry,
+    /// handed to the waiting restore (never a command response). Opened by Settings "Restore
+    /// backup…" in a serving app, or set in place of "Recover this log"/"Finish restore" by the
+    /// locked window's "Restore a backup instead". Not a lock state: the window follows no gate
+    /// while it waits (the restore that opened it ends it).
+    RestoreBackup,
 }
 
 impl Purpose {
@@ -79,6 +87,7 @@ impl Purpose {
             Purpose::Unlock => "unlock",
             Purpose::RecoverThisLog => "recover_this_log",
             Purpose::FinishRestore => "finish_restore",
+            Purpose::RestoreBackup => "restore_backup",
         }
     }
 
@@ -179,6 +188,14 @@ pub struct CredentialState {
     /// Which window the purpose belongs to: bumped by every open that builds a new one. A close
     /// that was meant for one window ([`close_if`]) leaves its successor alone (M6 T22, m-2).
     generation: Generation,
+    /// M10 T13 (PD-168): the waiting restore's end of the `restore_backup` passphrase. A reset (the
+    /// window closed or another purpose took it) drops it, which ends that restore with no store
+    /// call and no event.
+    restore: Option<SyncSender<SecretString>>,
+    /// The lock-state purpose a `restore_backup` window was set in place of (`keychain_lost`),
+    /// which it goes back to when that restore ends without a store; `None` for a window
+    /// Settings opened.
+    restore_return: Option<Purpose>,
 }
 
 /// Identifies one credential window (its purpose and its passphrase request).
@@ -195,7 +212,26 @@ impl CredentialState {
         self.purpose = None;
         self.passphrase = None;
         self.handed_over = false;
+        self.restore = None;
+        self.restore_return = None;
     }
+}
+
+/// What an open hands to the window it opens for (one of the two in-memory channels).
+enum Handoff {
+    /// The wizard's end of the first-run pair (Task 23).
+    FirstRun(oneshot::Sender<FirstRunPassphrase>),
+    /// A restore's end of the backup's passphrase (M10 T13).
+    Restore(SyncSender<SecretString>),
+}
+
+/// A restore's end of a `restore_backup` request (M10 T13): the window it waits on and the
+/// receiver `submit_secret` hands the one entry to. The receiver disconnects when the window goes
+/// (closed by the user or by Rust, or given another purpose) before a submit.
+#[derive(Debug)]
+pub struct RestorePassphrase {
+    pub generation: Generation,
+    pub rx: Receiver<SecretString>,
 }
 
 fn registry<R: Runtime>(
@@ -220,15 +256,16 @@ pub fn open<R: Runtime>(
     purpose: Purpose,
     how: Show,
 ) -> Result<(), WindowError> {
-    open_inner(app, purpose, None, how)
+    open_inner(app, purpose, None, how).map(drop)
 }
 
+/// The window's generation once it is open for `purpose` (see [`open`]).
 fn open_inner<R: Runtime>(
     app: &AppHandle<R>,
     purpose: Purpose,
-    passphrase: Option<oneshot::Sender<FirstRunPassphrase>>,
+    handoff: Option<Handoff>,
     how: Show,
-) -> Result<(), WindowError> {
+) -> Result<Generation, WindowError> {
     enum Decide {
         New,
         Same,
@@ -236,6 +273,7 @@ fn open_inner<R: Runtime>(
         Busy,
     }
     let mut announce = false;
+    let mut generation = 0;
     let opened = windows::open_with(app, Label::Credential, how, |registry, exists| {
         let mut st = registry.credential_state();
         // M6 T28 (T20 m-9), the credential half of the two-sided interlock: a window for a token is
@@ -271,16 +309,22 @@ fn open_inner<R: Runtime>(
                 st.purpose = Some(purpose);
             }
         }
-        if passphrase.is_some() {
-            st.passphrase = passphrase;
-            st.handed_over = false;
+        match handoff {
+            Some(Handoff::FirstRun(tx)) => {
+                st.passphrase = Some(tx);
+                st.handed_over = false;
+            }
+            // A second request for the same purpose replaces the first: its restore ends.
+            Some(Handoff::Restore(tx)) => st.restore = Some(tx),
+            None => {}
         }
+        generation = st.generation;
         Ok(())
     });
     if announce {
         context_changed(app);
     }
-    opened
+    opened.map(|()| generation)
 }
 
 /// Asks for the first-run recovery passphrase (§2.5 wizard step (1b), §8.6; Task 23): opens the
@@ -292,8 +336,111 @@ pub fn request_recovery_passphrase<R: Runtime>(
     how: Show,
 ) -> Result<oneshot::Receiver<FirstRunPassphrase>, WindowError> {
     let (tx, rx) = oneshot::channel();
-    open_inner(app, Purpose::RecoveryPassphrase, Some(tx), how)?;
+    open_inner(
+        app,
+        Purpose::RecoveryPassphrase,
+        Some(Handoff::FirstRun(tx)),
+        how,
+    )?;
     Ok(rx)
+}
+
+/// Asks for a backup's recovery passphrase (Settings "Restore backup…", M10 T13, PD-168): opens
+/// the window for [`Purpose::RestoreBackup`] (`Busy` while it is open for anything else) and
+/// returns the restore's end of the one-entry channel `submit_secret` hands the entry to.
+pub fn request_restore_passphrase<R: Runtime>(
+    app: &AppHandle<R>,
+    how: Show,
+) -> Result<RestorePassphrase, WindowError> {
+    let (tx, rx) = sync_channel(1);
+    let generation = open_inner(app, Purpose::RestoreBackup, Some(Handoff::Restore(tx)), how)?;
+    Ok(RestorePassphrase { generation, rx })
+}
+
+/// "Restore a backup instead" in the locked window (`keychain_lost`, M10 T13, PD-168): the open
+/// window `generation`, while it is "Recover this log" or "Finish restore", becomes
+/// [`Purpose::RestoreBackup`] in place (same window, announced), remembering the purpose it goes
+/// back to ([`leave_restore`]). `Busy` when that window is gone or has another purpose.
+pub fn enter_restore<R: Runtime>(
+    app: &AppHandle<R>,
+    generation: Generation,
+) -> Result<RestorePassphrase, WindowError> {
+    let r = registry(app)?;
+    let rx = {
+        let _no_open_in_between = r.lock_opening();
+        if app.get_webview_window(Label::Credential.as_str()).is_none() {
+            return Err(WindowError::Busy);
+        }
+        let mut st = r.credential_state();
+        let back = match st.purpose.clone() {
+            Some(p @ (Purpose::RecoverThisLog | Purpose::FinishRestore))
+                if st.generation == generation =>
+            {
+                p
+            }
+            _ => return Err(WindowError::Busy),
+        };
+        let (tx, rx) = sync_channel(1);
+        st.purpose = Some(Purpose::RestoreBackup);
+        st.restore = Some(tx);
+        st.restore_return = Some(back);
+        rx
+    };
+    context_changed(app);
+    Ok(RestorePassphrase { generation, rx })
+}
+
+/// The restore of window `generation` ended without a store (cancelled, refused, failed): a
+/// window set in place by [`enter_restore`] goes back to its lock-state purpose (announced); any
+/// other window is left alone. The pending channel goes either way.
+pub fn leave_restore<R: Runtime>(app: &AppHandle<R>, generation: Generation) {
+    let Ok(r) = registry(app) else {
+        return;
+    };
+    let announce = {
+        let _no_open_in_between = r.lock_opening();
+        let mut st = r.credential_state();
+        if st.generation != generation || st.purpose != Some(Purpose::RestoreBackup) {
+            return;
+        }
+        st.restore = None;
+        match st.restore_return.take() {
+            Some(back) => {
+                st.purpose = Some(back);
+                true
+            }
+            None => false,
+        }
+    };
+    if announce {
+        context_changed(app);
+    }
+}
+
+/// Hands the backup's passphrase to the restore waiting on this window (`submit_secret`, M10
+/// T13). `Err(secret)` when none waits (no request, or the restore ended): the caller drops it
+/// (zeroized). `Ok(in_place)`: whether the window was set in place of a lock-state purpose (it
+/// then stays open for the restore's answer; a window Settings opened closes after the submit).
+pub fn hand_restore_passphrase<R: Runtime>(
+    app: &AppHandle<R>,
+    secret: SecretString,
+) -> Result<bool, SecretString> {
+    let Ok(registry) = registry(app) else {
+        return Err(secret);
+    };
+    let mut st = registry.credential_state();
+    if st.purpose != Some(Purpose::RestoreBackup) {
+        return Err(secret);
+    }
+    let Some(tx) = st.restore.take() else {
+        return Err(secret);
+    };
+    tx.try_send(secret).map_err(|e| match e {
+        std::sync::mpsc::TrySendError::Full(s) | std::sync::mpsc::TrySendError::Disconnected(s) => {
+            s
+        }
+    })?;
+    Ok(st.restore_return.is_some())
 }
 
 /// The purpose the open window has (`None`: no window, or the registry is missing).
@@ -617,9 +764,12 @@ mod tests {
             Purpose::Unlock,
             Purpose::RecoverThisLog,
             Purpose::FinishRestore,
+            // M10 T13: not a lock state (the restore that opened it ends it, no gate moves it).
+            Purpose::RestoreBackup,
         ];
         let names: std::collections::BTreeSet<&str> = all.iter().map(Purpose::as_str).collect();
         assert_eq!(names.len(), all.len());
+        assert_eq!(Purpose::RestoreBackup.as_str(), "restore_backup");
         let lock: Vec<&str> = all
             .iter()
             .filter(|p| p.is_lock_state())

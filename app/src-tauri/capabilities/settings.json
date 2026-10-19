@@ -1,9 +1,10 @@
 {
   "identifier": "settings",
-  "description": "the Settings window (Δ1): settings, instances, credential trigger, CLI, removal",
+  "description": "the Settings window (Δ1): settings, instances, credential trigger, CLI, removal, backup and restore (M10)",
   "windows": ["settings"],
   "permissions": [
     "allow-app-status",
+    "allow-backup-trigger",
     "allow-cli-install",
     "allow-cli-uninstall",
     "allow-credential-window-open",
@@ -18,6 +19,8 @@
     "allow-removal-finish",
     "allow-removal-mark",
     "allow-removal-state",
+    "allow-restore-begin",
+    "allow-restore-cancel",
     "allow-retest-token",
     "allow-settings-apply",
     "allow-settings-get",

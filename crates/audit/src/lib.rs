@@ -101,7 +101,7 @@ pub use recover::{RecoverReport, archive_and_start_fresh, latest_archived, recov
 pub use recovery::MIN_PASSPHRASE_CHARS;
 pub use request_set::{RequestRecord, request_set_hash};
 pub use requests::{ReconcileReport, ReconciledWrite, ScriptFailedFlags, is_terminal};
-pub use restore::{RestoreReport, finish_restore, restore_from_source};
+pub use restore::{RestoreReport, finish_restore, live_store_blocks_restore, restore_from_source};
 pub use schema::{DB_FILE, SCHEMA_HEAD};
 pub use settings::{
     FilePolicy, InstancePolicy, KEY_ALLOW_DEGRADED_SCRIPTS, RETENTION_DEFAULT, RETENTION_MIN,

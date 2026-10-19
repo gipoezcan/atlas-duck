@@ -17,6 +17,7 @@ pub mod diag;
 pub mod early_argv;
 pub mod os_hooks;
 pub mod removal;
+pub mod restore_flow;
 pub mod sandbox_probe;
 pub mod script_glue;
 pub mod secret_service;

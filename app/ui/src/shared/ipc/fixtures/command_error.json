@@ -320,6 +320,54 @@
     "kind": "audit"
   },
   {
+    "error": {
+      "kind": "wrong_passphrase"
+    },
+    "kind": "restore"
+  },
+  {
+    "error": {
+      "kind": "not_a_backup"
+    },
+    "kind": "restore"
+  },
+  {
+    "error": {
+      "kind": "newer"
+    },
+    "kind": "restore"
+  },
+  {
+    "error": {
+      "kind": "broken"
+    },
+    "kind": "restore"
+  },
+  {
+    "error": {
+      "kind": "anchor_dir_mismatch"
+    },
+    "kind": "restore"
+  },
+  {
+    "error": {
+      "kind": "committed_incomplete"
+    },
+    "kind": "restore"
+  },
+  {
+    "error": {
+      "kind": "keychain"
+    },
+    "kind": "restore"
+  },
+  {
+    "error": {
+      "kind": "failed"
+    },
+    "kind": "restore"
+  },
+  {
     "kind": "internal"
   }
 ]

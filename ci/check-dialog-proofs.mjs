@@ -103,6 +103,13 @@ function cfgTestModules(files) {
   return found;
 }
 
+/** The module a file is: `serve` for `…/serve.rs`, `settings` for `…/settings/mod.rs`. */
+export function moduleOf(file) {
+  const parts = posix(file).split("/");
+  const name = parts[parts.length - 1].replace(/\.rs$/, "");
+  return name === "mod" ? parts[parts.length - 2] : name;
+}
+
 /** `crates/core` for `crates/core/src/x.rs`, `app/src-tauri` for `app/src-tauri/src/x.rs`. */
 function crateOf(file) {
   const i = posix(file).indexOf("/src/");
@@ -387,7 +394,11 @@ export function scanDialogProofs(files, helpers = PROOF_HELPERS, guarded = GUARD
         if (/\blet\s+(?:mut\s+)?$/.test(before)) return; // a local of the same name
         if (/\bmod\s+$/.test(before)) return; // a module declaration
         if (/\.\s*$/.test(before) && !/\bself\s*\.\s*$/.test(before)) return; // a method of another value
-        if (/::\s*$/.test(before) && !/\b(?:super|self|crate|Self)\s*::\s*$/.test(before)) return; // `Type::name`
+        // `Type::name` or `other_module::name`: another fn of that name. A path through the helper's
+        // own module (`crate::serve::confirmed_by`, `serve::confirmed_by`) names the helper (M10
+        // T13: such a call was skipped before).
+        const seg = /\b(\w+)\s*::\s*$/.exec(before)?.[1];
+        if (seg !== undefined && !["super", "self", "crate", "Self", moduleOf(h.file)].includes(seg)) return;
         if (/^\s*:(?!:)/.test(after)) return; // a parameter or field name
         if (h.noneOk && /^\s*\(/.test(file.code.slice(m.index + m[0].length))) {
           const open = file.code.indexOf("(", m.index);

@@ -31,6 +31,8 @@ import type {
   RemovalChoice,
   RemovalFinishAnswer,
   RemovalState,
+  RestoreCancelAnswer,
+  RestoreDone,
   RetestOutcome,
   RunningScriptView,
   SettingChange,
@@ -67,6 +69,8 @@ import {
   isRemovalBackupAnswer,
   isRemovalFinishAnswer,
   isRemovalState,
+  isRestoreCancelAnswer,
+  isRestoreDone,
   isRetestOutcome,
   isRunningScriptView,
   isSettingsGet,
@@ -333,6 +337,21 @@ export function exportCancel(): Promise<ExportCancelAnswer> {
 /** A full backup into a folder Rust's own dialog picks (no token in it); `saved: false` when cancelled. */
 export function backupTrigger(): Promise<RemovalBackupAnswer> {
   return call('backup_trigger', {}, isRemovalBackupAnswer);
+}
+
+/**
+ * "Restore backup…" (8.11, PD-168, M10 T13): Rust asks its native confirmation, opens its own file
+ * dialog and the credential window for the backup's passphrase, then restores (indeterminate
+ * `audit_job {job: restore}`; requests wait while it runs). A cancelled dialog or closed window
+ * rejects with `cancelled`; a refused restore with `restore` (`error.kind`).
+ */
+export function restoreBegin(): Promise<RestoreDone> {
+  return call('restore_begin', {}, isRestoreDone);
+}
+
+/** Ends a restore before its store call (PD-181); `busy` once the restore runs. */
+export function restoreCancel(): Promise<RestoreCancelAnswer> {
+  return call('restore_cancel', {}, isRestoreCancelAnswer);
 }
 
 /** The live script runs (PD-81, 9.6), oldest first. */

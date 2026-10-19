@@ -747,6 +747,125 @@ fn lock_states_follow_each_other_in_an_open_window() -> TestResult {
     Ok(())
 }
 
+/// A recognisable backup passphrase: never in an answer.
+const RESTORE_CANARY: &str = "canary-restore-passphrase-t13";
+
+/// §10.3, PD-168 (M10 T13): a backup's recovery passphrase enters only through `submit_secret` in
+/// the `restore_backup` window Rust opened: the context header names the purpose; a second entry
+/// or an expiry date is refused and nothing is handed on; the one entry reaches the waiting restore
+/// through the in-memory channel (the answer holds no secret) and the window Settings opened
+/// closes. A window closed without a submit ends the wait (the channel disconnects); with no
+/// restore waiting a submit is `not_ready`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restore_passphrase_only_through_submit_secret() -> TestResult {
+    let tmp = scratch()?;
+    let app = app_with_data_dir(tmp.path())?;
+    let handle = app.handle().clone();
+    let request = credential::request_restore_passphrase(&handle, Show::Focus)?;
+    assert_eq!(
+        credential::current_purpose(&handle),
+        Some(Purpose::RestoreBackup)
+    );
+    let w = window(&app, "credential")?;
+    assert_eq!(
+        call(&w, "credential_context", json!({}))
+            .await
+            .map_err(|e| e.to_string())?["purpose"],
+        "restore_backup"
+    );
+    for (body, field) in [
+        (
+            json!({"secret": RESTORE_CANARY, "secret_confirm": RESTORE_CANARY}),
+            "secret_confirm",
+        ),
+        (
+            json!({"secret": RESTORE_CANARY, "expires_on": "2027-01-31"}),
+            "expires_on",
+        ),
+    ] {
+        assert_eq!(
+            call(&w, "submit_secret", body).await,
+            Err(json!({"kind": "invalid_argument", "field": field}))
+        );
+    }
+    assert!(request.rx.try_recv().is_err(), "nothing handed on");
+    let answer = call(&w, "submit_secret", json!({"secret": RESTORE_CANARY}))
+        .await
+        .map_err(|e| e.to_string())?;
+    assert_eq!(answer, json!({"accepted": {}}));
+    assert!(!answer.to_string().contains(RESTORE_CANARY));
+    let entered = request.rx.recv_timeout(WAIT)?;
+    assert_eq!(entered.expose_secret(), RESTORE_CANARY);
+    closed(&handle).await?;
+
+    // Closed without a submit: the restore's wait ends. (A new app: the mock runtime keeps the
+    // destroyed window, which would make the next open `busy`.)
+    let tmp = scratch()?;
+    let app = app_with_data_dir(tmp.path())?;
+    let handle = app.handle().clone();
+    let request = credential::request_restore_passphrase(&handle, Show::Focus)?;
+    let w = window(&app, "credential")?;
+    call(&w, "close_credential", json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    closed(&handle).await?;
+    assert!(matches!(
+        request.rx.recv_timeout(WAIT),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    ));
+    Ok(())
+}
+
+/// PD-168 (M10 T13): "Restore a backup instead" sets the locked window (`keychain_lost`) in place
+/// to `restore_backup` (same window, `credential_context_changed`); its submit is handed to the
+/// waiting restore and the window stays open for that restore's answer; when the restore ends
+/// without a store the window goes back to its locked purpose. Another window's generation is
+/// refused.
+#[test]
+fn restore_in_place_goes_back_to_the_locked_purpose() -> TestResult {
+    let tmp = scratch()?;
+    let app = app_with_data_dir(tmp.path())?;
+    let handle = app.handle();
+    open_credential(handle, Unlock::Recover, Show::Focus)?;
+    let (_, generation) = credential::current_window(handle).ok_or("no window")?;
+    assert_eq!(
+        credential::enter_restore(handle, generation.wrapping_add(1)).err(),
+        Some(WindowError::Busy)
+    );
+    let request = credential::enter_restore(handle, generation)?;
+    assert_eq!(
+        credential::current_window(handle),
+        Some((Purpose::RestoreBackup, generation))
+    );
+    let w = window(&app, "credential")?;
+    assert_eq!(
+        invoke(&w, "submit_secret", json!({"secret": RESTORE_CANARY})),
+        Ok(json!({"accepted": {}}))
+    );
+    assert!(request.rx.recv_timeout(WAIT).is_ok());
+    assert_eq!(
+        credential::current_window(handle),
+        Some((Purpose::RestoreBackup, generation)),
+        "the window waits for the restore's answer"
+    );
+    // A second submit has no restore to go to.
+    assert_eq!(
+        invoke(&w, "submit_secret", json!({"secret": RESTORE_CANARY})),
+        Err(json!({"kind": "not_ready"}))
+    );
+    credential::leave_restore(handle, generation);
+    assert_eq!(
+        credential::current_window(handle),
+        Some((Purpose::RecoverThisLog, generation))
+    );
+    // `restore_from_backup` is for the locked purposes only (not_ready otherwise: no gate here).
+    assert_eq!(
+        invoke(&w, "restore_from_backup", json!({})),
+        Err(json!({"kind": "not_ready"}))
+    );
+    Ok(())
+}
+
 /// §7.1, §10.3: the window cannot be opened for an `http://` instance or one whose origin is not
 /// natively confirmed; nothing is built.
 #[test]
