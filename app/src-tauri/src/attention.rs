@@ -10,7 +10,7 @@
 //! `queue_list()`, a window call or the keychain-backed settings read.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -524,12 +524,37 @@ pub fn drive_overlay(sink: &dyn OverlaySink, pending: u32) {
     sink.set_overlay(overlay_for(pending));
 }
 
+/// The Approvals window was just built: the overlay is on its taskbar button only while the window
+/// exists (PD-173), so a window created after the count was set (tray menu, relaunch, startup, a
+/// raise) gets the current `pending` here. Other windows have no overlay.
+pub fn overlay_for_new_window(sink: &dyn OverlaySink, label: Label, pending: u32) {
+    if label == Label::Approvals {
+        drive_overlay(sink, pending);
+    }
+}
+
+/// The overlay of a window `windows::open` just built, with the count of [`AppState`]. A stale
+/// read is harmless: the next `set_badge` (every queue change) drives the overlay again, and the
+/// worker that calls it is the only writer of the count.
+///
+/// [`AppState`]: crate::state::AppState
+pub fn apply_overlay_to_new_window<R: Runtime>(app: &AppHandle<R>, label: Label) {
+    let pending = app
+        .try_state::<crate::state::AppState>()
+        .map_or(0, |s| s.pending());
+    overlay_for_new_window(&AppOverlay(app), label, pending);
+}
+
 /// §5.6: a default-mode raise shows the window without activating it; only where `show()` may not
 /// activate-or-surface it (Windows) does it also flash the taskbar button. macOS and Linux no longer
 /// flash on that raise (M6 final review M-6, L217).
 pub fn flash_after_default_raise(os: &str) -> bool {
     os == "windows"
 }
+
+/// The largest width or height `decode_overlay` accepts.
+#[cfg(any(windows, test))]
+const MAX_OVERLAY_SIDE: u32 = 256;
 
 /// Decodes one committed overlay PNG (`icons/overlay-*.png`) into `(width, height, RGBA)`. The
 /// generator (`ci/gen-overlay-icons.mjs`) writes 8-bit RGBA, no interlace, filter none and a stored
@@ -562,6 +587,10 @@ pub fn decode_overlay(png: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
         }
     }
     let (width, height) = header?;
+    // Before any buffer is sized from the header: the overlays are 16x16.
+    if width > MAX_OVERLAY_SIDE || height > MAX_OVERLAY_SIDE {
+        return None;
+    }
     let row = usize::try_from(width).ok()?.checked_mul(4)?;
     let want = row
         .checked_add(1)?
@@ -624,24 +653,24 @@ impl OverlayIcon {
 /// the tray. The notification plugin is used from Rust only; no window capability grants it.
 pub struct TauriNotifier {
     app: AppHandle<Wry>,
-    /// The last badge count: the overlay is applied again when the Approvals window is created
-    /// after it (it only shows "while the window exists", PD-173).
-    pending: AtomicU32,
 }
 
 impl TauriNotifier {
     pub fn new(app: AppHandle<Wry>) -> TauriNotifier {
-        TauriNotifier {
-            app,
-            pending: AtomicU32::new(0),
-        }
+        TauriNotifier { app }
     }
 }
 
-impl OverlaySink for TauriNotifier {
+/// The overlay of an app's Approvals window. The overlay only shows "while the window exists"
+/// (PD-173): `set_badge` drives it for a window that is there, and `windows::open` applies the
+/// current count to a window it builds ([`apply_overlay_to_new_window`]), on every path that
+/// opens it (raise, tray menu, relaunch, startup).
+struct AppOverlay<'a, R: Runtime>(&'a AppHandle<R>);
+
+impl<R: Runtime> OverlaySink for AppOverlay<'_, R> {
     #[cfg(windows)]
     fn set_overlay(&self, icon: Option<OverlayIcon>) {
-        let Some(w) = self.app.get_webview_window(Label::Approvals.as_str()) else {
+        let Some(w) = self.0.get_webview_window(Label::Approvals.as_str()) else {
             return;
         };
         let image = icon
@@ -653,7 +682,15 @@ impl OverlaySink for TauriNotifier {
 
     /// macOS (no Dock tile, the tray title carries the count) and Linux have no overlay.
     #[cfg(not(windows))]
-    fn set_overlay(&self, _icon: Option<OverlayIcon>) {}
+    fn set_overlay(&self, _icon: Option<OverlayIcon>) {
+        let _ = self.0;
+    }
+}
+
+impl OverlaySink for TauriNotifier {
+    fn set_overlay(&self, icon: Option<OverlayIcon>) {
+        AppOverlay(&self.app).set_overlay(icon);
+    }
 }
 
 impl Notifier for TauriNotifier {
@@ -666,8 +703,6 @@ impl Notifier for TauriNotifier {
             Show::WithoutActivating
         };
         let _ = windows::open(&self.app, Label::Approvals, how);
-        // The window may have been created just now: it gets the overlay it missed.
-        drive_overlay(self, self.pending.load(Ordering::Relaxed));
         if !focus && flash_after_default_raise(std::env::consts::OS) {
             // Where `show()` may not activate or surface the window (Windows) the taskbar flash
             // says so (§5.6); macOS and Linux do not flash on a default-mode raise (L217 M-6).
@@ -695,7 +730,6 @@ impl Notifier for TauriNotifier {
     fn set_badge(&self, pending: u32) {
         // The tray's "Open approvals (N)", tooltip and (macOS) menu-bar title, and the Windows
         // taskbar overlay icon (PD-173). The macOS app has no Dock tile (§2.5).
-        self.pending.store(pending, Ordering::Relaxed);
         crate::tray::set_pending(&self.app, pending);
         drive_overlay(self, pending);
     }
@@ -1316,6 +1350,85 @@ mod tests {
             .expect("IDAT chunk");
         compressed[idat + 4 + 2] = 0x03;
         assert_eq!(decode_overlay(&compressed), None);
+    }
+
+    /// The committed PNG with `edit(png, idat_data_start)` applied; the zlib header sits at
+    /// `idat_data_start`, the block flags at `+2`, LEN at `+3`, NLEN at `+5`, the first filter byte
+    /// at `+7`.
+    fn mutated(edit: impl FnOnce(&mut Vec<u8>, usize)) -> Vec<u8> {
+        let mut png = OverlayIcon::Digit(1).png().to_vec();
+        let idat = png
+            .windows(4)
+            .position(|w| w == b"IDAT")
+            .expect("IDAT chunk");
+        edit(&mut png, idat + 4);
+        png
+    }
+
+    #[test]
+    fn overlay_decoder_refuses_each_malformed_stream() {
+        // Control: the unedited file decodes (the refusals below are the edits' doing).
+        assert!(decode_overlay(&mutated(|_, _| {})).is_some());
+        // NLEN is not the complement of LEN.
+        assert_eq!(decode_overlay(&mutated(|p, d| p[d + 5] ^= 0x01)), None);
+        // A filter byte other than none.
+        assert_eq!(decode_overlay(&mutated(|p, d| p[d + 7] = 1)), None);
+        // A stored length that overruns the stream (NLEN kept consistent).
+        assert_eq!(
+            decode_overlay(&mutated(
+                |p, d| p[d + 3..d + 7].copy_from_slice(&[0xff, 0xff, 0, 0])
+            )),
+            None
+        );
+        // No IDAT chunk, no IEND chunk.
+        assert_eq!(decode_overlay(&mutated(|p, d| p[d - 1] = b'X')), None);
+        let no_iend = {
+            let mut png = OverlayIcon::Digit(1).png().to_vec();
+            let end = png
+                .windows(4)
+                .position(|w| w == b"IEND")
+                .expect("IEND chunk");
+            png[end + 3] = b'X';
+            png
+        };
+        assert_eq!(decode_overlay(&no_iend), None);
+        // The header says another size than the pixels hold; and sizes that would ask for an
+        // absurd buffer are refused before any is allocated.
+        for (width, height) in [
+            (15u32, 16u32),
+            (16, 17),
+            (0, 0),
+            (257, 16),
+            (1 << 20, 1 << 20),
+        ] {
+            let png = mutated(|p, _| {
+                p[16..20].copy_from_slice(&width.to_be_bytes());
+                p[20..24].copy_from_slice(&height.to_be_bytes());
+            });
+            assert_eq!(decode_overlay(&png), None, "{width}x{height}");
+        }
+    }
+
+    #[test]
+    fn a_new_approvals_window_gets_the_current_overlay() {
+        let sink = FakeOverlay::default();
+        overlay_for_new_window(&sink, Label::Approvals, 3);
+        overlay_for_new_window(&sink, Label::Approvals, 12);
+        overlay_for_new_window(&sink, Label::Approvals, 0);
+        assert_eq!(
+            *lock(&sink.0),
+            vec![
+                Some(OverlayIcon::Digit(3)),
+                Some(OverlayIcon::NinePlus),
+                None
+            ]
+        );
+        // No other window has an overlay.
+        let other = FakeOverlay::default();
+        for label in Label::ALL.into_iter().filter(|l| *l != Label::Approvals) {
+            overlay_for_new_window(&other, label, 3);
+        }
+        assert!(lock(&other.0).is_empty());
     }
 
     #[test]

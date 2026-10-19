@@ -56,6 +56,8 @@ pub const MSG_STORE_UNAVAILABLE: &str = "audit store could not be opened";
 
 /// Log event when the tray icon cannot be created (startup continues).
 pub const LOG_EVENT_TRAY_BUILD_FAILED: &str = "tray_build_failed";
+/// Log event when the macOS menu-bar count could not be set (the tooltip and menu still show it).
+pub const LOG_EVENT_TRAY_TITLE_FAILED: &str = "tray_title_failed";
 /// Log event when tauri-plugin-single-instance forwards a second launch.
 pub const LOG_EVENT_FORWARDED_LAUNCH: &str = "forwarded_launch";
 /// Log event when the CI-only autostart probe cannot enable autostart.
@@ -385,19 +387,18 @@ pub fn refresh(app: &AppHandle) {
     let pending = app.try_state::<AppState>().map_or(0, |s| s.pending());
     let updated = tray_menu(app, &entries)
         .and_then(|menu| tray.set_menu(Some(menu)))
-        .and_then(|()| tray.set_tooltip(Some(tooltip)))
-        .and_then(|()| {
-            // The menu-bar count is macOS's badge (PD-173); the other platforms ignore a title
-            // or show it as a label next to the icon, which is not wanted there.
-            if cfg!(target_os = "macos") {
-                tray.set_title(tray_title(pending))
-            } else {
-                Ok(())
-            }
-        });
+        .and_then(|()| tray.set_tooltip(Some(tooltip)));
     if updated.is_err() {
         tracing::warn!(
             event = LOG_EVENT_TRAY_BUILD_FAILED,
+            error_class = "tauri_tray"
+        );
+    }
+    // The menu-bar count is macOS's badge (PD-173); the other platforms ignore a title or show it
+    // as a label next to the icon, which is not wanted there.
+    if cfg!(target_os = "macos") && tray.set_title(tray_title(pending)).is_err() {
+        tracing::warn!(
+            event = LOG_EVENT_TRAY_TITLE_FAILED,
             error_class = "tauri_tray"
         );
     }

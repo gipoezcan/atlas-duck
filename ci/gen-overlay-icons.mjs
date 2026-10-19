@@ -5,7 +5,7 @@
 // the committed files byte for byte (the `ci/gen-overlay-icons.test.mjs` test runs it).
 //
 // The IDAT is stored (level 0) deflate: byte-identical on every zlib and node version, and the
-// app's reader (`attention::overlay`) decodes stored blocks only, so no PNG codec is linked.
+// app's reader (`attention::decode_overlay`) decodes stored blocks only, so no PNG codec is linked.
 //
 // Usage: node ci/gen-overlay-icons.mjs [--check] [--dir <icons dir>]
 // Exit 0 = written / identical. Exit 1 = a file differs or is missing (--check), one per line.

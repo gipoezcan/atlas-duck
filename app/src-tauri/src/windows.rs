@@ -671,6 +671,7 @@ pub(crate) fn open_with<R: Runtime>(
             let data = app.try_state::<DataDirHold>().map(|h| h.data().clone());
             window_spec(label, how, data.as_ref(), cfg!(windows))
                 .and_then(|spec| build(app, &spec, registry.nav.clone()))
+                .inspect(|_| crate::attention::apply_overlay_to_new_window(app, label))
                 .and_then(|w| match how {
                     Show::Focus | Show::FocusUnrequested => bring_up(&w, how),
                     Show::WithoutActivating => Ok(()),
