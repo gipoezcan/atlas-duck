@@ -107,7 +107,8 @@ fn commands() -> String {
 fn envelope() -> String {
     "Every call prints exactly one JSON object on stdout with the keys `request_id`, `op_id`, \
      `instance`, `status`, `data`, `edited`, `redacted`, `redaction_note`, `message`, `error` \
-     and `meta`; an absent value is `null`. `error` is `{code, retryable, message, details?}`. \
+     and `meta`. `edited` and `redacted` are booleans; every other key is `null` when absent. \
+     `error` is `{code, retryable, message, details?}`. \
      The exit code is a summary of the envelope: see the exit matrix.\n"
         .to_owned()
 }
@@ -138,6 +139,16 @@ fn exit_matrix() -> String {
          envelope whose `data` holds `script_error` exits {}.\n",
         exit::RESULT_EVICTED,
         exit::SCRIPT,
+    );
+    out.push_str(
+        "\n`status` exits 0 whenever the request id is known, whatever state the request is \
+         in: read the envelope for that. An id the app does not know is \
+         `unknown_request` and follows the matrix.\n\n\
+         `verify-export` prints no envelope and has its own exit codes:\n\
+         - `verify-export` exit 0: verified against a supplied trust root\n\
+         - `verify-export` exit 20: internally consistent, trust root not verified\n\
+         - `verify-export` exit 21: tamper or fork detected\n\
+         - `verify-export` exit 22: usage or I/O error\n",
     );
     out
 }

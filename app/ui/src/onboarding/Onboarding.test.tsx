@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { onboardingText } from '../shared/ipc/invoke';
 import { Onboarding } from './Onboarding';
+import { OnboardingText, WIZARD_SECTION_IDS } from './OnboardingText';
 
 vi.mock('../shared/ipc/invoke', () => ({ onboardingText: vi.fn() }));
 
@@ -85,6 +86,54 @@ describe('Onboarding page', () => {
     expect(readText).not.toHaveBeenCalled();
   });
 
+  it('copying the same section twice clears the live line first so the second copy is announced', async () => {
+    vi.mocked(onboardingText).mockResolvedValue(sections('text'));
+    render(<Onboarding />);
+    await flush();
+    const status = screen.getByRole('status');
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Copy Section 0' }));
+    });
+    await flush();
+    expect(status.textContent).toBe('Copied: Section 0');
+    let resolve: () => void = () => undefined;
+    writeText.mockImplementationOnce(() => new Promise<void>((r) => { resolve = r; }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Copy Section 0' }));
+    });
+    expect(status.textContent).toBe('');
+    await act(async () => {
+      resolve();
+    });
+    await flush();
+    expect(status.textContent).toBe('Copied: Section 0');
+  });
+
+  it('each text block is a named region, so its heading is exposed as its name', async () => {
+    vi.mocked(onboardingText).mockResolvedValue(sections('a', 'b'));
+    render(<Onboarding />);
+    await flush();
+    expect(screen.getByRole('region', { name: 'Section 0' }).textContent).toBe('a');
+    expect(screen.getByRole('region', { name: 'Section 1' }).textContent).toBe('b');
+  });
+
+  it('the wizard subset shows exactly its seven sections of the full page, in the page order', async () => {
+    const ids = [
+      'commands', 'envelope', 'exit_matrix', 'timeouts', 'sessions', 'redaction', 'parallel',
+      'paging', 'writes', 'retry', 'outcome_unknown', 'exit9', 'confluence', 'create_fields',
+      'conflicts', 'windows_paths', 'wsl',
+    ];
+    vi.mocked(onboardingText).mockResolvedValue({
+      sections: ids.map((id) => ({ id, title: `T ${id}`, text: id })),
+    });
+    render(<OnboardingText only={WIZARD_SECTION_IDS} level={3} />);
+    await flush();
+    expect(screen.getAllByRole('heading', { level: 3 }).map((h) => h.textContent)).toEqual(
+      WIZARD_SECTION_IDS.map((id) => `T ${id}`),
+    );
+    expect(WIZARD_SECTION_IDS).toHaveLength(7);
+  });
+
   it('a clipboard that refuses, or is missing, is a fixed line and the text stays selectable', async () => {
     vi.mocked(onboardingText).mockResolvedValue(sections('only text'));
     render(<Onboarding />);
@@ -151,6 +200,8 @@ describe('Onboarding page', () => {
     expect(onboardingText).toHaveBeenCalledTimes(2);
     expect(screen.queryByRole('alert')).toBeNull();
     expect(screen.getByRole('status').textContent).toBe('Loading the instructions');
+    // The button that was focused is gone: focus moves to the status, not to the body.
+    expect(document.activeElement).toBe(screen.getByRole('status'));
     await act(async () => {
       resolve(sections('late'));
     });

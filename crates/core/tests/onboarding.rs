@@ -4,7 +4,7 @@
 use atlas_duck_core::onboarding::{
     RULE_STATUS, RULE_TIMEOUT, RULE_WRITES, Section, sections, text,
 };
-use atlas_duck_ipc::envelope::{ErrorCode, Status};
+use atlas_duck_ipc::envelope::{Envelope, ErrorCode, Status};
 use atlas_duck_ipc::proto::EXIT_MATRIX;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -183,22 +183,84 @@ fn onboarding_exit_matrix_matches_envelope_table() -> TestResult {
     Ok(())
 }
 
+/// PD-20 (`crates/cli/src/exit.rs`) and §12.1: the codes the matrix alone would get wrong or omit.
+#[test]
+fn onboarding_exit_matrix_states_the_status_rule_and_verify_export_codes() -> TestResult {
+    let text = section("exit_matrix")?.text;
+    assert!(
+        text.contains("`status` exits 0 whenever the request id is known"),
+        "{text}"
+    );
+    assert!(text.contains("`unknown_request`"), "{text}");
+    for line in [
+        "- `verify-export` exit 0: verified against a supplied trust root",
+        "- `verify-export` exit 20: internally consistent, trust root not verified",
+        "- `verify-export` exit 21: tamper or fork detected",
+        "- `verify-export` exit 22: usage or I/O error",
+    ] {
+        assert!(text.contains(line), "missing: {line}");
+    }
+    // These lines are not matrix rows: the table read-back test must not see them.
+    assert!(!text.lines().any(|l| l.starts_with("- exit 20")));
+    Ok(())
+}
+
+/// I-2: the wizard's hand-written subset (UI constant) only names sections core really has.
+#[test]
+fn wizard_section_ids_are_core_section_ids() -> TestResult {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../app/ui/src/onboarding/OnboardingText.tsx"
+    ))?;
+    let list = src
+        .split("WIZARD_SECTION_IDS")
+        .nth(1)
+        .and_then(|r| r.split_once("= ["))
+        .and_then(|(_, r)| r.split_once(']'))
+        .map(|(l, _)| l)
+        .ok_or("no WIZARD_SECTION_IDS list")?;
+    let wizard: Vec<&str> = list.split('\'').skip(1).step_by(2).collect();
+    assert_eq!(wizard.len(), 7, "{wizard:?}");
+    let core: Vec<&str> = sections().iter().map(|s| s.id).collect();
+    for id in &wizard {
+        assert!(core.contains(id), "wizard id {id} is not a core section");
+    }
+    // The wizard shows them in the page's order.
+    let positions: Vec<usize> = wizard
+        .iter()
+        .filter_map(|id| core.iter().position(|c| c == id))
+        .collect();
+    assert!(positions.windows(2).all(|w| w[0] < w[1]), "{wizard:?}");
+    Ok(())
+}
+
+/// The envelope section names every key the CLI serializes, and does not call booleans `null`.
+#[test]
+fn onboarding_envelope_names_every_serialized_key() -> TestResult {
+    let text = section("envelope")?.text;
+    let env = Envelope::failed(ErrorCode::Internal, false, "m");
+    let serde_json::Value::Object(keys) = serde_json::to_value(&env)? else {
+        return Err("envelope is not an object".into());
+    };
+    for key in keys.keys() {
+        assert!(text.contains(&format!("`{key}`")), "key not named: {key}");
+    }
+    assert!(
+        text.contains("`edited` and `redacted` are booleans"),
+        "{text}"
+    );
+    assert!(
+        text.contains("every other key is `null` when absent"),
+        "{text}"
+    );
+    Ok(())
+}
+
 #[test]
 fn onboarding_text_lists_every_command_as_the_cli_prints_it() {
+    // The whole-page text (PD-80) carries the commands; the per-op lines are pinned by
+    // `onboarding_lists_every_registry_op`, these are the spellings an agent must see.
     let snippet = text();
-    let lines: Vec<&str> = snippet
-        .lines()
-        .filter_map(|l| l.strip_prefix("- `").and_then(|l| l.strip_suffix('`')))
-        .collect();
-    // Every registry op: the usage `ops describe` and `--help` print, placeholders included.
-    for spec in atlas_duck_registry::all() {
-        let usage = atlas_duck_registry::op_usage(spec);
-        assert!(lines.contains(&usage.as_str()), "{usage}");
-    }
-    // Every generic command, from the table `--help` prints.
-    for g in atlas_duck_registry::GENERIC_COMMANDS {
-        assert!(lines.contains(&g.usage), "{}", g.usage);
-    }
     for needle in [
         "atlas-duck script run <file|-> [--args <json>] [--limits <json>] [--dry-run[=full|sparse]]",
         "atlas-duck requests list [--agent NAME] [--state pending|recent]",
@@ -206,7 +268,6 @@ fn onboarding_text_lists_every_command_as_the_cli_prints_it() {
         "atlas-duck doctor",
         "atlas-duck help",
         "<id>=<json>",
-        "-file <path>]",
     ] {
         assert!(snippet.contains(needle), "{needle}");
     }

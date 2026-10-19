@@ -36,6 +36,13 @@ export function OnboardingText({ only, level = 2 }: Props) {
   const [copyLine, setCopyLine] = useState('');
   const live = useRef(true);
   const inFlight = useRef(false);
+  const refocus = useRef(false);
+  const focusAfterRetry = useCallback((el: HTMLParagraphElement | null) => {
+    if (el !== null && refocus.current) {
+      refocus.current = false;
+      el.focus();
+    }
+  }, []);
 
   const load = useCallback(() => {
     // One request at a time: a second click on "Try again" must not start a second load.
@@ -63,6 +70,9 @@ export function OnboardingText({ only, level = 2 }: Props) {
   }, [load]);
 
   const copy = useCallback((section: OnboardingSection) => {
+    // Clear first: the same line twice in a row would not change the live region, and a screen
+    // reader announces only a change.
+    setCopyLine('');
     // Only on this click (a user gesture), only a write: nothing is ever read back.
     let written: Promise<void>;
     try {
@@ -85,12 +95,21 @@ export function OnboardingText({ only, level = 2 }: Props) {
     return failed ? (
       <p role="alert">
         {T.load_failed}{' '}
-        <button type="button" onClick={load}>
+        <button
+          type="button"
+          onClick={() => {
+            refocus.current = true;
+            load();
+          }}
+        >
           {T.retry}
         </button>
       </p>
     ) : (
-      <p role="status">{T.loading}</p>
+      // The retry button unmounts with the alert: focus goes to the status that replaces it.
+      <p role="status" tabIndex={-1} ref={focusAfterRetry}>
+        {T.loading}
+      </p>
     );
   }
   const Heading = level === 2 ? 'h2' : 'h3';
@@ -107,7 +126,12 @@ export function OnboardingText({ only, level = 2 }: Props) {
             <button type="button" aria-label={T.copy_label(s.title)} onClick={() => copy(s)}>
               {T.copy_button}
             </button>
-            <pre className="onboarding-text" tabIndex={0} aria-labelledby={headingId}>
+            <pre
+              className="onboarding-text"
+              tabIndex={0}
+              role="region"
+              aria-labelledby={headingId}
+            >
               {s.text}
             </pre>
           </div>
