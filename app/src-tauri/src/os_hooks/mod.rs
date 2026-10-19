@@ -3,7 +3,8 @@
 //! [`ShutdownPort`]; the hooks only say when, with which reason, and how long the OS waits:
 //!
 //! - Windows ([`windows`]): a hidden top-level window answers `WM_QUERYENDSESSION` (TRUE only
-//!   after the path ended; FALSE with `ShutdownBlockReasonCreate` until then) and `WM_ENDSESSION`.
+//!   after the path ended; FALSE with `ShutdownBlockReasonCreate` until then) and `WM_ENDSESSION`,
+//!   and the installer's registered quit message (M10 T23, `windows/hooks.nsh`).
 //! - macOS ([`macos`]): `applicationShouldTerminate:` on the app delegate answers
 //!   `NSTerminateLater` and replies at the end of the path. Cmd+Q, the Dock's Quit and the
 //!   logout's quit event all arrive there (L83); a logout, restart or shutdown is `OsShutdown`,
@@ -16,7 +17,8 @@
 //!   `WM_ENDSESSION`, AppKit's `terminate:` without the delegate method) runs it before it ends.
 //!
 //! Every source logs `APP_STOP` through the path: `os_shutdown` for the OS end-session sources,
-//! `quit` for Cmd+Q, the tray, the header and the credential window. PD-83 (L111): each OS grants a
+//! `installer` for the installer's quit message and a Windows end session with
+//! `ENDSESSION_CLOSEAPP`, `quit` for Cmd+Q, the tray, the header and the credential window. PD-83 (L111): each OS grants a
 //! bounded delay; when it ends the process first, the write that was on the wire is reconciled
 //! `outcome_unknown {crash}` at the next start (§11.3).
 

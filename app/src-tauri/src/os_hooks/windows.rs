@@ -16,6 +16,14 @@
 //! - `WM_ENDSESSION`: TRUE (the session ends: the user chose to shut down anyway, or the shutdown
 //!   is forced) waits for the path, at most [`super::PATH_WAIT`]; FALSE (cancelled) changes
 //!   nothing: the path that began runs to its end and the app exits.
+//! - The reason (M10 T23, PD-172, L129): an end session whose `lParam` has `ENDSESSION_CLOSEAPP`
+//!   (Restart Manager closing the app so an installer can replace its files, Tauri's own
+//!   `CheckIfAppIsRunning` among them) runs the path with `Installer`; every other end session
+//!   (logoff, shutdown, critical) with `OsShutdown` ([`end_session_reason`]).
+//! - The installer's quit request (§2.5, §12.2): the registered message [`INSTALLER_QUIT_MESSAGE`],
+//!   sent by `windows/hooks.nsh` to the window found by [`WINDOW_CLASS`], runs the path with
+//!   `Installer` and is answered after the path ended, at most [`super::PATH_WAIT`]; no block goes
+//!   up (no session ends).
 //!
 //! PD-83: when Windows ends the process first, the write on the wire is reconciled
 //! `outcome_unknown {crash}` at the next start.
@@ -38,6 +46,26 @@ pub const QUERY_WAIT: Duration = Duration::from_secs(4);
 const QUERY_POLL: Duration = Duration::from_millis(50);
 /// How often the window's timer looks for the end of the path once it answered FALSE.
 pub const TIMER_INTERVAL: Duration = Duration::from_millis(100);
+/// The hidden window's class: the installer finds the window by it (`hooks.nsh`
+/// `ATLAS_DUCK_ENDSESSION_CLASS`, the same string; a test compares them).
+pub const WINDOW_CLASS: &str = "atlas-duck-end-session";
+/// The name of the installer's registered quit message (`RegisterWindowMessageW`; `hooks.nsh`
+/// `ATLAS_DUCK_INSTALLER_QUIT_MESSAGE`, the same string).
+pub const INSTALLER_QUIT_MESSAGE: &str = "AtlasDuckInstallerQuit";
+/// `ENDSESSION_CLOSEAPP` (WinUser.h; every OS compiles the mapping, the Windows build checks the
+/// value against `windows-sys`).
+pub const ENDSESSION_CLOSEAPP: u32 = 0x0000_0001;
+
+/// The reason an end-session message's `lParam` names: `ENDSESSION_CLOSEAPP` is an installer (or
+/// an update) closing the app to replace its files, `Installer`; anything else is the session
+/// ending, `OsShutdown`.
+pub fn end_session_reason(lparam: isize) -> ShutdownReason {
+    if lparam & ENDSESSION_CLOSEAPP as isize != 0 {
+        ShutdownReason::Installer
+    } else {
+        ShutdownReason::OsShutdown
+    }
+}
 
 /// The OS block of the hook's window.
 pub trait ShutdownBlock {
@@ -66,10 +94,10 @@ pub struct EndSession {
 }
 
 impl EndSession {
-    /// The run, begun here with `OsShutdown` unless another source began it.
-    fn ticket(&mut self, port: &dyn ShutdownPort) -> ShutdownTicket {
+    /// The run, begun here with `reason` unless this window or another source began it.
+    fn ticket(&mut self, port: &dyn ShutdownPort, reason: ShutdownReason) -> ShutdownTicket {
         self.ticket
-            .get_or_insert_with(|| port.begin(ShutdownReason::OsShutdown))
+            .get_or_insert_with(|| port.begin(reason))
             .clone()
     }
 
@@ -101,11 +129,13 @@ impl EndSession {
         self.text
     }
 
-    /// `WM_QUERYENDSESSION`: the answer (TRUE: the session may end). See the module text.
+    /// `WM_QUERYENDSESSION`: the answer (TRUE: the session may end). `reason` is its `lParam`'s
+    /// ([`end_session_reason`]). See the module text.
     pub fn query(
         &mut self,
         port: &dyn ShutdownPort,
         block: &dyn ShutdownBlock,
+        reason: ShutdownReason,
         wait: Duration,
     ) -> bool {
         if !self.blocked {
@@ -113,7 +143,7 @@ impl EndSession {
             self.blocked = block.create(text);
             self.text = self.blocked.then_some(text);
         }
-        let ticket = self.ticket(port);
+        let ticket = self.ticket(port, reason);
         let deadline = Instant::now() + wait;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -128,21 +158,31 @@ impl EndSession {
         }
     }
 
-    /// `WM_ENDSESSION`: `ending` (wParam TRUE) waits for the path, at most `wait`, then releases
-    /// the block (Windows ends the process once this returns). True when the path ended.
+    /// `WM_ENDSESSION`: `ending` (wParam TRUE) waits for the path (begun with `reason`, its
+    /// `lParam`'s, when no query came first), at most `wait`, then releases the block (Windows
+    /// ends the process once this returns). True when the path ended.
     pub fn end(
         &mut self,
         port: &dyn ShutdownPort,
         block: &dyn ShutdownBlock,
         ending: bool,
+        reason: ShutdownReason,
         wait: Duration,
     ) -> bool {
         if !ending {
             return self.ticket.as_ref().is_some_and(ShutdownTicket::is_done);
         }
-        let ended = self.ticket(port).wait_timeout(wait);
+        let ended = self.ticket(port, reason).wait_timeout(wait);
         self.release(block);
         ended
+    }
+
+    /// The installer's quit request ([`INSTALLER_QUIT_MESSAGE`]): the path begins with
+    /// `Installer` (or the one that runs is joined) and the answer waits for its end, at most
+    /// `wait`. No block goes up: no session ends. True when the path ended.
+    pub fn installer_quit(&mut self, port: &dyn ShutdownPort, wait: Duration) -> bool {
+        self.ticket(port, ShutdownReason::Installer)
+            .wait_timeout(wait)
     }
 
     /// The window's timer after a FALSE answer: while the path runs the block's text follows the
@@ -174,20 +214,30 @@ mod window {
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, MSG,
-        RegisterClassExW, SetTimer, TranslateMessage, WM_ENDSESSION, WM_QUERYENDSESSION, WM_TIMER,
-        WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+        RegisterClassExW, RegisterWindowMessageW, SetTimer, TranslateMessage, WM_ENDSESSION,
+        WM_QUERYENDSESSION, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
     };
 
     use super::super::{LOG_EVENT_OS_END_SESSION, LOG_EVENT_OS_HOOK_FAILED, PATH_WAIT};
-    use super::{EndSession, QUERY_WAIT, ShutdownBlock, ShutdownPort, TIMER_INTERVAL};
+    use super::{
+        EndSession, INSTALLER_QUIT_MESSAGE, QUERY_WAIT, ShutdownBlock, ShutdownPort,
+        TIMER_INTERVAL, WINDOW_CLASS, end_session_reason,
+    };
 
     const THREAD_NAME: &str = "atlas-duck-end-session";
-    const CLASS_NAME: &str = "atlas-duck-end-session";
     /// The window is never shown; Windows lists a blocking app by its window's title.
     const WINDOW_TITLE: &str = "atlas-duck";
     const TIMER_ID: usize = 1;
 
     static PORT: OnceLock<Arc<dyn ShutdownPort>> = OnceLock::new();
+    /// The id Windows gave [`INSTALLER_QUIT_MESSAGE`] (set before the window exists; unset when
+    /// the registration failed: the installer then terminates the app instead).
+    static QUIT_MESSAGE: OnceLock<u32> = OnceLock::new();
+
+    /// `msg` is the installer's quit request.
+    fn is_installer_quit(msg: u32) -> bool {
+        QUIT_MESSAGE.get() == Some(&msg)
+    }
 
     thread_local! {
         static STATE: RefCell<EndSession> = RefCell::new(EndSession::default());
@@ -235,8 +285,16 @@ mod window {
     /// Registers the class, creates the hidden top-level window and pumps its messages for the
     /// rest of the process (the thread is never joined). A failed step is logged where it failed.
     fn run_window() {
-        let class = wide(CLASS_NAME);
+        let class = wide(WINDOW_CLASS);
         let title = wide(WINDOW_TITLE);
+        let quit = wide(INSTALLER_QUIT_MESSAGE);
+        // SAFETY: `quit` is NUL-terminated and outlives the call.
+        match unsafe { RegisterWindowMessageW(quit.as_ptr()) } {
+            0 => failed_call("register_message"),
+            id => {
+                let _ = QUIT_MESSAGE.set(id);
+            }
+        }
         // SAFETY: a null name asks for the handle of this process's own exe module; it is not
         // owned (never freed).
         let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
@@ -333,10 +391,11 @@ mod window {
         unsafe { KillTimer(hwnd, TIMER_ID) };
     }
 
-    /// The decisions for one of our messages (`WM_QUERYENDSESSION`, `WM_ENDSESSION`, `WM_TIMER`);
-    /// `None`: not ours (the default procedure answers). Without the state or the port the answer
-    /// is 0 (FALSE for `WM_QUERYENDSESSION`), never the default procedure's TRUE.
-    fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM) -> Option<LRESULT> {
+    /// The decisions for one of our messages (`WM_QUERYENDSESSION`, `WM_ENDSESSION`, `WM_TIMER`,
+    /// the installer's quit request); `None`: not ours (the default procedure answers). Without
+    /// the state or the port the answer is 0 (FALSE for `WM_QUERYENDSESSION`), never the default
+    /// procedure's TRUE.
+    fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
         if msg == WM_TIMER && wparam != TIMER_ID {
             return None;
         }
@@ -352,12 +411,20 @@ mod window {
             };
             let block = WindowBlock(hwnd);
             match msg {
+                m if is_installer_quit(m) => {
+                    tracing::info!(event = LOG_EVENT_OS_END_SESSION, reason = "installer_quit");
+                    if !state.installer_quit(&**port, PATH_WAIT) {
+                        failed("path_wait_expired");
+                    }
+                    Some(0)
+                }
                 WM_QUERYENDSESSION => {
                     tracing::info!(
                         event = LOG_EVENT_OS_END_SESSION,
                         reason = "wm_queryendsession"
                     );
-                    let answer = state.query(&**port, &block, QUERY_WAIT);
+                    let reason = end_session_reason(lparam);
+                    let answer = state.query(&**port, &block, reason, QUERY_WAIT);
                     if !answer {
                         start_timer(hwnd);
                     }
@@ -368,7 +435,8 @@ mod window {
                     if ending {
                         tracing::info!(event = LOG_EVENT_OS_END_SESSION, reason = "wm_endsession");
                     }
-                    if !state.end(&**port, &block, ending, PATH_WAIT) && ending {
+                    let reason = end_session_reason(lparam);
+                    if !state.end(&**port, &block, ending, reason, PATH_WAIT) && ending {
                         failed("path_wait_expired");
                     }
                     Some(0)
@@ -396,8 +464,13 @@ mod window {
             // runs the path if the session ends anyway). Release builds use `panic = "abort"`
             // (workspace Cargo.toml): there a panic ends the process at once, before this catch,
             // with no path, no `APP_STOP` and no cancellations; the next start reconciles (§11.3).
-            WM_QUERYENDSESSION | WM_ENDSESSION | WM_TIMER => {
-                catch_unwind(AssertUnwindSafe(|| on_message(hwnd, msg, wparam))).unwrap_or(Some(0))
+            m if m == WM_QUERYENDSESSION
+                || m == WM_ENDSESSION
+                || m == WM_TIMER
+                || is_installer_quit(m) =>
+            {
+                catch_unwind(AssertUnwindSafe(|| on_message(hwnd, msg, wparam, lparam)))
+                    .unwrap_or(Some(0))
             }
             _ => None,
         };
@@ -419,9 +492,16 @@ mod window {
             STATE.with(|state| {
                 let _held = state.borrow_mut();
                 for (msg, wparam) in [(WM_QUERYENDSESSION, 0), (WM_ENDSESSION, 1)] {
-                    assert_eq!(on_message(std::ptr::null_mut(), msg, wparam), Some(0));
+                    assert_eq!(on_message(std::ptr::null_mut(), msg, wparam, 0), Some(0));
                 }
             });
+        }
+
+        /// The portable mapping's constant is WinUser.h's.
+        #[test]
+        fn endsession_closeapp_is_the_windows_value() {
+            use windows_sys::Win32::UI::WindowsAndMessaging::ENDSESSION_CLOSEAPP as WIN;
+            assert_eq!(super::super::ENDSESSION_CLOSEAPP, WIN);
         }
     }
 }
@@ -436,6 +516,9 @@ mod tests {
 
     use super::super::fake::FakePort;
     use super::*;
+
+    /// A plain end session's reason (`lParam` 0).
+    const OS: ShutdownReason = ShutdownReason::OsShutdown;
 
     /// The block as the window sees it: up or not, its text, and how often it was set.
     #[derive(Default)]
@@ -488,7 +571,7 @@ mod tests {
         let mut s = EndSession::default();
         let began = Instant::now();
         assert!(
-            !s.query(&*port, &block, QUERY_WAIT),
+            !s.query(&*port, &block, OS, QUERY_WAIT),
             "FALSE while the write is on the wire"
         );
         assert!(
@@ -502,7 +585,7 @@ mod tests {
         assert!(!s.poll(&*port, &block));
         assert!(block.up.get());
         // The user retries the shutdown: the run is joined, still FALSE, still blocked.
-        assert!(!s.query(&*port, &block, QUERY_WAIT));
+        assert!(!s.query(&*port, &block, OS, QUERY_WAIT));
         assert_eq!(port.starts(), 1);
         assert_eq!(
             port.begins(),
@@ -516,7 +599,7 @@ mod tests {
         assert!(s.poll(&*port, &block));
         assert!(!block.up.get() && !s.blocked());
         // A query after the end: TRUE at once.
-        assert!(s.query(&*port, &block, QUERY_WAIT));
+        assert!(s.query(&*port, &block, OS, QUERY_WAIT));
         assert!(!block.up.get());
     }
 
@@ -528,7 +611,7 @@ mod tests {
         let port = FakePort::new();
         let block = FakeBlock::default();
         let mut s = EndSession::default();
-        assert!(!s.query(&*port, &block, Duration::from_millis(120)));
+        assert!(!s.query(&*port, &block, OS, Duration::from_millis(120)));
         assert_eq!(block.shown.get(), Some(BLOCK_REASON_NO_WRITE));
         assert_eq!(s.text(), Some(BLOCK_REASON_NO_WRITE));
         assert_eq!(block.creates.get(), 1);
@@ -550,7 +633,7 @@ mod tests {
         port.write.store(true, Ordering::SeqCst);
         let block = FakeBlock::default();
         let mut s = EndSession::default();
-        assert!(!s.query(&*port, &block, QUERY_WAIT));
+        assert!(!s.query(&*port, &block, OS, QUERY_WAIT));
         assert_eq!(block.shown.get(), Some(BLOCK_REASON));
         port.write.store(false, Ordering::SeqCst);
         assert!(!s.poll(&*port, &block));
@@ -578,7 +661,7 @@ mod tests {
         let block = FakeBlock::default();
         let mut s = EndSession::default();
         let began = Instant::now();
-        assert!(s.query(&*port, &block, QUERY_WAIT));
+        assert!(s.query(&*port, &block, OS, QUERY_WAIT));
         assert!(
             began.elapsed() >= Duration::from_millis(150),
             "answered before the end"
@@ -597,7 +680,7 @@ mod tests {
         let port = FakePort::new();
         let block = FakeBlock::default();
         let mut s = EndSession::default();
-        assert!(!s.query(&*port, &block, Duration::from_millis(120)));
+        assert!(!s.query(&*port, &block, OS, Duration::from_millis(120)));
         assert!(block.up.get());
         assert_eq!(block.shown.get(), Some(BLOCK_REASON_NO_WRITE));
         assert_eq!(port.begins(), [ShutdownReason::OsShutdown]);
@@ -608,12 +691,12 @@ mod tests {
         let block = FakeBlock::default();
         block.refuse.set(true);
         let mut s = EndSession::default();
-        assert!(!s.query(&*port, &block, QUERY_WAIT));
+        assert!(!s.query(&*port, &block, OS, QUERY_WAIT));
         assert_eq!(port.starts(), 1);
         assert!(!s.blocked());
         // The next query tries the block again.
         block.refuse.set(false);
-        assert!(!s.query(&*port, &block, QUERY_WAIT));
+        assert!(!s.query(&*port, &block, OS, QUERY_WAIT));
         assert!(s.blocked() && block.creates.get() == 2);
     }
 
@@ -625,8 +708,8 @@ mod tests {
         port.write.store(true, Ordering::SeqCst);
         let block = FakeBlock::default();
         let mut s = EndSession::default();
-        assert!(!s.query(&*port, &block, QUERY_WAIT));
-        assert!(!s.end(&*port, &block, false, Duration::from_secs(10)));
+        assert!(!s.query(&*port, &block, OS, QUERY_WAIT));
+        assert!(!s.end(&*port, &block, false, OS, Duration::from_secs(10)));
         assert!(
             block.up.get(),
             "a cancelled shutdown keeps the block until the path ended"
@@ -638,7 +721,7 @@ mod tests {
                 port.finish();
             })
         };
-        assert!(s.end(&*port, &block, true, Duration::from_secs(10)));
+        assert!(s.end(&*port, &block, true, OS, Duration::from_secs(10)));
         assert!(!block.up.get());
         let _ = finisher.join();
 
@@ -646,7 +729,13 @@ mod tests {
         let port = FakePort::new();
         port.instant.store(true, Ordering::SeqCst);
         let mut s = EndSession::default();
-        assert!(s.end(&*port, &FakeBlock::default(), true, Duration::from_secs(10)));
+        assert!(s.end(
+            &*port,
+            &FakeBlock::default(),
+            true,
+            OS,
+            Duration::from_secs(10)
+        ));
         assert_eq!(port.begins(), [ShutdownReason::OsShutdown]);
         // A path that outlives the wait: Windows ends the process after the answer.
         let port = FakePort::new();
@@ -655,7 +744,135 @@ mod tests {
             &*port,
             &FakeBlock::default(),
             true,
+            OS,
             Duration::from_millis(30)
         ));
+    }
+
+    /// M10 T23 (§2.5, §12.2, PD-172): the installer's quit request runs the path with `Installer`
+    /// and is answered only after the path ended; no block goes up. A later end session joins the
+    /// run (its reason does not replace the first).
+    #[test]
+    fn installer_quit_message_maps_to_installer_reason() {
+        let port = FakePort::new();
+        let finisher = {
+            let port = port.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                port.finish();
+            })
+        };
+        let mut s = EndSession::default();
+        let began = Instant::now();
+        assert!(s.installer_quit(&*port, Duration::from_secs(10)));
+        assert!(
+            began.elapsed() >= Duration::from_millis(150),
+            "answered before the end"
+        );
+        assert!(port.path.ended());
+        assert_eq!(port.begins(), [ShutdownReason::Installer]);
+        assert!(!s.blocked(), "no session ends: no block");
+        let _ = finisher.join();
+        // An end session after the request joins the installer's run.
+        let block = FakeBlock::default();
+        assert!(s.query(&*port, &block, OS, QUERY_WAIT));
+        assert_eq!(port.begins(), [ShutdownReason::Installer]);
+        assert_eq!(port.starts(), 1);
+
+        // A path that outlives the wait: the answer comes anyway, false.
+        let port = FakePort::new();
+        let mut s = EndSession::default();
+        assert!(!s.installer_quit(&*port, Duration::from_millis(30)));
+        assert_eq!(port.begins(), [ShutdownReason::Installer]);
+        assert!(!port.path.ended());
+    }
+
+    /// `ENDSESSION_CLOSEAPP` (Restart Manager closing the app for an installer; Tauri's
+    /// `CheckIfAppIsRunning`) is the installer's reason, alone or with other flags, on the query
+    /// and on a forced `WM_ENDSESSION` that no query preceded (L129: `lParam` was not read).
+    #[test]
+    fn endsession_closeapp_maps_to_installer() {
+        const LOGOFF: isize = 0x8000_0000_u32 as isize;
+        const CRITICAL: isize = 0x4000_0000;
+        for lparam in [1, 1 | CRITICAL, 1 | LOGOFF] {
+            assert_eq!(
+                end_session_reason(lparam),
+                ShutdownReason::Installer,
+                "{lparam:#x}"
+            );
+        }
+        let port = FakePort::new();
+        port.instant.store(true, Ordering::SeqCst);
+        let mut s = EndSession::default();
+        let block = FakeBlock::default();
+        assert!(s.query(&*port, &block, end_session_reason(1), QUERY_WAIT));
+        assert_eq!(port.begins(), [ShutdownReason::Installer]);
+
+        let port = FakePort::new();
+        port.instant.store(true, Ordering::SeqCst);
+        let mut s = EndSession::default();
+        let reason = end_session_reason(ENDSESSION_CLOSEAPP as isize);
+        assert!(s.end(
+            &*port,
+            &FakeBlock::default(),
+            true,
+            reason,
+            Duration::from_secs(10)
+        ));
+        assert_eq!(port.begins(), [ShutdownReason::Installer]);
+    }
+
+    /// A shutdown, logoff or critical end session without `ENDSESSION_CLOSEAPP` stays
+    /// `OsShutdown`.
+    #[test]
+    fn plain_endsession_stays_os_shutdown() {
+        const LOGOFF: isize = 0x8000_0000_u32 as isize;
+        const CRITICAL: isize = 0x4000_0000;
+        for lparam in [0, LOGOFF, CRITICAL, LOGOFF | CRITICAL, 0x2] {
+            assert_eq!(
+                end_session_reason(lparam),
+                ShutdownReason::OsShutdown,
+                "{lparam:#x}"
+            );
+        }
+        let port = FakePort::new();
+        port.instant.store(true, Ordering::SeqCst);
+        let mut s = EndSession::default();
+        let block = FakeBlock::default();
+        assert!(s.query(&*port, &block, end_session_reason(LOGOFF), QUERY_WAIT));
+        assert_eq!(port.begins(), [ShutdownReason::OsShutdown]);
+    }
+
+    /// The `!define` value of `name` in `hooks.nsh` (`!define NAME "value"`).
+    fn nsh_define<'a>(nsh: &'a str, name: &str) -> Option<&'a str> {
+        nsh.lines().find_map(|line| {
+            let rest = line.trim().strip_prefix("!define")?.trim_start();
+            let (key, value) = rest.split_once(char::is_whitespace)?;
+            if key != name {
+                return None;
+            }
+            value.trim().strip_prefix('"')?.strip_suffix('"')
+        })
+    }
+
+    /// The installer finds the window by its class and sends the registered message by its name:
+    /// one string each, shared by this file and `windows/hooks.nsh`.
+    #[test]
+    fn endsession_class_name_matches_hooks_nsh() {
+        let nsh = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/windows/hooks.nsh"));
+        assert_eq!(
+            nsh_define(nsh, "ATLAS_DUCK_ENDSESSION_CLASS"),
+            Some(WINDOW_CLASS)
+        );
+        assert_eq!(
+            nsh_define(nsh, "ATLAS_DUCK_INSTALLER_QUIT_MESSAGE"),
+            Some(INSTALLER_QUIT_MESSAGE)
+        );
+        // Each is defined once, and the hooks use the defines, not a second copy of the strings.
+        for value in [WINDOW_CLASS, INSTALLER_QUIT_MESSAGE] {
+            assert_eq!(nsh.matches(&format!("\"{value}\"")).count(), 1, "{value}");
+        }
+        assert_eq!(nsh_define("!define X \"y\"", "X"), Some("y"));
+        assert_eq!(nsh_define("!define XY \"y\"", "X"), None);
     }
 }
