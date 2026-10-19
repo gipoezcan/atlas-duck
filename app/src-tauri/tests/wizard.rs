@@ -183,6 +183,16 @@ fn step_is(step: &'static str) -> impl Fn(&Value) -> bool {
     move |s| s["step"] == step
 }
 
+/// `wizard_restore`'s answer for a restore cancelled at one of its questions: the answer is the
+/// state at once, read after the restore task was spawned, so the task may already have come back
+/// (the anchor-dir step, no error; seen on the Linux CI) or still run (`restore`).
+fn restore_or_back(s: &Value) {
+    assert!(
+        (s["step"] == "restore" || s["step"] == "anchor_dir") && s["error"].is_null(),
+        "{s}"
+    );
+}
+
 // ---------- the machine ----------
 
 struct NoUi;
@@ -2313,7 +2323,7 @@ async fn a_cancelled_wizard_restore_changes_nothing() -> TestResult {
     let m = Machine::new(&tmp, "host-a", None, MemKeyring::new())?;
     let (app, setup) = at_anchor_step(&m).await?;
     let s = run(&setup, "wizard_restore").await?;
-    assert_eq!(s["step"], "restore", "{s}");
+    restore_or_back(&s);
     let s = until(&setup, "back at the anchor-dir step", step_is("anchor_dir")).await?;
     assert_eq!(s["error"], Value::Null, "{s}");
     assert_eq!(m.restore_dialogs.load(Ordering::SeqCst), 1);
@@ -2495,7 +2505,7 @@ async fn a_restore_cancelled_after_an_archive_keeps_the_pinned_id() -> TestResul
     let ids = m.keys.ids();
     m.confirmer.1.store(1, Ordering::SeqCst);
     let s = run(&a.setup, "wizard_restore").await?;
-    assert_eq!(s["step"], "restore", "{s}");
+    restore_or_back(&s);
     let s = until(&a.setup, "the restore ended", |s| s["step"] != "restore").await?;
     assert_eq!(
         (s["step"].clone(), s["error"].clone()),
