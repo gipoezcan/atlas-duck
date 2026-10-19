@@ -2091,6 +2091,25 @@ async fn pin_write_failure_offers_retry() -> TestResult {
     stop(&app).await
 }
 
+/// The credential window the wizard's restore opened for the backup's passphrase. The flow sets the
+/// purpose before it builds the window (one `opening` lock), so the test waits for the built
+/// window too: building it here a second time would race the flow's own build (which then fails
+/// with no window, `io`).
+async fn restore_window(
+    app: &App<MockRuntime>,
+) -> Result<WebviewWindow<MockRuntime>, Box<dyn std::error::Error>> {
+    let handle = app.handle().clone();
+    eventually(
+        "the credential window asks for the backup's passphrase",
+        || {
+            credential::current_purpose(&handle) == Some(Purpose::RestoreBackup)
+                && handle.get_webview_window("credential").is_some()
+        },
+    )
+    .await?;
+    Ok(window(app, "credential")?)
+}
+
 /// The wizard's restore driven to its end through the setup and credential windows: the
 /// anchor-dir step, `wizard_restore`, the native confirmation, the file dialog, the backup's
 /// passphrase in the credential window (`restore_backup`), then the instance step. Returns the
@@ -2113,12 +2132,7 @@ async fn restored_by_wizard(
     *m.pick_restore.lock().map_err(|_| "poisoned")? = Some(bundle);
     let s = run(&setup, "wizard_restore").await?;
     assert_eq!(s["step"], "restore", "{s}");
-    let handle = app.handle().clone();
-    eventually(
-        "the credential window asks for the backup's passphrase",
-        || credential::current_purpose(&handle) == Some(Purpose::RestoreBackup),
-    )
-    .await?;
+    let w = restore_window(&app).await?;
     // While it runs, the other (1b) commands wait.
     for cmd in ["wizard_begin", "wizard_anchor_dir", "wizard_restore"] {
         let r = call(&setup, cmd, json!({})).await;
@@ -2127,7 +2141,6 @@ async fn restored_by_wizard(
             "{cmd}: {r:?}"
         );
     }
-    let w = window(&app, "credential")?;
     assert_eq!(
         call(&w, "submit_secret", json!({ "secret": PASSPHRASE })).await,
         Ok(json!({"accepted": {}}))
@@ -2225,12 +2238,7 @@ async fn wizard_restore_swaps_store_in_serve_state() -> TestResult {
     assert_eq!(reason(&reply.envelope), Some("first_run"));
     *m.pick_restore.lock().map_err(|_| "poisoned")? = Some(bundle);
     run(&setup, "wizard_restore").await?;
-    let handle = app.handle().clone();
-    eventually("the backup's passphrase is asked", || {
-        credential::current_purpose(&handle) == Some(Purpose::RestoreBackup)
-    })
-    .await?;
-    let w = window(&app, "credential")?;
+    let w = restore_window(&app).await?;
     call(&w, "submit_secret", json!({ "secret": PASSPHRASE }))
         .await
         .map_err(|e| format!("submit_secret: {e}"))?;
@@ -2297,12 +2305,7 @@ async fn wizard_restore_calls_new_ids_before_every_attempt() -> TestResult {
     let (app, setup) = at_anchor_step(&m).await?;
     *m.pick_restore.lock().map_err(|_| "poisoned")? = Some(bundle.clone());
     run(&setup, "wizard_restore").await?;
-    let handle = app.handle().clone();
-    eventually("the backup's passphrase is asked", || {
-        credential::current_purpose(&handle) == Some(Purpose::RestoreBackup)
-    })
-    .await?;
-    let w = window(&app, "credential")?;
+    let w = restore_window(&app).await?;
     call(
         &w,
         "submit_secret",
