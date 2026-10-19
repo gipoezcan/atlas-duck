@@ -704,7 +704,7 @@ Tauri events [named-by-plan], payloads carry ids and counts only: `queue_changed
 
 ## Milestones
 
-Order is the §14 order. Hard dependencies: M2 ← M1; M3 ← M1 (M2 for execution, see M3); M4 ← M3; M5 ← M3; M6 ← M2, M3, M4, M5; M7 ← M3, M5; M8 ← M1, M3, M4; M9 ← M3, M4; M10 ← M2, M4, M6, M8, M9. Planned file names (`docs/superpowers/plans/2026-10-07-atlas-duck-…`): `m01-skeleton`, `m02-audit-store`, `m03-core-lifecycle`, `m04-ipc-cli`, `m05-jira`, `m06-approvals-ui`, `m07-confluence`, `m08-script-sandbox`, `m09-mcp`, `m10-audit-ui-packaging`, each `.md`.
+Order is the §14 order. Hard dependencies: M2 ← M1; M3 ← M1 (M2 for execution, see M3); M4 ← M3; M5 ← M3; M6 ← M2, M3, M4, M5; M7 ← M3, M5; M8 ← M1, M3, M4; M9 ← M3, M4; M10 ← M2, M4, M6, M7, M8, M9. Planned file names (`docs/superpowers/plans/2026-10-07-atlas-duck-…`): `m01-skeleton`, `m02-audit-store`, `m03-core-lifecycle`, `m04-ipc-cli`, `m05-jira`, `m06-approvals-ui`, `m07-confluence`, `m08-script-sandbox`, `m09-mcp`, `m10-audit-ui-packaging`, each `.md`.
 
 Each milestone entry lists: scope (§14, with the placements this plan makes where §14 is silent or contradicts §13), depends on, exit criterion (commands and §13 lead phrases; test ids from the Traceability section), §15 verify-items resolved (V-ids), ledger decisions it depends on (L-ids from the Decisions section), status. "Exit criterion" is demonstrable: every item is a command that exits 0 or a named test that passes on the CI legs of the Global Constraints "CI gates" (Windows MSVC, macOS arm64 with the x86_64 build under Rosetta, Ubuntu 22.04, plus Fedora 40 where stated).
 
