@@ -564,10 +564,10 @@ fn covers(path: &Path, a: &ArchivedDb, witness: &Witness) -> Result<bool, OpenEr
         None => witness.prunes.is_empty(),
         Some(cutoff) => {
             let mut prunes = witness.prunes.iter();
-            let named = prunes.clone().any(|(seq, hash, c)| {
+            let matched = prunes.clone().any(|(seq, hash, c)| {
                 *seq == first_retained && ct_eq(hash, &last_pruned) && *c == cutoff
             });
-            named && prunes.all(|(seq, ..)| *seq <= first_retained)
+            matched && prunes.all(|(seq, ..)| *seq <= first_retained)
         }
     };
     if !bound {
