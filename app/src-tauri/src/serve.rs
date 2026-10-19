@@ -3287,6 +3287,11 @@ mod tests {
         assert_eq!(answer, Err(CommandError::Cancelled));
         assert!(entries(&rig.out).is_empty(), "{:?}", entries(&rig.out));
         assert_eq!(count(&rig.store, atlas_duck_audit::EventType::EXPORT)?, 0);
+        // The task is reported finished shortly after its answer was sent.
+        let until = Instant::now() + Duration::from_secs(30);
+        while state.job_running() && Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert!(!state.cancel_export(), "the job ended");
         Ok(())
     }
