@@ -6,6 +6,8 @@ Source material for the M10 onboarding page. Sentences in blockquotes are copied
 
 Register `atlas-duck mcp` as a stdio MCP server in the client. The server is long-lived: it stays up when the app is closed, restarted or upgraded.
 
+Protocol version: the server negotiates MCP revisions up to 2025-11-25, the newest one with an `initialize` handshake. A request that names the 2026-07-28 inline lifecycle (no `initialize`) is refused with error code -32022 (unsupported protocol version), so a client that speaks only that revision cannot connect. The TypeScript SDK 1.32.0 sends `initialize` and works.
+
 Tool surface:
 
 - `--tools full` (default): one tool per registry operation, plus `script_run`, `request_await`, `request_status`, `request_cancel`, `request_list`, `ops_list`, `ops_describe` and `instances_list` (§4.6).
@@ -35,7 +37,7 @@ Plan text: to recover a lost request id through MCP, call `request_list` with `m
 
 > "Agent name = MCP `clientInfo.name` (unverified), overridable by `--agent`. `--instance X` sets the default instance for this MCP server." (§4.6)
 
-Plan text: the approver sees the agent name, so set `--agent` to a value that tells sessions apart. The spec's example pattern is `<tool>-<repo>`, for example `claude-code-billing-api`. Precedence (PD-122): `--agent` > `ATLAS_DUCK_AGENT` > MCP `clientInfo.name` > none. So `ATLAS_DUCK_AGENT` also applies inside the MCP server and overrides `clientInfo.name`. `--agent ""` counts as given: it means no agent, with no fallback to the env var or `clientInfo.name`. An empty `ATLAS_DUCK_AGENT` or an empty `clientInfo.name` counts as absent. The name is read once, at the first connect after `initialize`; a later reconnect reuses it. The `--agent ""` row is the plan's reading of lead ruling R2 and is pending lead confirmation (plan review m-7).
+Plan text: the approver sees the agent name, so set `--agent` to a value that tells sessions apart. The spec's example pattern is `<tool>-<repo>`, for example `claude-code-billing-api`. Precedence (PD-122): `--agent` > `ATLAS_DUCK_AGENT` > MCP `clientInfo.name` > none. So `ATLAS_DUCK_AGENT` also applies inside the MCP server and overrides `clientInfo.name`. `--agent ""` counts as given: it means no agent, with no fallback to the env var or `clientInfo.name`. An empty `ATLAS_DUCK_AGENT` or an empty `clientInfo.name` counts as absent. The name is frozen at the first attempt to connect, also when that attempt fails and whichever tool call makes it: the `hello` is built once and every later reconnect reuses it, so a `clientInfo.name` that first shows up on a later call is not picked up. The `--agent ""` row is confirmed (lead ruling R2, PD-122, ledger L158): `--agent` counts as given even when empty, so `clientInfo.name` is not consulted.
 
 Spec text for the CLI variable:
 
