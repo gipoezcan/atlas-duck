@@ -287,6 +287,36 @@ fn u06_first_run_previous_chain_incident() {
 }
 
 #[test]
+fn configured_anchor_dir_is_checked_too() {
+    // `OpenConfig.anchor_dir` (no wizard dir): no setting row, the incident follows GENESIS and
+    // its file goes to the configured dir.
+    let dir = tempfile::tempdir().expect("anchor dir");
+    let (a, last) = used_chain(dir.path(), START);
+    let (store, b) = new_store_with(fake_clock(LATER), MemKeyring::new(), |cfg| {
+        cfg.anchor_dir = Some(dir.path().to_path_buf());
+    });
+    assert_eq!(payload(&store, 1)["previous_chain_id"], json!(a.chain_id));
+    assert_eq!(types(&b), ["GENESIS", "VERIFY"]);
+    assert_eq!(
+        payload(&store, 2)["chains"],
+        json!([chain_json(&a.chain_id, &last)])
+    );
+    assert_eq!(store.open_incidents(), vec![2]);
+    assert_eq!(store.settings().anchor_dir, None, "the fallback stays one");
+    drain(&store);
+    assert!(
+        dir.path()
+            .join(format!("{}.incident-2.json", b.chain_id))
+            .is_file()
+    );
+    assert!(matches!(
+        lines(dir.path(), &b.chain_id).first(),
+        Some(AnchorLine::Header { .. })
+    ));
+    store.shutdown();
+}
+
+#[test]
 fn other_host_or_user_chain_ignored() {
     let (host, os_user) = this_host_and_user();
     let dir = tempfile::tempdir().expect("anchor dir");
