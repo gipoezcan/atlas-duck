@@ -652,9 +652,22 @@ pub fn export_fixture(kind: FixtureKind, out: &Path) -> std::io::Result<FixtureI
     use crate::request_set::{RequestRecord, request_set_hash, requests_to_json};
     use crate::types::{EventType, ExportControl, NewEvent, RustChosenPath, TimeRange};
 
+    /// Removes the store directory it created when dropped (an early error included); declared
+    /// before the store and its lock, so it drops after them (T8 review M-8).
+    struct RemoveOnDrop(Option<PathBuf>);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            if let Some(d) = self.0.take() {
+                let _ = std::fs::remove_dir_all(d);
+            }
+        }
+    }
+
     let fail = |what: &str| std::io::Error::other(format!("export fixture: {what}"));
     let store_dir = out.join("atlas-duck-fixture-store");
+    // An existing entry of that name is never ours to remove.
     std::fs::create_dir(&store_dir)?;
+    let mut cleanup = RemoveOnDrop(Some(store_dir.clone()));
     let data = match check_data_dir(&store_dir) {
         Ok(DataDirResolution::Local(d)) => d,
         _ => return Err(fail("the store directory is not a local data dir")),
@@ -737,6 +750,7 @@ pub fn export_fixture(kind: FixtureKind, out: &Path) -> std::io::Result<FixtureI
     store.shutdown();
     drop(store);
     drop(lock);
+    cleanup.0 = None;
     std::fs::remove_dir_all(&store_dir)?;
     let receipt = exported?;
     let dir = out.join(&receipt.dir_name);

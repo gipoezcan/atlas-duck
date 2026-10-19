@@ -176,6 +176,9 @@ jobs:
           once "$RUNNER_TEMP/verify-export-max.log" max_size_payload_round_trips
           ATLAS_DUCK_VERIFY_EXPORT_CASES=4096 cargo test -p atlas-duck-audit --locked --test verify_export -- --exact verify_export_garbage_never_panics --nocapture 2>&1 | tee "$RUNNER_TEMP/verify-export-garbage.log"
           once "$RUNNER_TEMP/verify-export-garbage.log" verify_export_garbage_never_panics
+          # The measured peaks stay as evidence for later bound discussions (T8 review M-9).
+          # (-o: with --nocapture the line may follow libtest's "test <name> ... " on one line.)
+          grep -ohE 'verify_export (of a 96 MiB payload|garbage):.*' "$RUNNER_TEMP/verify-export-max.log" "$RUNNER_TEMP/verify-export-garbage.log" | tee -a "$GITHUB_STEP_SUMMARY"
 
       # T9 handoff: what a full unix-socket backlog answers to a non-blocking connect. Linux says
       # EAGAIN (the client maps it to busy, exit 11); BSD/macOS may say ECONNREFUSED, which the CLI
