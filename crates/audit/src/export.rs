@@ -58,8 +58,9 @@
 //! blob of the SQLite row (at most [`MAX_EXPORT_CT_LEN`], about 97 MiB), the decrypted
 //! plaintext (at most `MAX_PAYLOAD_LEN`, 96 MiB, zeroized on drop), the line buffer (at most
 //! [`MAX_EXPORT_LINE_BYTES`], about 258 MiB, zeroized on drop) and, briefly, the decompression
-//! input: about 450 MiB in all. Rows below 1 MiB add the JCS check of `payload` (a parsed copy
-//! and its re-encoding, at most a few MiB). Known limits: the 8 KiB `BufWriter` of a file and
+//! input: about 450 MiB in all. Rows below 1 MiB add the JCS check of `payload` (a value tree of
+//! the plaintext, at most 32 bytes per byte of text, so at most 32 MiB, measured about 20 MB for
+//! a list of 1 MiB, and its re-encoding). Known limits: the 8 KiB `BufWriter` of a file and
 //! serde_json's scratch buffers keep fragments of plaintext that are not zeroized (the same
 //! bytes are on disk).
 
