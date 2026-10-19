@@ -13,7 +13,7 @@ use atlas_duck_audit::types::{
     Actor, AuditCursor, AuditFilter, DecisionColumn, EventFlags, EventHeader, EventType,
     MAX_AUDIT_PAGE_ROWS, PAYLOAD_PAGE_BYTES,
 };
-use atlas_duck_audit::{Store, UtcInstant};
+use atlas_duck_audit::{RETENTION_MIN, Store, UtcInstant};
 use common::*;
 use serde_json::{Value, json};
 
@@ -335,7 +335,11 @@ fn audit_query_rejects_bad_cursors_and_filters() {
         Err(AuditError::Invalid(_))
     ));
     // A flag entry that is not a defined single bit selects nothing safely: refused.
-    for bad in [EventFlags::from_bits(0), EventFlags::from_bits(1 << 40)] {
+    for bad in [
+        EventFlags::from_bits(0),
+        EventFlags::from_bits(1 << 40),
+        EventFlags::EDITED | EventFlags::STALE,
+    ] {
         let f = AuditFilter {
             flags_any: vec![bad],
             ..Default::default()
@@ -379,7 +383,9 @@ fn audit_query_keyset_pages_cover_all_rows_once() {
             page_no += 1;
             assert!(page_no < 1000, "paging did not end");
             assert!(page.rows.len() <= limit as usize);
-            assert_eq!(page.scanned, page.rows.len() as u64);
+            // Examined rows: the page plus the probe row when another page follows.
+            let probe = u64::from(page.next.is_some());
+            assert_eq!(page.scanned, page.rows.len() as u64 + probe);
             seen.extend(seqs(&page.rows));
             match page.next {
                 Some(n) => {
@@ -662,6 +668,199 @@ fn payload_view_small_payload_is_one_page_and_debug_hides_bytes() {
     let shown = format!("{page:?}");
     assert!(!shown.contains(WORD), "{shown}");
     assert!(!shown.contains("120"), "no byte values either: {shown}");
+}
+
+/// Follows `next` until it ends; bounded so a continuation bug fails instead of hanging.
+/// Returns the rows and every page's `(rows, scanned)`.
+fn walk_budgeted(
+    s: &Store,
+    f: &AuditFilter,
+    limit: u32,
+    budget: u64,
+) -> (Vec<EventHeader>, Vec<(usize, u64)>) {
+    let mut out = Vec::new();
+    let mut shape = Vec::new();
+    let mut cursor = AuditCursor::first(limit);
+    for _ in 0..10_000 {
+        let page = s.testing_query_budgeted(f, cursor, budget).expect("page");
+        assert!(
+            page.scanned <= budget,
+            "a call examines at most the budget: {} > {budget}",
+            page.scanned
+        );
+        shape.push((page.rows.len(), page.scanned));
+        out.extend(page.rows);
+        match page.next {
+            Some(n) => cursor = n,
+            None => return (out, shape),
+        }
+    }
+    panic!("continuation did not end");
+}
+
+#[test]
+fn query_row_budget_bounds_a_no_match_scan_and_continues() {
+    let (s, _f) = store();
+    for agent in ["alice", "bob"] {
+        let events: Vec<_> = (0..40)
+            .map(|i| {
+                let mut e = ev(T::APP_START, None, json!({ "i": i }));
+                e.actor.agent_name = Some(agent.to_owned());
+                e
+            })
+            .collect();
+        s.append_batch(events).expect("append");
+    }
+    let total = all(&s).len() as u64;
+    assert!(total >= 80);
+
+    // Nothing matches: every call stops at the budget with an empty page and a continuation.
+    let nobody = AuditFilter {
+        agent_name: Some("nobody".into()),
+        ..Default::default()
+    };
+    let first = s
+        .testing_query_budgeted(&nobody, AuditCursor::first(5), 10)
+        .expect("page");
+    assert!(first.rows.is_empty());
+    assert_eq!(first.scanned, 10, "ten rows examined, none matched");
+    let next = first.next.expect("a continuation, not the end");
+    assert_eq!(next.limit, 5);
+    let (rows, shape) = walk_budgeted(&s, &nobody, 5, 10);
+    assert!(rows.is_empty());
+    assert_eq!(
+        shape.iter().map(|p| p.1).sum::<u64>(),
+        total,
+        "continuing examines every row exactly once"
+    );
+    assert!(shape.len() as u64 >= total / 10);
+
+    // A sparse match: the continued walk returns exactly the unbudgeted result.
+    let alice = AuditFilter {
+        agent_name: Some("alice".into()),
+        ..Default::default()
+    };
+    let want = seqs(&pages(&s, &alice, 500));
+    assert_eq!(want.len(), 40);
+    for (limit, budget) in [(4u32, 7u64), (1, 1), (500, 13), (3, 20), (7, 10_000)] {
+        let (got, _) = walk_budgeted(&s, &alice, limit, budget);
+        assert_eq!(seqs(&got), want, "limit {limit} budget {budget}");
+    }
+    // The budget landing exactly on the end of the store leaves no phantom continuation.
+    let (_, shape) = walk_budgeted(&s, &nobody, 5, total);
+    assert_eq!(shape, vec![(0, total)]);
+}
+
+#[test]
+fn query_default_budget_stops_a_large_no_match_scan() {
+    let (s, _f) = store();
+    let budget = atlas_duck_audit::QUERY_ROW_BUDGET;
+    let batch = 5_000usize;
+    let batches = (budget as usize / batch) + 1;
+    for _ in 0..batches {
+        s.append_batch(day_events(batch)).expect("append");
+    }
+    assert!(all(&s).len() as u64 > budget);
+    let nobody = AuditFilter {
+        agent_name: Some("nobody".into()),
+        ..Default::default()
+    };
+    let page = s.query(&nobody, AuditCursor::first(10)).expect("page");
+    assert!(page.rows.is_empty());
+    assert_eq!(page.scanned, budget);
+    assert!(page.next.is_some(), "more rows follow the budget window");
+}
+
+#[test]
+fn query_pages_with_a_filter_over_equal_timestamps() {
+    let (s, _f) = store();
+    // The clock never moves: every row shares one `ts_utc`, so only `seq` orders them.
+    let events: Vec<_> = (0..30)
+        .map(|i| {
+            let mut e = ev(T::APP_START, None, json!({ "i": i }));
+            e.actor.agent_name = Some(if i % 3 == 0 { "alice" } else { "bob" }.to_owned());
+            e
+        })
+        .collect();
+    s.append_batch(events).expect("append");
+    let alice = AuditFilter {
+        agent_name: Some("alice".into()),
+        ..Default::default()
+    };
+    let want: Vec<u64> = all(&s)
+        .iter()
+        .filter(|h| h.actor.agent_name.as_deref() == Some("alice"))
+        .map(|h| h.seq)
+        .collect();
+    assert_eq!(want.len(), 10);
+    for limit in [1u32, 3, 4, 10] {
+        assert_eq!(seqs(&pages(&s, &alice, limit)), want, "limit {limit}");
+    }
+}
+
+#[test]
+fn trail_after_a_real_prune_compares_with_the_first_delivery() {
+    let (s, f) = new_store_with(fake_clock(START), MemKeyring::new(), |cfg| {
+        cfg.hooks.synchronous_normal = true;
+    });
+    corroborate_now(&s, &f.clock);
+    prune_ready(&s, RETENTION_MIN);
+    let submit = received(&s, "aged", "agent-a", Some("100"));
+    for _ in 0..60 {
+        day(&s, &f.clock, 1);
+    }
+    let d1 = delivered(&s, "aged", "agent-a", Some("100"));
+    for _ in 0..45 {
+        day(&s, &f.clock, 1);
+    }
+    let headers = s.headers_for_request("aged").expect("headers");
+    assert_eq!(
+        seqs(&headers),
+        vec![d1],
+        "the submit (seq {submit}) is past retention and gone"
+    );
+    let t = s.trail("aged").expect("trail");
+    assert_eq!(t.deliveries.count, 1);
+    assert!(!t.deliveries.to_other_peer);
+    delivered(&s, "aged", "agent-b", Some("100"));
+    assert!(s.trail("aged").expect("trail").deliveries.to_other_peer);
+}
+
+#[test]
+fn unknown_submit_origin_with_a_known_delivery_is_another_peer() {
+    let (s, _f) = store();
+    let mut e = ev(
+        T::REQUEST_RECEIVED,
+        Some("blind"),
+        json!({ "connection": { "peer_origin_start_time": null } }),
+    );
+    e.actor = Actor::default();
+    s.append(e).expect("append");
+    delivered(&s, "blind", "agent-a", Some("100"));
+    assert!(s.trail("blind").expect("trail").deliveries.to_other_peer);
+}
+
+#[test]
+fn payload_view_page_boundary_is_exact() {
+    let (s, _f) = store();
+    // `{"blob":"` + n + `"}` is 11 bytes around the blob in JCS.
+    let n = PAYLOAD_PAGE_BYTES - 11;
+    let exact = put_payload(&s, json!({ "blob": "x".repeat(n) }));
+    assert_eq!(
+        s.read_payload(exact).expect("payload").len(),
+        PAYLOAD_PAGE_BYTES
+    );
+    let page = s.payload_view(exact, 0).expect("page");
+    assert_eq!(page.page_count, 1);
+    assert_eq!(page.bytes.len(), PAYLOAD_PAGE_BYTES);
+    assert!(matches!(
+        s.payload_view(exact, 1),
+        Err(AuditError::Invalid(_))
+    ));
+    let over = put_payload(&s, json!({ "blob": "x".repeat(n + 1) }));
+    let page = s.payload_view(over, 1).expect("page 1");
+    assert_eq!(page.page_count, 2);
+    assert_eq!(page.bytes.len(), 1);
 }
 
 #[test]

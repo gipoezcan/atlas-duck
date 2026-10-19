@@ -600,6 +600,33 @@ fn request_received_payload_and_columns() -> TestResult {
     Ok(())
 }
 
+/// Contract with the audit read API (`Store::trail`, M10 T10): it reads the origin start time
+/// from `connection.peer_origin_start_time` of the submit and the top-level
+/// `peer_origin_start_time` of a DELIVERED. A rename of either key here makes `to_other_peer`
+/// wrong or the trail fail.
+#[test]
+fn trail_reads_the_real_builders_peer_start_time_keys() -> TestResult {
+    let ts = TempStore::new()?;
+    let port = ts.port();
+    let id = RequestId::new()?;
+    port.append(received(id.as_str(), &json!({ "key": "ABC-1" }))?)?;
+    let sha = [7u8; 32];
+    let same = delivered(&ctx(id.as_str()), &hello(), &conn(), &sha);
+    port.append(same)?;
+    let t = ts.store().trail(id.as_str())?;
+    assert_eq!(t.deliveries.count, 1);
+    assert!(!t.deliveries.to_other_peer, "same peer, same start time");
+
+    // Same executable, another process start: only the start time key can tell.
+    let mut later = conn();
+    later.peer.peer_origin_start_time = Some(1);
+    port.append(delivered(&ctx(id.as_str()), &hello(), &later, &sha))?;
+    let t = ts.store().trail(id.as_str())?;
+    assert_eq!(t.deliveries.count, 2);
+    assert!(t.deliveries.to_other_peer, "another origin start time");
+    Ok(())
+}
+
 #[test]
 fn builders_append_with_their_columns() -> TestResult {
     let ts = TempStore::new()?;

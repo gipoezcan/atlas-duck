@@ -93,6 +93,7 @@ pub use open::{
 };
 pub use passphrase::{PASSPHRASE_MISMATCH, PASSPHRASE_TOO_SHORT};
 pub use prune::{PruneOutcome, PruneSkip};
+pub use query::{MAX_FILTER_TEXT_BYTES, QUERY_ROW_BUDGET};
 pub use reanchor::{
     RE_ANCHOR_DOES_NOT_VERIFY, RE_ANCHOR_HELD, RE_ANCHOR_NOTHING_MISSING, RE_ANCHOR_RESTORED,
 };

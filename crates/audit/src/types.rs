@@ -412,9 +412,11 @@ impl AuditCursor {
     }
 }
 
-/// One page of matching headers, `seq` descending. `next` is `Some` exactly when more matching
-/// rows follow. `scanned` is the number of rows this page read (equal to `rows.len()`: the
-/// query is index-assisted keyset paging, not a counted full scan).
+/// One page of matching headers, `seq` descending. `next` is `Some` when more rows may follow:
+/// after a full page, or when the per-call row budget ended the scan early (a partial or even
+/// empty page whose `next` must be followed). `scanned` is the number of rows examined by this
+/// call (at most the budget), matching or not. Keyset paging bounds the work per call; it is
+/// not an index lookup (only `seq` is indexed for these filters).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditPage {
     pub rows: Vec<EventHeader>,

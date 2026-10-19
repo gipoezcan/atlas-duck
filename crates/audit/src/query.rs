@@ -5,6 +5,19 @@
 //! opened for exactly two purposes: the delivery comparison of [`Store::trail`] (the submit
 //! record and each `DELIVERED` of one request) and [`Store::payload_view`] (one row, on the
 //! user's request).
+//!
+//! Known limits, accepted: [`Store::payload_view`] decrypts and hashes the whole payload for
+//! every page (O(pages x size) for a maximal payload; a caller that pages through one should
+//! cache the plaintext for the open view). A trail's headers and its payload reads are separate
+//! reader acquisitions, not one snapshot: a prune in between fails the trail closed
+//! (`NotFound`/`InvalidRecord`) rather than showing a mix.
+//!
+//! Peer comparison is exact: `peer_origin_exe` paths compare component-wise and case-sensitively
+//! on every platform (nothing in the store normalises paths), so Windows paths differing only
+//! in case read as another peer: noisy, never silent.
+//!
+//! An empty `target` prefix is "no constraint"; the other text filters match the empty string
+//! literally.
 
 use std::path::PathBuf;
 
@@ -22,6 +35,11 @@ use crate::types::{
 
 /// The longest text a filter field may carry (bytes); targets, ids and agent names are short.
 pub const MAX_FILTER_TEXT_BYTES: usize = 2048;
+
+/// The most rows one [`Store::query`] call examines while it holds the shared reader lock
+/// (every other read path waits for it). A filter that matches little returns a partial page
+/// with a continuation cursor once this many rows were examined.
+pub const QUERY_ROW_BUDGET: u64 = 20_000;
 
 fn io(e: rusqlite::Error) -> AuditError {
     AuditError::Io(e.to_string())
@@ -63,10 +81,8 @@ fn conditions(f: &AuditFilter) -> Result<(Vec<String>, Vec<Sql>), AuditError> {
     }
     if let Some(prefix) = text(&f.target)?.filter(|p| !p.is_empty()) {
         // Byte-exact prefix without LIKE (whose `%`, `_` and ASCII case folding would leak
-        // into the match): the range bound keeps the comparison on the column's collation,
-        // `substr` (characters) makes it a prefix.
-        sql.push("target >= ?".into());
-        args.push(Sql::Text(prefix.to_owned()));
+        // into the match): `substr` (characters) equality makes it a prefix. No index serves
+        // this condition; the row budget bounds its cost.
         sql.push("substr(target, 1, ?) = ?".into());
         args.push(Sql::Integer(
             i64::try_from(prefix.chars().count()).unwrap_or(i64::MAX),
@@ -108,46 +124,110 @@ fn conditions(f: &AuditFilter) -> Result<(Vec<String>, Vec<Sql>), AuditError> {
 impl Store {
     /// One page of the retained events that match `f`, newest first (keyset on `seq`, so a
     /// row appended meanwhile never shifts a page). Plaintext columns only; never decrypts.
+    /// At most [`QUERY_ROW_BUDGET`] rows are examined per call: when that runs out before the
+    /// page fills, the page is partial (possibly empty) and `next` continues below the examined
+    /// rows, so a caller follows `next` until it is `None`.
     /// `Invalid` for a `limit` outside 1..=[`MAX_AUDIT_PAGE_ROWS`], an over-long filter text or a
     /// `flags_any` entry that is not one defined flag bit.
     pub fn query(&self, f: &AuditFilter, page: AuditCursor) -> Result<AuditPage, AuditError> {
         if page.limit == 0 || page.limit > MAX_AUDIT_PAGE_ROWS {
             return Err(AuditError::Invalid("the audit page limit is out of range"));
         }
-        let (mut sql, mut args) = conditions(f)?;
-        if let Some(before) = page.before_seq {
-            sql.push("seq < ?".into());
-            args.push(Sql::Integer(i64::try_from(before).unwrap_or(i64::MAX)));
+        self.query_budgeted(f, page, QUERY_ROW_BUDGET)
+    }
+
+    /// [`Store::query`] with a lowered row budget (feature `testing`).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn testing_query_budgeted(
+        &self,
+        f: &AuditFilter,
+        page: AuditCursor,
+        budget: u64,
+    ) -> Result<AuditPage, AuditError> {
+        self.query_budgeted(f, page, budget)
+    }
+
+    fn query_budgeted(
+        &self,
+        f: &AuditFilter,
+        page: AuditCursor,
+        budget: u64,
+    ) -> Result<AuditPage, AuditError> {
+        if page.limit == 0 || page.limit > MAX_AUDIT_PAGE_ROWS {
+            return Err(AuditError::Invalid("the audit page limit is out of range"));
         }
-        let filter = if sql.is_empty() {
-            "1 = 1".to_owned()
-        } else {
-            sql.join(" AND ")
-        };
+        let budget = budget.max(1);
+        let (mut sql, mut args) = conditions(f)?;
+        let before = page
+            .before_seq
+            .map_or(i64::MAX, |b| i64::try_from(b).unwrap_or(i64::MAX));
         // One extra row tells whether another page follows.
         let limit = page.limit;
-        args.push(Sql::Integer(i64::from(limit) + 1));
+        let window_stmt = "SELECT seq FROM events WHERE seq < ? ORDER BY seq DESC \
+                           LIMIT 2 OFFSET ?";
+        let count_stmt = "SELECT count(*) FROM events WHERE seq < ? AND seq >= ?";
+        sql.push("seq < ?".into());
+        args.push(Sql::Integer(before));
+        sql.push("seq >= ?".into());
+        // The lower window bound goes in last; it is set inside the reader closure.
+        let filter = sql.join(" AND ");
         let stmt =
             format!("SELECT {HEADER_COLUMNS} FROM events WHERE {filter} ORDER BY seq DESC LIMIT ?");
-        let mut rows = self.with_reader(|conn| {
+        let (mut rows, scanned, exhausted_at) = self.with_reader(|conn| {
+            // The window: the `budget` newest rows below the cursor, found on the primary key
+            // alone. `low` is the seq of the last row inside it; a second row means the
+            // window ends before the store does.
+            let budget_off = i64::try_from(budget - 1).unwrap_or(i64::MAX);
+            let edge: Vec<i64> = conn
+                .prepare(window_stmt)
+                .map_err(io)?
+                .query_map(rusqlite::params![before, budget_off], |r| r.get(0))
+                .map_err(io)?
+                .collect::<Result<_, _>>()
+                .map_err(io)?;
+            let low = edge.first().copied().unwrap_or(0);
+            let more_below = edge.len() > 1;
+            let mut args = args.clone();
+            args.push(Sql::Integer(low));
+            args.push(Sql::Integer(i64::from(limit) + 1));
             let mut stmt = conn.prepare(&stmt).map_err(io)?;
             let mut it = stmt.query(params_from_iter(args.iter())).map_err(io)?;
             let mut out = Vec::new();
             while let Some(r) = it.next().map_err(io)? {
                 out.push(header_from_row(r)?);
             }
-            Ok(out)
+            drop(it);
+            // Rows examined: the window down to the last row returned (the probe row
+            // included) when the page filled, else the whole window.
+            let floor = if out.len() > limit as usize {
+                out.last()
+                    .map_or(low, |h| i64::try_from(h.seq).unwrap_or(low))
+            } else {
+                low
+            };
+            let scanned: i64 = conn
+                .query_row(count_stmt, rusqlite::params![before, floor], |r| r.get(0))
+                .map_err(io)?;
+            Ok((
+                out,
+                u64::try_from(scanned).unwrap_or(0),
+                more_below.then_some(low),
+            ))
         })?;
         let more = rows.len() > limit as usize;
         rows.truncate(limit as usize);
-        let next = match (more, rows.last()) {
-            (true, Some(last)) => Some(AuditCursor {
+        let next = match (more, rows.last(), exhausted_at) {
+            (true, Some(last), _) => Some(AuditCursor {
                 before_seq: Some(last.seq),
+                limit,
+            }),
+            // The budget ran out before the page filled: continue below the window.
+            (false, _, Some(low)) => Some(AuditCursor {
+                before_seq: u64::try_from(low).ok(),
                 limit,
             }),
             _ => None,
         };
-        let scanned = rows.len() as u64;
         Ok(AuditPage {
             rows,
             next,
