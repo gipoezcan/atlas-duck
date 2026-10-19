@@ -193,7 +193,7 @@ jobs:
           set -euo pipefail
           cargo test -p atlas-duck-audit --release --locked --test audit_query_bench -- --ignored --exact audit_query_bench --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/audit-query-bench.log"
           grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/audit-query-bench.log" || { echo "::error::audit_query_bench did not run exactly once"; exit 1; }
-          grep -q 'BENCH rows=1000000 enforce=true' "$RUNNER_TEMP/audit-query-bench.log" || { echo "::error::audit_query_bench did not run enforced on 1000000 rows"; exit 1; }
+          grep -Eq 'BENCH rows=[0-9]{7,} enforce=true' "$RUNNER_TEMP/audit-query-bench.log" || { echo "::error::audit_query_bench did not run enforced on at least 1000000 rows"; exit 1; }
           { echo '### Audit-window query benchmark (PD-158)'; echo '```'; grep -ohE '^BENCH .*' "$RUNNER_TEMP/audit-query-bench.log"; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
         env:
           CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
