@@ -4,7 +4,7 @@
 
 use std::ffi::OsString;
 
-use atlas_duck_app_lib::early_argv::{EarlyMode, classify_argv, verify_export_stub};
+use atlas_duck_app_lib::early_argv::{EarlyMode, classify_argv, verify_export_main};
 use atlas_duck_app_lib::startup::child_reaping::restore_default_sigchld;
 use atlas_duck_app_lib::startup::crash::apply_process_crash_settings;
 use atlas_duck_app_lib::startup::hardening;
@@ -30,7 +30,7 @@ fn main() {
     }
     match mode {
         EarlyMode::Cli(rest) => std::process::exit(atlas_duck_cli::run(rest)),
-        EarlyMode::VerifyExport(rest) => std::process::exit(verify_export_stub(rest)),
+        EarlyMode::VerifyExport(rest) => std::process::exit(verify_export_main(rest)),
         EarlyMode::Gui { background } => {
             // PD-33: before any other thread exists; `__cli` and `__verify-export` keep glibc's default.
             let _ = atlas_duck_app_lib::compose::set_mmap_threshold();

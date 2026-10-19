@@ -137,7 +137,7 @@ fn resolution_state(resolution: io::Result<DataDirResolution>) -> DataState {
 }
 
 /// §3.2 order: `$APPIMAGE` (Linux), the app next to the CLI, `cli.toml`'s `app_path`.
-fn locate_app(
+pub(crate) fn locate_app(
     base_host: Option<(&BaseDirs, &str)>,
     env: &dyn Fn(&str) -> Option<OsString>,
     exe: Option<&Path>,

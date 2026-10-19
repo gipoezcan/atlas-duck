@@ -46,6 +46,30 @@ Pass `reason` in each tool call.
 After an atlas-duck upgrade, restart the MCP server.
 ";
 
+/// `atlas-duck verify-export --help` (§12.1): the app's verifier, run as a child process; no
+/// envelope, no global flags.
+const VERIFY_EXPORT_HELP: &str = "\
+Usage: atlas-duck verify-export <dir> [--anchor-dir <dir>] [--manifest-sha256 <64 lowercase hex>]
+
+Verify an audit export directory offline. Needs no running app, no keychain and no key; it
+reads only <dir> and the anchor directory. The report goes to stdout (no JSON envelope).
+
+Flags:
+  --anchor-dir <dir>            the anchor directory the export was anchored to
+  --manifest-sha256 <hex>       the SHA-256 of manifest.json, obtained from the exporter
+  --help                        show this help
+
+verify-export must be the first argument; the global flags do not apply to it.
+A directory ending in .partial is an incomplete export and is refused: rename it after an
+interrupted export once you know it is complete.
+
+Exit codes:
+  0   verified against a trust root you supplied
+  20  internally consistent, but no trust root covers the whole export
+  21  tampering or a fork detected
+  22  usage or I/O error, or the atlas-duck app was not found
+";
+
 /// JSON given on the command line or in a file is read by serde_json.
 const JSON_NOTE: &str = "JSON notes: an integer above 18446744073709551615 (u64::MAX) is rounded to a float, and when an
 object repeats a key the last one wins.
@@ -136,8 +160,8 @@ pub(crate) fn help_text(path: &[String]) -> Option<String> {
     if first == Some("mcp") {
         return Some(MCP_HELP.to_owned());
     }
-    if let Some(name @ "verify-export") = first {
-        return Some(format!("{name}: not available in this build\n"));
+    if first == Some("verify-export") {
+        return Some(VERIFY_EXPORT_HELP.to_owned());
     }
     let mut out = String::new();
     let generic: Vec<&GenericCommand> = GENERIC_COMMANDS

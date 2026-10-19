@@ -3,11 +3,12 @@
 //! §2.2: depends only on `ipc` + `registry`. §2.1: never touches keychain or DB.
 //! C.9: the crate exposes only `run`; everything else is `pub(crate)`.
 //!
-//! Local commands (argv errors, `--help`, `ops list`/`ops describe` without `--instance`,
-//! `verify-export` in this build) are answered here and never connect to the app or build
-//! the tokio runtime (§4.1 "Local parsing"). Connected commands (`connected`) build a current-thread
-//! runtime of their own and reach the app through a `Connector`. `mcp` is neither: `run` hands it
-//! to the `mcp` module once argv and the environment are valid.
+//! Local commands (argv errors, `--help`, `ops list`/`ops describe` without `--instance`) are
+//! answered here and never connect to the app or build the tokio runtime (§4.1 "Local parsing").
+//! Connected commands (`connected`) build a current-thread runtime of their own and reach the app
+//! through a `Connector`. `mcp` is neither: `run` hands it to the `mcp` module once argv and the
+//! environment are valid. `verify-export` is neither either: `run` starts the app's verifier as a
+//! child process before argv parsing and prints no envelope (§12.1, C.9).
 
 // §4.7: the launched app's test-only environment names exist only in test builds; a release build
 // must never carry them.
@@ -32,6 +33,7 @@ mod mcp;
 mod output;
 #[cfg(test)]
 mod test_support;
+mod verify_export;
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -100,7 +102,7 @@ pub(crate) fn execute(
             op_id,
             instance: None,
         } => local::ops_describe(op_id),
-        Command::NotInThisBuild(name) => local::not_in_this_build(name),
+        Command::VerifyExport => local::verify_export_misplaced(),
         _ => execute_connected(&command, &opts, &deadline, connector),
     };
     let exit = exit::exit_for(&command, &envelope);
@@ -197,6 +199,11 @@ pub fn run(args: Vec<OsString>) -> i32 {
         && first == launch::stub::STUB_COMMAND
     {
         return launch::stub::run_stub(rest);
+    }
+    // §12.1: `verify-export` hands its arguments to the app's verifier untouched and prints no
+    // envelope; its exit code (0, 20, 21, 22) is the child's.
+    if verify_export::is_call(&args) {
+        return verify_export::run(args.get(1..).unwrap_or_default());
     }
     // §3.3: build_id is compiled into every binary (M4's `hello` sends it). black_box keeps the
     // constant referenced, so the linker cannot drop it from the executable.
@@ -368,15 +375,39 @@ mod tests {
     }
 
     #[test]
-    fn verify_export_not_in_this_build() {
-        let (o, calls) = go(&["verify-export", "dir"]);
+    fn verify_export_after_a_global_flag_is_a_usage_failure() {
+        // `run` starts `verify-export` only as the first argument; argv parsing never runs it.
+        let (o, calls) = go(&["--output", "text", "verify-export", "dir"]);
         assert_eq!(calls, 0);
         assert_eq!(o.exit, 2);
         assert_eq!(code(&o), Some(ErrorCode::Usage));
-        assert_eq!(
-            o.env.error.map(|e| e.message).as_deref(),
-            Some("not available in this build")
-        );
+        let message = o.env.error.map(|e| e.message).unwrap_or_default();
+        assert!(message.contains("must be the first argument"), "{message}");
+    }
+
+    #[test]
+    fn verify_export_help_is_local_and_documents_its_flags() {
+        for args in [&["verify-export", "--help"][..], &["help", "verify-export"]] {
+            let (o, calls) = go(args);
+            assert_eq!(calls, 0, "{args:?}");
+            assert_eq!(o.exit, 0, "{args:?}");
+            let help = o
+                .env
+                .data
+                .as_ref()
+                .and_then(|d| d["help"].as_str())
+                .unwrap_or_default();
+            for needle in [
+                "atlas-duck verify-export <dir>",
+                "--anchor-dir",
+                "--manifest-sha256",
+                "20",
+                "21",
+                "22",
+            ] {
+                assert!(help.contains(needle), "{args:?} {needle}: {help}");
+            }
+        }
     }
 
     /// `execute` + `print_outcome` over captured writers: (outcome, stdout, stderr, exit).

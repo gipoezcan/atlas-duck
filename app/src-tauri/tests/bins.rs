@@ -1,5 +1,5 @@
 //! The three bins of the Tauri package (§12.1): the CLI usage envelope (§4.2, §4.3), the early-argv
-//! dispatch before any Tauri/GTK code (§2.5 Scope), the verify-export stub (§12.1), the sandbox stub
+//! dispatch before any Tauri/GTK code (§2.5 Scope), the verify-export mode (§12.1), the sandbox stub
 //! (§3.4), the embedded BUILD_ID (§3.3, §3.4) and, on Windows, the worker's PE header (§9.3).
 
 use std::io::Read;
@@ -131,13 +131,94 @@ fn app_cli_marker_is_byte_identical_to_the_cli_bin() {
     assert_usage_envelope(&via_app.stdout);
 }
 
+/// §12.1: the marker and its alias run the real verifier; a directory that is not an export is a
+/// usage or I/O error (22) whose report goes to stdout, a missing directory argument is a usage
+/// error (22) whose reason and usage line go to stderr.
 #[test]
-fn app_verify_export_marker_and_alias_exit_22() {
+fn app_verify_export_marker_and_alias_report_usage_error_on_missing_dir() {
     for marker in ["__verify-export", "--verify-export"] {
-        let run = run_with_timeout(cmd(APP, &[marker, "x"]), LIMIT);
-        assert_eq!(run.status.code(), Some(22), "{marker}");
-        assert!(run.stdout.is_empty(), "{marker}: stdout must stay empty");
+        let missing = run_with_timeout(cmd(APP, &[marker, "no-such-export-directory"]), LIMIT);
+        assert_eq!(missing.status.code(), Some(22), "{marker}");
+        let stdout = String::from_utf8_lossy(&missing.stdout);
+        assert!(stdout.contains("cannot verify:"), "{marker}: {stdout}");
+
+        let usage = run_with_timeout(cmd(APP, &[marker]), LIMIT);
+        assert_eq!(usage.status.code(), Some(22), "{marker}");
+        assert!(usage.stdout.is_empty(), "{marker}: stdout must stay empty");
+        let stderr = String::from_utf8_lossy(&usage.stderr);
+        assert!(
+            stderr.contains("usage: verify-export <dir>"),
+            "{marker}: {stderr}"
+        );
     }
+}
+
+fn hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// §12.1, C.9: `atlas-duck verify-export` finds the app next to the CLI, runs `__verify-export`
+/// with this process's stdio and exits with its code, printing no envelope. The exports come from
+/// the audit crate's fixture writer (an honest one, a tampered one).
+#[test]
+fn cli_verify_export_passes_report_and_exit_code_through() {
+    use atlas_duck_audit::testing::{FixtureKind, export_fixture};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut seen = Vec::new();
+    for (kind, with_root, last_line) in [
+        (
+            FixtureKind::Pass,
+            true,
+            "verified against the manifest SHA-256",
+        ),
+        (FixtureKind::Tamper, true, "TAMPERED:"),
+        (
+            FixtureKind::NoTrustRoot,
+            false,
+            "internally consistent; trust root NOT verified",
+        ),
+    ] {
+        let out = tmp.path().join(format!("{kind:?}"));
+        std::fs::create_dir(&out).expect("fixture dir");
+        let info = export_fixture(kind, &out).expect("fixture");
+        let dir = info.dir.to_str().expect("UTF-8 path").to_owned();
+        let root = hex(&info.manifest_sha256);
+        let mut args = vec!["verify-export", dir.as_str()];
+        if with_root {
+            args.extend(["--manifest-sha256", root.as_str()]);
+        }
+        let run = run_with_timeout(cmd(CLI, &args), LIMIT);
+        assert_eq!(
+            run.status.code(),
+            Some(i32::from(info.expected_exit)),
+            "{kind:?}"
+        );
+        let stdout = String::from_utf8(run.stdout).expect("UTF-8 report");
+        let last = stdout.lines().last().unwrap_or_default();
+        assert!(last.starts_with(last_line), "{kind:?}: {stdout}");
+        assert!(
+            !stdout.trim_start().starts_with('{'),
+            "{kind:?}: the CLI prints no envelope: {stdout}"
+        );
+        assert!(run.stderr.is_empty(), "{kind:?}: {:?}", run.stderr);
+        seen.push(info.expected_exit);
+    }
+    assert_eq!(seen, [0, 21, 20]);
+
+    // A directory that is no export: the app's own report on stdout, exit 22 from the child.
+    let run = run_with_timeout(
+        cmd(CLI, &["verify-export", "no-such-export-directory"]),
+        LIMIT,
+    );
+    assert_eq!(run.status.code(), Some(22));
+    assert!(String::from_utf8_lossy(&run.stdout).contains("cannot verify:"));
+
+    // A usage error is the app's too: its reason on stderr, nothing on stdout, exit 22.
+    let run = run_with_timeout(cmd(CLI, &["verify-export", "d", "--pubkey", "k"]), LIMIT);
+    assert_eq!(run.status.code(), Some(22));
+    assert!(run.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&run.stderr).contains("--pubkey"));
 }
 
 #[test]
@@ -279,10 +360,18 @@ fn early_argv_modes_keep_their_stdio() {
     assert_eq!(cli.status.code(), Some(2));
     assert_usage_envelope(&cli.stdout);
 
+    // Still 22, now from the real body: "x" is not an export directory. The report reaches the
+    // parent's stdout and a usage error reaches its stderr (not the null device).
     let verify = run_with_timeout(cmd(APP, &["__verify-export", "x"]), LIMIT);
     assert_eq!(verify.status.code(), Some(22));
     assert!(
-        !verify.stderr.is_empty(),
-        "the verify-export stub's stderr line must reach the parent, not the null device"
+        String::from_utf8_lossy(&verify.stdout).contains("cannot verify:"),
+        "the verifier's report must reach the parent"
+    );
+    let usage = run_with_timeout(cmd(APP, &["__verify-export", "x", "--bogus"]), LIMIT);
+    assert_eq!(usage.status.code(), Some(22));
+    assert!(
+        !usage.stderr.is_empty(),
+        "the usage error must reach the parent's stderr, not the null device"
     );
 }

@@ -396,11 +396,8 @@ async fn run(
             short_call(client, method::OPS_DESCRIBE, params, deadline).await
         }
         // `doctor` is answered by `doctor::execute` before the flow starts; `mcp` is served by
-        // `run`.
-        Command::Doctor
-        | Command::Help { .. }
-        | Command::Mcp { .. }
-        | Command::NotInThisBuild(_) => {
+        // `run`, and so is `verify-export`.
+        Command::Doctor | Command::Help { .. } | Command::Mcp { .. } | Command::VerifyExport => {
             Envelope::failed(ErrorCode::Internal, false, MSG_NOT_CONNECTED)
         }
     }

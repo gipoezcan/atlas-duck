@@ -100,8 +100,9 @@ pub(crate) enum Command {
         instance: Option<String>,
         agent_given: bool,
     },
-    /// `verify-export` (M10): a `usage` failure in this build.
-    NotInThisBuild(&'static str),
+    /// `verify-export` anywhere but first: `run` starts it from the raw argv, so a parse that gets
+    /// here (a global flag came before it) is a `usage` failure.
+    VerifyExport,
 }
 
 /// A `usage` failure: becomes `failed` / `usage` / exit 2 with `details` when non-empty.
@@ -163,7 +164,7 @@ enum Kind {
     RequestsList,
     Doctor,
     Mcp,
-    NotInBuild(&'static str),
+    VerifyExport,
     Op(&'static OperationSpec),
     /// A proper prefix of a command path (`jira issue`, `ops`).
     Incomplete,
@@ -183,7 +184,7 @@ fn classify(pos: &[String]) -> (Kind, usize) {
         Some("cancel") => return (Kind::Cancel, 1),
         Some("doctor") => return (Kind::Doctor, 1),
         Some("mcp") => return (Kind::Mcp, 1),
-        Some("verify-export") => return (Kind::NotInBuild("verify-export"), 1),
+        Some("verify-export") => return (Kind::VerifyExport, 1),
         Some("ops") => {
             return match word(1) {
                 None => (Kind::Incomplete, 1),
@@ -222,7 +223,7 @@ fn classify(pos: &[String]) -> (Kind, usize) {
 enum Arity {
     Value,
     OptionalValue,
-    /// Accepted and ignored: `verify-export` fails anyway.
+    /// Accepted and ignored: a misplaced `verify-export` fails anyway.
     Skip,
 }
 
@@ -233,7 +234,7 @@ fn flag_arity(kind: Kind, flag: &str) -> Option<Arity> {
         (Kind::ScriptRun, "--args" | "--limits") => Some(Arity::Value),
         (Kind::ScriptRun, "--dry-run") => Some(Arity::OptionalValue),
         (Kind::RequestsList, "--state" | "--match-params-file") => Some(Arity::Value),
-        (Kind::NotInBuild(_), _) => Some(Arity::Skip),
+        (Kind::VerifyExport, _) => Some(Arity::Skip),
         _ => None,
     }
 }
@@ -660,7 +661,7 @@ fn build(
         Kind::Help => Ok(Command::Help {
             path: rest.to_vec(),
         }),
-        Kind::NotInBuild(name) => Ok(Command::NotInThisBuild(name)),
+        Kind::VerifyExport => Ok(Command::VerifyExport),
         Kind::Mcp => {
             exactly(rest, &[])?;
             // PD-116: the other global flags have no meaning for a server.
@@ -1473,10 +1474,18 @@ mod tests {
     }
 
     #[test]
-    fn verify_export_parses_to_not_in_this_build() {
+    fn verify_export_parses_to_the_misplaced_command() {
         assert_eq!(
-            ok(&["verify-export", "dir", "--anchor-dir", "x"]).1,
-            Command::NotInThisBuild("verify-export")
+            ok(&[
+                "--output",
+                "text",
+                "verify-export",
+                "dir",
+                "--anchor-dir",
+                "x"
+            ])
+            .1,
+            Command::VerifyExport
         );
     }
 

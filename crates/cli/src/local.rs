@@ -1,6 +1,7 @@
 //! Commands that run entirely in the CLI (§4.1 "Local parsing"): `ops list` and `ops describe`
 //! without `--instance` (PD-10), `--help` (PD-12), and the usage failures argv parsing produces.
-//! They never connect to the app and never launch it.
+//! They never connect to the app and never launch it. (`verify-export` runs the app's verifier
+//! as a child process; see `verify_export`.)
 
 use atlas_duck_ipc::envelope::{Envelope, ErrorCode, Status};
 use atlas_duck_ipc::sandbox::ScriptLimits;
@@ -95,11 +96,15 @@ pub(crate) fn mcp_serving() -> Envelope {
     succeeded(Value::Null)
 }
 
-/// `verify-export` (M10).
-pub(crate) fn not_in_this_build(command: &str) -> Envelope {
+/// `verify-export` reached argv parsing: a global flag came before the command word (`run` starts
+/// `verify-export` only when it is the first argument, because the app owns its flags).
+pub(crate) fn verify_export_misplaced() -> Envelope {
     let mut details = serde_json::Map::new();
-    details.insert("command".into(), json!(command));
-    usage("not available in this build", details)
+    details.insert("command".into(), json!("verify-export"));
+    usage(
+        "verify-export must be the first argument: atlas-duck verify-export <dir> [--anchor-dir <dir>] [--manifest-sha256 <64 lowercase hex>]",
+        details,
+    )
 }
 
 #[cfg(test)]
@@ -155,10 +160,15 @@ mod tests {
     }
 
     #[test]
-    fn verify_export_not_in_this_build() {
-        let env = not_in_this_build("verify-export");
+    fn verify_export_misplaced_is_a_usage_failure_with_the_usage_line() {
+        let env = verify_export_misplaced();
         let err = env.error.unwrap_or_else(|| panic!("error"));
         assert_eq!(err.code, ErrorCode::Usage);
-        assert_eq!(err.message, "not available in this build");
+        assert!(
+            err.message.contains("must be the first argument"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("--manifest-sha256"), "{}", err.message);
     }
 }
