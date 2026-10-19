@@ -50,7 +50,7 @@ const FIXTURES = new Map<string, Json>(
 const DISCRIMINANTS = new Set([
   'kind', 'class', 'status', 'level', 'step', 'state', 'product', 'purpose', 'choice', 'result',
   'outcome', 'mode', 'op', 'scope', 'preset', 'method', 'cli', 'autostart',
-  'attention_mode', 'secret_service', 'code', 'field', 'conn', 'error', 'preselect', 'scripts',
+  'attention_mode', 'anchors_missing', 'secret_service', 'code', 'field', 'conn', 'error', 'preselect', 'scripts',
 ]);
 
 /** The one discriminator path a `free` run poisons as well (the per-path prototype pass), or null. */
