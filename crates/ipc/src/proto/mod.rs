@@ -260,56 +260,111 @@ pub fn busy_envelope(retry_after_s: u64) -> Envelope {
     e
 }
 
+/// One row of [`EXIT_MATRIX`]: `(status, error.code, exit)`. A row with `None` answers every
+/// code of that status that has no row of its own (for `failed`: an envelope without an error
+/// object).
+pub type ExitRow = (Status, Option<ErrorCode>, i32);
+
+/// §4.3 status ↔ exit matrix (normative), the one table behind [`exit_code`] and the
+/// onboarding page's exit-matrix section (PD-175). Two rules live outside the rows:
+/// `result_evicted` wins over every status, and a `succeeded`/`released` envelope whose `data`
+/// holds `script_error` exits 8 (`SCRIPT`).
+pub const EXIT_MATRIX: &[ExitRow] = {
+    use crate::envelope::exit;
+    use ErrorCode as C;
+    use Status as S;
+    &[
+        (S::Succeeded, None, exit::OK),
+        (S::Released, None, exit::OK),
+        (S::Failed, None, exit::FAILED_INTERNAL),
+        (S::Failed, Some(C::Internal), exit::FAILED_INTERNAL),
+        (S::Failed, Some(C::ProtocolError), exit::FAILED_INTERNAL),
+        (S::Failed, Some(C::AuditFailure), exit::FAILED_INTERNAL),
+        (S::Failed, Some(C::AuditStorageLow), exit::FAILED_INTERNAL),
+        (S::Failed, Some(C::Usage), exit::USAGE_VALIDATION),
+        (S::Failed, Some(C::Validation), exit::USAGE_VALIDATION),
+        (
+            S::Failed,
+            Some(C::MarkdownPlaceholders),
+            exit::USAGE_VALIDATION,
+        ),
+        (
+            S::Failed,
+            Some(C::OpUnsupportedByInstance),
+            exit::USAGE_VALIDATION,
+        ),
+        (S::Failed, Some(C::UnknownRequest), exit::USAGE_VALIDATION),
+        (S::Denied, None, exit::DENIED),
+        (S::Failed, Some(C::Denied), exit::DENIED),
+        (S::Failed, Some(C::ResolutionFailed), exit::DENIED),
+        (S::Pending, None, exit::PENDING),
+        (S::Executing, None, exit::PENDING),
+        (S::Failed, Some(C::Unreachable), exit::UNREACHABLE),
+        (S::Failed, Some(C::ProtocolMismatch), exit::UNREACHABLE),
+        (S::Failed, Some(C::ServerIdentity), exit::UNREACHABLE),
+        (S::OutcomeUnknown, None, exit::UPSTREAM),
+        (S::Failed, Some(C::UpstreamNetwork), exit::UPSTREAM),
+        (S::Failed, Some(C::UpstreamUnavailable), exit::UPSTREAM),
+        (S::Failed, Some(C::UpstreamHttp), exit::UPSTREAM),
+        (S::Failed, Some(C::ResultTooLarge), exit::UPSTREAM),
+        (S::Failed, Some(C::UpstreamUnknownOutcome), exit::UPSTREAM),
+        (S::Expired, None, exit::EXPIRED_CANCELLED_ABANDONED),
+        (S::Cancelled, None, exit::EXPIRED_CANCELLED_ABANDONED),
+        (S::Abandoned, None, exit::EXPIRED_CANCELLED_ABANDONED),
+        (
+            S::Failed,
+            Some(C::Expired),
+            exit::EXPIRED_CANCELLED_ABANDONED,
+        ),
+        (
+            S::Failed,
+            Some(C::Cancelled),
+            exit::EXPIRED_CANCELLED_ABANDONED,
+        ),
+        (
+            S::Failed,
+            Some(C::Abandoned),
+            exit::EXPIRED_CANCELLED_ABANDONED,
+        ),
+        (S::Failed, Some(C::ScriptSyntax), exit::SCRIPT),
+        (S::Failed, Some(C::ScriptLimit), exit::SCRIPT),
+        (S::Failed, Some(C::SandboxUnavailable), exit::SCRIPT),
+        (S::Failed, Some(C::Locked), exit::LOCKED_CONFIG_TOKEN),
+        (S::Failed, Some(C::NotConfigured), exit::LOCKED_CONFIG_TOKEN),
+        (S::Failed, Some(C::NeedsToken), exit::LOCKED_CONFIG_TOKEN),
+        (S::Failed, Some(C::ResultEvicted), exit::RESULT_EVICTED),
+        (S::Failed, Some(C::Busy), exit::BUSY),
+    ]
+};
+
 /// §4.3 status ↔ exit matrix (normative). Agents branch on status + error.code, not this.
 pub fn exit_code(env: &Envelope) -> i32 {
-    use crate::envelope::{ErrorCode as C, Status as S, exit};
+    exit_code_in(EXIT_MATRIX, env)
+}
+
+/// [`exit_code`] over an explicit table: the row for `(status, error.code)`, else the row of
+/// the status with no code, else `FAILED_INTERNAL`.
+pub fn exit_code_in(matrix: &[ExitRow], env: &Envelope) -> i32 {
+    use crate::envelope::exit;
     let code = env.error.as_ref().map(|e| e.code);
-    if code == Some(C::ResultEvicted) {
-        return exit::RESULT_EVICTED;
+    let row = |status: Status, code: Option<ErrorCode>| {
+        matrix
+            .iter()
+            .find(|(s, c, _)| *s == status && *c == code)
+            .map(|(_, _, exit)| *exit)
+    };
+    if code == Some(ErrorCode::ResultEvicted) {
+        return row(Status::Failed, code).unwrap_or(exit::RESULT_EVICTED);
     }
     let script_error = env
         .data
         .as_ref()
         .and_then(|d| d.get("script_error"))
         .is_some();
-    match env.status {
-        S::Pending | S::Executing => exit::PENDING,
-        S::Succeeded | S::Released => {
-            if script_error {
-                exit::SCRIPT
-            } else {
-                exit::OK
-            }
-        }
-        S::Denied => exit::DENIED,
-        S::Expired | S::Cancelled | S::Abandoned => exit::EXPIRED_CANCELLED_ABANDONED,
-        S::OutcomeUnknown => exit::UPSTREAM,
-        S::Failed => match code {
-            Some(C::Internal | C::ProtocolError | C::AuditFailure | C::AuditStorageLow) | None => {
-                exit::FAILED_INTERNAL
-            }
-            Some(
-                C::Usage
-                | C::Validation
-                | C::MarkdownPlaceholders
-                | C::OpUnsupportedByInstance
-                | C::UnknownRequest,
-            ) => exit::USAGE_VALIDATION,
-            Some(C::Unreachable | C::ProtocolMismatch | C::ServerIdentity) => exit::UNREACHABLE,
-            Some(
-                C::UpstreamNetwork
-                | C::UpstreamUnavailable
-                | C::UpstreamHttp
-                | C::ResultTooLarge
-                | C::UpstreamUnknownOutcome,
-            ) => exit::UPSTREAM,
-            Some(C::ScriptSyntax | C::ScriptLimit | C::SandboxUnavailable) => exit::SCRIPT,
-            Some(C::Locked | C::NotConfigured | C::NeedsToken) => exit::LOCKED_CONFIG_TOKEN,
-            Some(C::Busy) => exit::BUSY,
-            // Never produced with status failed (they come with their own status).
-            Some(C::Denied | C::ResolutionFailed) => exit::DENIED,
-            Some(C::Expired | C::Cancelled | C::Abandoned) => exit::EXPIRED_CANCELLED_ABANDONED,
-            Some(C::ResultEvicted) => exit::RESULT_EVICTED,
-        },
+    if script_error && matches!(env.status, Status::Succeeded | Status::Released) {
+        return exit::SCRIPT;
     }
+    row(env.status, code)
+        .or_else(|| row(env.status, None))
+        .unwrap_or(exit::FAILED_INTERNAL)
 }

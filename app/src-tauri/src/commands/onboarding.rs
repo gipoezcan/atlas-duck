@@ -15,13 +15,21 @@ use super::{CommandError, finish};
 #[serde(deny_unknown_fields)]
 pub struct OnboardingTextArgs {}
 
-/// The snippet the user copies into an agent's instruction file.
+/// One independent section of the page (PD-175): the user copies each on its own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct OnboardingTextDto {
+pub struct OnboardingSectionDto {
+    pub id: String,
+    pub title: String,
     pub text: String,
 }
 
-/// `onboarding_text {}` (Δ1, PD-80).
+/// The sections the user copies into an agent's instruction file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OnboardingTextDto {
+    pub sections: Vec<OnboardingSectionDto>,
+}
+
+/// `onboarding_text {}` (Δ1, PD-80, PD-175).
 #[tauri::command]
 pub async fn onboarding_text<R: Runtime>(
     app: AppHandle<R>,
@@ -29,7 +37,14 @@ pub async fn onboarding_text<R: Runtime>(
 ) -> Result<OnboardingTextDto, CommandError> {
     let Args(OnboardingTextArgs {}) = args;
     let response = Ok(OnboardingTextDto {
-        text: atlas_duck_core::onboarding::text(),
+        sections: atlas_duck_core::onboarding::sections()
+            .into_iter()
+            .map(|s| OnboardingSectionDto {
+                id: s.id.to_owned(),
+                title: s.title.to_owned(),
+                text: s.text,
+            })
+            .collect(),
     });
     finish(&app, response)
 }

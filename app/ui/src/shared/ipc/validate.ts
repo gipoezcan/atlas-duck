@@ -33,6 +33,7 @@ import type {
   InputKind,
   InstanceView,
   KillAnswer,
+  OnboardingSection,
   OnboardingText,
   OrphanInstall,
   PlainInputKind,
@@ -473,7 +474,10 @@ export const isRunningScriptView = (v: unknown): v is RunningScriptView =>
 export const isKillAnswer = (v: unknown): v is KillAnswer =>
   closed(v, { answer: oneOf('killed', 'not_running', 'already_stopping') });
 
-export const isOnboardingText = (v: unknown): v is OnboardingText => closed(v, { text: isStr });
+const isOnboardingSection = (v: unknown): v is OnboardingSection =>
+  closed(v, { id: isStr, title: isStr, text: isStr });
+export const isOnboardingText = (v: unknown): v is OnboardingText =>
+  closed(v, { sections: arrayOf(isOnboardingSection) });
 
 export const isRemovalBackupAnswer =(v: unknown): v is RemovalBackupAnswer =>
   fields(v, { saved: isBool }) && Object.keys(v).length === 1;

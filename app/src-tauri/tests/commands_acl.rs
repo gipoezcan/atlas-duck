@@ -1919,12 +1919,20 @@ fn shell_commands_granted_to_their_windows_only() -> TestResult {
             if !granted.contains(label) {
                 assert!(acl_refused(&r), "{label}: {cmd} {r:?}");
             } else if *cmd == "onboarding_text" {
-                let text = r
+                let sections = r
                     .as_ref()
                     .ok()
-                    .and_then(|v| v["text"].as_str())
-                    .ok_or("no text")?;
-                assert!(text.contains("never resubmit a pending request"), "{label}");
+                    .and_then(|v| v["sections"].as_array())
+                    .ok_or("no sections")?;
+                let timeouts = sections
+                    .iter()
+                    .find(|s| s["id"] == "timeouts")
+                    .and_then(|s| s["text"].as_str())
+                    .ok_or("no timeouts section")?;
+                assert!(
+                    timeouts.contains("never resubmit a pending request"),
+                    "{label}"
+                );
             } else {
                 assert_eq!(r, Err(json!({"kind": "not_ready"})), "{label}: {cmd}");
             }

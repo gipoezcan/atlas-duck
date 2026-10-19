@@ -120,7 +120,9 @@ beforeEach(() => {
     });
   for (const f of mocks) vi.mocked(f as (...a: unknown[]) => Promise<unknown>).mockReset();
   // The onboarding step reads the snippet from Rust; most tests do not look at it.
-  vi.mocked(onboardingText).mockResolvedValue({ text: 'snippet' });
+  vi.mocked(onboardingText).mockResolvedValue({
+    sections: [{ id: 'commands', title: 'Commands', text: 'snippet' }],
+  });
 });
 
 afterEach(() => {
@@ -449,14 +451,21 @@ describe('Wizard', () => {
 
   it('onboarding_text_rendered_as_text: the step shows the snippet as one text node, never markup', async () => {
     const hostile = '# atlas-duck\n<img src=x onerror="window.__pwned=1"><script>window.__pwned=1</script>';
-    vi.mocked(onboardingText).mockResolvedValue({ text: hostile });
+    vi.mocked(onboardingText).mockResolvedValue({
+      sections: [
+        { id: 'commands', title: 'Commands', text: hostile },
+        // PD-175: the wizard keeps the PD-80 subset; the other sections are the Onboarding window's.
+        { id: 'confluence', title: 'Confluence pages', text: 'only in the window' },
+      ],
+    });
     await show(at('onboarding'));
     const section = screen.getByRole('region', { name: T.onboarding_heading });
-    const pre = within(section).getByLabelText('Instructions for your agents');
+    const pre = within(section).getByLabelText('Commands');
     expect(pre.tagName).toBe('PRE');
     expect(pre.textContent).toBe(hostile);
     expect(pre.childElementCount).toBe(0);
     expect(section.querySelector('img, script')).toBeNull();
+    expect(within(section).queryByLabelText('Confluence pages')).toBeNull();
     expect(onboardingText).toHaveBeenCalledTimes(1);
     // The finish button is still there beside it.
     expect(within(section).getByRole('button', { name: T.onboarding_finish })).toBeTruthy();
@@ -468,8 +477,10 @@ describe('Wizard', () => {
     const section = screen.getByRole('region', { name: T.onboarding_heading });
     expect(within(section).getByRole('alert').textContent).toContain('Could not load the instructions');
     expect(within(section).getByRole('button', { name: T.onboarding_finish })).toBeTruthy();
-    vi.mocked(onboardingText).mockResolvedValueOnce({ text: 'second try' });
+    vi.mocked(onboardingText).mockResolvedValueOnce({
+      sections: [{ id: 'commands', title: 'Commands', text: 'second try' }],
+    });
     await click('Try again');
-    expect(within(section).getByLabelText('Instructions for your agents').textContent).toBe('second try');
+    expect(within(section).getByLabelText('Commands').textContent).toBe('second try');
   });
 });

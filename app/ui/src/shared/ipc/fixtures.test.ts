@@ -206,8 +206,14 @@ describe('fixtures validate against their TS types', () => {
     expect(isKillAnswer({ answer: 'yes' })).toBe(false);
     expect(isKillAnswer({ killed: true })).toBe(false);
     expect(isKillAnswer({ answer: 'killed', extra: 1 })).toBe(false);
-    expect(isOnboardingText({ text: null })).toBe(false);
-    expect(isOnboardingText({ text: 'x', extra: 1 })).toBe(false);
+    expect(isOnboardingText({ sections: null })).toBe(false);
+    expect(isOnboardingText({ text: 'x' })).toBe(false);
+    expect(isOnboardingText({ sections: [], extra: 1 })).toBe(false);
+    expect(isOnboardingText({ sections: [{ id: 'a', title: 'A', text: null }] })).toBe(false);
+    expect(isOnboardingText({ sections: [{ id: 'a', title: 'A', text: 'x', extra: 1 }] })).toBe(
+      false,
+    );
+    expect(isOnboardingText({ sections: [{ id: 'a', title: 'A', text: 'x' }] })).toBe(true);
   });
   it('export and audit errors: closed nested shapes, a not_renamed hash is 64 lowercase hex digits', () => {
     const exportErrors = commandError.filter((e) => e.kind === 'export');

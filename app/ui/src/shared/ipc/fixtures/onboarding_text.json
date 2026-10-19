@@ -1,5 +1,16 @@
 [
   {
-    "text": "# atlas-duck\n\n- `atlas-duck ops list`\n"
+    "sections": [
+      {
+        "id": "commands",
+        "title": "Commands",
+        "text": "- `atlas-duck ops list`\n"
+      },
+      {
+        "id": "exit_matrix",
+        "title": "Exit codes",
+        "text": "- exit 0: `succeeded`, `released`\n"
+      }
+    ]
   }
 ]

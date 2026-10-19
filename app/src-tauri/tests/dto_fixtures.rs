@@ -21,7 +21,7 @@ use atlas_duck_app_lib::commands::credential::{
     connection_failure, context_dto,
 };
 use atlas_duck_app_lib::commands::dto::{StatusLevel, StatusLineDto};
-use atlas_duck_app_lib::commands::onboarding::OnboardingTextDto;
+use atlas_duck_app_lib::commands::onboarding::{OnboardingSectionDto, OnboardingTextDto};
 use atlas_duck_app_lib::commands::running::KillAnswer;
 use atlas_duck_app_lib::commands::settings::{
     CliInstallAnswer, ConfinementDto, ExtraLayerDto, OUTCOME_ALREADY_INSTALLED,
@@ -1541,8 +1541,20 @@ fn running_kill_answer_shape() -> Result<(), Box<dyn std::error::Error>> {
 
 /// `onboarding_text` (M6 T30): a short sample; the real text is generated from the registry.
 fn onboarding_texts() -> Vec<OnboardingTextDto> {
+    let section = |id: &str, title: &str, text: &str| OnboardingSectionDto {
+        id: id.into(),
+        title: title.into(),
+        text: text.into(),
+    };
     vec![OnboardingTextDto {
-        text: "# atlas-duck\n\n- `atlas-duck ops list`\n".into(),
+        sections: vec![
+            section("commands", "Commands", "- `atlas-duck ops list`\n"),
+            section(
+                "exit_matrix",
+                "Exit codes",
+                "- exit 0: `succeeded`, `released`\n",
+            ),
+        ],
     }]
 }
 

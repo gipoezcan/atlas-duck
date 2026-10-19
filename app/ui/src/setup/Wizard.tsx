@@ -17,7 +17,7 @@ import {
 import type { CliInstallAnswer, WizardError, WizardState, WizardStep } from '../shared/ipc/types';
 import { SETTINGS_TEXT, WINDOW_TITLES } from '../shared/strings';
 import { InstanceForm } from '../settings/InstanceForm';
-import { OnboardingText } from '../onboarding/OnboardingText';
+import { OnboardingText, WIZARD_SECTION_IDS } from '../onboarding/OnboardingText';
 import { Cfg, own } from '../settings/text';
 import { useAction, useWindowBusy, WindowBusyContext } from '../settings/useAction';
 import { SetupInstances } from './SetupInstances';
@@ -409,7 +409,7 @@ function Panel({
       return (
         <section aria-label={T.onboarding_heading}>
           <h2 tabIndex={-1}>{T.onboarding_heading}</h2>
-          <OnboardingText />
+          <OnboardingText only={WIZARD_SECTION_IDS} level={3} />
           <button type="button" disabled={pending} onClick={() => step((rendered) => wizardFinish(rendered), { settle: true })}>
             {T.onboarding_finish}
           </button>

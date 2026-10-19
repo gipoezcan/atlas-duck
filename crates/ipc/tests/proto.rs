@@ -3,8 +3,9 @@
 use atlas_duck_ipc::envelope::{Envelope, ErrorCode as C, Status as S, exit};
 use atlas_duck_ipc::jcs::JcsError;
 use atlas_duck_ipc::proto::{
-    AgentNameSource, ClientKind, ListState, Meta, ProgressNotification, ProgressSink,
-    RequestHandler, busy_envelope, exit_code, new_request_id, params_sha256, params_sha256_hex,
+    AgentNameSource, ClientKind, EXIT_MATRIX, ExitRow, ListState, Meta, ProgressNotification,
+    ProgressSink, RequestHandler, busy_envelope, exit_code, exit_code_in, new_request_id,
+    params_sha256, params_sha256_hex,
 };
 use atlas_duck_ipc::sandbox::{HostCall, HostCallResult, ScriptLimits};
 use serde_json::json;
@@ -106,6 +107,72 @@ fn exit_code_matrix_section_4_3() {
     assert_eq!(covered, C::ALL.len());
     // failed without an error object is internal.
     assert_eq!(exit_code(&with_status(S::Failed)), 1);
+}
+
+/// PD-175: `exit_code` is a lookup in `EXIT_MATRIX`, the table the onboarding page prints.
+#[test]
+fn exit_code_reads_exit_matrix() {
+    // A table that disagrees with §4.3 everywhere: the answers follow the table, not a match.
+    let custom: &[ExitRow] = &[
+        (S::Succeeded, None, 42),
+        (S::Failed, Some(C::Usage), 43),
+        (S::Failed, None, 44),
+        (S::Pending, None, 45),
+    ];
+    assert_eq!(exit_code_in(custom, &with_status(S::Succeeded)), 42);
+    assert_eq!(exit_code_in(custom, &failed(C::Usage)), 43);
+    assert_eq!(exit_code_in(custom, &failed(C::Validation)), 44);
+    assert_eq!(exit_code_in(custom, &with_status(S::Failed)), 44);
+    assert_eq!(exit_code_in(custom, &with_status(S::Pending)), 45);
+    // A pending envelope with an error object still reads the status row.
+    let mut lost = failed(C::Unreachable);
+    lost.status = S::Pending;
+    assert_eq!(exit_code_in(custom, &lost), 45);
+
+    // The shipped table: every row answers what `exit_code` answers.
+    assert!(!EXIT_MATRIX.is_empty());
+    for (status, code, want) in EXIT_MATRIX {
+        let e = match code {
+            Some(c) => {
+                let mut e = failed(*c);
+                e.status = *status;
+                e
+            }
+            None => with_status(*status),
+        };
+        assert_eq!(exit_code(&e), *want, "{status:?} {code:?}");
+    }
+    // Every status has a row, and `failed` has one row per code plus the "no error" fallback.
+    for status in [
+        S::Pending,
+        S::Executing,
+        S::Succeeded,
+        S::Released,
+        S::Denied,
+        S::Expired,
+        S::Cancelled,
+        S::Failed,
+        S::OutcomeUnknown,
+        S::Abandoned,
+    ] {
+        assert!(
+            EXIT_MATRIX.iter().any(|(s, _, _)| *s == status),
+            "{status:?}"
+        );
+    }
+    assert!(
+        EXIT_MATRIX
+            .iter()
+            .any(|(s, c, _)| *s == S::Failed && c.is_none())
+    );
+    for code in C::ALL {
+        assert!(
+            EXIT_MATRIX
+                .iter()
+                .any(|(s, c, _)| *s == S::Failed && *c == Some(code)),
+            "{code:?}"
+        );
+    }
 }
 
 #[test]

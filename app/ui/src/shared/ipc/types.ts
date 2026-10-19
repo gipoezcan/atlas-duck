@@ -447,9 +447,16 @@ export interface KillAnswer {
   answer: 'killed' | 'not_running' | 'already_stopping';
 }
 
-/** `onboarding_text` (PD-80): the snippet to copy, generated in Rust from the registry. */
-export interface OnboardingText {
+/** One independent section of the onboarding page (PD-175), generated in Rust. */
+export interface OnboardingSection {
+  id: string;
+  title: string;
   text: string;
+}
+
+/** `onboarding_text` (PD-80, PD-175): the sections to copy, generated in Rust from the registry. */
+export interface OnboardingText {
+  sections: OnboardingSection[];
 }
 
 /** `prune_backlog_now`. */
