@@ -67,9 +67,9 @@ use crate::error::{AuditError, OpenError, RestoreError};
 use crate::keystore::{EntryName, KeyStore, KeyStoreError, KeyringLocality, canary_self_test};
 use crate::lock::InstanceLock;
 use crate::open::{
-    ArchivedDb, RESTORING_DB_FILE, RecoveryOffer, audit_err, is_id, kek_opens_store,
-    kek_unwraps_a_key, random_id, recovery_offer, remove_staging_leftovers, start_existing,
-    sync_dir, with_suffix, with_written_by,
+    ArchivedDb, RESTORING_DB_FILE, RecoveryOffer, audit_err, durable_rename, is_id,
+    kek_opens_store, kek_unwraps_a_key, random_id, recovery_offer, remove_staging_leftovers,
+    start_existing, sync_dir, with_suffix, with_written_by,
 };
 use crate::recover::{
     ARCHIVE_DIR, existing_db, file_len, file_stamp, plaintext_head, recovered_kek,
@@ -699,7 +699,7 @@ fn commit_swap(
             }
         }
     }
-    if let Err(e) = std::fs::rename(staging, &db) {
+    if let Err(e) = durable_rename(staging, &db) {
         let mut msg = e.to_string();
         if let Some((t, r)) = linked.as_ref().zip(replaced)
             && std::fs::remove_file(t).is_err()

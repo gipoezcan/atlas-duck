@@ -21,9 +21,9 @@ use crate::error::OpenError;
 use crate::keystore::{EntryName, KeyStore, KeyStoreError, KeyringLocality, canary_self_test};
 use crate::lock::InstanceLock;
 use crate::open::{
-    ArchivedDb, RecoveryOffer, audit_err, is_id, kek_opens_store, kek_unwraps_a_key,
-    recovery_offer, remove_staging_leftovers, sql, start_existing, sync_dir, with_suffix,
-    with_written_by,
+    ArchivedDb, RecoveryOffer, audit_err, durable_rename, is_id, kek_opens_store,
+    kek_unwraps_a_key, recovery_offer, remove_staging_leftovers, sql, start_existing, sync_dir,
+    with_suffix, with_written_by,
 };
 use crate::recovery::{RecoveryError, open_recovery};
 use crate::schema;
@@ -444,11 +444,11 @@ pub fn archive_and_start_fresh(
         }
     }
 
-    std::fs::rename(&db, &target)?;
+    durable_rename(&db, &target)?;
     if sizes.1.is_some()
-        && let Err(e) = std::fs::rename(&wal, &target_wal)
+        && let Err(e) = durable_rename(&wal, &target_wal)
     {
-        let _ = std::fs::rename(&target, &db);
+        let _ = durable_rename(&target, &db);
         return Err(e.into());
     }
 
@@ -472,8 +472,8 @@ pub fn archive_and_start_fresh(
         Ok(())
     };
     if let Err(e) = finish() {
-        let back = std::fs::rename(&target, &db).and_then(|()| match sizes.1 {
-            Some(_) => std::fs::rename(&target_wal, &wal),
+        let back = durable_rename(&target, &db).and_then(|()| match sizes.1 {
+            Some(_) => durable_rename(&target_wal, &wal),
             None => Ok(()),
         });
         if back.is_err() {

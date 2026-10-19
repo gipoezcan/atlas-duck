@@ -179,13 +179,103 @@ pub(crate) fn remove_staging_leftovers(data: &LocalDataDir) -> io::Result<()> {
     remove_with_side_files(data, RESTORING_DB_FILE)
 }
 
-/// Makes a rename inside `dir` durable (Unix); NTFS journals the rename itself.
+/// Makes a rename inside `dir` durable: `fsync` of the directory.
+#[cfg(unix)]
 pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    std::fs::File::open(dir)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = dir;
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Makes a rename inside `dir` durable: `FlushFileBuffers` on a handle of the directory (M2
+/// final review M-2).
+#[cfg(windows)]
+pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
+    sync_dir_with(dir, &open_dir_handle)
+}
+
+/// [`sync_dir`] on Windows with the opener as a parameter (tests inject one): the handle
+/// `open(dir, FILE_FLAG_BACKUP_SEMANTICS)` returns is flushed (`File::sync_all` is
+/// `FlushFileBuffers`).
+#[cfg(windows)]
+pub(crate) fn sync_dir_with(
+    dir: &Path,
+    open: &dyn Fn(&Path, u32) -> io::Result<std::fs::File>,
+) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+    open(dir, FILE_FLAG_BACKUP_SEMANTICS)?.sync_all()
+}
+
+/// Opens `path` for [`sync_dir`]: write access (`FlushFileBuffers` refuses a handle without it)
+/// and `flags` as `dwFlagsAndAttributes` (a directory opens only with
+/// `FILE_FLAG_BACKUP_SEMANTICS`). std's default share mode lets every other handle on the
+/// directory, and renames inside it, go on.
+#[cfg(windows)]
+pub(crate) fn open_dir_handle(path: &Path, flags: u32) -> io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(flags)
+        .open(path)
+}
+
+/// Renames `from` to `to`, replacing an existing `to`; an `Err` means `from` was not moved
+/// (every caller renames inside one data dir, one volume). Windows: `MoveFileExW` with
+/// `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`, so the call returns only once the move
+/// is on disk (std's `rename` asks for no write-through); Unix: `rename(2)`. The directory flush
+/// is the caller's [`sync_dir`] right after it, which every call site already treats as a step
+/// after the rename (first run: `renamed`; restore: `SwapError::After`; archive: move back).
+/// M2 final review M-2: the restore commit, first-run and archive renames.
+pub(crate) fn durable_rename(from: &Path, to: &Path) -> io::Result<()> {
+    rename_os(from, to)?;
+    #[cfg(any(test, feature = "testing"))]
+    crate::testing::record_durable_rename(from, to);
     Ok(())
+}
+
+#[cfg(windows)]
+fn rename_os(from: &Path, to: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let from = wide_path(from)?;
+    let to = wide_path(to)?;
+    // SAFETY: `from` and `to` are NUL-terminated UTF-16 strings without an interior NUL, and
+    // both outlive the call; `MoveFileExW` only reads them.
+    let ok = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn rename_os(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+/// `p` as a NUL-terminated wide string. An interior NUL would end the name early at the C
+/// boundary and name another file: refused. No `\\?\` prefix is added (it would stop `/` from
+/// being a separator): a path past `MAX_PATH` fails with the OS error, as the data dir's
+/// free-space probe (`GetDiskFreeSpaceExW`) already does.
+#[cfg(windows)]
+fn wide_path(p: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut w: Vec<u16> = p.as_os_str().encode_wide().collect();
+    if w.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path contains a NUL character",
+        ));
+    }
+    w.push(0);
+    Ok(w)
 }
 
 pub(crate) fn audit_err(e: AuditError) -> OpenError {
@@ -258,7 +348,7 @@ impl FirstRun {
         if self.db.try_exists()? {
             return Err(OpenError::AlreadyExists);
         }
-        std::fs::rename(&self.new, &self.db)?;
+        durable_rename(&self.new, &self.db)?;
         self.renamed.store(true, Ordering::SeqCst);
         sync_dir(&self.dir)?;
         Writer::open(&self.db, parts)

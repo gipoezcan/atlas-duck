@@ -3,7 +3,7 @@
 //! points and a free-space stub.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -386,6 +386,46 @@ impl Faults {
             _ => Ok(()),
         }
     }
+}
+
+/// Every rename [`durable_rename`] made in this process, in order (one process runs many tests
+/// in parallel: [`durable_renames_into`] keeps a test's own).
+static DURABLE_RENAMES: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
+
+pub(crate) fn record_durable_rename(from: &Path, to: &Path) {
+    lock(&DURABLE_RENAMES).push((from.to_path_buf(), to.to_path_buf()));
+}
+
+/// The `(from, to)` of every rename `durable_rename` made whose target lies under `dir`, in
+/// order: call-site tests (restore commit, first run, archive).
+pub fn durable_renames_into(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
+    lock(&DURABLE_RENAMES)
+        .iter()
+        .filter(|(_, to)| to.starts_with(dir))
+        .cloned()
+        .collect()
+}
+
+/// The store's rename (Windows: `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`).
+pub fn durable_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    crate::open::durable_rename(from, to)
+}
+
+/// The Windows directory flush with an injected opener: `open(dir, flags)` returns the handle
+/// that is flushed.
+#[cfg(windows)]
+pub fn sync_dir_with(
+    dir: &Path,
+    open: &dyn Fn(&Path, u32) -> std::io::Result<std::fs::File>,
+) -> std::io::Result<()> {
+    crate::open::sync_dir_with(dir, open)
+}
+
+/// The opener the Windows directory flush uses: `path` with `flags` as its
+/// `dwFlagsAndAttributes`.
+#[cfg(windows)]
+pub fn open_dir_handle(path: &Path, flags: u32) -> std::io::Result<std::fs::File> {
+    crate::open::open_dir_handle(path, flags)
 }
 
 /// A [`FreeSpaceProbe`] reporting a settable number of bytes, or an error.
