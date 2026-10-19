@@ -1001,6 +1001,9 @@ jobs:
       - name: Command surface check (C.10, PD-66)
         run: node ci/check-commands.mjs
 
+      - name: Native-dialog proofs (L54, 10.3)
+        run: node ci/check-dialog-proofs.mjs
+
       - name: Isolation hook tests (payload allowlist, 2 MiB cap)
         run: node --test app/isolation/hook.test.mjs
 
