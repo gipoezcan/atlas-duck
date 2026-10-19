@@ -431,9 +431,13 @@ pub enum JobRefused {
 }
 
 /// A restore job's store call (PD-181, M10 T13): `restore_cancel` and the quit path end the flow
-/// only before it; once the call began it runs to its end (`Store::restore` has no cancel). One
+/// only while no call runs; a running call runs to its end (`Store::restore` has no cancel). A
+/// first call that asks for the rollback confirmation changed nothing, so the flow [`reopen`]s
+/// for that dialog and must `begin` again for the second call (T13 review I-1). One
 /// compare-and-swap decides which came first, so a cancel answered `cancelled: true` never races a
 /// call that starts anyway.
+///
+/// [`reopen`]: StoreCall::reopen
 #[derive(Debug, Default)]
 pub struct StoreCall(std::sync::atomic::AtomicU8);
 
@@ -450,7 +454,15 @@ impl StoreCall {
             .is_ok()
     }
 
-    /// Cancels the flow before its store call: `false` once the call began.
+    /// The store call returned having changed nothing (the rollback needs its own confirmation):
+    /// until the next [`StoreCall::begin`] a cancel ends the flow again.
+    pub fn reopen(&self) {
+        let _ =
+            self.0
+                .compare_exchange(CALL_STARTED, CALL_OPEN, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    /// Cancels the flow while no store call runs: `false` while one runs.
     pub fn cancel(&self) -> bool {
         match self.0.compare_exchange(
             CALL_OPEN,
@@ -468,7 +480,7 @@ impl StoreCall {
         self.0.load(Ordering::SeqCst) == CALL_CANCELLED
     }
 
-    /// The store call began.
+    /// A store call runs.
     pub fn started(&self) -> bool {
         self.0.load(Ordering::SeqCst) == CALL_STARTED
     }
@@ -477,9 +489,10 @@ impl StoreCall {
 /// What `restore_cancel` did (PD-181).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestoreCancel {
-    /// The restore ended before its store call (or no restore runs: `false`).
+    /// The restore ended while no store call ran: before it, or in the rollback dialog after a
+    /// first call that changed nothing (or no restore runs: `false`).
     Cancelled(bool),
-    /// The store call runs: it cannot be cancelled.
+    /// A store call runs: it cannot be cancelled.
     Running,
 }
 
@@ -612,9 +625,9 @@ impl ServeState {
         }
     }
 
-    /// `restore_cancel` (PD-181, M10 T13): a running Settings restore ends before its store call
-    /// (`Cancelled(true)`: no store call, no `RESTORE`); once the call began it is `Running`.
-    /// `Cancelled(false)` when no restore runs.
+    /// `restore_cancel` (PD-181, M10 T13): a running Settings restore ends while no store call
+    /// runs (`Cancelled(true)`: no further store call, no `RESTORE`; also in the rollback dialog);
+    /// while a call runs it is `Running`. `Cancelled(false)` when no restore runs.
     pub fn cancel_restore(&self) -> RestoreCancel {
         let slot = lock(&self.audit_job);
         match slot.as_ref() {
@@ -636,9 +649,10 @@ impl ServeState {
     }
 
     /// The quit path's part (PD-181): the running job's cancel flag is set (an export ends before
-    /// its next row and removes its partial directory; a restore that has not called the store
-    /// yet calls nothing) and its task is handed over to be waited for. Called after the freeze,
-    /// so no job starts afterwards.
+    /// its next row and removes its partial directory; a restore with no store call running, also
+    /// one in its rollback dialog, calls the store no more) and its task is handed over to be
+    /// waited for. Called after the freeze, so no job starts afterwards. A job held in a native
+    /// dialog is waited for within the quit path's bound only; its later answer changes nothing.
     fn stop_audit_job(&self) -> Option<JoinHandle<()>> {
         let job = lock(&self.audit_job).take()?;
         if let Some(call) = &job.call {
@@ -858,12 +872,18 @@ pub enum UnlockFailure {
     /// M10 T13 (restore from a backup): the chosen file or folder is not an atlas-duck backup
     /// (no bundle, or its files do not match its manifest). Nothing changed.
     NotABackup,
-    /// M10 T13: the restore committed but did not complete; the next start completes it (§8.7,
-    /// plan text "Restore will be completed at the next start").
+    /// M10 T13: the restore committed but did not complete; the next start completes it (§8.7;
+    /// the window's text is the UI's `COMMITTED_INCOMPLETE_TEXT`).
     CommittedIncomplete,
     /// M10 T13 (M2 T16 M-4): the locked store's own records cannot be read, so a restore cannot
     /// move it aside; "Archive old DB and start fresh" comes first. No dialog was shown.
     ArchiveFirst,
+    /// M10 T13 (review M-2): the chosen backup failed its check (its chain or its schema); the
+    /// locked log is not concerned. Nothing changed.
+    Broken,
+    /// M10 T13 (review M-2): the chosen backup does not match the anchor directory's lines.
+    /// Nothing changed.
+    AnchorDirMismatch,
 }
 
 impl UnlockFailure {
@@ -884,6 +904,8 @@ impl UnlockFailure {
             UnlockFailure::NotABackup => "not_a_backup",
             UnlockFailure::CommittedIncomplete => "committed_incomplete",
             UnlockFailure::ArchiveFirst => "archive_first",
+            UnlockFailure::Broken => "broken",
+            UnlockFailure::AnchorDirMismatch => "anchor_dir_mismatch",
         }
     }
 
@@ -898,11 +920,20 @@ impl UnlockFailure {
             OpenError::Restore(RestoreError::CommittedIncomplete { .. }) => {
                 UnlockFailure::CommittedIncomplete
             }
+            // The chosen backup failed its check, not the locked log (T13 review M-2).
+            OpenError::Restore(RestoreError::ChainBroken(_)) => UnlockFailure::Broken,
+            OpenError::Restore(RestoreError::AnchorDirMismatch(_)) => {
+                UnlockFailure::AnchorDirMismatch
+            }
+            // Never leaves the flow, which asks the rollback dialog; a refusal of the call as such.
+            OpenError::Restore(RestoreError::RollbackNeedsConfirmation { .. }) => {
+                UnlockFailure::Invalid
+            }
             OpenError::WrongPassphrase => UnlockFailure::WrongPassphrase,
             OpenError::KeyStore(KeyStoreError::NotLocal) => UnlockFailure::KeyringNotLocal,
             OpenError::KeyStore(_) => UnlockFailure::KeychainUnavailable,
             OpenError::NewerStore(_) => UnlockFailure::StoreNewer,
-            OpenError::Integrity(_) | OpenError::Restore(_) => UnlockFailure::Integrity,
+            OpenError::Integrity(_) => UnlockFailure::Integrity,
             OpenError::Io(_) | OpenError::Sqlite(_) | OpenError::MigrationFailed { .. } => {
                 UnlockFailure::Io
             }
@@ -1073,8 +1104,10 @@ pub async fn archive_and_start_fresh(state: &Arc<ServeState>) -> Result<Archived
 }
 
 /// The wait for the backup's passphrase (the credential window set in place to `restore_backup`;
-/// `None` when it goes without a submit, or when the argument, the stop test, answers true).
-pub type AwaitPassphrase = Box<dyn FnOnce(&dyn Fn() -> bool) -> Option<SecretString> + Send>;
+/// `Cancelled` when it goes without a submit, or when the argument, the stop test, answers true).
+pub type AwaitPassphrase = Box<
+    dyn FnOnce(&dyn Fn() -> bool) -> Result<SecretString, crate::restore_flow::NotAsked> + Send,
+>;
 
 /// "Restore a backup instead" (M10 T13, PD-168, §8.11, §10.3): only in `keychain_lost` with no core
 /// (one at a time with unlocks and archives). On a blocking thread, `restore_flow::
@@ -3131,7 +3164,7 @@ mod tests {
                     &store,
                     &Answers::new(&[Confirm::Ok, Confirm::Ok]),
                     || Some(chosen(&source)),
-                    |_| Some(SecretString::from(PASS.to_owned())),
+                    |_| Ok(SecretString::from(PASS.to_owned())),
                     &call,
                     &cancel,
                     &Events::default(),
@@ -3258,6 +3291,126 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Answers Ok to the "Restore backup" dialog; holds the rollback dialog up (bounded, 30 s)
+    /// until the job's cancel flag is set, then answers Ok, as a user who clicks Ok after a Quit
+    /// or a cancel would. `up` hears when the rollback dialog is shown.
+    struct HeldRollback {
+        flag: Arc<OnceLock<Arc<AtomicBool>>>,
+        up: Mutex<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl NativeConfirmer for HeldRollback {
+        fn confirm(&self, text: &str) -> Confirm {
+            if text == crate::restore_flow::RESTORE_CONFIRM_TEXT {
+                return Confirm::Ok;
+            }
+            if let Ok(up) = self.up.lock() {
+                let _ = up.send(());
+            }
+            let until = std::time::Instant::now() + Duration::from_secs(30);
+            while std::time::Instant::now() < until
+                && !self.flag.get().is_some_and(|c| c.load(Ordering::SeqCst))
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Confirm::Ok
+        }
+    }
+
+    /// A Settings restore of `rig`'s own bundle (a same-machine rollback) as the audit job, held
+    /// in its rollback dialog (see [`HeldRollback`]); the receiver hears when the dialog is up.
+    fn held_rollback(
+        state: &ServeState,
+        rig: &Rig,
+    ) -> Result<PausedRestore, Box<dyn std::error::Error>> {
+        let source = rig.store.backup(chosen(&rig.out))?.bundle_dir;
+        let flag: Arc<OnceLock<Arc<AtomicBool>>> = Arc::new(OnceLock::new());
+        let (up_tx, up) = std::sync::mpsc::channel();
+        let confirmer = HeldRollback {
+            flag: flag.clone(),
+            up: Mutex::new(up_tx),
+        };
+        let store = rig.store.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let ended = finished.clone();
+        let rx = state
+            .spawn_restore_job(move |cancel, call| {
+                let _ = flag.set(cancel.clone());
+                let answer = crate::restore_flow::run_live_restore(
+                    &store,
+                    &confirmer,
+                    || Some(chosen(&source)),
+                    |_| Ok(SecretString::from(PASS.to_owned())),
+                    &call,
+                    &cancel,
+                    &Events::default(),
+                );
+                ended.store(true, Ordering::SeqCst);
+                answer
+            })
+            .map_err(|e| format!("{e:?}"))?;
+        Ok((rx, up, finished))
+    }
+
+    /// T13 review I-1 (PD-181): while a Settings restore's rollback dialog is up (its first store
+    /// call changed nothing) `restore_cancel` cancels it (`Cancelled(true)`, not `Running`), and
+    /// the dialog's later Ok calls the store no more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_cancel_in_the_rollback_dialog_cancels()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rig = rig(3)?;
+        let state = serving_store(&rig);
+        let (rx, up, _) = held_rollback(&state, &rig)?;
+        up.recv_timeout(Duration::from_secs(30))?;
+        let before = rig.store.head();
+        assert_eq!(state.cancel_restore(), RestoreCancel::Cancelled(true));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(30), rx).await??,
+            Err(CommandError::Cancelled)
+        );
+        assert_eq!(rig.store.head(), before);
+        assert_eq!(count(&rig.store, atlas_duck_audit::EventType::RESTORE)?, 0);
+        Ok(())
+    }
+
+    /// T13 review I-1 (PD-181, L202): Quit while the rollback dialog is up cancels the restore
+    /// (the call cancelled, the job's flag set); the dialog's Ok then calls the store no more, so
+    /// the job has ended without a restore when the core stage starts, and the next start opens
+    /// the same chain with no `RESTORE`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quit_in_the_rollback_dialog_restores_nothing() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let rig = rig(3)?;
+        let state = serving_store(&rig);
+        let (rx, up, finished) = held_rollback(&state, &rig)?;
+        up.recv_timeout(Duration::from_secs(30))?;
+        let chain = rig.store.head().2;
+        let at_core_stage: OnceLock<bool> = OnceLock::new();
+        let started = Instant::now();
+        let outcome = shutdown_with(&state, started + Duration::from_secs(60), |_| {
+            let _ = at_core_stage.set(finished.load(Ordering::SeqCst));
+            Some(std::future::ready(ShutdownReport::default()))
+        })
+        .await;
+        assert_eq!(at_core_stage.get(), Some(&true), "job ended");
+        assert_eq!(outcome.report, Some(ShutdownReport::default()));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(30), rx).await??,
+            Err(CommandError::Cancelled)
+        );
+        assert!(lock(&state.store).is_none(), "store shut down");
+        let cfg = crate::commands::audit::tests::config(&rig.ring, &rig.install_id, &rig.faults);
+        let StartupOutcome::Ready { store, .. } =
+            atlas_duck_audit::open(&rig.data, &rig.lock, cfg)?
+        else {
+            return Err("the store did not open again".into());
+        };
+        assert_eq!(count(&store, atlas_duck_audit::EventType::RESTORE)?, 0);
+        assert_eq!(store.head().2, chain, "the same chain");
+        store.shutdown();
         Ok(())
     }
 

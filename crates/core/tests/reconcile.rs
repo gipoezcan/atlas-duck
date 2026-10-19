@@ -657,6 +657,33 @@ async fn after_restore_reconciles_the_file_again_and_marks_the_deleted_pats() ->
     Ok(())
 }
 
+/// M10 T13 review I-4: when the `needs_token` record cannot be written, `after_restore` answers
+/// the error, and the instance table is read again all the same (the deleted token shows as
+/// `needs_token`, not as a stored one).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_restore_reloads_the_instances_when_its_records_fail() -> TestResult {
+    let plan = FaultPlan::new();
+    let h = Harness::builder()
+        .jira("jira-main")
+        .faults(plan.clone())
+        .start()
+        .await?;
+    let id = h.instance("jira-main").ok_or("no instance")?.id.clone();
+    assert_eq!(h.instances().list().first().map(|i| i.state), Some("ok"));
+    h.credentials().delete(&id).map_err(|e| format!("{e:?}"))?;
+    plan.fail_nth(
+        EventType::INSTANCE_STATE_CHANGED,
+        plan.attempts(EventType::INSTANCE_STATE_CHANGED) + 1,
+    );
+    let answer = h.core().after_restore(&restore_report(vec![id])).await;
+    assert!(answer.is_err(), "{answer:?}");
+    assert_eq!(
+        h.instances().list().first().map(|i| i.state),
+        Some("needs_token")
+    );
+    Ok(())
+}
+
 // ---- I-26: the crash predicate ---------------------------------------------------------------
 
 async fn crash_after_stale_check(h: &mut Harness, id: &str) -> TestResult {

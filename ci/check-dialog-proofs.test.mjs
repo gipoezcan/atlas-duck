@@ -483,7 +483,7 @@ test("M10 T13: the restore's confirmations and source dialog are load-bearing on
     [
       "RustChosenPath::from_native_dialog(source)",
       'RustChosenPath::from_native_dialog(PathBuf::from("/tmp/backup"))',
-      /restore_flow\.rs:\d+: /,
+      /restore_flow\.rs:\d+: RustChosenPath::from_native_dialog outside a function that opens a folder or file dialog/,
     ],
   ]) {
     const r = withSliceCopy((rel, t) => (rel === RESTORE ? replaceOnce(t, from, to) : t), cli);

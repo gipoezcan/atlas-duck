@@ -284,6 +284,13 @@ fn check_schema(conn: &Connection, user_version: u32, hooks: &Hooks) -> Result<(
     Ok(())
 }
 
+/// True when `source` is a file directly in `data_dir` (both compared canonically where they
+/// resolve, so another spelling of the same path is caught too).
+fn is_data_dir_file(data_dir: &Path, source: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    !source.is_dir() && canon(source).parent() == Some(canon(data_dir).as_path())
+}
+
 /// Steps 1–4. Writes nothing but the staging file, which every error path deletes.
 fn stage(
     data_dir: &Path,
@@ -291,6 +298,12 @@ fn stage(
     passphrase: &SecretString,
     hooks: &Hooks,
 ) -> Result<Staged, AuditError> {
+    // A file of the data dir itself (the live `audit.db`, its WAL, the staging file written
+    // below, `instance.lock`) is never a backup (T13 review M-4): the live store restored onto
+    // itself would replace it by its own copy. `archived/` stores and bundle folders stay sources.
+    if is_data_dir_file(data_dir, source) {
+        return Err(restore_err(RestoreError::NotABundle));
+    }
     let schema_head = hooks.schema_head();
     // 1. The source: a bundle's files must be the manifest's.
     let (snapshot, manifest) = if source.is_dir() {
@@ -987,6 +1000,7 @@ impl Writer {
     /// The restore's confirmation record (PD-168), on the restored store; best effort: the
     /// restore is complete whatever this append does.
     fn log_confirmations(&mut self, c: &RestoreConfirmations) -> Option<u64> {
+        crash!(&self.st.hooks, RestoreConfirmationAppend).ok()?;
         let p = confirmation_event(c).ok()?;
         self.append_tx(vec![p]).ok()?.first().map(|c| c.seq)
     }

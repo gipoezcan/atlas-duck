@@ -700,17 +700,20 @@ impl Core {
     /// config file is reconciled again (prune stays blocked until it ran), each instance whose
     /// PAT the restore deleted (`report.pats_deleted`) gets its `INSTANCE_STATE_CHANGED
     /// {needs_token}` record, and the instance table is read again (those are `needs_token`).
+    /// The table is read again even when the records failed (M10 T13 review I-4): the restore
+    /// deleted the tokens whatever was logged; the error is still answered.
     pub async fn after_restore(&self, report: &RestoreReport) -> Result<(), AuditError> {
         let ids = report.pats_deleted.clone();
         let cfg = self.instances.current_config().await;
-        self.engine
+        let logged = self
+            .engine
             .blocking(move |p| {
                 crate::reconcile::reconcile_config_file(p, &cfg);
                 crate::reconcile::log_pats_deleted(p, &ids)
             })
-            .await?;
+            .await;
         self.instances.reload_now().await;
-        Ok(())
+        logged
     }
 
     /// The writes the crash reconciliation of this start closed as `outcome_unknown` (§11.3):

@@ -141,7 +141,8 @@ pub enum RestoreFailure {
     /// The backup does not match the anchor directory's lines.
     AnchorDirMismatch,
     /// The restore committed but a later step failed: the store is closed and the next start
-    /// completes the restore (plan text "Restore will be completed at the next start").
+    /// completes the restore (the windows show `COMMITTED_INCOMPLETE_TEXT`, owned by the UI in
+    /// `app/ui/src/shared/strings.ts`, with a restart prompt).
     CommittedIncomplete,
     /// The keychain could not be read or written.
     Keychain,

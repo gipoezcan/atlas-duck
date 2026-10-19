@@ -2525,3 +2525,79 @@ fn no_confirmation_record_before_the_reseal() {
         other => panic!("expected Locked(KeychainLost(FinishRestore)), got {other:?}"),
     }
 }
+
+/// T13 review I-3 (PD-168, L192): the confirmation record is best effort. When its append fails
+/// the restore is complete all the same, from both entry points: `Ok` with `confirmation_seq:
+/// None`, `RESTORE` the newest record, and the restored store takes appends and verifies.
+#[test]
+fn failed_confirmation_append_leaves_a_complete_restore() {
+    let (a, _fa) = machine_a();
+    let out = tempfile::tempdir().expect("out dir");
+    let bundle = backup_into(&a, out.path());
+    let faults = Faults::new();
+    let (b, fb) = machine_b(3, &faults);
+    faults.fail(FaultPoint::RestoreConfirmationAppend, 1);
+    let rep = b
+        .restore(
+            chosen(&bundle.bundle_dir),
+            &pass(PASSPHRASE),
+            restore_dialog(),
+            None,
+        )
+        .expect("restore");
+    assert_eq!(rep.confirmation_seq, None);
+    assert_eq!(b.head().0, rep.restore_seq);
+    assert_eq!(
+        types_after(&fb, rep.restore_seq - 1),
+        vec!["RESTORE".to_owned()]
+    );
+    b.append(ev(EventType::APP_START, None, json!({})))
+        .expect("the restored store takes appends");
+    assert_eq!(b.full_verify(), vec![]);
+
+    // No live store: `restore_from_source`.
+    let faults = Faults::new();
+    let fc = fixture(fake_clock("2026-12-01T09:00:00.000Z"), MemKeyring::new());
+    let mut cfg = fc.config();
+    cfg.hooks.faults = Some(faults.clone());
+    faults.fail(FaultPoint::RestoreConfirmationAppend, 1);
+    let (c, rep2) = restore_from_source(
+        &fc.data,
+        &fc.lock,
+        cfg,
+        chosen(&bundle.bundle_dir),
+        &pass(PASSPHRASE),
+        restore_dialog(),
+        None,
+    )
+    .expect("restore");
+    assert_eq!(rep2.confirmation_seq, None);
+    assert_eq!(c.head().0, rep2.restore_seq);
+    c.append(ev(EventType::APP_START, None, json!({})))
+        .expect("the restored store takes appends");
+    assert_eq!(c.full_verify(), vec![]);
+    c.shutdown();
+}
+
+/// T13 review M-4: a file of the data dir itself (the live `audit.db`, its staging file, the
+/// lock) is never a backup: `NotABundle` before anything is copied, and the live store is as it
+/// was. (An `archived/` store stays a source: `u16_archived_db_restored_same_machine`.)
+#[test]
+fn restore_refuses_a_file_of_the_data_dir() {
+    let (s, f) = store_with(3);
+    let head = s.head();
+    let e = s
+        .restore(
+            chosen(&f.db_path()),
+            &pass(PASSPHRASE),
+            restore_dialog(),
+            Some(rollback_dialog()),
+        )
+        .expect_err("the live store is not a backup");
+    assert!(
+        matches!(e, AuditError::Restore(RestoreError::NotABundle)),
+        "{e:?}"
+    );
+    assert_eq!(s.head(), head);
+    assert!(!f.dir.path().join("audit.db.restoring").exists());
+}

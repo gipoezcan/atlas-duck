@@ -1317,27 +1317,49 @@ pub struct RestoreCancelArgs {}
 /// `restore_begin`'s answer after a completed restore (counts only). `tokens_deleted` instances
 /// need their token again (§8.11 step 3); `offer_passphrase_change` is always true: the backup's
 /// recovery passphrase is this log's now, and §8.11 step 2 offers a change right after.
+/// `after_restore_failed`: the restore is complete, but its follow-up (`Core::after_restore`: the
+/// config file reconciled again, `needs_token` per deleted token) failed; the instance list was
+/// read again all the same, and prune stays blocked until a restart reconciles the file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RestoreDoneDto {
     pub restore_seq: u64,
     pub records_lost: u64,
     pub tokens_deleted: u64,
     pub offer_passphrase_change: bool,
+    pub after_restore_failed: bool,
 }
 
 impl RestoreDoneDto {
-    pub fn of(r: &atlas_duck_audit::RestoreReport) -> RestoreDoneDto {
+    pub fn of(r: &atlas_duck_audit::RestoreReport, after_restore_failed: bool) -> RestoreDoneDto {
         RestoreDoneDto {
             restore_seq: r.restore_seq,
             records_lost: r.records_lost,
             tokens_deleted: r.pats_deleted.len() as u64,
             offer_passphrase_change: true,
+            after_restore_failed,
         }
     }
 }
 
-/// `restore_cancel`'s answer: true when the restore ended before its store call; false when none
-/// ran. Once the store call began the answer is the error `busy` (PD-181).
+/// The answer after a completed restore and its follow-up `followed` (`Core::after_restore`): a
+/// failed follow-up is logged and named in the answer (T13 review I-4), never a plain success.
+fn restore_done(
+    report: &atlas_duck_audit::RestoreReport,
+    followed: Result<(), atlas_duck_audit::AuditError>,
+) -> RestoreDoneDto {
+    if followed.is_err() {
+        tracing::warn!(
+            event = LOG_EVENT_SETTINGS_FAILED,
+            error_class = "restore",
+            error_kind = "after_restore"
+        );
+    }
+    RestoreDoneDto::of(report, followed.is_err())
+}
+
+/// `restore_cancel`'s answer: true when the restore ended while no store call ran (before it, or
+/// in the rollback dialog after a first call that changed nothing); false when none ran. While a
+/// store call runs the answer is the error `busy` (PD-181).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct RestoreCancelDto {
     pub cancelled: bool,
@@ -1403,36 +1425,36 @@ fn restore_job<R: Runtime>(
     )?;
     // M2 handoff (T16): the restored view must be reconciled with the config file before prune
     // runs again, and every PAT the restore deleted is logged `needs_token` (PD-28).
-    if tauri::async_runtime::block_on(core.after_restore(&report)).is_err() {
-        tracing::warn!(
-            event = LOG_EVENT_SETTINGS_FAILED,
-            error_class = "restore",
-            error_kind = "after_restore"
-        );
-    }
+    let followed = tauri::async_runtime::block_on(core.after_restore(&report));
     emit_settings_changed(app);
     emit_status_changed(app);
-    Ok(RestoreDoneDto::of(&report))
+    Ok(restore_done(&report, followed))
 }
 
 /// The backup's passphrase: the credential window opened for `restore_backup` and the one entry its
 /// `submit_secret` hands over (never a command response). A window that goes without a submit, or
-/// `stop` (restore cancel, Quit), is `None`; the window is closed then.
+/// `stop` (restore cancel, Quit), is `Cancelled`; the window is closed then. `Busy` when the
+/// window is open for something else (it may have opened while the native dialogs were up).
 fn restore_passphrase<R: Runtime>(
     app: &AppHandle<R>,
     stop: &dyn Fn() -> bool,
-) -> Option<secrecy::SecretString> {
-    let request = credential::request_restore_passphrase(app, Show::Focus).ok()?;
+) -> Result<secrecy::SecretString, restore_flow::NotAsked> {
+    let request =
+        credential::request_restore_passphrase(app, Show::Focus).map_err(|e| match e {
+            WindowError::Busy => restore_flow::NotAsked::Busy,
+            _ => restore_flow::NotAsked::NoWindow,
+        })?;
     let entered = restore_flow::wait_passphrase(&request.rx, stop);
-    if entered.is_none() {
+    if entered.is_err() {
         credential::close_if(app, request.generation);
     }
     entered
 }
 
-/// `restore_cancel {}` (PD-181): a Settings restore ends before its store call (`{cancelled:
-/// true}`: no store call, no `RESTORE`, the credential window closes); once `Store::restore` runs it
-/// cannot be cancelled (`busy`). `{cancelled: false}` when no restore runs.
+/// `restore_cancel {}` (PD-181): a Settings restore ends while no store call runs (`{cancelled:
+/// true}`: no further store call, no `RESTORE`, the credential window closes; also while the
+/// rollback confirmation is up, T13 review I-1); while `Store::restore` runs it cannot be
+/// cancelled (`busy`). `{cancelled: false}` when no restore runs.
 #[tauri::command]
 pub async fn restore_cancel<R: Runtime>(
     app: AppHandle<R>,
@@ -1887,6 +1909,35 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&retest).unwrap_or_default(),
             json!({"failed": {"class": "other_user"}})
+        );
+    }
+
+    /// T13 review I-4: a failed `Core::after_restore` is never answered as a plain success: the
+    /// answer names it (`after_restore_failed`); a follow-up that ran does not.
+    #[test]
+    fn restore_done_names_a_failed_follow_up() {
+        let report = atlas_duck_audit::RestoreReport {
+            restore_seq: 12,
+            new_chain_id: "chain".into(),
+            source_install_id: String::new(),
+            source_chain_id: "source".into(),
+            replaced_db: None,
+            records_lost: 0,
+            pats_lost: true,
+            pats_deleted: vec!["inst-1".into()],
+            confirmation_seq: Some(13),
+        };
+        let done = restore_done(&report, Ok(()));
+        assert!(!done.after_restore_failed);
+        assert_eq!(done.tokens_deleted, 1);
+        let failed = restore_done(&report, Err(atlas_duck_audit::AuditError::Closed));
+        assert!(failed.after_restore_failed);
+        assert_eq!(
+            RestoreDoneDto {
+                after_restore_failed: false,
+                ..failed
+            },
+            done
         );
     }
 }

@@ -15,8 +15,9 @@
 //! - Settings "Restore backup…" ([`run_live_restore`]): `Store::restore` on the serving store, as
 //!   the serving state's audit job (PD-181: `audit_job {job: restore}` is indeterminate, `started`
 //!   right before the store call (appends wait from there on, M2 T16 M-10), then `done`, `failed`
-//!   or `cancelled`; `restore_cancel` ends the flow only before the store call; Quit cancels it
-//!   before the call, else waits for it within `STORE_WAIT`). The caller then runs
+//!   or `cancelled`; `restore_cancel` ends the flow while no store call runs (before it, and in
+//!   the rollback dialog after a first call that changed nothing); Quit cancels it then too, else
+//!   waits for the running call within `STORE_WAIT`). The caller then runs
 //!   `Core::after_restore` (the config file reconciled again, `needs_token` per deleted PAT).
 //! - The locked window's "Restore a backup instead" (`keychain_lost`, [`restore_without_store`]):
 //!   `restore_from_source` with the locked store moved aside; `serve::restore_from_backup` then
@@ -43,26 +44,48 @@ use crate::serve::{AuditJobKind, StoreCall, UnlockFailure};
 use crate::ui_sink::{EventOut, emit_audit_changed, emit_audit_job};
 
 /// plan text (PD-168, §8.11, §10.3): the native "Restore backup" confirmation, before any dialog
-/// or store call.
-pub const RESTORE_CONFIRM_TEXT: &str = "Restore a backup? The current audit log is moved to the \
-     archived folder of the data directory (never deleted) and the backup's log continues as a new \
-     segment. You need the backup's recovery passphrase, which becomes this log's recovery \
-     passphrase. Stored tokens are never restored: every instance needs its token again. Requests \
-     wait while the restore runs.";
+/// or store call. True for both entry points and for a data dir without a log (T13 review I-2):
+/// the current log is moved aside only if there is one, its open incidents stay with it, and this
+/// computer's tokens are deleted.
+pub const RESTORE_CONFIRM_TEXT: &str = "Restore a backup? The current audit log, if there is \
+     one, is moved to the archived folder of the data directory (never deleted), and the backup's \
+     log continues as a new segment. Open integrity incidents of the current log stay with its \
+     archived copy. You need the backup's recovery passphrase, which becomes this log's recovery \
+     passphrase. This computer's stored tokens are deleted and none are restored: every instance \
+     needs its token again. Requests wait while the restore runs.";
 
 /// plan text (§8.11 step 4): the native confirmation of a same-machine rollback, with the number
-/// of records it gives up.
+/// of records it gives up. The store counts from the current log file and from this install's
+/// keychain head anchor, whichever reaches further (T13 review I-2): records beyond what the file
+/// holds (no file, or one cut short) are in no archived copy, so the text promises none for them.
 pub fn rollback_text(records_lost: u64) -> String {
     format!(
         "This backup is older than this computer's audit log: restoring it gives up the last \
-         {records_lost} records of the log (they stay in the archived copy of the current log). \
-         Restore it anyway?"
+         {records_lost} records of the log. The count is taken from the current log file and from \
+         the newest record this computer's keychain remembers for the log. Records still in the \
+         current log file stay in its archived copy; records that file does not hold (because it \
+         is missing or was cut short) are kept nowhere. Restore it anyway?"
     )
 }
 
-/// plan text (PD-181, §8.7): what the windows say after `committed_incomplete` (with a restart
-/// prompt).
-pub const COMMITTED_INCOMPLETE_TEXT: &str = "Restore will be completed at the next start";
+/// The diagnostic event of a completed restore whose confirmation record could not be appended
+/// (T13 review I-3; `RestoreReport::confirmation_seq` is `None`): the §10.3 evidence is missing
+/// from the log, so the diagnostic log says so (its class only, never a path or text).
+pub const LOG_EVENT_CONFIRMATION_UNRECORDED: &str = "restore_confirmation_unrecorded";
+
+/// The diagnostic event of a source dialog whose answer is not a filesystem path (a portal's
+/// document URI): the flow ends as if cancelled (T13 review M-9).
+pub const LOG_EVENT_SOURCE_NOT_A_PATH: &str = "restore_source_not_a_path";
+
+/// Logs a completed restore whose confirmation record is missing (T13 review I-3, L192).
+fn note_confirmation(report: &RestoreReport) {
+    if report.confirmation_seq.is_none() {
+        tracing::warn!(
+            event = LOG_EVENT_CONFIRMATION_UNRECORDED,
+            error_class = "restore"
+        );
+    }
+}
 
 /// The file a backup bundle is chosen by (`backup.rs` `MANIFEST_FILE`): it stands for its folder.
 pub const BUNDLE_MANIFEST: &str = "manifest.json";
@@ -97,26 +120,47 @@ pub fn pick_restore_source<R: Runtime>(app: &AppHandle<R>) -> Option<RustChosenP
         .set_title(SOURCE_DIALOG_TITLE)
         .add_filter(SOURCE_FILTER, SOURCE_EXTENSIONS)
         .blocking_pick_file()?;
-    let path = chosen.into_path().ok()?;
+    let path = match chosen.into_path() {
+        Ok(p) => p,
+        Err(_) => {
+            // A portal's answer that names no filesystem path (T13 review M-9): no restore can
+            // read it, and it is not the user's cancel.
+            tracing::warn!(event = LOG_EVENT_SOURCE_NOT_A_PATH, error_class = "restore");
+            return None;
+        }
+    };
     let source = source_of(path);
     Some(RustChosenPath::from_native_dialog(source))
 }
 
+/// Why a question before the store call gave no answer (nothing was changed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotAsked {
+    /// A dialog was cancelled, the credential window went without a submit, or the flow's stop
+    /// test answered true (restore cancel, Quit).
+    Cancelled,
+    /// The credential window is open for something else (a PAT, the recovery note): it keeps
+    /// that purpose and the passphrase cannot be asked now.
+    Busy,
+    /// The credential window could not be opened.
+    NoWindow,
+}
+
 /// Waits for the one passphrase entry of a `restore_backup` window, looking at `stop` between
-/// bounded waits: `None` when the window went without a submit (the sender dropped) or `stop`
-/// answered true (restore cancel, Quit). Never blocks unbounded.
+/// bounded waits: `Cancelled` when the window went without a submit (the sender dropped) or
+/// `stop` answered true (restore cancel, Quit). Never blocks unbounded.
 pub fn wait_passphrase(
     rx: &Receiver<SecretString>,
     stop: &dyn Fn() -> bool,
-) -> Option<SecretString> {
+) -> Result<SecretString, NotAsked> {
     loop {
         if stop() {
-            return None;
+            return Err(NotAsked::Cancelled);
         }
         match rx.recv_timeout(PASSPHRASE_POLL) {
-            Ok(secret) => return Some(secret),
+            Ok(secret) => return Ok(secret),
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return None,
+            Err(RecvTimeoutError::Disconnected) => return Err(NotAsked::Cancelled),
         }
     }
 }
@@ -149,27 +193,27 @@ struct Asked {
 }
 
 /// The native "Restore backup" confirmation, then the source dialog, then the passphrase (in this
-/// order, PD-168). `None` as soon as one is cancelled, or `stop` answers true between them;
-/// nothing was changed then.
+/// order, PD-168). An error as soon as one is cancelled or cannot be asked, or `stop` answers
+/// true between them; nothing was changed then.
 fn ask_restore(
     confirmer: &dyn NativeConfirmer,
     pick: impl FnOnce() -> Option<RustChosenPath>,
-    passphrase: impl FnOnce(&dyn Fn() -> bool) -> Option<SecretString>,
+    passphrase: impl FnOnce(&dyn Fn() -> bool) -> Result<SecretString, NotAsked>,
     stop: &dyn Fn() -> bool,
-) -> Option<Asked> {
+) -> Result<Asked, NotAsked> {
     if confirmer.confirm(RESTORE_CONFIRM_TEXT) != Confirm::Ok {
-        return None;
+        return Err(NotAsked::Cancelled);
     }
     let confirmed = crate::serve::confirmed_by(RESTORE_CONFIRM_TEXT);
     if stop() {
-        return None;
+        return Err(NotAsked::Cancelled);
     }
-    let source = pick()?;
+    let source = pick().ok_or(NotAsked::Cancelled)?;
     if stop() {
-        return None;
+        return Err(NotAsked::Cancelled);
     }
     let passphrase = passphrase(stop)?;
-    Some(Asked {
+    Ok(Asked {
         source,
         passphrase,
         confirmed,
@@ -178,17 +222,26 @@ fn ask_restore(
 
 /// The rollback confirmation (§8.11 step 4) for `records_lost`, asked again with the new count
 /// while `head` (the live head's seq) moved during the dialog (M2 T16 M-3): records appended
-/// meanwhile are lost too. `None` when cancelled.
+/// meanwhile are lost too. `None` when cancelled, or when `stop` answers true before a dialog or
+/// after its answer: a `restore_cancel` or Quit while the dialog was up wins over its Ok (T13
+/// review I-1).
 fn ask_rollback(
     confirmer: &dyn NativeConfirmer,
     records_lost: u64,
     head: &dyn Fn() -> u64,
+    stop: &dyn Fn() -> bool,
 ) -> Option<Confirmed> {
     let mut count = records_lost;
     loop {
+        if stop() {
+            return None;
+        }
         let before = head();
         let text = rollback_text(count);
         if confirmer.confirm(&text) != Confirm::Ok {
+            return None;
+        }
+        if stop() {
             return None;
         }
         let after = head();
@@ -202,23 +255,27 @@ fn ask_rollback(
 /// Settings "Restore backup…" on the job's thread (PD-168, PD-181): the questions, then
 /// `Store::restore` (with the rollback confirmation when the store asks for it), `audit_job
 /// {job: restore}` `started` right before the store call and `done`/`failed`/`cancelled` after it,
-/// `audit_changed` after a restore. `call` decides between `restore_cancel` and the store call;
-/// `cancel` is the job's quit flag. Every refusal before the store call is `cancelled` with no
-/// event and nothing changed.
+/// `audit_changed` after a restore. `call` decides between `restore_cancel` and each store call;
+/// `cancel` is the job's quit flag. Every refusal before the store call is `cancelled` (`busy`
+/// when the credential window is open for something else) with no event and nothing changed. A
+/// first store call that asks for the rollback confirmation changed nothing either: while that
+/// dialog is up, `restore_cancel` and Quit end the flow again (`cancelled`, T13 review I-1).
 pub fn run_live_restore(
     store: &Store,
     confirmer: &dyn NativeConfirmer,
     pick: impl FnOnce() -> Option<RustChosenPath>,
-    passphrase: impl FnOnce(&dyn Fn() -> bool) -> Option<SecretString>,
+    passphrase: impl FnOnce(&dyn Fn() -> bool) -> Result<SecretString, NotAsked>,
     call: &StoreCall,
     cancel: &AtomicBool,
     out: &dyn EventOut,
 ) -> Result<RestoreReport, CommandError> {
     let job = AuditJobKind::Restore;
     let stop = || cancel.load(Ordering::SeqCst) || call.cancelled();
-    let Some(asked) = ask_restore(confirmer, pick, passphrase, &stop) else {
-        return Err(CommandError::Cancelled);
-    };
+    let asked = ask_restore(confirmer, pick, passphrase, &stop).map_err(|n| match n {
+        NotAsked::Cancelled => CommandError::Cancelled,
+        NotAsked::Busy => CommandError::Busy,
+        NotAsked::NoWindow => CommandError::Internal,
+    })?;
     if cancel.load(Ordering::SeqCst) || !call.begin() {
         return Err(CommandError::Cancelled);
     }
@@ -234,9 +291,11 @@ pub fn run_live_restore(
             Err(AuditError::Restore(RestoreError::RollbackNeedsConfirmation { records_lost }))
                 if rollback.is_none() =>
             {
-                match ask_rollback(confirmer, records_lost, &|| store.head().0) {
-                    Some(c) => rollback = Some(c),
-                    None => {
+                // Nothing changed: until the next store call a cancel or Quit ends the flow.
+                call.reopen();
+                match ask_rollback(confirmer, records_lost, &|| store.head().0, &stop) {
+                    Some(c) if !cancel.load(Ordering::SeqCst) && call.begin() => rollback = Some(c),
+                    _ => {
                         emit_audit_job(out, job, "cancelled", None);
                         return Err(CommandError::Cancelled);
                     }
@@ -247,6 +306,7 @@ pub fn run_live_restore(
     };
     match r {
         Ok(report) => {
+            note_confirmation(&report);
             emit_audit_job(out, job, "done", None);
             emit_audit_changed(out);
             Ok(report)
@@ -261,23 +321,26 @@ pub fn run_live_restore(
 /// The locked window's "Restore a backup instead" on a blocking thread (PD-168, M2 T16 M-4): a
 /// locked store whose records cannot be read is `archive_first` before any dialog; then the
 /// questions and `restore_from_source` (a fresh `config()` per attempt), with the rollback
-/// confirmation when it asks (no store runs, so its count cannot move). `stop` ends the wait for
-/// the passphrase (Quit). Returns the running store and the report.
+/// confirmation when it asks (no store runs, so its count cannot move). `stop` (Quit) ends the
+/// wait for the passphrase, and the flow after the rollback dialog (T13 review I-1): its later Ok
+/// calls `restore_from_source` no more. Returns the running store and the report.
 pub fn restore_without_store(
     data: &LocalDataDir,
     lock: &InstanceLock,
     config: &dyn Fn() -> OpenConfig,
     confirmer: &dyn NativeConfirmer,
     pick: impl FnOnce() -> Option<RustChosenPath>,
-    passphrase: impl FnOnce(&dyn Fn() -> bool) -> Option<SecretString>,
+    passphrase: impl FnOnce(&dyn Fn() -> bool) -> Result<SecretString, NotAsked>,
     stop: &dyn Fn() -> bool,
 ) -> Result<(Store, RestoreReport), UnlockFailure> {
     if live_store_blocks_restore(data) {
         return Err(UnlockFailure::ArchiveFirst);
     }
-    let Some(asked) = ask_restore(confirmer, pick, passphrase, stop) else {
-        return Err(UnlockFailure::Cancelled);
-    };
+    let asked = ask_restore(confirmer, pick, passphrase, stop).map_err(|n| match n {
+        NotAsked::Cancelled => UnlockFailure::Cancelled,
+        NotAsked::Busy => UnlockFailure::Busy,
+        NotAsked::NoWindow => UnlockFailure::Io,
+    })?;
     let mut rollback = None;
     loop {
         match restore_from_source(
@@ -292,12 +355,16 @@ pub fn restore_without_store(
             Err(OpenError::Restore(RestoreError::RollbackNeedsConfirmation { records_lost }))
                 if rollback.is_none() =>
             {
-                match ask_rollback(confirmer, records_lost, &|| 0) {
+                match ask_rollback(confirmer, records_lost, &|| 0, stop) {
                     Some(c) => rollback = Some(c),
                     None => return Err(UnlockFailure::Cancelled),
                 }
             }
-            other => return other.map_err(|e| UnlockFailure::of(&e)),
+            Ok((store, report)) => {
+                note_confirmation(&report);
+                return Ok((store, report));
+            }
+            Err(e) => return Err(UnlockFailure::of(&e)),
         }
     }
 }
@@ -410,7 +477,7 @@ mod tests {
             },
             |_| {
                 asked.push("passphrase");
-                Some(pass())
+                Ok(pass())
             },
             &call,
             &cancel,
@@ -438,7 +505,7 @@ mod tests {
             },
             |_| {
                 asked.push("passphrase");
-                Some(pass())
+                Ok(pass())
             },
             &|| false,
         );
@@ -486,7 +553,7 @@ mod tests {
             &r.store,
             &confirmer,
             || Some(chosen(&source)),
-            |_| Some(pass()),
+            |_| Ok(pass()),
             &call,
             &cancel,
             &Events::default(),
@@ -513,6 +580,320 @@ mod tests {
         Ok(())
     }
 
+    /// A native confirmer that answers Ok to every dialog and runs `during` while each rollback
+    /// dialog is up (a `restore_cancel` or a Quit while the user reads it).
+    struct DuringRollback<'a> {
+        during: &'a (dyn Fn() + Sync),
+        texts: Mutex<Vec<String>>,
+    }
+
+    impl<'a> DuringRollback<'a> {
+        fn new(during: &'a (dyn Fn() + Sync)) -> DuringRollback<'a> {
+            DuringRollback {
+                during,
+                texts: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn texts(&self) -> Vec<String> {
+            self.texts.lock().map(|t| t.clone()).unwrap_or_default()
+        }
+    }
+
+    impl NativeConfirmer for DuringRollback<'_> {
+        fn confirm(&self, text: &str) -> Confirm {
+            if let Ok(mut t) = self.texts.lock() {
+                t.push(text.to_owned());
+            }
+            if text != RESTORE_CONFIRM_TEXT {
+                (self.during)();
+            }
+            Confirm::Ok
+        }
+    }
+
+    /// T13 review I-1 (PD-181): a same-machine rollback's first store call changes nothing and
+    /// asks for the rollback confirmation. A `restore_cancel` while that dialog is up is answered
+    /// `cancelled` and ends the flow, and so does a Quit (the call cancelled, then the job's
+    /// flag, as `stop_audit_job` does): the dialog's later Ok calls the store no more.
+    #[test]
+    fn cancel_or_quit_in_the_rollback_dialog_calls_nothing() -> TestResult {
+        for quit in [false, true] {
+            let r = rig(2)?;
+            let source = bundle(&r)?;
+            let head = r.store.head();
+            let (call, cancel) = (StoreCall::default(), AtomicBool::new(false));
+            let answered = AtomicBool::new(false);
+            let during = || {
+                answered.store(call.cancel(), Ordering::SeqCst);
+                if quit {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+            };
+            let confirmer = DuringRollback::new(&during);
+            let events = Events::default();
+            let got = run_live_restore(
+                &r.store,
+                &confirmer,
+                || Some(chosen(&source)),
+                |_| Ok(pass()),
+                &call,
+                &cancel,
+                &events,
+            );
+            assert_eq!(got, Err(CommandError::Cancelled), "quit: {quit}");
+            if !quit {
+                assert!(answered.load(Ordering::SeqCst), "restore_cancel: cancelled");
+            }
+            assert_eq!(confirmer.texts().len(), 2, "quit: {quit}");
+            assert_eq!(events.phases(), ["started", "cancelled"], "quit: {quit}");
+            assert_eq!(r.store.head(), head, "quit: {quit}");
+            assert_eq!(count(&r.store, EventType::RESTORE)?, 0, "quit: {quit}");
+        }
+        Ok(())
+    }
+
+    /// T13 review I-1 (no store): a Quit (the freeze, the flow's stop test) while the rollback
+    /// dialog of the locked store's own backup is up ends the flow: `restore_from_source` is not
+    /// called again, the locked store stays in place and nothing is recorded.
+    #[test]
+    fn quit_in_the_rollback_dialog_without_a_store_calls_nothing() -> TestResult {
+        let l = rig(2)?;
+        let source = bundle(&l)?;
+        one_more(&l.store)?;
+        l.store.shutdown();
+        l.ring.wipe_install(&l.install_id);
+        let before = atlas_duck_audit::testing::event_types(&l.data)?;
+        let frozen = AtomicBool::new(false);
+        let during = || frozen.store(true, Ordering::SeqCst);
+        let confirmer = DuringRollback::new(&during);
+        let got = restore_without_store(
+            &l.data,
+            &l.lock,
+            &|| config(&l.ring, &l.install_id, &l.faults),
+            &confirmer,
+            || Some(chosen(&source)),
+            |_| Ok(pass()),
+            &|| frozen.load(Ordering::SeqCst),
+        );
+        assert!(
+            matches!(got, Err(UnlockFailure::Cancelled)),
+            "{:?}",
+            got.as_ref().map(|_| ()).map_err(|f| f.class())
+        );
+        assert_eq!(confirmer.texts().len(), 2);
+        assert_eq!(atlas_duck_audit::testing::event_types(&l.data)?, before);
+        Ok(())
+    }
+
+    /// The diagnostic lines `f` writes on this thread, through the allowlist (§7.7).
+    fn diag_lines<T>(f: impl FnOnce() -> T) -> (T, String) {
+        use tracing_subscriber::Registry;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if let Ok(mut v) = self.0.lock() {
+                    v.extend_from_slice(buf);
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Capture;
+            fn make_writer(&'a self) -> Capture {
+                self.clone()
+            }
+        }
+
+        let cap = Capture::default();
+        let subscriber =
+            Registry::default().with(crate::diag::fields::allowlist_layer(cap.clone()));
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let text = cap
+            .0
+            .lock()
+            .map(|v| String::from_utf8_lossy(&v).into_owned())
+            .unwrap_or_default();
+        (out, text)
+    }
+
+    /// T13 review I-3 (PD-168, L192): a confirmation record whose append failed is a warn line
+    /// in the diagnostic log (its event and class only), from both entry points; the restore is
+    /// complete and answered as such. A recorded one writes no such line.
+    #[test]
+    fn unrecorded_confirmation_is_logged() -> TestResult {
+        use atlas_duck_audit::testing::FaultPoint;
+
+        let r = rig(2)?;
+        let source = bundle(&r)?;
+        r.faults.fail(FaultPoint::RestoreConfirmationAppend, 1);
+        let (got, log) = diag_lines(|| {
+            run_live_restore(
+                &r.store,
+                &Answers::new(&[Confirm::Ok, Confirm::Ok]),
+                || Some(chosen(&source)),
+                |_| Ok(pass()),
+                &StoreCall::default(),
+                &AtomicBool::new(false),
+                &Events::default(),
+            )
+        });
+        let report = got?;
+        assert_eq!(report.confirmation_seq, None);
+        assert_eq!(count(&r.store, EventType::RESTORE)?, 1);
+        assert!(
+            log.contains(&format!(
+                "event={LOG_EVENT_CONFIRMATION_UNRECORDED} error_class=restore dropped_fields=0"
+            )),
+            "{log}"
+        );
+
+        // The locked window's entry.
+        let a = rig(2)?;
+        let source = bundle(&a)?;
+        let l = rig(3)?;
+        l.store.shutdown();
+        l.ring.wipe_install(&l.install_id);
+        l.faults.fail(FaultPoint::RestoreConfirmationAppend, 1);
+        let (got, log) = diag_lines(|| {
+            restore_without_store(
+                &l.data,
+                &l.lock,
+                &|| config(&l.ring, &l.install_id, &l.faults),
+                &Answers::new(&[Confirm::Ok]),
+                || Some(chosen(&source)),
+                |_| Ok(pass()),
+                &|| false,
+            )
+        });
+        let (store, report) = got.map_err(|f| f.class())?;
+        store.shutdown();
+        assert_eq!(report.confirmation_seq, None);
+        assert!(
+            log.contains(&format!("event={LOG_EVENT_CONFIRMATION_UNRECORDED}")),
+            "{log}"
+        );
+
+        // Recorded: no line.
+        let r = rig(2)?;
+        let source = bundle(&r)?;
+        let (got, log) = diag_lines(|| {
+            run_live_restore(
+                &r.store,
+                &Answers::new(&[Confirm::Ok, Confirm::Ok]),
+                || Some(chosen(&source)),
+                |_| Ok(pass()),
+                &StoreCall::default(),
+                &AtomicBool::new(false),
+                &Events::default(),
+            )
+        });
+        got?.confirmation_seq.ok_or("no confirmation record")?;
+        assert!(!log.contains(LOG_EVENT_CONFIRMATION_UNRECORDED), "{log}");
+        Ok(())
+    }
+
+    /// T13 review M-1: a credential window that cannot be had for the passphrase (it opened for
+    /// something else while the native dialogs were up) is `busy`, not a user cancel, and one
+    /// that cannot be opened is a failure; nothing was called and no event was sent.
+    #[test]
+    fn passphrase_window_not_had_is_not_a_cancel() -> TestResult {
+        let r = rig(2)?;
+        let source = bundle(&r)?;
+        let head = r.store.head();
+        for (not_asked, want) in [
+            (NotAsked::Busy, CommandError::Busy),
+            (NotAsked::NoWindow, CommandError::Internal),
+        ] {
+            let events = Events::default();
+            let call = StoreCall::default();
+            let got = run_live_restore(
+                &r.store,
+                &Answers::new(&[Confirm::Ok]),
+                || Some(chosen(&source)),
+                |_| Err(not_asked),
+                &call,
+                &AtomicBool::new(false),
+                &events,
+            );
+            assert_eq!(got, Err(want), "{not_asked:?}");
+            assert_eq!(events.all(), Vec::new());
+            assert!(!call.started());
+        }
+        assert_eq!(r.store.head(), head);
+
+        // The locked window's entry.
+        let (_tmp, data, lock) = empty_data_dir()?;
+        for (not_asked, want) in [
+            (NotAsked::Busy, UnlockFailure::Busy),
+            (NotAsked::NoWindow, UnlockFailure::Io),
+        ] {
+            let got = restore_without_store(
+                &data,
+                &lock,
+                &|| config(&r.ring, &r.install_id, &r.faults),
+                &Answers::new(&[Confirm::Ok]),
+                || Some(chosen(&source)),
+                |_| Err(not_asked),
+                &|| false,
+            );
+            assert_eq!(
+                got.as_ref().map(|_| ()).map_err(|f| *f),
+                Err(want),
+                "{not_asked:?}"
+            );
+        }
+        assert!(!data.path().join(atlas_duck_audit::DB_FILE).exists());
+        Ok(())
+    }
+
+    /// T13 review M-2: the locked window's classes for a restore's refusals name the backup, not
+    /// the locked log: a backup whose chain or schema fails its check is `broken`, one that does
+    /// not match the anchor dir `anchor_dir_mismatch` (never `integrity`, which reads as the
+    /// live log failing).
+    #[test]
+    fn unlock_failures_of_restore_errors() {
+        let cases = [
+            (RestoreError::WrongPassphrase, "wrong_passphrase"),
+            (RestoreError::NotABundle, "not_a_backup"),
+            (RestoreError::ManifestMismatch, "not_a_backup"),
+            (
+                RestoreError::SnapshotNewer { found: "x".into() },
+                "store_newer",
+            ),
+            (RestoreError::ChainBroken("x".into()), "broken"),
+            (
+                RestoreError::AnchorDirMismatch("x".into()),
+                "anchor_dir_mismatch",
+            ),
+            (
+                RestoreError::RollbackNeedsConfirmation { records_lost: 3 },
+                "invalid",
+            ),
+            (
+                RestoreError::CommittedIncomplete {
+                    restore_seq: 3,
+                    reason: "x".into(),
+                },
+                "committed_incomplete",
+            ),
+        ];
+        for (e, class) in cases {
+            let what = e.to_string();
+            assert_eq!(
+                UnlockFailure::of(&OpenError::Restore(e)).class(),
+                class,
+                "{what}"
+            );
+        }
+    }
+
     /// PD-181 (L116 restore progress): `audit_job {job: restore}` is indeterminate: `started` right
     /// before the store call, then `done` (with `audit_changed`) or `failed`; no counts.
     #[test]
@@ -524,7 +905,7 @@ mod tests {
             &r.store,
             &Answers::new(&[Confirm::Ok, Confirm::Ok]),
             || Some(chosen(&source)),
-            |_| Some(pass()),
+            |_| Ok(pass()),
             &StoreCall::default(),
             &AtomicBool::new(false),
             &events,
@@ -553,7 +934,7 @@ mod tests {
             &r.store,
             &Answers::new(&[Confirm::Ok]),
             || Some(chosen(&source)),
-            |_| Some(SecretString::from("not the passphrase".to_owned())),
+            |_| Ok(SecretString::from("not the passphrase".to_owned())),
             &StoreCall::default(),
             &AtomicBool::new(false),
             &events,
@@ -569,21 +950,24 @@ mod tests {
 
     /// PD-168 (§10.3 "logged as `CONFIG_CHANGED`"): after the restore the store records the
     /// hashes of exactly the dialog texts the user answered: the "Restore backup" text and the
-    /// rollback text with its count.
+    /// rollback text with its count. The second store call (the confirmed rollback) began through
+    /// the job's `StoreCall`, so a cancel meanwhile is refused (T13 review I-1).
     #[test]
     fn restore_confirmation_recorded_after_restore() -> TestResult {
         let r = rig(2)?;
         let source = bundle(&r)?;
         let confirmer = Answers::new(&[Confirm::Ok, Confirm::Ok]);
+        let call = StoreCall::default();
         let report = run_live_restore(
             &r.store,
             &confirmer,
             || Some(chosen(&source)),
-            |_| Some(pass()),
-            &StoreCall::default(),
+            |_| Ok(pass()),
+            &call,
             &AtomicBool::new(false),
             &Events::default(),
         )?;
+        assert!(call.started() && !call.cancel(), "the second call began");
         let texts = confirmer.texts();
         assert_eq!(
             texts,
@@ -670,7 +1054,7 @@ mod tests {
             || Some(chosen(&source)),
             |_| {
                 assert!(call.cancel(), "nothing started yet");
-                Some(pass())
+                Ok(pass())
             },
             &call,
             &AtomicBool::new(false),
@@ -699,10 +1083,16 @@ mod tests {
     fn wait_passphrase_returns_the_entry_or_stops() {
         let (tx, rx) = sync_channel::<SecretString>(1);
         assert!(tx.send(pass()).is_ok());
-        assert!(wait_passphrase(&rx, &|| false).is_some());
-        assert!(wait_passphrase(&rx, &|| true).is_none(), "stop");
+        assert!(wait_passphrase(&rx, &|| false).is_ok());
+        assert!(
+            matches!(wait_passphrase(&rx, &|| true), Err(NotAsked::Cancelled)),
+            "stop"
+        );
         drop(tx);
-        assert!(wait_passphrase(&rx, &|| false).is_none(), "the window went");
+        assert!(
+            matches!(wait_passphrase(&rx, &|| false), Err(NotAsked::Cancelled)),
+            "the window went"
+        );
     }
 
     /// PD-168 (`keychain_lost`): "Restore a backup instead" runs `restore_from_source`: the locked
@@ -726,7 +1116,7 @@ mod tests {
             &|| config(&l.ring, &l.install_id, &l.faults),
             &confirmer,
             || Some(chosen(&source)),
-            |_| Some(pass()),
+            |_| Ok(pass()),
             &|| false,
         )
         .map_err(|f| f.class())?;
@@ -768,7 +1158,7 @@ mod tests {
             },
             |_| {
                 asked.push("passphrase");
-                None
+                Err(NotAsked::Cancelled)
             },
             &|| false,
         );

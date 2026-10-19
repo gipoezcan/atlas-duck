@@ -1705,6 +1705,9 @@ impl Store {
         &self,
         c: &crate::restore::RestoreConfirmations,
     ) -> Option<u64> {
+        #[cfg(any(test, feature = "testing"))]
+        self.fault(crate::testing::FaultPoint::RestoreConfirmationAppend)
+            .ok()?;
         let p = crate::restore::confirmation_event(c).ok()?;
         self.send_append(vec![p]).ok()?.first().map(|c| c.seq)
     }

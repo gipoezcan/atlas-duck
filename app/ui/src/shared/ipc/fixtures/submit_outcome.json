@@ -45,5 +45,15 @@
     "failed": {
       "class": "archive_first"
     }
+  },
+  {
+    "failed": {
+      "class": "broken"
+    }
+  },
+  {
+    "failed": {
+      "class": "anchor_dir_mismatch"
+    }
   }
 ]

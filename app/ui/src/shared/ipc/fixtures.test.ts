@@ -235,9 +235,15 @@ describe('fixtures validate against their TS types', () => {
 
   // M10 T13 (PD-168): the restore's answers carry counts only, its errors a fixed kind only.
   it('restore answers and errors: closed shapes, fixed kinds', () => {
-    expect(restoreDone.map((d) => d.offer_passphrase_change)).toEqual([true, true]);
+    expect(restoreDone.map((d) => d.offer_passphrase_change)).toEqual([true, true, true]);
+    // T13 review I-4: a failed follow-up is named, never answered as a plain success.
+    expect(restoreDone.map((d) => d.after_restore_failed)).toEqual([false, false, true]);
     expect(isRestoreDone({ ...restoreDone[0], source: '/x' })).toBe(false);
     expect(isRestoreDone({ ...restoreDone[0], tokens_deleted: '2' })).toBe(false);
+    expect(isRestoreDone({ ...restoreDone[0], after_restore_failed: 'no' })).toBe(false);
+    const withoutFollowUp: Record<string, unknown> = { ...restoreDone[0] };
+    delete withoutFollowUp.after_restore_failed;
+    expect(isRestoreDone(withoutFollowUp)).toBe(false);
     expect(restoreCancel.map((c) => c.cancelled)).toEqual([true, false]);
     expect(isRestoreCancelAnswer({ cancelled: 'yes' })).toBe(false);
     const kinds = commandError

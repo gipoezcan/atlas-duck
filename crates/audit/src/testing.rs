@@ -304,6 +304,10 @@ pub enum FaultPoint {
     /// Restore (live store): its barrier replaced whatever was installed; the keychain is not
     /// read yet and nothing is committed. An armed failure fails the restore there.
     RestoreBarrierHeld,
+    /// Restore (both entry points): the restore completed (KEK re-sealed, anchor reset armed);
+    /// its confirmation record (`CONFIG_CHANGED {key: restore_backup}`) is not appended yet. An
+    /// armed failure fails that append.
+    RestoreConfirmationAppend,
 }
 
 /// Runs when a [`FaultPoint`] is reached (see [`Faults::on_hit`]).

@@ -1,14 +1,23 @@
 [
   {
+    "after_restore_failed": false,
     "offer_passphrase_change": true,
     "records_lost": 22,
     "restore_seq": 51,
     "tokens_deleted": 2
   },
   {
+    "after_restore_failed": false,
     "offer_passphrase_change": true,
     "records_lost": 0,
     "restore_seq": 9,
     "tokens_deleted": 0
+  },
+  {
+    "after_restore_failed": true,
+    "offer_passphrase_change": true,
+    "records_lost": 0,
+    "restore_seq": 12,
+    "tokens_deleted": 1
   }
 ]

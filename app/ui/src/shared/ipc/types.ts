@@ -683,15 +683,22 @@ export type AuditJobPhase = 'started' | 'progress' | 'done' | 'failed' | 'cancel
  * `restore_begin` (M10 T13, PD-168): a completed restore, counts only. `tokens_deleted` instances
  * need their token again; `offer_passphrase_change` is always true (the backup's recovery passphrase
  * is this log's now: offer "Change recovery passphrase…" right after, §8.11 step 2).
+ * `after_restore_failed` (T13 review I-4): the restore is complete but its follow-up (the config file
+ * reconciled again, `needs_token` per deleted token) failed; a restart completes the reconcile.
  */
 export interface RestoreDone {
   restore_seq: number;
   records_lost: number;
   tokens_deleted: number;
   offer_passphrase_change: boolean;
+  after_restore_failed: boolean;
 }
 
-/** `restore_cancel`: false when no restore ran; once the store call began the answer is `busy`. */
+/**
+ * `restore_cancel`: false when no restore ran. While a store call runs the answer is `busy`; before
+ * it, and while the rollback confirmation is up after a store call that changed nothing, the cancel
+ * ends the restore (`true`).
+ */
 export interface RestoreCancelAnswer {
   cancelled: boolean;
 }

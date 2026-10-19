@@ -1139,6 +1139,9 @@ fn submit_outcomes() -> Vec<SubmitOutcome> {
         SubmitOutcome::Failed(SubmitFailure::class(CLASS_CONTEXT_CHANGED)),
         // M10 T13: "Restore a backup instead" on a locked store whose records cannot be read.
         SubmitOutcome::Failed(SubmitFailure::class("archive_first")),
+        // T13 review M-2: the chosen backup, not the locked log, failed its check.
+        SubmitOutcome::Failed(SubmitFailure::class("broken")),
+        SubmitOutcome::Failed(SubmitFailure::class("anchor_dir_mismatch")),
     ]
 }
 
@@ -1506,7 +1509,8 @@ fn removal_states() -> Vec<RemovalDto> {
     ]
 }
 
-/// `restore_begin` (M10 T13): a restore that gave up records, and one that gave up none.
+/// `restore_begin` (M10 T13): a restore that gave up records, one that gave up none, and one
+/// whose follow-up (`Core::after_restore`) failed (T13 review I-4).
 fn restore_dones() -> Vec<RestoreDoneDto> {
     vec![
         RestoreDoneDto {
@@ -1514,12 +1518,21 @@ fn restore_dones() -> Vec<RestoreDoneDto> {
             records_lost: 22,
             tokens_deleted: 2,
             offer_passphrase_change: true,
+            after_restore_failed: false,
         },
         RestoreDoneDto {
             restore_seq: 9,
             records_lost: 0,
             tokens_deleted: 0,
             offer_passphrase_change: true,
+            after_restore_failed: false,
+        },
+        RestoreDoneDto {
+            restore_seq: 12,
+            records_lost: 0,
+            tokens_deleted: 1,
+            offer_passphrase_change: true,
+            after_restore_failed: true,
         },
     ]
 }

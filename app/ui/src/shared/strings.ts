@@ -728,3 +728,11 @@ export const ONBOARDING_PANEL_TEXT = {
   intro: 'Copy these instructions into the CLAUDE.md or AGENTS.md of the repositories your agents work in.',
   text_label: 'Instructions for your agents',
 } as const;
+
+/**
+ * plan text (PD-181, §8.7): what the windows say after a restore answered `committed_incomplete`, with a
+ * restart prompt (Settings: Task 21). The single copy for the main windows (T13 review M-10); the
+ * credential page imports nothing from here (PD-71), so Task 22 mirrors it in `credential/text.ts`
+ * with a test that the two are equal.
+ */
+export const COMMITTED_INCOMPLETE_TEXT = 'Restore will be completed at the next start';

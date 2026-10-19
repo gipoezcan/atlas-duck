@@ -614,9 +614,15 @@ export const isAuditReadFailure = (v: unknown): v is AuditReadFailure => {
   return v.kind === 'failed' && closed(v, { kind: isStr });
 };
 
-/** `restore_begin` (M10 T13): counts only. */
+/** `restore_begin` (M10 T13): counts only, and whether the follow-up failed (review I-4). */
 export const isRestoreDone = (v: unknown): v is RestoreDone =>
-  closed(v, { restore_seq: isNum, records_lost: isNum, tokens_deleted: isNum, offer_passphrase_change: isBool });
+  closed(v, {
+    restore_seq: isNum,
+    records_lost: isNum,
+    tokens_deleted: isNum,
+    offer_passphrase_change: isBool,
+    after_restore_failed: isBool,
+  });
 
 export const isRestoreCancelAnswer = (v: unknown): v is RestoreCancelAnswer =>
   closed(v, { cancelled: isBool });

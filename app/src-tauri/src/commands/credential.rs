@@ -24,7 +24,7 @@ use super::{CommandError, blocking, finish};
 use crate::credential::{self, FirstRunPassphrase, NoteFacts, PatTarget, Purpose};
 use crate::serve::{self, ServeState, UnlockKind};
 use crate::state::ServeSlot;
-use crate::windows::{self, Label, Show};
+use crate::windows::{self, Label, Show, WindowError};
 
 /// plan text (T20): a secret (PAT or passphrase) is 1 to 1 024 bytes of UTF-8 without `\0`.
 pub const SECRET_MAX_BYTES: usize = 1024;
@@ -636,7 +636,12 @@ async fn restore_in_place<R: Runtime>(app: &AppHandle<R>) -> Result<SubmitOutcom
         &state,
         Box::new(move || crate::restore_flow::pick_restore_source(&pick_app)),
         Box::new(move |stop| {
-            let request = credential::enter_restore(&pass_app, generation).ok()?;
+            use crate::restore_flow::NotAsked;
+            let request =
+                credential::enter_restore(&pass_app, generation).map_err(|e| match e {
+                    WindowError::Busy => NotAsked::Busy,
+                    _ => NotAsked::NoWindow,
+                })?;
             crate::restore_flow::wait_passphrase(&request.rx, stop)
         }),
     )
