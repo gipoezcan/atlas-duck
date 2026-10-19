@@ -53,8 +53,10 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 /// Upper bound for every wait in this file: a regression fails, it never hangs.
 const WAIT_BOUND: Duration = Duration::from_secs(30);
-/// The plan bound for a kill that must not block.
-const KILL_BOUND: Duration = Duration::from_millis(50);
+/// Bound for a kill that must not block. The regression it guards (a kill queued behind the
+/// frame) costs the whole frame time (about 2 s for a cap-size result), so 1 s separates the two;
+/// the plan's 50 ms was measured at about 200 ms on the Windows runner (CI, twice).
+const KILL_BOUND: Duration = Duration::from_millis(1000);
 /// The embedded version the fake reports and the expected identity records.
 const VERSION: &str = "fake-build-1";
 const MIB: usize = 1024 * 1024;
