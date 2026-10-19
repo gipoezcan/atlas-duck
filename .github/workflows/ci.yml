@@ -958,6 +958,10 @@ jobs:
           bash ci/script-matrix-step.sh --self-test
           pwsh -NoProfile -File ci/script-matrix-step.ps1 -SelfTest
 
+      # PD-178 / P15: the release identity guard's text checks (no release build starts here).
+      - name: Release identity guard self-test
+        run: bash ci/check-release-identity.sh --self-test
+
       - name: Probe evidence (§9.4, go/no-go record)
         run: |
           set -euo pipefail

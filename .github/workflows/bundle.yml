@@ -98,6 +98,14 @@ jobs:
       # M4 plan Task 26 (T21 I-2): the release build must carry no test-only feature and nothing may
       # force debug assertions (which would open the compile_error! locks). Same target and flags
       # as the build below; the feature tree is the corrected one (cargo tree has no --release).
+      # PD-178 / P15 (spec §12.5): a release refuses the placeholder bundle identifier, the data-dir
+      # folder name as identifier, and the placeholder icons. Runs only for release builds: T26 adds
+      # the `on: workflow_call` `release: boolean` input; until then inputs.release is empty and the
+      # step is skipped.
+      - name: Release identity guard (bundle identifier and placeholder icons)
+        if: ${{ inputs.release }}
+        run: bash ci/check-release-identity.sh
+
       - name: Release build guard (no test-only feature, no forced debug assertions)
         run: bash ci/check-release-build.sh "$TARGET"
 
@@ -176,6 +184,14 @@ jobs:
       # M4 plan Task 26 (T21 I-2): the release build must carry no test-only feature and nothing may
       # force debug assertions (which would open the compile_error! locks). Same target and flags
       # as the build below; the feature tree is the corrected one (cargo tree has no --release).
+      # PD-178 / P15 (spec §12.5): a release refuses the placeholder bundle identifier, the data-dir
+      # folder name as identifier, and the placeholder icons. Runs only for release builds: T26 adds
+      # the `on: workflow_call` `release: boolean` input; until then inputs.release is empty and the
+      # step is skipped.
+      - name: Release identity guard (bundle identifier and placeholder icons)
+        if: ${{ inputs.release }}
+        run: bash ci/check-release-identity.sh
+
       - name: Release build guard (no test-only feature, no forced debug assertions)
         run: bash ci/check-release-build.sh "$TARGET"
 
@@ -283,6 +299,14 @@ jobs:
       # M4 plan Task 26 (T21 I-2): the release build must carry no test-only feature and nothing may
       # force debug assertions (which would open the compile_error! locks). Same target and flags
       # as the build below; the feature tree is the corrected one (cargo tree has no --release).
+      # PD-178 / P15 (spec §12.5): a release refuses the placeholder bundle identifier, the data-dir
+      # folder name as identifier, and the placeholder icons. Runs only for release builds: T26 adds
+      # the `on: workflow_call` `release: boolean` input; until then inputs.release is empty and the
+      # step is skipped.
+      - name: Release identity guard (bundle identifier and placeholder icons)
+        if: ${{ inputs.release }}
+        run: bash ci/check-release-identity.sh
+
       - name: Release build guard (no test-only feature, no forced debug assertions)
         run: bash ci/check-release-build.sh "$TARGET"
 
@@ -375,6 +399,14 @@ jobs:
       # M4 plan Task 26 (T21 I-2): the release build must carry no test-only feature and nothing may
       # force debug assertions (which would open the compile_error! locks). Same target and flags
       # as the build below; the feature tree is the corrected one (cargo tree has no --release).
+      # PD-178 / P15 (spec §12.5): a release refuses the placeholder bundle identifier, the data-dir
+      # folder name as identifier, and the placeholder icons. Runs only for release builds: T26 adds
+      # the `on: workflow_call` `release: boolean` input; until then inputs.release is empty and the
+      # step is skipped.
+      - name: Release identity guard (bundle identifier and placeholder icons)
+        if: ${{ inputs.release }}
+        run: bash ci/check-release-identity.sh
+
       - name: Release build guard (no test-only feature, no forced debug assertions)
         run: bash ci/check-release-build.sh "$TARGET"
 
