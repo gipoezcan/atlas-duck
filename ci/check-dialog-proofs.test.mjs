@@ -2,9 +2,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { PROOF_HELPERS, isExempt, scanDialogProofs } from "./check-dialog-proofs.mjs";
+import { PROOF_HELPERS, collectFiles, isExempt, scanDialogProofs } from "./check-dialog-proofs.mjs";
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SERVE = "app/src-tauri/src/serve.rs";
@@ -97,6 +98,7 @@ test("exempt paths, cfg(test) items, struct items and comments are not sites", (
     "crates/core/src/testing/harness.rs",
     "crates/audit/tests/prune.rs",
     "app/src-tauri/tests/commands_acl.rs",
+    "app/src-tauri/tests/cli_flows/main.rs",
   ]) {
     assert.ok(isExempt(path), path);
     assert.deepEqual(scanDialogProofs([{ path, src: lit }]), []);
@@ -113,6 +115,264 @@ test("exempt paths, cfg(test) items, struct items and comments are not sites", (
     "}",
   ].join("\n");
   assert.deepEqual(scanDialogProofs([{ path: "crates/audit/src/types.rs", src }]), []);
+});
+
+const LITERAL = "Confirmed { dialog_text_sha256: [0; 32] }";
+const SITE = `${OTHER}:`;
+const OUTSIDE = "Confirmed built outside a dialog function and the proof-helper allowlist";
+const NO_PATH_DIALOG = "RustChosenPath::from_native_dialog outside a function that opens a folder or file dialog";
+const lines = (...l) => l.join("\n");
+
+test("I-1: Confirmed built on the Cancel arm, after ignoring the answer or before the dialog is flagged", () => {
+  const cancelArm = lines(
+    "fn pick(c: &dyn NativeConfirmer) -> Option<Confirmed> {",
+    '    match c.confirm("t") {',
+    "        Confirm::Ok => None,",
+    `        Confirm::Cancel => { let k = ${LITERAL}; Some(k) }`,
+    "    }",
+    "}",
+  );
+  assert.deepEqual(scanDialogProofs([{ path: OTHER, src: cancelArm }]), [`${SITE}4: ${OUTSIDE}`]);
+  const ignored = lines(
+    "fn f(c: &dyn NativeConfirmer) -> Confirmed {",
+    '    let _r = c.confirm("t");',
+    "    let _o = Confirm::Ok;",
+    `    ${LITERAL}`,
+    "}",
+  );
+  assert.deepEqual(scanDialogProofs([{ path: OTHER, src: ignored }]), [`${SITE}4: ${OUTSIDE}`]);
+  const before = lines(
+    "fn f(c: &dyn NativeConfirmer) -> Confirmed {",
+    `    let k = ${LITERAL};`,
+    '    if c.confirm("t") != Confirm::Ok { panic!() }',
+    "    k",
+    "}",
+  );
+  assert.deepEqual(scanDialogProofs([{ path: OTHER, src: before }]), [`${SITE}2: ${OUTSIDE}`]);
+  // The realistic accident: the Ok branch only logs, the proof is built whatever the answer was.
+  const accident = lines(
+    "fn f(c: &dyn NativeConfirmer, store: &Store) {",
+    '    if c.confirm("t") == Confirm::Ok { log(); }',
+    `    store.apply(Some(${LITERAL}));`,
+    "}",
+  );
+  assert.deepEqual(scanDialogProofs([{ path: OTHER, src: accident }]), [`${SITE}3: ${OUTSIDE}`]);
+  // Built inside the block of a `!= Ok` test, which is the cancel path.
+  const inNe = lines(
+    "fn f(c: &dyn NativeConfirmer) -> Confirmed {",
+    '    if c.confirm("t") != Confirm::Ok {',
+    `        return ${LITERAL};`,
+    "    }",
+    `    ${LITERAL}`,
+    "}",
+  );
+  assert.deepEqual(scanDialogProofs([{ path: OTHER, src: inNe }]), [`${SITE}3: ${OUTSIDE}`]);
+});
+
+test("I-1: Confirmed built on the Ok path is accepted in each of its shapes", () => {
+  const shapes = [
+    // brace arm, expression arm, `==` block, `!=` early return, `?`, `if let`
+    lines(
+      "fn f(c: &dyn NativeConfirmer) -> Option<Confirmed> {",
+      '    match c.confirm("t") {',
+      `        Confirm::Ok => { Some(${LITERAL}) }`,
+      "        Confirm::Cancel => None,",
+      "    }",
+      "}",
+    ),
+    lines(
+      "fn f(c: &dyn NativeConfirmer) -> Option<Confirmed> {",
+      '    match c.confirm("t") {',
+      `        Confirm::Ok => Some(${LITERAL}),`,
+      "        _ => None,",
+      "    }",
+      "}",
+    ),
+    lines(
+      "fn f(c: &dyn NativeConfirmer) -> Option<Confirmed> {",
+      '    if c.confirm("t") == Confirm::Ok {',
+      `        return Some(${LITERAL});`,
+      "    }",
+      "    None",
+      "}",
+    ),
+    lines(
+      "fn f(c: &dyn NativeConfirmer) -> Option<Confirmed> {",
+      '    if c.confirm("t") != Confirm::Ok { return None; }',
+      `    Some(${LITERAL})`,
+      "}",
+    ),
+    lines("fn f(&self) -> Result<Confirmed, E> {", '    self.confirm("t")?;', `    Ok(${LITERAL})`, "}"),
+    lines(
+      "fn f(c: &dyn NativeConfirmer) -> Option<Confirmed> {",
+      '    if let Confirm::Ok = c.confirm("t") {',
+      `        return Some(${LITERAL});`,
+      "    }",
+      "    None",
+      "}",
+    ),
+  ];
+  for (const src of shapes) assert.deepEqual(scanDialogProofs([{ path: OTHER, src }]), [], src);
+});
+
+test("I-1: from_native_dialog takes the picked result: a literal path, a path before the dialog or on the cancel path is flagged", () => {
+  const literal = lines(
+    "fn pick(app: &App, store: &Store) {",
+    "    let Some(p) = app.dialog().file().blocking_pick_folder() else { return };",
+    '    store.backup(RustChosenPath::from_native_dialog(PathBuf::from("/etc")));',
+    "}",
+  );
+  assert.deepEqual(scanDialogProofs([{ path: OTHER, src: literal }]), [`${SITE}3: ${NO_PATH_DIALOG}`]);
+  const ignored = lines(
+    "fn pick(app: &App, store: &Store, other: PathBuf) {",
+    "    let _ = app.dialog().file().blocking_pick_folder();",
+    "    store.backup(RustChosenPath::from_native_dialog(other));",
+    "}",
+  );
+  assert.deepEqual(scanDialogProofs([{ path: OTHER, src: ignored }]), [`${SITE}3: ${NO_PATH_DIALOG}`]);
+  const before = lines(
+    "fn pick(app: &App, store: &Store, other: PathBuf) {",
+    "    let r = RustChosenPath::from_native_dialog(other);",
+    "    let _ = app.dialog().file().blocking_pick_folder();",
+    "}",
+  );
+  assert.deepEqual(scanDialogProofs([{ path: OTHER, src: before }]), [`${SITE}2: ${NO_PATH_DIALOG}`]);
+  const cancelArm = lines(
+    "fn pick(app: &App, store: &Store, d: PathBuf) {",
+    "    match app.dialog().file().blocking_pick_folder() {",
+    "        Some(p) => store.backup(RustChosenPath::from_native_dialog(p)),",
+    "        None => store.backup(RustChosenPath::from_native_dialog(d)),",
+    "    }",
+    "}",
+  );
+  assert.deepEqual(scanDialogProofs([{ path: OTHER, src: cancelArm }]), [`${SITE}4: ${NO_PATH_DIALOG}`]);
+  // The picked value, derived and passed on, is what the check wants.
+  const derived = lines(
+    "fn pick(app: &App, store: &Store) -> Result<bool, E> {",
+    "    let Some(chosen) = app.dialog().file().set_title(T).blocking_pick_folder() else { return Ok(false) };",
+    "    let path = chosen.into_path().map_err(|_| E::Internal)?;",
+    "    store.backup(RustChosenPath::from_native_dialog(path))?;",
+    "    Ok(true)",
+    "}",
+  );
+  assert.deepEqual(scanDialogProofs([{ path: OTHER, src: derived }]), []);
+});
+
+test("I-2: only #[cfg(test)] modules, crate-root tests/ dirs and the testing paths are exempt", () => {
+  const lit = `fn t() -> Confirmed { ${LITERAL} }`;
+  for (const path of ["crates/ipc/src/tests/x.rs", "crates/ipc/src/tests.rs", "app/src-tauri/src/commands/tests/y.rs"]) {
+    assert.ok(!isExempt(path), path);
+    assert.equal(scanDialogProofs([{ path, src: lit }]).length, 1, path);
+  }
+  // A file that the parent declares `#[cfg(test)] mod x;` is test code.
+  const parent = { path: "crates/ipc/src/lib.rs", src: "#[cfg(test)]\nmod tests;\nmod live;\n" };
+  assert.deepEqual(scanDialogProofs([parent, { path: "crates/ipc/src/tests/x.rs", src: lit }]), []);
+  assert.deepEqual(scanDialogProofs([parent, { path: "crates/ipc/src/tests.rs", src: lit }]), []);
+  assert.equal(scanDialogProofs([parent, { path: "crates/ipc/src/live.rs", src: lit }]).length, 1);
+  const nested = { path: "crates/ipc/src/a/mod.rs", src: "#[cfg(test)]\npub(crate) mod tests;\n" };
+  assert.deepEqual(scanDialogProofs([nested, { path: "crates/ipc/src/a/tests.rs", src: lit }]), []);
+  // The real scan visits the crate-root tests/ dirs, so the exemption is exercised on real paths.
+  const visited = collectFiles(REPO).map((f) => f.path);
+  for (const dir of ["crates/audit/tests/", "app/src-tauri/tests/"]) {
+    const some = visited.filter((p) => p.startsWith(dir));
+    assert.ok(some.length > 0, dir);
+    assert.ok(some.every(isExempt), dir);
+  }
+});
+
+test("M-1: an aliased import or alias of Confirmed or RustChosenPath, and Self literals in impl Confirmed", () => {
+  const alias = lines("use atlas_duck_audit::types::Confirmed as C;", `fn f() -> C { C { dialog_text_sha256: [0; 32] } }`);
+  const found = scanDialogProofs([{ path: OTHER, src: alias }]);
+  assert.equal(found.length, 1);
+  assert.match(found[0], /^app\/src-tauri\/src\/commands\/other\.rs:1: .*Confirmed.*under another name/);
+  assert.equal(scanDialogProofs([{ path: OTHER, src: "use a::{RustChosenPath as R, X};" }]).length, 1);
+  assert.equal(scanDialogProofs([{ path: OTHER, src: "type C = Confirmed;" }]).length, 1);
+  const selfLit = lines(
+    "impl Confirmed {",
+    "    fn f() -> Self { Self { dialog_text_sha256: [0; 32] } }",
+    "}",
+  );
+  assert.deepEqual(scanDialogProofs([{ path: OTHER, src: selfLit }]), [`${SITE}2: ${OUTSIDE}`]);
+  const traitImpl = lines("impl From<X> for Confirmed {", "    fn from(_: X) -> Self { Self { dialog_text_sha256: [0; 32] } }", "}");
+  assert.deepEqual(scanDialogProofs([{ path: OTHER, src: traitImpl }]), [`${SITE}2: ${OUTSIDE}`]);
+  // `Self {` in an unrelated impl is not a Confirmed.
+  assert.deepEqual(scanDialogProofs([{ path: OTHER, src: "impl Other { fn f() -> Self { Self { a: 1 } } }" }]), []);
+});
+
+test("M-2: Self::apply and Self::confirmed callers are callers of the helper", () => {
+  const helper = "fn apply(t: Option<&str>) -> Confirmed { Confirmed { dialog_text_sha256: [0; 32] } }";
+  for (const name of ["apply", "confirmed"]) {
+    const h = helper.replace("apply", name);
+    const rogue = `fn rogue(&self) { Self::${name}(self, Some("x")); }`;
+    const found = scanDialogProofs([{ path: SERVE, src: `${h}\n${rogue}` }], [{ file: SERVE, name }]);
+    assert.equal(found.length, 1, name);
+    assert.match(found[0], new RegExp(`proof helper ${name} called from fn rogue`));
+    const ok = `fn add(&self) { self.confirm(&t)?; Self::${name}(self, Some("x")); }`;
+    assert.deepEqual(scanDialogProofs([{ path: SERVE, src: `${h}\n${ok}` }], [{ file: SERVE, name }]), []);
+  }
+});
+
+test("M-3: impl<T> Confirmed {} is not a literal", () => {
+  for (const head of ["impl<T> Confirmed {", "impl<T: Clone + Into<X>> Confirmed {", "impl<'a> Trait<'a> for Confirmed {"]) {
+    assert.deepEqual(scanDialogProofs([{ path: OTHER, src: `${head}\n    fn f(&self) {}\n}` }]), [], head);
+  }
+});
+
+// M-4: the allowlist and the dialog proof are load-bearing on the real files. A slice of the real
+// tree (the three files that hold a listed helper) is copied into a scratch directory (the env var,
+// else `target/`, never the system temp dir) and mutated; the CLI must then fail.
+const SLICE = [SERVE, "crates/core/src/instances/admin.rs", "crates/core/src/settings/mod.rs"];
+
+function withSliceCopy(mutate, run) {
+  const base = process.env.CHECK_DIALOG_PROOFS_SCRATCH ?? join(REPO, "target", "check-dialog-proofs-scratch");
+  mkdirSync(base, { recursive: true });
+  const root = mkdtempSync(join(base, "slice-"));
+  try {
+    for (const rel of SLICE) {
+      const to = join(root, ...rel.split("/"));
+      mkdirSync(dirname(to), { recursive: true });
+      let text = readFileSync(join(REPO, ...rel.split("/")), "utf8");
+      text = mutate(rel, text);
+      writeFileSync(to, text);
+    }
+    return run(root);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+const cli = (root) =>
+  spawnSync(process.execPath, [join(REPO, "ci", "check-dialog-proofs.mjs"), root], { encoding: "utf8" });
+
+function replaceOnce(text, from, to) {
+  assert.ok(text.includes(from), `mutation target missing: ${from}`);
+  return text.replace(from, to);
+}
+
+test("M-4: the unmodified slice of the real tree passes", () => {
+  const r = withSliceCopy((_, t) => t, cli);
+  assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+});
+
+test("M-4: dropping a helper from the allowlist (renaming it) fails the check", () => {
+  const r = withSliceCopy((rel, t) => (rel === SERVE ? t.replace(/\bconfirmed_by\b/g, "confirmed_by_renamed") : t), cli);
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /serve\.rs:\d+: Confirmed built outside a dialog function/);
+  assert.match(r.stdout, /listed proof helper confirmed_by not found/);
+});
+
+test("M-4: a rogue caller of a real helper fails the check", () => {
+  const rogue = (rel, t) =>
+    rel === "crates/core/src/settings/mod.rs" ? `${t}\nfn rogue_caller(text: &str) { let _ = confirmed(text); }\n` : t;
+  const r = withSliceCopy(rogue, cli);
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /settings\/mod\.rs:\d+: proof helper confirmed called from fn rogue_caller/);
+});
+
+test("M-4: removing the answer test before a real helper call fails the check", () => {
+  const r = withSliceCopy((rel, t) => (rel === SERVE ? replaceOnce(t, "answer != Confirm::Ok", "false") : t), cli);
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /serve\.rs:\d+: proof helper confirmed_by called from fn /);
 });
 
 test("accepts_current_tree", () => {
