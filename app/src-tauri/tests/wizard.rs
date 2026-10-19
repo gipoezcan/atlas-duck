@@ -35,9 +35,10 @@ use atlas_duck_app_lib::wizard::{
 };
 use atlas_duck_audit::lock::InstanceLock;
 use atlas_duck_audit::testing::{KeyOpKind, MemKeyStore, MemKeyring, event_types, recovery_row};
+use atlas_duck_audit::types::RustChosenPath;
 use atlas_duck_audit::{
-    FirstRunInput, KeyStore, KeyStoreError, KeyringLocality, OpenConfig, SystemClock,
-    create_new_store, new_ids,
+    AuditCursor, AuditFilter, EventType, FirstRunInput, KeyStore, KeyStoreError, KeyringLocality,
+    MAX_AUDIT_PAGE_ROWS, OpenConfig, SystemClock, create_new_store, new_ids,
 };
 use atlas_duck_core::{Confirm, GateState, NativeConfirmer, ShutdownReason, UiEvent, UiSink};
 use atlas_duck_ipc::build_info::BUILD_ID;
@@ -403,6 +404,14 @@ struct Machine {
     confirmer: Arc<Answers>,
     pins: Arc<Mutex<Vec<PinCall>>>,
     pick: Arc<Mutex<Option<PathBuf>>>,
+    /// M10 T15: what the anchor-dir folder dialog answers, and how often it was shown.
+    pick_anchor: Arc<Mutex<Option<PathBuf>>>,
+    anchor_dialogs: Arc<AtomicU32>,
+    /// M10 T15: what the restore's file dialog answers, and how often it was shown.
+    pick_restore: Arc<Mutex<Option<PathBuf>>>,
+    restore_dialogs: Arc<AtomicU32>,
+    /// M10 T15: the next this many writes of the pinned file that name an `install_id` fail.
+    pin_fail: Arc<AtomicU32>,
     secret_service: Option<SecretService>,
     /// Step 0's start never ends.
     idle_start: bool,
@@ -449,6 +458,11 @@ impl Machine {
             confirmer: Arc::default(),
             pins: Arc::default(),
             pick: Arc::default(),
+            pick_anchor: Arc::default(),
+            anchor_dialogs: Arc::default(),
+            pick_restore: Arc::default(),
+            restore_dialogs: Arc::default(),
+            pin_fail: Arc::default(),
             secret_service: None,
             idle_start: false,
             in_flight_at_start: Arc::default(),
@@ -474,6 +488,10 @@ impl Machine {
     fn env(&self) -> WizardEnv<MockRuntime> {
         let pins = self.pins.clone();
         let pick = self.pick.clone();
+        let (pick_anchor, anchor_dialogs) = (self.pick_anchor.clone(), self.anchor_dialogs.clone());
+        let (pick_restore, restore_dialogs) =
+            (self.pick_restore.clone(), self.restore_dialogs.clone());
+        let pin_fail = self.pin_fail.clone();
         let ring = self.ring.clone();
         WizardEnv {
             pinned_file: self.pinned_file.clone(),
@@ -483,12 +501,31 @@ impl Machine {
             secret_service: Arc::new(FixedSecretService(self.secret_service)),
             starter: self.starter(),
             pick_folder: Arc::new(move |_| pick.lock().ok().and_then(|p| p.clone())),
+            pick_anchor_dir: Arc::new(move |_| {
+                anchor_dialogs.fetch_add(1, Ordering::SeqCst);
+                let p = pick_anchor.lock().ok().and_then(|p| p.clone())?;
+                Some(RustChosenPath::from_native_dialog(p))
+            }),
+            pick_restore: Arc::new(move |_| {
+                restore_dialogs.fetch_add(1, Ordering::SeqCst);
+                let p = pick_restore.lock().ok().and_then(|p| p.clone())?;
+                Some(RustChosenPath::from_native_dialog(p))
+            }),
             write_pinned: Arc::new(move |file, p| {
                 if let Ok(mut calls) = pins.lock() {
                     calls.push(PinCall {
                         install_id: p.install_id.clone(),
                         data_dir_existed: p.data_dir.is_dir(),
                     });
+                }
+                let fail = p.install_id.is_some()
+                    && pin_fail
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok();
+                if fail {
+                    return Err(paths::PinnedError::Io(std::io::Error::other(
+                        "the test refuses this write",
+                    )));
                 }
                 paths::write_pinned(file, p)
             }),
@@ -518,6 +555,17 @@ impl Machine {
 
     /// A store in `dir` created as the wizard would, shut down again; its `install_id`.
     fn provision(&self, dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
+        self.provision_with(dir, None, |_| Ok(()))
+    }
+
+    /// A store in `dir` created as the wizard would, with `anchor` as its anchor dir; `then` runs on
+    /// it before it is shut down (its anchor-dir lines written first). Its `install_id`.
+    fn provision_with(
+        &self,
+        dir: &Path,
+        anchor: Option<&Path>,
+        then: impl FnOnce(&atlas_duck_audit::Store) -> TestResult,
+    ) -> Result<String, Box<dyn std::error::Error>> {
         std::fs::create_dir_all(dir)?;
         let data = local(dir)?;
         let lock = InstanceLock::acquire(&data, self.host)?;
@@ -533,12 +581,33 @@ impl Machine {
                 passphrase: SecretString::from(PASSPHRASE),
                 passphrase_confirm: SecretString::from(PASSPHRASE),
                 archived_db: None,
-                anchor_dir: None,
+                anchor_dir: anchor.map(|a| RustChosenPath::from_native_dialog(a.to_path_buf())),
                 archive_confirmed: None,
             },
         )?;
+        let done = if anchor.is_some() && !store.testing_anchor_dir_drain() {
+            Err("the provisioned store's anchor-dir lines were not written".into())
+        } else {
+            then(&store)
+        };
         store.shutdown();
+        done?;
         Ok(install_id)
+    }
+
+    /// A backup bundle of a store of another install (its own data dir and ring entries) in
+    /// `<root>/backups`, made with [`PASSPHRASE`]: what the wizard's restore picks.
+    fn backup_elsewhere(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let out = self.root.join("backups");
+        std::fs::create_dir_all(&out)?;
+        let bundle = Mutex::new(None);
+        self.provision_with(&self.root.join("old-data"), None, |store| {
+            let receipt = store.backup(RustChosenPath::from_native_dialog(out.clone()))?;
+            *bundle.lock().map_err(|_| "poisoned")? = Some(receipt.bundle_dir);
+            Ok(())
+        })?;
+        let bundle = bundle.into_inner().map_err(|_| "poisoned")?;
+        Ok(bundle.ok_or("no backup")?)
     }
 }
 
@@ -673,7 +742,7 @@ async fn step0_writes_data_dir_before_pinned_file() -> TestResult {
     assert_eq!(pinned.install_id, None);
     assert!(m.default_dir.join("instance.lock").exists());
     until(&setup, "the first-run gate serves", |s| {
-        s["step"] == "passphrase" && s["refused_count"] == 0
+        s["step"] == "anchor_dir" && s["refused_count"] == 0
     })
     .await?;
     let data = local(&m.default_dir)?;
@@ -977,7 +1046,7 @@ async fn wizard_genesis_swaps_handler_without_rebind() -> TestResult {
     let handle = app.handle().clone();
     run(&setup, "wizard_use_default_dir").await?;
     until(&setup, "the gate serves", |s| {
-        s["step"] == "passphrase" && s["refused_count"] == 0
+        s["step"] == "anchor_dir" && s["refused_count"] == 0
     })
     .await?;
     let data = local(&m.default_dir)?;
@@ -992,7 +1061,7 @@ async fn wizard_genesis_swaps_handler_without_rebind() -> TestResult {
     // The steps before the passphrase refuse.
     for cmd in ["wizard_skip_instances", "wizard_finish"] {
         assert_eq!(
-            call(&setup, cmd, json!({"step": "passphrase"})).await,
+            call(&setup, cmd, json!({"step": "anchor_dir"})).await,
             Err(json!({"kind": "not_ready"})),
             "{cmd}"
         );
@@ -1148,7 +1217,8 @@ async fn new_ids_before_every_create_attempt() -> TestResult {
         !s["error"].is_null()
     })
     .await?;
-    assert_eq!(s["step"], "passphrase");
+    // Back at the anchor-dir step (M10 T15), which offers Begin again.
+    assert_eq!(s["step"], "anchor_dir");
     assert_eq!(s["error"]["class"], "keychain_unavailable", "{s}");
     assert_eq!(s["passphrase_window"], false);
     assert_eq!(
@@ -1181,13 +1251,13 @@ async fn new_ids_before_every_create_attempt() -> TestResult {
                 ..pinned.clone()
             },
         )
-        .is_ok()
+        .map_err(|_| "io")
     });
     let pair = FirstRunPassphrase {
         passphrase: SecretString::from(PASSPHRASE),
         confirm: SecretString::from(PASSPHRASE),
     };
-    serve::create_first_store(&state, pair, None, pin)
+    serve::create_first_store(&state, pair, None, None, pin)
         .await
         .map_err(|e| format!("{e:?}"))?;
     let ids = m.keys.ids();
@@ -1205,7 +1275,7 @@ async fn new_ids_before_every_create_attempt() -> TestResult {
         confirm: SecretString::from(PASSPHRASE),
     };
     assert_eq!(
-        serve::create_first_store(&state, pair, None, Box::new(|_| true)).await,
+        serve::create_first_store(&state, pair, None, None, Box::new(|_| Ok(()))).await,
         Err(FirstStoreFailure::NotFirstRun)
     );
     stop(&app).await
@@ -1339,8 +1409,9 @@ async fn a_local_or_unknown_keyring_goes_on_to_the_passphrase() -> TestResult {
 }
 
 /// PD-77: the passphrase is asked for only once the first-run gate serves. While the start after
-/// step 0 is still opening the data dir, the wizard shows the passphrase step but Begin opens no
-/// window (a pair taken then could only fail).
+/// step 0 is still opening the data dir, the wizard shows the (1b) anchor-dir step (M10 T15) but
+/// Begin opens no window (a pair taken then could only fail), and no restore starts (it needs the
+/// first-run gate's serving state).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn begin_waits_for_the_first_run_gate() -> TestResult {
     let tmp = scratch()?;
@@ -1348,13 +1419,16 @@ async fn begin_waits_for_the_first_run_gate() -> TestResult {
     m.idle_start = true;
     let (app, setup) = m.app()?;
     let s = run(&setup, "wizard_use_default_dir").await?;
-    assert_eq!(s["step"], "passphrase");
+    assert_eq!(s["step"], "anchor_dir");
     assert_eq!(s["refused_count"], Value::Null, "nothing serves yet");
     assert_eq!(windows::snapshot(app.handle()), AppSnapshot::BeforeFirstRun);
-    assert_eq!(
-        call(&setup, "wizard_begin", json!({})).await,
-        Err(json!({"kind": "not_ready"}))
-    );
+    for cmd in ["wizard_begin", "wizard_restore"] {
+        assert_eq!(
+            call(&setup, cmd, json!({})).await,
+            Err(json!({"kind": "not_ready"})),
+            "{cmd}"
+        );
+    }
     assert_eq!(credential::current_purpose(app.handle()), None);
     assert_eq!(wizard_state(&setup).await?["passphrase_window"], false);
     Ok(())
@@ -1557,7 +1631,7 @@ async fn archived_db_is_derived_again_for_genesis() -> TestResult {
 
     let setup = window(&app, "setup")?;
     let s = wizard_state(&setup).await?;
-    assert_eq!(s["step"], "passphrase", "{s}");
+    assert_eq!(s["step"], "anchor_dir", "{s}");
     run(&setup, "wizard_begin").await?;
     assert_eq!(
         type_passphrase(&app, PASSPHRASE).await,
@@ -1599,4 +1673,687 @@ async fn archived_db_is_derived_again_for_genesis() -> TestResult {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// ---------- M10 T15: the anchor-dir step, the restore alternative, the pin retry ----------
+
+/// The payloads of every record of type `t` of the store `state` serves.
+fn payloads(state: &ServeState, t: EventType) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
+    let store = state.open_store().ok_or("no store")?;
+    let page = store.query(
+        &AuditFilter {
+            event_types: vec![t],
+            ..AuditFilter::default()
+        },
+        AuditCursor::first(MAX_AUDIT_PAGE_ROWS),
+    )?;
+    let mut out = Vec::new();
+    for row in page.rows {
+        out.push(serde_json::from_slice(&store.read_payload(row.seq)?)?);
+    }
+    Ok(out)
+}
+
+/// The `CONFIG_CHANGED` payload of setting `key`.
+fn config_changed(state: &ServeState, key: &str) -> Result<Value, Box<dyn std::error::Error>> {
+    payloads(state, EventType::CONFIG_CHANGED)?
+        .into_iter()
+        .find(|p| p["key"] == key)
+        .ok_or_else(|| format!("no CONFIG_CHANGED {{key: {key}}}").into())
+}
+
+/// The machine's wizard at the anchor-dir step, the first-run gate serving.
+async fn at_anchor_step(
+    m: &Machine,
+) -> Result<(App<MockRuntime>, WebviewWindow<MockRuntime>), Box<dyn std::error::Error>> {
+    let (app, setup) = m.app()?;
+    run(&setup, "wizard_use_default_dir").await?;
+    until(&setup, "the anchor-dir step", |s| {
+        s["step"] == "anchor_dir" && s["refused_count"] == 0
+    })
+    .await?;
+    Ok((app, setup))
+}
+
+/// Every entry of `dir` (empty when it holds nothing).
+fn entries(dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let mut out = std::fs::read_dir(dir)?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<Result<Vec<_>, _>>()?;
+    out.sort();
+    Ok(out)
+}
+
+/// §2.5 (1b) order (M10 T15): the optional anchor directory is the first (1b) step, before the
+/// passphrase. Its folder comes from Rust's own dialog and is shown as text, with no confirmation
+/// (nothing is weakened at first run) and nothing written into it before `GENESIS`; a path the
+/// store would refuse (not absolute) is refused at once and nothing is kept; Clear drops the
+/// choice; a cancelled dialog changes nothing. Begin goes on to the passphrase, and the anchor
+/// commands are not offered while the passphrase window waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn anchor_dir_step_before_passphrase() -> TestResult {
+    let tmp = scratch()?;
+    let m = Machine::new(&tmp, "host-a", None, MemKeyring::new())?;
+    let anchors = m.root.join("anchors");
+    std::fs::create_dir(&anchors)?;
+    let (app, setup) = at_anchor_step(&m).await?;
+    let s = wizard_state(&setup).await?;
+    assert_eq!(
+        (s["anchor_dir"].clone(), s["passphrase_window"].clone()),
+        (Value::Null, json!(false))
+    );
+    assert_eq!(credential::current_purpose(app.handle()), None);
+    // The step does not move on by itself, nor by the later steps' commands.
+    for cmd in ["wizard_skip_instances", "wizard_finish"] {
+        assert_eq!(
+            call(&setup, cmd, json!({"step": "anchor_dir"})).await,
+            Err(json!({"kind": "not_ready"})),
+            "{cmd}"
+        );
+    }
+    // A cancelled dialog: nothing.
+    let s = run(&setup, "wizard_anchor_dir").await?;
+    assert_eq!(m.anchor_dialogs.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        (
+            s["step"].clone(),
+            s["anchor_dir"].clone(),
+            s["error"].clone()
+        ),
+        (json!("anchor_dir"), Value::Null, Value::Null)
+    );
+    // A path `create_new_store` would refuse: refused here, nothing kept.
+    *m.pick_anchor.lock().map_err(|_| "poisoned")? = Some(PathBuf::from("relative/anchors"));
+    let s = run(&setup, "wizard_anchor_dir").await?;
+    assert_eq!(s["error"]["class"], "anchor_dir_invalid", "{s}");
+    assert_eq!(s["anchor_dir"], Value::Null);
+    // A folder: shown as text, no native confirmation, nothing written there yet.
+    *m.pick_anchor.lock().map_err(|_| "poisoned")? = Some(anchors.clone());
+    let s = run(&setup, "wizard_anchor_dir").await?;
+    assert_eq!(
+        (
+            s["step"].clone(),
+            s["anchor_dir"].clone(),
+            s["error"].clone()
+        ),
+        (
+            json!("anchor_dir"),
+            json!(anchors.display().to_string()),
+            Value::Null
+        )
+    );
+    assert!(m.confirmer.0.lock().map_err(|_| "poisoned")?.is_empty());
+    assert!(entries(&anchors)?.is_empty());
+    // Clear drops it; the dialog chooses it again.
+    let s = run(&setup, "wizard_anchor_dir_clear").await?;
+    assert_eq!(s["anchor_dir"], Value::Null);
+    let s = run(&setup, "wizard_anchor_dir").await?;
+    assert_eq!(s["anchor_dir"], anchors.display().to_string());
+    // Begin: the passphrase step, the chosen folder still shown.
+    let s = run(&setup, "wizard_begin").await?;
+    assert_eq!(
+        (s["step"].clone(), s["passphrase_window"].clone()),
+        (json!("passphrase"), json!(true))
+    );
+    assert_eq!(s["anchor_dir"], anchors.display().to_string());
+    for cmd in [
+        "wizard_anchor_dir",
+        "wizard_anchor_dir_clear",
+        "wizard_restore",
+    ] {
+        assert_eq!(
+            call(&setup, cmd, json!({})).await,
+            Err(json!({"kind": "not_ready"})),
+            "{cmd}"
+        );
+    }
+    assert_eq!(
+        m.anchor_dialogs.load(Ordering::SeqCst),
+        4,
+        "no dialog after Begin"
+    );
+    assert!(entries(&anchors)?.is_empty(), "nothing before GENESIS");
+    stop(&app).await
+}
+
+/// PD-167, §8.5 (M10 T15): the anchor directory chosen at the anchor-dir step reaches
+/// `create_new_store` (`FirstRunInput.anchor_dir`): `GENESIS` is followed by `CONFIG_CHANGED {key:
+/// anchor_dir, old: null, new: <dir>}` and the new chain's file starts in that folder with its
+/// header; with no previous chain there, no incident and no notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn anchor_dir_passed_to_genesis() -> TestResult {
+    let tmp = scratch()?;
+    let m = Machine::new(&tmp, "host-a", None, MemKeyring::new())?;
+    let anchors = m.root.join("anchors");
+    std::fs::create_dir(&anchors)?;
+    let (app, setup) = at_anchor_step(&m).await?;
+    *m.pick_anchor.lock().map_err(|_| "poisoned")? = Some(anchors.clone());
+    run(&setup, "wizard_anchor_dir").await?;
+    run(&setup, "wizard_begin").await?;
+    assert_eq!(
+        type_passphrase(&app, PASSPHRASE).await,
+        Ok(json!({"accepted": {}}))
+    );
+    let s = until(&setup, "GENESIS", step_is("recovery_note")).await?;
+    assert_eq!(s["notice"], Value::Null, "{s}");
+    let state = serving(&app).ok_or("not serving")?;
+    let setting = config_changed(&state, "anchor_dir")?;
+    assert_eq!(setting["old"], Value::Null, "{setting}");
+    assert_eq!(setting["new"], anchors.display().to_string(), "{setting}");
+    let store = state.open_store().ok_or("no store")?;
+    assert!(store.open_incidents().is_empty());
+    assert!(
+        store.testing_anchor_dir_drain(),
+        "the anchor lines were written"
+    );
+    let chain = store.head().2;
+    let file = anchors.join(format!("{chain}.jsonl"));
+    let text = std::fs::read_to_string(&file)?;
+    let header: Value = serde_json::from_str(text.lines().next().ok_or("an empty chain file")?)?;
+    assert_eq!(header["install_id"], store.install_id(), "{header}");
+    stop(&app).await
+}
+
+/// PD-167 (M10 T15): when the chosen anchor directory already holds a log of this computer and
+/// user, `GENESIS` records the previous-chain incident and the wizard says so with the plan's
+/// text, from the first store on (also after the recovery note); nothing before `GENESIS` says it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn previous_chain_text_shown_after_genesis() -> TestResult {
+    let tmp = scratch()?;
+    let m = Machine::new(&tmp, "host-a", None, MemKeyring::new())?;
+    let anchors = m.root.join("anchors");
+    std::fs::create_dir(&anchors)?;
+    // An earlier store of this computer and user wrote its chain file into the folder.
+    m.provision_with(&m.root.join("earlier-data"), Some(&anchors), |_| Ok(()))?;
+    let earlier = entries(&anchors)?;
+    assert_eq!(earlier.len(), 1, "{earlier:?}");
+    let (app, setup) = at_anchor_step(&m).await?;
+    *m.pick_anchor.lock().map_err(|_| "poisoned")? = Some(anchors.clone());
+    let s = run(&setup, "wizard_anchor_dir").await?;
+    assert_eq!(s["notice"], Value::Null);
+    run(&setup, "wizard_begin").await?;
+    assert_eq!(
+        type_passphrase(&app, PASSPHRASE).await,
+        Ok(json!({"accepted": {}}))
+    );
+    let s = until(&setup, "GENESIS", step_is("recovery_note")).await?;
+    assert_eq!(s["notice"], wizard::MSG_PREVIOUS_CHAIN_FOUND, "{s}");
+    assert_eq!(
+        wizard::MSG_PREVIOUS_CHAIN_FOUND,
+        "The anchor directory already holds an atlas-duck log of this computer and user. This was recorded as an integrity incident; see Audit."
+    );
+    let state = serving(&app).ok_or("not serving")?;
+    let incidents = state.open_store().ok_or("no store")?.open_incidents();
+    assert_eq!(incidents.len(), 1, "{incidents:?}");
+    let verify = payloads(&state, EventType::VERIFY)?;
+    assert!(
+        verify.iter().any(|v| v["result"] == "previous_chain_found"),
+        "{verify:?}"
+    );
+    let s = run_step(&setup, "wizard_finish", "recovery_note").await?;
+    assert_eq!(
+        (s["step"].clone(), s["notice"].clone()),
+        (json!("instances"), json!(wizard::MSG_PREVIOUS_CHAIN_FOUND))
+    );
+    stop(&app).await
+}
+
+/// PD-167 (M10 T15): an anchor directory the store cannot check at `GENESIS` (here a file, not a
+/// folder) refuses the first store with nothing written; the wizard is back at the anchor-dir step
+/// with the store's own fixed text (no path), and a cleared choice lets `GENESIS` go through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refused_anchor_dir_comes_back_with_its_text() -> TestResult {
+    let tmp = scratch()?;
+    let m = Machine::new(&tmp, "host-a", None, MemKeyring::new())?;
+    let not_a_folder = m.root.join("anchors.txt");
+    std::fs::write(&not_a_folder, b"x")?;
+    let (app, setup) = at_anchor_step(&m).await?;
+    *m.pick_anchor.lock().map_err(|_| "poisoned")? = Some(not_a_folder.clone());
+    run(&setup, "wizard_anchor_dir").await?;
+    run(&setup, "wizard_begin").await?;
+    assert_eq!(
+        type_passphrase(&app, PASSPHRASE).await,
+        Ok(json!({"accepted": {}}))
+    );
+    let s = until(&setup, "the refusal", |s| !s["error"].is_null()).await?;
+    assert_eq!(s["step"], "anchor_dir", "{s}");
+    assert_eq!(
+        s["error"],
+        json!({"class": "anchor_dir", "text": "the anchor directory is not a directory"})
+    );
+    assert_eq!(s["anchor_dir"], not_a_folder.display().to_string());
+    let data = local(&m.default_dir)?;
+    assert!(!data.path().join("audit.db").exists(), "nothing created");
+    assert_eq!(std::fs::read(&not_a_folder)?, b"x");
+    // Without it, the next attempt (straight through serve: one credential window per mock app)
+    // writes `GENESIS`.
+    let s = run(&setup, "wizard_anchor_dir_clear").await?;
+    assert_eq!(
+        (s["anchor_dir"].clone(), s["error"].clone()),
+        (Value::Null, Value::Null)
+    );
+    let state = serving(&app).ok_or("not serving")?;
+    let pair = FirstRunPassphrase {
+        passphrase: SecretString::from(PASSPHRASE),
+        confirm: SecretString::from(PASSPHRASE),
+    };
+    let first = serve::create_first_store(&state, pair, None, None, Box::new(|_| Ok(())))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert!(first.pin_written && !first.previous_chain_found);
+    stop(&app).await
+}
+
+/// PD-171 (M10 T15): the proof of the native "Archive old DB and start fresh" confirmation the
+/// credential window answered is kept by the serving state until the first store: `GENESIS` is
+/// followed by `CONFIG_CHANGED {key: archive_and_start_fresh, archived_db_file,
+/// dialog_text_sha256}` naming the archived file and the hash of the text the dialog showed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn archive_confirmation_survives_from_credential_window_to_first_store() -> TestResult {
+    let tmp = scratch()?;
+    let m = Machine::new(&tmp, "host-a", None, MemKeyring::new())?;
+    let old_id = m.provision(&m.default_dir)?;
+    m.ring.wipe_install(&old_id);
+    let pinned = PinnedPaths {
+        schema_version: paths::PINNED_SCHEMA_VERSION,
+        data_dir: m.default_dir.clone(),
+        config_dir: m.config_dir.clone(),
+        install_id: Some(old_id.clone()),
+    };
+    paths::write_pinned(&m.pinned_file, &pinned)?;
+    let context = tauri::generate_context!(assets = tauri::test::noop_assets(), test = true);
+    let app = commands::register(mock_builder()).build(context)?;
+    app.manage(WindowRegistry::new(
+        NavPolicy::for_this_platform(None),
+        StartupRoute::completed(),
+    ));
+    app.manage(AppState::new(StartupSummary::Ready, None));
+    app.manage(Wizard::new(m.env(), Some(pinned.clone())));
+    let data = local(&m.default_dir)?;
+    let lock = Arc::new(InstanceLock::acquire(&data, m.host)?);
+    app.manage(DataDirHold::new(data.clone(), lock.clone()));
+    app.manage(ServeSlot::default());
+    let inputs = m
+        .starter()
+        .inputs(app.handle(), data.clone(), lock, &pinned)?;
+    let state = start_with(inputs).await.map_err(|e| format!("{e:?}"))?;
+    if let Some(slot) = app.try_state::<ServeSlot>() {
+        slot.set(state.clone());
+    }
+    // The locked window's "Archive old DB and start fresh".
+    let handle = app.handle().clone();
+    tokio::task::spawn_blocking(move || {
+        credential::open(&handle, Purpose::RecoverThisLog, windows::Show::Focus)
+    })
+    .await?
+    .map_err(|e| format!("{e:?}"))?;
+    let w = window(&app, "credential")?;
+    let answer = run(&w, "archive_and_start_fresh").await?;
+    let archived_file = answer["archived"]["archived_file"].clone();
+    assert!(archived_file.is_string(), "{answer}");
+    assert_eq!(state.gate_state(), Some(GateState::FirstRun));
+    let shown = serve::archive_confirm_text(&data);
+    assert_eq!(
+        *m.confirmer.0.lock().map_err(|_| "poisoned")?,
+        std::slice::from_ref(&shown)
+    );
+
+    // The first store (straight through serve: one credential window per mock app).
+    let archived = credential::take_archived(app.handle());
+    assert!(archived.is_some());
+    let pair = FirstRunPassphrase {
+        passphrase: SecretString::from(PASSPHRASE),
+        confirm: SecretString::from(PASSPHRASE),
+    };
+    serve::create_first_store(&state, pair, archived, None, Box::new(|_| Ok(())))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let record = config_changed(&state, "archive_and_start_fresh")?;
+    assert_eq!(record["archived_db_file"], archived_file, "{record}");
+    assert_eq!(
+        record["dialog_text_sha256"],
+        atlas_duck_core::payloads::sha256_hex(shown.as_bytes()),
+        "{record}"
+    );
+    serve::shutdown(&state, ShutdownReason::Quit, WAIT).await;
+    Ok(())
+}
+
+/// M6 final review M-9 (M10 T15): a pinned file that cannot name the new store's `install_id`
+/// after `GENESIS` is no longer passed over: the wizard stops at `pin_retry` with the plan's text,
+/// no later step moves on, Begin writes it again (a failed retry says so and stays), and once it
+/// is written the wizard goes on with the recovery note.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pin_write_failure_offers_retry() -> TestResult {
+    let tmp = scratch()?;
+    let m = Machine::new(&tmp, "host-a", None, MemKeyring::new())?;
+    let (app, setup) = at_anchor_step(&m).await?;
+    m.pin_fail.store(1, Ordering::SeqCst);
+    run(&setup, "wizard_begin").await?;
+    assert_eq!(
+        type_passphrase(&app, PASSPHRASE).await,
+        Ok(json!({"accepted": {}}))
+    );
+    let s = until(&setup, "the pin retry", step_is("pin_retry")).await?;
+    assert_eq!(s["step_text"], wizard::MSG_PIN_WRITE_FAILED, "{s}");
+    assert_eq!(
+        wizard::MSG_PIN_WRITE_FAILED,
+        "Could not record this installation's id. Try again"
+    );
+    let state = serving(&app).ok_or("not serving")?;
+    assert!(state.core.get().is_some(), "the store serves");
+    let new_id = state.note_facts().map(|f| f.0).ok_or("no store")?;
+    assert_eq!(
+        read_pinned(&m.pinned_file)?.and_then(|p| p.install_id),
+        None
+    );
+    // Nothing else moves on.
+    for (cmd, step) in [
+        ("wizard_finish", "recovery_note"),
+        ("wizard_skip_instances", "instances"),
+        ("wizard_finish", "cli"),
+    ] {
+        let s = run_step(&setup, cmd, step).await?;
+        assert_eq!(
+            (s["step"].clone(), s["error"]["class"].clone()),
+            (json!("pin_retry"), json!("wrong_step")),
+            "{cmd} {step}"
+        );
+    }
+    // A retry that fails again says so and stays.
+    m.pin_fail.store(1, Ordering::SeqCst);
+    let s = run(&setup, "wizard_begin").await?;
+    assert_eq!(
+        (s["step"].clone(), s["error"]["class"].clone()),
+        (json!("pin_retry"), json!("pinned_write"))
+    );
+    // The next one writes it: the note step follows (its window is still open).
+    let s = run(&setup, "wizard_begin").await?;
+    assert_eq!(s["step"], "recovery_note", "{s}");
+    assert_eq!(s["step_text"], Value::Null);
+    assert_eq!(
+        read_pinned(&m.pinned_file)?.and_then(|p| p.install_id),
+        Some(new_id.clone())
+    );
+    assert_eq!(
+        m.pins()
+            .iter()
+            .map(|p| p.install_id.clone())
+            .collect::<Vec<_>>(),
+        [
+            None,
+            None,
+            Some(new_id.clone()),
+            Some(new_id.clone()),
+            Some(new_id)
+        ]
+    );
+    stop(&app).await
+}
+
+/// The wizard's restore driven to its end through the setup and credential windows: the
+/// anchor-dir step, `wizard_restore`, the native confirmation, the file dialog, the backup's
+/// passphrase in the credential window (`restore_backup`), then the instance step. Returns the
+/// app, the setup window, the serving state as it was before the restore, the endpoint, and the
+/// last wizard state.
+async fn restored_by_wizard(
+    m: &Machine,
+) -> Result<
+    (
+        App<MockRuntime>,
+        WebviewWindow<MockRuntime>,
+        Arc<ServeState>,
+        Value,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let bundle = m.backup_elsewhere()?;
+    let (app, setup) = at_anchor_step(m).await?;
+    let state = serving(&app).ok_or("not serving")?;
+    *m.pick_restore.lock().map_err(|_| "poisoned")? = Some(bundle);
+    let s = run(&setup, "wizard_restore").await?;
+    assert_eq!(s["step"], "restore", "{s}");
+    let handle = app.handle().clone();
+    eventually(
+        "the credential window asks for the backup's passphrase",
+        || credential::current_purpose(&handle) == Some(Purpose::RestoreBackup),
+    )
+    .await?;
+    // While it runs, the other (1b) commands wait.
+    for cmd in ["wizard_begin", "wizard_anchor_dir", "wizard_restore"] {
+        let r = call(&setup, cmd, json!({})).await;
+        assert!(
+            r == Err(json!({"kind": "busy"})) || r == Err(json!({"kind": "not_ready"})),
+            "{cmd}: {r:?}"
+        );
+    }
+    let w = window(&app, "credential")?;
+    assert_eq!(
+        call(&w, "submit_secret", json!({ "secret": PASSPHRASE })).await,
+        Ok(json!({"accepted": {}}))
+    );
+    let s = until(&setup, "the restored store serves", step_is("instances")).await?;
+    Ok((app, setup, state, s))
+}
+
+/// PD-168 (M10 T15): "Restore from a backup" at the (1b) step is the alternative to `GENESIS`: the
+/// one native confirmation is "Restore backup", the restored store holds the backup's chain and a
+/// `RESTORE` (no new `GENESIS`), the first-run passphrase is never asked (no recovery-passphrase
+/// window, no recovery note step), and the wizard goes on at the instances.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wizard_restore_skips_genesis_and_passphrase() -> TestResult {
+    let tmp = scratch()?;
+    let m = Machine::new(&tmp, "host-a", None, MemKeyring::new())?;
+    let (app, setup, state, s) = restored_by_wizard(&m).await?;
+    assert_eq!(s["passphrase_window"], false);
+    assert_eq!(s["error"], Value::Null, "{s}");
+    assert_eq!(
+        *m.confirmer.0.lock().map_err(|_| "poisoned")?,
+        [atlas_duck_app_lib::restore_flow::RESTORE_CONFIRM_TEXT]
+    );
+    assert_eq!(m.restore_dialogs.load(Ordering::SeqCst), 1);
+    assert_eq!(credential::current_purpose(app.handle()), None);
+    let data = local(&m.default_dir)?;
+    let types = event_types(&data)?;
+    assert_eq!(
+        types.iter().filter(|t| *t == "GENESIS").count(),
+        1,
+        "the backup's own GENESIS only: {types:?}"
+    );
+    assert!(types.iter().any(|t| t == "RESTORE"), "{types:?}");
+    // The confirmation is recorded with the restore (PD-168).
+    let record = config_changed(&state, "restore_backup")?;
+    assert_eq!(
+        record["dialog_text_sha256"],
+        atlas_duck_core::payloads::sha256_hex(
+            atlas_duck_app_lib::restore_flow::RESTORE_CONFIRM_TEXT.as_bytes()
+        )
+    );
+    // No passphrase or GENESIS step can come any more.
+    assert_eq!(
+        call(&setup, "wizard_begin", json!({})).await,
+        Err(json!({"kind": "not_ready"}))
+    );
+    stop(&app).await
+}
+
+/// L109, PD-168 (M10 T15): the restore keeps the install its keystore was built for, so before it
+/// the wizard drops any pinned id and after it pins the restored store's (live) `install_id`; the
+/// only keystore built is that new install's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wizard_restore_pins_live_install_id() -> TestResult {
+    let tmp = scratch()?;
+    let m = Machine::new(&tmp, "host-a", None, MemKeyring::new())?;
+    let (app, _setup, state, _s) = restored_by_wizard(&m).await?;
+    let live = state.note_facts().map(|f| f.0).ok_or("no store")?;
+    assert_eq!(m.keys.ids(), std::slice::from_ref(&live));
+    let restore = payloads(&state, EventType::RESTORE)?;
+    assert_eq!(
+        restore.first().map(|r| r["install_id"].clone()),
+        Some(json!(live.clone())),
+        "{restore:?}"
+    );
+    assert_eq!(
+        m.pins()
+            .iter()
+            .map(|p| p.install_id.clone())
+            .collect::<Vec<_>>(),
+        [None, None, Some(live.clone())]
+    );
+    assert_eq!(
+        read_pinned(&m.pinned_file)?.and_then(|p| p.install_id),
+        Some(live)
+    );
+    stop(&app).await
+}
+
+/// PD-168 (M10 T15): after the wizard's restore the serving state swaps in the restored store as
+/// `create_first_store` does: the same serving state, a core on the restored store, the cell
+/// swapped without a rebind, and a connection made before answers normally now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wizard_restore_swaps_store_in_serve_state() -> TestResult {
+    let tmp = scratch()?;
+    let m = Machine::new(&tmp, "host-a", None, MemKeyring::new())?;
+    let bundle = m.backup_elsewhere()?;
+    let (app, setup) = at_anchor_step(&m).await?;
+    let data = local(&m.default_dir)?;
+    let endpoint = read_endpoint_file(&data)?;
+    let state = serving(&app).ok_or("not serving")?;
+    let gate = state.cell.current();
+    let mut c = connect(&m, &data).await?;
+    let reply: SubmitReply = c.call("request.submit", submit_params()).await?;
+    assert_eq!(reason(&reply.envelope), Some("first_run"));
+    *m.pick_restore.lock().map_err(|_| "poisoned")? = Some(bundle);
+    run(&setup, "wizard_restore").await?;
+    let handle = app.handle().clone();
+    eventually("the backup's passphrase is asked", || {
+        credential::current_purpose(&handle) == Some(Purpose::RestoreBackup)
+    })
+    .await?;
+    let w = window(&app, "credential")?;
+    call(&w, "submit_secret", json!({ "secret": PASSPHRASE }))
+        .await
+        .map_err(|e| format!("submit_secret: {e}"))?;
+    until(&setup, "the restored store serves", step_is("instances")).await?;
+    let now = serving(&app).ok_or("not serving")?;
+    assert!(Arc::ptr_eq(&now, &state), "the same serving state");
+    assert!(state.core.get().is_some(), "the core serves");
+    assert_eq!(state.refused(), None, "the gate is gone");
+    assert!(
+        !Arc::ptr_eq(&state.cell.current(), &gate),
+        "the cell swapped"
+    );
+    assert_eq!(read_endpoint_file(&data)?, endpoint, "no rebind");
+    let store = state.open_store().ok_or("no store")?;
+    assert_eq!(
+        Some(store.install_id().to_owned()),
+        state.note_facts().map(|f| f.0)
+    );
+    let reply: SubmitReply = c.call("request.submit", submit_params()).await?;
+    assert_ne!(reason(&reply.envelope), Some("first_run"));
+    drop(c);
+    stop(&app).await
+}
+
+/// PD-168 (M10 T15): a restore cancelled at one of its questions (here the file dialog, after the
+/// native confirmation) changes nothing: no credential window, no store, no pinned id, and the
+/// wizard is back at the anchor-dir step with no error (the user's choice).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_wizard_restore_changes_nothing() -> TestResult {
+    let tmp = scratch()?;
+    let m = Machine::new(&tmp, "host-a", None, MemKeyring::new())?;
+    let (app, setup) = at_anchor_step(&m).await?;
+    let s = run(&setup, "wizard_restore").await?;
+    assert_eq!(s["step"], "restore", "{s}");
+    let s = until(&setup, "back at the anchor-dir step", step_is("anchor_dir")).await?;
+    assert_eq!(s["error"], Value::Null, "{s}");
+    assert_eq!(m.restore_dialogs.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *m.confirmer.0.lock().map_err(|_| "poisoned")?,
+        [atlas_duck_app_lib::restore_flow::RESTORE_CONFIRM_TEXT]
+    );
+    assert_eq!(credential::current_purpose(app.handle()), None);
+    let data = local(&m.default_dir)?;
+    assert!(!data.path().join("audit.db").exists());
+    assert_eq!(
+        read_pinned(&m.pinned_file)?.and_then(|p| p.install_id),
+        None
+    );
+    // Begin still leads to the passphrase.
+    let s = run(&setup, "wizard_begin").await?;
+    assert_eq!(s["step"], "passphrase", "{s}");
+    stop(&app).await
+}
+
+/// L109, M2 handoff (M10 T15): `new_ids()` before every restore attempt, as before every
+/// `create_new_store`: an attempt that fails (the wrong passphrase) restores nothing and comes back
+/// to the anchor-dir step with its class; the next attempt builds the keystore of other ids, and
+/// the restored store and the pinned file carry those.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wizard_restore_calls_new_ids_before_every_attempt() -> TestResult {
+    let tmp = scratch()?;
+    let m = Machine::new(&tmp, "host-a", None, MemKeyring::new())?;
+    let bundle = m.backup_elsewhere()?;
+    let (app, setup) = at_anchor_step(&m).await?;
+    *m.pick_restore.lock().map_err(|_| "poisoned")? = Some(bundle.clone());
+    run(&setup, "wizard_restore").await?;
+    let handle = app.handle().clone();
+    eventually("the backup's passphrase is asked", || {
+        credential::current_purpose(&handle) == Some(Purpose::RestoreBackup)
+    })
+    .await?;
+    let w = window(&app, "credential")?;
+    call(
+        &w,
+        "submit_secret",
+        json!({ "secret": "not the backup's passphrase" }),
+    )
+    .await
+    .map_err(|e| format!("submit_secret: {e}"))?;
+    let s = until(&setup, "the first attempt failed", |s| {
+        !s["error"].is_null()
+    })
+    .await?;
+    assert_eq!(
+        (s["step"].clone(), s["error"]["class"].clone()),
+        (json!("anchor_dir"), json!("wrong_passphrase")),
+        "{s}"
+    );
+    let data = local(&m.default_dir)?;
+    assert!(!data.path().join("audit.db").exists(), "nothing restored");
+    let first = m.keys.ids();
+    assert_eq!(first.len(), 1);
+
+    // The second attempt (straight through serve: one credential window per mock app).
+    let state = serving(&app).ok_or("not serving")?;
+    let pinned = read_pinned(&m.pinned_file)?.ok_or("no pinned file")?;
+    let file = m.pinned_file.clone();
+    let pin: PinWriter = Box::new(move |id| {
+        paths::write_pinned(
+            &file,
+            &PinnedPaths {
+                install_id: id.map(str::to_owned),
+                ..pinned.clone()
+            },
+        )
+        .map_err(|_| "io")
+    });
+    let first_store = serve::restore_first_store(
+        &state,
+        Box::new(move || Some(RustChosenPath::from_native_dialog(bundle))),
+        Box::new(|_| Ok(SecretString::from(PASSPHRASE))),
+        pin,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    assert!(first_store.pin_written);
+    let ids = m.keys.ids();
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert_ne!(ids[0], ids[1], "new ids for the second attempt");
+    assert_eq!(state.note_facts().map(|f| f.0), Some(ids[1].clone()));
+    assert_eq!(
+        read_pinned(&m.pinned_file)?.and_then(|p| p.install_id),
+        Some(ids[1].clone())
+    );
+    stop(&app).await
 }

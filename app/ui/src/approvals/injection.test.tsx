@@ -310,7 +310,11 @@ function answer(cmd: string, args: Record<string, unknown>): Promise<Json> {
     case 'wizard_choose_dir':
     case 'wizard_begin':
     case 'wizard_skip_instances':
-    case 'wizard_finish': return reply(cmd, 'wizard_state');
+    case 'wizard_finish':
+    // M10 T15: the (1b) anchor-dir step and the restore alternative.
+    case 'wizard_anchor_dir':
+    case 'wizard_anchor_dir_clear':
+    case 'wizard_restore': return reply(cmd, 'wizard_state');
     // M10 T12 (Δ-M10-3): the Audit window's commands; its UI (T20) renders their answers.
     case 'audit_query': return reply(cmd, 'audit_page');
     case 'audit_trail': return reply(cmd, 'audit_trail');

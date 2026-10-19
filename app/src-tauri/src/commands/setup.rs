@@ -1,13 +1,15 @@
 //! The setup window's own commands (C.10 + Δ1, PD-72, PD-77; M6 T23): `wizard_state`,
 //! `wizard_use_default_dir`, `wizard_choose_dir`, `wizard_begin`, `wizard_skip_instances`,
-//! `wizard_finish`. Granted to the `setup` window only; it also holds the four instance commands
+//! `wizard_finish`; M10 T15 (Δ-M10-3): `wizard_anchor_dir`, `wizard_anchor_dir_clear`,
+//! `wizard_restore`. Granted to the `setup` window only; it also holds the four instance commands
 //! and `cli_install` (`commands::settings`) and `quit`.
 //!
 //! None takes a value but the two that move on (`wizard_skip_instances`, `wizard_finish`), which take
 //! the step the page showed: the data dir is the §7.7 default or what Rust's own folder dialog returns,
-//! the recovery passphrase goes to the credential window (never here), and every answer is the
-//! wizard's whole state ([`WizardState`]), so the page renders what Rust decided and skips nothing
-//! itself. The rules live in `crate::wizard`.
+//! so are the anchor directory and the backup to restore, the recovery passphrase and the backup's
+//! passphrase go to the credential window (never here), and every answer is the wizard's whole
+//! state ([`WizardState`]), so the page renders what Rust decided and skips nothing itself. The
+//! rules live in `crate::wizard`.
 
 use serde::Deserialize;
 use tauri::{AppHandle, Runtime};
@@ -35,6 +37,23 @@ pub struct WizardChooseDirArgs {}
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WizardBeginArgs {}
+
+/// `wizard_anchor_dir {}` (M10 T15): the anchor directory from Rust's folder dialog (no path
+/// argument).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WizardAnchorDirArgs {}
+
+/// `wizard_anchor_dir_clear {}` (M10 T15): no anchor directory.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WizardAnchorDirClearArgs {}
+
+/// `wizard_restore {}` (M10 T15, PD-168): restore a backup instead of a new log (no path, no
+/// passphrase argument).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WizardRestoreArgs {}
 
 /// `wizard_skip_instances {step}`: leaves the instance step. `step` is the step the page showed
 /// (`WizardState::step`); Rust answers `wrong_step` for any other, so a repeated click or a stale
@@ -100,6 +119,40 @@ pub async fn wizard_begin<R: Runtime>(
     finish(&app, response)
 }
 
+/// `wizard_anchor_dir {}` (Δ-M10-3, §2.5 (1b), §8.5): Rust's folder dialog for the optional
+/// external anchor directory, chosen before `GENESIS`; the folder is shown as text.
+#[tauri::command]
+pub async fn wizard_anchor_dir<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<WizardAnchorDirArgs>,
+) -> Result<WizardState, CommandError> {
+    let Args(WizardAnchorDirArgs {}) = args;
+    let response = wizard::anchor_dir(&app).await;
+    finish(&app, response)
+}
+
+/// `wizard_anchor_dir_clear {}` (Δ-M10-3): no anchor directory for `GENESIS`.
+#[tauri::command]
+pub async fn wizard_anchor_dir_clear<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<WizardAnchorDirClearArgs>,
+) -> Result<WizardState, CommandError> {
+    let Args(WizardAnchorDirClearArgs {}) = args;
+    let response = wizard::anchor_dir_clear(&app).await;
+    finish(&app, response)
+}
+
+/// `wizard_restore {}` (Δ-M10-3, PD-168): "Restore from a backup" before any `GENESIS`.
+#[tauri::command]
+pub async fn wizard_restore<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<WizardRestoreArgs>,
+) -> Result<WizardState, CommandError> {
+    let Args(WizardRestoreArgs {}) = args;
+    let response = wizard::restore(&app).await;
+    finish(&app, response)
+}
+
 /// `wizard_skip_instances {}` (Δ1).
 #[tauri::command]
 pub async fn wizard_skip_instances<R: Runtime>(
@@ -151,7 +204,32 @@ mod tests {
             assert_eq!(parse::<WizardBeginArgs>(&body), refused());
             assert_eq!(parse::<WizardSkipInstancesArgs>(&body), refused());
             assert_eq!(parse::<WizardFinishArgs>(&body), refused());
+            assert_eq!(parse::<WizardAnchorDirArgs>(&body), refused());
+            assert_eq!(parse::<WizardAnchorDirClearArgs>(&body), refused());
+            assert_eq!(parse::<WizardRestoreArgs>(&body), refused());
         }
+        // M10 T15: an anchor directory, a backup source or a passphrase never comes from here.
+        for body in [
+            json!({"anchor_dir": "\\\\nas\\anchors"}),
+            json!({"source": "C:\\backups\\manifest.json"}),
+            json!({"passphrase": "canary-passphrase"}),
+        ] {
+            assert_eq!(parse::<WizardAnchorDirArgs>(&body), refused(), "{body}");
+            assert_eq!(
+                parse::<WizardAnchorDirClearArgs>(&body),
+                refused(),
+                "{body}"
+            );
+            assert_eq!(parse::<WizardRestoreArgs>(&body), refused(), "{body}");
+        }
+        assert_eq!(
+            parse::<WizardAnchorDirArgs>(&json!({})),
+            Ok(WizardAnchorDirArgs {})
+        );
+        assert_eq!(
+            parse::<WizardRestoreArgs>(&json!({})),
+            Ok(WizardRestoreArgs {})
+        );
         assert_eq!(
             parse::<WizardChooseDirArgs>(&json!({})),
             Ok(WizardChooseDirArgs {})

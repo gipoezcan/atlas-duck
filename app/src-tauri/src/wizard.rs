@@ -13,11 +13,19 @@
 //!   `audit.db` the first-run gate answers (exit 9 `not_configured {first_run}`, the refused count in
 //!   the tray and in [`WizardState::refused_count`]); with one, the pinned file carries the store's
 //!   `install_id` and the normal open path follows (1a, I-34: no passphrase, no note, no `GENESIS`).
-//! - **(1b)** ([`begin`]): on Linux the Secret Service check (the §8.6 stop text, nothing written),
+//! - **(1b)**, first the optional external anchor directory (M10 T15, §2.5: chosen before
+//!   `GENESIS`, so a previous chain in it is detected, §8.5, PD-167): [`anchor_dir`] takes a folder
+//!   from Rust's own dialog (shown as text; no confirmation at first run, nothing is weakened),
+//!   [`anchor_dir_clear`] drops it. Or, instead of a new log, [`restore`] restores a backup
+//!   (PD-168: `serve::restore_first_store`, the T13 flow with no live store) and the wizard goes on
+//!   at the instances.
+//! - Then ([`begin`]): on Linux the Secret Service check (the §8.6 stop text, nothing written),
 //!   then the credential window for the recovery passphrase; the pair comes back over the in-memory
 //!   channel (`credential::request_recovery_passphrase`), never in a command response, and goes
-//!   straight into `serve::create_first_store` (new ids for every attempt, `GENESIS`, the pinned
-//!   `install_id`, `Core::start`, the cell swapped without a rebind).
+//!   straight into `serve::create_first_store` (new ids for every attempt, `GENESIS` with the
+//!   anchor dir and an archive's kept confirmation, the pinned `install_id`, `Core::start`, the
+//!   cell swapped without a rebind). A pinned file that could not name the new store is offered
+//!   again ([`WizardStep::PinRetry`]) before anything else moves on.
 //! - Then the recovery note (offered in the credential window), the instances, the CLI and the
 //!   onboarding snippet; [`skip_instances`] and [`finish`] move on.
 //!
@@ -31,6 +39,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use atlas_duck_audit::lock::{INSTANCE_LOCK_FILE, InstanceLock, LockError};
+use atlas_duck_audit::types::RustChosenPath;
 use atlas_duck_audit::{
     ArchivedDb, DB_FILE, KeyringLocality, latest_archived, read_store_install_id,
 };
@@ -38,14 +47,16 @@ use atlas_duck_core::{GateState, InstanceView};
 use atlas_duck_ipc::paths::{
     self, DataDirResolution, LocalDataDir, PINNED_SCHEMA_VERSION, PinnedError, PinnedPaths,
 };
+use secrecy::SecretString;
 use serde::Serialize;
 use tauri::{AppHandle, Manager, Runtime};
 use tokio::sync::oneshot;
 
 use crate::commands::{CommandError, blocking};
 use crate::credential::{self, FirstRunPassphrase, Purpose};
+use crate::restore_flow::{NotAsked, wait_passphrase};
 use crate::secret_service::{SecretService, SecretServiceCheck};
-use crate::serve::{self, FirstStoreFailure};
+use crate::serve::{self, FirstStore, FirstStoreFailure, UnlockFailure};
 use crate::startup::{
     MSG_DATA_DIR_NOT_LOCAL, MSG_DATA_DIR_UNUSABLE, MSG_RUNNING_ON_OTHER_HOST, render_message,
 };
@@ -78,6 +89,24 @@ pub const LOG_EVENT_STOPPED: &str = "wizard_stopped";
 pub const LOG_EVENT_ARCHIVED_UNREADABLE: &str = "wizard_archived_unreadable";
 /// The setup window could not be moved into the data dir's webview folder.
 pub const LOG_EVENT_SETUP_NOT_MOVED: &str = "wizard_setup_window_not_moved";
+/// Step 0 found an `audit.db` whose `install_id` could not be read (the pinned file is written
+/// without one and the open fails as at startup); `error_class` = `integrity|io` (M6 final review
+/// M-9).
+pub const LOG_EVENT_STORE_ID_UNREADABLE: &str = "wizard_store_id_unreadable";
+
+/// plan text (M10 T15, PD-167): shown from the first store on when its first run recorded a
+/// `previous_chain_found` incident.
+pub const MSG_PREVIOUS_CHAIN_FOUND: &str = "The anchor directory already holds an atlas-duck log of this computer and user. This was recorded as an integrity incident; see Audit.";
+
+/// plan text (M10 T15, M6 final review M-9): [`WizardStep::PinRetry`]'s text; Begin writes the
+/// pinned file again.
+pub const MSG_PIN_WRITE_FAILED: &str = "Could not record this installation's id. Try again";
+
+/// [`WizardError::class`] of a folder the anchor-dir dialog returned that is not an absolute UTF-8
+/// path (refused before anything keeps it, as the store would refuse it at `GENESIS`).
+pub const CLASS_ANCHOR_DIR_INVALID: &str = "anchor_dir_invalid";
+/// [`WizardError::class`] of a failed retry of the pinned file.
+pub const CLASS_PINNED_WRITE: &str = "pinned_write";
 
 /// How long the move of the setup window waits for Tauri to forget the old one.
 const RELOCATE_WAIT: Duration = Duration::from_secs(2);
@@ -92,10 +121,19 @@ pub enum WizardStep {
     /// (1a): the chosen data dir holds an audit DB; it opens like at startup (unlock in the
     /// credential window, or an error window).
     ExistingStore,
-    /// (1b): the recovery passphrase (Begin, then the credential window).
+    /// (1b), first (M10 T15, §2.5): the optional external anchor directory, or "Restore from a
+    /// backup" instead of a new log; Begin goes on to the recovery passphrase.
+    AnchorDir,
+    /// (1b) instead of `GENESIS` (M10 T15, PD-168): the restore from a backup runs (its native
+    /// confirmation, the file dialog, the backup's passphrase in the credential window).
+    Restore,
+    /// (1b): the credential window waits for the recovery passphrase.
     Passphrase,
     /// `GENESIS` is being written and the core started.
     Genesis,
+    /// M10 T15 (M6 final review M-9): the first store serves but the pinned file could not name
+    /// its `install_id`; Begin writes it again, and nothing else moves on until it is written.
+    PinRetry,
     /// The credential window offers "Save recovery note" (§8.6: only right after `GENESIS`).
     RecoveryNote,
     Instances,
@@ -111,8 +149,11 @@ impl WizardStep {
         match self {
             WizardStep::DataDir => "data_dir",
             WizardStep::ExistingStore => "existing_store",
+            WizardStep::AnchorDir => "anchor_dir",
+            WizardStep::Restore => "restore",
             WizardStep::Passphrase => "passphrase",
             WizardStep::Genesis => "genesis",
+            WizardStep::PinRetry => "pin_retry",
             WizardStep::RecoveryNote => "recovery_note",
             WizardStep::Instances => "instances",
             WizardStep::Cli => "cli",
@@ -125,11 +166,14 @@ impl WizardStep {
 
 /// Every wire name of [`WizardStep::as_str`]: what `wizard_finish` and `wizard_skip_instances`
 /// accept as the step the page showed (`commands::dto::StepName`).
-pub const STEP_NAMES: [&str; 10] = [
+pub const STEP_NAMES: [&str; 13] = [
     "data_dir",
     "existing_store",
+    "anchor_dir",
+    "restore",
     "passphrase",
     "genesis",
+    "pin_retry",
     "recovery_note",
     "instances",
     "cli",
@@ -142,9 +186,15 @@ pub const STEP_NAMES: [&str; 10] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InFlight {
     DataDir,
+    /// Rust's folder dialog for the anchor directory is up (M10 T15).
+    AnchorDir,
+    /// The restore from a backup runs, from its first dialog to its core start (M10 T15).
+    Restore,
     /// The credential window waits for the passphrase pair.
     Passphrase,
     Genesis,
+    /// The pinned file is written again (M10 T15).
+    Pin,
 }
 
 /// Why the last step did nothing: a fixed class, and for a refused folder its app-generated text.
@@ -170,6 +220,13 @@ pub struct Progress {
     pub passphrase_request: u64,
     /// This wizard wrote `GENESIS` (the recovery note step follows).
     pub genesis_written: bool,
+    /// M10 T15 (§2.5 (1b)): the anchor directory Rust's dialog returned, for `GENESIS`
+    /// (`FirstRunInput.anchor_dir`); never from a webview.
+    pub anchor_dir: Option<RustChosenPath>,
+    /// M10 T15 (PD-167): the first store's first run recorded a `previous_chain_found` incident.
+    pub previous_chain: bool,
+    /// M10 T15 (M6 final review M-9): the first store serves, the pinned file lacks its id.
+    pub pin_failed: bool,
     /// Whether the instance step is shown, decided once when the core first serves (§2.5 (1a):
     /// skipped when `config.toml` lists instances whose origins the store holds).
     pub instances_wanted: Option<bool>,
@@ -201,8 +258,11 @@ pub fn step_of(p: &Progress, f: &Facts<'_>) -> WizardStep {
         return WizardStep::DataDir;
     }
     match f.snapshot {
-        // The core serves before the wizard has recorded its `GENESIS`.
+        // The core serves before the wizard has recorded its `GENESIS` (or its restore).
         AppSnapshot::Serving if p.in_flight == Some(InFlight::Genesis) => WizardStep::Genesis,
+        AppSnapshot::Serving if p.in_flight == Some(InFlight::Restore) => WizardStep::Restore,
+        // M6 final review M-9: nothing moves on while the pinned file lacks the store's id.
+        AppSnapshot::Serving if p.pin_failed => WizardStep::PinRetry,
         AppSnapshot::Serving => {
             if p.genesis_written && f.passphrase_window_open {
                 WizardStep::RecoveryNote
@@ -214,13 +274,17 @@ pub fn step_of(p: &Progress, f: &Facts<'_>) -> WizardStep {
                 WizardStep::Onboarding
             }
         }
-        AppSnapshot::Gate(GateState::FirstRun) if p.in_flight == Some(InFlight::Genesis) => {
-            WizardStep::Genesis
-        }
-        AppSnapshot::Gate(GateState::FirstRun) => WizardStep::Passphrase,
+        // (1b): the anchor-dir step (with the restore alternative) until Begin asks for the
+        // passphrase; a closed passphrase window or a failed attempt comes back to it.
+        AppSnapshot::Gate(GateState::FirstRun) => match p.in_flight {
+            Some(InFlight::Genesis) => WizardStep::Genesis,
+            Some(InFlight::Restore) => WizardStep::Restore,
+            Some(InFlight::Passphrase) => WizardStep::Passphrase,
+            _ => WizardStep::AnchorDir,
+        },
         // The start after step 0 is still opening the store.
         AppSnapshot::BeforeFirstRun | AppSnapshot::Starting if !p.existing_store => {
-            WizardStep::Passphrase
+            WizardStep::AnchorDir
         }
         // PD-06: nothing is served; only a restart helps.
         AppSnapshot::StoreUnavailable => WizardStep::Stopped(MSG_STORE_UNAVAILABLE),
@@ -405,9 +469,19 @@ pub fn prepare_data_dir(
         .try_exists()
         .map_err(|_| DirRefusal::Unusable(chosen.to_path_buf()))?;
     // (1a): pinned with the store's own id (§8.6: the latest `RESTORE`, else `GENESIS`). An id that
-    // cannot be read leaves the pinned file without one; the open then fails as it would at startup.
+    // cannot be read leaves the pinned file without one (logged, M6 final review M-9); the open then
+    // fails as it would at startup.
     let install_id = if existing_store {
-        read_store_install_id(&data).ok().flatten()
+        match read_store_install_id(&data) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(
+                    event = LOG_EVENT_STORE_ID_UNREADABLE,
+                    error_class = open_error_class(&e)
+                );
+                None
+            }
+        }
     } else {
         None
     };
@@ -458,7 +532,24 @@ pub fn pick_folder_dialog<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
         .and_then(|chosen| chosen.into_path().ok())
 }
 
+/// The production anchor-dir picker (M10 T15, §2.5 (1b)): Rust's own folder dialog, on the
+/// blocking pool only; no §7.7 local-filesystem check (an anchor dir is meant to be a network
+/// share, §8.5). `None` when cancelled, or when the answer names no filesystem path.
+pub fn pick_anchor_dir_dialog<R: Runtime>(app: &AppHandle<R>) -> Option<RustChosenPath> {
+    use tauri_plugin_dialog::DialogExt;
+    let chosen = app
+        .dialog()
+        .file()
+        .set_title(crate::recovery_tier::ANCHOR_DIR_DIALOG_TITLE)
+        .blocking_pick_folder()?;
+    let folder = chosen.into_path().ok()?;
+    Some(RustChosenPath::from_native_dialog(folder))
+}
+
 /// Everything the wizard takes from the app (the tests pass their own).
+// The two dialogs that answer a `RustChosenPath` are spelled out: `ci/check-dialog-proofs.mjs`
+// (rule 4) refuses a `type` alias of that type, since it would hide where one is built.
+#[allow(clippy::type_complexity)]
 pub struct WizardEnv<R: Runtime> {
     /// This host's pinned `paths.toml` (§7.7, host-qualified off Windows).
     pub pinned_file: PathBuf,
@@ -469,6 +560,12 @@ pub struct WizardEnv<R: Runtime> {
     pub secret_service: Arc<dyn SecretServiceCheck>,
     pub starter: Arc<dyn ServeStarter<R>>,
     pub pick_folder: FolderPicker<R>,
+    /// M10 T15: Rust's folder dialog for the anchor directory ([`pick_anchor_dir_dialog`] in
+    /// production); `None` when cancelled.
+    pub pick_anchor_dir: Arc<dyn Fn(&AppHandle<R>) -> Option<RustChosenPath> + Send + Sync>,
+    /// M10 T15 (PD-168): Rust's file dialog for the backup to restore
+    /// (`restore_flow::pick_restore_source` in production); `None` when cancelled.
+    pub pick_restore: Arc<dyn Fn(&AppHandle<R>) -> Option<RustChosenPath> + Send + Sync>,
     pub write_pinned: PinnedWriter,
     pub check_dir: DirCheck,
     /// Where the keyring entries live (§8.6): what `KeyStore::locality` answers, with no keyring
@@ -568,6 +665,15 @@ pub struct WizardState {
     /// The instances (the setup window has no `settings_get`, M6 T25); empty until the core
     /// serves.
     pub instances: Vec<InstanceView>,
+    /// M10 T15: the anchor directory chosen for `GENESIS` (display only, escaped onto one line:
+    /// no command takes a path); `null` when none is chosen.
+    pub anchor_dir: Option<String>,
+    /// M10 T15: Rust's fixed text for the step shown ([`MSG_PIN_WRITE_FAILED`] at `pin_retry`);
+    /// `null` otherwise.
+    pub step_text: Option<&'static str>,
+    /// M10 T15 (PD-167): [`MSG_PREVIOUS_CHAIN_FOUND`] from the first store on when its first run
+    /// recorded a previous chain; `null` otherwise.
+    pub notice: Option<&'static str>,
 }
 
 fn state_of<R: Runtime>(
@@ -597,6 +703,15 @@ fn state_of<R: Runtime>(
         passphrase_window: p.in_flight == Some(InFlight::Passphrase),
         error: p.error.clone(),
         instances,
+        anchor_dir: p
+            .anchor_dir
+            .as_ref()
+            .map(|d| crate::recovery_tier::one_line(&d.path().display().to_string())),
+        step_text: match step {
+            WizardStep::PinRetry => Some(MSG_PIN_WRITE_FAILED),
+            _ => None,
+        },
+        notice: p.previous_chain.then_some(MSG_PREVIOUS_CHAIN_FOUND),
     }
 }
 
@@ -809,35 +924,49 @@ pub fn serving_changed<R: Runtime>(app: &AppHandle<R>) {
 
 // ---------- (1b) ----------
 
-/// `wizard_begin {}` (PD-77): in the passphrase step (the first-run gate serves) the Linux Secret
+/// `wizard_begin {}` (PD-77): at the anchor-dir step (the first-run gate serves) the Linux Secret
 /// Service check (§8.6: no usable provider stops the wizard with the fixed text, before any id
 /// exists and with nothing written), then the credential window for the recovery passphrase;
-/// while it waits, the window is brought back. In the (1a) step it opens what the store's state
-/// needs again (the credential window to unlock, or the error window). Elsewhere `not_ready`.
+/// while it waits (the passphrase step), the window is brought back. At `pin_retry` the pinned
+/// file is written again with the store's `install_id` (M10 T15). In the (1a) step it opens what
+/// the store's state needs again (the credential window to unlock, or the error window). While a
+/// restore or the anchor-dir dialog runs `busy`; elsewhere `not_ready`.
 pub async fn begin<R: Runtime>(app: &AppHandle<R>) -> Result<WizardState, CommandError> {
     let step = {
         let w = wizard(app)?;
         let mut p = w.progress();
         let step = current_step(app, &mut p, None);
-        if step == WizardStep::Passphrase {
-            // Only once the first-run gate serves (the start after step 0 may still be opening):
-            // a pair taken earlier could only fail.
-            if windows::snapshot(app) != AppSnapshot::Gate(GateState::FirstRun) {
-                return Err(CommandError::NotReady);
-            }
-            match p.in_flight {
-                Some(InFlight::Passphrase) => {}
-                Some(_) => return Err(CommandError::Busy),
-                None => {
-                    p.in_flight = Some(InFlight::Passphrase);
-                    p.error = None;
+        match step {
+            WizardStep::AnchorDir | WizardStep::Passphrase => {
+                // Only once the first-run gate serves (the start after step 0 may still be
+                // opening): a pair taken earlier could only fail.
+                if windows::snapshot(app) != AppSnapshot::Gate(GateState::FirstRun) {
+                    return Err(CommandError::NotReady);
+                }
+                match p.in_flight {
+                    Some(InFlight::Passphrase) => {}
+                    Some(_) => return Err(CommandError::Busy),
+                    None => {
+                        p.in_flight = Some(InFlight::Passphrase);
+                        p.error = None;
+                    }
                 }
             }
+            WizardStep::PinRetry => {
+                if p.in_flight.is_some() {
+                    return Err(CommandError::Busy);
+                }
+                p.in_flight = Some(InFlight::Pin);
+                p.error = None;
+            }
+            WizardStep::Restore => return Err(CommandError::Busy),
+            _ => {}
         }
         step
     };
     match step {
-        WizardStep::Passphrase => request_passphrase(app).await?,
+        WizardStep::AnchorDir | WizardStep::Passphrase => request_passphrase(app).await?,
+        WizardStep::PinRetry => retry_pin(app).await,
         WizardStep::ExistingStore => {
             let action = windows::route_relaunch(&windows::snapshot(app), &[]);
             if matches!(
@@ -957,6 +1086,207 @@ fn window_error(e: WindowError) -> CommandError {
     }
 }
 
+/// What the page shows of a first store that did not happen: its class, and for a refused anchor
+/// dir the store's fixed text (no path).
+fn failure_error(f: FirstStoreFailure) -> WizardError {
+    WizardError {
+        class: f.class(),
+        text: f.text().map(str::to_owned),
+    }
+}
+
+/// The serving state of the data dir (step 0 managed it).
+fn serving_state<R: Runtime>(app: &AppHandle<R>) -> Option<Arc<serve::ServeState>> {
+    app.try_state::<ServeSlot>().and_then(|s| s.get().cloned())
+}
+
+/// The pin retry with `in_flight` set to `Pin` by [`begin`] (M6 final review M-9): the pinned
+/// file is written again with the serving store's `install_id`; a failure is logged with its
+/// class and shown as [`CLASS_PINNED_WRITE`], and the step stays.
+async fn retry_pin<R: Runtime>(app: &AppHandle<R>) {
+    let Ok(w) = wizard(app) else {
+        return;
+    };
+    let pin = pin_writer(&w);
+    let install_id = serving_state(app).and_then(|s| s.note_facts()).map(|f| f.0);
+    let written = blocking(move || {
+        Ok(match (pin, install_id) {
+            (Some(pin), Some(id)) => serve::pin_store_id(&pin, &id),
+            _ => false,
+        })
+    })
+    .await
+    .unwrap_or(false);
+    let mut p = w.progress();
+    p.in_flight = None;
+    if written {
+        p.pin_failed = false;
+    } else {
+        p.error = Some(WizardError {
+            class: CLASS_PINNED_WRITE,
+            text: None,
+        });
+    }
+}
+
+/// `wizard_anchor_dir {}` (M10 T15, §2.5 (1b), §8.5): at the anchor-dir step, Rust's folder dialog
+/// (no §7.7 local-filesystem check: a share is what an anchor dir is for); the folder is kept for
+/// `GENESIS` and shown as text. A path the store would refuse (not absolute, not UTF-8) is refused
+/// here with [`CLASS_ANCHOR_DIR_INVALID`] and nothing is kept; whether the folder can be read is
+/// the store's check at `GENESIS` (PD-167; its refusal comes back to this step). No confirmation:
+/// at first run nothing is weakened, and `GENESIS` records the setting (`CONFIG_CHANGED {key:
+/// anchor_dir, old: null}`). A cancelled dialog changes nothing; a second request while the dialog
+/// is up is `busy`; elsewhere `not_ready`.
+pub async fn anchor_dir<R: Runtime>(app: &AppHandle<R>) -> Result<WizardState, CommandError> {
+    let pick = {
+        let w = wizard(app)?;
+        let mut p = w.progress();
+        if current_step(app, &mut p, None) != WizardStep::AnchorDir {
+            return Err(CommandError::NotReady);
+        }
+        if p.in_flight.is_some() {
+            return Err(CommandError::Busy);
+        }
+        p.in_flight = Some(InFlight::AnchorDir);
+        p.error = None;
+        w.env.pick_anchor_dir.clone()
+    };
+    let handle = app.clone();
+    // The dialog blocks until the user answers: the blocking pool, never the main thread.
+    let picked = tauri::async_runtime::spawn_blocking(move || pick(&handle))
+        .await
+        .unwrap_or(None);
+    {
+        let w = wizard(app)?;
+        let mut p = w.progress();
+        p.in_flight = None;
+        match picked {
+            None => {}
+            Some(dir) if usable_anchor_dir(dir.path()) => p.anchor_dir = Some(dir),
+            Some(_) => {
+                p.error = Some(WizardError {
+                    class: CLASS_ANCHOR_DIR_INVALID,
+                    text: None,
+                });
+            }
+        }
+    }
+    answer(app).await
+}
+
+/// What `create_new_store` takes as the wizard's anchor dir: absolute, non-empty UTF-8 text.
+fn usable_anchor_dir(dir: &Path) -> bool {
+    dir.is_absolute() && dir.to_str().is_some_and(|s| !s.is_empty())
+}
+
+/// `wizard_anchor_dir_clear {}` (M10 T15): at the anchor-dir step, no anchor directory for
+/// `GENESIS`; `busy` while the folder dialog is up, elsewhere `not_ready`.
+pub async fn anchor_dir_clear<R: Runtime>(app: &AppHandle<R>) -> Result<WizardState, CommandError> {
+    {
+        let w = wizard(app)?;
+        let mut p = w.progress();
+        if current_step(app, &mut p, None) != WizardStep::AnchorDir {
+            return Err(CommandError::NotReady);
+        }
+        if p.in_flight.is_some() {
+            return Err(CommandError::Busy);
+        }
+        p.anchor_dir = None;
+        p.error = None;
+    }
+    answer(app).await
+}
+
+/// `wizard_restore {}` (M10 T15, §2.5 (1b), §8.11, PD-168): "Restore from a backup" instead of a
+/// new log, at the anchor-dir step once the first-run gate serves. The restore runs in the
+/// background ([`serve::restore_first_store`]: the native "Restore backup" confirmation, Rust's
+/// file dialog, the backup's passphrase in the credential window, purpose `restore_backup`, new
+/// ids, `restore_from_source`, the pinned `install_id`, the core start) while the wizard shows
+/// `restore`; afterwards it goes on at the instances (no `GENESIS`, no first-run passphrase, no
+/// recovery note). The answer is the state at once. A cancel at any question comes back to the
+/// anchor-dir step with nothing changed, a failure with its class. `busy` while another step runs;
+/// elsewhere `not_ready`.
+pub async fn restore<R: Runtime>(app: &AppHandle<R>) -> Result<WizardState, CommandError> {
+    let state = {
+        let w = wizard(app)?;
+        let mut p = w.progress();
+        if current_step(app, &mut p, None) != WizardStep::AnchorDir
+            || windows::snapshot(app) != AppSnapshot::Gate(GateState::FirstRun)
+        {
+            return Err(CommandError::NotReady);
+        }
+        if p.in_flight.is_some() {
+            return Err(CommandError::Busy);
+        }
+        let state = serving_state(app).ok_or(CommandError::NotReady)?;
+        p.in_flight = Some(InFlight::Restore);
+        p.error = None;
+        state
+    };
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move { run_restore(handle, state).await });
+    answer(app).await
+}
+
+/// The wizard's restore task (see [`restore`]).
+async fn run_restore<R: Runtime>(app: AppHandle<R>, state: Arc<serve::ServeState>) {
+    let Some(w) = app.try_state::<Wizard<R>>() else {
+        return;
+    };
+    let result = match pin_writer(&w) {
+        None => Err(FirstStoreFailure::PinnedWrite),
+        Some(pin) => {
+            let (pick_app, pass_app, pick) = (app.clone(), app.clone(), w.env.pick_restore.clone());
+            serve::restore_first_store(
+                &state,
+                Box::new(move || pick(&pick_app)),
+                Box::new(move |stop| restore_passphrase(&pass_app, stop)),
+                pin,
+            )
+            .await
+        }
+    };
+    {
+        let mut p = w.progress();
+        p.in_flight = None;
+        match result {
+            Ok(first) => {
+                p.pin_failed = !first.pin_written;
+                // The restored store keeps the backup's own anchor-dir setting (§8.11).
+                p.anchor_dir = None;
+            }
+            // The user's choice: back at the anchor-dir step, no error.
+            Err(FirstStoreFailure::Restore(UnlockFailure::Cancelled)) => {}
+            Err(f) => p.error = Some(failure_error(f)),
+        }
+    }
+    if result.is_ok() {
+        // The Settings and setup windows re-read the instances of the restored store.
+        crate::ui_sink::emit_settings_changed(&app);
+    }
+    emit_wizard_changed(&app);
+}
+
+/// The backup's passphrase for the wizard's restore (PD-168): the credential window opens for
+/// `restore_backup` (`busy` while it is open for anything else) and the one entry comes back over
+/// the in-memory channel; `stop` (Quit) ends the wait and the window. The window closes itself
+/// after its submit.
+fn restore_passphrase<R: Runtime>(
+    app: &AppHandle<R>,
+    stop: &dyn Fn() -> bool,
+) -> Result<SecretString, NotAsked> {
+    let request =
+        credential::request_restore_passphrase(app, Show::Focus).map_err(|e| match e {
+            WindowError::Busy => NotAsked::Busy,
+            _ => NotAsked::NoWindow,
+        })?;
+    let got = wait_passphrase(&request.rx, stop);
+    if got.is_err() {
+        credential::close_if(app, request.generation);
+    }
+    got
+}
+
 /// The wizard's end of the passphrase channel: the pair goes straight into
 /// `serve::create_first_store` (never into a response, a log or the progress). A window closed
 /// before a pair was accepted is the user's choice: back to the passphrase step, no error. A failed
@@ -1000,13 +1330,14 @@ async fn await_passphrase<R: Runtime>(
         let mut p = w.progress();
         p.in_flight = None;
         match result {
-            Ok(()) => p.genesis_written = true,
-            Err(f) => {
-                p.error = Some(WizardError {
-                    class: f.class(),
-                    text: None,
-                });
+            Ok(first) => {
+                p.genesis_written = true;
+                p.previous_chain = first.previous_chain_found;
+                p.pin_failed = !first.pin_written;
             }
+            // Back at the anchor-dir step, which names the failure (a refused anchor dir with the
+            // store's own fixed text).
+            Err(f) => p.error = Some(failure_error(f)),
         }
     }
     if result.is_ok() {
@@ -1019,12 +1350,13 @@ async fn await_passphrase<R: Runtime>(
 }
 
 /// `GENESIS` for this data dir: the archived store an archive left (in memory, else derived again
-/// from the archive folder), the pinned-file writer, then `serve::create_first_store`.
+/// from the archive folder), the anchor dir chosen at the anchor-dir step, the pinned-file writer,
+/// then `serve::create_first_store`.
 async fn genesis<R: Runtime>(
     app: &AppHandle<R>,
     w: &Wizard<R>,
     pair: FirstRunPassphrase,
-) -> Result<(), FirstStoreFailure> {
+) -> Result<FirstStore, FirstStoreFailure> {
     let state = app
         .try_state::<ServeSlot>()
         .and_then(|s| s.get().cloned())
@@ -1033,26 +1365,15 @@ async fn genesis<R: Runtime>(
         .try_state::<DataDirHold>()
         .map(|h| h.data().clone())
         .ok_or(FirstStoreFailure::NotFirstRun)?;
-    let pinned = w
-        .progress()
-        .pinned
-        .clone()
-        .ok_or(FirstStoreFailure::PinnedWrite)?;
+    let pin = pin_writer(w).ok_or(FirstStoreFailure::PinnedWrite)?;
+    let anchor_dir = w.progress().anchor_dir.clone();
     let archived = match credential::take_archived(app) {
         Some(a) => Some(a),
         None => tauri::async_runtime::spawn_blocking(move || archived_on_disk(&data))
             .await
             .unwrap_or(None),
     };
-    let (file, write) = (w.env.pinned_file.clone(), w.env.write_pinned.clone());
-    let pin: serve::PinWriter = Box::new(move |install_id| {
-        let p = PinnedPaths {
-            install_id: install_id.map(str::to_owned),
-            ..pinned.clone()
-        };
-        write(&file, &p).is_ok()
-    });
-    serve::create_first_store(&state, pair, archived, pin).await
+    serve::create_first_store(&state, pair, archived, anchor_dir, pin).await
 }
 
 /// The archive [`latest_archived`] finds (T20 review I-1); an unreadable folder names none (the
@@ -1061,14 +1382,46 @@ fn archived_on_disk(data: &LocalDataDir) -> Option<ArchivedDb> {
     match latest_archived(data) {
         Ok(found) => found,
         Err(e) => {
-            let class = match e {
-                atlas_duck_audit::OpenError::Integrity(_) => "integrity",
-                _ => "io",
-            };
-            tracing::warn!(event = LOG_EVENT_ARCHIVED_UNREADABLE, error_class = class);
+            tracing::warn!(
+                event = LOG_EVENT_ARCHIVED_UNREADABLE,
+                error_class = open_error_class(&e)
+            );
             None
         }
     }
+}
+
+/// The diagnostic class of a read of the store's files that failed: `integrity|io` (never the
+/// error's text, which can name a path).
+fn open_error_class(e: &atlas_duck_audit::OpenError) -> &'static str {
+    match e {
+        atlas_duck_audit::OpenError::Integrity(_) => "integrity",
+        _ => "io",
+    }
+}
+
+/// The diagnostic class of a pinned-file write that failed ([`serve::PinWriter`]; never a path).
+pub fn pinned_error_class(e: &PinnedError) -> &'static str {
+    match e {
+        PinnedError::NonUtf8Path(_) => "non_utf8",
+        PinnedError::NotAbsolutePath(_) => "not_absolute",
+        PinnedError::Parse => "parse",
+        PinnedError::NewerSchema { .. } => "newer_schema",
+        PinnedError::Io(_) => "io",
+    }
+}
+
+/// The pinned-file writer of a first store: this host's pinned paths with the `install_id` given.
+fn pin_writer<R: Runtime>(w: &Wizard<R>) -> Option<serve::PinWriter> {
+    let pinned = w.progress().pinned.clone()?;
+    let (file, write) = (w.env.pinned_file.clone(), w.env.write_pinned.clone());
+    Some(Box::new(move |install_id| {
+        let p = PinnedPaths {
+            install_id: install_id.map(str::to_owned),
+            ..pinned.clone()
+        };
+        write(&file, &p).map_err(|e| pinned_error_class(&e))
+    }))
 }
 
 // ---------- the rest ----------
@@ -1189,7 +1542,40 @@ mod tests {
             ..facts(&first_run)
         };
         assert_eq!(step_of(&p, &no_dir), WizardStep::DataDir);
-        assert_eq!(step_of(&p, &facts(&first_run)), WizardStep::Passphrase);
+        // M10 T15 (§2.5 (1b)): the anchor-dir step first; the passphrase step only while the
+        // credential window waits for the pair; the restore while it runs.
+        assert_eq!(step_of(&p, &facts(&first_run)), WizardStep::AnchorDir);
+        for (in_flight, step) in [
+            (InFlight::AnchorDir, WizardStep::AnchorDir),
+            (InFlight::Passphrase, WizardStep::Passphrase),
+            (InFlight::Restore, WizardStep::Restore),
+        ] {
+            let p = Progress {
+                in_flight: Some(in_flight),
+                ..Progress::default()
+            };
+            assert_eq!(step_of(&p, &facts(&first_run)), step, "{in_flight:?}");
+        }
+        // The core of a restore serves before the wizard recorded it.
+        let restoring = Progress {
+            in_flight: Some(InFlight::Restore),
+            ..Progress::default()
+        };
+        assert_eq!(
+            step_of(&restoring, &facts(&AppSnapshot::Serving)),
+            WizardStep::Restore
+        );
+        // M6 final review M-9: a pinned file without the store's id holds every later step.
+        let unpinned = Progress {
+            genesis_written: true,
+            pin_failed: true,
+            ..Progress::default()
+        };
+        let note_window = Facts {
+            passphrase_window_open: true,
+            ..facts(&AppSnapshot::Serving)
+        };
+        assert_eq!(step_of(&unpinned, &note_window), WizardStep::PinRetry);
         let genesis = Progress {
             in_flight: Some(InFlight::Genesis),
             ..Progress::default()
@@ -1202,7 +1588,7 @@ mod tests {
         );
         assert_eq!(
             step_of(&p, &facts(&AppSnapshot::Starting)),
-            WizardStep::Passphrase
+            WizardStep::AnchorDir
         );
         let existing = Progress {
             existing_store: true,
@@ -1281,8 +1667,11 @@ mod tests {
         let all = [
             WizardStep::DataDir,
             WizardStep::ExistingStore,
+            WizardStep::AnchorDir,
+            WizardStep::Restore,
             WizardStep::Passphrase,
             WizardStep::Genesis,
+            WizardStep::PinRetry,
             WizardStep::RecoveryNote,
             WizardStep::Instances,
             WizardStep::Cli,
@@ -1314,6 +1703,73 @@ mod tests {
         let gate = GateState::Locked(atlas_duck_audit::LockedReason::KeyringNotLocal);
         let shown = gate.envelope().error.map(|e| e.message);
         assert_eq!(shown.as_deref(), Some(MSG_KEYRING_NOT_LOCAL));
+    }
+
+    /// M6 final review M-9 (M10 T15): an `audit.db` whose `install_id` cannot be read at step 0 is
+    /// still (1a) and pinned without an id, as before, but the diagnostic log now says so with a
+    /// class (never the path or the error's text).
+    #[test]
+    fn an_unreadable_store_id_is_logged() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path().join("data");
+        std::fs::create_dir(&dir)?;
+        std::fs::write(dir.join(DB_FILE), b"this is not an audit log")?;
+        let pinned_file = tmp.path().join("paths.toml");
+        let (got, log) = crate::restore_flow::tests::diag_lines(|| {
+            prepare_data_dir(
+                &dir,
+                false,
+                &pinned_file,
+                tmp.path(),
+                "thishost",
+                paths::check_data_dir,
+                &|_: &Path, _: &PinnedPaths| Ok::<(), PinnedError>(()),
+            )
+        });
+        let prepared = got.map_err(|r| format!("{r:?}"))?;
+        assert!(prepared.existing_store);
+        assert_eq!(prepared.pinned.install_id, None);
+        assert!(
+            log.contains("event=wizard_store_id_unreadable error_class=integrity dropped_fields=0")
+                || log.contains("event=wizard_store_id_unreadable error_class=io dropped_fields=0"),
+            "{log}"
+        );
+        assert!(!log.contains("this is not"), "{log}");
+        Ok(())
+    }
+
+    /// The pinned-file write's classes (M10 T15): fixed names, never the path a variant carries.
+    #[test]
+    fn pinned_error_classes_name_no_path() {
+        let p = PathBuf::from("/home/alice/secret-dir");
+        for (e, class) in [
+            (PinnedError::NonUtf8Path(p.clone()), "non_utf8"),
+            (PinnedError::NotAbsolutePath(p), "not_absolute"),
+            (PinnedError::Parse, "parse"),
+            (
+                PinnedError::NewerSchema { schema_version: 9 },
+                "newer_schema",
+            ),
+            (PinnedError::Io(std::io::Error::other("x")), "io"),
+        ] {
+            assert_eq!(pinned_error_class(&e), class);
+        }
+    }
+
+    /// M10 T15: the wizard's anchor dir must be what `create_new_store` takes (absolute, non-empty
+    /// UTF-8 text); anything else is refused before it is kept.
+    #[test]
+    fn a_usable_anchor_dir_is_absolute_utf8() {
+        assert!(!usable_anchor_dir(Path::new("relative/anchors")));
+        assert!(!usable_anchor_dir(Path::new("")));
+        let abs = std::env::temp_dir().join("anchors");
+        assert!(usable_anchor_dir(&abs));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = std::ffi::OsStr::from_bytes(b"/mnt/\xff-anchors");
+            assert!(!usable_anchor_dir(Path::new(raw)));
+        }
     }
 
     #[test]

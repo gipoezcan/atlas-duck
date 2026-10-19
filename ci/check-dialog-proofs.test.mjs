@@ -421,8 +421,11 @@ const SLICE = [
   // M10 T14: the recovery tier's confirmations and the anchor directory's folder dialog.
   "app/src-tauri/src/recovery_tier.rs",
   "app/src-tauri/src/commands/settings.rs",
+  // M10 T15: the wizard's anchor-directory folder dialog.
+  "app/src-tauri/src/wizard.rs",
 ];
 const RESTORE = "app/src-tauri/src/restore_flow.rs";
+const WIZARD = "app/src-tauri/src/wizard.rs";
 const RECOVERY = "app/src-tauri/src/recovery_tier.rs";
 const SETTINGS_COMMANDS = "app/src-tauri/src/commands/settings.rs";
 
@@ -520,6 +523,25 @@ test("M10 T14: the recovery tier's confirmations and the anchor folder dialog ar
     assert.equal(r.status, 1, from);
     assert.match(r.stdout, flagged);
   }
+});
+
+test("M10 T15: the wizard's anchor directory comes from its folder dialog on the real file", () => {
+  const r = withSliceCopy(
+    (rel, t) =>
+      rel === WIZARD
+        ? replaceOnce(
+            t,
+            "RustChosenPath::from_native_dialog(folder)",
+            'RustChosenPath::from_native_dialog(std::path::PathBuf::from("/mnt/anchors"))',
+          )
+        : t,
+    cli,
+  );
+  assert.equal(r.status, 1);
+  assert.match(
+    r.stdout,
+    /wizard\.rs:\d+: RustChosenPath::from_native_dialog outside a function that opens a folder or file dialog/,
+  );
 });
 
 // T14 review I-1: the anchor-directory proof is of the text that names the folder chosen, so the

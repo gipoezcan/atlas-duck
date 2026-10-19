@@ -491,8 +491,11 @@ export const isWizardState = (v: unknown): v is WizardState =>
     step: oneOf(
       'data_dir',
       'existing_store',
+      'anchor_dir',
+      'restore',
       'passphrase',
       'genesis',
+      'pin_retry',
       'recovery_note',
       'instances',
       'cli',
@@ -509,6 +512,9 @@ export const isWizardState = (v: unknown): v is WizardState =>
     passphrase_window: isBool,
     error: (e) => e === null || isWizardError(e),
     instances: (i) => Array.isArray(i) && i.every(isInstanceView),
+    anchor_dir: strOrNull,
+    step_text: strOrNull,
+    notice: strOrNull,
   });
 
 const AUDIT_FLAGS: readonly unknown[] = [

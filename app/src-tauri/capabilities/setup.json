@@ -1,6 +1,6 @@
 {
   "identifier": "setup",
-  "description": "the first-run wizard window (Δ1, PD-72)",
+  "description": "the first-run wizard window (Δ1, PD-72; anchor directory and restore, M10)",
   "windows": ["setup"],
   "permissions": [
     "allow-cli-install",
@@ -10,9 +10,12 @@
     "allow-instance-confirm-config",
     "allow-onboarding-text",
     "allow-quit",
+    "allow-wizard-anchor-dir",
+    "allow-wizard-anchor-dir-clear",
     "allow-wizard-begin",
     "allow-wizard-choose-dir",
     "allow-wizard-finish",
+    "allow-wizard-restore",
     "allow-wizard-skip-instances",
     "allow-wizard-state",
     "allow-wizard-use-default-dir",

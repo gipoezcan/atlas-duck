@@ -116,6 +116,11 @@ export const WINDOW_COMMANDS = {
     "wizard_begin",
     "wizard_skip_instances",
     "wizard_finish",
+    // M10 T15 (Δ-M10-3, §2.5 (1b), PD-168): the anchor directory (Rust's folder dialog) and the
+    // restore from a backup before `GENESIS` (its passphrase enters the credential window).
+    "wizard_anchor_dir",
+    "wizard_anchor_dir_clear",
+    "wizard_restore",
     "instance_add",
     "instance_change_url",
     "instance_confirm_config",

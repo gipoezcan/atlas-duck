@@ -88,8 +88,9 @@ pub use export::{EXPORT_DIR_EXISTS, EXPORT_NO_RECORDS, MAX_EXPORT_CT_LEN, MAX_EX
 pub use forget::{ForgetError, ForgetReport, OrphanInstall, forget_install, orphan_installs};
 pub use keystore::{EntryName, KeyStore, KeyStoreError, KeyringLocality, OsKeyStore};
 pub use open::{
-    ArchivedDb, FirstRunInput, LockedReason, RecoveryOffer, StartupOutcome, create_new_store,
-    keychain_retry_schedule, new_ids, open, read_store_install_id,
+    ArchivedDb, FIRST_RUN_ANCHOR_DIR_REFUSALS, FirstRunInput, LockedReason, RecoveryOffer,
+    StartupOutcome, create_new_store, keychain_retry_schedule, new_ids, open,
+    read_store_install_id,
 };
 pub use passphrase::{PASSPHRASE_MISMATCH, PASSPHRASE_TOO_SHORT};
 pub use prune::{PruneOutcome, PruneSkip};

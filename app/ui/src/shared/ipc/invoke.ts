@@ -435,9 +435,31 @@ export function wizardChooseDir(): Promise<WizardState> {
   return call('wizard_choose_dir', {}, isWizardState);
 }
 
-/** (1b) Begin: Rust checks the keyring and opens the credential window for the passphrase. */
+/**
+ * (1b) Begin: Rust checks the keyring and opens the credential window for the passphrase; at the
+ * `pin_retry` step Rust writes the pinned file again (M10 T15).
+ */
 export function wizardBegin(): Promise<WizardState> {
   return call('wizard_begin', {}, isWizardState);
+}
+
+/** (1b) M10 T15: the anchor directory from Rust's own folder dialog (the page never sends a path). */
+export function wizardAnchorDir(): Promise<WizardState> {
+  return call('wizard_anchor_dir', {}, isWizardState);
+}
+
+/** (1b) M10 T15: no anchor directory for GENESIS. */
+export function wizardAnchorDirClear(): Promise<WizardState> {
+  return call('wizard_anchor_dir_clear', {}, isWizardState);
+}
+
+/**
+ * (1b) M10 T15 (PD-168): restore a backup instead of a new log. Rust asks its native confirmation
+ * and its file dialog; the backup's passphrase goes to the credential window, never here. The
+ * answer is the state at once (`restore` while it runs).
+ */
+export function wizardRestore(): Promise<WizardState> {
+  return call('wizard_restore', {}, isWizardState);
 }
 
 /**

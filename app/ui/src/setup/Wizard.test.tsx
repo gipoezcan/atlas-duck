@@ -34,6 +34,10 @@ vi.mock('../shared/ipc/invoke', () => ({
   wizardBegin: vi.fn(),
   wizardSkipInstances: vi.fn(),
   wizardFinish: vi.fn(),
+  // M10 T15: the (1b) anchor-dir step and the restore (their panels' tests are Task 22's).
+  wizardAnchorDir: vi.fn(),
+  wizardAnchorDirClear: vi.fn(),
+  wizardRestore: vi.fn(),
 }));
 vi.mock('../shared/ipc/events', () => ({ on: vi.fn() }));
 

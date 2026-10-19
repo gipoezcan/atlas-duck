@@ -107,6 +107,8 @@ fn wizard_env(
             keys,
         }),
         pick_folder: Arc::new(|app: &tauri::AppHandle| wizard::pick_folder_dialog(app)),
+        pick_anchor_dir: Arc::new(|app: &tauri::AppHandle| wizard::pick_anchor_dir_dialog(app)),
+        pick_restore: Arc::new(|app: &tauri::AppHandle| restore_flow::pick_restore_source(app)),
         write_pinned: Arc::new(paths::write_pinned),
         check_dir: paths::check_data_dir,
         // What `OsKeyStore::locality` answers (no keyring call, §8.6).

@@ -58,6 +58,16 @@ pub const MAX_BAD_LINES_REPORTED: usize = 16;
 /// bound as the export verifier's, PD-162); an anchor dir holding more is refused.
 pub const MAX_FIRST_RUN_CHAIN_FILES: usize = 256;
 
+/// The first run's refusals of an anchor dir it could not check (`OpenError::Invalid`, nothing
+/// written; PD-167). Fixed texts without a path: the wizard shows them (M10 T15).
+pub const FIRST_RUN_DIR_NOT_ABSOLUTE: &str = "the anchor directory is not an absolute path";
+pub const FIRST_RUN_DIR_NOT_A_DIRECTORY: &str = "the anchor directory is not a directory";
+pub const FIRST_RUN_DIR_UNREADABLE: &str = "the anchor directory cannot be read";
+pub const FIRST_RUN_DIR_TOO_MANY_CHAINS: &str =
+    "the anchor directory holds more chain files than a first run reads";
+pub const FIRST_RUN_CHAIN_FILE_UNREADABLE: &str =
+    "a chain file in the anchor directory cannot be read";
+
 /// What a first run (and the export verifier) reads of a chain file before it knows whose it is:
 /// the header, also after a run of torn lines (each at most [`MAX_LINE_BYTES`]), lies far inside
 /// it.
@@ -854,18 +864,14 @@ fn previous_chains_with(
     keep_named: Option<&str>,
     max_bytes: u64,
 ) -> Result<Vec<PreviousChain>, OpenError> {
-    let unreadable = || OpenError::Invalid("the anchor directory cannot be read");
+    let unreadable = || OpenError::Invalid(FIRST_RUN_DIR_UNREADABLE);
     if !dir.is_absolute() {
-        return Err(OpenError::Invalid(
-            "the anchor directory is not an absolute path",
-        ));
+        return Err(OpenError::Invalid(FIRST_RUN_DIR_NOT_ABSOLUTE));
     }
     match std::fs::metadata(dir) {
         Ok(m) if m.is_dir() => {}
         Ok(_) => {
-            return Err(OpenError::Invalid(
-                "the anchor directory is not a directory",
-            ));
+            return Err(OpenError::Invalid(FIRST_RUN_DIR_NOT_A_DIRECTORY));
         }
         Err(_) => return Err(unreadable()),
     }
@@ -882,9 +888,7 @@ fn previous_chains_with(
         };
         chains.push(chain.to_owned());
         if chains.len() > MAX_FIRST_RUN_CHAIN_FILES {
-            return Err(OpenError::Invalid(
-                "the anchor directory holds more chain files than a first run reads",
-            ));
+            return Err(OpenError::Invalid(FIRST_RUN_DIR_TOO_MANY_CHAINS));
         }
     }
     chains.sort();
@@ -892,8 +896,7 @@ fn previous_chains_with(
     for chain in chains {
         let name = file_name(&chain);
         let path = dir.join(&name);
-        let unreadable_file =
-            || OpenError::Invalid("a chain file in the anchor directory cannot be read");
+        let unreadable_file = || OpenError::Invalid(FIRST_RUN_CHAIN_FILE_UNREADABLE);
         // Only a regular file is a chain (a directory is not); one gone since the listing is not
         // one. The handle is checked again: that check is the one a swap cannot get past.
         match std::fs::metadata(&path) {

@@ -39,6 +39,22 @@ pub const NEW_DB_FILE: &str = "audit.db.new";
 /// Restore staging file (F.1); a leftover is deleted at the next start.
 pub const RESTORING_DB_FILE: &str = "audit.db.restoring";
 
+/// [`create_new_store`]'s refusal of a wizard anchor dir that is not absolute UTF-8 text.
+pub const FIRST_RUN_ANCHOR_DIR_NOT_UTF8: &str =
+    "the anchor directory is not an absolute UTF-8 path";
+
+/// Every `OpenError::Invalid` text with which [`create_new_store`] refuses the anchor dir it was
+/// given or configured (PD-167; nothing written). Fixed texts without a path: the wizard shows
+/// them next to the folder the user chose (M10 T15); any other `Invalid` is not about the dir.
+pub const FIRST_RUN_ANCHOR_DIR_REFUSALS: [&str; 6] = [
+    FIRST_RUN_ANCHOR_DIR_NOT_UTF8,
+    anchor_dir::FIRST_RUN_DIR_NOT_ABSOLUTE,
+    anchor_dir::FIRST_RUN_DIR_NOT_A_DIRECTORY,
+    anchor_dir::FIRST_RUN_DIR_UNREADABLE,
+    anchor_dir::FIRST_RUN_DIR_TOO_MANY_CHAINS,
+    anchor_dir::FIRST_RUN_CHAIN_FILE_UNREADABLE,
+];
+
 /// Why the store is not served (§4.3 `details.reason`, exit 9). While locked nothing after
 /// startup step 2 runs: no migration, no write (§8.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -940,9 +956,7 @@ pub fn create_new_store(
             p.path()
                 .to_str()
                 .filter(|s| !s.is_empty() && p.path().is_absolute())
-                .ok_or(OpenError::Invalid(
-                    "the anchor directory is not an absolute UTF-8 path",
-                ))?
+                .ok_or(OpenError::Invalid(FIRST_RUN_ANCHOR_DIR_NOT_UTF8))?
                 .to_owned(),
         ),
     };

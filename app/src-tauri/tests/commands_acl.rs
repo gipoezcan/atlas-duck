@@ -2006,16 +2006,21 @@ fn close_credential_granted_to_credential_only() -> TestResult {
     Ok(())
 }
 
-/// M6 T23 (Δ1, PD-72): the six wizard commands are the setup window's alone; with a valid body they
-/// reach their handler (`not_ready`: this app has no wizard), everywhere else Tauri's ACL refuses
-/// them first. None takes a key: a folder, a path or a passphrase is refused before the handler.
+/// M6 T23 (Δ1, PD-72), M10 T15 (Δ-M10-3): the nine wizard commands are the setup window's alone;
+/// with a valid body they reach their handler (`not_ready`: this app has no wizard), everywhere else
+/// Tauri's ACL refuses them first. None takes a key: a folder, a path or a passphrase is refused
+/// before the handler (the anchor directory and the backup come from Rust's dialogs, the backup's
+/// passphrase from the credential window).
 #[test]
 fn wizard_commands_granted_to_setup_only() -> TestResult {
     let app = app()?;
     let wizard = [
+        "wizard_anchor_dir",
+        "wizard_anchor_dir_clear",
         "wizard_begin",
         "wizard_choose_dir",
         "wizard_finish",
+        "wizard_restore",
         "wizard_skip_instances",
         "wizard_state",
         "wizard_use_default_dir",
@@ -2060,7 +2065,16 @@ fn wizard_commands_granted_to_setup_only() -> TestResult {
                 "{cmd} without a step"
             );
         }
-        for key in ["data_dir", "path", "dir", "secret", "step"] {
+        for key in [
+            "data_dir",
+            "path",
+            "dir",
+            "secret",
+            "step",
+            "anchor_dir",
+            "source",
+            "passphrase",
+        ] {
             // `step` is the one key `wizard_finish` and `wizard_skip_instances` take.
             if takes_step && key == "step" {
                 continue;
@@ -4494,6 +4508,11 @@ const S09_GRANTS: [(&str, &[&str]); 7] = [
             "wizard_begin",
             "wizard_skip_instances",
             "wizard_finish",
+            // M10 T15 (Δ-M10-3, §2.5 (1b), PD-168): the anchor directory and the restore from a
+            // backup before `GENESIS`.
+            "wizard_anchor_dir",
+            "wizard_anchor_dir_clear",
+            "wizard_restore",
             "instance_add",
             "instance_change_url",
             "instance_confirm_config",
@@ -4724,6 +4743,10 @@ fn s09_new_commands_outside_grant_rejected() -> TestResult {
             json!({"install_id": "0123456789abcdef0123456789abcdef"}),
             &["settings"],
         ),
+        // M10 T15: the wizard's anchor directory and restore, the setup window only.
+        ("wizard_anchor_dir", json!({}), &["setup"]),
+        ("wizard_anchor_dir_clear", json!({}), &["setup"]),
+        ("wizard_restore", json!({}), &["setup"]),
     ]);
     for (cmd, body, want) in table {
         assert!(COMMANDS.contains(&cmd), "{cmd} is not in COMMANDS");
@@ -5288,6 +5311,14 @@ fn s09_cases() -> Vec<S09Case> {
             (Some("secret"), huge()),
         ),
         case("verify_now", "audit", json!({}), whole(), pad()),
+        case("wizard_anchor_dir", "setup", json!({}), whole(), pad()),
+        case(
+            "wizard_anchor_dir_clear",
+            "setup",
+            json!({}),
+            whole(),
+            pad(),
+        ),
         case("wizard_begin", "setup", json!({}), whole(), pad()),
         case("wizard_choose_dir", "setup", json!({}), whole(), pad()),
         case(
@@ -5297,6 +5328,7 @@ fn s09_cases() -> Vec<S09Case> {
             num("step"),
             (Some("step"), huge()),
         ),
+        case("wizard_restore", "setup", json!({}), whole(), pad()),
         case(
             "wizard_skip_instances",
             "setup",

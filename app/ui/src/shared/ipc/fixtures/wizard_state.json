@@ -1,17 +1,21 @@
 [
   {
+    "anchor_dir": null,
     "data_dir": null,
     "default_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
     "error": null,
     "existing_store": false,
     "instances": [],
+    "notice": null,
     "passphrase_window": false,
     "refused_count": null,
     "secret_service": "n/a",
     "step": "data_dir",
+    "step_text": null,
     "stopped_text": null
   },
   {
+    "anchor_dir": null,
     "data_dir": null,
     "default_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
     "error": {
@@ -20,25 +24,31 @@
     },
     "existing_store": false,
     "instances": [],
+    "notice": null,
     "passphrase_window": false,
     "refused_count": null,
     "secret_service": "n/a",
     "step": "data_dir",
+    "step_text": null,
     "stopped_text": null
   },
   {
+    "anchor_dir": null,
     "data_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
     "default_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
     "error": null,
     "existing_store": false,
     "instances": [],
+    "notice": null,
     "passphrase_window": true,
     "refused_count": 3,
     "secret_service": "ok",
     "step": "passphrase",
+    "step_text": null,
     "stopped_text": null
   },
   {
+    "anchor_dir": null,
     "data_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
     "default_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
     "error": null,
@@ -59,22 +69,108 @@
         "state": "ok"
       }
     ],
+    "notice": null,
     "passphrase_window": false,
     "refused_count": null,
     "secret_service": "n/a",
     "step": "instances",
+    "step_text": null,
     "stopped_text": null
   },
   {
+    "anchor_dir": null,
     "data_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
     "default_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
     "error": null,
     "existing_store": false,
     "instances": [],
+    "notice": null,
     "passphrase_window": false,
     "refused_count": 0,
     "secret_service": "missing",
     "step": "stopped",
+    "step_text": null,
     "stopped_text": "atlas-duck needs a system keyring (Secret Service, e.g. GNOME Keyring or KWallet). Install or unlock one, then restart atlas-duck."
+  },
+  {
+    "anchor_dir": "\\\\nas\\audit-anchors",
+    "data_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
+    "default_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
+    "error": null,
+    "existing_store": false,
+    "instances": [],
+    "notice": null,
+    "passphrase_window": false,
+    "refused_count": 1,
+    "secret_service": "n/a",
+    "step": "anchor_dir",
+    "step_text": null,
+    "stopped_text": null
+  },
+  {
+    "anchor_dir": "\\\\nas\\audit-anchors",
+    "data_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
+    "default_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
+    "error": {
+      "class": "anchor_dir",
+      "text": "a chain file in the anchor directory cannot be read"
+    },
+    "existing_store": false,
+    "instances": [],
+    "notice": null,
+    "passphrase_window": false,
+    "refused_count": 0,
+    "secret_service": "n/a",
+    "step": "anchor_dir",
+    "step_text": null,
+    "stopped_text": null
+  },
+  {
+    "anchor_dir": null,
+    "data_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
+    "default_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
+    "error": null,
+    "existing_store": false,
+    "instances": [],
+    "notice": null,
+    "passphrase_window": false,
+    "refused_count": 0,
+    "secret_service": "n/a",
+    "step": "restore",
+    "step_text": null,
+    "stopped_text": null
+  },
+  {
+    "anchor_dir": null,
+    "data_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
+    "default_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
+    "error": {
+      "class": "pinned_write",
+      "text": null
+    },
+    "existing_store": false,
+    "instances": [],
+    "notice": null,
+    "passphrase_window": false,
+    "refused_count": null,
+    "secret_service": "n/a",
+    "step": "pin_retry",
+    "step_text": "Could not record this installation's id. Try again",
+    "stopped_text": null
+  },
+  {
+    "anchor_dir": null,
+    "data_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
+    "default_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
+    "error": null,
+    "existing_store": false,
+    "instances": [],
+    "notice": "The anchor directory already holds an atlas-duck log of this computer and user. This was recorded as an integrity incident; see Audit.",
+    "passphrase_window": false,
+    "refused_count": null,
+    "secret_service": "n/a",
+    "step": "instances",
+    "step_text": null,
+    "stopped_text": null
   }
 ]

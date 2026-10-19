@@ -4,9 +4,12 @@ import { on } from '../shared/ipc/events';
 import {
   cliInstall,
   quit,
+  wizardAnchorDir,
+  wizardAnchorDirClear,
   wizardBegin,
   wizardChooseDir,
   wizardFinish,
+  wizardRestore,
   wizardSkipInstances,
   wizardState,
   wizardUseDefaultDir,
@@ -191,6 +194,8 @@ function WizardWindow() {
         <p className="visually-hidden" aria-live="polite">
           {T.step_announce(headingOf(state))}
         </p>
+        {/* Rust's fixed text once GENESIS recorded a previous chain (PD-167), as a plain text node. */}
+        {state.notice === null ? null : <p role="status">{state.notice}</p>}
         <div ref={panel}>
           <Panel state={state} step={step} pending={action.pending || settling} onChanged={reread} />
         </div>
@@ -213,10 +218,16 @@ function headingOf(state: WizardState): string {
       return T.data_dir_heading;
     case 'existing_store':
       return T.existing_heading;
+    case 'anchor_dir':
+      return T.anchor_heading;
+    case 'restore':
+      return T.restore_heading;
     case 'passphrase':
       return T.passphrase_heading;
     case 'genesis':
       return T.genesis_heading;
+    case 'pin_retry':
+      return T.pin_heading;
     case 'recovery_note':
       return T.note_heading;
     case 'instances':
@@ -284,6 +295,56 @@ function Panel({
           <StepError error={state.error} />
           <button type="button" disabled={pending} onClick={() => step(() => wizardBegin())}>
             {T.existing_continue}
+          </button>
+        </section>
+      );
+    // M10 T15: placeholder panels so the (1b) steps can be walked; Task 22 owns their UI.
+    case 'anchor_dir':
+      return (
+        <section aria-label={T.anchor_heading}>
+          <h2 tabIndex={-1}>{T.anchor_heading}</h2>
+          <p>{T.anchor_intro}</p>
+          {state.anchor_dir === null ? null : (
+            <p>
+              {T.anchor_dir}: <Cfg value={state.anchor_dir} />
+            </p>
+          )}
+          <StepError error={state.error} />
+          <button type="button" disabled={pending} onClick={() => step(() => wizardAnchorDir())}>
+            {T.anchor_choose}
+          </button>{' '}
+          {state.anchor_dir === null ? null : (
+            <>
+              <button type="button" disabled={pending} onClick={() => step(() => wizardAnchorDirClear())}>
+                {T.anchor_clear}
+              </button>{' '}
+            </>
+          )}
+          <button type="button" disabled={pending} onClick={() => step(() => wizardRestore())}>
+            {T.restore_offer}
+          </button>
+          <p>
+            <button type="button" disabled={pending} onClick={() => step(() => wizardBegin())}>
+              {T.passphrase_begin}
+            </button>
+          </p>
+        </section>
+      );
+    case 'restore':
+      return (
+        <section aria-label={T.restore_heading}>
+          <h2 tabIndex={-1}>{T.restore_heading}</h2>
+          <p role="status">{T.restore_working}</p>
+        </section>
+      );
+    case 'pin_retry':
+      return (
+        <section aria-label={T.pin_heading}>
+          <h2 tabIndex={-1}>{T.pin_heading}</h2>
+          {/* Rust's fixed text, shown as a plain text node. */}
+          <p role="alert">{state.step_text ?? T.errors.other}</p>
+          <button type="button" disabled={pending} onClick={() => step(() => wizardBegin())}>
+            {T.pin_retry}
           </button>
         </section>
       );

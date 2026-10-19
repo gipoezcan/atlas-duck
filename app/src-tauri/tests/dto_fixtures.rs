@@ -40,7 +40,10 @@ use atlas_duck_app_lib::removal::{
     BackupAnswer, Choice, FinishAnswer, ItemDto, RemovalDto, RemovalError,
 };
 use atlas_duck_app_lib::ui_sink::audit_job_payload;
-use atlas_duck_app_lib::wizard::{MSG_NEEDS_SECRET_SERVICE, WizardError, WizardState, WizardStep};
+use atlas_duck_app_lib::wizard::{
+    MSG_NEEDS_SECRET_SERVICE, MSG_PIN_WRITE_FAILED, MSG_PREVIOUS_CHAIN_FOUND, WizardError,
+    WizardState, WizardStep,
+};
 use atlas_duck_atlassian::ConnClass;
 use atlas_duck_audit::{Actor, AuditError, DecisionColumn, EventFlags, EventHeader, EventType};
 use atlas_duck_core::engine::write::CONFLICT_DENY_PREFILL;
@@ -1675,7 +1678,9 @@ fn removal_finish_answers() -> Vec<FinishAnswer> {
 }
 
 /// `wizard_state` (M6 T23): a fresh start, a refused folder, the passphrase window, the instance
-/// step with an unconfirmed instance, the Secret Service stop.
+/// step with an unconfirmed instance, the Secret Service stop; M10 T15 (appended, the setup tests
+/// take the first five by position): the anchor-dir step with a folder, a refused anchor dir, the
+/// restore, the pin retry, the instance step after a previous chain was found.
 fn wizard_states() -> Vec<WizardState> {
     let base = WizardState {
         step: WizardStep::DataDir.as_str(),
@@ -1688,6 +1693,9 @@ fn wizard_states() -> Vec<WizardState> {
         passphrase_window: false,
         error: None,
         instances: vec![],
+        anchor_dir: None,
+        step_text: None,
+        notice: None,
     };
     let data_dir = Some("C:\\Users\\alice\\AppData\\Local\\atlas-duck".to_owned());
     vec![
@@ -1718,9 +1726,49 @@ fn wizard_states() -> Vec<WizardState> {
         WizardState {
             step: WizardStep::Stopped(MSG_NEEDS_SECRET_SERVICE).as_str(),
             stopped_text: Some(MSG_NEEDS_SECRET_SERVICE),
-            data_dir,
+            data_dir: data_dir.clone(),
             refused_count: Some(0),
             secret_service: "missing",
+            ..base.clone()
+        },
+        WizardState {
+            step: WizardStep::AnchorDir.as_str(),
+            data_dir: data_dir.clone(),
+            refused_count: Some(1),
+            anchor_dir: Some("\\\\nas\\audit-anchors".into()),
+            ..base.clone()
+        },
+        WizardState {
+            step: WizardStep::AnchorDir.as_str(),
+            data_dir: data_dir.clone(),
+            refused_count: Some(0),
+            anchor_dir: Some("\\\\nas\\audit-anchors".into()),
+            error: Some(WizardError {
+                class: "anchor_dir",
+                text: Some(atlas_duck_audit::FIRST_RUN_ANCHOR_DIR_REFUSALS[5].into()),
+            }),
+            ..base.clone()
+        },
+        WizardState {
+            step: WizardStep::Restore.as_str(),
+            data_dir: data_dir.clone(),
+            refused_count: Some(0),
+            ..base.clone()
+        },
+        WizardState {
+            step: WizardStep::PinRetry.as_str(),
+            data_dir: data_dir.clone(),
+            step_text: Some(MSG_PIN_WRITE_FAILED),
+            error: Some(WizardError {
+                class: "pinned_write",
+                text: None,
+            }),
+            ..base.clone()
+        },
+        WizardState {
+            step: WizardStep::Instances.as_str(),
+            data_dir,
+            notice: Some(MSG_PREVIOUS_CHAIN_FOUND),
             ..base
         },
     ]

@@ -514,8 +514,11 @@ export interface RemovalFinishAnswer {
 export type WizardStep =
   | 'data_dir'
   | 'existing_store'
+  | 'anchor_dir'
+  | 'restore'
   | 'passphrase'
   | 'genesis'
+  | 'pin_retry'
   | 'recovery_note'
   | 'instances'
   | 'cli'
@@ -545,6 +548,12 @@ export interface WizardState {
   passphrase_window: boolean;
   error: WizardError | null;
   instances: InstanceView[];
+  /** M10 T15: the anchor directory chosen for GENESIS (display only, Rust escaped it); `null` when none. */
+  anchor_dir: string | null;
+  /** M10 T15: Rust's fixed text for the step shown (the `pin_retry` text); `null` otherwise. */
+  step_text: string | null;
+  /** M10 T15 (PD-167): Rust's fixed text once GENESIS recorded a previous chain; `null` otherwise. */
+  notice: string | null;
 }
 
 /** The store health as Settings and the Audit window show it. */

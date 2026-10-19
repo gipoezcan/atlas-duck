@@ -20,6 +20,19 @@ export const SETUP_TEXT = {
     'This folder already holds an audit log. atlas-duck keeps it and does not ask for a new recovery passphrase.',
   existing_data_dir: 'Folder',
   existing_continue: 'Continue with this log',
+  /** M10 T15 (placeholder wording; Task 22 owns the anchor-dir step's text). */
+  anchor_heading: 'Anchor directory (optional)',
+  anchor_intro:
+    'Advanced: atlas-duck can also write its audit anchors to a folder outside this computer, for example a network share. Choose it now if you want one, or begin without it.',
+  anchor_dir: 'Anchor directory',
+  anchor_choose: 'Choose anchor directory…',
+  anchor_clear: 'No anchor directory',
+  restore_offer: 'Restore from a backup…',
+  restore_heading: 'Restoring a backup',
+  restore_working:
+    'Answer the dialogs, then enter the backup’s recovery passphrase in the credentials window.',
+  pin_heading: 'Installation id',
+  pin_retry: 'Try again',
   passphrase_heading: 'Recovery passphrase',
   passphrase_intro:
     'The recovery passphrase lets you read the audit log again if this computer’s keychain is lost. It is required, you enter it twice, and atlas-duck cannot show it again.',
@@ -82,6 +95,10 @@ export const SETUP_TEXT = {
     io: 'A file could not be written.',
     invalid: 'The setup could not be completed.',
     core_start: 'The audit log was created, but atlas-duck could not start on it. Restart atlas-duck.',
+    anchor_dir: 'The anchor directory cannot be used:',
+    anchor_dir_invalid: 'The anchor directory must be a full path.',
+    wrong_passphrase: 'That is not the backup’s recovery passphrase.',
+    not_a_backup: 'That is not an atlas-duck backup.',
     other: 'The step could not be completed.',
   } as Readonly<Record<string, string>>,
   /** A refused command by error kind. */
