@@ -2585,7 +2585,13 @@ fn x05_released(records: &[(EventType, Value)]) -> Result<Vec<(Value, String)>> 
             continue;
         }
         let Some(released) = payload.get("released") else {
-            continue;
+            // Only an outcome item (it has a `code`) is a payload without released bytes.
+            if payload.get("code").is_some() {
+                continue;
+            }
+            return Err(
+                format!("{kind:?} has no `released` and is no outcome item: {payload}").into(),
+            );
         };
         let bytes = body_from_json(released)
             .ok_or_else(|| format!("{kind:?}: `released` is no body: {payload}"))?;
@@ -2601,10 +2607,14 @@ fn x05_released(records: &[(EventType, Value)]) -> Result<Vec<(Value, String)>> 
 /// - every released canary is in some released payload, no dropped canary is in any (so the
 ///   released bytes are the ones the sweep reasons about);
 /// - the PAT and the dropped canaries are on no channel;
-/// - a released canary is on a channel only as the released bytes themselves: the channel is one
-///   envelope (a CLI stdout, or the `structuredContent` of an MCP result whose text blocks that
-///   carry it are that envelope), `released`, and its `data` is the parse of a released payload
-///   (`data.result` for a read, `data` for a script).
+/// - a released canary is on a channel only as `data` equal to the parse of a released payload and
+///   nowhere else in the message: the channel is one envelope (a CLI stdout, or the
+///   `structuredContent` of an MCP result whose text blocks that carry it are that envelope),
+///   `released`, and its `data` is the parse of a released payload (`data.result` for a read,
+///   `data` for a script); with `data` nulled in the envelope (and in each such text block), the
+///   rest of the message (meta, error, the other JSON-RPC keys) carries none of the canaries.
+///   The payload is matched against all released payloads, not the request's own (the audit
+///   payloads carry no request id here).
 fn x05_sweep(seen: &[(String, String)], released: &[(Value, String)]) -> Result<()> {
     for canary in X05_RELEASED_CANARIES {
         if !released.iter().any(|(_, text)| text.contains(canary)) {
@@ -2634,6 +2644,9 @@ fn x05_sweep(seen: &[(String, String)], released: &[(Value, String)]) -> Result<
         }
         let line: Value = serde_json::from_str(text.trim())
             .map_err(|e| format!("{name} carries {carried:?} but is no JSON: {e}"))?;
+        // `rest` is the message with every copy of the envelope's `data` nulled: whatever is left
+        // (meta, error, the other keys of the envelope and of the JSON-RPC line) must carry no canary.
+        let mut rest = line.clone();
         let env = if line.get("jsonrpc").is_some() {
             let result = &line["result"];
             let env = result["structuredContent"].clone();
@@ -2642,7 +2655,15 @@ fn x05_sweep(seen: &[(String, String)], released: &[(Value, String)]) -> Result<
                     format!("{name} carries {carried:?} outside an envelope: {text}").into(),
                 );
             }
-            for block in result["content"].as_array().into_iter().flatten() {
+            let mut bare = env.clone();
+            bare["data"] = Value::Null;
+            rest["result"]["structuredContent"] = bare.clone();
+            for (n, block) in result["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
                 let block_text = block["text"].as_str().unwrap_or_default();
                 if !carried.iter().any(|canary| block_text.contains(canary)) {
                     continue;
@@ -2655,9 +2676,11 @@ fn x05_sweep(seen: &[(String, String)], released: &[(Value, String)]) -> Result<
                     )
                     .into());
                 }
+                rest["result"]["content"][n]["text"] = json!(bare.to_string());
             }
             env
         } else {
+            rest["data"] = Value::Null;
             line
         };
         if status_of(&env) != "released" {
@@ -2675,6 +2698,15 @@ fn x05_sweep(seen: &[(String, String)], released: &[(Value, String)]) -> Result<
             )
             .into());
         }
+        let rest_text = rest.to_string();
+        for canary in &carried {
+            if rest_text.contains(canary) {
+                return Err(format!(
+                    "{name}: the released canary {canary} is outside `data`: {rest_text}"
+                )
+                .into());
+            }
+        }
     }
     Ok(())
 }
@@ -2690,7 +2722,9 @@ fn x05_sweep(seen: &[(String, String)], released: &[(Value, String)]) -> Result<
 /// the audit log, while the canaries of the released fields (search summary, kept summary, page
 /// body, script summary) and the two controls (an issue description released whole, the same
 /// description in a script's result) are in released bytes, so the absence is not vacuous; (2) a
-/// canary of a released field is on a channel only as the released bytes (`x05_sweep`); (3) the
+/// canary of a released field is on a channel only as `data` equal to a released payload, and
+/// nowhere else in the message (`x05_sweep`; the Confluence page is released whole, so that leg has
+/// no dropped canary); (3) the
 /// mock Jira and the mock Confluence received exactly the approved writes: each mock's writes, in
 /// order, are the `requests` of the `WRITE_APPROVED` records of its URLs (method, URL, body bytes),
 /// there are no others and every one has its `WRITE_EXECUTED`; (4) a denied write sent nothing
