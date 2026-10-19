@@ -165,6 +165,11 @@ pub struct StoreHealth {
     /// Anchor-dir lines waiting to be written (held until startup verification passed, or
     /// while the dir fails).
     pub anchor_dir_lines_pending: u32,
+    /// A keychain anchor entry this process found missing (startup verification) and has not
+    /// written since: the condition for "Re-anchor" (Δ-M10-1, PD-170). `None` while a restore
+    /// barrier holds the anchors (a restore running, or an interrupted restore being completed
+    /// or deferred: M2 handoff T16 M-7, never a lost anchor).
+    pub anchors_missing: Option<crate::types::MissingAnchor>,
 }
 
 /// One row's ciphertext and what opening it needs. No `Debug`: it holds a wrapped key.
@@ -745,6 +750,7 @@ impl Store {
                 .load(Ordering::Relaxed),
             anchor_dir_write_failing: d.write_failing,
             anchor_dir_lines_pending: d.lines_pending,
+            anchors_missing: a.missing,
         }
     }
 
@@ -993,12 +999,12 @@ impl Store {
     /// The `VERIFY {scope: "full"}` of a run over store file `generation`: refused (nothing
     /// appended) if a restore replaced that file meanwhile, so its findings, about the old
     /// file and the old anchors, never land in the restored chain.
-    fn append_full_verify(
+    pub(crate) fn append_full_verify(
         &self,
         findings: &[VerifyFinding],
         generation: u64,
     ) -> Result<Committed, AuditError> {
-        let mut p = self.verify_event("full", findings, None)?;
+        let mut p = self.verify_event("full", findings, None, None)?;
         p.for_generation = Some(generation);
         self.send_append(vec![p])?
             .pop()
@@ -1007,7 +1013,7 @@ impl Store {
 
     /// The findings of a full verification, without the `VERIFY` append, and the store file
     /// generation they are about (read before anything else).
-    fn run_full_verify(&self) -> Result<(Vec<VerifyFinding>, u64), AuditError> {
+    pub(crate) fn run_full_verify(&self) -> Result<(Vec<VerifyFinding>, u64), AuditError> {
         self.sender()?;
         let generation = self.inner.shared.generation.load(Ordering::SeqCst);
         // A keychain that does not answer ends the run (no "ok" without the anchor checks);
@@ -1084,14 +1090,84 @@ impl Store {
             .ok_or_else(|| AuditError::AppendFailed("the writer returned no row".into()))
     }
 
+    /// "Change recovery passphrase" (C.3, Δ-M10-1, §8.6, PD-169): the store's KEK is sealed
+    /// again under `new` (Argon2id, recovery layout 1 kept), the blob is opened with
+    /// `new_confirm` and compared before anything is written (as at first run), then the
+    /// `recovery` row and `CREDENTIAL_CHANGED {change: recovery_passphrase}` commit in one writer
+    /// transaction (that `change` is store-owned: `append` refuses it). The old passphrase is not
+    /// asked (the KEK is in memory) and no confirmation is needed (not a §10.3 weakening).
+    /// `Invalid(PASSPHRASE_TOO_SHORT | PASSPHRASE_MISMATCH)`: nothing written. The derivation runs
+    /// on the calling thread, never on the writer; a restore that replaced the KEK meanwhile makes
+    /// the writer refuse the blob (`Invalid`). The caller offers the recovery note afterwards.
+    pub fn change_recovery_passphrase(
+        &self,
+        new: &SecretString,
+        new_confirm: &SecretString,
+    ) -> Result<Committed, AuditError> {
+        crate::passphrase::change(self, new, new_confirm)
+    }
+
+    /// "Re-anchor" (C.3, Δ-M10-1, §8.7, PD-170, M2 handoff T15), after its native
+    /// confirmation: only while `health().anchors_missing` is `Some` (so never during an
+    /// interrupted restore) and no anchor barrier is installed (`Invalid` otherwise, nothing
+    /// written). The anchors are held still, a full verification runs, and unless its only
+    /// incidents are the missing anchors (then its `VERIFY {scope: full}` is appended and the
+    /// call is `Invalid`: a tampered store is never re-anchored) `VERIFY {scope: re_anchor,
+    /// result: re_anchored, dialog_text_sha256}` flagged `integrity_incident` is appended, then
+    /// both anchors are written from the verified store (first-retained, then head). Returns that
+    /// `VERIFY`. A keychain failure after it is the error; the incident stands and the anchors
+    /// stay missing (a retry logs another one).
+    pub fn re_anchor(&self, confirmed: Confirmed) -> Result<Committed, AuditError> {
+        crate::reanchor::re_anchor(self, confirmed)
+    }
+
+    /// `Closed` once this handle no longer serves the store.
+    pub(crate) fn ensure_open(&self) -> Result<(), AuditError> {
+        self.sender().map(drop)
+    }
+
+    /// The store file generation this handle serves (a restore commit bumps it).
+    pub(crate) fn generation(&self) -> u64 {
+        self.inner.shared.generation.load(Ordering::SeqCst)
+    }
+
+    /// A verification found both keychain anchor entries present: nothing is missing.
+    pub(crate) fn note_anchors_present(&self) {
+        self.inner.shared.anchors.set_missing(None);
+    }
+
+    /// Sends one writer command and waits for its reply (`Closed` once the writer stopped).
+    pub(crate) fn writer_call<T>(
+        &self,
+        make: impl FnOnce(SyncSender<Result<T, AuditError>>) -> Cmd,
+    ) -> Result<T, AuditError> {
+        let (reply, rx) = sync_channel(1);
+        self.sender()?
+            .send(make(reply))
+            .map_err(|_| AuditError::Closed)?;
+        rx.recv().map_err(|_| AuditError::Closed)?
+    }
+
+    /// The KEK this handle serves (a restore replaces it).
+    pub(crate) fn current_kek(&self) -> Kek {
+        lock(&self.inner.shared.keys).kek.clone()
+    }
+
+    /// This install's keystore.
+    pub(crate) fn keystore(&self) -> &dyn KeyStore {
+        &*self.inner.keys
+    }
+
     /// The `VERIFY` record of a run (F.11), flagged `integrity_incident` iff any finding is an
     /// incident kind; such a record also gets its incident file in the anchor dir once it
-    /// committed (PD-164).
-    fn verify_event(
+    /// committed (PD-164). `confirmed`: the native confirmation the run follows (re-anchor),
+    /// recorded as `dialog_text_sha256`.
+    pub(crate) fn verify_event(
         &self,
         scope: &str,
         findings: &[VerifyFinding],
         unanchored_tail: Option<u64>,
+        confirmed: Option<&Confirmed>,
     ) -> Result<PreparedEvent, AuditError> {
         let detected_at = self
             .inner
@@ -1101,7 +1177,10 @@ impl Store {
             .ok_or_else(|| {
                 AuditError::AppendFailed("wall clock outside years 0000..=9999".into())
             })?;
-        let payload = verify::verify_payload(scope, findings, &detected_at, unanchored_tail);
+        let mut payload = verify::verify_payload(scope, findings, &detected_at, unanchored_tail);
+        if let Some(c) = confirmed {
+            payload["dialog_text_sha256"] = json!(hex::encode(c.dialog_text_sha256));
+        }
         let mut p = PreparedEvent::system(EventType::VERIFY, &payload)?;
         p.incident = IncidentDraft::of(findings, &detected_at);
         if p.incident.is_some() {
@@ -1117,7 +1196,7 @@ impl Store {
         findings: &[VerifyFinding],
         unanchored_tail: Option<u64>,
     ) -> Result<Committed, AuditError> {
-        let p = self.verify_event(scope, findings, unanchored_tail)?;
+        let p = self.verify_event(scope, findings, unanchored_tail, None)?;
         self.send_append(vec![p])?
             .pop()
             .ok_or_else(|| AuditError::AppendFailed("the writer returned no row".into()))
@@ -1131,7 +1210,7 @@ impl Store {
         &self,
         findings: &[VerifyFinding],
     ) -> Result<(Committed, Committed), AuditError> {
-        let verify = self.verify_event("recover", findings, None)?;
+        let verify = self.verify_event("recover", findings, None, None)?;
         let recovered = PreparedEvent::system(
             EventType::KEY_RECOVERED,
             &json!({ "what": ["kek", "head_anchor", "first_retained_anchor", "pats_lost"] }),
@@ -1182,6 +1261,11 @@ impl Store {
     /// `PRUNE`/`RESTORE` for this process (a hold barrier nothing lifts), so the next start can
     /// reconcile it. If the `VERIFY` append fails, anchors stay disabled.
     pub(crate) fn apply_startup(&self, v: &StartupVerdict) -> Result<VerifyOutcome, AuditError> {
+        // Before anchor writes are enabled, so the anchor thread's first write clears it.
+        self.inner
+            .shared
+            .anchors
+            .set_missing(v.anchor_actions.anchors_missing);
         let verify_seq = if v.findings.is_empty() {
             None
         } else {

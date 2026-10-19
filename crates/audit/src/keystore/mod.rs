@@ -87,6 +87,14 @@ pub trait KeyStore: Send + Sync {
     /// Where the entries live (§8.6, I-44). Required, with no default: an impl that has no
     /// way to tell reports `Unknown`, which keeps the store locked (fail closed).
     fn locality(&self) -> KeyringLocality;
+    /// The same keyring addressed as install `install_id` (`atlas-duck/<install_id>/…`): "forget
+    /// old install" (PD-170) reads and deletes the entries of an install that only an archived
+    /// store names. `None` (the default) when this keystore cannot address another install; its
+    /// callers then refuse (fail closed).
+    fn for_install(&self, install_id: &str) -> Option<Box<dyn KeyStore>> {
+        let _ = install_id;
+        None
+    }
 }
 
 /// §8.6 canary: write a random value to the `Canary` entry, read it back, compare, delete it.

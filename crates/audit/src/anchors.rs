@@ -17,6 +17,7 @@ use serde_json::json;
 
 use crate::error::AuditError;
 use crate::keystore::{EntryName, KeyStore, KeyStoreError};
+use crate::types::MissingAnchor;
 
 /// Leading layout byte of the `head_anchor` and `first_retained_anchor` entries (F.6).
 pub const ANCHOR_LAYOUT: u8 = 1;
@@ -315,11 +316,17 @@ pub(crate) struct AnchorState {
     dead: bool,
     /// The thread left its loop (stop or panic).
     exited: bool,
+    /// The head anchor entry was found missing at startup and not written since (PD-170).
+    head_missing: bool,
+    /// The same for the first-retained entry (only prune, a restore or re-anchor write it).
+    first_retained_missing: bool,
 }
 
 impl AnchorState {
     fn new() -> AnchorState {
         AnchorState {
+            head_missing: false,
+            first_retained_missing: false,
             window: BATCH_WINDOW,
             wait_timeout: DEFAULT_WAIT_TIMEOUT,
             dead: false,
@@ -476,6 +483,8 @@ pub(crate) struct AnchorHealth {
     pub(crate) first_retained_pending: bool,
     pub(crate) blocked: Option<BarrierKind>,
     pub(crate) thread_dead: bool,
+    /// `None` behind a restore barrier: what the keychain holds then is the restore's to set.
+    pub(crate) missing: Option<MissingAnchor>,
 }
 
 /// Releases an installed barrier when dropped, unless [`BarrierGuard::complete`] says the
@@ -818,7 +827,22 @@ impl AnchorShared {
             ),
             blocked: st.barrier.as_ref().map(Barrier::kind),
             thread_dead: st.dead,
+            missing: match st.barrier {
+                Some(Barrier::Restore { .. } | Barrier::RestoreHold) => None,
+                _ => MissingAnchor::of(st.head_missing, st.first_retained_missing),
+            },
         }
+    }
+
+    /// The anchor entries startup verification found missing (PD-170); each flag clears once
+    /// this thread writes that entry. Set before anchor writes are enabled.
+    pub(crate) fn set_missing(&self, missing: Option<MissingAnchor>) {
+        let mut st = lock(&self.state);
+        st.head_missing = matches!(missing, Some(MissingAnchor::Head | MissingAnchor::Both));
+        st.first_retained_missing = matches!(
+            missing,
+            Some(MissingAnchor::FirstRetained | MissingAnchor::Both)
+        );
     }
 
     /// The thread dropped our reply sender: it stopped or panicked. Wait until it left, so the
@@ -941,6 +965,8 @@ fn run_loop(shared: &AnchorShared, keys: &dyn KeyStore, scale_div: u32) {
                     st.written_head = Some(job.head);
                     st.dirty_since = None;
                     st.clear_failure();
+                    st.head_missing = false;
+                    st.first_retained_missing = false;
                     Ok(())
                 }
                 Err(e) => {
@@ -981,6 +1007,8 @@ fn run_loop(shared: &AnchorShared, keys: &dyn KeyStore, scale_div: u32) {
                     st.written_head = Some(reset.head);
                     st.dirty_since = None;
                     st.clear_failure();
+                    st.head_missing = false;
+                    st.first_retained_missing = false;
                 }
                 Err(e) => st.schedule_retry(e.clone(), Instant::now(), scale_div),
             }
@@ -1021,6 +1049,7 @@ fn run_loop(shared: &AnchorShared, keys: &dyn KeyStore, scale_div: u32) {
                         st.barrier = None;
                     }
                     st.clear_failure();
+                    st.first_retained_missing = false;
                 }
                 Err(e) => {
                     st.schedule_retry(e.clone(), Instant::now(), scale_div);
@@ -1041,6 +1070,7 @@ fn run_loop(shared: &AnchorShared, keys: &dyn KeyStore, scale_div: u32) {
                 Ok(()) => {
                     st.written_head = Some(target);
                     st.clear_failure();
+                    st.head_missing = false;
                     // Commits during the write kept the window open: it restarts only if
                     // something newer than the written anchor remains.
                     st.dirty_since = st.head_stale().map(|_| Instant::now());
@@ -1239,6 +1269,36 @@ mod more_tests {
             .expect("again");
         g.complete();
         assert_eq!(a.health().blocked, Some(BarrierKind::Restore));
+    }
+
+    #[test]
+    fn missing_anchors_are_not_reported_behind_a_restore_barrier() {
+        // PD-170: what the keychain holds during a restore is the restore's to reset.
+        let a = shared(true);
+        a.set_missing(Some(MissingAnchor::Both));
+        assert_eq!(a.health().missing, Some(MissingAnchor::Both));
+        let g = a
+            .install_barrier(Barrier::Restore {
+                seq: 2,
+                reset: None,
+            })
+            .expect("restore barrier");
+        assert_eq!(a.health().missing, None);
+        drop(g);
+        let g = a.install_barrier(Barrier::RestoreHold).expect("hold");
+        assert_eq!(a.health().missing, None);
+        drop(g);
+        // A prune barrier does not hide them.
+        let _g = a
+            .install_barrier(Barrier::Prune {
+                seq: 3,
+                record_hash: [3; 32],
+                first_retained: fr(),
+            })
+            .expect("prune barrier");
+        assert_eq!(a.health().missing, Some(MissingAnchor::Both));
+        a.set_missing(None);
+        assert_eq!(a.health().missing, None);
     }
 
     #[test]

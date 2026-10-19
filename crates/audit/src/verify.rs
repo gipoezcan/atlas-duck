@@ -23,7 +23,7 @@ use crate::crypto::{self, Dek, Kek, ct_eq};
 use crate::encoding::{self, FIELD_LIST, FORMAT_VERSION, RowFields, ZERO_HASH};
 use crate::error::{AuditError, OpenError};
 use crate::request_set::{request_set_hash, requests_from_json};
-use crate::types::EventFlags;
+use crate::types::{EventFlags, MissingAnchor};
 
 /// At most this many findings of one kind are listed; the rest are counted in one summary
 /// finding, so a `VERIFY` payload stays far below the payload cap whatever the damage.
@@ -62,6 +62,10 @@ pub enum FindingKind {
     /// (§8.5, PD-167): a fact about the dir, never a finding of a store's own chain (not in
     /// [`CHAIN_KINDS`]). Its `VERIFY` names the chains under the payload key `chains`.
     PreviousChainFound,
+    /// "Re-anchor" (§8.7, PD-170): the keychain anchors were rewritten from the verified store
+    /// after an entry was lost. Recorded as an incident (it needs `INTEGRITY_ACK`), never a
+    /// finding of the chain (not in [`CHAIN_KINDS`]).
+    ReAnchored,
     // informational kinds
     UnanchoredTail,
     InterruptedPruneReconciled,
@@ -94,6 +98,7 @@ impl FindingKind {
             FindingKind::AnchorDirMismatch => "anchor_dir_mismatch",
             FindingKind::AnchoredRecordPrunedEarly => "anchored_record_pruned_early",
             FindingKind::PreviousChainFound => "previous_chain_found",
+            FindingKind::ReAnchored => "re_anchored",
             FindingKind::UnanchoredTail => "unanchored_tail",
             FindingKind::InterruptedPruneReconciled => "interrupted_prune_reconciled",
             FindingKind::InterruptedRestoreReconciled => "interrupted_restore_reconciled",
@@ -273,6 +278,10 @@ pub struct AnchorActions {
     pub defer_prune: Option<HeadAnchor>,
     /// The same for an interrupted restore: the `RESTORE` seq; no head anchor is written.
     pub defer_restore: Option<u64>,
+    /// The anchor entries found missing (absent or undecodable), outside an interrupted
+    /// restore (whose missing head anchor is the restore's, M2 handoff T16 M-7): the start
+    /// state of `StoreHealth.anchors_missing` (PD-170).
+    pub anchors_missing: Option<MissingAnchor>,
 }
 
 /// The startup verdict (§8.7 step 3), held in memory until step 4 appends its `VERIFY`.
@@ -1283,6 +1292,10 @@ fn check_anchors(
         }
         return Ok(res);
     }
+    res.actions.anchors_missing = MissingAnchor::of(
+        c.head_anchor.is_none() && c.head_newer.is_none(),
+        c.first_retained.is_none() && c.first_retained_newer.is_none(),
+    );
 
     // Head anchor.
     let mut anchor_ok_seq: Option<u64> = None;
@@ -2057,5 +2070,25 @@ mod tests {
         assert!(FindingKind::PreviousChainFound.is_incident());
         assert!(!CHAIN_KINDS.contains(&FindingKind::PreviousChainFound));
         assert_eq!(CHAIN_KINDS.len(), 11);
+    }
+
+    #[test]
+    fn re_anchored_is_an_incident_outside_the_chain_kinds() {
+        // Δ-M10-1, PD-170: it needs INTEGRITY_ACK, and is not a finding about the chain.
+        assert!(FindingKind::ReAnchored.is_incident());
+        assert!(!CHAIN_KINDS.contains(&FindingKind::ReAnchored));
+        assert_eq!(FindingKind::ReAnchored.as_str(), "re_anchored");
+    }
+
+    #[test]
+    fn missing_anchor_of_both_flags() {
+        use crate::types::MissingAnchor;
+        assert_eq!(MissingAnchor::of(false, false), None);
+        assert_eq!(MissingAnchor::of(true, false), Some(MissingAnchor::Head));
+        assert_eq!(
+            MissingAnchor::of(false, true),
+            Some(MissingAnchor::FirstRetained)
+        );
+        assert_eq!(MissingAnchor::of(true, true), Some(MissingAnchor::Both));
     }
 }

@@ -47,7 +47,8 @@ pub(crate) const CHANNEL_BOUND: usize = 64;
 /// bookkeeping or confirmation (C.3, §8.3): chain start, `prune_log`, segment boundary,
 /// incidents and acks, migrations, key recovery/rotation (a DEK in the same transaction),
 /// clock episodes, the legal hold (Rust-drawn confirmation, §8.8), backup and export receipts.
-/// `append` refuses them. `CONFIG_CHANGED` stays appendable by `core`, except with a policy key (`settings.rs`).
+/// `append` refuses them. `CONFIG_CHANGED` stays appendable by `core`, except with a policy key (`settings.rs`),
+/// and `CREDENTIAL_CHANGED` except with `change: recovery_passphrase` (`passphrase.rs`).
 const STORE_OWNED: [EventType; 12] = [
     EventType::GENESIS,
     EventType::PRUNE,
@@ -180,6 +181,15 @@ impl PreparedEvent {
         {
             return Err(AuditError::Invalid(
                 "policy settings change through apply_setting and reconcile_config_file only",
+            ));
+        }
+        // Store-owned for this change only (PD-169): logged with the `recovery` row it records.
+        if ev.event_type == EventType::CREDENTIAL_CHANGED
+            && ev.payload.get("change").and_then(Value::as_str)
+                == Some(crate::passphrase::RECOVERY_PASSPHRASE_CHANGE)
+        {
+            return Err(AuditError::Invalid(
+                "the recovery passphrase changes through change_recovery_passphrase only",
             ));
         }
         PreparedEvent::build(ev)
@@ -432,6 +442,14 @@ pub(crate) enum Cmd {
         out: PathBuf,
         install_id: String,
         reply: SyncSender<Result<BackupReceipt, AuditError>>,
+    },
+    /// `Store::change_recovery_passphrase` (PD-169): `blob` seals `kek` (checked against the KEK
+    /// in force); the `recovery` row and `event` in one transaction.
+    ChangeRecoveryPassphrase {
+        blob: Vec<u8>,
+        kek: Kek,
+        event: Box<PreparedEvent>,
+        reply: SyncSender<Result<Committed, AuditError>>,
     },
     /// Replaces the view without logging anything (feature `testing`): for tests that need
     /// exact seqs; the settings tests use the real calls.
@@ -1627,6 +1645,15 @@ impl Writer {
                     reply,
                 } => {
                     let r = self.backup_run(&out, &install_id);
+                    let _ = reply.send(r);
+                }
+                Cmd::ChangeRecoveryPassphrase {
+                    blob,
+                    kek,
+                    event,
+                    reply,
+                } => {
+                    let r = self.change_recovery_run(&blob, &kek, &event);
                     let _ = reply.send(r);
                 }
                 Cmd::Prune { confirm, reply } => {

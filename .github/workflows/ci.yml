@@ -495,6 +495,45 @@ jobs:
         if: runner.os == 'Linux'
         run: bash ci/keyring-ci.sh
 
+      # M10 Task 9: the recovery-tier store APIs (passphrase change, forget install) on the real
+      # keychain; every test of `recovery_tier_os` is #[ignore]d (7e570000... install ids, entries
+      # deleted on drop). An all-ignored target passes with zero tests run, so check-no-skips gets
+      # its `--list --ignored` output as the list and an empty ignored list: every one must pass.
+      - name: Audit recovery-tier OS keystore tests (Windows Credential Manager, #[ignore]d)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $a = @('test', '-p', 'atlas-duck-audit', '--locked', '--test', 'recovery_tier_os')
+          $log = Join-Path $env:RUNNER_TEMP 'recovery-tier-os.log'
+          $list = Join-Path $env:RUNNER_TEMP 'recovery-tier-os.list'
+          $none = Join-Path $env:RUNNER_TEMP 'recovery-tier-os.none'
+          cargo @a -- --ignored --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo @a -- --list --ignored 2>$null | Set-Content -Path $list -Encoding utf8
+          Set-Content -Path $none -Value '' -Encoding utf8
+          node ci/check-no-skips.mjs $log $list $none recovery_tier_os
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Audit recovery-tier OS keystore tests (macOS login keychain, #[ignore]d)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          args=(test -p atlas-duck-audit --locked --test recovery_tier_os)
+          cargo "${args[@]}" -- --ignored --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/recovery-tier-os.log"
+          cargo "${args[@]}" -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/recovery-tier-os.list"
+          : > "$RUNNER_TEMP/recovery-tier-os.none"
+          node ci/check-no-skips.mjs "$RUNNER_TEMP/recovery-tier-os.log" "$RUNNER_TEMP/recovery-tier-os.list" "$RUNNER_TEMP/recovery-tier-os.none" recovery_tier_os
+
+      - name: Audit recovery-tier OS keystore tests (Linux, file-backed Secret Service, #[ignore]d)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          KEYRING_CI_TEST=recovery_tier_os bash ci/keyring-ci.sh 2>&1 | tee "$RUNNER_TEMP/recovery-tier-os.log"
+          cargo test -p atlas-duck-audit --locked --test recovery_tier_os -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/recovery-tier-os.list"
+          : > "$RUNNER_TEMP/recovery-tier-os.none"
+          node ci/check-no-skips.mjs "$RUNNER_TEMP/recovery-tier-os.log" "$RUNNER_TEMP/recovery-tier-os.list" "$RUNNER_TEMP/recovery-tier-os.none" recovery_tier_os
+
       # T26 / T22: the same harness_smoke flow against the real OsKeyStore (a 7e570000... test
       # install id; a guard deletes the entries). CI=true is the guard's second opt-in. The harness
       # writes and deletes the entries through `atlas-duck-app __test-os-keystore`: a macOS
@@ -1143,6 +1182,16 @@ jobs:
 
       - name: Audit OS keychain tests (macOS login keychain, x86_64 under Rosetta)
         run: cargo test -p atlas-duck-audit --test os_keystore --locked --target x86_64-apple-darwin -- --ignored --test-threads=1 --nocapture
+
+      # M10 Task 9: the recovery-tier OS keystore tests as the native macOS leg (no skips).
+      - name: Audit recovery-tier OS keystore tests (macOS login keychain, x86_64 under Rosetta, #[ignore]d)
+        run: |
+          set -euo pipefail
+          args=(test -p atlas-duck-audit --locked --target x86_64-apple-darwin --test recovery_tier_os)
+          cargo "${args[@]}" -- --ignored --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/recovery-tier-os.log"
+          cargo "${args[@]}" -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/recovery-tier-os.list"
+          : > "$RUNNER_TEMP/recovery-tier-os.none"
+          node ci/check-no-skips.mjs "$RUNNER_TEMP/recovery-tier-os.log" "$RUNNER_TEMP/recovery-tier-os.list" "$RUNNER_TEMP/recovery-tier-os.none" recovery_tier_os
 
       # M4 plan Task 26 (T26a): the same cli_flows run as the native macOS leg, x86_64 under Rosetta.
       - name: M4 app lib tests and cli_flows x86_64-apple-darwin (no skips, pass-count minimum)

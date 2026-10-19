@@ -176,4 +176,14 @@ impl KeyStore for OsKeyStore {
             },
         }
     }
+
+    /// The same platform store and locality dirs under another install's service name.
+    fn for_install(&self, install_id: &str) -> Option<Box<dyn KeyStore>> {
+        Some(Box::new(OsKeyStore {
+            install_id: install_id.to_string(),
+            service: service_name(install_id),
+            store: self.store.clone(),
+            dirs: self.dirs.clone(),
+        }))
+    }
 }

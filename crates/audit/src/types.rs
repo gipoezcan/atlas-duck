@@ -253,6 +253,28 @@ pub enum QueryKind {
     Cql,
 }
 
+/// Which keychain anchor entry is missing (Δ-M10-1, PD-170): `StoreHealth.anchors_missing`, the
+/// condition under which Settings offers "Re-anchor". An entry that does not decode counts as
+/// missing, as at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingAnchor {
+    Head,
+    FirstRetained,
+    Both,
+}
+
+impl MissingAnchor {
+    /// `None` when neither entry is missing.
+    pub(crate) fn of(head: bool, first_retained: bool) -> Option<MissingAnchor> {
+        match (head, first_retained) {
+            (true, true) => Some(MissingAnchor::Both),
+            (true, false) => Some(MissingAnchor::Head),
+            (false, true) => Some(MissingAnchor::FirstRetained),
+            (false, false) => None,
+        }
+    }
+}
+
 /// Proof that the native confirmation dialog returned Ok (built by `core`, M3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Confirmed {

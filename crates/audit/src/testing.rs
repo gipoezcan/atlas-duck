@@ -239,6 +239,10 @@ impl KeyStore for MemKeyStore {
     fn locality(&self) -> KeyringLocality {
         lock(&self.ring.locality).clone()
     }
+
+    fn for_install(&self, install_id: &str) -> Option<Box<dyn KeyStore>> {
+        Some(Box::new(MemKeyStore::new(self.ring.clone(), install_id)))
+    }
 }
 
 /// Where the store consults [`Faults`] (feature `testing` only; release builds have no hooks).
@@ -286,6 +290,9 @@ pub enum FaultPoint {
     /// Export: at the top of each row of a batch, before the row's cancel check. An armed
     /// failure ends the export there.
     ExportRow,
+    /// Recovery-passphrase change: inside its transaction, after the `recovery` row was
+    /// rewritten and before its `CREDENTIAL_CHANGED` is inserted. An armed failure rolls both back.
+    RecoveryRowWritten,
 }
 
 /// Runs when a [`FaultPoint`] is reached (see [`Faults::on_hit`]).

@@ -98,6 +98,8 @@ rust:audit-keychain:
     - export TMPDIR="$CI_PROJECT_DIR/.tmp" XDG_DATA_HOME="$CI_PROJECT_DIR/.xdg"
     - mkdir -p "$TMPDIR" "$XDG_DATA_HOME"
     - bash ci/keyring-ci.sh
+    # M10 Task 9: the recovery-tier store APIs on the same Secret Service (all #[ignore]d).
+    - KEYRING_CI_TEST=recovery_tier_os bash ci/keyring-ci.sh
 
 node:ci-checks:
   stage: check

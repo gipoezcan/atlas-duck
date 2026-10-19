@@ -604,7 +604,7 @@ fn covers(path: &Path, a: &ArchivedDb, witness: &Witness) -> Result<bool, OpenEr
 /// `(chain_id, head_seq, stamp)` of an archive file name `audit-<chain_id>-<head_seq>-<stamp>.db`
 /// as [`archive_and_start_fresh`] writes it; `None` for any other name (its WAL and `-shm` files,
 /// a stray file).
-fn parse_archive_name(name: &str) -> Option<(String, u64, String)> {
+pub(crate) fn parse_archive_name(name: &str) -> Option<(String, u64, String)> {
     let rest = name.strip_prefix("audit-")?.strip_suffix(".db")?;
     let (chain_id, rest) = rest.split_once('-')?;
     let (seq, stamp) = rest.split_once('-')?;

@@ -42,10 +42,13 @@ mod crypto;
 pub mod encoding;
 pub mod error;
 pub mod export;
+mod forget;
 mod incidents;
 pub mod keystore;
 pub mod open;
+mod passphrase;
 mod prune;
+mod reanchor;
 pub mod recover;
 // The recovery blob (Argon2id, the KEK it seals): crate-internal in production, like `crypto`.
 #[cfg(any(test, feature = "testing"))]
@@ -81,11 +84,13 @@ pub use clock::{Clock, SystemClock};
 pub use crypto::MAX_PAYLOAD_LEN;
 pub use error::{AuditError, OpenError, RestoreError};
 pub use export::{MAX_EXPORT_CT_LEN, MAX_EXPORT_LINE_BYTES};
+pub use forget::{ForgetReport, OrphanInstall, forget_install, orphan_installs};
 pub use keystore::{EntryName, KeyStore, KeyStoreError, KeyringLocality, OsKeyStore};
 pub use open::{
     ArchivedDb, FirstRunInput, LockedReason, RecoveryOffer, StartupOutcome, create_new_store,
     keychain_retry_schedule, new_ids, open, read_store_install_id,
 };
+pub use passphrase::{PASSPHRASE_MISMATCH, PASSPHRASE_TOO_SHORT};
 pub use prune::{PruneOutcome, PruneSkip};
 pub use recover::{RecoverReport, archive_and_start_fresh, latest_archived, recover_this_log};
 pub use recovery::MIN_PASSPHRASE_CHARS;
@@ -100,7 +105,8 @@ pub use settings::{
 pub use store::{Hooks, OpenConfig, Store, StoreHealth};
 pub use types::{
     Actor, Committed, Confirmed, DecisionColumn, EventFlags, EventHeader, EventType, ExportControl,
-    ExportReceipt, ExportVerdict, NewEvent, QueryKind, RustChosenPath, TimeRange, UtcInstant,
+    ExportReceipt, ExportVerdict, MissingAnchor, NewEvent, QueryKind, RustChosenPath, TimeRange,
+    UtcInstant,
 };
 pub use verify::{FindingKind, VerifyFinding, VerifyOutcome};
 pub use verify_export::verify_export;
