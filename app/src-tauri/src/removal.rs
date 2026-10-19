@@ -407,7 +407,9 @@ impl RemovalState {
             recorded: true,
             autostart_removed: open.autostart_removed,
         });
-        inner.backup_made = open.backup;
+        // A backup made in this process before the first hydrating call (the Audit window's "Back
+        // up now") belongs to the open procedure too.
+        inner.backup_made |= open.backup;
     }
 
     /// A removal call is running now (the credential window must not open meanwhile).
@@ -701,9 +703,9 @@ pub fn begin_text(targets: &[(String, bool)]) -> String {
             ""
         };
         format!(
-            "The stored token of each of these instances will be deleted: {list}. {unknown}A \
-             deleted token stays valid on the Jira/Confluence server until you revoke it there; \
-             the next step lists each one."
+            "Any token stored for these instances will be deleted: {list}. {unknown}A deleted \
+             token stays valid on the Jira/Confluence server until you revoke it there; the next \
+             step lists each one."
         )
     };
     format!(
@@ -1523,6 +1525,15 @@ mod tests {
                 },
             ]
         );
+        // A backup made in this process before the log was read (Audit window) is kept.
+        let backed_up = RemovalState::default();
+        backed_up.lock().backup_made = true;
+        let mut unbacked = facts.clone();
+        if let Some(open) = unbacked.open.as_mut() {
+            open.backup = false;
+        }
+        backed_up.hydrate(unbacked, &views);
+        assert!(backed_up.dto(ret).backup_made);
         // A procedure begun in this process is not replaced by the log's.
         let own = RemovalState::default();
         own.lock().procedure = Some(Procedure::default());
