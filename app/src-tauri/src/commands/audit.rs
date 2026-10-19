@@ -2,7 +2,7 @@
 //! M10 T12): `verify_now`, the read-only queries (`audit_query`, `audit_trail`, `audit_status`),
 //! the payload view (`audit_payload`), the incident acknowledgement (`acknowledge_incident`) and
 //! the export and backup triggers (`export_trigger`, `export_cancel`, `backup_trigger`). Granted to
-//! `audit` only.
+//! `audit` only, except `backup_trigger`, which Settings holds too (M10 T13).
 //!
 //! - **No path, no bytes in.** Every argument struct is closed (`deny_unknown_fields`) and bounded
 //!   while it is parsed; the export and backup folders come from Rust's own folder dialog.

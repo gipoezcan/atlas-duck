@@ -397,8 +397,9 @@ pub struct ServeState {
     /// retry, and (M9 Δ4) serves the `StoreFailed` gate. Only a restart clears it.
     store_failed: AtomicBool,
     hooks: ServeHooks,
-    /// The Audit window's one long job (M10 T12, PD-181): an export or a backup, from its dialogs
-    /// to its end. The quit path sets its cancel flag and waits for it before the core's shutdown.
+    /// The one long audit job (M10 T12/T13, PD-181): an export, a backup or a Settings restore,
+    /// from its dialogs to its end. The quit path sets its cancel flag (and cancels a restore's
+    /// store call that has not begun) and waits for it before the core's shutdown.
     audit_job: Mutex<Option<AuditJob>>,
 }
 
