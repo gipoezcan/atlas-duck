@@ -506,6 +506,8 @@ impl World {
                 passphrase: SecretString::from(PASSPHRASE.to_owned()),
                 passphrase_confirm: SecretString::from(PASSPHRASE.to_owned()),
                 archived_db: None,
+                anchor_dir: None,
+                archive_confirmed: None,
             },
         )
         .map_err(short_err)?;

@@ -1703,6 +1703,10 @@ impl Opener {
                 passphrase,
                 passphrase_confirm: confirm,
                 archived_db: archived,
+                // The wizard's anchor-dir step and the archive confirmation it carries are
+                // Task 15's (PD-167, PD-171).
+                anchor_dir: None,
+                archive_confirmed: None,
             },
         )
         .map_err(|e| FirstStoreFailure::of(&e))?;
@@ -2397,6 +2401,8 @@ mod tests {
                 passphrase: SecretString::from(pass.to_owned()),
                 passphrase_confirm: SecretString::from(pass.to_owned()),
                 archived_db: None,
+                anchor_dir: None,
+                archive_confirmed: None,
             },
         )?;
         store.recent_headers(Duration::from_secs(60))?;
@@ -2510,6 +2516,8 @@ mod tests {
                 passphrase: SecretString::from(pass.to_owned()),
                 passphrase_confirm: SecretString::from(pass.to_owned()),
                 archived_db: None,
+                anchor_dir: None,
+                archive_confirmed: None,
             },
         )?;
         Ok((store, keys, lock))

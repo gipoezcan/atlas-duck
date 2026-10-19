@@ -104,6 +104,8 @@ pub fn input(install_id: &str, chain_id: &str, pass: &str, confirm: &str) -> Fir
         passphrase: SecretString::from(pass.to_string()),
         passphrase_confirm: SecretString::from(confirm.to_string()),
         archived_db: None,
+        anchor_dir: None,
+        archive_confirmed: None,
     }
 }
 

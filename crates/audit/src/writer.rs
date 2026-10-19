@@ -95,6 +95,22 @@ pub(crate) fn ts_text(t: UtcInstant) -> Result<String, AuditError> {
         .ok_or_else(|| AuditError::AppendFailed("wall clock outside years 0000..=9999".into()))
 }
 
+/// What a first run writes besides the keys (§2.5 (1b), §8.5, PD-167, PD-171): the `GENESIS`
+/// links and, in the same transaction, in this order, the wizard's anchor dir as a setting (its
+/// row and the view after it), the `previous_chain_found` incident and the archive's
+/// confirmation.
+pub(crate) struct FirstRunRecords {
+    /// `GENESIS.archived_db` (or `null`).
+    pub(crate) archived_db: Value,
+    /// `GENESIS.previous_chain_id` (or `null`).
+    pub(crate) previous_chain_id: Value,
+    /// `GENESIS.previous_last_anchor` `{seq, record_hash, epoch}` (or `null`).
+    pub(crate) previous_last_anchor: Value,
+    pub(crate) setting: Option<(PreparedEvent, Settings)>,
+    pub(crate) incident: Option<PreparedEvent>,
+    pub(crate) archive_confirmation: Option<PreparedEvent>,
+}
+
 /// One event after F.3 steps 1–3 (JCS, SHA-256, zstd), ready for the writer. No `Debug`: it
 /// holds the compressed plaintext.
 pub(crate) struct PreparedEvent {
@@ -970,13 +986,15 @@ impl Writer {
     }
 
     /// `GENESIS` (seq 1, F.11), the uncorroborated DEK (key_id 1, `month` NULL) and the
-    /// `recovery` row, in one transaction on a store created by [`Writer::create`].
+    /// `recovery` row, then the rows of `r` that follow it, all in one transaction on a store
+    /// created by [`Writer::create`] (the first run renames the file to `audit.db` only after
+    /// this commit, so no store ever lacks them, PD-167). Returns `(GENESIS, head)`.
     pub(crate) fn write_genesis(
         &mut self,
         recovery_blob: &[u8],
         install_id: &str,
-        archived_db: Option<Value>,
-    ) -> Result<Committed, AuditError> {
+        r: FirstRunRecords,
+    ) -> Result<(Committed, Committed), AuditError> {
         if self.st.head.seq != 0 {
             return Err(AuditError::AppendFailed(
                 "GENESIS on a non-empty store".into(),
@@ -996,9 +1014,9 @@ impl Writer {
                 "chain_id": st.head.chain_id,
                 "install_id": install_id,
                 "created_at": created_at,
-                "archived_db": archived_db.unwrap_or(Value::Null),
-                "previous_chain_id": null,
-                "previous_last_anchor": null,
+                "archived_db": r.archived_db,
+                "previous_chain_id": r.previous_chain_id,
+                "previous_last_anchor": r.previous_last_anchor,
             }),
         )?;
         p.target = Some(install_id.to_string());
@@ -1008,11 +1026,27 @@ impl Writer {
         )
         .map_err(sql)?;
         let mut new_keys = HashMap::new();
-        let c = st.insert_one(&tx, &stamp, &p, mono, &mut new_keys)?;
+        let genesis = st.insert_one(&tx, &stamp, &p, mono, &mut new_keys)?;
+        let mut head = genesis;
+        let mut opened = Vec::new();
+        if let Some((row, _)) = &r.setting {
+            head = st.append_in_tx(&tx, row, &mut new_keys)?;
+        }
+        if let Some(row) = &r.incident {
+            head = st.append_in_tx(&tx, row, &mut new_keys)?;
+            opened.push(IncidentChange::Opened(head.seq));
+        }
+        if let Some(row) = &r.archive_confirmation {
+            head = st.append_in_tx(&tx, row, &mut new_keys)?;
+        }
         tx.commit().map_err(sql)?;
-        st.genesis_hash = Some(c.record_hash);
-        st.post_commit(new_keys, &[]);
-        Ok(c)
+        self.st.genesis_hash = Some(genesis.record_hash);
+        // Before the rows' anchor-dir lines are queued: they go to the setting's dir.
+        if let Some((_, view)) = r.setting {
+            self.set_view(view);
+        }
+        self.st.post_commit(new_keys, &opened);
+        Ok((genesis, head))
     }
 
     /// The restore transaction on a staging copy (§8.11 steps 3 and 5; plan order): any

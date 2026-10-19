@@ -5,7 +5,8 @@
 //! the store's chains (only `<chain_id>.jsonl` names: the incident files
 //! `<chain_id>.incident-<verify_seq>.json` beside them never reach the parser, PD-164) and
 //! [`check`] compares them with the store (§8.7). A line torn by a crash is tolerated on both
-//! sides (PD-165, see `parse_file`).
+//! sides (PD-165, see `parse_file`). At a first run, `previous_chains` finds the chain files of
+//! this host and OS user the chosen dir already holds (§8.5, PD-167).
 //!
 //! Lines are JCS text (sorted keys, no whitespace); a line that is not exactly what
 //! [`to_line`] produces for its content is rejected. Hashes are 64 lowercase hex characters,
@@ -22,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use atlas_duck_ipc::jcs::{MAX_SAFE_INTEGER, to_jcs_vec};
 use chrono::NaiveDate;
@@ -51,6 +53,10 @@ pub const MAX_LINES: usize = 1_000_000;
 
 /// Unparseable lines reported one by one per file; the rest is counted in one summary.
 pub const MAX_BAD_LINES_REPORTED: usize = 16;
+
+/// Chain files (`<chain_id>.jsonl`) a first run reads to find previous chains (PD-167, the same
+/// bound as the export verifier's, PD-162); an anchor dir holding more is refused.
+pub const MAX_FIRST_RUN_CHAIN_FILES: usize = 256;
 
 /// The event types written as immediate lines (§8.5).
 const IMMEDIATE_TYPES: [&str; 6] = [
@@ -755,6 +761,149 @@ fn parse_file(
         ));
     }
     lines
+}
+
+// ---------------------------------------------------------------------------------------
+// Previous chains at a first run (§8.5 "First run against a used anchor dir", PD-167)
+
+/// A chain file of this host and OS user that a first run found in its anchor dir.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreviousChain {
+    /// The file's `<chain_id>`.
+    pub(crate) chain_id: String,
+    /// The last line in file order that names a record: `(seq, record_hash, epoch)`.
+    pub(crate) last: Option<(u64, [u8; 32], Option<String>)>,
+    pub(crate) mtime: Option<SystemTime>,
+    /// Every `(seq, record_hash)` the file's lines name, kept only for the chain asked for and
+    /// only when the whole file was read and every line parsed (torn lines aside). `None`: no
+    /// complete witness, so no archive can be shown to cover it.
+    pub(crate) named: Option<Vec<(u64, [u8; 32])>>,
+}
+
+impl PreviousChain {
+    /// "Newest" (PD-167): the last line's `epoch` (a dated line after an undated one, `None`
+    /// lowest), then the file's mtime, then the id (deterministic).
+    fn newness(&self) -> (Option<&str>, Option<SystemTime>, &str) {
+        (
+            self.last.as_ref().and_then(|l| l.2.as_deref()),
+            self.mtime,
+            &self.chain_id,
+        )
+    }
+}
+
+/// The chains of this `host` and `os_user` in `dir` (headers compared exactly, after the
+/// writer's bounds; RF-3), newest first, for a first run whose own chain is `own_chain`. Only
+/// regular files named `<chain_id>.jsonl` are read (never an incident file), each with the
+/// bounds and the torn-line rule of [`load`] (a header after a torn line 1 counts), and nothing
+/// is written. A file whose first readable line is a header of this host and user is a previous
+/// chain, whatever else it holds. `named` is kept for `keep_named` only.
+///
+/// Refused (`Invalid`), so that a first run never starts over a dir it could not check: a dir
+/// that is not absolute, not a directory or cannot be listed; more than
+/// [`MAX_FIRST_RUN_CHAIN_FILES`] chain files; a chain file that cannot be read.
+pub(crate) fn previous_chains(
+    dir: &Path,
+    host: &str,
+    os_user: &str,
+    own_chain: &str,
+    keep_named: Option<&str>,
+) -> Result<Vec<PreviousChain>, OpenError> {
+    let unreadable = || OpenError::Invalid("the anchor directory cannot be read");
+    if !dir.is_absolute() {
+        return Err(OpenError::Invalid(
+            "the anchor directory is not an absolute path",
+        ));
+    }
+    match std::fs::metadata(dir) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => {
+            return Err(OpenError::Invalid(
+                "the anchor directory is not a directory",
+            ));
+        }
+        Err(_) => return Err(unreadable()),
+    }
+    let mut chains = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|_| unreadable())? {
+        let entry = entry.map_err(|_| unreadable())?;
+        let name = entry.file_name();
+        let Some(chain) = name
+            .to_str()
+            .and_then(|n| n.strip_suffix(".jsonl"))
+            .filter(|c| is_id(c) && *c != own_chain)
+        else {
+            continue;
+        };
+        chains.push(chain.to_owned());
+        if chains.len() > MAX_FIRST_RUN_CHAIN_FILES {
+            return Err(OpenError::Invalid(
+                "the anchor directory holds more chain files than a first run reads",
+            ));
+        }
+    }
+    chains.sort();
+    let mut out = Vec::new();
+    for chain in chains {
+        let name = file_name(&chain);
+        let path = dir.join(&name);
+        // Only a regular file is opened (a FIFO would block); one gone since the listing is not
+        // a chain.
+        match std::fs::metadata(&path) {
+            Ok(m) if m.is_file() => {}
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                return Err(OpenError::Invalid(
+                    "a chain file in the anchor directory cannot be read",
+                ));
+            }
+        }
+        let (bytes, whole) = read_prefix(&path).map_err(|_| {
+            OpenError::Invalid("a chain file in the anchor directory cannot be read")
+        })?;
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        let lines = parse_file(&name, &chain, &bytes, &mut problems, &mut notes);
+        let ours = matches!(lines.first(),
+            Some((_, AnchorLine::Header { host: h, os_user: u, .. })) if h == host && u == os_user);
+        if !ours {
+            continue;
+        }
+        let complete = whole && problems.is_empty();
+        out.push(PreviousChain {
+            last: lines
+                .iter()
+                .rev()
+                .find_map(|(_, l)| named(l))
+                .map(|n| (n.seq, *n.record_hash, n.epoch.clone())),
+            mtime: std::fs::metadata(&path).and_then(|m| m.modified()).ok(),
+            named: (complete && keep_named == Some(chain.as_str())).then(|| {
+                lines
+                    .iter()
+                    .filter_map(|(_, l)| named(l).map(|n| (n.seq, *n.record_hash)))
+                    .collect()
+            }),
+            chain_id: chain,
+        });
+    }
+    out.sort_by(|a, b| b.newness().cmp(&a.newness()));
+    Ok(out)
+}
+
+/// At most [`MAX_FILE_BYTES`] of the file, cut after its last complete line when it is longer;
+/// `true` when that is the whole file.
+fn read_prefix(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 <= MAX_FILE_BYTES {
+        return Ok((bytes, true));
+    }
+    // The partial last line is dropped from the buffer (the file itself is only read).
+    let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    drop(bytes.split_off(complete));
+    Ok((bytes, false))
 }
 
 // ---------------------------------------------------------------------------------------

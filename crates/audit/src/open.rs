@@ -15,19 +15,22 @@ use rusqlite::{Connection, OptionalExtension};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 
-use crate::anchor_dir::{self, AnchorDirLines};
+use crate::anchor_dir::writer::{HeaderFacts, IncidentDraft};
+use crate::anchor_dir::{self, AnchorDirLines, PreviousChain};
 use crate::anchors::{self, AnchorLoadError, FirstRetainedAnchor, HeadAnchor};
 use crate::crypto::{self, Kek, KekEntryError, fill_random};
 use crate::encoding::ZERO_HASH;
 use crate::error::{AuditError, OpenError};
 use crate::keystore::{EntryName, KeyStore, KeyStoreError, KeyringLocality, canary_self_test};
 use crate::lock::InstanceLock;
+use crate::recover;
 use crate::recovery::{check_new_passphrase, new_recovery_blob};
 use crate::schema::{self, StoreVersions};
 use crate::settings;
 use crate::store::{AnchorInit, OpenConfig, Store};
+use crate::types::{Confirmed, EventFlags, EventType, RustChosenPath};
 use crate::verify::{self, StartupInputs, StartupVerdict, VerifyOutcome};
-use crate::writer::{Writer, WriterParts};
+use crate::writer::{FirstRunRecords, PreparedEvent, Writer, WriterParts};
 
 /// First-run staging file: the new DB is renamed to `audit.db` only once `GENESIS` committed
 /// (plan decision), so a crash never leaves an `audit.db` without `GENESIS`.
@@ -108,13 +111,17 @@ pub fn keychain_retry_schedule() -> &'static [Duration] {
 }
 
 /// What the wizard collected (§2.5 step (1b)): ids from [`new_ids`], the recovery passphrase
-/// typed twice, and the archived DB when started fresh beside one (§8.7).
+/// typed twice, the archived DB when started fresh beside one (§8.7), the anchor dir chosen in
+/// the wizard (§8.5, logged as the store's `anchor_dir` setting) and the archive's native
+/// confirmation (PD-171, logged right after `GENESIS`; only together with `archived_db`).
 pub struct FirstRunInput {
     pub install_id: String,
     pub chain_id: String,
     pub passphrase: SecretString,
     pub passphrase_confirm: SecretString,
     pub archived_db: Option<ArchivedDb>,
+    pub anchor_dir: Option<RustChosenPath>,
+    pub archive_confirmed: Option<Confirmed>,
 }
 
 /// `GENESIS.archived_db` (F.11).
@@ -317,19 +324,20 @@ struct FirstRun {
     recovery_blob: Vec<u8>,
     install_id: String,
     chain_id: String,
-    archived_db: Option<Value>,
+    records: FirstRunRecords,
     renamed: Arc<AtomicBool>,
 }
 
 impl FirstRun {
-    /// Runs on the writer thread: `GENESIS` under `audit.db.new`, close and fsync, both
-    /// anchors, rename to `audit.db`, then the writer's read-write open of `audit.db`.
+    /// Runs on the writer thread: `GENESIS` and the rows that follow it under `audit.db.new`,
+    /// close and fsync, both anchors (the head anchor at the last of those rows), rename to
+    /// `audit.db`, then the writer's read-write open of `audit.db`.
     fn run(self, parts: WriterParts) -> Result<Writer, OpenError> {
         #[cfg(any(test, feature = "testing"))]
         let hooks = parts.hooks.clone();
         let mut w = Writer::create(&self.new, parts, &self.chain_id)?;
-        let genesis = w
-            .write_genesis(&self.recovery_blob, &self.install_id, self.archived_db)
+        let (genesis, last) = w
+            .write_genesis(&self.recovery_blob, &self.install_id, self.records)
             .map_err(audit_err)?;
         if genesis.seq != 1 {
             return Err(OpenError::Integrity("GENESIS did not get seq 1".into()));
@@ -337,8 +345,8 @@ impl FirstRun {
         let parts = w.close_for_rename(&self.new)?;
         let head = HeadAnchor {
             chain_id: self.chain_id.clone(),
-            seq: genesis.seq,
-            record_hash: genesis.record_hash,
+            seq: last.seq,
+            record_hash: last.record_hash,
         }
         .to_entry()
         .map_err(audit_err)?;
@@ -787,13 +795,111 @@ pub fn read_store_install_id(data: &LocalDataDir) -> Result<Option<String>, Open
     }
 }
 
+/// The first run's `GENESIS` links and the rows that follow it (§8.5 "First run against a used
+/// anchor dir", §8.7, PD-167, PD-171), from the anchor dir the store will use (the wizard's,
+/// else `OpenConfig.anchor_dir`). Reads only; a dir that cannot be checked is refused (see
+/// [`anchor_dir::previous_chains`]).
+/// - `GENESIS.previous_chain_id` / `previous_last_anchor`: the newest chain of this host and OS
+///   user found there, and its last anchored `{seq, record_hash, epoch}` (also when exempt: it
+///   is the predecessor either way);
+/// - the wizard's dir as the store's `anchor_dir` setting;
+/// - `VERIFY {scope: first_run, result: previous_chain_found, chains}` flagged
+///   `integrity_incident` naming every found chain but the `archived_db` chain whose archive
+///   covers its anchors ([`recover::archive_covers`]); none when no other chain is left;
+/// - `CONFIG_CHANGED {source: app, key: archive_and_start_fresh, archived_db_file,
+///   dialog_text_sha256}` for the archive's native confirmation.
+fn first_run_records(
+    data: &LocalDataDir,
+    cfg: &OpenConfig,
+    input: &FirstRunInput,
+    wizard_dir: Option<&str>,
+) -> Result<FirstRunRecords, OpenError> {
+    let dir = anchor_dir::resolve(wizard_dir, cfg.anchor_dir.as_deref());
+    let header = HeaderFacts::new(input.install_id.clone(), cfg.clock.clone());
+    let archived = input.archived_db.as_ref();
+    let found = match &dir {
+        Some(d) => anchor_dir::previous_chains(
+            d,
+            header.host(),
+            header.os_user(),
+            &input.chain_id,
+            archived.map(|a| a.chain_id.as_str()),
+        )?,
+        None => Vec::new(),
+    };
+    let newest = found.first();
+    let previous_chain_id = newest.map_or(Value::Null, |c| json!(c.chain_id));
+    let previous_last_anchor = newest
+        .and_then(|c| c.last.as_ref())
+        .map_or(Value::Null, |(seq, hash, epoch)| {
+            json!({ "seq": seq, "record_hash": hex::encode(hash), "epoch": epoch })
+        });
+    let not_exempt: Vec<PreviousChain> = found
+        .iter()
+        .filter(|c| !archived.is_some_and(|a| recover::archive_covers(data, a, c)))
+        .cloned()
+        .collect();
+    let incident = if not_exempt.is_empty() {
+        None
+    } else {
+        let detected_at = cfg.clock.now_utc().try_to_rfc3339_ms().ok_or_else(|| {
+            OpenError::Io(io::Error::other("wall clock outside years 0000..=9999"))
+        })?;
+        let (findings, payload) = verify::previous_chain_verify(&not_exempt, &detected_at);
+        let mut p = PreparedEvent::system(EventType::VERIFY, &payload).map_err(audit_err)?;
+        p.incident = IncidentDraft::of(&findings, &detected_at);
+        p.store_flags = EventFlags::INTEGRITY_INCIDENT;
+        Some(p)
+    };
+    let setting = wizard_dir
+        .map(settings::first_run_anchor_dir)
+        .transpose()
+        .map_err(audit_err)?;
+    let archive_confirmation = match (&input.archive_confirmed, archived) {
+        (Some(c), Some(a)) => Some(
+            PreparedEvent::system(
+                EventType::CONFIG_CHANGED,
+                &json!({
+                    "source": "app",
+                    "key": "archive_and_start_fresh",
+                    "archived_db_file": a.file,
+                    "dialog_text_sha256": hex::encode(c.dialog_text_sha256),
+                }),
+            )
+            .map_err(audit_err)?,
+        ),
+        _ => None,
+    };
+    let archived_db = archived.map_or(Value::Null, |a| {
+        json!({
+            "file": a.file,
+            "chain_id": a.chain_id,
+            "head_seq": a.head_seq,
+            "head_hash": hex::encode(a.head_hash),
+        })
+    });
+    Ok(FirstRunRecords {
+        archived_db,
+        previous_chain_id,
+        previous_last_anchor,
+        setting,
+        incident,
+        archive_confirmation,
+    })
+}
+
 /// Wizard step (1b): a new store with `GENESIS` (C.3). In order: refuse an existing DB →
-/// `install_id` must be the keystore's → the passphrase rules (pure, before any keychain
+/// `install_id` must be the keystore's → the wizard's anchor dir must be absolute UTF-8, and an
+/// archive confirmation needs an archived DB → the passphrase rules (pure, before any keychain
 /// access) → keyring locality (no keyring call unless `Local`) → canary → no `kek`/anchor
-/// entry may exist yet under this `install_id` (`Invalid`, never overwritten) → KEK and the
-/// recovery blob (sealed, reopened with the second entry and compared) → KEK to the keychain
-/// → `GENESIS` under `audit.db.new` → anchors → rename. Any failure before the rename leaves
-/// no DB file and deletes the keychain entries it wrote (best effort).
+/// entry may exist yet under this `install_id` (`Invalid`, never overwritten) → the anchor dir
+/// is read for previous chains (`first_run_records`; a dir that cannot be checked is
+/// `Invalid`) → KEK and the recovery blob (sealed, reopened with the second entry and compared)
+/// → KEK to the keychain → under `audit.db.new`, in one transaction, `GENESIS`, the anchor-dir
+/// setting, the `previous_chain_found` incident and the archive confirmation → anchors (the
+/// head at the last of those rows) → rename. Nothing is written to the anchor dir before the
+/// store exists (its writer then creates the chain file, header first). Any failure before the
+/// rename leaves no DB file and deletes the keychain entries it wrote (best effort).
 pub fn create_new_store(
     data: &LocalDataDir,
     lock: &InstanceLock,
@@ -824,6 +930,25 @@ pub fn create_new_store(
             "install_id and chain_id must be 32 lowercase hex characters",
         ));
     }
+    // The wizard's anchor dir becomes the store's setting: absolute UTF-8 text, as
+    // `Store::change_anchor_dir` requires.
+    let wizard_dir = match &input.anchor_dir {
+        None => None,
+        Some(p) => Some(
+            p.path()
+                .to_str()
+                .filter(|s| !s.is_empty() && p.path().is_absolute())
+                .ok_or(OpenError::Invalid(
+                    "the anchor directory is not an absolute UTF-8 path",
+                ))?
+                .to_owned(),
+        ),
+    };
+    if input.archive_confirmed.is_some() && input.archived_db.is_none() {
+        return Err(OpenError::Invalid(
+            "an archive confirmation without an archived store",
+        ));
+    }
     check_new_passphrase(&input.passphrase, &input.passphrase_confirm)?;
     match cfg.keys.locality() {
         KeyringLocality::Local => {}
@@ -843,6 +968,8 @@ pub fn create_new_store(
             ));
         }
     }
+    // The anchor dir is read before any keychain entry is written: a refused dir leaves nothing.
+    let records = first_run_records(data, &cfg, &input, wizard_dir.as_deref())?;
     let kek = Kek::generate().map_err(audit_err)?;
     let recovery_blob = new_recovery_blob(&input.passphrase, &input.passphrase_confirm, &kek)?;
     if let Err(e) = cfg.keys.set(&EntryName::Kek, &kek.to_entry_bytes()) {
@@ -850,14 +977,6 @@ pub fn create_new_store(
         let _ = cfg.keys.delete(&EntryName::Kek);
         return Err(e.into());
     }
-    let archived_db = input.archived_db.map(|a| {
-        json!({
-            "file": a.file,
-            "chain_id": a.chain_id,
-            "head_seq": a.head_seq,
-            "head_hash": hex::encode(a.head_hash),
-        })
-    });
     let keys = cfg.keys.clone();
     let renamed = Arc::new(AtomicBool::new(false));
     let first_run = FirstRun {
@@ -868,7 +987,7 @@ pub fn create_new_store(
         recovery_blob,
         install_id: input.install_id.clone(),
         chain_id: input.chain_id,
-        archived_db,
+        records,
         renamed: renamed.clone(),
     };
     // First run wrote both anchors itself; there is no earlier state to verify.

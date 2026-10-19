@@ -58,6 +58,10 @@ pub enum FindingKind {
     RestoreBoundaryMismatch,
     AnchorDirMismatch,
     AnchoredRecordPrunedEarly,
+    /// The anchor dir chosen at a first run already held a chain of this host and OS user
+    /// (§8.5, PD-167): a fact about the dir, never a finding of a store's own chain (not in
+    /// [`CHAIN_KINDS`]). Its `VERIFY` names the chains under the payload key `chains`.
+    PreviousChainFound,
     // informational kinds
     UnanchoredTail,
     InterruptedPruneReconciled,
@@ -89,6 +93,7 @@ impl FindingKind {
             FindingKind::RestoreBoundaryMismatch => "restore_boundary_mismatch",
             FindingKind::AnchorDirMismatch => "anchor_dir_mismatch",
             FindingKind::AnchoredRecordPrunedEarly => "anchored_record_pruned_early",
+            FindingKind::PreviousChainFound => "previous_chain_found",
             FindingKind::UnanchoredTail => "unanchored_tail",
             FindingKind::InterruptedPruneReconciled => "interrupted_prune_reconciled",
             FindingKind::InterruptedRestoreReconciled => "interrupted_restore_reconciled",
@@ -200,6 +205,44 @@ pub(crate) fn verify_payload(
         "detected_at": detected_at,
         "unanchored_tail": unanchored_tail,
     })
+}
+
+/// The first-run incident of PD-167 for the previous chains `chains` (newest first, not empty):
+/// one `PreviousChainFound` finding naming the newest chain's last anchored line, and the
+/// `VERIFY` payload `{scope: "first_run", result: "previous_chain_found", …}` with the key
+/// `chains: [{chain_id, last_seq, last_record_hash}]` (Δ-M10-1; `null` for a chain file without
+/// an anchored line).
+pub(crate) fn previous_chain_verify(
+    chains: &[anchor_dir::PreviousChain],
+    detected_at: &str,
+) -> (Vec<VerifyFinding>, Value) {
+    let newest = chains.first();
+    let last = newest.and_then(|c| c.last.as_ref());
+    let finding = VerifyFinding::new(
+        FindingKind::PreviousChainFound,
+        format!(
+            "the anchor directory already holds {} chain(s) of this host and OS user; the newest \
+             is {}",
+            chains.len(),
+            newest.map_or("", |c| c.chain_id.as_str())
+        ),
+    )
+    .expected(last.map(|l| l.0), last.map(|l| l.1));
+    let findings = vec![finding];
+    let mut payload = verify_payload("first_run", &findings, detected_at, None);
+    payload["chains"] = Value::Array(
+        chains
+            .iter()
+            .map(|c| {
+                json!({
+                    "chain_id": c.chain_id,
+                    "last_seq": c.last.as_ref().map(|l| l.0),
+                    "last_record_hash": c.last.as_ref().map(|l| hex::encode(l.1)),
+                })
+            })
+            .collect(),
+    );
+    (findings, payload)
 }
 
 /// The interrupted-restore completion the verdict asks for (T16 carries it out): the anchors
@@ -1972,4 +2015,18 @@ pub(crate) fn snapshot_anchor_dir(
     check_anchor_dir(conn, lines, &log, head, &lost, &mut out)?;
     drop(tx);
     Ok(out.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn previous_chain_found_is_an_incident_outside_the_chain_kinds() {
+        // Δ-M10-1: an interrupted prune or restore is still reconciled next to it (the
+        // reconciliation reads `CHAIN_KINDS` only).
+        assert!(FindingKind::PreviousChainFound.is_incident());
+        assert!(!CHAIN_KINDS.contains(&FindingKind::PreviousChainFound));
+        assert_eq!(CHAIN_KINDS.len(), 11);
+    }
 }

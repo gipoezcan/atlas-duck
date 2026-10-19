@@ -533,6 +533,8 @@ impl Machine {
                 passphrase: SecretString::from(PASSPHRASE),
                 passphrase_confirm: SecretString::from(PASSPHRASE),
                 archived_db: None,
+                anchor_dir: None,
+                archive_confirmed: None,
             },
         )?;
         store.shutdown();

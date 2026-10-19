@@ -564,6 +564,7 @@ impl AnchorDirShared {
     }
 
     /// Nothing is written until the next `enable` (tests).
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn disable(&self) {
         lock(&self.state).enabled = false;
     }
@@ -682,10 +683,10 @@ fn bounded(s: String) -> String {
 }
 
 /// The OS user as the recovery note names it (the first non-empty of `USERNAME`, `USER`,
-/// `LOGNAME`): the same rule as the app's `credential::os_user`. Task 6's previous-chain
-/// detection (RF-3) matches a header's `host` and `os_user` exactly, so the two must never
-/// drift (one shared helper, never a third copy), and it compares against the value as written
-/// here, after [`bounded`] (cut to 200 characters, empty -> `unknown`).
+/// `LOGNAME`): the same rule as the app's `credential::os_user`. The previous-chain detection
+/// (PD-167, RF-3) matches a header's `host` and `os_user` exactly, so the two must never drift
+/// (one shared helper, never a third copy); it compares against the value as written here, after
+/// [`bounded`] (cut to 200 characters, empty -> `unknown`), through [`HeaderFacts::os_user`].
 fn os_user() -> String {
     ["USERNAME", "USER", "LOGNAME"]
         .iter()
@@ -701,6 +702,16 @@ impl HeaderFacts {
             os_user: bounded(os_user()),
             clock,
         }
+    }
+
+    /// `host` as every header of this install names it (PD-167 compares it exactly).
+    pub(crate) fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// `os_user` as every header of this install names it (PD-167 compares it exactly).
+    pub(crate) fn os_user(&self) -> &str {
+        &self.os_user
     }
 
     fn line(&self, chain_id: &str) -> io::Result<String> {

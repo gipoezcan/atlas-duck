@@ -583,6 +583,18 @@ pub(crate) fn untrusted() -> AuditError {
 /// `apply_setting(SettingChange::AnchorDir(..))` (Δ-M10-1, PD-166).
 pub(crate) const ANCHOR_DIR_REFUSED: AuditError = AuditError::Invalid("use change_anchor_dir");
 
+/// The anchor dir chosen in the first-run wizard (§2.5 (1b), PD-167) as the new store's
+/// setting: the same `CONFIG_CHANGED {key: anchor_dir, source: app, old: null, new}` as any
+/// setting, with `confirmed: null` (nothing is weakened at a first run; every later change goes
+/// through `Store::change_anchor_dir` and its confirmation), and the view after it.
+pub(crate) fn first_run_anchor_dir(dir: &str) -> Result<(PreparedEvent, Settings), AuditError> {
+    let mut view = Settings::default();
+    let planned = plan(&view, &SettingChange::AnchorDir(Some(dir.to_owned())))?;
+    let payload = planned.payload("app", None);
+    apply_event(&mut view, planned.event_type, &payload)?;
+    Ok((planned.event(&payload)?, view))
+}
+
 impl Writer {
     /// Makes `s` the view (writer thread) and publishes it for `Store::settings`.
     pub(crate) fn set_view(&mut self, s: Settings) {

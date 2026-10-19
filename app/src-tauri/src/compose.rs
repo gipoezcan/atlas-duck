@@ -312,6 +312,8 @@ mod tests {
                 passphrase: SecretString::from(pass.to_owned()),
                 passphrase_confirm: SecretString::from(pass.to_owned()),
                 archived_db: None,
+                anchor_dir: None,
+                archive_confirmed: None,
             },
         )?;
         let inputs = CoreInputs {

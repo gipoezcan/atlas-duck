@@ -12,11 +12,11 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension};
 use secrecy::SecretString;
 
-use crate::anchor_dir::{self, AnchorDirLines};
+use crate::anchor_dir::{self, AnchorDirLines, PreviousChain};
 use crate::anchors::{self, AnchorLoadError, FirstRetainedAnchor};
 use crate::clock::UtcInstant;
-use crate::crypto::{Kek, KekEntryError};
-use crate::encoding::ZERO_HASH;
+use crate::crypto::{Kek, KekEntryError, ct_eq};
+use crate::encoding::{FIELD_LIST, RowFields, ZERO_HASH};
 use crate::error::OpenError;
 use crate::keystore::{EntryName, KeyStore, KeyStoreError, KeyringLocality, canary_self_test};
 use crate::lock::InstanceLock;
@@ -494,6 +494,83 @@ pub fn archive_and_start_fresh(
         head_seq,
         head_hash,
     })
+}
+
+/// The archive exemption of a first run (§8.5 "Exempt: the chain recorded as `archived_db`",
+/// PD-167): whether the archived store `a`, which the same `GENESIS` names, covers every anchor
+/// of `chain`. All of these must hold, else the previous chain raises the incident:
+/// - `chain` is `a`'s chain and its file was read whole with every line valid (`named`);
+/// - `a.file` is `archived/<name>` with a name [`archive_and_start_fresh`] writes for that chain
+///   and head seq (nothing outside `archived/` is opened), a regular file whose plaintext head
+///   is `a`'s `(head_seq, head_hash, chain_id)`;
+/// - no anchored seq lies beyond that head;
+/// - every anchored `(seq, record_hash)` at or after the archive's first retained seq (its latest
+///   `prune_log` row, else 1) names a row of the archive whose stored `record_hash` is the line's
+///   and whose columns hash to it (recomputed: a `record_hash` column copied from the lines does
+///   not cover anything). Lines below the first retained seq were pruned from the archive.
+///
+/// Read-only (a sidecar-free reader; a `-shm` it leaves is removed, as in [`latest_archived`]).
+/// Any error reads as "not covered".
+pub(crate) fn archive_covers(data: &LocalDataDir, a: &ArchivedDb, chain: &PreviousChain) -> bool {
+    let Some(named) = chain
+        .named
+        .as_ref()
+        .filter(|_| chain.chain_id == a.chain_id)
+    else {
+        return false;
+    };
+    let Some(name) = a.file.strip_prefix(&format!("{ARCHIVE_DIR}/")) else {
+        return false;
+    };
+    if !parse_archive_name(name).is_some_and(|(c, seq, _)| c == a.chain_id && seq == a.head_seq) {
+        return false;
+    }
+    let path = data.path().join(ARCHIVE_DIR).join(name);
+    if !std::fs::metadata(&path).is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    let covered = covers(&path, a, named);
+    // A read-only open of a store with a WAL may have created `-shm`; it is derived state.
+    let _ = remove_if_present(&with_suffix(&path, "-shm"));
+    covered.unwrap_or(false)
+}
+
+fn covers(path: &Path, a: &ArchivedDb, named: &[(u64, [u8; 32])]) -> Result<bool, OpenError> {
+    let (head_seq, head_hash, head_chain) = plaintext_head(path)?;
+    if head_seq != a.head_seq || !ct_eq(&head_hash, &a.head_hash) || head_chain != a.chain_id {
+        return Ok(false);
+    }
+    if named.iter().any(|(seq, _)| *seq > head_seq) {
+        return Ok(false);
+    }
+    let conn = schema::open_peek(path)?;
+    let (first_retained, _) = verify::latest_prune_values(&conn).map_err(sql)?;
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {}, record_hash FROM events WHERE seq = ?1",
+            FIELD_LIST.join(", ")
+        ))
+        .map_err(sql)?;
+    for (seq, line_hash) in named.iter().filter(|(seq, _)| *seq >= first_retained) {
+        let Ok(at) = i64::try_from(*seq) else {
+            return Ok(false);
+        };
+        let mut rows = stmt.query([at]).map_err(sql)?;
+        let Some(r) = rows.next().map_err(sql)? else {
+            return Ok(false);
+        };
+        let stored = match r.get_ref(FIELD_LIST.len()).map_err(sql)? {
+            ValueRef::Blob(b) => <[u8; 32]>::try_from(b).ok(),
+            _ => None,
+        };
+        let recomputed = RowFields::from_row(r).and_then(|f| f.record_hash()).ok();
+        let genuine = matches!((stored, recomputed), (Some(s), Some(h))
+            if ct_eq(&s, line_hash) && ct_eq(&h, &s));
+        if !genuine {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// `(chain_id, head_seq, stamp)` of an archive file name `audit-<chain_id>-<head_seq>-<stamp>.db`
