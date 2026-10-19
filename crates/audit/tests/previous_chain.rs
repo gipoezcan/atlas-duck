@@ -321,7 +321,7 @@ impl Drop for Denied {
 #[cfg(unix)]
 fn deny_reads(path: &Path) -> Option<Denied> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0)).expect("chmod 000");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
     let denied = Denied(path.to_path_buf());
     std::fs::File::open(path).is_err().then_some(denied)
 }
