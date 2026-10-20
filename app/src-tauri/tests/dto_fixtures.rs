@@ -12,8 +12,9 @@ use atlas_duck_app_lib::commands::approvals::{
     DenyCount, QueueDetail, RawPageDto, RedactionContextDto, preview_fetch_response,
 };
 use atlas_duck_app_lib::commands::audit::{
-    AcknowledgedDto, AuditPageDto, AuditPayloadDto, AuditStatusDto, AuditTrailDto, CursorDto,
-    DeliveriesDto, EventHeaderDto, ExportCancelDto, ExportDoneDto, IncidentDto,
+    AcknowledgedDto, AuditPageDto, AuditPayloadDto, AuditStatusDto, AuditTrailDto,
+    CredentialChangeFailure, CursorDto, DeliveriesDto, EventHeaderDto, ExportCancelDto,
+    ExportDoneDto, IncidentDto,
 };
 use atlas_duck_app_lib::commands::credential::{
     ArchiveOutcome, CLASS_CONTEXT_CHANGED, CLASS_PASSPHRASE_NOT_CHANGED, Connected,
@@ -927,17 +928,33 @@ fn audit_trails() -> Vec<AuditTrailDto> {
     ]
 }
 
-/// `audit_payload` (M10 T12): a one-page payload as a tree, and the second page of a long one.
+/// `audit_payload` (M10 T12): a one-page payload as a tree, and the second page of a long one;
+/// first and last (T20, L126) the two `CREDENTIAL_CHANGED` records with a failed keychain step.
 fn audit_payloads() -> Vec<AuditPayloadDto> {
     let json = br#"{"body":"<b>x</b>","n":1}"#;
     let page = render::raw_display_last("aé\u{200B}".as_bytes(), &[]).text;
+    let credential = |change: &str, failure| {
+        let json = format!(
+            r#"{{"change":"{change}","expires_at":null,"new_user_key":"JIRAUSER10100","old_user_key":null}}"#
+        );
+        AuditPayloadDto {
+            srcdoc: render::audit_payload_document(json.as_bytes(), Platform::MacOsLinux),
+            page: 0,
+            page_count: 1,
+            total_bytes: json.len() as u64,
+            display: render::raw_display_last(json.as_bytes(), &[]).text,
+            credential_change: Some(failure),
+        }
+    };
     vec![
+        credential("store_failed", CredentialChangeFailure::StoreFailed),
         AuditPayloadDto {
             srcdoc: render::audit_payload_document(json, Platform::MacOsLinux),
             page: 0,
             page_count: 1,
             total_bytes: 25,
             display: render::raw_display_last(json, &[]).text,
+            credential_change: None,
         },
         AuditPayloadDto {
             srcdoc: render::audit_payload_page_document(&page, Platform::MacOsLinux),
@@ -945,7 +962,9 @@ fn audit_payloads() -> Vec<AuditPayloadDto> {
             page_count: 2,
             total_bytes: 262_150,
             display: page,
+            credential_change: None,
         },
+        credential("delete_failed", CredentialChangeFailure::DeleteFailed),
     ]
 }
 

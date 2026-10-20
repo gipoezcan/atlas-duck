@@ -579,7 +579,14 @@ export const isAuditTrail = (v: unknown): v is AuditTrail =>
   });
 
 export const isAuditPayload = (v: unknown): v is AuditPayload =>
-  closed(v, { srcdoc: isStr, page: isNum, page_count: isNum, total_bytes: isNum, display: isStr });
+  closed(v, {
+    srcdoc: isStr,
+    page: isNum,
+    page_count: isNum,
+    total_bytes: isNum,
+    display: isStr,
+    credential_change: (c) => c === null || c === 'store_failed' || c === 'delete_failed',
+  });
 
 const isAuditIncident = (v: unknown): v is AuditIncident =>
   closed(v, { verify_seq: isNum, result: strOrNull, detected_at: strOrNull });

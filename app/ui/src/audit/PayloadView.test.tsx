@@ -17,6 +17,7 @@ const answer = (page: number, page_count = 2): AuditPayload => ({
   page_count,
   total_bytes: 300_000,
   display: `${DISPLAY}${page}`,
+  credential_change: null,
 });
 
 beforeEach(() => {

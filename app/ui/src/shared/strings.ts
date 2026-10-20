@@ -827,6 +827,11 @@ export const AUDIT_TEXT = {
   payload_failed: 'Could not read the payload.',
   payload_unreadable: 'The payload could not be read: it does not decrypt or does not match its digest.',
   payload_gone: 'That record is no longer in the log.',
+  /** L126: the fixed line of a `CREDENTIAL_CHANGED` record with a failed keychain step (plan text). */
+  credential_change: {
+    store_failed: 'token store failed',
+    delete_failed: 'token delete failed',
+  },
 
   jobs: 'Export and backup',
   export: 'Compliance export',

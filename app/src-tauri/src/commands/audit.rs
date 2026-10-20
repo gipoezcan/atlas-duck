@@ -458,6 +458,8 @@ impl AuditTrailDto {
 /// `audit_payload`'s answer (PD-67, PD-68): `srcdoc` is the sandboxed document of the page (the
 /// JSON tree when the payload is one page, else the page as text) and `display` the page's PD-68
 /// projection (escapes and whitespace marked, a UTF-8 sequence cut by the boundary carried).
+/// `credential_change` is set on every page of a `CREDENTIAL_CHANGED` record whose `change` is a
+/// failed keychain step, for the window's fixed line (L126); `null` for anything else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AuditPayloadDto {
     pub srcdoc: String,
@@ -465,6 +467,16 @@ pub struct AuditPayloadDto {
     pub page_count: u32,
     pub total_bytes: u64,
     pub display: String,
+    pub credential_change: Option<CredentialChangeFailure>,
+}
+
+/// The two corrective `CREDENTIAL_CHANGED.change` values (the keychain write or delete that followed
+/// the record failed); closed, never the payload's text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialChangeFailure {
+    StoreFailed,
+    DeleteFailed,
 }
 
 /// One open integrity incident: the `VERIFY` seq and, from its record, the result and the time it
@@ -592,7 +604,32 @@ pub fn payload_dto(
         page_count: current.page_count,
         total_bytes: current.total_bytes,
         display,
+        credential_change: credential_failure(store, seq),
     })
+}
+
+/// L126: the failed keychain step a `CREDENTIAL_CHANGED` record `seq` names in its payload's
+/// `change` (`store_failed`, `delete_failed`), else `None`: another change, another record kind,
+/// or a record that cannot be read here (the payload view itself says that). The kind comes from
+/// the record's header (the one row at `seq`, no filter scan), so other records are not decrypted
+/// again.
+fn credential_failure(store: &Store, seq: u64) -> Option<CredentialChangeFailure> {
+    let at = AuditCursor {
+        before_seq: Some(seq.checked_add(1)?),
+        limit: 1,
+    };
+    let page = store.query(&AuditFilter::default(), at).ok()?;
+    let header = page.rows.first()?;
+    if header.seq != seq || header.event_type != EventType::CREDENTIAL_CHANGED {
+        return None;
+    }
+    let bytes = store.read_payload(seq).ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    match payload.get("change").and_then(serde_json::Value::as_str)? {
+        "store_failed" => Some(CredentialChangeFailure::StoreFailed),
+        "delete_failed" => Some(CredentialChangeFailure::DeleteFailed),
+        _ => None,
+    }
 }
 
 /// The result and detected-at time of the `VERIFY` record `seq`, as its payload holds them (its
@@ -1709,6 +1746,96 @@ pub(crate) mod tests {
             "{}",
             second.srcdoc
         );
+        Ok(())
+    }
+
+    /// L126: a `CREDENTIAL_CHANGED` record whose `change` is `store_failed` or `delete_failed`
+    /// answers that word as `credential_change`, on every page; any other change, a `change` that
+    /// is not that exact text, and every other record kind answer `null`.
+    #[test]
+    fn audit_payload_names_a_failed_credential_change() -> TestResult {
+        let r = rig(0)?;
+        let append = |event_type: EventType, change: Value| {
+            r.store.append(NewEvent {
+                event_type,
+                request_id: None,
+                op_id: None,
+                op_class: None,
+                instance_id: Some("inst-1".into()),
+                target: None,
+                actor: Default::default(),
+                decision: None,
+                flags: EventFlags::default(),
+                payload: json!({
+                    "change": change,
+                    "old_user_key": null,
+                    "new_user_key": "JIRAUSER10100",
+                    "expires_at": null,
+                }),
+            })
+        };
+        let credential = EventType::CREDENTIAL_CHANGED;
+        for (event_type, change, want) in [
+            (
+                credential,
+                json!("store_failed"),
+                Some(CredentialChangeFailure::StoreFailed),
+            ),
+            (
+                credential,
+                json!("delete_failed"),
+                Some(CredentialChangeFailure::DeleteFailed),
+            ),
+            (credential, json!("added"), None),
+            (credential, json!("deleted"), None),
+            (credential, json!("Store_failed"), None),
+            (credential, json!("store_failed "), None),
+            (credential, json!(["store_failed"]), None),
+            (credential, json!(null), None),
+            (EventType::READ_FETCHED, json!("store_failed"), None),
+            (EventType::CONFIG_CHANGED, json!("delete_failed"), None),
+        ] {
+            let c = append(event_type, change.clone())?;
+            let p = payload_dto(&r.store, c.seq, 0, Platform::MacOsLinux)?;
+            assert_eq!(p.credential_change, want, "{event_type:?} {change}");
+        }
+        let c = append(credential, json!("delete_failed"))?;
+        let wire = serde_json::to_value(payload_dto(&r.store, c.seq, 0, Platform::MacOsLinux)?)?;
+        assert_eq!(wire["credential_change"], json!("delete_failed"));
+        let c = append(EventType::READ_FETCHED, json!("x"))?;
+        let wire = serde_json::to_value(payload_dto(&r.store, c.seq, 0, Platform::MacOsLinux)?)?;
+        assert_eq!(wire["credential_change"], Value::Null);
+        Ok(())
+    }
+
+    /// The field holds on every page of a payload longer than one (a record no real
+    /// `CREDENTIAL_CHANGED` reaches, but the rule does not depend on the page).
+    #[test]
+    fn audit_payload_credential_change_on_every_page() -> TestResult {
+        let r = rig(0)?;
+        let c = r.store.append(NewEvent {
+            event_type: EventType::CREDENTIAL_CHANGED,
+            request_id: None,
+            op_id: None,
+            op_class: None,
+            instance_id: Some("inst-1".into()),
+            target: None,
+            actor: Default::default(),
+            decision: None,
+            flags: EventFlags::default(),
+            payload: json!({
+                "change": "store_failed",
+                "pad": "a".repeat(atlas_duck_audit::PAYLOAD_PAGE_BYTES),
+            }),
+        })?;
+        for page in 0..2 {
+            let p = payload_dto(&r.store, c.seq, page, Platform::MacOsLinux)?;
+            assert_eq!(p.page_count, 2);
+            assert_eq!(
+                p.credential_change,
+                Some(CredentialChangeFailure::StoreFailed)
+            );
+        }
         Ok(())
     }
 

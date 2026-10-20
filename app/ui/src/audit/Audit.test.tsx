@@ -13,7 +13,7 @@ import {
   exportTrigger,
   verifyNow,
 } from '../shared/ipc/invoke';
-import type { VerifyNow } from '../shared/ipc/types';
+import type { CredentialChangeFailure, VerifyNow } from '../shared/ipc/types';
 import { Audit } from './Audit';
 import { flush, header, status } from './testing';
 
@@ -192,7 +192,14 @@ describe('Audit window (M10 T20)', () => {
   it('an opened record shows its columns and its trail; the payload is decrypted only on request', async () => {
     vi.mocked(auditQuery).mockResolvedValueOnce({ rows: [header(41)], next: null, scanned: 1 });
     vi.mocked(auditTrail).mockResolvedValueOnce({ headers: [header(41)], deliveries: { count: 0, to_other_peer: false } });
-    vi.mocked(auditPayload).mockResolvedValueOnce({ srcdoc: '<p>x</p>', page: 0, page_count: 1, total_bytes: 3, display: 'x' });
+    vi.mocked(auditPayload).mockResolvedValueOnce({
+      srcdoc: '<p>x</p>',
+      page: 0,
+      page_count: 1,
+      total_bytes: 3,
+      display: 'x',
+      credential_change: null,
+    });
     render(<Audit />);
     await flush();
     fireEvent.click(screen.getByRole('button', { name: 'Open record 41' }));
@@ -211,35 +218,50 @@ describe('Audit window (M10 T20)', () => {
     expect(screen.queryByRole('region', { name: 'Record 41' })).toBeNull();
   });
 
-  // L126's fixed line ("token store failed" / "token delete failed") needs the record's `change`,
-  // which is only in the encrypted payload: no plaintext column carries it (T20 report, lead ruling
-  // pending). What the window can do today: the record opens, and its decrypted payload (Rust's
-  // tree, which shows `change`) is one press away.
-  it.todo('credential_store_or_delete_failed_line_shown: the fixed line from a plaintext signal');
-
-  it('a CREDENTIAL_CHANGED record opens and its decrypted payload is reachable', async () => {
-    vi.mocked(auditQuery).mockResolvedValueOnce({
-      rows: [header(43, { request_id: null, event_type: 'CREDENTIAL_CHANGED', instance_id: 'inst-1' })],
-      next: null,
-      scanned: 1,
-    });
-    vi.mocked(auditPayload).mockResolvedValueOnce({
-      srcdoc: '<p>change: store_failed</p>',
-      page: 0,
-      page_count: 1,
-      total_bytes: 80,
-      display: '{"change":"store_failed"}',
-    });
-    render(<Audit />);
-    await flush();
-    fireEvent.click(screen.getByRole('button', { name: 'Open record 43' }));
-    await flush();
-    const detail = screen.getByRole('region', { name: 'Record 43' });
-    expect(detail.textContent).toContain('CREDENTIAL_CHANGED');
-    fireEvent.click(within(detail).getByRole('button', { name: 'Show the decrypted payload' }));
-    await flush();
-    expect(auditPayload).toHaveBeenCalledWith(43, 0);
-    expect(detail.querySelector('iframe')?.getAttribute('srcdoc')).toBe('<p>change: store_failed</p>');
+  // L126 (lead ruling on the T20 report): Rust reads `change` from the decrypted payload and answers
+  // the closed `credential_change`; the window shows the plan's fixed line above the payload.
+  it('credential_store_or_delete_failed_line_shown: the fixed line above the payload, none otherwise', async () => {
+    const LINES = ['token store failed', 'token delete failed'];
+    const cases: [CredentialChangeFailure | null, string | null][] = [
+      ['store_failed', 'token store failed'],
+      ['delete_failed', 'token delete failed'],
+      [null, null],
+    ];
+    for (const [credential_change, line] of cases) {
+      vi.mocked(auditQuery).mockResolvedValueOnce({
+        rows: [header(43, { request_id: null, event_type: 'CREDENTIAL_CHANGED', instance_id: 'inst-1' })],
+        next: null,
+        scanned: 1,
+      });
+      vi.mocked(auditPayload).mockResolvedValueOnce({
+        srcdoc: '<p>change</p>',
+        page: 0,
+        page_count: 1,
+        total_bytes: 94,
+        display: '{"change":"…"}',
+        credential_change,
+      });
+      const { unmount } = render(<Audit />);
+      await flush();
+      fireEvent.click(screen.getByRole('button', { name: 'Open record 43' }));
+      await flush();
+      const detail = screen.getByRole('region', { name: 'Record 43' });
+      // Nothing before the payload is asked for: the line comes with the decrypted answer.
+      for (const l of LINES) expect(within(detail).queryByText(l)).toBeNull();
+      fireEvent.click(within(detail).getByRole('button', { name: 'Show the decrypted payload' }));
+      await flush();
+      expect(auditPayload).toHaveBeenLastCalledWith(43, 0);
+      const frame = detail.querySelector('iframe');
+      expect(frame?.getAttribute('srcdoc')).toBe('<p>change</p>');
+      for (const l of LINES) {
+        if (l !== line) expect(within(detail).queryByText(l)).toBeNull();
+      }
+      if (line !== null) {
+        const shown = within(detail).getByText(line);
+        expect(shown.compareDocumentPosition(frame as Node) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      }
+      unmount();
+    }
   });
 
   it('a record of no request has no trail to read', async () => {

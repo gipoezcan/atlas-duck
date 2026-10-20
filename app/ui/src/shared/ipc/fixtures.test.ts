@@ -146,6 +146,15 @@ describe('fixtures validate against their TS types', () => {
     expect(isAuditPage({ ...page, next: { before_seq: 3 } })).toBe(false);
     expect(isAuditTrail({ ...auditTrail[0], deliveries: { count: 1 } })).toBe(false);
     expect(isAuditPayload({ ...auditPayload[0], bytes_b64: '' })).toBe(false);
+    // M10 T20 (L126): `credential_change` is closed: the two failed keychain steps or null, never
+    // another change or the payload's text; the key is always sent.
+    expect(new Set(auditPayload.map((p) => p.credential_change))).toEqual(new Set(['store_failed', 'delete_failed', null]));
+    for (const change of ['added', 'deleted', 'Store_failed', 'store_failed ', '', '__proto__', 0, ['store_failed'], undefined]) {
+      expect(isAuditPayload({ ...auditPayload[0], credential_change: change })).toBe(false);
+    }
+    const withoutChange = Object.fromEntries(Object.entries(auditPayload[0] ?? {}).filter(([k]) => k !== 'credential_change'));
+    expect(isAuditPayload(auditPayload[0])).toBe(true);
+    expect(isAuditPayload(withoutChange)).toBe(false);
     const [incidents, quiet] = auditStatus;
     expect(incidents?.open_incidents.some((i) => i.result === null)).toBe(true);
     expect(quiet?.anchor_dir).toBeNull();

@@ -90,4 +90,5 @@
 .audit-record dd { margin: 0; overflow-wrap: anywhere; }
 .audit-record .agent-text-value { max-width: none; white-space: pre-wrap; overflow: visible; }
 .audit-payload iframe { display: block; width: 100%; height: 28rem; border: 1px solid #8886; }
+.audit-credential-line { border-left: 3px solid currentColor; padding-left: 0.5rem; }
 .audit-export-result code { overflow-wrap: anywhere; }

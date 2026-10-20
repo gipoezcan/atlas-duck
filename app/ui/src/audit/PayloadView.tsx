@@ -19,7 +19,9 @@ function failureText(e: unknown): string {
  * window only as the document Rust built (`srcdoc`: a JSON tree of text nodes, or the page as
  * text, invisible characters escaped) inside the sandboxed preview frame (`PreviewFrame`, the one
  * place an iframe document is set); Rust's `display` text is not put into this window's DOM.
- * Mounted only when the user asks for the payload.
+ * Above it, a `CREDENTIAL_CHANGED` record with a failed keychain step gets its fixed line (L126,
+ * from Rust's closed `credential_change`, never payload text). Mounted only when the user asks for
+ * the payload.
  */
 export function PayloadView({ seq }: { seq: number }) {
   const [page, setPage] = useState(0);
@@ -44,9 +46,16 @@ export function PayloadView({ seq }: { seq: number }) {
 
   const loaded = data !== null && data.page === page && failed === null ? data : null;
   const count = Math.max(1, data?.page_count ?? 1);
+  // L126: Rust's closed word for a failed keychain step, shown as the plan's fixed line.
+  const credential = loaded?.credential_change ?? null;
   return (
     <section className="audit-payload" aria-label={T.payload}>
       <h4>{T.payload}</h4>
+      {credential === null ? null : (
+        <p className="audit-credential-line">
+          <strong>{T.credential_change[credential]}</strong>
+        </p>
+      )}
       <div className="raw-nav">
         <button type="button" disabled={page <= 0} onClick={() => setPage((p) => Math.max(0, p - 1))}>
           {T.payload_previous}

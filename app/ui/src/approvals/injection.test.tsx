@@ -51,8 +51,9 @@ const DISCRIMINANTS = new Set([
   'kind', 'class', 'status', 'level', 'step', 'state', 'product', 'purpose', 'choice', 'result',
   'outcome', 'mode', 'op', 'scope', 'preset', 'method', 'cli', 'autostart',
   'attention_mode', 'anchors_missing', 'secret_service', 'code', 'field', 'conn', 'error', 'preselect', 'scripts',
-  // M10 T20: an audit header's flags (closed 8.2 names) and the `audit_job` event's job and phase.
-  'flags', 'job', 'phase',
+  // M10 T20: an audit header's flags (closed 8.2 names) and the `audit_job` event's job and phase;
+  // the payload answer's `credential_change` (L126: `store_failed`, `delete_failed` or null).
+  'flags', 'job', 'phase', 'credential_change',
 ]);
 
 /** The one discriminator path a `free` run poisons as well (the per-path prototype pass), or null. */

@@ -672,9 +672,13 @@ export interface AuditTrail {
   deliveries: { count: number; to_other_peer: boolean };
 }
 
+/** The failed keychain step of a `CREDENTIAL_CHANGED` record (L126), read by Rust from its payload. */
+export type CredentialChangeFailure = 'store_failed' | 'delete_failed';
+
 /**
  * One page of a record's decrypted payload: `srcdoc` goes into an `<iframe sandbox="">` only;
- * `display` is the page as Rust-projected text (escapes and whitespace marked).
+ * `display` is the page as Rust-projected text (escapes and whitespace marked). `credential_change`
+ * is set on every page of a `CREDENTIAL_CHANGED` record with a failed keychain step, else null.
  */
 export interface AuditPayload {
   srcdoc: string;
@@ -682,6 +686,7 @@ export interface AuditPayload {
   page_count: number;
   total_bytes: number;
   display: string;
+  credential_change: CredentialChangeFailure | null;
 }
 
 /** An open integrity incident; `result` and `detected_at` are null when its record is unreadable. */
