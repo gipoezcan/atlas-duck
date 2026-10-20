@@ -46,6 +46,8 @@ async function emit(name: string, payload: unknown): Promise<void> {
 }
 
 const verification = () => screen.getByRole('region', { name: 'Verification' });
+/** The element the end-to-end flows read the verification result from. */
+const result = () => screen.getByTestId('verification-result');
 const verifyButton = () => within(verification()).getByRole('button', { name: /Verify/ }) as HTMLButtonElement;
 
 beforeEach(() => {
@@ -72,7 +74,7 @@ describe('Audit shell', () => {
     await flush();
     expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('Audit');
     expect(verifyButton().textContent).toBe('Verify now');
-    expect(within(verification()).queryByRole('status')).toBeNull();
+    expect(within(verification()).getByRole('status').textContent).toBe('');
     expect(within(verification()).queryByRole('alert')).toBeNull();
     for (const [answer, sentence] of answers) {
       vi.mocked(verifyNow).mockResolvedValueOnce(answer);
@@ -81,9 +83,7 @@ describe('Audit shell', () => {
       const shown = within(verification()).getByRole(answer.result === 'verified' ? 'status' : 'alert');
       expect(shown.textContent).toBe(sentence);
       // Only the one result is on the page, and the button is back.
-      expect(
-        within(verification()).queryAllByRole('status').length + within(verification()).queryAllByRole('alert').length,
-      ).toBe(1);
+      expect(result().textContent).toBe(sentence);
       expect(verifyButton().disabled).toBe(false);
     }
     expect(verifyNow).toHaveBeenCalledTimes(3);
@@ -92,7 +92,12 @@ describe('Audit shell', () => {
   it('a refused or failed call is "verification did not complete", never a pass', async () => {
     render(<Audit />);
     await flush();
-    for (const rejection of [{ kind: 'not_ready' }, 'command not allowed', { kind: 'internal' }]) {
+    for (const rejection of [
+      { kind: 'not_ready' },
+      // What `call()` turns a rejection it does not recognise into.
+      { kind: 'refused', message: 'command not allowed' },
+      { kind: 'internal' },
+    ]) {
       vi.mocked(verifyNow).mockRejectedValueOnce(rejection);
       fireEvent.click(verifyButton());
       await flush();
@@ -115,7 +120,7 @@ describe('Audit shell', () => {
     expect(verifyNow).toHaveBeenCalledTimes(1);
     expect(verifyButton().disabled).toBe(true);
     expect(verifyButton().textContent).toBe('Verifying…');
-    expect(within(verification()).queryByRole('status')).toBeNull();
+    expect(within(verification()).getByRole('status').textContent).toBe('');
     await act(async () => {
       finish({ result: 'verified', text: VERIFIED });
       await Promise.resolve();
@@ -136,6 +141,26 @@ describe('Audit shell', () => {
     fireEvent.click(verifyButton());
     await flush();
     expect(within(verification()).queryByRole('alert')).toBeNull();
+    expect(result().textContent).toBe('');
+  });
+
+  it('the result sits in one element with a stable test id that holds only the sentence', async () => {
+    render(<Audit />);
+    await flush();
+    // Always in the page, empty until there is a result (a status region inserted with its text is not announced).
+    const region = within(verification()).getByRole('status');
+    expect(result().textContent).toBe('');
+    vi.mocked(verifyNow).mockResolvedValueOnce({ result: 'verified', text: 'x' });
+    fireEvent.click(verifyButton());
+    await flush();
+    expect(within(verification()).getByRole('status')).toBe(region);
+    expect(result().textContent).toBe(VERIFIED);
+    // The rest of the window says "integrity incident" and "unverified" in places: not in the result.
+    expect(document.body.textContent).toContain('integrity incident');
+    vi.mocked(verifyNow).mockResolvedValueOnce({ result: 'incident', count: 1, text: 'x' });
+    fireEvent.click(verifyButton());
+    await flush();
+    expect(result().textContent).toBe(INCIDENT);
   });
 });
 
@@ -216,6 +241,22 @@ describe('Audit window (M10 T20)', () => {
     expect(detail.querySelector('iframe')?.getAttribute('sandbox')).toBe('');
     fireEvent.click(within(detail).getByRole('button', { name: 'Close record' }));
     expect(screen.queryByRole('region', { name: 'Record 41' })).toBeNull();
+    // Focus goes back to the row's button, not to the page.
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Open record 41' }));
+  });
+
+  it('closing a record whose row is not in the list puts focus on the Records heading', async () => {
+    vi.mocked(auditQuery).mockResolvedValueOnce({ rows: [header(41)], next: null, scanned: 1 });
+    vi.mocked(auditTrail).mockResolvedValue({ headers: [header(41), header(40)], deliveries: { count: 0, to_other_peer: false } });
+    render(<Audit />);
+    await flush();
+    fireEvent.click(screen.getByRole('button', { name: 'Open record 41' }));
+    await flush();
+    // The trail opens another record, one the list does not hold.
+    fireEvent.click(within(screen.getByRole('region', { name: 'Request trail' })).getByRole('button', { name: 'Open record 40' }));
+    await flush();
+    fireEvent.click(screen.getByRole('button', { name: 'Close record' }));
+    expect(document.activeElement).toBe(screen.getByRole('heading', { level: 2, name: 'Records' }));
   });
 
   // L126 (lead ruling on the T20 report): Rust reads `change` from the decrypted payload and answers

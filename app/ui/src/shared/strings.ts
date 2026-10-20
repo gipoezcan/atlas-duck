@@ -696,7 +696,8 @@ export const AUDIT_TEXT = {
   refused: 'verification did not complete',
   verification: 'Verification',
 
-  // M10 T20 (spec 8.7, 8.10, PD-161, PD-180, PD-181): plan text unless marked otherwise.
+  // M10 T20 (spec 8.7, 8.10, PD-161, PD-180, PD-181): agent-written text (editable in review)
+  // except what is marked plan text or verbatim below (PD-161, L126, the 8.7 action name, PD-82).
   loading: 'Loading',
   retry: 'Try again',
   incidents: 'Integrity incidents',
@@ -720,11 +721,10 @@ export const AUDIT_TEXT = {
   ack_close: 'Close',
   ack_done: (verifySeq: number, ackSeq: number) =>
     `Incident ${verifySeq} was acknowledged (record ${ackSeq}). The red banner is cleared for this incident.`,
-  ack_cancelled: 'Cancelled: the incident is still open.',
-  /** Why an acknowledgement was refused, by error kind. */
+  ack_cancelled: 'Cancelled: the incident is still open.',  /** Why an acknowledgement was refused, by error kind. */
   ack_errors: {
     not_found: 'That incident is no longer open.',
-    note: 'The note is too long: at most 1000 characters.',
+    note: 'The note was refused: at most 1000 characters, and no NUL character.',
     unreadable: 'The incident record could not be read, so it cannot be acknowledged here.',
   } as Readonly<Record<string, string>>,
   anchor_dir: 'Anchor directory',
@@ -754,6 +754,23 @@ export const AUDIT_TEXT = {
   filter_nul: 'A filter cannot hold a NUL character',
   time_invalid: 'Not a date and time',
   range_order: '"From" is after "To"',
+  /** The registry classes in the class filter. */
+  class_labels: {
+    read: 'read',
+    write: 'write',
+    script: 'script',
+  } as Readonly<Record<string, string>>,
+  /** The `decision` column values in the decision filter. */
+  decision_labels: {
+    approve: 'approve',
+    approve_edited: 'approve (edited)',
+    release: 'release',
+    release_redacted: 'release (redacted)',
+    deny: 'deny',
+    expire: 'expire',
+    cancel: 'cancel',
+    reject: 'reject',
+  } as Readonly<Record<string, string>>,
   /** The 8.2 flag names as the window labels them. */
   flag_labels: {
     edited: 'edited',
@@ -765,6 +782,8 @@ export const AUDIT_TEXT = {
     clock_behind: 'clock behind',
     integrity_incident: 'integrity incident',
   } as Readonly<Record<string, string>>,
+  /** A flag, class or decision name this window has no label for (the validators keep the names closed). */
+  unknown_name: 'unknown name',
   list_label: 'Audit records, newest first',
   list_loading: 'Searching the records',
   list_failed: 'Could not read the records',
@@ -844,7 +863,7 @@ export const AUDIT_TEXT = {
   export_progress: (done: number, total: number) => `${done} of ${total} records written`,
   export_starting: 'Starting the export',
   export_cancel: 'Cancel export',
-  export_cancel_requested: 'Cancel requested: the export stops and removes its folder.',
+  export_cancel_requested: "Cancel requested. The export's own result follows.",
   export_cancel_none: 'No export was running.',
   /** PD-161 (plan text): shown with the result. */
   export_recipient: (hex: string) =>
@@ -872,7 +891,8 @@ export const AUDIT_TEXT = {
   backup_running: 'A backup is running',
   backup_saved: 'The backup was saved.',
   backup_not_saved: 'No backup was made.',
-  backup_failed: 'The backup failed. Nothing needs to be undone.',
+  backup_failed:
+    'The backup failed. If an unfinished backup folder is left in the folder you chose, delete it.',
   backup_cancelled: 'Cancelled: no backup was made.',
   /** M10 T16 review M-4: `backup_trigger` answers `removal {running}` while a removal step runs. */
   backup_removal_running: 'A "Prepare for removal" step is running: wait for it to end, then try again.',

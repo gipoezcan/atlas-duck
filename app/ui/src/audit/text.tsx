@@ -1,3 +1,5 @@
+import type { ReactNode } from 'react';
+
 import { AUDIT_TEXT as T, UNUSUAL_CHARACTERS } from '../shared/strings';
 import { Badge } from '../shared/text/Badge';
 import { own } from '../shared/text/own';
@@ -19,7 +21,33 @@ export function Val({ value }: { value: string | number | null }) {
   );
 }
 
-const LOCAL_TIME = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/;
+/** What a command said: a result (`status`) or a refusal or failure (`alert`). */
+export interface Said {
+  role: 'status' | 'alert';
+  body: ReactNode;
+}
+
+/**
+ * Where a window says what a command answered. The `status` region is always in the page, empty
+ * until a result is filled in (several screen readers do not announce a status region that is
+ * inserted already holding its text); an `alert` is announced as it appears.
+ */
+export function Announce({ said, className }: { said: Said | null; className?: string }) {
+  return (
+    <>
+      <div role="status" className={className}>
+        {said?.role === 'status' ? said.body : null}
+      </div>
+      {said?.role === 'alert' ? (
+        <div role="alert" className={className}>
+          {said.body}
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+const LOCAL_TIME =/^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/;
 
 /**
  * A `datetime-local` value read as UTC (the fields say "UTC"), in Rust's `ts_utc` form

@@ -351,6 +351,30 @@ fn reconcile_decrypts_only_what_it_needs() {
 }
 
 #[test]
+fn event_type_at_reads_one_header_row_and_decrypts_nothing() {
+    let (s, _f) = store();
+    let a = put(&s, T::REQUEST_RECEIVED, "a", json!({}));
+    let b = put(
+        &s,
+        T::CREDENTIAL_CHANGED,
+        "a",
+        json!({ "change": "store_failed" }),
+    );
+    let before = s.testing_payload_reads();
+    assert_eq!(s.event_type_at(a).unwrap(), T::REQUEST_RECEIVED);
+    assert_eq!(s.event_type_at(b).unwrap(), T::CREDENTIAL_CHANGED);
+    assert!(matches!(
+        s.event_type_at(b + 1),
+        Err(AuditError::NotFound { .. })
+    ));
+    assert!(matches!(
+        s.event_type_at(u64::MAX),
+        Err(AuditError::NotFound { .. })
+    ));
+    assert_eq!(s.testing_payload_reads(), before, "no decrypt");
+}
+
+#[test]
 fn reconcile_unreadable_script_failed_fails_closed() {
     let (s, _f) = store();
     put(&s, T::REQUEST_RECEIVED, "s1", json!({}));

@@ -60,7 +60,7 @@ export function PayloadView({ seq }: { seq: number }) {
         <button type="button" disabled={page <= 0} onClick={() => setPage((p) => Math.max(0, p - 1))}>
           {T.payload_previous}
         </button>
-        {data === null ? null : <span role="status">{T.payload_page(data.page + 1, count, data.total_bytes)}</span>}
+        <span role="status">{data === null ? null : T.payload_page(data.page + 1, count, data.total_bytes)}</span>
         <button type="button" disabled={data === null || page + 1 >= count} onClick={() => setPage((p) => p + 1)}>
           {T.payload_next}
         </button>

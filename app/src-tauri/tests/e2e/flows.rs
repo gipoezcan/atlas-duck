@@ -474,6 +474,25 @@ async fn wait_text(
     .await
 }
 
+/// The Audit window's verification result once there is one: the text of the element the page
+/// keeps for it (`data-testid="verification-result"`, empty until a result), trimmed. Not the page
+/// text: the window always says "integrity incident" and shows "unverified" badges elsewhere.
+async fn verification_result(wd: &WebDriver) -> Result<String> {
+    wait_for("the verification result", WAIT, || async {
+        let Some(element) = wd
+            .find_all("[data-testid='verification-result']")
+            .await?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        let text = wd.text(&element).await?.trim().to_owned();
+        Ok((!text.is_empty()).then_some(text))
+    })
+    .await
+}
+
 async fn wait_enabled(wd: &WebDriver, e: &Element, within: Duration) -> Result<()> {
     wait_for("an enabled control", within, || async {
         Ok(wd.is_enabled(e).await?.then_some(()))
@@ -886,16 +905,10 @@ async fn ui06(rig: &Rig) -> Result<()> {
         .wait_find_xpath("//button[normalize-space()='Verify now']", WAIT)
         .await?;
     wd.click(&verify).await?;
-    let text = wait_text(wd, "the verification result", WAIT, |t| {
-        t.contains("verified") || t.contains("did not complete") || t.contains("integrity incident")
-    })
-    .await?;
-    ensure!(
-        text.contains("verified")
-            && !text.contains("did not complete")
-            && !text.contains("integrity incident"),
-        "Verify now: {text}"
-    );
+    // Exactly the sentence, from the one element that holds it: the window's other text says
+    // "integrity incident" (a filter, the incident count) and "unverified" (an agent name's badge).
+    let text = verification_result(wd).await?;
+    ensure_eq!(text, "verified", "Verify now");
     Ok(())
 }
 
@@ -1359,10 +1372,8 @@ async fn s09(rig: &Rig) -> Result<()> {
         .wait_find_xpath("//button[normalize-space()='Verify now']", WAIT)
         .await?;
     wd.click(&verify).await?;
-    wait_text(wd, "the verification result", WAIT, |t| {
-        t.contains("verified")
-    })
-    .await?;
+    let text = verification_result(wd).await?;
+    ensure_eq!(text, "verified", "Verify now");
     // Running scripts: running_list answered.
     rig.open_window("Running scripts", "Running scripts")
         .await?;

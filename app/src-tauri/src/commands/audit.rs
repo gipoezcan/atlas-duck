@@ -611,16 +611,10 @@ pub fn payload_dto(
 /// L126: the failed keychain step a `CREDENTIAL_CHANGED` record `seq` names in its payload's
 /// `change` (`store_failed`, `delete_failed`), else `None`: another change, another record kind,
 /// or a record that cannot be read here (the payload view itself says that). The kind comes from
-/// the record's header (the one row at `seq`, no filter scan), so other records are not decrypted
-/// again.
+/// the record's header (a primary-key lookup of the one row at `seq`: no `query` window walk), so
+/// other records are not decrypted again.
 fn credential_failure(store: &Store, seq: u64) -> Option<CredentialChangeFailure> {
-    let at = AuditCursor {
-        before_seq: Some(seq.checked_add(1)?),
-        limit: 1,
-    };
-    let page = store.query(&AuditFilter::default(), at).ok()?;
-    let header = page.rows.first()?;
-    if header.seq != seq || header.event_type != EventType::CREDENTIAL_CHANGED {
+    if store.event_type_at(seq).ok()? != EventType::CREDENTIAL_CHANGED {
         return None;
     }
     let bytes = store.read_payload(seq).ok()?;
@@ -1796,8 +1790,17 @@ pub(crate) mod tests {
             (EventType::CONFIG_CHANGED, json!("delete_failed"), None),
         ] {
             let c = append(event_type, change.clone())?;
+            let reads = r.store.testing_payload_reads();
             let p = payload_dto(&r.store, c.seq, 0, Platform::MacOsLinux)?;
             assert_eq!(p.credential_change, want, "{event_type:?} {change}");
+            // The view's own read, plus one more only for a `CREDENTIAL_CHANGED` record: the kind
+            // comes from the header row, so no other record is decrypted a second time.
+            let expected = if event_type == credential { 2 } else { 1 };
+            assert_eq!(
+                r.store.testing_payload_reads() - reads,
+                expected,
+                "{event_type:?} {change}"
+            );
         }
         let c = append(credential, json!("delete_failed"))?;
         let wire = serde_json::to_value(payload_dto(&r.store, c.seq, 0, Platform::MacOsLinux)?)?;

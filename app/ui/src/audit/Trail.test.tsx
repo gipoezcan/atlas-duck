@@ -2,7 +2,8 @@ import { fireEvent, render, screen, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { auditTrail } from '../shared/ipc/invoke';
-import { flush, header } from './testing';
+import type { AuditTrail } from '../shared/ipc/types';
+import { deferred, flush, header } from './testing';
 import { Trail } from './Trail';
 
 vi.mock('../shared/ipc/invoke', () => ({ auditTrail: vi.fn() }));
@@ -84,9 +85,60 @@ describe('Audit request trail (spec 8.10)', () => {
       'Record 17 of this request could not be read, so its trail cannot be shown. Its records are still in the list.',
     );
     unmount();
-    vi.mocked(auditTrail).mockRejectedValueOnce('command not allowed');
+    // What `call()` turns a rejection it does not recognise into.
+    vi.mocked(auditTrail).mockRejectedValueOnce({ kind: 'refused', message: 'command not allowed' });
     render(<Trail requestId="req_0123456789abcdefghij" onOpen={() => undefined} />);
     await flush();
     expect(screen.getByRole('alert').textContent).toBe('Could not read the trail of this request.');
+  });
+
+  it('the answer of an earlier request never replaces the one now shown', async () => {
+    const first = deferred<AuditTrail>();
+    vi.mocked(auditTrail).mockReturnValueOnce(first.promise);
+    vi.mocked(auditTrail).mockResolvedValueOnce({ headers: [], deliveries: { count: 1, to_other_peer: false } });
+    const { rerender } = render(<Trail requestId="req_aaaaaaaaaaaaaaaaaaaa" onOpen={() => undefined} />);
+    rerender(<Trail requestId="req_bbbbbbbbbbbbbbbbbbbb" onOpen={() => undefined} />);
+    await flush();
+    expect(screen.getByText('Delivered 1 time')).toBeTruthy();
+    first.resolve({ headers: [], deliveries: { count: 5, to_other_peer: false } });
+    await flush();
+    expect(screen.getByText('Delivered 1 time')).toBeTruthy();
+    expect(screen.queryByText('Delivered 5 times')).toBeNull();
+  });
+
+  it('an answer that comes after the trail was closed changes nothing and raises nothing', async () => {
+    const late = deferred<AuditTrail>();
+    vi.mocked(auditTrail).mockReturnValueOnce(late.promise);
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { unmount, container } = render(<Trail requestId="req_0123456789abcdefghij" onOpen={() => undefined} />);
+    unmount();
+    late.resolve({ headers: [], deliveries: { count: 2, to_other_peer: false } });
+    await flush();
+    expect(container.textContent).toBe('');
+    expect(errors).not.toHaveBeenCalled();
+    errors.mockRestore();
+  });
+
+  it('the status region is there empty before the trail is asked for, and says "reading" once it is', async () => {
+    const pending = deferred<AuditTrail>();
+    vi.mocked(auditTrail).mockReturnValueOnce(pending.promise);
+    render(<Trail requestId="req_0123456789abcdefghij" onOpen={() => undefined} />);
+    const region = screen.getByRole('status');
+    await flush();
+    expect(screen.getByRole('status')).toBe(region);
+    expect(region.textContent).toBe('Reading the trail');
+    pending.resolve({ headers: [], deliveries: { count: 1, to_other_peer: false } });
+    await flush();
+    expect(region.textContent).toBe('');
+  });
+
+  it('the time of a record is a bidi-isolated text node like every other column', async () => {
+    vi.mocked(auditTrail).mockResolvedValueOnce({
+      headers: [header(10, { ts_utc: '2026-10-19T08:30:15.250Z' })],
+      deliveries: { count: 0, to_other_peer: false },
+    });
+    render(<Trail requestId="req_0123456789abcdefghij" onOpen={() => undefined} />);
+    await flush();
+    expect(screen.getByText('2026-10-19T08:30:15.250Z').tagName).toBe('BDI');
   });
 });

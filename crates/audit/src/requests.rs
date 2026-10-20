@@ -270,6 +270,12 @@ impl Store {
         self.with_reader(|c| query_headers(c, "ts_utc >= ?1", [cutoff.as_str()]))
     }
 
+    /// The event type of record `seq`, from its one header row (primary key lookup, no window
+    /// scan, never decrypts).
+    pub fn event_type_at(&self, seq: u64) -> Result<EventType, AuditError> {
+        Ok(self.header_at(seq)?.event_type)
+    }
+
     fn header_at(&self, seq: u64) -> Result<EventHeader, AuditError> {
         let seq_i = i64::try_from(seq).map_err(|_| AuditError::NotFound { seq })?;
         self.with_reader(|c| query_headers(c, "seq = ?1", [seq_i]))?

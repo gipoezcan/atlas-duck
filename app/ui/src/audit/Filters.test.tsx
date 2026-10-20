@@ -51,6 +51,20 @@ describe('Audit filters (spec 8.10, L38)', () => {
     expect(screen.getByText(/payloads are not searched/)).toBeTruthy();
   });
 
+  it('the class and decision options are labelled from the strings table, the value is the wire name', () => {
+    render(<Filters onApply={() => undefined} />);
+    const options = (label: string) =>
+      [...(screen.getByLabelText(label) as HTMLSelectElement).options].map((o) => [o.value, o.textContent]);
+    expect(options('Decision')).toContainEqual(['approve_edited', 'approve (edited)']);
+    expect(options('Decision')).toContainEqual(['release_redacted', 'release (redacted)']);
+    expect(options('Class')).toEqual([
+      ['', 'any'],
+      ['read', 'read'],
+      ['write', 'write'],
+      ['script', 'script'],
+    ]);
+  });
+
   it('a date-time field is read as UTC text in the `ts_utc` form; anything else is refused', () => {
     // A browser normalizes `.500` to `.5`: the fraction is milliseconds from the left.
     expect(utcOf('2026-10-19T08:30:15.5')).toBe('2026-10-19T08:30:15.500Z');
@@ -91,6 +105,8 @@ describe('Audit filters (spec 8.10, L38)', () => {
     const described = field('Agent name').getAttribute('aria-describedby') ?? '';
     expect(document.getElementById(described)?.textContent).toBe('At most 2048 bytes');
     expect(screen.getByRole('alert').textContent).toBe('Check the filters');
+    // Focus goes to the field that was refused, not left on the button.
+    expect(document.activeElement).toBe(field('Agent name'));
 
     set('Agent name', '');
     set('Target (starts with)', 'a\u0000b');

@@ -91,17 +91,19 @@ export function EventList({ filter, selected, onOpen }: Props) {
   const nothing = started && rows.length === 0 && next === null;
   return (
     <div className="audit-list">
-      {started ? (
-        <p role="status">
-          <span>{T.list_summary(rows.length, examined)}</span>
-          {next === null ? (
-            <>
-              {' '}
-              <span>{T.list_end}</span>
-            </>
-          ) : null}
-        </p>
-      ) : null}
+      <p role="status">
+        {started ? (
+          <>
+            <span>{T.list_summary(rows.length, examined)}</span>
+            {next === null ? (
+              <>
+                {' '}
+                <span>{T.list_end}</span>
+              </>
+            ) : null}
+          </>
+        ) : null}
+      </p>
       {loading && !started ? <p>{T.list_loading}</p> : null}
       {error === null ? null : (
         <p role="alert">
@@ -137,7 +139,7 @@ export function Flags({ flags }: { flags: readonly string[] }) {
   return (
     <>
       {flags.map((f) => (
-        <Badge key={f} label={own(T.flag_labels, f) ?? f} tone={f === 'integrity_incident' ? 'caution' : 'neutral'} />
+        <Badge key={f} label={own(T.flag_labels, f) ?? T.unknown_name} tone={f === 'integrity_incident' ? 'caution' : 'neutral'} />
       ))}
     </>
   );
@@ -158,7 +160,11 @@ function Row({
         <button type="button" aria-current={current ? 'true' : undefined} onClick={() => onOpen(h)}>
           {T.open_record(h.seq)}
         </button>
-        <span>{h.ts_utc}</span>
+        {/* The flags come first: a narrow row cuts the end of its line, and a caution flag must stay in view. */}
+        <Flags flags={h.flags} />
+        <span>
+          <Val value={h.ts_utc} />
+        </span>
         <code>
           <Val value={h.event_type} />
         </code>
@@ -167,7 +173,6 @@ function Row({
             <Val value={h.decision} />
           </span>
         )}
-        <Flags flags={h.flags} />
       </div>
       <div className="audit-line">
         {h.op_id === null ? null : (

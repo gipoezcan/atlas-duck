@@ -4,7 +4,7 @@ import { acknowledgeIncident } from '../shared/ipc/invoke';
 import type { AuditIncident, AuditStatus } from '../shared/ipc/types';
 import { AUDIT_TEXT as T } from '../shared/strings';
 import { own } from '../shared/text/own';
-import { errorText, kinds, Val } from './text';
+import { Announce, errorText, kinds, type Said, Val } from './text';
 
 /** plan text (PD-180): the note is at most 1 000 characters; Rust re-validates (`invalid_argument {note}`). */
 const NOTE_MAX = 1_000;
@@ -19,11 +19,9 @@ interface Props {
   onChanged: () => void;
 }
 
-type Outcome = { text: string; role: 'status' | 'alert' };
-
-function refusal(e: unknown): Outcome {
+function refusal(e: unknown): Said {
   const { kind, inner, field } = kinds(e);
-  if (kind === 'cancelled') return { text: T.ack_cancelled, role: 'status' };
+  if (kind === 'cancelled') return { body: T.ack_cancelled, role: 'status' };
   const text =
     kind === 'not_found'
       ? own(T.ack_errors, 'not_found')
@@ -32,7 +30,7 @@ function refusal(e: unknown): Outcome {
         : kind === 'audit' && inner === 'unreadable'
           ? own(T.ack_errors, 'unreadable')
           : undefined;
-  return { text: text ?? errorText(e), role: 'alert' };
+  return { body: text ?? errorText(e), role: 'alert' };
 }
 
 /**
@@ -46,10 +44,12 @@ export function Incidents({ status, failed, onRetry, onChanged }: Props) {
   const [open, setOpen] = useState<number | null>(null);
   const [note, setNote] = useState('');
   const [sending, setSending] = useState(false);
-  const [outcome, setOutcome] = useState<Outcome | null>(null);
+  const [outcome, setOutcome] = useState<Said | null>(null);
   const inFlight = useRef(false);
   const live = useRef(true);
   const field = useRef<HTMLTextAreaElement>(null);
+  const heading = useRef<HTMLHeadingElement>(null);
+  const triggers = useRef(new Map<number, HTMLButtonElement>());
   const ids = useId();
 
   useEffect(() => {
@@ -69,6 +69,12 @@ export function Incidents({ status, failed, onRetry, onChanged }: Props) {
     setOutcome(null);
   };
 
+  /** The note closes: focus goes back to the button that opened it (it would fall to the page). */
+  const close = (seq: number) => {
+    setOpen(null);
+    triggers.current.get(seq)?.focus();
+  };
+
   const send = (seq: number) => {
     if (inFlight.current) return;
     inFlight.current = true;
@@ -80,7 +86,9 @@ export function Incidents({ status, failed, onRetry, onChanged }: Props) {
         if (!live.current) return;
         setSending(false);
         setOpen(null);
-        setOutcome({ text: T.ack_done(ack.verify_seq, ack.ack_seq), role: 'status' });
+        // The incident drops out of the list: focus goes to the section, which stays.
+        heading.current?.focus();
+        setOutcome({ body: T.ack_done(ack.verify_seq, ack.ack_seq), role: 'status' });
         onChanged();
       },
       (e: unknown) => {
@@ -110,6 +118,10 @@ export function Incidents({ status, failed, onRetry, onChanged }: Props) {
         )}{' '}
         <button
           type="button"
+          ref={(el) => {
+            if (el === null) triggers.current.delete(seq);
+            else triggers.current.set(seq, el);
+          }}
           aria-label={T.acknowledge_label(seq)}
           aria-expanded={open === seq}
           disabled={sending}
@@ -132,7 +144,7 @@ export function Incidents({ status, failed, onRetry, onChanged }: Props) {
             <button type="button" disabled={sending} onClick={() => send(seq)}>
               {T.ack_send}
             </button>{' '}
-            <button type="button" disabled={sending} onClick={() => setOpen(null)}>
+            <button type="button" disabled={sending} onClick={() => close(seq)}>
               {T.ack_close}
             </button>
           </div>
@@ -143,7 +155,9 @@ export function Incidents({ status, failed, onRetry, onChanged }: Props) {
 
   return (
     <section className="audit-incidents" aria-label={T.incidents}>
-      <h2>{T.incidents}</h2>
+      <h2 ref={heading} tabIndex={-1}>
+        {T.incidents}
+      </h2>
       {status === null ? (
         failed ? (
           <p role="alert">
@@ -171,7 +185,7 @@ export function Incidents({ status, failed, onRetry, onChanged }: Props) {
           ) : null}
         </>
       )}
-      {outcome === null ? null : <p role={outcome.role}>{outcome.text}</p>}
+      <Announce said={outcome} />
     </section>
   );
 }

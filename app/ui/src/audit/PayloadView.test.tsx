@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { auditPayload } from '../shared/ipc/invoke';
 import type { AuditPayload } from '../shared/ipc/types';
 import { PayloadView } from './PayloadView';
-import { flush } from './testing';
+import { deferred, flush } from './testing';
 
 vi.mock('../shared/ipc/invoke', () => ({ auditPayload: vi.fn() }));
 
@@ -68,6 +68,47 @@ describe('Audit payload view (spec 8.10, PD-67, PD-68)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Previous page' }));
     await flush();
     expect(auditPayload).toHaveBeenLastCalledWith(41, 0);
+  });
+
+  it('the page that answers late is not shown for the page now asked for', async () => {
+    const slow = deferred<AuditPayload>();
+    vi.mocked(auditPayload).mockImplementation((_seq, page = 0) =>
+      page === 1 ? slow.promise : Promise.resolve(answer(page)),
+    );
+    const { container } = render(<PayloadView seq={41} />);
+    await flush();
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Previous page' }));
+    await flush();
+    slow.resolve(answer(1));
+    await flush();
+    expect(container.querySelector('iframe')?.getAttribute('srcdoc')).toBe(`${SRCDOC}0`);
+    expect(screen.getByRole('status').textContent).toBe('Page 1 of 2, 300000 bytes');
+  });
+
+  it('an answer that comes after the view was closed changes nothing and raises nothing', async () => {
+    const late = deferred<AuditPayload>();
+    vi.mocked(auditPayload).mockReturnValueOnce(late.promise);
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { unmount, container } = render(<PayloadView seq={41} />);
+    unmount();
+    late.resolve(answer(0));
+    await flush();
+    expect(container.textContent).toBe('');
+    expect(errors).not.toHaveBeenCalled();
+    errors.mockRestore();
+  });
+
+  it('the page status is in the page before the answer, empty, and is filled in later', async () => {
+    const first = deferred<AuditPayload>();
+    vi.mocked(auditPayload).mockReturnValueOnce(first.promise);
+    render(<PayloadView seq={41} />);
+    const region = screen.getByRole('status');
+    expect(region.textContent).toBe('');
+    first.resolve(answer(0));
+    await flush();
+    expect(screen.getByRole('status')).toBe(region);
+    expect(region.textContent).toBe('Page 1 of 2, 300000 bytes');
   });
 
   it('a payload that does not decrypt, a pruned record and other failures are fixed sentences', async () => {

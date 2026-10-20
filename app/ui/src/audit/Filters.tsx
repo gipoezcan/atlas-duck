@@ -64,6 +64,9 @@ const EMPTY: Form = {
 
 type Errors = Partial<Record<'from' | 'to' | TextKey, string>>;
 
+/** The refusable fields in the order the form shows them. */
+const FIELD_ORDER = ['from', 'to', 'agent_name', 'op_id', 'instance_id', 'target'] as const;
+
 const utf8 = new TextEncoder();
 
 /**
@@ -112,6 +115,9 @@ export function Filters({ onApply }: { onApply: (filter: AuditFilter) => void })
     const built = buildFilter(form);
     if ('errors' in built) {
       setErrors(built.errors);
+      // To the first refused field, in the form's order.
+      const first = FIELD_ORDER.find((key) => built.errors[key] !== undefined);
+      if (first !== undefined) document.getElementById(`${ids}-${first}`)?.focus();
       return;
     }
     setErrors({});
@@ -152,7 +158,12 @@ export function Filters({ onApply }: { onApply: (filter: AuditFilter) => void })
     );
   };
 
-  const select = (key: 'op_class' | 'decision', label: string, values: readonly string[]) => {
+  const select = (
+    key: 'op_class' | 'decision',
+    label: string,
+    values: readonly string[],
+    labels: Readonly<Record<string, string>>,
+  ) => {
     const id = `${ids}-${key}`;
     return (
       <div className="audit-field">
@@ -161,7 +172,7 @@ export function Filters({ onApply }: { onApply: (filter: AuditFilter) => void })
           <option value="">{T.any}</option>
           {values.map((v) => (
             <option key={v} value={v}>
-              {v}
+              {own(labels, v) ?? T.unknown_name}
             </option>
           ))}
         </select>
@@ -177,10 +188,10 @@ export function Filters({ onApply }: { onApply: (filter: AuditFilter) => void })
         {field('to', T.to, 'datetime-local')}
         {field('agent_name', T.agent_name, 'text')}
         {field('op_id', T.op_id, 'text')}
-        {select('op_class', T.op_class, CLASSES)}
+        {select('op_class', T.op_class, CLASSES, T.class_labels)}
         {field('instance_id', T.instance_id, 'text')}
         {field('target', T.target, 'text')}
-        {select('decision', T.decision, DECISIONS)}
+        {select('decision', T.decision, DECISIONS, T.decision_labels)}
       </div>
       <fieldset className="audit-flags">
         <legend>{T.flags}</legend>

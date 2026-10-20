@@ -12,7 +12,7 @@ import { ExportBackup } from './ExportBackup';
 import { Filters } from './Filters';
 import { Incidents } from './Incidents';
 import { PayloadView } from './PayloadView';
-import { Val } from './text';
+import { Announce, Val } from './text';
 import { Trail } from './Trail';
 
 type Result = keyof typeof T.results | 'refused';
@@ -118,6 +118,23 @@ export function Audit() {
     setListKey((k) => k + 1);
   };
 
+  // Closing the record unmounts the focused button: focus goes back to that record's row button,
+  // or to the Records heading when the list does not hold it (a trail opened it).
+  const records = useRef<HTMLElement>(null);
+  const recordsHeading = useRef<HTMLHeadingElement>(null);
+  const closed = useRef<number | null>(null);
+  useEffect(() => {
+    if (record !== null || closed.current === null) return;
+    const name = T.open_record(closed.current);
+    closed.current = null;
+    const row = [...(records.current?.querySelectorAll('button') ?? [])].find((b) => b.textContent === name);
+    (row ?? recordsHeading.current)?.focus();
+  }, [record]);
+  const closeRecord = () => {
+    closed.current = record?.seq ?? null;
+    setRecord(null);
+  };
+
   return (
     <main className="audit">
       <h1>{WINDOW_TITLES.audit}</h1>
@@ -127,19 +144,29 @@ export function Audit() {
         <button type="button" disabled={running} onClick={verify}>
           {running ? T.verifying : T.verify}
         </button>
-        {result === null ? null : (
-          <p role={result === 'verified' ? 'status' : 'alert'}>
-            {result === 'refused' ? T.refused : T.results[result]}
-          </p>
-        )}
+        {/* The end-to-end flows read the result here: the window says "integrity incident" and "unverified" elsewhere. */}
+        <div data-testid="verification-result">
+          <Announce
+            said={
+              result === null
+                ? null
+                : {
+                    role: result === 'verified' ? 'status' : 'alert',
+                    body: result === 'refused' ? T.refused : T.results[result],
+                  }
+            }
+          />
+        </div>
       </section>
       <ExportBackup job={job} />
-      <section aria-label={T.records}>
-        <h2>{T.records}</h2>
+      <section aria-label={T.records} ref={records}>
+        <h2 ref={recordsHeading} tabIndex={-1}>
+          {T.records}
+        </h2>
         <Filters onApply={apply} />
         <EventList key={listKey} filter={filter} selected={record?.seq ?? null} onOpen={setRecord} />
         {record === null ? null : (
-          <RecordDetail key={record.seq} header={record} onOpen={setRecord} onClose={() => setRecord(null)} />
+          <RecordDetail key={record.seq} header={record} onOpen={setRecord} onClose={closeRecord} />
         )}
       </section>
     </main>

@@ -33,11 +33,14 @@ function failureText(e: unknown): string {
 export function Trail({ requestId, onOpen }: Props) {
   const [trail, setTrail] = useState<AuditTrail | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
+  // False until the read is asked for: the status region is in the page empty first, then filled.
+  const [asked, setAsked] = useState(false);
 
   useEffect(() => {
     let live = true;
     setTrail(null);
     setFailed(null);
+    setAsked(true);
     auditTrail(requestId).then(
       (t) => {
         if (live) setTrail(t);
@@ -55,12 +58,9 @@ export function Trail({ requestId, onOpen }: Props) {
   return (
     <section className="audit-trail" aria-label={T.trail}>
       <h3>{T.trail}</h3>
+      <p role="status">{asked && trail === null && failed === null ? T.trail_loading : null}</p>
       {failed === null ? null : <p role="alert">{failed}</p>}
-      {trail === null ? (
-        failed === null ? (
-          <p role="status">{T.trail_loading}</p>
-        ) : null
-      ) : (
+      {trail === null ? null : (
         <>
           <p>
             <span>{T.deliveries(trail.deliveries.count)}</span>{' '}
@@ -76,7 +76,7 @@ export function Trail({ requestId, onOpen }: Props) {
                 <button type="button" onClick={() => onOpen(h)}>
                   {T.open_record(h.seq)}
                 </button>{' '}
-                <span>{h.ts_utc}</span>{' '}
+                <Val value={h.ts_utc} />{' '}
                 <code>
                   <Val value={h.event_type} />
                 </code>

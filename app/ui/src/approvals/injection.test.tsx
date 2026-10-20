@@ -54,6 +54,11 @@ const DISCRIMINANTS = new Set([
   // M10 T20: an audit header's flags (closed 8.2 names) and the `audit_job` event's job and phase;
   // the payload answer's `credential_change` (L126: `store_failed`, `delete_failed` or null).
   'flags', 'job', 'phase', 'credential_change',
+  // M10 T20 review I-2: the export's SHA-256 (64 lowercase hex, the `validate.ts` format check). A
+  // `free` run keeps it valid so the export result and the `not_renamed` error reach the page and
+  // `dir_name` is shown poisoned; its path is poisoned (`__proto__`, `constructor`) by the focus
+  // pass, and `all` poisons it with everything else, where the validator rejects it.
+  'manifest_sha256',
 ]);
 
 /** The one discriminator path a `free` run poisons as well (the per-path prototype pass), or null. */
@@ -112,6 +117,8 @@ function scan(where: string): string[] {
   if (g['__pwned'] !== undefined) found.push(`${where}: window.__pwned is set`);
   // What a table lookup that hit `Object.prototype` leaves in plain DOM text (a text node is a string).
   const text = document.body.textContent ?? '';
+  // Reading a fixture is not rendering it: what the benign runs must have put on a page (see `fx`).
+  if (learning) for (const marker of RENDERED_BENIGN) if (text.includes(marker)) renderedBenign.add(marker);
   if (text.includes('[native code]') || text.includes('[object Object]')) {
     found.push(`${where}: the page shows a function or an object as text`);
   }
@@ -136,6 +143,20 @@ function scan(where: string): string[] {
   }
   return found;
 }
+
+/**
+ * Page texts the benign runs must reach: `fx` marks a fixture used when a command reads it, but a
+ * validator may refuse the answer (the export result and `not_renamed` once did, unseen). The
+ * export result, its recipient sentence and the `not_renamed` result are written out here on
+ * purpose: this test must not read the table it checks.
+ */
+const RENDERED_BENIGN = [
+  'The export is complete',
+  'atlas-duck verify-export',
+  'but its folder kept the name',
+  '5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e',
+];
+const renderedBenign = new Set<string>();
 
 const protos = [Object.prototype, Array.prototype, Function.prototype, String.prototype];
 const protoNames = protos.map((p) => Object.getOwnPropertyNames(p).join());
@@ -176,15 +197,24 @@ function fx(name: string, pass: Mode = mode): Json[] {
  * The n-th call of a command: the fixtures in turn; every second call refuses with one of the
  * `command_error` fixtures, so the error paths of every window are shown too.
  */
-function reply(cmd: string, name: string, pick?: (list: Json[]) => Json): Promise<Json> {
+function reply(cmd: string, name: string, pick?: (list: Json[]) => Json, refusals?: (all: Json[]) => Json[]): Promise<Json> {
   const i = counters.get(cmd) ?? 0;
   counters.set(cmd, i + 1);
   if (i % 2 === 1) {
-    const errors = fx('command_error');
+    const all = fx('command_error');
+    const errors = refusals ? refusals(all) : all;
     return Promise.reject(errors[(i >> 1) % errors.length]);
   }
   const list = fx(name);
   return Promise.resolve(pick ? pick(list) : list[(i >> 1) % list.length]);
+}
+
+/** The `export` errors of `command_error`, the `not_renamed` result (hash shown) and `leftover` first. */
+function exportFailures(all: Json[]): Json[] {
+  const inner = (e: Json) => (e as { kind?: unknown; error?: { kind?: unknown } }).error?.kind;
+  const exports = all.filter((e) => (e as { kind?: unknown }).kind === 'export');
+  const rank = (e: Json) => ['not_renamed', 'leftover'].indexOf(String(inner(e))) >>> 0;
+  return exports.sort((a, b) => rank(a) - rank(b));
 }
 
 /** A read that always answers the scenario's pinned fixture: the window stays on that state. */
@@ -329,7 +359,9 @@ function answer(cmd: string, args: Record<string, unknown>): Promise<Json> {
     case 'audit_payload': return reply(cmd, 'audit_payload');
     case 'audit_status': return pinned('audit_status');
     case 'acknowledge_incident': return reply(cmd, 'acknowledged');
-    case 'export_trigger': return reply(cmd, 'export_done');
+    // Its refusals are the export's own, `not_renamed` first: with all 75 errors in turn the explorer
+    // would have to press Export 96 times to reach the one that shows a result.
+    case 'export_trigger': return reply(cmd, 'export_done', undefined, exportFailures);
     case 'export_cancel': return reply(cmd, 'export_cancel');
     case 'backup_trigger': return reply(cmd, 'removal_backup_answer');
     // M10 T13 (PD-168): Settings "Restore backup…"; its UI is Task 21's.
@@ -553,6 +585,17 @@ const SCENARIOS: Scenario[] = [
     name: 'audit jobs',
     element: () => <Audit />,
     after: async () => {
+      // Export twice: the explorer presses a control once, so the second answer (the export's own
+      // refusals, `not_renamed` first) would never show a result. The first answer is the done result.
+      for (let i = 0; i < 2; i++) {
+        const start = [...document.querySelectorAll('button')].find((b) => b.textContent === 'Export…');
+        if (start !== undefined && !start.disabled) {
+          await act(async () => {
+            fireEvent.click(start);
+          });
+          await settle();
+        }
+      }
       const jobs = fx('audit_job');
       for (const job of jobs) await emit('audit_job', job);
       await emit('audit_job', jobs.find((j) => (j as { phase?: unknown }).phase === 'progress') ?? null);
@@ -669,6 +712,12 @@ async function clean(value: string, reach: Reach, modes: readonly Mode[] = ['fre
   expect(protoIntact()).toBe(true);
 }
 
+/**
+ * The table-driven cases run under their own bound, not vitest's 5 s default: the slowest took
+ * 1.6 s on the CI runner before the Audit window, so this is ten times that.
+ */
+const TABLE_TEST_TIMEOUT = 20_000;
+
 describe('s06_injection_payloads_every_field_every_tab', () => {
   it('baseline: benign text shows an iframe and no script or image', () => {
     expect(baseline.has('iframe')).toBe(true);
@@ -678,18 +727,22 @@ describe('s06_injection_payloads_every_field_every_tab', () => {
     expect(benignUsed.size).toBeGreaterThan(0);
   });
 
+  it('baseline: the export result and the `not_renamed` result are on a page, not only read', () => {
+    expect([...renderedBenign].sort()).toEqual([...RENDERED_BENIGN].sort());
+  });
+
   // Every payload alone, in every string field of the small windows.
   it.each(CORPUS.map((p) => [p.id, p.value] as const))('%s alone, in the credential, setup, audit, running and onboarding windows', (_id, value) =>
     clean(value, 'cheap'),
-  );
+  TABLE_TEST_TIMEOUT);
 
   // Every payload of a kind at once, in every string field of every window and every tab.
-  it.each(COMBINABLE)('all %s payloads at once, in every window and tab', (kind) => clean(combined(kind), 'core'));
+  it.each(COMBINABLE)('all %s payloads at once, in every window and tab', (kind) => clean(combined(kind), 'core'), TABLE_TEST_TIMEOUT);
 
   // Names and odd values only matter as the whole value of a field (a table lookup, a key).
   it.each(
     [...KINDS.prototype, ...KINDS.null, ...KINDS.long].map((p) => [p.id, p.value] as const),
-  )('%s alone, in every window and tab', (_id, value) => clean(value, 'core'));
+  )('%s alone, in every window and tab', (_id, value) => clean(value, 'core'), TABLE_TEST_TIMEOUT);
 
   // A wire name looked up in a table of a page: the record's other discriminators stay valid, so
   // the record is rendered, and this one field (a path, as a closed sibling of the same name
@@ -704,6 +757,7 @@ describe('s06_injection_payloads_every_field_every_tab', () => {
         focus = null;
       }
     },
+    TABLE_TEST_TIMEOUT,
   );
 
   it('prototype keys and markup on every record of every answer', async () => {

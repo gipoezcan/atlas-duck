@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { auditQuery } from '../shared/ipc/invoke';
 import type { AuditPage, EventHeader } from '../shared/ipc/types';
 import { EventList, FOLLOW_LIMIT } from './EventList';
-import { flush, header } from './testing';
+import { deferred, flush, header } from './testing';
 
 vi.mock('../shared/ipc/invoke', () => ({ auditQuery: vi.fn() }));
 
@@ -112,5 +112,45 @@ describe('Audit event list (spec 8.10, PD-74)', () => {
     expect(open.getAttribute('aria-current')).toBe('true');
     fireEvent.click(open);
     expect(onOpen).toHaveBeenCalledWith(h);
+  });
+
+  it('a row keeps its flags in view: they come before the event name, which is what a narrow row cuts', async () => {
+    const h = header(41, { event_type: 'VERIFY', flags: ['integrity_incident'], ts_utc: '2026-10-19T08:30:15.250Z' });
+    vi.mocked(auditQuery).mockResolvedValueOnce(page([h], null, 1));
+    render(<EventList filter={{}} selected={null} onOpen={() => undefined} />);
+    await flush();
+    const row = screen.getByRole('listitem');
+    const flag = within(row).getByRole('note', { name: 'integrity incident' });
+    const event = within(row).getByText('VERIFY');
+    expect(flag.compareDocumentPosition(event) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // The time is a bidi-isolated text node like the other columns.
+    expect(within(row).getByText('2026-10-19T08:30:15.250Z').tagName).toBe('BDI');
+  });
+
+  it('the summary region is in the page before the first answer, empty, and is filled in later', async () => {
+    const first = deferred<AuditPage>();
+    vi.mocked(auditQuery).mockReturnValueOnce(first.promise);
+    render(<EventList filter={{}} selected={null} onOpen={() => undefined} />);
+    const region = screen.getByRole('status');
+    expect(region.textContent).toBe('');
+    first.resolve(page([header(5)], null, 4));
+    await flush();
+    expect(screen.getByRole('status')).toBe(region);
+    expect(region.textContent).toContain('1 shown, 4 examined');
+  });
+
+  it('an answer that comes after the list was closed changes nothing and raises nothing', async () => {
+    const late = deferred<AuditPage>();
+    vi.mocked(auditQuery).mockReturnValueOnce(late.promise);
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { unmount, container } = render(<EventList filter={{}} selected={null} onOpen={() => undefined} />);
+    unmount();
+    late.resolve(page([header(5)], { before_seq: 5, limit: 200 }, 4));
+    await flush();
+    expect(container.textContent).toBe('');
+    expect(errors).not.toHaveBeenCalled();
+    // And it asked for nothing more after it went.
+    expect(auditQuery).toHaveBeenCalledTimes(1);
+    errors.mockRestore();
   });
 });

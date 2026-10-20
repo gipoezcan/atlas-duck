@@ -84,10 +84,15 @@ describe('Audit integrity incidents (spec 8.7, PD-180, L134)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Acknowledge integrity incident 42' }));
     const cases: [unknown, string][] = [
       [{ kind: 'not_found' }, 'That incident is no longer open.'],
-      [{ kind: 'invalid_argument', field: 'note' }, 'The note is too long: at most 1000 characters.'],
+      [
+        { kind: 'invalid_argument', field: 'note' },
+        'The note was refused: at most 1000 characters, and no NUL character.',
+      ],
       [{ kind: 'audit', error: { kind: 'unreadable', seq: 42 } }, 'The incident record could not be read, so it cannot be acknowledged here.'],
       [{ kind: 'not_ready' }, 'The audit log is not open yet: try again in a moment.'],
-      ['command not allowed', 'The command failed.'],
+      // What `call()` turns a rejection it does not recognise into (`toCommandError`).
+      [{ kind: 'refused', message: 'command not allowed' }, 'The command was refused.'],
+      [{ kind: 'internal' }, 'The command failed.'],
     ];
     for (const [error, text] of cases) {
       vi.mocked(acknowledgeIncident).mockRejectedValueOnce(error);
@@ -97,6 +102,48 @@ describe('Audit integrity incidents (spec 8.7, PD-180, L134)', () => {
     }
     // `not_found`: the list is out of date, so it is read again.
     expect(onChanged).toHaveBeenCalledTimes(1);
+  });
+
+  it('a note Rust refused (a NUL, or too long) gets a sentence that names both limits, never "too long" alone', async () => {
+    render(<Incidents status={TWO} failed={false} onRetry={() => undefined} onChanged={() => undefined} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Acknowledge integrity incident 42' }));
+    fireEvent.change(screen.getByLabelText('Note (up to 1000 characters)'), { target: { value: 'a\u0000b' } });
+    vi.mocked(acknowledgeIncident).mockRejectedValueOnce({ kind: 'invalid_argument', field: 'note' });
+    fireEvent.click(screen.getByRole('button', { name: 'Acknowledge…' }));
+    await flush();
+    // Rust, not the page, decides what a note may hold: the page sends it as typed.
+    expect(acknowledgeIncident).toHaveBeenCalledWith(42, 'a\u0000b');
+    const said = screen.getByRole('alert').textContent ?? '';
+    expect(said).toContain('NUL');
+    expect(said).toContain('1000');
+    expect(said).not.toContain('too long');
+  });
+
+  it('the status region is in the page before any result, empty, and is filled in later', async () => {
+    render(<Incidents status={TWO} failed={false} onRetry={() => undefined} onChanged={() => undefined} />);
+    const region = screen.getByRole('status');
+    expect(region.textContent).toBe('');
+    fireEvent.click(screen.getByRole('button', { name: 'Acknowledge integrity incident 7' }));
+    vi.mocked(acknowledgeIncident).mockRejectedValueOnce({ kind: 'cancelled' });
+    fireEvent.click(screen.getByRole('button', { name: 'Acknowledge…' }));
+    await flush();
+    // The same element, now holding the text (not a new one inserted with it).
+    expect(screen.getByRole('status')).toBe(region);
+    expect(region.textContent).toBe('Cancelled: the incident is still open.');
+  });
+
+  it('focus returns to the Acknowledge button when the note closes, and to the heading after an acknowledgement', async () => {
+    render(<Incidents status={TWO} failed={false} onRetry={() => undefined} onChanged={() => undefined} />);
+    const trigger = screen.getByRole('button', { name: 'Acknowledge integrity incident 42' });
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+    expect(document.activeElement).toBe(trigger);
+    fireEvent.click(trigger);
+    vi.mocked(acknowledgeIncident).mockResolvedValueOnce({ verify_seq: 42, ack_seq: 57 });
+    fireEvent.click(screen.getByRole('button', { name: 'Acknowledge…' }));
+    await flush();
+    expect(screen.queryByLabelText('Note (up to 1000 characters)')).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'Integrity incidents' }));
   });
 
   it('no incident, a read that failed', () => {

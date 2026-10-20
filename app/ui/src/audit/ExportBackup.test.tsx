@@ -89,7 +89,7 @@ describe('Audit export and backup (spec 8.10, PD-161, PD-181)', () => {
     await flush();
     expect(exportCancel).toHaveBeenCalledTimes(1);
     // The cancel's answer is not the outcome: the export may still finish.
-    expect(screen.getByText('Cancel requested: the export stops and removes its folder.')).toBeTruthy();
+    expect(screen.getByRole('status').textContent).toBe("Cancel requested. The export's own result follows.");
     expect(screen.getByRole('progressbar')).toBeTruthy();
 
     run.reject({ kind: 'cancelled' });
@@ -184,10 +184,62 @@ describe('Audit export and backup (spec 8.10, PD-161, PD-181)', () => {
     expect(screen.getByRole('button', { name: 'Cancel export' })).toBeTruthy();
   });
 
+  it('the status region is there before any result, empty, and the result fills the same element', async () => {
+    vi.mocked(exportTrigger).mockResolvedValueOnce({ manifest_sha256: HEX, dir_name: NAME, rows: 2 });
+    render(<ExportBackup job={null} />);
+    const region = screen.getByRole('status');
+    expect(region.textContent).toBe('');
+    fireEvent.click(exportButton());
+    await flush();
+    expect(screen.getByRole('status')).toBe(region);
+    expect(region.textContent).toContain('The export is complete');
+  });
+
+  it('a refusal the way call() delivers an unknown rejection is "refused", not a made-up text', async () => {
+    vi.mocked(exportTrigger).mockRejectedValueOnce({ kind: 'refused', message: 'command not allowed' });
+    render(<ExportBackup job={null} />);
+    fireEvent.click(exportButton());
+    await flush();
+    expect(screen.getByRole('alert').textContent).toBe('The command was refused.');
+  });
+
+  it('a restore Settings started stays shown when this window\'s own call is answered busy meanwhile', async () => {
+    const run = deferred<ExportDone>();
+    vi.mocked(exportTrigger).mockReturnValueOnce(run.promise);
+    const { rerender } = render(<ExportBackup job={null} />);
+    fireEvent.click(exportButton());
+    await flush();
+    // Another window's restore starts; this window's call is then refused as busy.
+    rerender(<ExportBackup job={{ job: 'restore', phase: 'started' }} />);
+    run.reject({ kind: 'busy' });
+    await flush();
+    expect(screen.getByRole('progressbar', { name: 'A restore is running. Requests wait while the restore runs' })).toBeTruthy();
+    expect(exportButton().disabled).toBe(true);
+    expect(backupButton().disabled).toBe(true);
+  });
+
+  it('a terminal event that never comes does not keep the triggers off once this window\'s own call ended', async () => {
+    const run = deferred<ExportDone>();
+    vi.mocked(exportTrigger).mockReturnValueOnce(run.promise);
+    const { rerender } = render(<ExportBackup job={null} />);
+    fireEvent.click(exportButton());
+    await flush();
+    rerender(<ExportBackup job={{ job: 'export', phase: 'progress', done: 1, total: 2 }} />);
+    run.resolve({ manifest_sha256: HEX, dir_name: NAME, rows: 2 });
+    await flush();
+    expect(screen.queryByRole('progressbar')).toBeNull();
+    expect(exportButton().disabled).toBe(false);
+    expect(backupButton().disabled).toBe(false);
+  });
+
   it('backup answers and refusals', async () => {
     const cases: [unknown, string, 'status' | 'alert'][] = [
       [{ saved: false }, 'No backup was made.', 'status'],
-      [{ kind: 'backup' }, 'The backup failed. Nothing needs to be undone.', 'alert'],
+      [
+        { kind: 'backup' },
+        'The backup failed. If an unfinished backup folder is left in the folder you chose, delete it.',
+        'alert',
+      ],
       [{ kind: 'removal', error: { kind: 'running' } }, 'A "Prepare for removal" step is running: wait for it to end, then try again.', 'alert'],
       [{ kind: 'cancelled' }, 'Cancelled: no backup was made.', 'status'],
       [{ kind: 'busy' }, 'Another export, backup or restore is running: wait for it to end, then try again.', 'alert'],

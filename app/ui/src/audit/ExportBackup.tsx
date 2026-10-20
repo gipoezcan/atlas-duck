@@ -3,41 +3,49 @@ import { useEffect, useId, useRef, useState } from 'react';
 import { backupTrigger, exportCancel, exportTrigger } from '../shared/ipc/invoke';
 import type { AuditJobEvent, AuditJobKind, ExportDone } from '../shared/ipc/types';
 import { AUDIT_TEXT as T } from '../shared/strings';
-import { errorText, kinds, utcOf } from './text';
+import { Announce, errorText, kinds, type Said, utcOf } from './text';
 
 interface Props {
   /** The latest `audit_job` event (validated by the window), or null before any. */
   job: AuditJobEvent | null;
 }
 
-type Said = { text: string; role: 'status' | 'alert' };
+const say = (role: Said['role'], body: string): Said => ({ role, body });
 
-/** How an export ended: complete (also when only the rename failed), or a sentence. */
-type ExportOutcome =
-  | { kind: 'done'; done: ExportDone }
-  | { kind: 'not_renamed'; done: ExportDone }
-  | ({ kind: 'said' } & Said);
+/** How an export ended, as the window says it: complete (also when only the rename failed), or a sentence. */
+function exportResult(done: ExportDone, renamed: boolean): Said {
+  const { manifest_sha256: hex, dir_name: name, rows } = done;
+  return {
+    role: renamed ? 'status' : 'alert',
+    body: (
+      <div className="audit-export-result">
+        <p>{renamed ? T.export_done(name, rows) : T.export_not_renamed(name, rows)}</p>
+        <p>{T.export_recipient(hex)}</p>
+        <p>
+          <code>{hex}</code>
+        </p>
+      </div>
+    ),
+  };
+}
 
-function exportRefusal(e: unknown): ExportOutcome {
+function exportRefusal(e: unknown): Said {
   const { kind, inner } = kinds(e);
-  if (kind === 'cancelled') return { kind: 'said', text: T.export_cancelled, role: 'status' };
+  if (kind === 'cancelled') return say('status', T.export_cancelled);
   if (kind === 'export' && typeof e === 'object' && e !== null) {
     const error = (e as { error: Record<string, unknown> }).error;
     const name = typeof error['dir_name'] === 'string' ? error['dir_name'] : '';
-    if (inner === 'leftover') return { kind: 'said', text: T.export_leftover(name), role: 'alert' };
+    if (inner === 'leftover') return say('alert', T.export_leftover(name));
     if (inner === 'not_renamed' && typeof error['manifest_sha256'] === 'string' && typeof error['rows'] === 'number') {
-      return {
-        kind: 'not_renamed',
-        done: { manifest_sha256: error['manifest_sha256'], dir_name: name, rows: error['rows'] },
-      };
+      return exportResult({ manifest_sha256: error['manifest_sha256'], dir_name: name, rows: error['rows'] }, false);
     }
   }
-  return { kind: 'said', text: errorText(e), role: 'alert' };
+  return say('alert', errorText(e));
 }
 
 function backupRefusal(e: unknown): Said {
-  if (kinds(e).kind === 'cancelled') return { text: T.backup_cancelled, role: 'status' };
-  return { text: errorText(e), role: 'alert' };
+  if (kinds(e).kind === 'cancelled') return say('status', T.backup_cancelled);
+  return say('alert', errorText(e));
 }
 
 const running = (job: AuditJobEvent | null, kind: AuditJobKind) =>
@@ -58,9 +66,8 @@ export function ExportBackup({ job }: Props) {
   const [to, setTo] = useState('');
   const [exporting, setExporting] = useState(false);
   const [backingUp, setBackingUp] = useState(false);
-  const [exportOutcome, setExportOutcome] = useState<ExportOutcome | null>(null);
-  const [backupOutcome, setBackupOutcome] = useState<Said | null>(null);
-  const [cancelSaid, setCancelSaid] = useState<Said | null>(null);
+  // The latest thing a command of this window said (one live region for all of them).
+  const [said, setSaid] = useState<Said | null>(null);
   // The job event current when this window's own call ended: a terminal event that never comes
   // must not keep the triggers off (the next event replaces it).
   const [ended, setEnded] = useState<AuditJobEvent | null>(null);
@@ -86,61 +93,67 @@ export function ExportBackup({ job }: Props) {
     inFlight.current = true;
     return true;
   };
-  const release = () => {
+  /**
+   * This window's own call ended: the job event then current is ignored when it is one of this
+   * call's own kind (its terminal event may never come), unless the call was refused as `busy`:
+   * then a job another window runs is what is current, and it must stay shown.
+   */
+  const release = (kind: AuditJobKind, failure?: unknown) => {
     inFlight.current = false;
-    setEnded(jobRef.current);
+    const current = jobRef.current;
+    if (kinds(failure).kind === 'busy' || current === null || current.job !== kind) return;
+    setEnded(current);
   };
 
   const startExport = () => {
     const fromUtc = utcOf(from);
     const toUtc = utcOf(to);
     if (fromUtc === undefined || toUtc === undefined) {
-      setExportOutcome({ kind: 'said', text: T.export_errors['from_utc'] ?? '', role: 'alert' });
+      setSaid(say('alert', T.export_errors['from_utc'] ?? ''));
       return;
     }
     if (fromUtc !== null && toUtc !== null && fromUtc > toUtc) {
-      setExportOutcome({ kind: 'said', text: T.export_errors['to_utc'] ?? '', role: 'alert' });
+      setSaid(say('alert', T.export_errors['to_utc'] ?? ''));
       return;
     }
     if (!claim()) return;
     setExporting(true);
-    setExportOutcome(null);
-    setCancelSaid(null);
+    setSaid(null);
     exportTrigger(fromUtc, toUtc).then(
       (done) => {
-        release();
+        release('export');
         setExporting(false);
-        setExportOutcome({ kind: 'done', done });
+        setSaid(exportResult(done, true));
       },
       (e: unknown) => {
-        release();
+        release('export', e);
         setExporting(false);
-        setExportOutcome(exportRefusal(e));
+        setSaid(exportRefusal(e));
       },
     );
   };
 
   const cancel = () => {
     exportCancel().then(
-      (a) => setCancelSaid({ text: a.cancelled ? T.export_cancel_requested : T.export_cancel_none, role: 'status' }),
-      (e: unknown) => setCancelSaid({ text: errorText(e), role: 'alert' }),
+      (a) => setSaid(say('status', a.cancelled ? T.export_cancel_requested : T.export_cancel_none)),
+      (e: unknown) => setSaid(say('alert', errorText(e))),
     );
   };
 
   const startBackup = () => {
     if (!claim()) return;
     setBackingUp(true);
-    setBackupOutcome(null);
+    setSaid(null);
     backupTrigger().then(
       (a) => {
-        release();
+        release('backup');
         setBackingUp(false);
-        setBackupOutcome({ text: a.saved ? T.backup_saved : T.backup_not_saved, role: 'status' });
+        setSaid(say('status', a.saved ? T.backup_saved : T.backup_not_saved));
       },
       (e: unknown) => {
-        release();
+        release('backup', e);
         setBackingUp(false);
-        setBackupOutcome(backupRefusal(e));
+        setSaid(backupRefusal(e));
       },
     );
   };
@@ -191,10 +204,8 @@ export function ExportBackup({ job }: Props) {
           <button type="button" onClick={cancel}>
             {T.export_cancel}
           </button>
-          {cancelSaid === null ? null : <p role={cancelSaid.role}>{cancelSaid.text}</p>}
         </div>
       ) : null}
-      {exportOutcome === null ? null : <ExportResult outcome={exportOutcome} />}
 
       <h3>{T.backup}</h3>
       <p>{T.backup_note}</p>
@@ -211,22 +222,7 @@ export function ExportBackup({ job }: Props) {
           <span id={`${ids}-restore`}>{T.restore_running}</span> <progress aria-labelledby={`${ids}-restore`} />
         </div>
       ) : null}
-      {backupOutcome === null ? null : <p role={backupOutcome.role}>{backupOutcome.text}</p>}
+      <Announce said={said} />
     </section>
-  );
-}
-
-/** The export's result: the trust root to hand on, with the recipient's instructions (PD-161). */
-function ExportResult({ outcome }: { outcome: ExportOutcome }) {
-  if (outcome.kind === 'said') return <p role={outcome.role}>{outcome.text}</p>;
-  const { manifest_sha256: hex, dir_name: name, rows } = outcome.done;
-  return (
-    <div role={outcome.kind === 'done' ? 'status' : 'alert'} className="audit-export-result">
-      <p>{outcome.kind === 'done' ? T.export_done(name, rows) : T.export_not_renamed(name, rows)}</p>
-      <p>{T.export_recipient(hex)}</p>
-      <p>
-        <code>{hex}</code>
-      </p>
-    </div>
   );
 }
