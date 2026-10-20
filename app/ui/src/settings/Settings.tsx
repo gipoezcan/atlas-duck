@@ -4,10 +4,12 @@ import { on } from '../shared/ipc/events';
 import { settingsGet } from '../shared/ipc/invoke';
 import type { Confinement, SettingsGet, SettingsView } from '../shared/ipc/types';
 import { SETTINGS_TEXT as T, WINDOW_TITLES } from '../shared/strings';
+import { AnchorDir } from './AnchorDir';
 import { InstanceForm } from './InstanceForm';
 import { Cli } from './Cli';
 import { Instances } from './Instances';
 import { Limits } from './Limits';
+import { OldInstalls, Recovery } from './Recovery';
 import { Removal } from './Removal';
 import { Retention } from './Retention';
 import { DegradedToggle, ScriptLimitsForm } from './Scripts';
@@ -106,6 +108,9 @@ export function Settings() {
       <Limits view={settings} onChanged={reload} readOnly={readOnly} />
       <ScriptLimitsForm view={settings} onChanged={reload} readOnly={readOnly} />
       <Retention view={settings} onChanged={reload} readOnly={readOnly} />
+      <Recovery onChanged={reload} />
+      <AnchorDir view={settings} onChanged={reload} />
+      <OldInstalls />
       <ConfinementStatus confinement={confinement} view={settings} onChanged={reload} />
       <Cli installed={cliInstalled} removable={cliRemovable} onChanged={reload} />
       <Removal onChanged={reload} />

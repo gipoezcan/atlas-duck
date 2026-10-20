@@ -1,9 +1,12 @@
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { on } from '../shared/ipc/events';
 import {
+  exportCancel,
   removalBackup,
   removalBegin,
+  removalExport,
   removalFinish,
   removalMark,
   removalState,
@@ -13,12 +16,17 @@ import { Removal } from './Removal';
 import { WindowBusyContext, useWindowBusy } from './useAction';
 
 vi.mock('../shared/ipc/invoke', () => ({
+  exportCancel: vi.fn(),
   removalBackup: vi.fn(),
   removalBegin: vi.fn(),
+  removalExport: vi.fn(),
   removalFinish: vi.fn(),
   removalMark: vi.fn(),
   removalState: vi.fn(),
 }));
+vi.mock('../shared/ipc/events', () => ({ on: vi.fn() }));
+
+let jobHandlers: ((payload: unknown) => void)[] = [];
 
 /** The spec's 12.5 sentence, written out here on purpose: the test must not read the constant it checks. */
 const REVOKE = 'Revoke this token in Jira/Confluence (Profile → Personal Access Tokens)';
@@ -81,10 +89,24 @@ const disabled = (name: string | RegExp) =>
   (screen.getByRole('button', { name }) as HTMLButtonElement).disabled;
 
 beforeEach(() => {
-  for (const f of [removalBackup, removalBegin, removalFinish, removalMark, removalState]) {
+  for (const f of [removalBackup, removalBegin, removalFinish, removalMark, removalState, removalExport, exportCancel]) {
     vi.mocked(f as (...a: unknown[]) => Promise<unknown>).mockReset();
   }
+  jobHandlers = [];
+  vi.mocked(on)
+    .mockReset()
+    .mockImplementation((name, handler) => {
+      if (name === 'audit_job') jobHandlers.push(handler as (payload: unknown) => void);
+      return Promise.resolve(() => undefined);
+    });
 });
+
+async function emitJob(payload: unknown): Promise<void> {
+  act(() => {
+    for (const h of jobHandlers) h(payload);
+  });
+  await flush();
+}
 
 describe('Removal', () => {
   it('revoke_checklist_text_verbatim: the spec sentence, the alias and the token identity per instance', async () => {
@@ -102,12 +124,8 @@ describe('Removal', () => {
   });
 
   it('shows the retention and the backup offer before anything is deleted', async () => {
-    await show({ ...idle, retention_days: 1, legal_hold: true });
-    expect(
-      screen.getByText(
-        'The newest audit record is kept until the legal hold is lifted, then for at least 1 more day.',
-      ),
-    ).toBeTruthy();
+    await show({ ...idle, retention_days: 1, retention_left_days: 1 });
+    expect(screen.getByText('The newest audit record is kept for at least 1 more day.')).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Create a full backup' })).toBeTruthy();
     expect(screen.queryByText(REVOKE)).toBeNull();
     expect(screen.queryByRole('button', { name: 'Finish removal' })).toBeNull();
@@ -377,5 +395,127 @@ describe('Removal', () => {
     vi.mocked(removalState).mockResolvedValue(idle);
     await click('Try again');
     expect(screen.getByRole('button', { name: 'Create a full backup' })).toBeTruthy();
+  });
+
+  // ---- M10 T21 (PD-176, L130, L217) ----
+
+  const HEX = '5e'.repeat(32);
+
+  it('removal_export_step_present: the export is offered next to the backup and carries no argument', async () => {
+    await show(idle);
+    expect(screen.getByRole('button', { name: 'Create a full backup' })).toBeTruthy();
+    vi.mocked(removalExport).mockResolvedValue({ manifest_sha256: HEX, dir_name: 'atlas-duck-export-1', rows: 3 });
+    await click('Export the audit log…');
+    expect(removalExport).toHaveBeenCalledWith();
+    const said = screen.getAllByRole('status').map((s) => s.textContent ?? '').join('|');
+    expect(said).toContain('The export is complete: 3 records in the folder atlas-duck-export-1');
+    expect(said).toContain(HEX);
+    expect(said).toContain('atlas-duck verify-export');
+  });
+
+  it('an export in progress shows its rows and offers Cancel; only audit_job events of the export count', async () => {
+    await show(idle);
+    let finish: (v: unknown) => void = () => undefined;
+    vi.mocked(removalExport).mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }) as never,
+    );
+    await click('Export the audit log…');
+    // A backup's event is not the export's progress.
+    await emitJob({ job: 'backup', phase: 'progress', done: 1, total: 9 });
+    expect(screen.getByRole('progressbar').hasAttribute('value')).toBe(false);
+    await emitJob({ job: 'export', phase: 'progress', done: 4, total: 10 });
+    expect(screen.getByRole('progressbar').getAttribute('value')).toBe('4');
+    expect(screen.getByText('4 of 10 records written')).toBeTruthy();
+    vi.mocked(exportCancel).mockResolvedValue({ cancelled: true });
+    await click('Cancel export');
+    expect(exportCancel).toHaveBeenCalledWith();
+    finish({ manifest_sha256: HEX, dir_name: 'x', rows: 1 });
+    await flush();
+    expect(screen.queryByRole('progressbar')).toBeNull();
+  });
+
+  it('the export refusals are the audit window\'s fixed texts, and a leftover or a not_renamed result is named', async () => {
+    await show(idle);
+    vi.mocked(removalExport).mockRejectedValueOnce({ kind: 'export', error: { kind: 'empty_range' } });
+    await click('Export the audit log…');
+    expect(screen.getByRole('alert').textContent).toContain('No records');
+    vi.mocked(removalExport).mockRejectedValueOnce({ kind: 'export', error: { kind: 'leftover', dir_name: 'part' } });
+    await click('Export the audit log…');
+    expect(screen.getByRole('alert').textContent).toContain('part');
+    vi.mocked(removalExport).mockRejectedValueOnce({
+      kind: 'export',
+      error: { kind: 'not_renamed', manifest_sha256: HEX, dir_name: 'x.partial', rows: 2 },
+    });
+    await click('Export the audit log…');
+    expect(screen.getByRole('alert').textContent).toContain('do not export again');
+    vi.mocked(removalExport).mockRejectedValueOnce({ kind: 'cancelled' });
+    await click('Export the audit log…');
+    // A declined dialog is a quiet result, not an alert.
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getAllByRole('status').map((s) => s.textContent).join('')).toContain('Cancelled: no export was made.');
+  });
+
+  it('removal_results_in_live_region: a status region is in the page before a result, and the result fills it', async () => {
+    await show(idle);
+    const empty = screen.getAllByRole('status').filter((s) => (s.textContent ?? '') === '');
+    expect(empty.length).toBeGreaterThan(0);
+    vi.mocked(removalBackup).mockResolvedValue({ saved: true });
+    await click('Create a full backup');
+    // The same element that was empty now holds the result (an inserted region is not announced).
+    const filled = empty.filter((s) => s.isConnected && s.textContent === 'The backup was saved.');
+    expect(filled).toHaveLength(1);
+    vi.mocked(removalExport).mockResolvedValue({ manifest_sha256: HEX, dir_name: 'd', rows: 1 });
+    await click('Export the audit log…');
+    expect(filled[0]?.textContent).toContain('The export is complete');
+  });
+
+  it('the finish result is announced through the same region, and a failure of a backup is an alert', async () => {
+    await show(active(item({ choice: 'done' })));
+    const empty = screen.getAllByRole('status').filter((s) => (s.textContent ?? '') === '');
+    vi.mocked(removalFinish).mockResolvedValue({ cli: 'removed', cli_reason: null, autostart: 'removed' });
+    vi.mocked(removalState).mockResolvedValue(idle);
+    await click('Finish removal');
+    const filled = empty.filter((s) => s.isConnected && (s.textContent ?? '').includes('You can uninstall atlas-duck now'));
+    expect(filled).toHaveLength(1);
+    cleanup();
+    await show(idle);
+    vi.mocked(removalBackup).mockRejectedValue({ kind: 'backup' });
+    await click('Create a full backup');
+    expect(screen.getByRole('alert').textContent).toContain('The backup failed.');
+  });
+
+  it('while a command runs a polite working line is in the page', async () => {
+    await show(idle);
+    vi.mocked(removalBegin).mockReturnValue(new Promise(() => undefined) as never);
+    const before = screen.getAllByRole('status').filter((s) => (s.textContent ?? '') === '');
+    await click('Delete the stored tokens');
+    expect(before.some((s) => s.isConnected && s.textContent === 'Working')).toBe(true);
+  });
+
+  it('the remaining retention: days when known, indefinitely under a legal hold, the setting otherwise', async () => {
+    await show({ ...idle, retention_days: 92, retention_left_days: 40 });
+    expect(screen.getByText('The newest audit record is kept for at least 40 more days.')).toBeTruthy();
+    cleanup();
+    await show({ ...idle, legal_hold: true, retention_left_days: null });
+    expect(screen.getByText('The newest audit record is kept indefinitely: a legal hold is on.')).toBeTruthy();
+    cleanup();
+    await show({ ...idle, retention_days: 92, retention_left_days: null });
+    expect(screen.getByText(/kept for at least 92 more days/)).toBeTruthy();
+  });
+
+  it('a recorded procedure is final: no answer can be changed, and the page says it ends only with Finish', async () => {
+    await show({ ...active(item({ choice: 'done' })), recorded: true });
+    expect(screen.getByText(/recorded in the audit log and are final/)).toBeTruthy();
+    expect(screen.getByText(/ends only with "Finish removal"/)).toBeTruthy();
+    for (const name of ['I revoked it', 'Skip', 'Answer again']) {
+      expect((screen.getByRole('button', { name }) as HTMLButtonElement).disabled, name).toBe(true);
+    }
+    expect((screen.getByRole('button', { name: 'Finish removal' }) as HTMLButtonElement).disabled).toBe(false);
+    cleanup();
+    await show(active(item({ choice: 'done' })));
+    expect(screen.queryByText(/recorded in the audit log and are final/)).toBeNull();
+    expect((screen.getByRole('button', { name: 'Skip' }) as HTMLButtonElement).disabled).toBe(false);
   });
 });

@@ -1,46 +1,13 @@
 import { useEffect, useId, useRef, useState } from 'react';
 
 import { backupTrigger, exportCancel, exportTrigger } from '../shared/ipc/invoke';
-import type { AuditJobEvent, AuditJobKind, ExportDone } from '../shared/ipc/types';
+import type { AuditJobEvent, AuditJobKind } from '../shared/ipc/types';
 import { AUDIT_TEXT as T } from '../shared/strings';
-import { Announce, errorText, kinds, type Said, utcOf } from './text';
+import { Announce, errorText, exportRefusal, exportResult, kinds, type Said, say, utcOf } from './text';
 
 interface Props {
   /** The latest `audit_job` event (validated by the window), or null before any. */
   job: AuditJobEvent | null;
-}
-
-const say = (role: Said['role'], body: string): Said => ({ role, body });
-
-/** How an export ended, as the window says it: complete (also when only the rename failed), or a sentence. */
-function exportResult(done: ExportDone, renamed: boolean): Said {
-  const { manifest_sha256: hex, dir_name: name, rows } = done;
-  return {
-    role: renamed ? 'status' : 'alert',
-    body: (
-      <div className="audit-export-result">
-        <p>{renamed ? T.export_done(name, rows) : T.export_not_renamed(name, rows)}</p>
-        <p>{T.export_recipient(hex)}</p>
-        <p>
-          <code>{hex}</code>
-        </p>
-      </div>
-    ),
-  };
-}
-
-function exportRefusal(e: unknown): Said {
-  const { kind, inner } = kinds(e);
-  if (kind === 'cancelled') return say('status', T.export_cancelled);
-  if (kind === 'export' && typeof e === 'object' && e !== null) {
-    const error = (e as { error: Record<string, unknown> }).error;
-    const name = typeof error['dir_name'] === 'string' ? error['dir_name'] : '';
-    if (inner === 'leftover') return say('alert', T.export_leftover(name));
-    if (inner === 'not_renamed' && typeof error['manifest_sha256'] === 'string' && typeof error['rows'] === 'number') {
-      return exportResult({ manifest_sha256: error['manifest_sha256'], dir_name: name, rows: error['rows'] }, false);
-    }
-  }
-  return say('alert', errorText(e));
 }
 
 function backupRefusal(e: unknown): Said {

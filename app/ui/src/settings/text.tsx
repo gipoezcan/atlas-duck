@@ -1,5 +1,12 @@
 import type { InstanceView } from '../shared/ipc/types';
-import { HTTPS_REQUIRED_HINT, SETTINGS_TEXT, UNUSUAL_CHARACTERS } from '../shared/strings';
+import {
+  AUDIT_TEXT,
+  COMMITTED_INCOMPLETE_TEXT,
+  HTTPS_REQUIRED_HINT,
+  RECOVERY_TEXT,
+  SETTINGS_TEXT,
+  UNUSUAL_CHARACTERS,
+} from '../shared/strings';
 import { Badge } from '../shared/text/Badge';
 import { own } from '../shared/text/own';
 import { unusual } from '../shared/text/unusual';
@@ -53,6 +60,23 @@ export function errorText(e: unknown): string {
   if (err.kind === 'removal') {
     const inner = err.error?.kind;
     return (typeof inner === 'string' ? own(t.removal_errors, inner) : undefined) ?? t.errors.other ?? '';
+  }
+  const inner = typeof err.error?.kind === 'string' ? err.error.kind : '';
+  if (err.kind === 'restore') {
+    if (inner === 'committed_incomplete') return `${COMMITTED_INCOMPLETE_TEXT}. ${RECOVERY_TEXT.restore_restart}`;
+    return own(RECOVERY_TEXT.restore_errors, inner) ?? RECOVERY_TEXT.restore_errors['failed'] ?? '';
+  }
+  if (err.kind === 'anchor_dir') {
+    return own(RECOVERY_TEXT.anchor_dir_errors, inner) ?? RECOVERY_TEXT.anchor_dir_errors['failed'] ?? '';
+  }
+  if (err.kind === 're_anchor') {
+    return own(RECOVERY_TEXT.reanchor_errors, inner) ?? RECOVERY_TEXT.reanchor_errors['failed'] ?? '';
+  }
+  if (err.kind === 'forget') {
+    return own(RECOVERY_TEXT.forget_errors, inner) ?? RECOVERY_TEXT.forget_errors['failed'] ?? '';
+  }
+  if (err.kind === 'export') {
+    return own(AUDIT_TEXT.export_errors, inner) ?? AUDIT_TEXT.export_errors['failed'] ?? '';
   }
   return own(t.errors, err.kind) ?? t.errors.internal ?? '';
 }

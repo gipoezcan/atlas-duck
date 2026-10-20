@@ -496,8 +496,6 @@ export const SETTINGS_TEXT = {
   apply: 'Apply',
   applied: 'Applied',
   not_a_number: 'Enter a whole number',
-  anchor: 'External anchor directory',
-  anchor_none: '(not set)',
   prune: 'Pruning',
   prune_button: 'Prune backlog now',
   prune_failed_last: 'The last prune failed.',
@@ -578,11 +576,27 @@ export const SETTINGS_TEXT = {
   removal_intro:
     'Before you uninstall atlas-duck: make a backup if you want one, delete the stored tokens, revoke each token on its server, and remove the command line and the login item. The audit log, its keys and its anchors are kept, so the log stays verifiable until its retention period has passed.',
   /**
-   * spec 12.5 step 1, shown with the setting until Task 21 shows `retention_left_days` (the newest
-   * record's remaining days, `null` while a legal hold is on; M10 T16, PD-176).
+   * spec 12.5 step 1 with the retention setting: the fallback while the newest record's remaining
+   * days are not known (`retention_left_days` is `null` without a legal hold: the head is unreadable).
    */
   removal_retention: (days: number, hold: boolean) =>
     `The newest audit record is kept ${hold ? 'until the legal hold is lifted, then for' : 'for'} at least ${days} more ${days === 1 ? 'day' : 'days'}.`,
+  /** spec 12.5 step 1 (M10 T16, PD-176): the newest record's remaining retention in days. */
+  removal_retention_left: (days: number) =>
+    `The newest audit record is kept for at least ${days} more ${days === 1 ? 'day' : 'days'}.`,
+  removal_retention_hold: 'The newest audit record is kept indefinitely: a legal hold is on.',
+  /** spec 12.5 step 1: the compliance export offered next to the backup (PD-176). */
+  removal_export: 'Export the audit log…',
+  removal_export_note:
+    'Exports the whole audit log with its decrypted payloads into a new folder. atlas-duck shows a warning and asks for the folder in its own dialogs.',
+  removal_export_running: 'An export is running',
+  removal_export_starting: 'Starting the export',
+  removal_export_cancel: 'Cancel export',
+  removal_export_cancel_requested: "Cancel requested. The export's own result follows.",
+  removal_export_cancel_none: 'No export was running.',
+  /** PD-176 (L130): answers recorded in the log are final and a resumed procedure ends only with Finish. */
+  removal_recorded:
+    'Your answers are recorded in the audit log and are final. If atlas-duck was restarted meanwhile, this procedure continues here. It ends only with "Finish removal".',
   removal_backup: 'Create a full backup',
   removal_backup_note: 'A backup never contains a token. You choose the folder in the next dialog.',
   removal_backup_saved: 'The backup was saved.',
@@ -656,6 +670,7 @@ export const SETTINGS_TEXT = {
     internal: 'The command failed',
     refused: 'The command was refused',
     cancelled: 'Cancelled: nothing was changed',
+    backup: 'The backup failed. If an unfinished backup folder is left in the folder you chose, delete it.',
     config_read_only: 'config.toml was written by a newer version: settings are read-only',
     no_config_file: 'There is no config.toml to change',
     conflict: 'config.toml changed meanwhile: reload and try again',
@@ -969,3 +984,120 @@ export const ONBOARDING_PANEL_TEXT = {
  * with a test that the two are equal.
  */
 export const COMMITTED_INCOMPLETE_TEXT = 'Restore will be completed at the next start';
+
+/**
+ * M10 T21 (spec 5.7, 8.6, 8.10, 8.11, 8.13, L27): Settings' "Recovery and backup" section and its
+ * anchor-directory section. Agent-written text (editable in review) except the plan's own words:
+ * the L27 sentence, "Make a full backup before every upgrade", "Restore will be completed at the
+ * next start" and "Requests wait while the restore runs". Rust draws every confirmation and every
+ * folder or file dialog; these are the page's lines around them.
+ */
+export const RECOVERY_TEXT = {
+  recovery: 'Recovery and backup',
+  /** L27 (plan text). */
+  backup_tokens: 'Backups never contain stored tokens; after a restore every instance needs its token again.',
+  backup_retention: 'Backups and exports are outside retention and crypto-shredding: keeping and deleting them is up to you.',
+  /** §8.13 (plan text): there is no automatic pre-upgrade snapshot. */
+  upgrade_backup: 'Make a full backup before every upgrade.',
+  backup_start: 'Back up now…',
+  backup_running: 'A backup is running',
+  backup_saved: 'The backup was saved.',
+  backup_not_saved: 'No backup was made.',
+  backup_cancelled: 'Cancelled: no backup was made.',
+  restore_note:
+    'Restoring replaces this audit log with the log of a backup. atlas-duck asks you to confirm in its own dialogs and to enter the recovery passphrase of the backup.',
+  restore_start: 'Restore backup…',
+  restore_running: 'A restore is running',
+  restore_starting: 'Starting the restore',
+  /** PD-181 (plan text): shown from the `started` event of the restore job. */
+  restore_wait: 'Requests wait while the restore runs',
+  restore_cancel: 'Cancel restore',
+  restore_cancel_requested: 'Cancel requested.',
+  restore_cancel_none: 'No restore is running.',
+  restore_cancel_too_late: 'The restore is already writing and cannot be cancelled.',
+  restore_done: 'The restore is complete.',
+  restore_records_lost: (n: number) =>
+    n === 0
+      ? 'No records were lost.'
+      : `${n} ${n === 1 ? 'record' : 'records'} written after the backup ${n === 1 ? 'is' : 'are'} no longer in the log.`,
+  restore_tokens: (n: number) =>
+    `Stored tokens are never restored: ${n === 0 ? 'no token was deleted' : `${n} stored ${n === 1 ? 'token was' : 'tokens were'} deleted`}, and every instance needs its token again.`,
+  restore_follow_up_failed:
+    'The restore is complete, but its follow-up step failed. Quit atlas-duck and start it again to finish it.',
+  restore_restart: 'Quit atlas-duck and start it again. Until then new requests cannot be recorded.',
+  restore_passphrase_offer:
+    "The backup's recovery passphrase is now the recovery passphrase of this log. You can change it now with \"Change recovery passphrase…\".",
+  restore_errors: {
+    wrong_passphrase: 'That recovery passphrase does not open the backup. Nothing was changed.',
+    not_a_backup: 'That folder is not a backup of atlas-duck. Nothing was changed.',
+    newer: 'The backup was written by a newer atlas-duck: install that version or newer. Nothing was changed.',
+    broken: 'The backup does not verify. Nothing was changed.',
+    anchor_dir_mismatch: 'The backup does not match the anchor directory. Nothing was changed.',
+    keychain: 'The keychain could not be used. Nothing was changed.',
+    failed: 'The restore failed. Nothing was changed.',
+  } as Readonly<Record<string, string>>,
+  passphrase_change: 'Change recovery passphrase…',
+  passphrase_note:
+    'The recovery passphrase unlocks the audit log after a keychain loss, from a backup or on a new machine. Changing it opens the credential window.',
+  passphrase_opened: 'The credential window is open: enter the new passphrase there.',
+
+  reanchor_heading: 'Anchors',
+  anchors_missing: {
+    head: 'The head anchor entry is missing from the keychain.',
+    first_retained: 'The first-retained anchor entry is missing from the keychain.',
+    both: 'The head anchor and the first-retained anchor entries are missing from the keychain.',
+  } as Readonly<Record<string, string>>,
+  reanchor: 'Re-anchor…',
+  reanchor_note:
+    'Re-anchoring writes both the head anchor and the first-retained anchor again from the audit log as it is now. It is recorded as an integrity incident, which you acknowledge in the Audit window.',
+  reanchor_done: 'Re-anchored. An integrity incident was recorded: acknowledge it in the Audit window.',
+  reanchor_errors: {
+    nothing_missing: 'No anchor entry is missing: nothing was changed.',
+    held: 'The anchors are held while another step runs: try again later.',
+    does_not_verify: 'The log does not verify, so nothing was re-anchored. An integrity incident was recorded: see Audit.',
+    restored: 'A restore changed the anchors meanwhile: nothing was changed.',
+    keychain: 'The keychain could not be written. An integrity incident was recorded: see Audit.',
+    failed: 'Re-anchoring failed. Nothing was changed.',
+  } as Readonly<Record<string, string>>,
+
+  orphans: 'Old installs',
+  orphans_intro:
+    'These installs left an archived audit log or keychain entries on this computer. Forgetting one deletes its keychain entries after native confirmations; the keys that open its archived log are deleted only if you confirm that too.',
+  orphans_none: 'No old installs were found.',
+  orphans_load_failed: 'Could not list the old installs.',
+  orphan_install: 'Install',
+  orphan_files: 'Archived logs',
+  orphan_entries: 'Keychain entries',
+  orphan_forget: 'Forget',
+  orphan_forget_label: (installId: string) => `Forget the install ${installId}`,
+  forgotten: (keysDeleted: boolean) =>
+    keysDeleted
+      ? 'Forgotten: its keychain entries and the keys of its archived log were deleted.'
+      : 'Forgotten: its token entries were deleted; the keys of its archived log were kept.',
+  forget_errors: {
+    unreadable: 'The keychain entries of the old installs could not be read: nothing was deleted.',
+    keychain: 'Some entries could not be deleted. Forget the install again to delete the rest.',
+    failed: 'Forgetting the install failed.',
+  } as Readonly<Record<string, string>>,
+  forget_deleted: 'Deleted',
+  forget_not_deleted: 'Not deleted',
+
+  anchor_dir: 'External anchor directory',
+  anchor_dir_none: '(not set)',
+  anchor_dir_note:
+    'Copies of the log head are written to this folder. It protects against rolling history back only if you cannot rewrite the folder yourself, for example a share administered by someone else. atlas-duck asks for a folder and confirms every change in its own dialogs.',
+  anchor_dir_set: 'Set anchor directory…',
+  anchor_dir_change: 'Change anchor directory…',
+  anchor_dir_remove: 'Remove anchor directory…',
+  anchor_dir_changed: 'The anchor directory was changed.',
+  anchor_dir_removed: 'The anchor directory was removed.',
+  anchor_dir_pending: (n: number) =>
+    `${n} ${n === 1 ? 'line waits' : 'lines wait'} to be written to the anchor directory.`,
+  anchor_dir_errors: {
+    not_writable: 'This folder cannot be written',
+    writer_busy: 'The audit log is busy: try again in a moment.',
+    unchanged: 'That is the anchor directory already in use: nothing was changed.',
+    not_set: 'No anchor directory is set: nothing was changed.',
+    failed: 'That folder cannot be used as an anchor directory: nothing was changed.',
+  } as Readonly<Record<string, string>>,
+} as const;

@@ -7,8 +7,11 @@ export interface Action {
   pending: boolean;
   /** The fixed text of the last refusal, `null` after a success or before the first call. */
   error: string | null;
-  /** Runs `fn`; resolves to its value, or `undefined` when it was refused (then `error` is set). */
-  run: <T>(fn: () => Promise<T>) => Promise<T | undefined>;
+  /**
+   * Runs `fn`; resolves to its value, or `undefined` when it was refused (then `error` is set, or,
+   * when `onFail` is given, `onFail` gets the rejection instead and `error` stays null).
+   */
+  run: <T>(fn: () => Promise<T>, onFail?: (e: unknown) => void) => Promise<T | undefined>;
 }
 
 /** The window-wide in-flight guard: one command at a time, so no two native dialogs overlap. */
@@ -57,7 +60,7 @@ export function useAction(): Action {
   const claim = win?.claim;
   const release = win?.release;
   const run = useCallback(
-    async <T,>(fn: () => Promise<T>): Promise<T | undefined> => {
+    async <T,>(fn: () => Promise<T>, onFail?: (e: unknown) => void): Promise<T | undefined> => {
       if (own.current) return undefined;
       if (claim !== undefined && !claim()) return undefined;
       own.current = true;
@@ -67,7 +70,13 @@ export function useAction(): Action {
         const v = await fn();
         return v;
       } catch (e) {
-        if (live.current) setError(errorText(e));
+        if (live.current) {
+          if (onFail === undefined) {
+            setError(errorText(e));
+          } else {
+            onFail(e);
+          }
+        }
         return undefined;
       } finally {
         own.current = false;

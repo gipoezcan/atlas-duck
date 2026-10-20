@@ -1,22 +1,33 @@
-import { act, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { on } from '../shared/ipc/events';
 import {
+  anchorDirRemove,
+  anchorDirSet,
+  backupTrigger,
   cliInstall,
   cliUninstall,
   credentialWindowOpen,
+  exportCancel,
+  forgetInstall,
   instanceAcceptUrlChange,
   instanceAdd,
   instanceChangeUrl,
   instanceConfirmConfig,
   instanceSetProxy,
+  orphanInstalls,
   pruneBacklogNow,
+  reAnchor,
+  recoveryPassphraseChange,
   removalBackup,
   removalBegin,
+  removalExport,
   removalFinish,
   removalMark,
   removalState,
+  restoreBegin,
+  restoreCancel,
   retestToken,
   settingsApply,
   settingsGet,
@@ -41,9 +52,20 @@ vi.mock('../shared/ipc/invoke', () => ({
   pruneBacklogNow: vi.fn(),
   removalBackup: vi.fn(),
   removalBegin: vi.fn(),
+  removalExport: vi.fn(),
   removalFinish: vi.fn(),
   removalMark: vi.fn(),
   removalState: vi.fn(),
+  exportCancel: vi.fn(),
+  backupTrigger: vi.fn(),
+  restoreBegin: vi.fn(),
+  restoreCancel: vi.fn(),
+  recoveryPassphraseChange: vi.fn(),
+  anchorDirSet: vi.fn(),
+  anchorDirRemove: vi.fn(),
+  reAnchor: vi.fn(),
+  orphanInstalls: vi.fn(),
+  forgetInstall: vi.fn(),
 }));
 vi.mock('../shared/ipc/events', () => ({ on: vi.fn() }));
 
@@ -61,6 +83,15 @@ function plain(inst: Partial<InstanceView>, over: Partial<SettingsGet> = {}): Se
 }
 
 let handlers: ((payload: unknown) => void)[] = [];
+/** The handlers by event name (`handlers` holds them all, for `settings_changed`). */
+let named = new Map<string, ((payload: unknown) => void)[]>();
+
+async function emitEvent(name: string, payload: unknown): Promise<void> {
+  act(() => {
+    for (const h of named.get(name) ?? []) h(payload);
+  });
+  await flush();
+}
 
 async function flush(): Promise<void> {
   await act(async () => {
@@ -82,6 +113,16 @@ async function emitChanged(): Promise<void> {
   await flush();
 }
 
+/**
+ * The one polite region of the window that says something: the sections that report what a command
+ * answered keep an empty region in the page (an inserted region is not announced).
+ */
+function filledStatus(): HTMLElement {
+  const filled = screen.getAllByRole('status').filter((s) => (s.textContent ?? '') !== '');
+  expect(filled).toHaveLength(1);
+  return filled[0] as HTMLElement;
+}
+
 const row = (alias: string): HTMLElement => {
   const cell = screen.getByRole('rowheader', { name: new RegExp(alias) });
   return cell.closest('tr') as HTMLElement;
@@ -89,13 +130,25 @@ const row = (alias: string): HTMLElement => {
 
 beforeEach(() => {
   handlers = [];
+  named = new Map();
   vi.mocked(on)
     .mockReset()
-    .mockImplementation((_name, handler) => {
+    .mockImplementation((name, handler) => {
       handlers.push(handler as (payload: unknown) => void);
+      named.set(name, [...(named.get(name) ?? []), handler as (payload: unknown) => void]);
       return Promise.resolve(() => undefined);
     });
   for (const f of [
+    anchorDirRemove,
+    anchorDirSet,
+    backupTrigger,
+    exportCancel,
+    forgetInstall,
+    reAnchor,
+    recoveryPassphraseChange,
+    removalExport,
+    restoreBegin,
+    restoreCancel,
     cliInstall,
     cliUninstall,
     settingsApply,
@@ -115,6 +168,7 @@ beforeEach(() => {
     vi.mocked(f as (...a: unknown[]) => Promise<unknown>).mockReset();
   }
   vi.mocked(settingsGet).mockReset();
+  vi.mocked(orphanInstalls).mockReset().mockResolvedValue([]);
   // "Prepare for removal" has its own tests (Removal.test.tsx): here it is the idle entry.
   vi.mocked(removalState)
     .mockReset()
@@ -194,13 +248,13 @@ describe('Settings', () => {
     vi.mocked(retestToken).mockResolvedValue({ failed: { class: 'other_user' } });
     fireEvent.click(screen.getByRole('button', { name: 'Re-test stored token' }));
     await flush();
-    expect(screen.getByRole('status').textContent).toContain('the token now belongs to another user');
+    expect(filledStatus().textContent).toContain('the token now belongs to another user');
     vi.mocked(retestToken).mockResolvedValue({ failed: { class: 'x\u202ey' } });
     fireEvent.click(screen.getByRole('button', { name: 'Re-test stored token' }));
     await flush();
     // An unknown class is fixed text: the wire name is not echoed.
-    expect(screen.getByRole('status').textContent).toContain('does not recognize');
-    expect(screen.getByRole('status').textContent).not.toContain('x\u202ey');
+    expect(filledStatus().textContent).toContain('does not recognize');
+    expect(filledStatus().textContent).not.toContain('x\u202ey');
   });
 
   it('pending URL change banner is verbatim and accept calls the command', async () => {
@@ -242,13 +296,18 @@ describe('Settings', () => {
     const controls = [...document.querySelectorAll('input, select, button, textarea')];
     expect(controls.length).toBeGreaterThan(8);
     const open = controls.filter((c) => !c.matches(':disabled')).map((c) => c.textContent);
-    // Only the token, re-test, prune, CLI and removal buttons stay on: core refuses ConfigReadOnly
-    // for what writes config.toml; the CLI install and "Prepare for removal" record audit events only.
+    // Only the token, re-test, prune, CLI, removal, backup/restore, passphrase, anchor and forget
+    // buttons stay on: core refuses ConfigReadOnly for what writes config.toml; the CLI install,
+    // "Prepare for removal" and the M10 recovery tier act on the audit store and keychain only.
     for (const c of controls) {
       const name = c.textContent ?? '';
       // The degraded toggle is audit-authoritative, not a config.toml key: it stays on (PD-141).
       const degraded = c.closest('label')?.textContent === 'Allow scripts with degraded confinement';
-      const stays = degraded || /token|Re-test|Prune backlog|CLI|full backup/.test(name);
+      const stays =
+        degraded ||
+        /token|Re-test|Prune backlog|CLI|full backup|Export the audit log|Back up now|Restore backup|recovery passphrase|anchor directory|Re-anchor|Forget/.test(
+          name,
+        );
       expect(c.matches(':disabled'), c.outerHTML).toBe(!stays);
     }
     expect(open.length).toBeGreaterThan(0);
@@ -605,7 +664,7 @@ describe('Settings', () => {
     expect(cliInstall).toHaveBeenCalledTimes(1);
     expect(cliInstall).toHaveBeenCalledWith();
     expect(cliUninstall).not.toHaveBeenCalled();
-    expect(screen.getByRole('status').textContent).toContain('Open a new terminal');
+    expect(filledStatus().textContent).toContain('Open a new terminal');
     // The window re-reads: the state shown is Rust's, not a local guess.
     expect(settingsGet).toHaveBeenCalledTimes(2);
     unmount();
@@ -618,7 +677,7 @@ describe('Settings', () => {
     expect(cliUninstall).toHaveBeenCalledTimes(1);
     expect(cliUninstall).toHaveBeenCalledWith();
     expect(cliInstall).toHaveBeenCalledTimes(1);
-    expect(screen.getByRole('status').textContent).toContain('Removed');
+    expect(filledStatus().textContent).toContain('Removed');
   });
 
   it('every CLI outcome has its own fixed text', async () => {
@@ -636,7 +695,7 @@ describe('Settings', () => {
       vi.mocked(cliInstall).mockResolvedValue({ outcome });
       fireEvent.click(screen.getByRole('button', { name: 'Install CLI to PATH' }));
       await flush();
-      const text = screen.getByRole('status').textContent ?? '';
+      const text = filledStatus().textContent ?? '';
       expect(text.length).toBeGreaterThan(10);
       seen.add(text);
       if (outcome === 'installed_local_bin') {
@@ -695,7 +754,7 @@ describe('Settings', () => {
       await flush();
       expect(screen.getByRole('alert').textContent, kind).toMatch(text);
       // A failed call leaves no success text behind.
-      expect(screen.queryByRole('status')).toBeNull();
+      expect(screen.queryAllByRole('status').filter((s) => s.textContent !== '')).toEqual([]);
     }
     // An unknown kind (or hostile text) is the generic line, not the wire string.
     vi.mocked(cliInstall).mockRejectedValue({ kind: 'cli_install', error: { kind: 'x\u202ey' } });
@@ -863,7 +922,7 @@ describe('Settings', () => {
     });
     fireEvent.click(screen.getByRole('button', { name: 'Re-test stored token' }));
     await flush();
-    const status = screen.getByRole('status');
+    const status = filledStatus();
     expect(status.querySelector('script')).toBeNull();
     expect(status.textContent).toContain('<script>alert(1)</script>');
     expect(within(status).getAllByText('unusual characters')).toHaveLength(2);
@@ -920,7 +979,7 @@ describe('Settings', () => {
       vi.mocked(retestToken).mockResolvedValue({ failed: { class: cls } });
       fireEvent.click(screen.getByRole('button', { name: 'Re-test stored token' }));
       await flush();
-      const status = screen.getByRole('status').textContent ?? '';
+      const status = filledStatus().textContent ?? '';
       expect(status, cls).toContain(text);
       expect(status, cls).not.toContain('recognize');
     }
@@ -933,9 +992,9 @@ describe('Settings', () => {
     });
     fireEvent.click(screen.getByRole('button', { name: 'Re-test stored token' }));
     await flush();
-    expect(screen.getByRole('status').textContent).toContain('alice');
-    expect(screen.getByRole('status').textContent).toContain('Jira');
-    expect(screen.getByRole('status').textContent).toContain('9.12.0');
+    expect(filledStatus().textContent).toContain('alice');
+    expect(filledStatus().textContent).toContain('Jira');
+    expect(filledStatus().textContent).toContain('9.12.0');
   });
 
   it('every prune skip reason of core has a text', async () => {
@@ -1023,5 +1082,300 @@ describe('Settings', () => {
       const id = el.getAttribute('aria-describedby') ?? '';
       expect(document.getElementById(id)?.textContent, el.outerHTML).toContain('work');
     }
+  });
+});
+
+// ---- M10 T21: recovery and backup, anchor directory, recovery tier ----
+
+/** `plain()` with the store health changed. */
+function withHealth(health: Partial<SettingsGet['settings']['health']>, anchorDir: string | null = null): SettingsGet {
+  const base = plain({});
+  return {
+    ...base,
+    settings: { ...base.settings, anchor_dir: anchorDir, health: { ...base.settings.health, ...health } },
+  };
+}
+
+const section = (name: string): ReturnType<typeof within> => within(screen.getByRole('region', { name }));
+
+const never = <T,>() => new Promise<T>(() => undefined);
+
+/** What the polite regions of a section hold (the banner region is empty unless a restore waits). */
+const statusText = (w: { getAllByRole: (role: string) => HTMLElement[] }): string =>
+  w.getAllByRole('status').map((s) => s.textContent ?? '').join('');
+
+const DONE = {
+  restore_seq: 5,
+  records_lost: 2,
+  tokens_deleted: 1,
+  offer_passphrase_change: true,
+  after_restore_failed: false,
+};
+
+describe('Settings recovery and backup (M10 T21)', () => {
+  it('backup_text_states_no_tokens: the L27 sentence, the upgrade advice, and a backup that carries no argument', async () => {
+    await show(plain({}));
+    const recovery = section('Recovery and backup');
+    // Written out here on purpose: the test must not read the constants it checks.
+    expect(
+      recovery.getByText('Backups never contain stored tokens; after a restore every instance needs its token again.'),
+    ).toBeTruthy();
+    expect(recovery.getByText('Make a full backup before every upgrade.')).toBeTruthy();
+    vi.mocked(backupTrigger).mockResolvedValue({ saved: true });
+    fireEvent.click(recovery.getByRole('button', { name: 'Back up now…' }));
+    await flush();
+    expect(backupTrigger).toHaveBeenCalledWith();
+    expect(statusText(recovery)).toBe('The backup was saved.');
+  });
+
+  it('a failed backup, a cancelled folder dialog and a busy slot are fixed texts', async () => {
+    await show(plain({}));
+    const recovery = section('Recovery and backup');
+    const press = async () => {
+      fireEvent.click(recovery.getByRole('button', { name: 'Back up now…' }));
+      await flush();
+    };
+    vi.mocked(backupTrigger).mockRejectedValueOnce({ kind: 'backup' });
+    await press();
+    expect(recovery.getByRole('alert').textContent).toContain('The backup failed.');
+    vi.mocked(backupTrigger).mockRejectedValueOnce({ kind: 'cancelled' });
+    await press();
+    expect(recovery.getByRole('alert').textContent).toBe('Cancelled: nothing was changed');
+    vi.mocked(backupTrigger).mockRejectedValueOnce({ kind: 'busy' });
+    await press();
+    expect(recovery.getByRole('alert').textContent).toContain('another task is running');
+    vi.mocked(backupTrigger).mockResolvedValueOnce({ saved: false });
+    await press();
+    expect(statusText(recovery)).toBe('No backup was made.');
+  });
+
+  it('restore_indeterminate_progress_and_wait_banner: no value on the bar, the banner from started, Cancel valid', async () => {
+    await show(plain({}));
+    const recovery = section('Recovery and backup');
+    let finish: (v: unknown) => void = () => undefined;
+    vi.mocked(restoreBegin).mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }) as never,
+    );
+    fireEvent.click(recovery.getByRole('button', { name: 'Restore backup…' }));
+    await flush();
+    expect(restoreBegin).toHaveBeenCalledWith();
+    const bar = recovery.getByRole('progressbar');
+    expect(bar.hasAttribute('value')).toBe(false);
+    expect(recovery.queryByText('Requests wait while the restore runs')).toBeNull();
+    // Rust emits `started` once its own dialogs are answered and the store call is next.
+    await emitEvent('audit_job', { job: 'restore', phase: 'started' });
+    expect(recovery.getByText('Requests wait while the restore runs')).toBeTruthy();
+    // An export's event does not say the restore waits.
+    vi.mocked(restoreCancel).mockResolvedValue({ cancelled: true });
+    fireEvent.click(recovery.getByRole('button', { name: 'Cancel restore' }));
+    await flush();
+    expect(restoreCancel).toHaveBeenCalledWith();
+    expect(statusText(recovery)).toContain('Cancel requested.');
+    finish(DONE);
+    await flush();
+    await emitEvent('audit_job', { job: 'restore', phase: 'done' });
+    expect(recovery.queryByRole('progressbar')).toBeNull();
+    expect(recovery.queryByText('Requests wait while the restore runs')).toBeNull();
+    const said = statusText(recovery);
+    expect(said).toContain('The restore is complete.');
+    expect(said).toContain('2 records written after the backup are no longer in the log.');
+    expect(said).toContain('1 stored token was deleted');
+    expect(said).toContain("The backup's recovery passphrase is now the recovery passphrase of this log.");
+  });
+
+  it('a cancel that is too late says so; a foreign job is not a restore', async () => {
+    await show(plain({}));
+    const recovery = section('Recovery and backup');
+    vi.mocked(restoreBegin).mockReturnValue(never());
+    fireEvent.click(recovery.getByRole('button', { name: 'Restore backup…' }));
+    await flush();
+    await emitEvent('audit_job', { job: 'export', phase: 'started' });
+    expect(recovery.queryByText('Requests wait while the restore runs')).toBeNull();
+    vi.mocked(restoreCancel).mockRejectedValue({ kind: 'busy' });
+    fireEvent.click(recovery.getByRole('button', { name: 'Cancel restore' }));
+    await flush();
+    expect(recovery.getByRole('alert').textContent).toContain('cannot be cancelled');
+  });
+
+  it('a follow-up that failed and a restore that committed incompletely each ask for a restart', async () => {
+    await show(plain({}));
+    const recovery = section('Recovery and backup');
+    vi.mocked(restoreBegin).mockResolvedValueOnce({ ...DONE, after_restore_failed: true });
+    fireEvent.click(recovery.getByRole('button', { name: 'Restore backup…' }));
+    await flush();
+    expect(statusText(recovery)).toContain('follow-up step failed');
+    expect(statusText(recovery)).toContain('start it again');
+    vi.mocked(restoreBegin).mockRejectedValueOnce({ kind: 'restore', error: { kind: 'committed_incomplete' } });
+    fireEvent.click(recovery.getByRole('button', { name: 'Restore backup…' }));
+    await flush();
+    const alert = recovery.getByRole('alert').textContent ?? '';
+    expect(alert).toContain('Restore will be completed at the next start');
+    expect(alert).toContain('start it again');
+    // No retry once the restore committed: the only restore control is gone while the text stands.
+    expect((recovery.getByRole('button', { name: 'Restore backup…' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('every other restore failure says that nothing changed', async () => {
+    await show(plain({}));
+    const recovery = section('Recovery and backup');
+    for (const kind of ['wrong_passphrase', 'not_a_backup', 'newer', 'broken', 'anchor_dir_mismatch', 'keychain', 'failed']) {
+      vi.mocked(restoreBegin).mockRejectedValueOnce({ kind: 'restore', error: { kind } });
+      fireEvent.click(recovery.getByRole('button', { name: 'Restore backup…' }));
+      await flush();
+      expect(recovery.getByRole('alert').textContent, kind).toContain('Nothing was changed.');
+    }
+  });
+
+  it('the passphrase change asks Rust to open the credential window, and the restore offers it', async () => {
+    await show(plain({}));
+    const recovery = section('Recovery and backup');
+    vi.mocked(recoveryPassphraseChange).mockResolvedValue(null);
+    fireEvent.click(recovery.getByRole('button', { name: 'Change recovery passphrase…' }));
+    await flush();
+    expect(recoveryPassphraseChange).toHaveBeenCalledWith();
+    expect(statusText(recovery)).toContain('credential window is open');
+  });
+
+  it('anchor_dir_failure_line_shown: a failing anchor write is a line, never an incident; pending lines are counted', async () => {
+    await show(withHealth({ anchor_dir_write_failing: true, anchor_dir_lines_pending: 3 }, '/mnt/anchors'));
+    const anchor = section('External anchor directory');
+    expect(anchor.getByText('Writing to the anchor directory fails; 3 lines wait and will be retried.')).toBeTruthy();
+    expect(anchor.getByText('/mnt/anchors')).toBeTruthy();
+  });
+
+  it('lines that wait without a failing write are counted too, and no line shows when nothing waits', async () => {
+    await show(withHealth({ anchor_dir_write_failing: false, anchor_dir_lines_pending: 1 }, '/mnt/anchors'));
+    expect(section('External anchor directory').getByText('1 line waits to be written to the anchor directory.')).toBeTruthy();
+    cleanup();
+    await show(withHealth({ anchor_dir_write_failing: false, anchor_dir_lines_pending: 0 }, '/mnt/anchors'));
+    expect(section('External anchor directory').queryByText(/waits? to be written/)).toBeNull();
+  });
+
+  it('anchor directory: set, change and remove carry no path; the answers are texts', async () => {
+    await show(withHealth({}, null));
+    let anchor = section('External anchor directory');
+    expect(anchor.getByText(/\(not set\)/)).toBeTruthy();
+    expect(anchor.queryByRole('button', { name: 'Remove anchor directory…' })).toBeNull();
+    vi.mocked(anchorDirSet).mockRejectedValueOnce({ kind: 'anchor_dir', error: { kind: 'not_writable' } });
+    fireEvent.click(anchor.getByRole('button', { name: 'Set anchor directory…' }));
+    await flush();
+    expect(anchorDirSet).toHaveBeenCalledWith();
+    expect(anchor.getByRole('alert').textContent).toBe('This folder cannot be written');
+    vi.mocked(anchorDirSet).mockResolvedValueOnce({ anchor_dir: '/mnt/new' });
+    fireEvent.click(anchor.getByRole('button', { name: 'Set anchor directory…' }));
+    await flush();
+    expect(anchor.getByRole('status').textContent).toBe('The anchor directory was changed.');
+    cleanup();
+    await show(withHealth({}, '/mnt/anchors'));
+    anchor = section('External anchor directory');
+    expect(anchor.getByRole('button', { name: 'Change anchor directory…' })).toBeTruthy();
+    vi.mocked(anchorDirRemove).mockResolvedValueOnce({ anchor_dir: null });
+    fireEvent.click(anchor.getByRole('button', { name: 'Remove anchor directory…' }));
+    await flush();
+    expect(anchorDirRemove).toHaveBeenCalledWith();
+    expect(anchor.getByRole('status').textContent).toBe('The anchor directory was removed.');
+    for (const [kind, text] of [
+      ['unchanged', 'already in use'],
+      ['writer_busy', 'busy'],
+      ['not_set', 'No anchor directory is set'],
+      ['failed', 'cannot be used'],
+    ] as const) {
+      vi.mocked(anchorDirRemove).mockRejectedValueOnce({ kind: 'anchor_dir', error: { kind } });
+      fireEvent.click(anchor.getByRole('button', { name: 'Remove anchor directory…' }));
+      await flush();
+      expect(anchor.getByRole('alert').textContent, kind).toContain(text);
+    }
+    vi.mocked(anchorDirRemove).mockRejectedValueOnce({ kind: 'cancelled' });
+    fireEvent.click(anchor.getByRole('button', { name: 'Remove anchor directory…' }));
+    await flush();
+    expect(anchor.getByRole('alert').textContent).toBe('Cancelled: nothing was changed');
+  });
+
+  it('reanchor_only_when_offered: a missing entry is named, the button only while Rust offers it', async () => {
+    await show(withHealth({ anchors_missing: 'head', re_anchor_offered: false }));
+    expect(screen.getByText('The head anchor entry is missing from the keychain.')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Re-anchor…' })).toBeNull();
+    cleanup();
+    await show(withHealth({ anchors_missing: null, re_anchor_offered: false }));
+    expect(screen.queryByRole('button', { name: 'Re-anchor…' })).toBeNull();
+    expect(screen.queryByText(/entry is missing|entries are missing/)).toBeNull();
+    cleanup();
+    await show(withHealth({ anchors_missing: 'both', re_anchor_offered: true }));
+    expect(screen.getByText(/head anchor and the first-retained anchor entries are missing/)).toBeTruthy();
+    // The text says that both anchors are written again and that an incident is recorded.
+    const note = screen.getByText(/writes both the head anchor and the first-retained anchor again/);
+    expect(note.textContent).toContain('integrity incident');
+    vi.mocked(reAnchor).mockResolvedValue({ verify_seq: 9 });
+    fireEvent.click(screen.getByRole('button', { name: 'Re-anchor…' }));
+    await flush();
+    expect(reAnchor).toHaveBeenCalledWith();
+    expect(screen.getByText(/Re-anchored\. An integrity incident was recorded/)).toBeTruthy();
+  });
+
+  it('a re-anchor that left an incident, or did nothing, says which', async () => {
+    await show(withHealth({ anchors_missing: 'head', re_anchor_offered: true }));
+    for (const [kind, text] of [
+      ['does_not_verify', 'integrity incident was recorded'],
+      ['keychain', 'integrity incident was recorded'],
+      ['held', 'held'],
+      ['nothing_missing', 'nothing was changed'],
+      ['restored', 'nothing was changed'],
+      ['failed', 'failed'],
+    ] as const) {
+      vi.mocked(reAnchor).mockRejectedValueOnce({ kind: 're_anchor', error: { kind } });
+      fireEvent.click(screen.getByRole('button', { name: 'Re-anchor…' }));
+      await flush();
+      expect(screen.getAllByRole('alert').map((a) => a.textContent).join('|'), kind).toContain(text);
+    }
+  });
+
+  it('forget_lists_orphans: install, archived files and entries are listed; Forget carries the id only', async () => {
+    const id = 'ab'.repeat(16);
+    vi.mocked(orphanInstalls).mockResolvedValue([
+      { install_id: id, archived_files: ['archived/old.db'], entries: ['kek', 'pat/1'] },
+    ]);
+    await show(plain({}));
+    const old = section('Old installs');
+    expect(old.getByText(id)).toBeTruthy();
+    expect(old.getByText('archived/old.db')).toBeTruthy();
+    expect(old.getByText('kek')).toBeTruthy();
+    expect(old.getByText('pat/1')).toBeTruthy();
+    vi.mocked(forgetInstall).mockResolvedValue({ install_id: id, deleted: ['kek'], keys_deleted: true });
+    vi.mocked(orphanInstalls).mockResolvedValue([]);
+    fireEvent.click(old.getByRole('button', { name: `Forget the install ${id}` }));
+    await flush();
+    expect(forgetInstall).toHaveBeenCalledWith(id);
+    expect(old.getByRole('status').textContent).toContain('Forgotten: its keychain entries and the keys of its archived log were deleted.');
+    // The list is read again: the forgotten install is gone, and focus moved to the section heading.
+    expect(old.queryByText(id)).toBeNull();
+    expect(old.getByText('No old installs were found.')).toBeTruthy();
+    expect(document.activeElement).toBe(old.getByRole('heading', { name: 'Old installs' }));
+  });
+
+  it('forgetting keeps the keys when the second confirmation was declined, and names a partial failure', async () => {
+    const id = 'cd'.repeat(16);
+    vi.mocked(orphanInstalls).mockResolvedValue([{ install_id: id, archived_files: [], entries: ['kek', 'pat/1'] }]);
+    await show(plain({}));
+    const old = section('Old installs');
+    vi.mocked(forgetInstall).mockResolvedValueOnce({ install_id: id, deleted: ['pat/1'], keys_deleted: false });
+    fireEvent.click(old.getByRole('button', { name: `Forget the install ${id}` }));
+    await flush();
+    expect(old.getByRole('status').textContent).toContain('the keys of its archived log were kept');
+    vi.mocked(forgetInstall).mockRejectedValueOnce({
+      kind: 'forget',
+      error: { kind: 'keychain', deleted: ['pat/1'], not_deleted: ['kek'] },
+    });
+    fireEvent.click(old.getByRole('button', { name: `Forget the install ${id}` }));
+    await flush();
+    const alert = old.getByRole('alert');
+    expect(alert.textContent).toContain('Some entries could not be deleted');
+    expect(within(alert).getByText('pat/1')).toBeTruthy();
+    expect(within(alert).getByText('kek')).toBeTruthy();
+    vi.mocked(forgetInstall).mockRejectedValueOnce({ kind: 'cancelled' });
+    fireEvent.click(old.getByRole('button', { name: `Forget the install ${id}` }));
+    await flush();
+    expect(old.getByRole('alert').textContent).toBe('Cancelled: nothing was changed');
   });
 });

@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react';
 
+import type { ExportDone } from '../shared/ipc/types';
 import { AUDIT_TEXT as T, UNUSUAL_CHARACTERS } from '../shared/strings';
 import { Badge } from '../shared/text/Badge';
 import { own } from '../shared/text/own';
@@ -45,6 +46,40 @@ export function Announce({ said, className }: { said: Said | null; className?: s
       ) : null}
     </>
   );
+}
+
+export const say = (role: Said['role'], body: ReactNode): Said => ({ role, body });
+
+/** How an export ended, as a window says it: complete (also when only the rename failed), or a sentence. */
+export function exportResult(done: ExportDone, renamed: boolean): Said {
+  const { manifest_sha256: hex, dir_name: name, rows } = done;
+  return {
+    role: renamed ? 'status' : 'alert',
+    body: (
+      <div className="audit-export-result">
+        <p>{renamed ? T.export_done(name, rows) : T.export_not_renamed(name, rows)}</p>
+        <p>{T.export_recipient(hex)}</p>
+        <p>
+          <code>{hex}</code>
+        </p>
+      </div>
+    ),
+  };
+}
+
+/** What a refused or failed export said: a cancel, a named leftover, the `not_renamed` result or a fixed sentence. */
+export function exportRefusal(e: unknown): Said {
+  const { kind, inner } = kinds(e);
+  if (kind === 'cancelled') return say('status', T.export_cancelled);
+  if (kind === 'export' && typeof e === 'object' && e !== null) {
+    const error = (e as { error: Record<string, unknown> }).error;
+    const name = typeof error['dir_name'] === 'string' ? error['dir_name'] : '';
+    if (inner === 'leftover') return say('alert', T.export_leftover(name));
+    if (inner === 'not_renamed' && typeof error['manifest_sha256'] === 'string' && typeof error['rows'] === 'number') {
+      return exportResult({ manifest_sha256: error['manifest_sha256'], dir_name: name, rows: error['rows'] }, false);
+    }
+  }
+  return say('alert', errorText(e));
 }
 
 const LOCAL_TIME =/^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/;

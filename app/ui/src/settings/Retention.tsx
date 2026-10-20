@@ -17,8 +17,8 @@ interface RetentionProps {
 }
 
 /**
- * Retention, legal hold and the attention mode, the external anchor directory (display only) and
- * the prune backlog line. Retention and hold go through core's native confirmation when they
+ * Retention, legal hold and the attention mode and the prune backlog line (the external anchor
+ * directory has its own section, `AnchorDir`). Retention and hold go through core's native confirmation when they
  * weaken a guarantee; a declined confirmation is `cancelled`: the hold and the mode snap back to
  * the stored value, the typed retention days stay in the field beside the error text. A read-only
  * config turns the config-writing controls off; the prune button is core's call.
@@ -112,10 +112,6 @@ export function Retention({ view, onChanged, readOnly }: RetentionProps) {
         {mode.error === null ? null : <p role="alert">{mode.error}</p>}
       </div>
       </Guard>
-      <p>
-        {T.anchor}:{' '}
-        {view.anchor_dir === null ? T.anchor_none : <Cfg value={view.anchor_dir} />}
-      </p>
       <section aria-label={T.prune}>
         <h3>{T.prune}</h3>
         {view.health.last_prune_failed ? <p>{T.prune_failed_last}</p> : null}

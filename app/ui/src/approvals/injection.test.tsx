@@ -59,6 +59,10 @@ const DISCRIMINANTS = new Set([
   // `dir_name` is shown poisoned; its path is poisoned (`__proto__`, `constructor`) by the focus
   // pass, and `all` poisons it with everything else, where the validator rejects it.
   'manifest_sha256',
+  // M10 T21: an old install's id (32 lowercase hex, the `validate.ts` format check) is a key the
+  // page sends back with "Forget"; a `free` run keeps it valid so the list, the buttons and the
+  // `forgotten` answer are reached. The per-path pass poisons it, and `all` poisons it with everything.
+  'install_id',
 ]);
 
 /** The one discriminator path a `free` run poisons as well (the per-path prototype pass), or null. */
@@ -178,7 +182,7 @@ let mode: Mode = 'free';
 let preview = 0;
 let enabled = false;
 let pin = 0;
-let variant: 'none' | 'tokens' | 'removal' = 'none';
+let variant: 'none' | 'tokens' | 'removal' | 'restoring' = 'none';
 /** The blocked read of the M-11 scenario: `redaction_preview` answers the report that flags mirror entries. */
 let mirror = false;
 let counters = new Map<string, number>();
@@ -364,10 +368,11 @@ function answer(cmd: string, args: Record<string, unknown>): Promise<Json> {
     case 'export_trigger': return reply(cmd, 'export_done', undefined, exportFailures);
     case 'export_cancel': return reply(cmd, 'export_cancel');
     case 'backup_trigger': return reply(cmd, 'removal_backup_answer');
-    // M10 T13 (PD-168): Settings "Restore backup…"; its UI is Task 21's.
-    case 'restore_begin': return reply(cmd, 'restore_done');
+    // M10 T13 (PD-168): Settings "Restore backup…". The `restoring` variant never answers, so the
+    // window shows the running restore (progress, banner, Cancel) and Cancel reaches `restore_cancel`.
+    case 'restore_begin': return variant === 'restoring' ? new Promise<Json>(() => undefined) : reply(cmd, 'restore_done');
     case 'restore_cancel': return reply(cmd, 'restore_cancel');
-    // M10 T14 (PD-166, PD-170): the recovery tier and the anchor directory; their UI is Task 21's.
+    // M10 T14 (PD-166, PD-170): the recovery tier and the anchor directory (Settings, T21).
     case 'recovery_passphrase_change': return Promise.resolve(null);
     case 'anchor_dir_set':
     case 'anchor_dir_remove': return reply(cmd, 'anchor_dir_answer');
@@ -379,18 +384,12 @@ function answer(cmd: string, args: Record<string, unknown>): Promise<Json> {
 }
 
 /**
- * Fixtures no window renders yet: M10 T13's restore answers and M10 T14's recovery-tier answers
- * wait for the Settings UI (Task 21), which removes each name here as its window comes to consume
- * it. (M10 T20's Audit window consumes the Audit answers and, driven below, `audit_job`.)
+ * Fixtures no window renders yet: none. M10 T13's restore answers and T14's recovery-tier answers
+ * are consumed by the Settings window (T21); the Audit answers and, driven below, `audit_job` by the
+ * Audit window (T20). A fixture added without a window that renders it fails
+ * `every_fixture_reaches_a_window`.
  */
-const NOT_YET_RENDERED = [
-  'anchor_dir_answer',
-  'forgotten',
-  'orphan_install',
-  're_anchored',
-  'restore_cancel',
-  'restore_done',
-];
+const NOT_YET_RENDERED: string[] = [];
 
 /** The handlers the windows registered through `on`, by event name: a scenario may drive events. */
 let handlers = new Map<string, ((payload: unknown) => void)[]>();
@@ -577,6 +576,27 @@ const SCENARIOS: Scenario[] = [
   ...[0, 1, 2, 3].map((i): Scenario => ({ name: `settings ${i}`, modes: only(i), element: () => <Settings />, before: () => void (pin = i) })),
   { name: 'settings tokens', modes: ['free'], element: () => <Settings />, before: () => void (variant = 'tokens') },
   { name: 'settings removal', modes: ['free', 'all'], element: () => <Settings />, before: () => void ((variant = 'removal'), (pin = 1)) },
+  // M10 T21: a restore that is running (its restore job started, Cancel pressed). The first state of
+  // Settings has the anchor failure line, a missing anchor entry and "Re-anchor".
+  {
+    name: 'settings restore',
+    modes: ['free'],
+    element: () => <Settings />,
+    before: () => void ((variant = 'restoring'), (pin = 0)),
+    after: async () => {
+      const start = [...document.querySelectorAll('button')].find((b) => b.textContent === 'Restore backup…');
+      if (start !== undefined && !start.disabled) {
+        await act(async () => {
+          fireEvent.click(start);
+        });
+        await settle();
+      }
+      const jobs = fx('audit_job');
+      await emit('audit_job', jobs.find((j) => (j as { job?: unknown }).job === 'restore') ?? null);
+      for (const job of jobs) await emit('audit_job', job);
+      await emit('audit_job', jobs.find((j) => (j as { job?: unknown }).job === 'restore') ?? null);
+    },
+  },
   ...[0, 1, 2, 3, 4].map((i): Scenario => ({ name: `setup ${i}`, cheap: true, modes: only(i), element: () => <Wizard />, before: () => void (pin = i) })),
   { name: 'audit', cheap: true, element: () => <Audit /> },
   // M10 T20: every `audit_job` fixture reaches the window, then the export's progress again, so the
