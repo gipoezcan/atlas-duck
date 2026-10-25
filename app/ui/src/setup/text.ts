@@ -20,17 +20,23 @@ export const SETUP_TEXT = {
     'This folder already holds an audit log. atlas-duck keeps it and does not ask for a new recovery passphrase.',
   existing_data_dir: 'Folder',
   existing_continue: 'Continue with this log',
-  /** M10 T15 (placeholder wording; Task 22 owns the anchor-dir step's text). */
+  /** plan text (M10 T22, spec 2.5 step 1b): the anchor-directory step comes before the passphrase. */
   anchor_heading: 'Anchor directory (optional)',
   anchor_intro:
-    'Advanced: atlas-duck can also write its audit anchors to a folder outside this computer, for example a network share. Choose it now if you want one, or begin without it.',
+    'Advanced: atlas-duck can also write its audit anchors to a folder outside this computer, for example a network share. Choose it now if you want one, or continue without it. You can change it later in Settings.',
   anchor_dir: 'Anchor directory',
+  anchor_none: 'No anchor directory chosen.',
   anchor_choose: 'Choose anchor directory…',
   anchor_clear: 'No anchor directory',
+  anchor_continue: 'Continue',
+  /** The alternative to a new log, offered only before the audit log exists. */
   restore_offer: 'Restore from a backup…',
+  restore_intro:
+    'Already have a backup of an atlas-duck audit log? Restore it instead of creating a new one. You enter the backup’s own recovery passphrase, so no new passphrase is set.',
   restore_heading: 'Restoring a backup',
   restore_working:
     'Answer the dialogs, then enter the backup’s recovery passphrase in the credentials window.',
+  restore_cancel_hint: 'Close the credentials window to cancel the restore.',
   pin_heading: 'Installation id',
   pin_retry: 'Try again',
   passphrase_heading: 'Recovery passphrase',
@@ -99,6 +105,12 @@ export const SETUP_TEXT = {
     anchor_dir_invalid: 'The anchor directory must be a full path.',
     wrong_passphrase: 'That is not the backup’s recovery passphrase.',
     not_a_backup: 'That is not an atlas-duck backup.',
+    cancelled: 'The restore was cancelled. Nothing was changed.',
+    broken: 'The backup does not verify. Nothing was changed.',
+    anchor_dir_mismatch: 'The backup does not match the anchor directory. Nothing was changed.',
+    store_newer: 'The backup was written by a newer atlas-duck.',
+    committed_incomplete: 'The restore will be completed at the next start. Restart atlas-duck.',
+    archive_first: 'The existing audit log cannot be moved aside. Archive it first.',
     other: 'The step could not be completed.',
   } as Readonly<Record<string, string>>,
   /** A refused command by error kind. */

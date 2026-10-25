@@ -9,9 +9,12 @@ import {
   instanceConfirmConfig,
   onboardingText,
   quit,
+  wizardAnchorDir,
+  wizardAnchorDirClear,
   wizardBegin,
   wizardChooseDir,
   wizardFinish,
+  wizardRestore,
   wizardSkipInstances,
   wizardState,
   wizardUseDefaultDir,
@@ -34,7 +37,7 @@ vi.mock('../shared/ipc/invoke', () => ({
   wizardBegin: vi.fn(),
   wizardSkipInstances: vi.fn(),
   wizardFinish: vi.fn(),
-  // M10 T15: the (1b) anchor-dir step and the restore (their panels' tests are Task 22's).
+  // M10 T15/T22: the (1b) anchor-dir step and the restore.
   wizardAnchorDir: vi.fn(),
   wizardAnchorDirClear: vi.fn(),
   wizardRestore: vi.fn(),
@@ -108,6 +111,9 @@ const mocks = [
   wizardBegin,
   wizardSkipInstances,
   wizardFinish,
+  wizardAnchorDir,
+  wizardAnchorDirClear,
+  wizardRestore,
 ];
 
 beforeEach(() => {
@@ -482,5 +488,150 @@ describe('Wizard', () => {
     });
     await click('Try again');
     expect(within(section).getByLabelText('Commands').textContent).toBe('second try');
+  });
+});
+
+// M10 T22 (spec 2.5 step 1b, PD-167, PD-168): the anchor-directory step, the restore alternative,
+// the previous-chain text and the pin-write retry.
+describe('Wizard (1b)', () => {
+  const anchorAt = (anchor_dir: string | null, over: Partial<WizardState> = {}) =>
+    at('anchor_dir', { anchor_dir, ...over });
+
+  it('anchor_dir_step_then_passphrase', async () => {
+    await show(anchorAt(null));
+    expect(heading()).toBe(T.anchor_heading);
+    expect(screen.getByText(T.anchor_none)).toBeTruthy();
+    // No anchor directory yet: nothing to clear.
+    expect(screen.queryByRole('button', { name: T.anchor_clear })).toBeNull();
+    answer(wizardAnchorDir, anchorAt('D:\\anchors'));
+    await click(T.anchor_choose);
+    expect(wizardAnchorDir).toHaveBeenCalledTimes(1);
+    expect(heading()).toBe(T.anchor_heading);
+    expect(screen.getByText('D:\\anchors')).toBeTruthy();
+    expect(screen.queryByText(T.anchor_none)).toBeNull();
+    // The choice can be taken back.
+    answer(wizardAnchorDirClear, anchorAt(null));
+    await click(T.anchor_clear);
+    expect(wizardAnchorDirClear).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(T.anchor_none)).toBeTruthy();
+    // Continuing is Rust's `wizard_begin`, and only then the passphrase step shows.
+    expect(wizardBegin).not.toHaveBeenCalled();
+    answer(wizardBegin, at('passphrase'));
+    await click(T.anchor_continue);
+    expect(wizardBegin).toHaveBeenCalledTimes(1);
+    expect(heading()).toBe(T.passphrase_heading);
+    expect(vi.mocked(wizardAnchorDir).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(wizardBegin).mock.invocationCallOrder[0] ?? 0,
+    );
+  });
+
+  it('a double click on Continue begins once: the passphrase step is not begun by its own button', async () => {
+    await show(anchorAt(null));
+    answer(wizardBegin, at('passphrase'));
+    const button = screen.getByRole('button', { name: T.anchor_continue });
+    await act(async () => {
+      fireEvent.click(button);
+      fireEvent.click(button);
+    });
+    await flush();
+    expect(wizardBegin).toHaveBeenCalledTimes(1);
+    // The next step's Begin is off for the cooldown, so a late second click cannot reach it.
+    const next = screen.getByRole('button', { name: T.passphrase_begin }) as HTMLButtonElement;
+    expect(next.disabled).toBe(true);
+    await click(T.passphrase_begin);
+    expect(wizardBegin).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows the anchor directory as plain text, however it is spelled', async () => {
+    await show(anchorAt('<img src=x onerror=alert(1)>\u202E'));
+    expect(document.querySelector('img')).toBeNull();
+    expect(document.querySelectorAll('[onerror]').length).toBe(0);
+    expect(screen.getByText(/<img src=x onerror=alert\(1\)>/)).toBeTruthy();
+  });
+
+  it('a refused anchor directory shows the fixed class text with the store text and stays on the step', async () => {
+    const refused = anchorAt(null, { error: { class: 'anchor_dir', text: 'The folder cannot be written.' } });
+    await show(anchorAt(null));
+    answer(wizardAnchorDir, refused);
+    await click(T.anchor_choose);
+    expect(heading()).toBe(T.anchor_heading);
+    const alert = screen.getByRole('alert').textContent ?? '';
+    expect(alert).toContain(T.errors['anchor_dir']);
+    expect(alert).toContain('The folder cannot be written.');
+  });
+
+  it('restore_alternative_visible_before_genesis', async () => {
+    const first = await show(anchorAt(null));
+    // Before any GENESIS: the restore alternative, with its explanation.
+    expect(screen.getByRole('button', { name: T.restore_offer })).toBeTruthy();
+    expect(screen.getByText(T.restore_intro)).toBeTruthy();
+    first.unmount();
+    // Once the log exists it is not offered any more.
+    for (const step of ['passphrase', 'genesis', 'recovery_note', 'instances', 'cli', 'onboarding'] as const) {
+      const view = await show(at(step));
+      expect(screen.queryByRole('button', { name: T.restore_offer }), step).toBeNull();
+      view.unmount();
+    }
+  });
+
+  it('Restore asks Rust once and shows the restore step, which collects no secret', async () => {
+    await show(anchorAt(null));
+    answer(wizardRestore, at('restore'));
+    await click(T.restore_offer);
+    expect(wizardRestore).toHaveBeenCalledTimes(1);
+    expect(heading()).toBe(T.restore_heading);
+    expect(screen.getByText(T.restore_working)).toBeTruthy();
+    expect(screen.getByText(T.restore_cancel_hint)).toBeTruthy();
+    expect(document.querySelector('input')).toBeNull();
+    expect(screen.getAllByRole('button').map((b) => b.textContent)).toEqual([T.quit]);
+  });
+
+  it('a restore that ends without a log goes back to the step with a fixed text for its class', async () => {
+    const classes = [
+      'cancelled',
+      'wrong_passphrase',
+      'not_a_backup',
+      'broken',
+      'anchor_dir_mismatch',
+      'committed_incomplete',
+      'archive_first',
+      'store_newer',
+    ];
+    for (const cls of classes) {
+      const view = await show(anchorAt(null));
+      answer(wizardRestore, anchorAt(null, { error: { class: cls, text: null } }));
+      await click(T.restore_offer);
+      const alert = screen.getByRole('alert').textContent ?? '';
+      expect(alert, cls).toBe(T.errors[cls]);
+      expect(alert, cls).not.toBe(T.errors['other']);
+      expect(T.errors[cls], cls).toBeTruthy();
+      expect(screen.getByRole('button', { name: T.restore_offer })).toBeTruthy();
+      view.unmount();
+    }
+  });
+
+  it('previous_chain_text_shown_after_genesis: Rust text as one plain text node', async () => {
+    const notice = 'The anchor directory already holds an atlas-duck log of this computer and user. <b>x</b>';
+    await show(at('recovery_note', { notice }));
+    const status = screen.getAllByRole('status').find((e) => e.textContent === notice);
+    expect(status).toBeTruthy();
+    expect(status?.querySelector('b')).toBeNull();
+    expect(screen.queryByText(T.restore_offer)).toBeNull();
+  });
+
+  it('pin_write_failure_offers_retry: Rust text, a retry through wizard_begin, a failed retry says so', async () => {
+    const text = 'Could not record this installation\u2019s id. Try again';
+    await show(at('pin_retry', { step_text: text }));
+    expect(heading()).toBe(T.pin_heading);
+    expect(screen.getByRole('alert').textContent).toBe(text);
+    answer(wizardBegin, at('pin_retry', { step_text: text, error: { class: 'pinned_write', text: null } }));
+    await click(T.pin_retry);
+    expect(wizardBegin).toHaveBeenCalledTimes(1);
+    const alerts = screen.getAllByRole('alert').map((a) => a.textContent);
+    expect(alerts).toContain(text);
+    expect(alerts).toContain(T.errors['pinned_write']);
+    answer(wizardBegin, at('recovery_note'));
+    await click(T.pin_retry);
+    expect(heading()).toBe(T.note_heading);
   });
 });

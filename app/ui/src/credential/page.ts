@@ -21,7 +21,11 @@ type Purpose =
   | 'recovery_passphrase'
   | 'unlock'
   | 'recover_this_log'
-  | 'finish_restore';
+  | 'finish_restore'
+  // M10 T22 (PD-168, PD-169): restore a backup (one passphrase, the backup's) and change the
+  // recovery passphrase (typed twice).
+  | 'restore_backup'
+  | 'change_recovery_passphrase';
 
 interface Context {
   purpose: string;
@@ -39,6 +43,16 @@ export const PURPOSE_LINE =
   'Stored tokens are never recovered (from a backup or after a keychain loss); you re-enter them. ' +
   'It is not your Atlassian password. Store it where your compliance owner can retrieve it.';
 
+/** The submit button of the passphrase windows; a PAT window says "Test and store", any other "Unlock". */
+const SUBMIT_LABELS: Readonly<Record<string, string>> = {
+  recovery_passphrase: 'Set passphrase',
+  change_recovery_passphrase: 'Change passphrase',
+  restore_backup: 'Restore',
+};
+
+/** plan text (PD-168): the one line of the `restore_backup` window, fixed here by its purpose. */
+export const RESTORE_LINE = 'Restore a backup: enter the recovery passphrase of the backup.';
+
 const TITLES: Record<Purpose, string> = {
   add_pat: 'Add token',
   replace_pat: 'Replace token',
@@ -46,6 +60,8 @@ const TITLES: Record<Purpose, string> = {
   unlock: 'Locked',
   recover_this_log: 'Recover this log',
   finish_restore: 'Finish restore',
+  restore_backup: 'Restore a backup',
+  change_recovery_passphrase: 'Change recovery passphrase',
 };
 
 const FAILURES: Record<string, string> = {
@@ -77,6 +93,20 @@ const FAILURES: Record<string, string> = {
   shutting_down: 'atlas-duck is shutting down.',
   cancelled: 'Cancelled.',
   not_ready: 'This window cannot take that now.',
+  // M10 T22: the classes of a refused passphrase change and of a refused restore.
+  passphrase_not_changed: 'The recovery passphrase was not changed.',
+  not_a_backup: 'That folder is not a backup of atlas-duck. Nothing was changed.',
+  broken: 'The backup does not verify. Nothing was changed.',
+  anchor_dir_mismatch: 'The backup does not match the anchor directory. Nothing was changed.',
+  committed_incomplete: 'Restore will be completed at the next start. Restart atlas-duck.',
+  archive_first:
+    'The locked audit log cannot be moved aside because its records cannot be read. Use "Archive old DB and start fresh" first.',
+};
+
+/** What a failed "Restore a backup instead" says: these classes are about the chosen backup. */
+const RESTORE_FAILURES: Record<string, string> = {
+  wrong_passphrase: 'This is not the recovery passphrase of that backup.',
+  store_newer: 'The backup was written by a newer atlas-duck.',
 };
 
 const REJECTIONS = new Set(['invalid_argument', 'not_ready', 'admin']);
@@ -121,11 +151,27 @@ function failureText(cls: string): string {
   return `The operation failed (${describe(cls, true).shown.slice(0, 64)}).`;
 }
 
+/** The text of a failed restore of a locked window: the backup's classes first, then the common ones. */
+function restoreFailureText(cls: string): string {
+  if (Object.hasOwn(RESTORE_FAILURES, cls)) return RESTORE_FAILURES[cls] ?? '';
+  return failureText(cls);
+}
+
 function isPat(purpose: string): boolean {
   return purpose === 'add_pat' || purpose === 'replace_pat';
 }
 
 function takesOnePassphrase(purpose: string): boolean {
+  return purpose === 'recover_this_log' || purpose === 'finish_restore' || purpose === 'restore_backup';
+}
+
+/** The windows that ask for a new passphrase twice. */
+function takesTwoPassphrases(purpose: string): boolean {
+  return purpose === 'recovery_passphrase' || purpose === 'change_recovery_passphrase';
+}
+
+/** The locked windows ("Recover this log", "Finish restore"): where a failed restore ends up. */
+function isLocked(purpose: string): boolean {
   return purpose === 'recover_this_log' || purpose === 'finish_restore';
 }
 
@@ -144,6 +190,9 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
   let done = false;
   // The recovery note was saved: the passphrase went to the wizard, so the window may be closed.
   let noteSaved = false;
+  // A failed restore whose answer came while Rust still showed `restore_backup`: it is shown when
+  // the window is back at its locked purpose (Rust sets it back right before it answers).
+  let carried: { text: string } | null = null;
   let secretField: HTMLInputElement | null = null;
   let confirmField: HTMLInputElement | null = null;
   let dateField: HTMLInputElement | null = null;
@@ -167,7 +216,7 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     const a = secretField.value;
     if (isPat(ctx.purpose)) return a.length > 0;
     if (takesOnePassphrase(ctx.purpose)) return charCount(a) >= MIN_PASSPHRASE_CHARS;
-    if (ctx.purpose === 'recovery_passphrase') {
+    if (takesTwoPassphrases(ctx.purpose)) {
       return charCount(a) >= MIN_PASSPHRASE_CHARS && confirmField !== null && a === confirmField.value;
     }
     return false;
@@ -296,7 +345,15 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     }
     if (isRecord(outcome.accepted)) {
       done = true;
-      showResult('Passphrase accepted.', true);
+      const purpose = ctx?.purpose;
+      showResult(
+        purpose === 'change_recovery_passphrase'
+          ? 'Recovery passphrase changed.'
+          : purpose === 'restore_backup'
+            ? 'Passphrase sent. The restore is running.'
+            : 'Passphrase accepted.',
+        true,
+      );
       void reload();
       return;
     }
@@ -318,7 +375,7 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
   async function submit(): Promise<void> {
     if (busy || !ctx || !secretField || !secretsValid()) return;
     const args: Record<string, unknown> = { secret: secretField.value };
-    if (confirmField && ctx.purpose === 'recovery_passphrase') args.secret_confirm = confirmField.value;
+    if (confirmField && takesTwoPassphrases(ctx.purpose)) args.secret_confirm = confirmField.value;
     if (dateField && isPat(ctx.purpose) && dateField.value !== '') args.expires_on = dateField.value;
     // Emptied before anything is awaited: the value now lives only in `args`.
     clearSecrets();
@@ -373,6 +430,48 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     }
   }
 
+  /**
+   * "Restore a backup instead" (PD-168): Rust asks its dialogs, then sets this window to
+   * `restore_backup` for the passphrase and back to the locked purpose when the restore fails. The
+   * answer is read whatever the context did meanwhile (a context change drops other answers): a
+   * failure waits for the locked purpose, a success is final.
+   */
+  async function restoreInstead(): Promise<void> {
+    if (busy) return;
+    busy = true;
+    const mine = generation;
+    refreshControls();
+    let text: string | null = null;
+    let unlocked = false;
+    try {
+      const outcome = await call('restore_from_backup');
+      if (isRecord(outcome) && isRecord(outcome.unlocked)) unlocked = true;
+      else if (isRecord(outcome) && isRecord(outcome.failed)) {
+        text = restoreFailureText(str(outcome.failed.class) ?? 'unknown');
+      } else text = 'The request could not be completed.';
+    } catch (e) {
+      text = rejectionText(e);
+    }
+    if (mine === generation) {
+      if (unlocked) {
+        done = true;
+        showResult('Unlocked.', true);
+      } else showResult(text ?? '', false);
+      busy = false;
+      refreshControls();
+      return;
+    }
+    // The context moved on: the busy flag belongs to the newer generation.
+    if (unlocked) {
+      done = true;
+      showResult('Unlocked.', true);
+    } else if (ctx !== null && isLocked(ctx.purpose)) {
+      showResult(text ?? '', false);
+    } else {
+      carried = { text: text ?? '' };
+    }
+  }
+
   function header(): HTMLElement {
     const h = el('header', 'context');
     const purpose = ctx?.purpose ?? '';
@@ -404,7 +503,12 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
         el('p', 'warning', 'Some characters above are not ordinary and are shown as escapes. Check the address before you continue.'),
       );
     }
-    if (ctx.refusedCount !== null) {
+    // The two M10 windows are not a locked state: their header is the purpose, nothing else.
+    if (
+      ctx.refusedCount !== null &&
+      ctx.purpose !== 'restore_backup' &&
+      ctx.purpose !== 'change_recovery_passphrase'
+    ) {
       const label = ctx.purpose === 'recovery_passphrase' ? 'Setup required' : 'Locked';
       h.append(el('p', 'locked', `${label} \u2014 ${ctx.refusedCount} requests refused`));
     }
@@ -417,14 +521,18 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     if (purpose === 'unlock') {
       addAction(bar, 'Retry keychain', () => void plainAction('retry_keychain'));
     }
-    if (purpose === 'recovery_passphrase' && ctx.noteAvailable) {
+    if (takesTwoPassphrases(purpose) && ctx.noteAvailable) {
       addAction(bar, 'Save recovery note', () => void plainAction('save_recovery_note'));
     }
-    if (purpose === 'recover_this_log' || purpose === 'finish_restore') {
+    if (isLocked(purpose)) {
       addAction(bar, 'Archive old DB and start fresh', () => void plainAction('archive_and_start_fresh'));
+      addAction(bar, 'Restore a backup instead', () => void restoreInstead());
     }
-    // A token window can always be cancelled; any window can be closed once its work is done.
-    if (isPat(purpose)) addClose(bar, done ? 'Close' : 'Cancel');
+    // A token, restore or passphrase-change window can always be cancelled; any window can be
+    // closed once its work is done.
+    if (isPat(purpose) || purpose === 'restore_backup' || purpose === 'change_recovery_passphrase') {
+      addClose(bar, done ? 'Close' : 'Cancel');
+    }
     else if (done || noteSaved) addClose(bar, 'Close');
     addQuit(bar);
   }
@@ -453,7 +561,7 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     const bar = el('div', 'actions');
     barEl = bar;
 
-    if (!done && (isPat(purpose) || purpose === 'recovery_passphrase' || takesOnePassphrase(purpose))) {
+    if (!done && (isPat(purpose) || takesTwoPassphrases(purpose) || takesOnePassphrase(purpose))) {
       const form = el('form', 'entry');
       form.setAttribute('autocomplete', 'off');
       form.addEventListener('submit', (ev) => {
@@ -471,9 +579,15 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
         form.append(wrap);
         dateField = date;
       } else {
+        if (purpose === 'restore_backup') form.append(el('p', 'purpose-line', RESTORE_LINE));
         form.append(el('p', 'purpose-line', PURPOSE_LINE));
-        field(form, 'Recovery passphrase', 'secret', 'off');
-        if (purpose === 'recovery_passphrase') {
+        field(
+          form,
+          purpose === 'change_recovery_passphrase' ? 'New recovery passphrase' : 'Recovery passphrase',
+          'secret',
+          'off',
+        );
+        if (takesTwoPassphrases(purpose)) {
           field(form, 'Repeat the passphrase', 'confirm', 'off');
           matchText = el('p', 'hint');
           form.append(matchText);
@@ -485,7 +599,7 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
         meterText = el('p', 'hint');
         form.append(meter, meterText);
       }
-      submitButton = el('button', 'primary', isPat(purpose) ? 'Test and store' : purpose === 'recovery_passphrase' ? 'Set passphrase' : 'Unlock');
+      submitButton = el('button', 'primary', Object.hasOwn(SUBMIT_LABELS, purpose) ? (SUBMIT_LABELS[purpose] ?? '') : isPat(purpose) ? 'Test and store' : 'Unlock');
       submitButton.type = 'submit';
       form.append(submitButton);
       root.append(form);
@@ -551,6 +665,14 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
       result = null;
       done = false;
       noteSaved = false;
+      // A failed restore answered first: back at the locked purpose it is shown; a purpose that
+      // is neither that nor `restore_backup` has nothing to show it on.
+      if (carried !== null && next !== null && isLocked(next.purpose)) {
+        result = { text: carried.text, ok: false, extra: [] };
+        carried = null;
+      } else if (next === null || next.purpose !== 'restore_backup') {
+        carried = null;
+      }
     }
     ctx = next;
     busy = false;

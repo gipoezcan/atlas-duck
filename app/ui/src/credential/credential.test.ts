@@ -2,7 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { mountCredentialPage, PURPOSE_LINE, type Deps } from './page';
+import { mountCredentialPage, PURPOSE_LINE, RESTORE_LINE, type Deps } from './page';
 import { describe as describeText } from './text';
 
 // The wire shapes are copied from src/shared/ipc/fixtures/{credential_context,submit_outcome}.json
@@ -440,8 +440,8 @@ describe('buttons per purpose', () => {
     ['recovery_passphrase', FIRST_RUN, ['Set passphrase', 'Quit atlas-duck']],
     ['recovery_passphrase+note', { ...FIRST_RUN, note_available: true }, ['Set passphrase', 'Save recovery note', 'Quit atlas-duck']],
     ['unlock', UNLOCK, ['Retry keychain', 'Quit atlas-duck']],
-    ['recover_this_log', LOCKED, ['Unlock', 'Archive old DB and start fresh', 'Quit atlas-duck']],
-    ['finish_restore', { ...LOCKED, purpose: 'finish_restore' }, ['Unlock', 'Archive old DB and start fresh', 'Quit atlas-duck']],
+    ['recover_this_log', LOCKED, ['Unlock', 'Archive old DB and start fresh', 'Restore a backup instead', 'Quit atlas-duck']],
+    ['finish_restore', { ...LOCKED, purpose: 'finish_restore' }, ['Unlock', 'Archive old DB and start fresh', 'Restore a backup instead', 'Quit atlas-duck']],
   ];
   for (const [name, ctx, expected] of cases) {
     it(`${name}`, async () => {
@@ -597,6 +597,269 @@ describe('closing the window (close_credential, T21 review I-4)', () => {
     expect(h.root.textContent).toContain('This window cannot take that now.');
     expect(h.root.textContent).not.toContain(CANARY);
     expect(h.root.querySelector('form')).not.toBeNull();
+  });
+});
+
+// M10 T22 (PD-168, PD-169): the purposes `restore_backup` and `change_recovery_passphrase`, and the
+// "Restore a backup instead" button of the keychain_lost window.
+const RESTORE = { ...LOCKED, purpose: 'restore_backup', refused_count: null };
+const CHANGE = { ...LOCKED, purpose: 'change_recovery_passphrase', refused_count: null };
+const FINISH = { ...LOCKED, purpose: 'finish_restore' };
+
+describe('restore_backup purpose (PD-168)', () => {
+  it('restore_purpose_header_text_fixed_by_rust', async () => {
+    // Whatever else the context carries, the header is the fixed text of the purpose: no instance
+    // rows, no refused count, nothing the context could use to put its own words on the page.
+    const h = await mount({ ...RESTORE, alias: '<b>work</b>', base_url: 'https://evil.example', product: 'jira' });
+    expect(h.root.querySelector('h1')?.textContent).toBe('Restore a backup');
+    const text = h.root.textContent ?? '';
+    expect(text).toContain(RESTORE_LINE);
+    expect(text).toContain(PURPOSE_LINE);
+    expect(text).not.toContain('evil.example');
+    expect(text).not.toContain('<b>');
+    expect(text).not.toContain('requests refused');
+    expect(h.root.querySelector('dl')).toBeNull();
+    expect(h.root.querySelector('b')).toBeNull();
+  });
+
+  it('takes one passphrase of at least 12 characters and sends only that', async () => {
+    const h = await mount(RESTORE);
+    expect(inputs(h.root)).toHaveLength(1);
+    const [a] = inputs(h.root) as [HTMLInputElement];
+    const submit = h.root.querySelector('button[type=submit]') as HTMLButtonElement;
+    expect(submit.textContent).toBe('Restore');
+    type(a, 'a'.repeat(11));
+    expect(submit.disabled).toBe(true);
+    submitForm(h.root);
+    expect(h.calls('submit_secret')).toEqual([]);
+    type(a, 'a'.repeat(12));
+    expect(submit.disabled).toBe(false);
+    handlers.submit_secret = () => ({ accepted: {} });
+    submitForm(h.root);
+    // emptied before the call is awaited
+    expect(a.value).toBe('');
+    await flush();
+    expect(h.calls('submit_secret')).toEqual([{ secret: 'a'.repeat(12) }]);
+    expect(h.root.textContent).toContain('Passphrase sent. The restore is running.');
+    expect(h.root.querySelector('form')).toBeNull();
+    expect(h.root.textContent).not.toContain('a'.repeat(12));
+  });
+
+  it('offers Cancel before the submit and Close after it, never a second form', async () => {
+    const h = await mount(RESTORE);
+    expect(buttons(h.root).sort()).toEqual(['Cancel', 'Quit atlas-duck', 'Restore']);
+    button(h.root, 'Cancel').click();
+    await flush();
+    expect(h.calls('close_credential')).toEqual([{}]);
+    const s = await mount(RESTORE);
+    handlers.submit_secret = () => ({ accepted: {} });
+    type(inputs(s.root)[0] as HTMLInputElement, 'p'.repeat(12));
+    submitForm(s.root);
+    await flush();
+    expect(buttons(s.root).sort()).toEqual(['Close', 'Quit atlas-duck']);
+  });
+
+  it('a rejected submit clears the field and shows a fixed text', async () => {
+    const h = await mount(RESTORE);
+    handlers.submit_secret = () => Promise.reject({ kind: 'not_ready', message: CANARY });
+    const [a] = inputs(h.root) as [HTMLInputElement];
+    type(a, CANARY + 'xxxx');
+    submitForm(h.root);
+    expect(a.value).toBe('');
+    await flush();
+    expect(h.root.textContent).toContain('This window cannot take that now.');
+    expect(h.root.textContent).not.toContain(CANARY);
+    expect(h.root.querySelector('form')).not.toBeNull();
+  });
+});
+
+describe('change_recovery_passphrase purpose (PD-169)', () => {
+  it('change_passphrase_typed_twice_fields_cleared_after_submit', async () => {
+    const h = await mount(CHANGE);
+    expect(h.root.querySelector('h1')?.textContent).toBe('Change recovery passphrase');
+    expect(h.root.textContent).toContain(PURPOSE_LINE);
+    // not first run and not locked: no count line
+    expect(h.root.textContent).not.toContain('requests refused');
+    const [a, b] = inputs(h.root) as [HTMLInputElement, HTMLInputElement];
+    expect(inputs(h.root)).toHaveLength(2);
+    const submit = h.root.querySelector('button[type=submit]') as HTMLButtonElement;
+    expect(submit.textContent).toBe('Change passphrase');
+    type(a, 'a'.repeat(12));
+    type(b, 'a'.repeat(11) + 'b');
+    expect(submit.disabled).toBe(true);
+    expect(h.root.textContent).toContain('The two passphrases differ.');
+    submitForm(h.root);
+    expect(h.calls('submit_secret')).toEqual([]);
+    type(b, 'a'.repeat(12));
+    expect(submit.disabled).toBe(false);
+    let release: (v: unknown) => void = () => undefined;
+    handlers.submit_secret = () => new Promise((r) => (release = r));
+    submitForm(h.root);
+    // both fields are empty while the call is still in flight
+    expect(a.value).toBe('');
+    expect(b.value).toBe('');
+    await flush();
+    expect(h.calls('submit_secret')).toEqual([{ secret: 'a'.repeat(12), secret_confirm: 'a'.repeat(12) }]);
+    release({ accepted: {} });
+    await flush();
+    expect(h.root.textContent).toContain('Recovery passphrase changed.');
+    expect(h.root.querySelector('form')).toBeNull();
+    expect(h.root.textContent).not.toContain('a'.repeat(12));
+  });
+
+  it('clears both fields after a refusal and after a rejection too', async () => {
+    const h = await mount(CHANGE);
+    handlers.submit_secret = () => ({ failed: { class: 'passphrase_not_changed' } });
+    const [a, b] = inputs(h.root) as [HTMLInputElement, HTMLInputElement];
+    type(a, 'b'.repeat(12));
+    type(b, 'b'.repeat(12));
+    submitForm(h.root);
+    await flush();
+    expect(a.value).toBe('');
+    expect(b.value).toBe('');
+    expect(h.root.textContent).toContain('The recovery passphrase was not changed.');
+    expect(h.root.querySelector('form')).not.toBeNull();
+    handlers.submit_secret = () => Promise.reject({ kind: 'not_ready', message: CANARY });
+    // the failure re-rendered the form: these are the new fields
+    const [a2, b2] = inputs(h.root) as [HTMLInputElement, HTMLInputElement];
+    expect(a2).not.toBe(a);
+    type(a2, 'c'.repeat(12));
+    type(b2, 'c'.repeat(12));
+    submitForm(h.root);
+    await flush();
+    expect(h.calls('submit_secret')).toHaveLength(2);
+    for (const f of inputs(h.root)) expect(f.value).toBe('');
+    expect(a2.value).toBe('');
+    expect(b2.value).toBe('');
+    expect(h.root.textContent).not.toContain(CANARY);
+  });
+
+  it('offers the recovery note once Rust says it is available and Close after the change', async () => {
+    const h = await mount(CHANGE);
+    expect(buttons(h.root).sort()).toEqual(['Cancel', 'Change passphrase', 'Quit atlas-duck']);
+    handlers.submit_secret = () => ({ accepted: {} });
+    type(inputs(h.root)[0] as HTMLInputElement, 'p'.repeat(12));
+    type(inputs(h.root)[1] as HTMLInputElement, 'p'.repeat(12));
+    ctxNow = { ...CHANGE, note_available: true };
+    submitForm(h.root);
+    await flush();
+    expect(buttons(h.root).sort()).toEqual(['Close', 'Quit atlas-duck', 'Save recovery note']);
+    handlers.save_recovery_note = () => NOTE_SAVED;
+    button(h.root, 'Save recovery note').click();
+    await flush();
+    expect(h.calls('save_recovery_note')).toEqual([{}]);
+    expect(h.root.textContent).toContain('Recovery note saved.');
+  });
+});
+
+describe('keychain_lost offers a restore (PD-168)', () => {
+  it('keychain_lost_offers_restore', async () => {
+    for (const ctx of [LOCKED, FINISH]) {
+      const h = await mount(ctx);
+      expect(buttons(h.root)).toContain('Restore a backup instead');
+    }
+    // the keychain-unavailable window has nothing to restore over: it waits for the keychain
+    const u = await mount(UNLOCK);
+    expect(buttons(u.root)).not.toContain('Restore a backup instead');
+    const h = await mount(LOCKED);
+    handlers.restore_from_backup = () => ({ unlocked: {} });
+    button(h.root, 'Restore a backup instead').click();
+    await flush();
+    expect(h.calls('restore_from_backup')).toEqual([{}]);
+    expect(h.root.textContent).toContain('Unlocked.');
+  });
+
+  it('is off while another call runs and sends one command per click', async () => {
+    const h = await mount(LOCKED);
+    handlers.restore_from_backup = () => new Promise(() => undefined);
+    const b = button(h.root, 'Restore a backup instead');
+    b.click();
+    b.click();
+    await flush();
+    expect(h.calls('restore_from_backup')).toHaveLength(1);
+    expect(b.disabled).toBe(true);
+    expect(button(h.root, 'Quit atlas-duck').disabled).toBe(false);
+  });
+
+  const failures: [string, string][] = [
+    ['cancelled', 'Cancelled.'],
+    ['wrong_passphrase', 'not the recovery passphrase of that backup'],
+    ['not_a_backup', 'not a backup of atlas-duck'],
+    ['broken', 'does not verify'],
+    ['anchor_dir_mismatch', 'does not match the anchor directory'],
+    ['committed_incomplete', 'Restore will be completed at the next start'],
+    ['archive_first', 'Archive old DB and start fresh'],
+    ['store_newer', 'newer atlas-duck'],
+  ];
+  for (const [cls, text] of failures) {
+    it(`shows the fixed text of a ${cls} restore and keeps the locked window`, async () => {
+      const h = await mount(LOCKED);
+      handlers.restore_from_backup = () => ({ failed: { class: cls } });
+      button(h.root, 'Restore a backup instead').click();
+      await flush();
+      expect(h.root.textContent).toContain(text);
+      expect(h.root.querySelector('.result.failed')).not.toBeNull();
+      expect(buttons(h.root)).toContain('Restore a backup instead');
+      expect(h.root.querySelector('form')).not.toBeNull();
+    });
+  }
+
+  it('an unknown restore failure class is shown escaped and cut, never as markup', async () => {
+    const h = await mount(LOCKED);
+    handlers.restore_from_backup = () => ({ failed: { class: '<img src=x onerror=1>' + 'z'.repeat(200) } });
+    button(h.root, 'Restore a backup instead').click();
+    await flush();
+    expect(h.root.querySelector('img')).toBeNull();
+    expect(h.root.textContent).toContain('The operation failed');
+  });
+
+  it('keeps the failure when Rust set the window to restore_backup and back while the call was running', async () => {
+    // Rust announces restore_backup (the page reloads: its own call is "overtaken"), the user
+    // enters the passphrase, the restore fails, Rust announces the locked purpose again and only
+    // then, or just before, the answer of the original call arrives.
+    for (const answerFirst of [true, false]) {
+      const h = await mount(LOCKED);
+      let release: (v: unknown) => void = () => undefined;
+      handlers.restore_from_backup = () => new Promise((r) => (release = r));
+      button(h.root, 'Restore a backup instead').click();
+      ctxNow = RESTORE;
+      h.emit();
+      await flush();
+      expect(h.root.querySelector('h1')?.textContent).toBe('Restore a backup');
+      const back = async () => {
+        ctxNow = LOCKED;
+        h.emit();
+        await flush();
+      };
+      if (answerFirst) {
+        release({ failed: { class: 'wrong_passphrase' } });
+        await flush();
+        await back();
+      } else {
+        await back();
+        release({ failed: { class: 'wrong_passphrase' } });
+        await flush();
+      }
+      expect(h.root.querySelector('h1')?.textContent).toBe('Recover this log');
+      expect(h.root.textContent).toContain('not the recovery passphrase of that backup');
+      expect(button(h.root, 'Restore a backup instead').disabled).toBe(false);
+      expect(inputs(h.root)).toHaveLength(1);
+      expect(inputs(h.root)[0]?.value).toBe('');
+    }
+  });
+
+  it('an unlocked answer that arrives after the window moved on is shown as done', async () => {
+    const h = await mount(LOCKED);
+    let release: (v: unknown) => void = () => undefined;
+    handlers.restore_from_backup = () => new Promise((r) => (release = r));
+    button(h.root, 'Restore a backup instead').click();
+    ctxNow = RESTORE;
+    h.emit();
+    await flush();
+    release({ unlocked: {} });
+    await flush();
+    expect(h.root.textContent).toContain('Unlocked.');
+    expect(h.root.querySelector('form')).toBeNull();
   });
 });
 

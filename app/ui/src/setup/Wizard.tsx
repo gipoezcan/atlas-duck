@@ -298,36 +298,41 @@ function Panel({
           </button>
         </section>
       );
-    // M10 T15: placeholder panels so the (1b) steps can be walked; Task 22 owns their UI.
+    // (1b) before GENESIS: the optional anchor directory, then the passphrase; or a restore instead.
     case 'anchor_dir':
       return (
         <section aria-label={T.anchor_heading}>
           <h2 tabIndex={-1}>{T.anchor_heading}</h2>
           <p>{T.anchor_intro}</p>
-          {state.anchor_dir === null ? null : (
-            <p>
-              {T.anchor_dir}: <Cfg value={state.anchor_dir} />
-            </p>
-          )}
+          {/* The path as Rust escaped it, shown as text; no confirmation: nothing is weakened here. */}
+          <p>
+            {state.anchor_dir === null ? (
+              T.anchor_none
+            ) : (
+              <>
+                {T.anchor_dir}: <Cfg value={state.anchor_dir} />
+              </>
+            )}
+          </p>
           <StepError error={state.error} />
           <button type="button" disabled={pending} onClick={() => step(() => wizardAnchorDir())}>
             {T.anchor_choose}
           </button>{' '}
           {state.anchor_dir === null ? null : (
-            <>
-              <button type="button" disabled={pending} onClick={() => step(() => wizardAnchorDirClear())}>
-                {T.anchor_clear}
-              </button>{' '}
-            </>
+            <button type="button" disabled={pending} onClick={() => step(() => wizardAnchorDirClear())}>
+              {T.anchor_clear}
+            </button>
           )}
+          <p>
+            {/* The cooldown keeps a double click off the passphrase step's own Begin button. */}
+            <button type="button" disabled={pending} onClick={() => step(() => wizardBegin(), { settle: true })}>
+              {T.anchor_continue}
+            </button>
+          </p>
+          <p>{T.restore_intro}</p>
           <button type="button" disabled={pending} onClick={() => step(() => wizardRestore())}>
             {T.restore_offer}
           </button>
-          <p>
-            <button type="button" disabled={pending} onClick={() => step(() => wizardBegin())}>
-              {T.passphrase_begin}
-            </button>
-          </p>
         </section>
       );
     case 'restore':
@@ -335,6 +340,7 @@ function Panel({
         <section aria-label={T.restore_heading}>
           <h2 tabIndex={-1}>{T.restore_heading}</h2>
           <p role="status">{T.restore_working}</p>
+          <p>{T.restore_cancel_hint}</p>
         </section>
       );
     case 'pin_retry':
