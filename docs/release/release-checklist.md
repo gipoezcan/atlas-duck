@@ -16,14 +16,20 @@ How to fill a row:
 - Keep the row ids unchanged and keep `|` out of the cells (the checker reads the table by its ids).
 - Every row says which build it was run on. The build id is the one in the go/no-go record.
 
-Rows owned by a release run (`CI (release run)`) are evidence from the `v*` tag run of release.yml, not
-from a branch run.
+Evidence comes from the release candidate R, the commit named in the go/no-go record: run URLs are runs of
+R (a release-candidate `v*` tag run or the branch runs for that commit). The tagged commit is R plus a
+docs-only change, checked by the gate. Rows whose evidence exists only in the tag run itself (signing
+verification, install probes of the signed packages) are not filled with a URL: their Result is
+`verified by job <name> in the tag run`, accepted only for `release-signing-verification`,
+`release-secrets-present`, `windows-extra-exes-signed`, `macos-dmg-spctl` and `install-probes-run-id`,
+with the job named in the row's text. Each of those jobs is in `upload`'s needs, so a red job blocks
+the upload. Owner `CI (release run)` marks them.
 
 ## 1. CI and release pipeline
 
 | ID | Item | Owner | Evidence | Result |
 |----|------|-------|----------|--------|
-| ci-green-release-commit | CI green on the release commit: URLs of the `ci`, `bundle`, `e2e-bundle` and `install-probes` runs for that exact commit (all legs, including Rosetta, the Windows and Linux e2e legs and GitLab). | CI (release run) | | PENDING |
+| ci-green-release-commit | CI green on the release commit: URLs of the `ci`, `bundle`, `e2e-bundle` and `install-probes` runs for that exact commit (all legs, including Rosetta, the Windows and Linux e2e legs and GitLab), runs of R. | CI (release run) | | PENDING |
 | release-signing-verification | Release pipeline signing verification output: `release-verify-windows` (signtool verify /pa /v) and `release-verify-macos` for both arches (codesign deep strict, hardened runtime, no get-task-allow, spctl, stapler), pasted or linked from the tag run. | CI (release run) | | PENDING |
 | release-secrets-present | T26 first release run: the guard step passed, so all nine signing secrets are present in the `release` environment (Q1 to Q3). The run must show the guard step green, not skipped. | unassigned (Q7) | | PENDING |
 | release-env-tags-only | T26 first release run: the `release` GitHub environment is limited to `v*` tags (Settings, Environments, deployment branches and tags), and a run from a branch cannot read its secrets. | unassigned (Q7) | | PENDING |

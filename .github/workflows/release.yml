@@ -118,11 +118,11 @@ jobs:
       actions: read
 
   # Task 33: the go/no-go gate. Secret-free (no environment, read-only token). It is red until a human
-  # fills docs/release/go-no-go-v1.md (verdict GO, this commit, build id, date, the named reviewer, Q7)
-  # and every row of docs/release/release-checklist.md; `upload` waits for it. The checker is not a
+  # fills docs/release/go-no-go-v1.md (verdict GO, the release-candidate commit R, build id, date, the named reviewer, Q7)
+  # and every row of docs/release/release-checklist.md; `upload` waits for it. R must be an ancestor of this commit with only those two docs changed. The checker is not a
   # ci.yml step for that reason; only its .test.mjs runs there.
   release-go-no-go:
-    name: release-go-no-go (record and checklist for this commit)
+    name: release-go-no-go (record and checklist, R to this commit)
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     steps:
@@ -130,6 +130,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0 # the gate runs git merge-base and git diff between R and this commit
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0

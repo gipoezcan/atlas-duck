@@ -4,11 +4,18 @@ M10 Task 33. Read by `ci/check-release-go-no-go.mjs` in release.yml's `release-g
 with `docs/release/release-checklist.md`. The checker is red on this file until the fields below are
 filled by a human. That is intended: it keeps `upload` blocked.
 
-Before the release run, a human fills the Decision section (verdict `GO`, the release commit, the
-build id, the date and the named reviewer), turns every open item below into a `[resolved]` line with
-the answer, and the checklist rows are all `PASS` or `N/A: <reason>`. The commit must be the commit of
-the `v*` tag; the checker compares it with `GITHUB_SHA`. Because the record lives in the tagged commit,
-the tag is cut on the commit that already contains the filled record.
+Before tagging, a human fills the Decision section (verdict `GO`, the release-candidate commit R, the
+build id, the date and the named reviewer), turns every open item below into a resolved line with the
+answer, and every checklist row is `PASS`, `N/A: <reason>` or (tag-run rows only) `verified by job <name>
+in the tag run`.
+
+`commit` is R: the commit whose CI and manual evidence the checklist cites (the run URLs are runs of R).
+A file cannot contain the hash of its own commit, so the tagged commit is R plus a docs-only change: the
+checker (given `--commit $GITHUB_SHA`) requires that R is an ancestor of the tagged commit and that
+`git diff --name-only R <tagged commit>` lists only `docs/release/go-no-go-v1.md` and
+`docs/release/release-checklist.md`. `docs/release/` is not bundled into any package, so the tagged
+commit builds source-identical to R. The tag run builds and ships the tagged commit, and its own jobs
+re-verify the signed packages (rows marked as tag-run rows in the checklist).
 
 ## Decision
 
@@ -23,8 +30,14 @@ checker fails while it is empty or holds a placeholder such as `none`, `n/a` or 
 
 ## Open items
 
-Human decisions (the plan's section "Human decisions (Q1-Q7, Q13)") and recorded gaps. Each line is
-`- [open] <id>: <text>`. A `GO` record has no `[open]` line.
+Human decisions (the plan's section "Human decisions (Q1-Q7, Q13)") and recorded gaps. Each list item
+has the form below. The checker fails a GO record that has any line with the open marker, in any list
+form and under any heading, and a resolved item must carry its answer.
+
+```
+- [open] <id>: <text>
+- [resolved] <id>: <the answer>
+```
 
 - [open] Q1: Windows Authenticode identity: certificate type and provider (OV or EV PFX, cloud HSM, Azure Trusted Signing or another service), who holds it, the timestamp server URL, whether EV and SmartScreen reputation matter for the first release. Long lead time. Blocks the first release run and the "signing verification" row.
 - [open] Q2: macOS Developer ID: the Developer ID Application identity name and Team ID, and who owns the Apple Developer account. Long lead time. Blocks the first release run and the I-45 row on the signed `.app`.

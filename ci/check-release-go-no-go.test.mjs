@@ -6,7 +6,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { REQUIRED_OPEN_ITEMS, REQUIRED_ROWS, check, checkChecklist } from "./check-release-go-no-go.mjs";
+import { REQUIRED_OPEN_ITEMS, REQUIRED_ROWS, TAG_RUN_ROWS, check, checkChecklist } from "./check-release-go-no-go.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, "..");
@@ -17,7 +17,7 @@ const OTHER_SHA = "fedcba9876543210fedcba9876543210fedcba98";
 // ----------------------------------------------------------- fixture builders (synthetic data)
 
 function validRecord(over = {}) {
-  const o = { verdict: "GO", sha: SHA, build: "1.0.0+build.7", date: "2026-11-02", reviewer: "A. Reviewer", status: "resolved", ...over };
+  const o = { verdict: "GO", sha: SHA, build: "1.0.0+build.7", date: "2026-11-02", reviewer: "Alex Doe", status: "resolved", ...over };
   const lines = ["# v1 go/no-go record", "", "## Decision", ""];
   lines.push(`- verdict: ${o.verdict}`, `- commit: \`${o.sha}\``, `- build id: ${o.build}`, `- date: ${o.date}`, `- reviewed by: ${o.reviewer}`, "");
   lines.push("## Open items", "");
@@ -45,8 +45,39 @@ const has = (violations, needle) => violations.some((v) => v.includes(needle));
 
 // -------------------------------------------------------------------- the record
 
+// A fake git: R = SHA is the release candidate, TIP the tagged commit.
+const TIP = OTHER_SHA;
+const fakeGit = ({ ancestor = true, diff = ["docs/release/go-no-go-v1.md", "docs/release/release-checklist.md"], fail = false } = {}) => (args) => {
+  if (fail) return { status: null, stdout: "", error: "spawn failed" };
+  if (args[0] === "merge-base") return { status: ancestor ? 0 : 1, stdout: "" };
+  if (args[0] === "diff") return { status: 0, stdout: diff.join("\n") + (diff.length ? "\n" : "") };
+  return { status: 2, stdout: "" };
+};
+
 test("a complete GO record passes", () => {
-  assert.deepEqual(check(validRecord(), { commit: SHA }), []);
+  assert.deepEqual(check(validRecord()), []);
+  assert.deepEqual(check(validRecord(), { commit: TIP, git: fakeGit() }), []);
+});
+
+test("C-1: R must be an ancestor of the release commit", () => {
+  assert.ok(has(check(validRecord(), { commit: TIP, git: fakeGit({ ancestor: false }) }), "ancestor"));
+});
+
+test("C-1: only the two release docs may differ between R and the release commit", () => {
+  const v = check(validRecord(), { commit: TIP, git: fakeGit({ diff: ["docs/release/go-no-go-v1.md", "app/src/main.rs"] }) });
+  assert.ok(has(v, "app/src/main.rs"));
+  assert.deepEqual(check(validRecord(), { commit: TIP, git: fakeGit({ diff: [] }) }), []);
+  assert.deepEqual(check(validRecord(), { commit: TIP, git: fakeGit({ diff: ["docs/release/release-checklist.md"] }) }), []);
+});
+
+test("C-1: the record cannot name the release commit itself", () => {
+  assert.ok(has(check(validRecord(), { commit: SHA, git: fakeGit() }), "release-candidate"));
+});
+
+test("C-1: git failures and a missing git fail closed", () => {
+  assert.ok(has(check(validRecord(), { commit: TIP, git: fakeGit({ fail: true }) }), "git"));
+  assert.ok(has(check(validRecord(), { commit: TIP }), "git"));
+  assert.ok(has(check(validRecord(), { commit: "--upload-pack=x", git: fakeGit() }), "not a 40"));
 });
 
 test("the required ids cover Q1-Q7, Q13 and the three named gaps", () => {
@@ -83,9 +114,39 @@ test("a bad commit sha fails", () => {
   assert.ok(has(check(validRecord({ sha: SHA.toUpperCase() })), "commit"));
 });
 
-test("the commit must equal the commit under release", () => {
-  assert.ok(has(check(validRecord(), { commit: OTHER_SHA }), "release commit"));
-  assert.deepEqual(check(validRecord(), { commit: SHA.toUpperCase() }), []);
+test("I-1: reviewer placeholders are rejected anywhere in the value", () => {
+  for (const r of ["unassigned (Q7)", "none yet", "pending Q7", "n/a (Q7)", "x", "Q7", "Name TBD", "to be named by Q7", "unknown person"]) {
+    assert.ok(has(check(validRecord({ reviewer: r })), "reviewed by"), r);
+  }
+});
+
+test("I-2: open items hide nowhere", () => {
+  for (const extra of ["* [open] Q9: x text", "+ [open] Q9: x text", "1. [open] Q9: x text", "2) [open] Q9: x text", "[OPEN] free line", "- [open] Q9: x text"]) {
+    assert.ok(has(check(validRecord({ extraBullet: extra })), "[open]"), extra);
+  }
+  const sub = validRecord().replace("## Open items\n", "## Open items\n\n### Later\n\n- [open] Q9: hidden under a subheading\n");
+  assert.ok(has(check(sub), "[open]"));
+  const elsewhere = validRecord() + "\n## Notes\n\nStill [open] somewhere.\n";
+  assert.ok(has(check(elsewhere), "[open]"));
+  const fenced = validRecord() + "\n```\n- [open] Q9: example in a code block\n```\n";
+  assert.deepEqual(check(fenced), []);
+});
+
+test("I-2: list items under Open items need a state and an id, in any list form", () => {
+  assert.ok(has(check(validRecord({ extraBullet: "* Q9: no state" })), "[open] or [resolved]"));
+  assert.ok(has(check(validRecord({ extraBullet: "1. Q9: no state" })), "[open] or [resolved]"));
+  assert.deepEqual(check(validRecord({ extraBullet: "* [resolved] Q9: answered with a real text" })), []);
+});
+
+test("M-4: build id placeholder and impossible dates fail", () => {
+  assert.ok(has(check(validRecord({ build: "none" })), "build id"));
+  assert.ok(has(check(validRecord({ build: "n/a" })), "build id"));
+  assert.ok(has(check(validRecord({ date: "2026-13-45" })), "date"));
+  assert.ok(has(check(validRecord({ date: "2026-02-30" })), "date"));
+});
+
+test("M-5: a resolved item carries its answer", () => {
+  assert.ok(has(check(validRecord({ extraBullet: "- [resolved] Q9:" })), "answer"));
 });
 
 test("an empty build id fails", () => {
@@ -178,10 +239,12 @@ test("CLI: exit 0 for a valid record and checklist, 1 for violations, 2 for usag
     const chk = join(dir, "chk.md");
     writeFileSync(rec, validRecord());
     writeFileSync(chk, validChecklist());
-    assert.equal(run([rec, "--checklist", chk, "--commit", SHA]).status, 0);
+    assert.equal(run([rec, "--checklist", chk]).status, 0);
+    // the record names SHA, which is no commit of this repository: the git calls fail closed
     const bad = run([rec, "--checklist", chk, "--commit", OTHER_SHA]);
     assert.equal(bad.status, 1);
-    assert.match(bad.stdout, /release commit/);
+    assert.match(bad.stdout, /ancestor|git/);
+    assert.equal(run([rec, "--checklist", chk, "--commit", "not-a-sha"]).status, 1);
     writeFileSync(rec, validRecord({ reviewer: "" }));
     assert.equal(run([rec]).status, 1);
     assert.equal(run([]).status, 2);
@@ -230,4 +293,63 @@ test("the committed record lists every required open item and is red only for hu
   for (const id of REQUIRED_OPEN_ITEMS) assert.ok(!has(v, `open item ${id}: missing`), id);
   assert.ok(has(v, "reviewed by"), "the reviewer stays unfilled until Q7");
   assert.ok(v.length > 0, "the checker is red on the real file until Q7 names the reviewer");
+});
+
+// ------------------------------------------------- fix round 1: tag-run rows, shapes, wiring
+
+test("C-1: tag-run rows accept 'verified by job <name> in the tag run' for their own jobs only", () => {
+  assert.ok(Object.keys(TAG_RUN_ROWS).length >= 5);
+  for (const [id, jobs] of Object.entries(TAG_RUN_ROWS)) {
+    assert.ok(REQUIRED_ROWS.includes(id), id);
+    for (const job of jobs) {
+      const rows = { [id]: { result: `verified by job ${job} in the tag run`, evidence: "" } };
+      assert.deepEqual(checkChecklist(validChecklist({ rows })), [], `${id} ${job}`);
+    }
+    const wrong = { [id]: { result: "verified by job bundle-x in the tag run", evidence: "" } };
+    assert.ok(has(checkChecklist(validChecklist({ rows: wrong })), id), `${id} wrong job`);
+  }
+  const other = REQUIRED_ROWS.find((id) => !(id in TAG_RUN_ROWS));
+  assert.ok(has(checkChecklist(validChecklist({ rows: { [other]: { result: "verified by job upload in the tag run", evidence: "" } } })), other));
+});
+
+test("C-1: every tag-run job is a job of release.yml and in upload's needs", () => {
+  const yml = readFileSync(join(REPO, ".github/workflows/release.yml"), "utf8");
+  const needs = /upload:[\s\S]*?needs: \[([^\]]*)\]/.exec(yml)[1].split(",").map((s) => s.trim());
+  for (const jobs of Object.values(TAG_RUN_ROWS)) {
+    for (const job of jobs) assert.ok(needs.includes(job), job);
+  }
+});
+
+test("C-1: the gate job checks out the full history", () => {
+  const yml = readFileSync(join(REPO, ".github/workflows/release.yml"), "utf8");
+  const job = yml.slice(yml.indexOf("\n  release-go-no-go:"));
+  assert.match(job.slice(0, job.indexOf("Set up Node.js")), /fetch-depth: 0/);
+});
+
+test("I-1: owner placeholders are rejected anywhere in the value", () => {
+  const id = REQUIRED_ROWS[5];
+  for (const owner of ["none yet", "pending Q7", "TBD (lead)", "x", "n/a", "unassigned"]) {
+    assert.ok(has(checkChecklist(validChecklist({ rows: { [id]: { owner } } })), id), owner);
+  }
+  assert.deepEqual(checkChecklist(validChecklist({ rows: { [id]: { owner: "macOS tester (Sam Roe)" } } })), []);
+});
+
+test("M-2: PASS evidence is a URL or a file name", () => {
+  const id = REQUIRED_ROWS[6];
+  for (const evidence of ["x", "ok", "see above", "done"]) {
+    assert.ok(has(checkChecklist(validChecklist({ rows: { [id]: { evidence } } })), id), evidence);
+  }
+  assert.deepEqual(checkChecklist(validChecklist({ rows: { [id]: { evidence: "evidence-macos-arm64.zip" } } })), []);
+});
+
+test("M-3: a row with other than five cells fails", () => {
+  const text = validChecklist() + `| ${REQUIRED_ROWS[0]} | item | owner | https://a.example/b | PASS | PENDING |\n`;
+  assert.ok(has(checkChecklist(text), "5 cells"));
+});
+
+test("M-1: N/A reasons that are placeholders fail", () => {
+  const id = REQUIRED_ROWS[7];
+  for (const result of ["N/A: ...", "N/A: n/a", "N/A: tbd", "N/A: x"]) {
+    assert.ok(has(checkChecklist(validChecklist({ rows: { [id]: { result } } })), id), result);
+  }
 });
