@@ -658,28 +658,57 @@ mod t21 {
         read_text(&repo_root().join("ci").join(name))
     }
 
+    /// The seven probe jobs (T21), in order. M10 Task 27 adds one `install-test-<probe>` job per
+    /// probe job after them, each `needs:` its probe job.
+    const PROBE_JOBS: [&str; 7] = [
+        "windows-per-user",
+        "windows-per-machine",
+        "macos-arm64",
+        "macos-x86_64-rosetta",
+        "ubuntu-deb",
+        "ubuntu-appimage",
+        "fedora-rpm",
+    ];
+    /// Every job of install-probes.yml: the probes and the install tests.
+    const ALL_JOBS: usize = 2 * PROBE_JOBS.len();
+
+    fn is_job_key(l: &str) -> bool {
+        l.starts_with("  ") && !l.starts_with("   ") && l.trim_end().ends_with(':')
+    }
+
+    fn job_ids(text: &str) -> Vec<&str> {
+        text.lines()
+            .skip_while(|l| *l != "jobs:")
+            .skip(1)
+            .filter(|l| is_job_key(l))
+            .map(|l| l.trim().trim_end_matches(':'))
+            .collect()
+    }
+
+    /// The lines of job `id` (after its key line, up to the next job key).
+    fn job_block<'a>(text: &'a str, id: &str) -> Vec<&'a str> {
+        let key = format!("  {id}:");
+        text.lines()
+            .skip_while(|l| *l != key)
+            .skip(1)
+            .take_while(|l| !is_job_key(l))
+            .collect()
+    }
+
     #[test]
     fn install_probes_workflow_defines_the_seven_jobs_in_order() {
         let text = workflow();
-        let jobs: Vec<&str> = text
-            .lines()
-            .skip_while(|l| *l != "jobs:")
-            .skip(1)
-            .filter(|l| l.starts_with("  ") && !l.starts_with("   ") && l.trim_end().ends_with(':'))
-            .map(|l| l.trim().trim_end_matches(':'))
-            .collect();
-        assert_eq!(
-            jobs,
-            [
-                "windows-per-user",
-                "windows-per-machine",
-                "macos-arm64",
-                "macos-x86_64-rosetta",
-                "ubuntu-deb",
-                "ubuntu-appimage",
-                "fedora-rpm",
-            ]
-        );
+        let mut want: Vec<String> = PROBE_JOBS.iter().map(|j| (*j).to_owned()).collect();
+        want.extend(PROBE_JOBS.iter().map(|j| format!("install-test-{j}")));
+        assert_eq!(job_ids(&text), want);
+        // M10 Task 27: each install test runs after (needs) the probe job of its package.
+        for probe in PROBE_JOBS {
+            let block = job_block(&text, &format!("install-test-{probe}"));
+            assert!(
+                block.iter().any(|l| l.trim() == format!("needs: {probe}")),
+                "install-test-{probe} does not need {probe}"
+            );
+        }
     }
 
     #[test]
@@ -739,14 +768,41 @@ mod t21 {
         // is used, forks are skipped and the token is read-only.
         let text = workflow();
         let checkouts = text.matches("uses: actions/checkout@").count();
-        assert_eq!(checkouts, 7, "one checkout per job");
+        assert_eq!(checkouts, ALL_JOBS, "one checkout per job");
         assert_eq!(
             text.matches("ref: ${{ github.event.workflow_run.head_sha || inputs.bundle_sha }}")
                 .count(),
-            7,
+            ALL_JOBS,
             "every checkout must be pinned to the bundle run's head sha"
         );
-        assert_eq!(text.matches("persist-credentials: false").count(), 7);
+        assert_eq!(text.matches("persist-credentials: false").count(), ALL_JOBS);
+        // per job, not only in total (M10 Task 27: the install tests too)
+        for id in job_ids(&text) {
+            let block = job_block(&text, id).join(
+                "
+",
+            );
+            assert_eq!(
+                block.matches("uses: actions/checkout@").count(),
+                1,
+                "{id}: one checkout"
+            );
+            assert!(
+                block.contains(
+                    "ref: ${{ github.event.workflow_run.head_sha || inputs.bundle_sha }}"
+                ),
+                "{id}: checkout not pinned to the bundled commit"
+            );
+            assert!(
+                block.contains("persist-credentials: false"),
+                "{id}: credentials persisted"
+            );
+            assert!(
+                block.contains("- name: Cross-check bundle_run_id and bundle_sha"),
+                "{id}: no cross-check of the manual inputs"
+            );
+            assert!(!block.contains("secrets."), "{id} uses a secret");
+        }
         assert!(
             text.contains("bundle_sha:"),
             "a manual run must name the bundled commit"
@@ -769,7 +825,7 @@ mod t21 {
         assert_eq!(
             text.matches("- name: Cross-check bundle_run_id and bundle_sha")
                 .count(),
-            7,
+            ALL_JOBS,
             "one cross-check per job"
         );
         for needle in [
@@ -785,7 +841,7 @@ mod t21 {
         ] {
             assert_eq!(
                 text.matches(needle).count(),
-                7,
+                ALL_JOBS,
                 "{needle} must appear once per job"
             );
         }
@@ -802,14 +858,19 @@ mod t21 {
                     || line.contains("ref: ${{")
                     || line.contains("run-id: ${{")
                     || line.contains("bundle_sha:")
-                    || line.contains("bundle_run_id:"),
-                "an input is interpolated outside env, ref or run-id: {line}"
+                    || line.contains("bundle_run_id:")
+                    // M10 Task 26 (workflow_call): a job-level `if:` compares the input inside an
+                    // Actions expression; nothing is interpolated into a shell there.
+                    || (line.trim_start().starts_with("if: ")
+                        && !line.contains("${{")
+                        && !line.contains("run:")),
+                "an input is interpolated outside env, ref, run-id or a job if: {line}"
             );
         }
         assert_eq!(
             text.matches("if: github.event_name == 'workflow_dispatch'\n        shell: bash")
                 .count(),
-            7
+            ALL_JOBS
         );
     }
 
