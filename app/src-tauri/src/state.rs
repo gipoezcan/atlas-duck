@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use atlas_duck_audit::lock::InstanceLock;
+use atlas_duck_core::StoreHealthView;
 use atlas_duck_ipc::paths::LocalDataDir;
 use atlas_duck_ipc::server::ShutdownSignal;
 use atlas_duck_sandbox_host::probe::{FloorVerdict, ProbeReport};
@@ -69,6 +70,23 @@ pub struct AppState {
     pending: AtomicU32,
     /// The no-tray-host hint was shown (§2.5: dismissal is UI state, in memory, not audited).
     tray_hint_shown: AtomicBool,
+    /// The last store-health snapshot the app read from the core (`StoreHealthView`: the very view
+    /// Settings and the header's status lines are built from), for the tray: it is built on the main
+    /// thread, which must not wait on the store. Filled by [`crate::status::note_health`] wherever
+    /// the app reads the health; `None` while no core serves.
+    health: Mutex<Option<StoreHealthView>>,
+    /// Rebuilds the tray menu and tooltip; registered by `setup` once the tray exists (the status
+    /// code is generic over the runtime, the tray is not).
+    tray_refresh: OnceLock<TrayRefresh>,
+}
+
+/// What [`AppState::set_tray_refresh`] holds.
+struct TrayRefresh(Box<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for TrayRefresh {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TrayRefresh")
+    }
 }
 
 impl AppState {
@@ -81,7 +99,37 @@ impl AppState {
             startup_text: None,
             pending: AtomicU32::new(0),
             tray_hint_shown: AtomicBool::new(false),
+            health: Mutex::new(None),
+            tray_refresh: OnceLock::new(),
         }
+    }
+
+    /// Registers the tray rebuild ([`AppState::refresh_tray`]); the first registration wins.
+    pub fn set_tray_refresh(&self, f: impl Fn() + Send + Sync + 'static) {
+        let _ = self.tray_refresh.set(TrayRefresh(Box::new(f)));
+    }
+
+    /// Rebuilds the tray menu and tooltip from the current state; nothing before the tray exists.
+    pub fn refresh_tray(&self) {
+        if let Some(f) = self.tray_refresh.get() {
+            (f.0)();
+        }
+    }
+
+    /// The cached store-health snapshot (a copy; a short lock, never the store).
+    pub fn health(&self) -> Option<StoreHealthView> {
+        self.health
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replaces the cached snapshot; true when it differs from the one it replaces.
+    pub fn set_health(&self, h: Option<StoreHealthView>) -> bool {
+        let mut slot = self.health.lock().unwrap_or_else(PoisonError::into_inner);
+        let changed = *slot != h;
+        *slot = h;
+        changed
     }
 
     /// The startup error text of this state (the same app-generated text the tray shows).
@@ -246,6 +294,40 @@ impl ServeSlot {
 mod tests {
     use super::*;
     use crate::tray_host::TrayHost;
+
+    /// T36b item 1: the store-health snapshot the tray reads. Empty at start, replaced as a whole,
+    /// and `set_health` says whether it changed (so a refresh only follows a real change).
+    #[test]
+    fn app_state_caches_the_store_health_snapshot() {
+        use atlas_duck_core::StoreHealthView;
+        let state = AppState::new(StartupSummary::Ready, None);
+        assert_eq!(state.health(), None);
+        let mut h = StoreHealthView {
+            storage_low: false,
+            anchor_write_failing: false,
+            anchor_thread_dead: false,
+            anchors_blocked: false,
+            open_incidents: 0,
+            prune_backlog_days: 0,
+            prune_backlog: None,
+            last_prune_failed: false,
+            shred_checkpoint_pending: false,
+            settings_unreadable: false,
+            anchor_dir_write_failing: false,
+            anchor_dir_lines_pending: 0,
+            anchors_missing: None,
+            re_anchor_offered: false,
+        };
+        assert!(state.set_health(Some(h.clone())), "None -> Some changes");
+        assert_eq!(state.health(), Some(h.clone()));
+        assert!(!state.set_health(Some(h.clone())), "the same snapshot");
+        h.storage_low = true;
+        assert!(state.set_health(Some(h.clone())));
+        assert_eq!(state.health(), Some(h));
+        assert!(state.set_health(None), "cleared");
+        assert!(!state.set_health(None));
+        assert_eq!(state.health(), None);
+    }
 
     #[test]
     fn app_state_holds_the_tray_host_result() {

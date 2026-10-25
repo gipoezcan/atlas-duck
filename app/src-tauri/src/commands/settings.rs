@@ -890,13 +890,17 @@ pub async fn settings_get<R: Runtime>(
     let response = match core(&app) {
         Ok(core) => {
             let (settings, instances) = (core.settings(), core.instances());
+            let noted = app.clone();
             // Reads the registry or the file system, and the settings view: the blocking pool.
             blocking(move || {
                 let cli = cli_state();
                 // Δ8: the setting is core's run policy as the glue reads it at each call.
                 let confinement =
                     ConfinementDto::of_probe(report.as_ref(), core.script_policy().allow_degraded);
-                Ok(settings_get_dto(&*settings, &*instances, confinement, cli))
+                let got = settings_get_dto(&*settings, &*instances, confinement, cli);
+                // T36b: the view's health is the freshest read there is; the tray follows it.
+                crate::status::note_health(&noted, Some(got.settings.health.clone()));
+                Ok(got)
             })
             .await
         }

@@ -2030,6 +2030,8 @@ pub fn start(
             Ok(state) => {
                 if let Some(slot) = handle.try_state::<ServeSlot>() {
                     slot.set(state);
+                    // T36b: the tray's store-health lines follow the core's health from here on.
+                    crate::status::spawn_health_ticker(handle.clone(), crate::status::HEALTH_TICK);
                 }
             }
             Err(StartupFailure::Store(_)) => {

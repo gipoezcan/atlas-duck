@@ -6,6 +6,8 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+use std::sync::Arc;
+
 use atlas_duck_core::reconcile::LINE_CHECK_TARGET;
 use atlas_duck_core::{ConfigBanner, Core, GateState, RunPolicy, StoreHealthView};
 use atlas_duck_preview::invisible::escape_for_display;
@@ -336,26 +338,88 @@ pub fn lines(i: &StatusInputs) -> Vec<StatusLineDto> {
 /// there is nothing to report.
 pub fn gather<R: Runtime>(app: &AppHandle<R>) -> StatusInputs {
     let mut i = gather_gate(app);
-    let core = app.try_state::<ServeSlot>().and_then(|slot| {
-        if slot.quit().0.is_cancelled() {
-            return None;
-        }
-        slot.get().and_then(|s| s.core.get().cloned())
-    });
-    if let Some(core) = core {
+    if let Some(core) = serving_core(app) {
         gather_core(&mut i, &core);
+        // The header's read is the freshest one there is: the tray follows it.
+        note_health(app, i.health.clone());
         if let Some(state) = app.try_state::<AppState>() {
             // Reads the core's settings view: [`gather`] runs on the blocking pool.
             gather_scripts(&mut i, &state, core.script_policy());
         }
+    } else {
+        // No serving core (locked, starting, quitting): there is no health to show, and the
+        // snapshot of an earlier core is not it.
+        i.health = None;
+        note_health(app, None);
     }
     i
+}
+
+/// Records the store health the app just read from the core (`None`: no core serves) in the
+/// snapshot the tray shows ([`AppState::health`]). When it differs from the one before, the tray
+/// rebuilds (menu and tooltip); true then. Takes the view the caller already holds: nothing here
+/// reads the store.
+pub fn note_health<R: Runtime>(app: &AppHandle<R>, health: Option<StoreHealthView>) -> bool {
+    let Some(state) = app.try_state::<AppState>() else {
+        return false;
+    };
+    let changed = state.set_health(health);
+    if changed {
+        state.refresh_tray();
+    }
+    changed
+}
+
+/// The serving `Core`, if there is one and the app is not quitting.
+fn serving_core<R: Runtime>(app: &AppHandle<R>) -> Option<Arc<Core>> {
+    app.try_state::<ServeSlot>().and_then(|slot| {
+        if slot.quit().0.is_cancelled() {
+            return None;
+        }
+        slot.get().and_then(|s| s.core.get().cloned())
+    })
+}
+
+/// Reads the store health from the serving core (`None` when none serves) into the tray's
+/// snapshot ([`note_health`]). Synchronous core call: the blocking pool.
+pub fn refresh_health<R: Runtime>(app: &AppHandle<R>) {
+    let health = serving_core(app).map(|core| core.settings().view().health);
+    note_health(app, health);
+}
+
+/// How often the app re-reads the store health for the tray while it runs.
+pub const HEALTH_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Nothing in a window tells the tray the store's health changed (an anchor write that starts
+/// failing, storage running low), so this re-reads it at once and then every `period` on the
+/// blocking pool, until the quit signal. The tray thread never waits on the store: it only reads the snapshot.
+pub fn spawn_health_ticker<R: Runtime>(
+    app: AppHandle<R>,
+    period: std::time::Duration,
+) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
+        let Some(quit) = app.try_state::<ServeSlot>().map(|s| s.quit().0.clone()) else {
+            return;
+        };
+        // A first read at once (serving just started), then one per period.
+        loop {
+            let tick = app.clone();
+            let _ = tauri::async_runtime::spawn_blocking(move || refresh_health(&tick)).await;
+            tokio::select! {
+                () = quit.cancelled() => return,
+                () = tokio::time::sleep(period) => {}
+            }
+        }
+    })
 }
 
 /// The part of [`gather_gate`] that reads `AppState`: the flag the script glue sets when it finds
 /// the sandbox binary replaced since the probe (PD-133, `updated_restart`). A flag, no core.
 pub fn gather_app_state(i: &mut StatusInputs, state: &AppState) {
     i.update_pending = state.update_pending();
+    // T36b: the tray's store-health lines come from the snapshot [`note_health`] keeps (no core,
+    // no store read); [`gather`] replaces it with the core's own read.
+    i.health = state.health();
 }
 
 /// `scripts_degraded` (PD-141): the startup probe's report is `NotMet` and the run policy allows

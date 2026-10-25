@@ -275,6 +275,15 @@ pub fn run_gui(background: bool) -> ! {
             // The tray is built in every startup state; in the four error states it also shows
             // the startup message (§7.7). A failure is logged and startup continues (§15 V33).
             tray::build_tray_or_log(app.handle());
+            // T36b: a change of the store-health snapshot rebuilds the tray menu and tooltip.
+            if let Some(state) = app.try_state::<AppState>() {
+                let handle = app.handle().clone();
+                state.set_tray_refresh(move || {
+                    if handle.tray_by_id(tray::TRAY_ID).is_some() {
+                        tray::refresh(&handle);
+                    }
+                });
+            }
             // §2.5: no tray host (Linux) → the one-time hint naming the GNOME extension.
             windows::show_no_tray_host_hint(app.handle());
             // §2.5 First run: the cold start opens the wizard (the setup window) at once.

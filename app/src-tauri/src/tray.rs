@@ -107,10 +107,11 @@ impl MenuEntry {
 
 /// The PD-90 status lines the tray shows (the others need the core and live in the Approvals
 /// header): `locked_refused`, `setup_refused`, `waiting_keyring`, `updated_restart` (the glue's
-/// flag lives in `AppState`, M8 Task 21), `store_newer`, `ipc_not_accepting`, `keychain_prompt`.
+/// flag lives in `AppState`, M8 Task 21), `store_newer`, `ipc_not_accepting`, `keychain_prompt`, and
+/// the store-health lines of [`TRAY_HEALTH_LINE_IDS`] (T36b, §8.5: Settings and the tray).
 /// Their text is `status::lines`' (§2.5 verbatim for the first three). `scripts_degraded` is not
 /// here: it needs the core's setting, and the menu is built on the main thread without a core call.
-pub const TRAY_LINE_IDS: [&str; 7] = [
+pub const TRAY_LINE_IDS: [&str; 12] = [
     "locked_refused",
     "setup_refused",
     "waiting_keyring",
@@ -118,6 +119,22 @@ pub const TRAY_LINE_IDS: [&str; 7] = [
     "store_newer",
     "ipc_not_accepting",
     "keychain_prompt",
+    "storage_low",
+    "anchor_write_failing",
+    "anchor_dir_write_failing",
+    "anchor_dir_lines_pending",
+    "anchors_missing",
+];
+
+/// The part of [`TRAY_LINE_IDS`] built from the store-health snapshot (`AppState::health`, filled
+/// from the same `StoreHealthView` the header reads). Shown only while `Core` serves: a locked or
+/// starting app has no health to report.
+pub const TRAY_HEALTH_LINE_IDS: [&str; 5] = [
+    "storage_low",
+    "anchor_write_failing",
+    "anchor_dir_write_failing",
+    "anchor_dir_lines_pending",
+    "anchors_missing",
 ];
 
 /// The menu ids of the disabled status items, in order; more lines than ids are dropped (the
@@ -132,11 +149,15 @@ pub fn status_lines(state: &AppSnapshot, inputs: &StatusInputs) -> Vec<String> {
     match state {
         AppSnapshot::StartupError(text) => vec![text.clone()],
         AppSnapshot::StoreUnavailable => vec![MSG_STORE_UNAVAILABLE.to_owned()],
-        _ => status::lines(inputs)
-            .into_iter()
-            .filter(|l| TRAY_LINE_IDS.contains(&l.id))
-            .map(|l| l.text)
-            .collect(),
+        _ => {
+            let serving = state == &AppSnapshot::Serving;
+            status::lines(inputs)
+                .into_iter()
+                .filter(|l| TRAY_LINE_IDS.contains(&l.id))
+                .filter(|l| serving || !TRAY_HEALTH_LINE_IDS.contains(&l.id))
+                .map(|l| l.text)
+                .collect()
+        }
     }
 }
 
@@ -790,6 +811,98 @@ mod tests {
             status_lines(&AppSnapshot::StoreUnavailable, &waiting),
             [MSG_STORE_UNAVAILABLE]
         );
+    }
+
+    fn health_view() -> atlas_duck_core::StoreHealthView {
+        atlas_duck_core::StoreHealthView {
+            storage_low: false,
+            anchor_write_failing: false,
+            anchor_thread_dead: false,
+            anchors_blocked: false,
+            open_incidents: 0,
+            prune_backlog_days: 0,
+            prune_backlog: None,
+            last_prune_failed: false,
+            shred_checkpoint_pending: false,
+            settings_unreadable: false,
+            anchor_dir_write_failing: false,
+            anchor_dir_lines_pending: 0,
+            anchors_missing: None,
+            re_anchor_offered: false,
+        }
+    }
+
+    /// T36b item 1 (T21b review M-1, §8.5 "Settings and the tray"): while the core serves, the tray
+    /// carries the store-health lines `status::lines` words for the header, with the very same
+    /// texts: `storage_low`, `anchor_write_failing`, `anchor_dir_write_failing`,
+    /// `anchor_dir_lines_pending` and `anchors_missing` (nothing else of the health: incidents and
+    /// the prune backlog stay the header's). Outside the serving state they are not shown (the
+    /// snapshot is the last one the core gave).
+    #[test]
+    fn the_tray_carries_the_store_health_lines_while_serving() {
+        use atlas_duck_core::StoreHealthView;
+        let inputs = |h: StoreHealthView| StatusInputs {
+            health: Some(h),
+            ..StatusInputs::default()
+        };
+        let text = |h: &StoreHealthView, id: &str| {
+            status::lines(&inputs(h.clone()))
+                .into_iter()
+                .find(|l| l.id == id)
+                .map(|l| l.text)
+                .unwrap_or_else(|| panic!("status::lines has no {id}"))
+        };
+        let all = StoreHealthView {
+            storage_low: true,
+            anchor_write_failing: true,
+            anchor_dir_write_failing: true,
+            anchor_dir_lines_pending: 4,
+            anchors_missing: Some("both"),
+            open_incidents: 2,
+            prune_backlog: Some("pruning is 3 days behind".into()),
+            ..health_view()
+        };
+        let lines = status_lines(&AppSnapshot::Serving, &inputs(all.clone()));
+        assert_eq!(
+            lines,
+            [
+                text(&all, "storage_low"),
+                text(&all, "anchor_write_failing"),
+                text(&all, "anchor_dir_write_failing"),
+                text(&all, "anchors_missing"),
+            ],
+            "same texts as the header, incidents and the prune backlog left out"
+        );
+        // Pending shows while nothing is failing.
+        let pending = StoreHealthView {
+            anchor_dir_lines_pending: 2,
+            ..health_view()
+        };
+        assert_eq!(
+            status_lines(&AppSnapshot::Serving, &inputs(pending.clone())),
+            [text(&pending, "anchor_dir_lines_pending")]
+        );
+        // Nothing to report: no line.
+        assert!(status_lines(&AppSnapshot::Serving, &inputs(health_view())).is_empty());
+        // Not serving: the cached snapshot is not shown (a locked or starting app has no health).
+        for state in [
+            AppSnapshot::Starting,
+            AppSnapshot::Gate(GateState::FirstRun),
+            locked(LockedReason::KeychainUnavailable),
+        ] {
+            assert!(
+                status_lines(&state, &inputs(all.clone()))
+                    .iter()
+                    .all(|l| !l.contains("anchor") && !l.contains("storage")),
+                "{state:?}"
+            );
+        }
+        // The menu has room for four status items; the tooltip carries every line.
+        let menu = menu_entries(&AppSnapshot::Serving, 0, &lines, false);
+        assert_eq!(menu.iter().filter(|e| !e.enabled).count(), 4);
+        for line in &lines {
+            assert!(tooltip_text(&lines, 0, false).contains(line.as_str()));
+        }
     }
 
     #[test]
