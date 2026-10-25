@@ -426,8 +426,12 @@ $missing"
 #      scripted approver's, with the window open and focused, and UI-06 covers the click itself;
 #   3. `atlas-duck verify-export` through a wrapper written as "Install CLI to PATH" writes it
 #      (`exec "$APPIMAGE_PATH" __cli "$@"`) runs `$APPIMAGE __verify-export` and exits 20 on the
-#      fixture's no-trust-root export, and `<AppImage> __verify-export` itself exits 20 (V14: the
-#      path is `$APPIMAGE`, never a /tmp/.mount_* path: a CLI that found no app exits 22). The running
+#      fixture's no-trust-root export, and `<AppImage> __verify-export` itself exits 20 (those two prove
+#      the report and exit code only: the CLI's fallback, the app next to it in the mount, also exits 20).
+#      V14, deterministic: the AppImage is extracted (--appimage-extract) and its usr/bin/atlas-duck run
+#      with APPDIR=<extracted dir> (so `runs_from_appimage` holds) and APPIMAGE=<a stub that records its
+#      argv and exits 20>; the stub's record must be `__verify-export <dir>`: only the `$APPIMAGE`
+#      branch of `discover::locate_app` runs that stub, the sibling atlas-duck-app cannot. The running
 #      app is not involved: no new forwarded_launch, no new window_opened, same mapped windows (S-03);
 #   4. the test-control `quit` file runs the one §2.5 shutdown path with ShutdownReason::Quit (what the
 #      tray's Quit item runs; no tray host exists here): the diag line `event=app_stop reason=quit`,
@@ -488,7 +492,7 @@ m10_app_gone() { ! pgrep -x atlas-duck-app >/dev/null; }
 
 m10_inner() {
   local appimage="$1" here="$2" work="$3" home="$4" export_dir="$5"
-  local code id status pid wm_pid="" i ctl before_forward before_opened windows wrapper last
+  local code id status pid wm_pid="" i ctl before_forward before_opened windows wrapper last cli_bin stub bad
   unset APPIMAGE_EXTRACT_AND_RUN
   trap "m4_stop_app \"$appimage\" || true; pkill -x gnome-keyring-d || true; pkill -x openbox || true" EXIT
   [ -n "${DISPLAY:-}" ] || m4_fail "no DISPLAY: run under xvfb-run"
@@ -587,6 +591,24 @@ m10_inner() {
   [ "$code" -eq 20 ] || { cat "$work/ve-direct.out" "$work/ve-direct.err" >&2 || true; m4_fail "<AppImage> __verify-export exited $code, expected 20"; }
   cmp -s "$work/ve-direct.out" "$work/ve-wrapper.out" || { diff "$work/ve-direct.out" "$work/ve-wrapper.out" >&2 || true; m4_fail "the wrapper's report differs from <AppImage> __verify-export's"; }
   echo "M10 <AppImage> __verify-export: exit 20, same report"
+  # V14 negative control: the CLI must execute exactly $APPIMAGE (a stub), with `__verify-export <dir>`.
+  mkdir -p "$work/extract"
+  (cd "$work/extract" && timeout 120 "$appimage" --appimage-extract >/dev/null 2>&1) || m4_fail "<AppImage> --appimage-extract failed"
+  cli_bin="$work/extract/squashfs-root/usr/bin/atlas-duck"
+  [ -x "$cli_bin" ] || m4_fail "the extracted AppImage has no executable usr/bin/atlas-duck"
+  stub="$work/stub-appimage"
+  printf '%s\n' '#!/bin/sh' 'for a in "$@"; do printf "%s\n" "$a"; done > "$STUB_ARGV"' 'exit 20' > "$stub"
+  chmod +x "$stub"
+  rm -f "$work/stub.argv"
+  set +e
+  env -u APPIMAGE_EXTRACT_AND_RUN APPDIR="$work/extract/squashfs-root" APPIMAGE="$stub" STUB_ARGV="$work/stub.argv" \
+    timeout 60 "$cli_bin" verify-export "$export_dir" >"$work/ve-stub.out" 2>"$work/ve-stub.err"
+  code=$?
+  set -e
+  [ "$code" -eq 20 ] || { cat "$work/ve-stub.out" "$work/ve-stub.err" >&2 || true; m4_fail "the CLI with APPIMAGE=<stub> exited $code, expected the stub's 20 (22: it did not start the stub)"; }
+  [ -f "$work/stub.argv" ] || m4_fail "the stub recorded nothing: the CLI did not run \$APPIMAGE (it fell back to the app next to it)"
+  [ "$(cat "$work/stub.argv")" = "$(printf '%s\n%s' __verify-export "$export_dir")" ] || { cat "$work/stub.argv" >&2; m4_fail "the stub's argv is not '__verify-export $export_dir'"; }
+  echo "M10 V14: the CLI ran \$APPIMAGE with '__verify-export <dir>' (stub argv recorded)"
   sleep 2
   [ "$(m10_diag_count "$M10_DIAG" 'event=forwarded_launch')" -eq "$before_forward" ] || m10_report "verify-export forwarded a launch to the running app"
   [ "$(m10_diag_count "$M10_DIAG" 'event=window_opened')" -eq "$before_opened" ] || m10_report "verify-export opened a window"
