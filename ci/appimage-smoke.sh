@@ -227,16 +227,11 @@ m8_mounts() {
   awk '$2 ~ /^\/tmp\/\.mount_/ { print $2 }' /proc/mounts | sort -u
 }
 
-m8_inner() {
-  local appimage="$1" here="$2" work="$3" code id status ready cfg_unreadable jira_configured pid cmdline i mounts n
-  unset APPIMAGE_EXTRACT_AND_RUN
-  trap "m4_stop_app \"$appimage\" || true; pkill -x gnome-keyring-d || true" EXIT
-  if command -v gnome-keyring-daemon >/dev/null; then
-    printf 'atlas-duck-ci' | gnome-keyring-daemon --components=secrets --daemonize --unlock >/dev/null || echo "M8: keyring daemon did not start (continuing)"
-  fi
-  printf '%s\n' 'return {n: 1 + 1};' > "$work/m8.js"
-
-  # Warm start: the CLI cold-starts `<AppImage> --background` (as the M4 section), so the
+# m8_warm_start <appimage> <work>: the CLI cold-starts `<AppImage> --background` (as the M4 section),
+# then polls `doctor` until the provisioned core serves. Shared by the M8 and M10 sections.
+m8_warm_start() {
+  local appimage="$1" work="$2" code ready i cfg_unreadable jira_configured
+  # The CLI cold-starts `<AppImage> --background` (as the M4 section), so the
   # `--timeout 0` run below finds a serving app.
   set +e
   timeout 180 "$appimage" __cli --timeout 120 doctor >"$work/doctor.json" 2>"$work/doctor.err"
@@ -264,6 +259,18 @@ m8_inner() {
   done
   [ -n "$ready" ] || { cat "$work/doctor.err" >&2 || true; m4_fail "the app did not serve the provisioned core within 60 polls (want data.app.config_unreadable=false and data.app.instances.jira.configured=true): $(cat "$work/doctor.json")"; }
   echo "M8 cold start: doctor exit 0, serving core ready (config_unreadable=$cfg_unreadable, jira configured=$jira_configured)"
+}
+
+m8_inner() {
+  local appimage="$1" here="$2" work="$3" code id status pid cmdline i mounts n
+  unset APPIMAGE_EXTRACT_AND_RUN
+  trap "m4_stop_app \"$appimage\" || true; pkill -x gnome-keyring-d || true" EXIT
+  if command -v gnome-keyring-daemon >/dev/null; then
+    printf 'atlas-duck-ci' | gnome-keyring-daemon --components=secrets --daemonize --unlock >/dev/null || echo "M8: keyring daemon did not start (continuing)"
+  fi
+  printf '%s\n' 'return {n: 1 + 1};' > "$work/m8.js"
+
+  m8_warm_start "$appimage" "$work"
 
   # (1) submit without waiting, through the AppImage's CLI.
   set +e
@@ -332,9 +339,18 @@ m8_inner() {
 
 # appimage-smoke.sh --m8 <e2e-artifact-dir>: the M8 section alone, CI only, on the downloaded
 # bundle-linux-e2e artifact, with the packages of the M6 job (`appimage-m6` of e2e-bundle.yml).
+# appimage-smoke.sh --m10 <e2e-artifact-dir> is the same provisioning with the M10 inner section
+# (m10_inner below): `m8_outer <dir> m10`; it also needs xdotool and openbox.
 m8_outer() {
-  local e2e_dist work m8_dir m8_code self_path home keys fixture_src fixture_code
+  local e2e_dist work m8_dir m8_code self_path home keys export_dir fixture_src fixture_code
+  local mode="${2:-m8}" inner_flag=--m8-inner inner_extra=()
   e2e_dist="$(realpath "${1:?usage: appimage-smoke.sh --m8 <e2e-artifact-dir>}")"
+  if [ "$mode" = m10 ]; then
+    inner_flag=--m10-inner
+    command -v xdotool >/dev/null || m4_fail "xdotool missing (apt: xdotool)"
+    command -v openbox >/dev/null || m4_fail "openbox missing (apt: openbox)"
+    command -v xwininfo >/dev/null || m4_fail "xwininfo missing (apt: x11-utils)"
+  fi
   self_path="$(realpath "$0")"
   [ "${CI:-}" = true ] || m4_fail "the M8 AppImage section runs only with CI=true"
   shopt -s nullglob
@@ -377,13 +393,215 @@ $missing"
   # The app is stopped first (its logs are final), then the logs of <work> and of the provisioned home
   # are saved, only then both are deleted (the home holds the app's diag.log).
   trap "pkill -x atlas-duck-app || true; m6_save_diag \"$work\"; m8_save_home_diag \"$home\"; rm -rf \"$work\" \"$home\"" EXIT
+  if [ "$mode" = m10 ]; then
+    export_dir="$(sed -n 's/^export=//p' "$m8_dir/fixture.txt" | head -n 1)"
+    [ -n "$export_dir" ] && [ -d "$export_dir" ] || m4_fail "the fixture's export directory '$export_dir' is not a directory (rebuild bundle-linux-e2e: script_fixture writes export=)"
+    inner_extra=("$home" "$export_dir")
+  fi
   set +e
   env ATLAS_DUCK_TEST_HOME="$home" ATLAS_DUCK_TEST_KEYSTORE="$keys" \
-    timeout 900 xvfb-run -a dbus-run-session -- bash "$self_path" --m8-inner "$m8_dir/atlas-duck-e2e.AppImage" "$(dirname "$self_path")" "$m8_dir/out"
+    timeout 900 xvfb-run -a dbus-run-session -- bash "$self_path" "$inner_flag" "$m8_dir/atlas-duck-e2e.AppImage" "$(dirname "$self_path")" "$m8_dir/out" "${inner_extra[@]}"
   m8_code=$?
   set -e
-  [ "$m8_code" -eq 0 ] || m4_fail "the M8 AppImage section failed (exit $m8_code)"
-  echo "OK: M8 AppImage section (script run after the CLI exited, release, await, app not under the CLI's mount)"
+  if [ "$mode" = m10 ]; then
+    [ "$m8_code" -eq 0 ] || m4_fail "the M10 AppImage section failed (exit $m8_code)"
+    echo "OK: M10 AppImage section (Approvals window mapped and focused, release and await with it open, quit diag line, verify-export through the wrapper exits 20)"
+  else
+    [ "$m8_code" -eq 0 ] || m4_fail "the M8 AppImage section failed (exit $m8_code)"
+    echo "OK: M8 AppImage section (script run after the CLI exited, release, await, app not under the CLI's mount)"
+  fi
+}
+
+# --- M10 section (CI-04 completion, L132; V14; S-03) ----------------------------------------------
+# Same provisioned DEBUG `scripted-approver` AppImage and test home as the M8 section, in its own
+# xvfb-run + dbus-run-session + keyring, plus the openbox window manager (a bare Xvfb has no focus
+# model: only a WM sets _NET_ACTIVE_WINDOW and gives a new window the input focus). Order:
+#   1. a forwarded no-argument launch opens Approvals: the `window_opened window=approvals` diag line,
+#      the window "atlas-duck: Approvals" mapped, and (xdotool) that window the active/focused one (L132:
+#      "window focus is not asserted");
+#   2. with the Approvals window open, `script run --timeout 0` (pending, exit 4) is released by the
+#      scripted approver and `await` delivers `released` with {n: 2} (L132: "the release through the
+#      window, await ..."). The click on the window's Approve button is not driven (no WebDriver
+#      reaches the window on Linux, M6 CI ruling; xdotool has no widget map): the release is the
+#      scripted approver's, with the window open and focused, and UI-06 covers the click itself;
+#   3. `atlas-duck verify-export` through a wrapper written as "Install CLI to PATH" writes it
+#      (`exec "$APPIMAGE_PATH" __cli "$@"`) runs `$APPIMAGE __verify-export` and exits 20 on the
+#      fixture's no-trust-root export, and `<AppImage> __verify-export` itself exits 20 (V14: the
+#      path is `$APPIMAGE`, never a /tmp/.mount_* path: a CLI that found no app exits 22). The running
+#      app is not involved: no new forwarded_launch, no new window_opened, same mapped windows (S-03);
+#   4. the test-control `quit` file runs the one §2.5 shutdown path with ShutdownReason::Quit (what the
+#      tray's Quit item runs; no tray host exists here): the diag line `event=app_stop reason=quit`,
+#      neither quit_wait_expired nor quit_core_lost, and no atlas-duck-app left (L132: "the quit line").
+# The autostart entry recording `$APPIMAGE` (V14) is asserted by the main section of this script
+# (the --autostart-probe block, run by bundle.yml's appimage-smoke on the shipped AppImage).
+
+# m10_windows: the titles of the MAPPED top-level windows named "atlas-duck: <window>", sorted.
+m10_windows() {
+  local id title
+  { xwininfo -root -tree 2>/dev/null || true; } | sed -n 's/^[[:space:]]*\(0x[0-9a-fA-F]*\) "\(atlas-duck: [^"]*\)".*/\1 \2/p' |
+    while read -r id title; do
+      if xwininfo -id "$id" 2>/dev/null | grep -q 'Map State: IsViewable'; then printf '%s\n' "$title"; fi
+    done | sort
+}
+
+# m10_diag_count <diag> <extended regex>: matching lines of the diag log.
+m10_diag_count() {
+  [ -f "$1" ] || { echo 0; return; }
+  grep -c -E "$2" "$1" || true
+}
+
+# m10_active_titles: the names of the window xdotool reports as active (EWMH) and as input-focused (X).
+m10_active_titles() {
+  xdotool getactivewindow getwindowname 2>/dev/null || true
+  xdotool getwindowfocus getwindowname 2>/dev/null || true
+}
+
+# m10_wait <seconds> <what> <command...>: until the command succeeds; fails with m10_report on timeout.
+m10_wait() {
+  local secs="$1" what="$2" end
+  shift 2
+  end=$((SECONDS + secs))
+  until "$@"; do
+    [ "$SECONDS" -lt "$end" ] || m10_report "timed out after ${secs}s waiting for $what"
+    sleep 0.5
+  done
+}
+
+m10_report() {
+  {
+    echo "--- mapped app windows"
+    m10_windows || true
+    echo "--- active/focused window names (xdotool)"
+    m10_active_titles || true
+    echo "--- processes"
+    ps -eo pid,ppid,stat,args | grep -E 'atlas-duck|AppImage|openbox' | grep -v grep || true
+    echo "--- ${M10_DIAG:-?} (end)"
+    tail -n 60 "${M10_DIAG:-/dev/null}" 2>/dev/null || echo "(no diag log)"
+  } >&2
+  m4_fail "$*"
+}
+
+m10_has_window() { m10_windows | grep -xF "$1" >/dev/null; }
+m10_has_focus() { m10_active_titles | grep -xF "$1" >/dev/null; }
+m10_diag_over() { [ "$(m10_diag_count "$M10_DIAG" "$1")" -gt "$2" ]; }
+m10_app_gone() { ! pgrep -x atlas-duck-app >/dev/null; }
+
+m10_inner() {
+  local appimage="$1" here="$2" work="$3" home="$4" export_dir="$5"
+  local code id status pid wm_pid="" i ctl before_forward before_opened windows wrapper last
+  unset APPIMAGE_EXTRACT_AND_RUN
+  trap "m4_stop_app \"$appimage\" || true; pkill -x gnome-keyring-d || true; pkill -x openbox || true" EXIT
+  [ -n "${DISPLAY:-}" ] || m4_fail "no DISPLAY: run under xvfb-run"
+  if command -v gnome-keyring-daemon >/dev/null; then
+    printf 'atlas-duck-ci' | gnome-keyring-daemon --components=secrets --daemonize --unlock >/dev/null || echo "M10: keyring daemon did not start (continuing)"
+  fi
+  printf '%s\n' 'return {n: 1 + 1};' > "$work/m10.js"
+
+  # The window manager first: new windows get the focus only under one. Bounded wait for its EWMH check window.
+  openbox >"$work/openbox.log" 2>&1 &
+  wm_pid=$!
+  for i in $(seq 1 60); do
+    xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id' && break
+    kill -0 "$wm_pid" 2>/dev/null || { cat "$work/openbox.log" >&2 || true; m4_fail "openbox exited before it took the display"; }
+    sleep 0.5
+  done
+  xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id' || m4_fail "openbox did not publish _NET_SUPPORTING_WM_CHECK within 30 s"
+  echo "M10 window manager: openbox pid $wm_pid"
+
+  m8_warm_start "$appimage" "$work"
+
+  # The diag log and the test-control dir live in the provisioned home (bounded: the app writes both at start).
+  M10_DIAG=""
+  ctl=""
+  for i in $(seq 1 60); do
+    M10_DIAG="$(find "$home" -name diag.log -type f 2>/dev/null | head -n 1 || true)"
+    ctl="$(find "$home" -type d -name test-control 2>/dev/null | head -n 1 || true)"
+    [ -n "$M10_DIAG" ] && [ -n "$ctl" ] && break
+    sleep 0.5
+  done
+  [ -n "$M10_DIAG" ] && [ -n "$ctl" ] || m4_fail "no diag.log ($M10_DIAG) or test-control dir ($ctl) under $home after 30 s"
+  echo "M10 diag log: $M10_DIAG, control dir: $ctl"
+
+  # (1) a forwarded no-argument launch opens Approvals (the core serves, so Approvals is what the state needs).
+  before_opened="$(m10_diag_count "$M10_DIAG" 'event=window_opened window=approvals')"
+  set +e
+  timeout 60 "$appimage" >"$work/forward-approvals.log" 2>&1
+  code=$?
+  set -e
+  [ "$code" -eq 0 ] || { cat "$work/forward-approvals.log" >&2 || true; m4_fail "the forwarded no-argument launch exited $code, expected 0"; }
+  m10_wait 60 "the diag line 'event=window_opened window=approvals'" m10_diag_over 'event=window_opened window=approvals' "$before_opened"
+  m10_wait 60 "a mapped window titled 'atlas-duck: Approvals'" m10_has_window "atlas-duck: Approvals"
+  echo "M10 Approvals window: window_opened logged, mapped"
+  m10_wait 30 "the focus on 'atlas-duck: Approvals' (xdotool getactivewindow/getwindowfocus)" m10_has_focus "atlas-duck: Approvals"
+  echo "M10 window focus: xdotool reports 'atlas-duck: Approvals' as the focused window"
+
+  # (2) release and await with the Approvals window open.
+  set +e
+  timeout 180 "$appimage" __cli script run "$work/m10.js" --reason atlas-test:release --timeout 0 >"$work/run.json" 2>"$work/run.err"
+  code=$?
+  set -e
+  [ "$code" -eq 4 ] || { cat "$work/run.json" "$work/run.err" >&2 || true; m4_fail "script run --timeout 0 exited $code, expected 4 (pending)"; }
+  id="$(m4_json_field "$work/run.json" request_id)" || m4_fail "script run has no request_id: $(cat "$work/run.json")"
+  set +e
+  timeout 240 "$appimage" __cli await "$id" --timeout 180 >"$work/await.json" 2>"$work/await.err"
+  code=$?
+  set -e
+  [ "$code" -eq 0 ] || { cat "$work/await.json" "$work/await.err" >&2 || true; m4_fail "await $id exited $code, expected 0"; }
+  status="$(m4_json_field "$work/await.json" status)" || m4_fail "await printed no envelope: $(cat "$work/await.json")"
+  [ "$status" = released ] || m4_fail "await status is '$status', expected released: $(cat "$work/await.json")"
+  [ "$(m4_json_field "$work/await.json" data.result.n)" = 2 ] || m4_fail "await delivered another result than {n: 2}: $(cat "$work/await.json")"
+  m10_has_window "atlas-duck: Approvals" || m10_report "the Approvals window is gone after the release"
+  echo "M10 release: pending (exit 4), released by the scripted approver with the Approvals window open, await delivered released (exit 0)"
+
+  # (3) verify-export through the Install-CLI wrapper (the text `cli_install::wrapper_script` writes), app running.
+  mkdir -p "$work/bin"
+  wrapper="$work/bin/atlas-duck"
+  {
+    printf '%s\n' '#!/bin/sh'
+    printf '%s\n' "APPIMAGE_PATH='$appimage'"
+    printf '%s\n' 'if [ ! -f "$APPIMAGE_PATH" ] || [ ! -x "$APPIMAGE_PATH" ]; then exit 5; fi'
+    printf '%s\n' 'exec "$APPIMAGE_PATH" __cli "$@"'
+  } > "$wrapper"
+  chmod +x "$wrapper"
+  before_forward="$(m10_diag_count "$M10_DIAG" 'event=forwarded_launch')"
+  before_opened="$(m10_diag_count "$M10_DIAG" 'event=window_opened')"
+  windows="$(m10_windows)"
+  set +e
+  timeout 120 "$wrapper" verify-export "$export_dir" >"$work/ve-wrapper.out" 2>"$work/ve-wrapper.err"
+  code=$?
+  set -e
+  [ "$code" -eq 20 ] || { cat "$work/ve-wrapper.out" "$work/ve-wrapper.err" >&2 || true; m4_fail "atlas-duck verify-export through the wrapper exited $code, expected 20 (no trust root; 22 means the CLI found no app)"; }
+  last="$(tail -n 1 "$work/ve-wrapper.out")"
+  case "$last" in
+    "internally consistent; trust root NOT verified"*) ;;
+    *) cat "$work/ve-wrapper.out" >&2 || true; m4_fail "the verify-export report ends with '$last', expected 'internally consistent; trust root NOT verified'" ;;
+  esac
+  case "$(head -c 1 "$work/ve-wrapper.out")" in
+    "{") m4_fail "verify-export printed an envelope, not the report: $(cat "$work/ve-wrapper.out")" ;;
+  esac
+  echo "M10 verify-export through the wrapper: exit 20, report: $last"
+  set +e
+  timeout 120 "$appimage" __verify-export "$export_dir" >"$work/ve-direct.out" 2>"$work/ve-direct.err"
+  code=$?
+  set -e
+  [ "$code" -eq 20 ] || { cat "$work/ve-direct.out" "$work/ve-direct.err" >&2 || true; m4_fail "<AppImage> __verify-export exited $code, expected 20"; }
+  cmp -s "$work/ve-direct.out" "$work/ve-wrapper.out" || { diff "$work/ve-direct.out" "$work/ve-wrapper.out" >&2 || true; m4_fail "the wrapper's report differs from <AppImage> __verify-export's"; }
+  echo "M10 <AppImage> __verify-export: exit 20, same report"
+  sleep 2
+  [ "$(m10_diag_count "$M10_DIAG" 'event=forwarded_launch')" -eq "$before_forward" ] || m10_report "verify-export forwarded a launch to the running app"
+  [ "$(m10_diag_count "$M10_DIAG" 'event=window_opened')" -eq "$before_opened" ] || m10_report "verify-export opened a window"
+  [ "$(m10_windows)" = "$windows" ] || m10_report "verify-export changed the mapped windows"
+  pgrep -x atlas-duck-app >/dev/null || m10_report "the app died during verify-export"
+  echo "M10 verify-export left the running app alone: no forwarded_launch, no window_opened, same windows"
+
+  # (4) quit through the test-control dir: the one shutdown path with reason Quit.
+  : > "$ctl/quit"
+  m10_wait 90 "the app to exit after the quit file" m10_app_gone
+  m10_wait 30 "the diag line 'event=app_stop reason=quit'" m10_diag_over 'event=app_stop reason=quit' 0
+  for bad in quit_wait_expired quit_core_lost; do
+    ! grep -qF "$bad" "$M10_DIAG" || m10_report "the diag log shows $bad"
+  done
+  echo "M10 quit: event=app_stop reason=quit logged, no quit_wait_expired or quit_core_lost, no atlas-duck-app left"
 }
 
 if [ "${1:-}" = --m6 ]; then
@@ -392,6 +610,15 @@ if [ "${1:-}" = --m6 ]; then
 fi
 if [ "${1:-}" = --m8 ]; then
   m8_outer "${2:-}"
+  exit 0
+fi
+if [ "${1:-}" = --m10 ]; then
+  m8_outer "${2:-}" m10
+  exit 0
+fi
+if [ "${1:-}" = --m10-inner ]; then
+  [ "$#" -eq 6 ] || m4_fail "usage: appimage-smoke.sh --m10-inner <appimage> <ci-dir> <work-dir> <home> <export-dir>"
+  m10_inner "$2" "$3" "$4" "$5" "$6"
   exit 0
 fi
 if [ "${1:-}" = --m8-inner ]; then

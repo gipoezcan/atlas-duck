@@ -612,6 +612,45 @@ jobs:
         if: always() && runner.os == 'Linux'
         run: sudo userdel atlasduck-s01 || true
 
+      # M10 Task 31 (L80), spec §13 S-01 (macOS): the same test as the Linux step above, run as a
+      # second macOS user made with `sysadminctl` (the runner user has passwordless sudo). Differences
+      # from Linux: TMPDIR is /var/folders/.../T, a 0700 chain the other user cannot traverse (round 2
+      # would die with EACCES before reaching the listener), so the test's temp dirs go under a
+      # world-traversable /private/tmp directory; the user gets a random password and no admin rights.
+      # Same skip and exactly-one-pass guards as Linux.
+      - name: M4 S-01 other local user (macOS, second account via sysadminctl, ignored test)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          s01_pw="$(openssl rand -hex 12)"
+          echo "::add-mask::$s01_pw"
+          sudo sysadminctl -addUser atlasduck-s01 -fullName "atlas-duck S-01" -password "$s01_pw" 2>&1
+          id atlasduck-s01
+          d="$PWD"
+          while [ "$d" != / ]; do sudo chmod o+x "$d"; d="$(dirname "$d")"; done
+          # The test binary lives under CARGO_TARGET_DIR when it is set.
+          if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+            d="$CARGO_TARGET_DIR"
+            while [ "$d" != / ] && [ -d "$d" ]; do sudo chmod o+x "$d"; d="$(dirname "$d")"; done
+          fi
+          mkdir -p /private/tmp/atlasduck-s01-tmp
+          chmod 755 /private/tmp/atlasduck-s01-tmp
+          export TMPDIR=/private/tmp/atlasduck-s01-tmp
+          export ATLAS_DUCK_TEST_OTHER_USER=atlasduck-s01
+          cargo test -p atlas-duck-ipc --locked --test transport_unix -- --ignored --exact s01_other_user_connection_rejected --nocapture 2>&1 | tee "$RUNNER_TEMP/s01.log"
+          if grep -E 'skipping s01_' "$RUNNER_TEMP/s01.log"; then
+            echo "::error::S-01 other-user test skipped (ATLAS_DUCK_TEST_OTHER_USER not seen)"
+            exit 1
+          fi
+          grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/s01.log" || { echo "::error::S-01 other-user test did not pass exactly once"; exit 1; }
+          echo "S01 macOS other-user (atlasduck-s01 via sysadminctl): rejected, 1 passed"
+
+      - name: M4 S-01 cleanup (delete the throwaway macOS user)
+        if: always() && runner.os == 'macOS'
+        run: |
+          sudo sysadminctl -deleteUser atlasduck-s01 || true
+          rm -rf /private/tmp/atlasduck-s01-tmp
+
       # M4 plan Task 26 step 3, spec §15 V01 (Windows): a pipe DACL that grants the owner only must
       # refuse a second local account (ERROR_ACCESS_DENIED). The test logs that account on with
       # LogonUserW (interactive) and opens the pipe impersonating it. The account is created here

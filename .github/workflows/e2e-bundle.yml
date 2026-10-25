@@ -18,7 +18,9 @@ name: e2e-bundle
 #   bundle-linux-e2e      debug scripted-approver rpm + AppImage
 #   fedora-no-tray-host   CI-03: fedora:40 container, Xvfb, session bus without a StatusNotifierWatcher
 #   appimage-m6           CI-04 M6 steps: the AppImage through its FUSE runtime, no tray host, Setup window, doctor, forwarded launches, SIGTERM
-#                         and (M8 Task 28) the CI-04 script step: a `script run` that is released and delivered after the CLI exited.
+#                         and (M8 Task 28) the CI-04 script step: a `script run` that is released and delivered after the CLI exited,
+#                         and (M10 Task 31) the CI-04 completion: Approvals window focus (xdotool), release + await with it open,
+#                         verify-export through the wrapper (exit 20), the quit diag line.
 #                         The CI-07 steps (scripts-enabled matrix, debug bundles) sit in this job and in fedora-no-tray-host, `if: false` until M10.
 #   bundle-macos-e2e      (M10 T27a) per arch: debug scripted-approver .app (ad-hoc) + the ci_fixture test executable,
 #                         artifact bundle-macos-e2e-<target> (never bundle-<target>)
@@ -238,13 +240,13 @@ jobs:
       # The M8 section's script_fixture test executable does link the host's webkit2gtk, GTK,
       # appindicator, xdo and ssl: appimage-smoke.sh --m8 runs `ldd` on it first and fails listing
       # every `not found` library, so a missing package shows up in one run.
-      - name: Install libfuse2, Xvfb, D-Bus, a Secret Service, xwininfo and the host GL libraries
+      - name: Install libfuse2, Xvfb, D-Bus, a Secret Service, xwininfo, xdotool, openbox and the host GL libraries
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libfuse2 xvfb xauth dbus-x11 gnome-keyring libsecret-tools x11-utils python3 \
-            libayatana-appindicator3-1 librsvg2-2 libwebkit2gtk-4.1-0 libxdo3 libssl3
-          command -v xwininfo
+            libayatana-appindicator3-1 librsvg2-2 libwebkit2gtk-4.1-0 libxdo3 libssl3 xdotool openbox
+          command -v xwininfo xdotool openbox
           ldconfig -p | grep -F 'libEGL.so.1 '
 
       - name: AppImage M6 section (no tray host, Setup window, doctor, forwarded launches, SIGTERM)
@@ -262,6 +264,16 @@ jobs:
         env:
           E2E_DIAG_DIR: ${{ runner.temp }}/e2e-diag-appimage
         run: CI=true bash ci/appimage-smoke.sh --m8 dist
+
+      # M10 Task 31 (CI-04 completion, L132; V14; S-03): the Approvals window mapped and focused
+      # (xdotool, under openbox), a release and `await` with it open, `atlas-duck verify-export`
+      # through the Install-CLI wrapper exiting 20 on the fixture's no-trust-root export, and the quit
+      # diag line (`event=app_stop reason=quit`) after the test-control quit. See the M10 comment block
+      # in ci/appimage-smoke.sh for what is and is not driven.
+      - name: AppImage M10 section (Approvals window focus, release and await, verify-export exit 20, quit line; CI-04)
+        env:
+          E2E_DIAG_DIR: ${{ runner.temp }}/e2e-diag-appimage
+        run: CI=true bash ci/appimage-smoke.sh --m10 dist
 
       # CI-07 (PD-150, R6 option (a)), switched on in M10: the debug scripted-approver bundle of this
       # commit runs `script run --dry-run=full` and a real run released by the scripted approver

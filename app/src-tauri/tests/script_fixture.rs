@@ -5,8 +5,9 @@
 //! harness. The test is `#[ignore]`d (a plain `cargo test` never runs it) and CI runs it by exact
 //! name; it is built in the `bundle-linux-e2e` job and shipped with that artifact.
 //!
-//! `ATLAS_DUCK_FIXTURE_OUT` names the file that receives two lines, `home=<ATLAS_DUCK_TEST_HOME>`
-//! and `keys=<ATLAS_DUCK_TEST_KEYSTORE>`. Without the variable the test fails (it never skips).
+//! `ATLAS_DUCK_FIXTURE_OUT` names the file that receives three lines, `home=<ATLAS_DUCK_TEST_HOME>`,
+//! `keys=<ATLAS_DUCK_TEST_KEYSTORE>` and `export=<a no-trust-root export directory>`. Without the
+//! variable the test fails (it never skips).
 //! The test home is a fresh directory the harness creates under `/tmp` and this test keeps.
 //!
 //! The Jira mock lives only while this process runs. The instance stays in the store with the
@@ -18,6 +19,7 @@ pub mod harness;
 
 use std::time::Duration;
 
+use atlas_duck_audit::testing::{FixtureKind, export_fixture};
 use atlas_duck_registry::Product;
 use harness::{Result, World, WorldOpts};
 
@@ -46,10 +48,24 @@ async fn provision_script_fixture() -> Result<()> {
         )
         .into());
     }
+    // M10 Task 31 (V14, S-03): a compliance export that verifies only without a trust root, for
+    // `appimage-smoke.sh --m10` (`atlas-duck verify-export <dir>` exits 20 on it). Written inside
+    // the test home, which the section deletes with the rest.
+    let export_parent = world.root().join("export-fixture");
+    std::fs::create_dir(&export_parent)?;
+    let export = export_fixture(FixtureKind::NoTrustRoot, &export_parent)?;
+    if export.expected_exit != 20 {
+        return Err(format!(
+            "the no-trust-root fixture expects exit {}, not 20",
+            export.expected_exit
+        )
+        .into());
+    }
     let text = format!(
-        "home={}\nkeys={}\n",
+        "home={}\nkeys={}\nexport={}\n",
         world.root().display(),
-        world.keys_dir().display()
+        world.keys_dir().display(),
+        export.dir.display()
     );
     std::fs::write(&out, &text)?;
     println!("script_fixture {}", text.replace('\n', " "));
