@@ -183,7 +183,12 @@ fn powershell_command(cli: &str, args: &[String]) -> String {
         text.push(' ');
         text.push_str(&quote(a));
     }
-    text.push_str("; exit $LASTEXITCODE");
+    // The `| Write-Output` stage makes PowerShell read the native command's stdout through a pipe
+    // and re-emit it on its own stdout. Without it the exit code came back but the report did
+    // not reach PowerShell's stdout (Windows CI run 40232178967: exit 0, empty stdout; the
+    // app checks its stdout writes, so it did write). `$LASTEXITCODE` stays the CLI's: the
+    // last pipeline stage is a cmdlet.
+    text.push_str(" | Write-Output; exit $LASTEXITCODE");
     text
 }
 
@@ -318,7 +323,7 @@ mod helper_tests {
         let args = vec!["verify-export".to_owned(), "C:\\a b\\o'k".to_owned()];
         assert_eq!(
             powershell_command("C:\\bin\\atlas-duck.exe", &args),
-            "& 'C:\\bin\\atlas-duck.exe' 'verify-export' 'C:\\a b\\o''k'; exit $LASTEXITCODE"
+            "& 'C:\\bin\\atlas-duck.exe' 'verify-export' 'C:\\a b\\o''k' | Write-Output; exit $LASTEXITCODE"
         );
     }
 
