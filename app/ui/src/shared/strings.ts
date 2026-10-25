@@ -539,6 +539,15 @@ export const SETTINGS_TEXT = {
   cli: 'Command line',
   cli_installed: 'The atlas-duck command is on your PATH.',
   cli_not_installed: 'The atlas-duck command is not on your PATH.',
+  /**
+   * Installed, but the folder is not on the PATH this app runs with (a GUI-launched macOS app has
+   * a minimal one): the text does not claim what the terminals have.
+   */
+  cli_installed_dir_not_on_path:
+    'The atlas-duck command is installed, but its folder is not on the PATH this app was started with. A terminal you open may still find it; if it does not, add that folder to the PATH of your shell.',
+  /** Not installed (or not recorded), yet the folder is on the PATH already: the user's own entry. */
+  cli_not_installed_dir_on_path:
+    'The folder for the atlas-duck command is already on your PATH, but the install is not complete yet. Use the button to finish it.',
   cli_install: 'Install CLI to PATH',
   cli_uninstall: 'Remove CLI from PATH',
   /** What `cli_install` / `cli_uninstall` did (spec 12.3), by the answer's fixed word. */

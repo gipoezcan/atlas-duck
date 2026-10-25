@@ -2151,12 +2151,12 @@ mod settings_commands {
     use atlas_duck_app_lib::commands::CommandError;
     use atlas_duck_app_lib::commands::dto::parse;
     use atlas_duck_app_lib::commands::settings::{
-        ConfinementDto, InstanceAcceptUrlChangeArgs, InstanceAddArgs, InstanceChangeUrlArgs,
-        InstanceConfirmConfigArgs, RetestOutcome, RetestTokenArgs, SettingChanges, cli_install_dto,
-        cli_uninstall_dto, conclude_instance_call, instance_accept_url_change_dto,
-        instance_add_dto, instance_change_url_dto, instance_confirm_config_dto,
-        instance_set_proxy_dto, pat_open_error, prune_backlog_now_dto, retest_token_dto,
-        settings_apply_dto, settings_get_dto,
+        CliState, ConfinementDto, InstanceAcceptUrlChangeArgs, InstanceAddArgs,
+        InstanceChangeUrlArgs, InstanceConfirmConfigArgs, RetestOutcome, RetestTokenArgs,
+        SettingChanges, cli_install_dto, cli_state_of, cli_uninstall_dto, conclude_instance_call,
+        instance_accept_url_change_dto, instance_add_dto, instance_change_url_dto,
+        instance_confirm_config_dto, instance_set_proxy_dto, pat_open_error, prune_backlog_now_dto,
+        retest_token_dto, settings_apply_dto, settings_get_dto,
     };
     use atlas_duck_app_lib::credential::{PatOpenError, open_for_pat};
     use atlas_duck_atlassian::testing::{
@@ -2875,9 +2875,15 @@ mod settings_commands {
     async fn settings_get_and_set_proxy_through_the_commands() -> TestResult {
         let h = Harness::jira().await?;
         let (s, i) = (h.core().settings(), h.instances());
-        let got =
-            blocking(move || settings_get_dto(&*s, &*i, ConfinementDto::pending(), false, true))
-                .await?;
+        let got = blocking(move || {
+            settings_get_dto(
+                &*s,
+                &*i,
+                ConfinementDto::pending(),
+                cli_state(false, true, None),
+            )
+        })
+        .await?;
         assert_eq!(got.instances.len(), 1);
         // The answer is what core's own admin objects say, not a copy of one field.
         assert_eq!(got.settings, h.core().settings().view());
@@ -2893,9 +2899,11 @@ mod settings_commands {
             "confinement",
             "cli_installed",
             "cli_removable",
+            "cli_dir_on_path",
         ] {
             assert!(wire.get(key).is_some(), "{key}");
         }
+        assert_eq!(wire["cli_dir_on_path"], Value::Null, "null when not known");
         let a = h.instances();
         let args = parse::<atlas_duck_app_lib::commands::settings::InstanceSetProxyArgs>(
             &json!({"alias": "jira-main", "proxy": "direct"}),
@@ -2905,12 +2913,98 @@ mod settings_commands {
         assert_eq!(view.proxy_effective.as_deref(), Some("direct"));
         // The CLI state is the caller's read of the OS, passed through as it is.
         let (s, i) = (h.core().settings(), h.instances());
-        let got =
-            blocking(move || settings_get_dto(&*s, &*i, ConfinementDto::pending(), true, false))
-                .await?;
+        let got = blocking(move || {
+            settings_get_dto(
+                &*s,
+                &*i,
+                ConfinementDto::pending(),
+                cli_state(true, false, Some(false)),
+            )
+        })
+        .await?;
         assert!(got.cli_installed);
         assert!(!got.cli_removable);
+        assert_eq!(got.cli_dir_on_path, Some(false));
+        let wire = serde_json::to_value(&got)?;
+        assert_eq!(wire["cli_dir_on_path"], json!(false));
         Ok(())
+    }
+
+    fn cli_state(installed: bool, removable: bool, dir_on_path: Option<bool>) -> CliState {
+        CliState {
+            installed,
+            removable,
+            dir_on_path,
+        }
+    }
+
+    /// T36b item 3 (T19 Q1): what `settings_get` says of the CLI folder follows the platform: the
+    /// process PATH on macOS (installed or not), the registry's user PATH on Windows, nothing for
+    /// deb/rpm or a machine with no stable layout.
+    #[test]
+    fn the_cli_state_says_whether_the_cli_folder_is_on_the_path() {
+        use atlas_duck_app_lib::cli_install::Kind;
+        let mac = Layout::resolve(&Inputs {
+            platform: Platform::Macos,
+            home: "/Users/u".into(),
+            cli_toml: "/Users/u/Library/Application Support/atlas-duck/cli-h.toml".into(),
+            current_exe: "/Applications/Atlas Duck.app/Contents/MacOS/atlas-duck-app".into(),
+            appimage: None,
+            appimage_is_file: false,
+            appdir: None,
+        });
+        let windows = Layout {
+            kind: Kind::Windows {
+                install_dir: r"C:\Program Files\atlas-duck".into(),
+            },
+            app_path: r"C:\Program Files\atlas-duck\atlas-duck-app.exe".into(),
+            cli_toml: r"C:\Users\u\AppData\Local\atlas-duck\cli.toml".into(),
+        };
+
+        // macOS: the process PATH, whether or not the link is there yet.
+        let ops = FakeOps::new();
+        assert_eq!(
+            cli_state_of(&ops, &mac),
+            cli_state(false, true, Some(false))
+        );
+        ops.set_session_path(Some(
+            std::env::join_paths(["/usr/bin", "/Users/u/.local/bin"]).expect("paths"),
+        ));
+        assert_eq!(cli_state_of(&ops, &mac), cli_state(false, true, Some(true)));
+
+        // deb/rpm: the CLI is in `/usr/bin`; no folder to ask about.
+        let deb = Layout::resolve(&Inputs {
+            platform: Platform::Linux,
+            home: "/home/u".into(),
+            cli_toml: "/home/u/.local/share/atlas-duck/cli-h.toml".into(),
+            current_exe: "/usr/bin/atlas-duck-app".into(),
+            appimage: None,
+            appimage_is_file: false,
+            appdir: None,
+        });
+        assert_eq!(cli_state_of(&ops, &deb), cli_state(true, false, None));
+
+        // Windows: the user PATH of the registry, not the process PATH.
+        let ops = FakeOps::with_path(r"C:\Windows");
+        ops.set_session_path(Some(
+            std::env::join_paths([r"C:\Program Files\atlas-duck"]).expect("paths"),
+        ));
+        assert_eq!(
+            cli_state_of(&ops, &Ok(windows.clone())),
+            cli_state(false, true, Some(false))
+        );
+        let ops = FakeOps::with_path(r"C:\Windows;C:\Program Files\atlas-duck");
+        assert_eq!(
+            cli_state_of(&ops, &Ok(windows)),
+            cli_state(false, true, Some(true)),
+            "on the user PATH, not yet installed (no cli.toml)"
+        );
+
+        // No layout: not installed, removable as before, nothing known about the PATH.
+        assert_eq!(
+            cli_state_of(&FakeOps::new(), &Err(InstallError::NoStablePath)),
+            cli_state(false, true, None)
+        );
     }
 
     /// S-05 (M8 Task 21): a startup probe whose memory-read probes got through (`OpenProcessVmRead`,
@@ -2951,8 +3045,10 @@ mod settings_commands {
         for (allowed, scripts) in [(false, "disabled"), (true, "degraded")] {
             let confinement = ConfinementDto::of_probe(state.probe_report(), allowed);
             let (s, i) = (h.core().settings(), h.instances());
-            let got =
-                blocking(move || settings_get_dto(&*s, &*i, confinement, false, true)).await?;
+            let got = blocking(move || {
+                settings_get_dto(&*s, &*i, confinement, cli_state(false, true, None))
+            })
+            .await?;
             // The core started and answers while the probe says the memory read got through.
             assert_eq!(got.settings, h.core().settings().view());
             assert_eq!(got.confinement.state, "not_met");

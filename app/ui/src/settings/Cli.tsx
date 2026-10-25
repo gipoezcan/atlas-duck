@@ -16,10 +16,13 @@ import { useAction } from './useAction';
 export function Cli({
   installed,
   removable,
+  dirOnPath,
   onChanged,
 }: {
   installed: boolean;
   removable: boolean;
+  /** `cli_dir_on_path`: whether the CLI's folder is on the PATH; `null` when not known. */
+  dirOnPath: boolean | null;
   onChanged: () => void;
 }) {
   const action = useAction();
@@ -34,10 +37,21 @@ export function Cli({
       onChanged();
     });
   const packaged = installed && !removable;
+  // The status line is path-aware: an installed CLI whose folder this app's PATH lacks is not
+  // called "on your PATH", and a folder already on the PATH is not called "not on your PATH".
+  const status = packaged
+    ? T.cli_outcomes.already_on_path
+    : installed
+      ? dirOnPath === false
+        ? T.cli_installed_dir_not_on_path
+        : T.cli_installed
+      : dirOnPath === true
+        ? T.cli_not_installed_dir_on_path
+        : T.cli_not_installed;
   return (
     <section aria-label={T.cli}>
       <h2>{T.cli}</h2>
-      <p>{packaged ? T.cli_outcomes.already_on_path : installed ? T.cli_installed : T.cli_not_installed}</p>
+      <p>{status}</p>
       {packaged ? null : (
         <button type="button" disabled={action.pending} onClick={click}>
           {installed ? T.cli_uninstall : T.cli_install}

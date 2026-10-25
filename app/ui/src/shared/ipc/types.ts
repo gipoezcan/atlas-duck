@@ -375,6 +375,13 @@ export interface SettingsGet {
   cli_installed: boolean;
   /** Removal changes something: false for deb/rpm, where the package owns the CLI (no button). */
   cli_removable: boolean;
+  /**
+   * The folder the CLI is in is on the PATH: the user PATH on Windows, the PATH this app was
+   * started with on macOS and for an AppImage (a GUI-launched macOS process has a minimal one, so
+   * `false` there does not prove a terminal lacks it). `null` for deb/rpm and when the app cannot
+   * tell where it is installed.
+   */
+  cli_dir_on_path: boolean | null;
 }
 
 /** One `settings_apply` change, in core's closed `{key, value}` form (`SettingChangeReq`). */

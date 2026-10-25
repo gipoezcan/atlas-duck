@@ -801,10 +801,30 @@ fn path_text_reflects_user_path() {
         ops.set_session_path(Some(join(&["/usr/bin"])));
         assert_eq!(cli_dir_on_path(&ops, layout), Some(false), "{layout:?}");
     }
+    // Windows: the user PATH of the registry (through the ops), not the process PATH.
     let ops = FakeOps::new();
     ops.set_session_path(Some(join(&["/home/u/.local/bin"])));
-    assert_eq!(cli_dir_on_path(&ops, &win), None);
     assert_eq!(cli_dir_on_path(&ops, &deb), None);
+    assert_eq!(
+        cli_dir_on_path(&ops, &win),
+        Some(false),
+        "no user PATH value"
+    );
+    let ops = FakeOps::with_path(r"C:\Windows");
+    assert_eq!(
+        cli_dir_on_path(&ops, &win),
+        Some(false),
+        "a PATH without the dir"
+    );
+    let ops = FakeOps::with_path(r"C:\Windows;C:\PROGRAM FILES\atlas-duck\");
+    assert_eq!(
+        cli_dir_on_path(&ops, &win),
+        Some(true),
+        "the dir, in any case"
+    );
+    // The process PATH does not matter there.
+    ops.set_session_path(Some(join(&["/usr/bin"])));
+    assert_eq!(cli_dir_on_path(&ops, &win), Some(true));
 }
 
 /// M-10: macOS resolves only where the link it would create is one it later removes: the CLI next

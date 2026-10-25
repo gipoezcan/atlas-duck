@@ -80,6 +80,7 @@ export function Settings() {
     confinement,
     cli_installed: cliInstalled,
     cli_removable: cliRemovable,
+    cli_dir_on_path: cliDirOnPath,
   } = data;
   const banner = settings.config_read_only;
   const readOnly = banner !== null;
@@ -112,7 +113,12 @@ export function Settings() {
       <AnchorDir view={settings} onChanged={reload} />
       <OldInstalls />
       <ConfinementStatus confinement={confinement} view={settings} onChanged={reload} />
-      <Cli installed={cliInstalled} removable={cliRemovable} onChanged={reload} />
+      <Cli
+        installed={cliInstalled}
+        removable={cliRemovable}
+        dirOnPath={cliDirOnPath}
+        onChanged={reload}
+      />
       <Removal onChanged={reload} />
     </main>
     </WindowBusyContext.Provider>

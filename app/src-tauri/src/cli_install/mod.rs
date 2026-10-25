@@ -481,14 +481,16 @@ pub fn local_bin_on_path(path: Option<&std::ffi::OsStr>, dir: &Path) -> bool {
         && std::env::split_paths(path).any(|entry| looks_absolute(&entry) && entry == dir)
 }
 
-/// Whether the folder this layout puts the CLI in (`~/.local/bin`) is on the PATH of this
-/// process: `None` where the CLI does not go to such a folder (Windows edits the user PATH itself,
-/// deb/rpm are in `/usr/bin`).
+/// Whether the folder this layout puts the CLI in is on the PATH: on macOS and for an AppImage
+/// (`~/.local/bin`) the PATH of this process (a GUI-launched macOS process has a minimal one); on
+/// Windows the user PATH of the registry (what a new terminal gets), read through `ops`. `None`
+/// for deb/rpm (the CLI is in `/usr/bin`).
 pub fn cli_dir_on_path(ops: &dyn PlatformOps, layout: &Layout) -> Option<bool> {
     let dir = match &layout.kind {
         Kind::Macos { link, .. } => link.parent(),
         Kind::AppImage { wrapper, .. } => wrapper.parent(),
-        Kind::Windows { .. } | Kind::Packaged => return None,
+        Kind::Windows { .. } => return Some(windows::present(ops, &layout.kind)),
+        Kind::Packaged => return None,
     };
     Some(dir.is_some_and(|d| local_bin_on_path(ops.session_path().as_deref(), d)))
 }

@@ -1466,6 +1466,7 @@ fn settings_gets() -> Vec<SettingsGet> {
             confinement: met,
             cli_installed: true,
             cli_removable: true,
+            cli_dir_on_path: Some(true),
         },
         SettingsGet {
             settings: views.next().unwrap_or_else(|| unreachable!()),
@@ -1473,6 +1474,7 @@ fn settings_gets() -> Vec<SettingsGet> {
             confinement: not_met,
             cli_installed: false,
             cli_removable: true,
+            cli_dir_on_path: Some(false),
         },
         // deb/rpm: the CLI is in `/usr/bin` and nothing can be removed.
         SettingsGet {
@@ -1481,6 +1483,7 @@ fn settings_gets() -> Vec<SettingsGet> {
             confinement: ConfinementDto::pending(),
             cli_installed: true,
             cli_removable: false,
+            cli_dir_on_path: None,
         },
         // The degraded state: the setting on (the first view) and an unmet floor.
         SettingsGet {
@@ -1489,6 +1492,8 @@ fn settings_gets() -> Vec<SettingsGet> {
             confinement: degraded,
             cli_installed: true,
             cli_removable: true,
+            // Installed to ~/.local/bin, which this process's PATH does not have.
+            cli_dir_on_path: Some(false),
         },
     ]
 }

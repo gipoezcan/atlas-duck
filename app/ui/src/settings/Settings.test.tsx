@@ -655,7 +655,7 @@ describe('Settings', () => {
   });
 
   it('the CLI button follows cli_installed and calls the matching command with no arguments', async () => {
-    const { unmount } = await show(plain({}, { cli_installed: false }));
+    const { unmount } = await show(plain({}, { cli_installed: false, cli_dir_on_path: false }));
     const install = screen.getByRole('button', { name: 'Install CLI to PATH' }) as HTMLButtonElement;
     expect(install.disabled).toBe(false);
     expect(screen.getByText('The atlas-duck command is not on your PATH.')).toBeTruthy();
@@ -679,6 +679,39 @@ describe('Settings', () => {
     expect(cliUninstall).toHaveBeenCalledWith();
     expect(cliInstall).toHaveBeenCalledTimes(1);
     expect(filledStatus().textContent).toContain('Removed');
+  });
+
+  it('the CLI status line follows cli_dir_on_path (T36b: path-aware, never over-asserts)', async () => {
+    const cases: [boolean, boolean | null, string][] = [
+      // installed: the folder is on the PATH, the PATH is unknown, or this app's PATH lacks it.
+      [true, true, 'The atlas-duck command is on your PATH.'],
+      [true, null, 'The atlas-duck command is on your PATH.'],
+      [
+        true,
+        false,
+        'The atlas-duck command is installed, but its folder is not on the PATH this app was started with. A terminal you open may still find it; if it does not, add that folder to the PATH of your shell.',
+      ],
+      // not installed: nothing there, or the folder is on the PATH already (the user's own entry).
+      [false, false, 'The atlas-duck command is not on your PATH.'],
+      [false, null, 'The atlas-duck command is not on your PATH.'],
+      [
+        false,
+        true,
+        'The folder for the atlas-duck command is already on your PATH, but the install is not complete yet. Use the button to finish it.',
+      ],
+    ];
+    for (const [installed, onPath, text] of cases) {
+      const { unmount } = await show(
+        plain({}, { cli_installed: installed, cli_removable: true, cli_dir_on_path: onPath }),
+      );
+      expect(screen.getByText(text), `${installed} ${onPath}`).toBeTruthy();
+      // Only one of the status sentences is shown.
+      expect(screen.queryAllByText(/^The (atlas-duck command|folder for the atlas-duck)/)).toHaveLength(1);
+      unmount();
+    }
+    // deb/rpm keeps the package sentence whatever the field says.
+    await show(plain({}, { cli_installed: true, cli_removable: false, cli_dir_on_path: null }));
+    expect(screen.getByText(/comes with the package and is already on your PATH/)).toBeTruthy();
   });
 
   it('every CLI outcome has its own fixed text', async () => {

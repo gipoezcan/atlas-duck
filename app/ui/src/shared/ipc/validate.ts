@@ -390,6 +390,7 @@ export const isSettingsGet = (v: unknown): v is SettingsGet =>
     confinement: isConfinement,
     cli_installed: isBool,
     cli_removable: isBool,
+    cli_dir_on_path: (b): b is boolean | null => b === null || isBool(b),
   });
 
 export const isRetestOutcome = (v: unknown): v is RetestOutcome => {

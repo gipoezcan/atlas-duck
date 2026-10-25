@@ -1,5 +1,6 @@
 [
   {
+    "cli_dir_on_path": true,
     "cli_installed": true,
     "cli_removable": true,
     "confinement": {
@@ -93,6 +94,7 @@
     }
   },
   {
+    "cli_dir_on_path": false,
     "cli_installed": false,
     "cli_removable": true,
     "confinement": {
@@ -165,6 +167,7 @@
     }
   },
   {
+    "cli_dir_on_path": null,
     "cli_installed": true,
     "cli_removable": false,
     "confinement": {
@@ -219,6 +222,7 @@
     }
   },
   {
+    "cli_dir_on_path": false,
     "cli_installed": true,
     "cli_removable": true,
     "confinement": {

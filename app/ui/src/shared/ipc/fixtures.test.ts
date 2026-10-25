@@ -475,6 +475,13 @@ describe('fixtures validate against their TS types', () => {
     expect(isSettingsGet({ ...full, cli_removable: 'yes' })).toBe(false);
     expect(isSettingsGet({ ...full, cli_removable: null })).toBe(false);
     expect(isSettingsGet({ ...full, cli_removable: undefined })).toBe(false);
+    // `cli_dir_on_path` (T36b) is a bool or null (deb/rpm, no layout), always on the wire: all three
+    // values are in the fixtures; absent, a string or a number is refused.
+    expect(new Set(settingsGet.map((g) => g.cli_dir_on_path))).toEqual(new Set([true, false, null]));
+    expect(isSettingsGet({ ...full, cli_dir_on_path: null })).toBe(true);
+    expect(isSettingsGet({ ...full, cli_dir_on_path: 'yes' })).toBe(false);
+    expect(isSettingsGet({ ...full, cli_dir_on_path: 1 })).toBe(false);
+    expect(isSettingsGet({ ...full, cli_dir_on_path: undefined })).toBe(false);
     expect(isSettingsGet({ ...full, settings: { ...full?.settings, attention_mode: 'loud' } })).toBe(false);
     expect(isSettingsGet({ ...full, settings: { ...full?.settings, config_read_only: { kind: 'x', text: '' } } })).toBe(false);
     // `conn` is written only for a tls, proxy or network failure.

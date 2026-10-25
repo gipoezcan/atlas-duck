@@ -473,6 +473,12 @@ pub struct SettingsGet {
     /// "Remove CLI from PATH" does something here: false for deb/rpm (the CLI is in `/usr/bin`; the
     /// package owns it), where Settings shows no removal button.
     pub cli_removable: bool,
+    /// The folder the CLI is in is on the PATH (`cli_install::cli_dir_on_path`): the user PATH on
+    /// Windows, this process's PATH on macOS and for an AppImage (a GUI-launched macOS process has a
+    /// minimal one, so `false` there does not prove a terminal lacks it). `null` for deb/rpm (the
+    /// CLI is in `/usr/bin`) and when this machine has no stable install layout. Settings words
+    /// its status line by it.
+    pub cli_dir_on_path: Option<bool>,
 }
 
 /// `retest_token`'s answer: "Connected as <user>" or a fixed failure class (§10.3); the instance
@@ -521,36 +527,55 @@ fn machine_for_removal() -> (Result<Layout, InstallError>, Option<Layout>) {
     }
 }
 
-/// `(installed, removable)` of the CLI on this machine (§12.3). `installed`: the CLI is on the PATH
-/// as this installation wants it; a machine whose layout cannot be resolved (no stable path) counts
-/// as not installed. `removable`: removal changes something, which it does not for deb/rpm.
-pub fn cli_state() -> (bool, bool) {
-    match this_machine() {
-        Ok(layout) => (
-            cli_install::is_installed(&SystemOps, &layout),
-            !matches!(layout.kind, Kind::Packaged),
-        ),
-        Err(_) => (false, true),
+/// What `settings_get` says of the CLI on this machine (§12.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CliState {
+    /// The CLI is on the PATH as this installation wants it; a machine whose layout cannot be
+    /// resolved (no stable path) counts as not installed.
+    pub installed: bool,
+    /// Removal changes something, which it does not for deb/rpm.
+    pub removable: bool,
+    /// [`cli_install::cli_dir_on_path`]; `None` where there is no such folder or no layout.
+    pub dir_on_path: Option<bool>,
+}
+
+/// [`CliState`] of `layout` over `ops` (the pure part of [`cli_state`]).
+pub fn cli_state_of(ops: &dyn PlatformOps, layout: &Result<Layout, InstallError>) -> CliState {
+    match layout {
+        Ok(layout) => CliState {
+            installed: cli_install::is_installed(ops, layout),
+            removable: !matches!(layout.kind, Kind::Packaged),
+            dir_on_path: cli_install::cli_dir_on_path(ops, layout),
+        },
+        Err(_) => CliState {
+            installed: false,
+            removable: true,
+            dir_on_path: None,
+        },
     }
+}
+
+/// [`CliState`] of this machine.
+pub fn cli_state() -> CliState {
+    cli_state_of(&SystemOps, &this_machine())
 }
 
 // ---------- the pure parts the tests drive ----------
 
-/// `settings_get` over core. `cli_installed` and `cli_removable` are [`cli_state`] (the caller
-/// reads the OS).
+/// `settings_get` over core. `cli` is [`cli_state`] (the caller reads the OS).
 pub fn settings_get_dto(
     settings: &dyn SettingsAdmin,
     instances: &dyn InstanceAdmin,
     confinement: ConfinementDto,
-    cli_installed: bool,
-    cli_removable: bool,
+    cli: CliState,
 ) -> SettingsGet {
     SettingsGet {
         settings: settings.view(),
         instances: instances.list(),
         confinement,
-        cli_installed,
-        cli_removable,
+        cli_installed: cli.installed,
+        cli_removable: cli.removable,
+        cli_dir_on_path: cli.dir_on_path,
     }
 }
 
@@ -867,17 +892,11 @@ pub async fn settings_get<R: Runtime>(
             let (settings, instances) = (core.settings(), core.instances());
             // Reads the registry or the file system, and the settings view: the blocking pool.
             blocking(move || {
-                let (installed, removable) = cli_state();
+                let cli = cli_state();
                 // Δ8: the setting is core's run policy as the glue reads it at each call.
                 let confinement =
                     ConfinementDto::of_probe(report.as_ref(), core.script_policy().allow_degraded);
-                Ok(settings_get_dto(
-                    &*settings,
-                    &*instances,
-                    confinement,
-                    installed,
-                    removable,
-                ))
+                Ok(settings_get_dto(&*settings, &*instances, confinement, cli))
             })
             .await
         }
