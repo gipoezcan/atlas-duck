@@ -1087,11 +1087,26 @@ async fn s06_audit(rig: &Rig) -> Result<()> {
             as_text += 1;
         }
         assert_inert_document(wd, "audit window").await?;
-        // The frame is the only one, and sandboxed (`sandbox=""`: the attribute is present, empty).
+        // The window holds Tauri's own isolation-pattern frame (`__tauri_isolation__`, the page's
+        // IPC bridge; it is not the page's) and the one payload frame. The invariant: exactly one
+        // payload frame (a closed record leaves none behind), and every iframe of the page's own
+        // is sandboxed with the empty token list (`sandbox=""`: present, empty, no `allow-scripts`).
         let frames = wd.find_all("iframe").await?;
-        ensure_eq!(frames.len(), 1, "iframes in the Audit window");
-        let sandbox = wd.attribute(&frames[0], "sandbox").await?;
-        ensure_eq!(sandbox.as_deref(), Some(""), "the payload frame's sandbox");
+        let mut payload_frames = 0usize;
+        for f in &frames {
+            if wd.attribute(f, "id").await?.as_deref() == Some("__tauri_isolation__") {
+                continue;
+            }
+            let frame_title = wd.attribute(f, "title").await?.unwrap_or_default();
+            ensure!(
+                frame_title.starts_with("Decrypted payload"),
+                "an iframe in the Audit window that is neither Tauri's isolation frame nor a payload frame: title {frame_title:?}"
+            );
+            payload_frames += 1;
+            let sandbox = wd.attribute(f, "sandbox").await?;
+            ensure_eq!(sandbox.as_deref(), Some(""), "the payload frame's sandbox");
+        }
+        ensure_eq!(payload_frames, 1, "payload frames in the Audit window");
         ensure_eq!(wd.title().await?, title, "the window title changed");
     }
     ensure!(shown > 0, "no payload was opened");
