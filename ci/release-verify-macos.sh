@@ -8,7 +8,9 @@
 #     runtime flag, and entitlements (codesign -d --entitlements :-) without get-task-allow;
 #   - spctl --assess --type execute on the .app (Gatekeeper accepts it: Developer ID + notarized);
 #   - spctl -a -t open --context context:primary-signature on the dmg;
-#   - xcrun stapler validate on the .app (the notarization ticket is stapled).
+#   - xcrun stapler validate on the dmg: ci/notarize-macos-dmg.sh notarizes the dmg after the build
+#     (fix I-1: no notarization credential inside cargo tauri build) and staples the ticket to the dmg,
+#     which is what users download; the .app inside is covered by that ticket but carries none.
 set -euo pipefail
 dir="${1:?usage: release-verify-macos.sh <dir-with-one-dmg> <arm64|x86_64>}"
 arch="${2:?usage: release-verify-macos.sh <dir-with-one-dmg> <arm64|x86_64>}"
@@ -55,5 +57,5 @@ done
 
 spctl --assess --type execute --verbose=4 "$app" || fail "spctl rejects the .app (not notarized or not Developer ID)"
 spctl -a -t open --context context:primary-signature -v "$dmg" || fail "spctl rejects the dmg"
-xcrun stapler validate "$app" || fail "no stapled notarization ticket on the .app"
+xcrun stapler validate "$dmg" || fail "no stapled notarization ticket on the dmg"
 echo "release-verify-macos: $(basename "$dmg") ($arch) is Developer ID signed, notarized and stapled"

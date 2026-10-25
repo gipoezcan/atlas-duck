@@ -36,6 +36,23 @@ inputs:
       passed as `cargo tauri build --config`. ci/check-release-build.sh checks the same value.
     required: false
     default: ""
+  # Signing values for the build step ONLY (M10 Task 26 fix I-1). A `with:` value is visible only
+  # where the action references it (here: the "Build the bundles" step), unlike `env:` on the
+  # `uses:` step, which every inner step (npm, vite) would see. Each is exported only when
+  # non-empty. Certificates and their passwords are never inputs: the signing jobs import them
+  # into a keychain / the cert store before this action runs.
+  apple-signing-identity:
+    description: "macOS release: the Developer ID identity name (read by ci/sign-macos-bins.sh)"
+    required: false
+    default: ""
+  signpath-api-token:
+    description: "Windows release: the token WINDOWS_SIGN_COMMAND needs when it calls SignPath"
+    required: false
+    default: ""
+  rust-cache:
+    description: "false: no cargo cache restore or save (release runs build from scratch)"
+    required: false
+    default: "true"
 
 runs:
   using: composite
@@ -53,6 +70,7 @@ runs:
         rustc -vV
 
     - name: Cache cargo registry and target dir
+      if: ${{ inputs.rust-cache == 'true' }}
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
         key: bundle-${{ inputs.target }}
@@ -138,11 +156,18 @@ runs:
         TARGET: ${{ inputs.target }}
         BUNDLES: ${{ inputs.bundles }}
         TAURI_CONFIG: ${{ inputs.tauri-config }}
+        SIGN_IDENTITY_INPUT: ${{ inputs.apple-signing-identity }}
+        SIGNPATH_TOKEN_INPUT: ${{ inputs.signpath-api-token }}
       run: |
         set -euo pipefail
+        if [ -n "$SIGN_IDENTITY_INPUT" ]; then export APPLE_SIGNING_IDENTITY="$SIGN_IDENTITY_INPUT"; fi
+        if [ -n "$SIGNPATH_TOKEN_INPUT" ]; then export SIGNPATH_API_TOKEN="$SIGNPATH_TOKEN_INPUT"; fi
+        unset SIGN_IDENTITY_INPUT SIGNPATH_TOKEN_INPUT
         config_args=()
+        # Same inline test as check-release-build.sh: optional leading whitespace, then "{".
+        trimmed="${TAURI_CONFIG#"${TAURI_CONFIG%%[![:space:]]*}"}"
         if [ -n "$TAURI_CONFIG" ]; then
-          case "$TAURI_CONFIG" in
+          case "$trimmed" in
             "{"*) config_args=(--config "$TAURI_CONFIG") ;;
             *) config_args=(--config "$GITHUB_WORKSPACE/$TAURI_CONFIG") ;;
           esac

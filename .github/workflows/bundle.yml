@@ -39,6 +39,27 @@ on:
         required: false
         type: boolean
         default: false
+    # Passed by name from release.yml; the values come from the `release` environment in the jobs
+    # that declare it. All optional here: ci/check-release-secrets.sh is the gate.
+    secrets:
+      WINDOWS_CERTIFICATE:
+        required: false
+      WINDOWS_CERTIFICATE_PASSWORD:
+        required: false
+      SIGNPATH_API_TOKEN:
+        required: false
+      APPLE_CERTIFICATE:
+        required: false
+      APPLE_CERTIFICATE_PASSWORD:
+        required: false
+      APPLE_SIGNING_IDENTITY:
+        required: false
+      APPLE_ID:
+        required: false
+      APPLE_PASSWORD:
+        required: false
+      APPLE_TEAM_ID:
+        required: false
 
 permissions:
   contents: read
@@ -94,9 +115,17 @@ jobs:
 
   # Authenticode (spec §3.2). Provider-neutral (human decisions Q1, Q3 open): the environment
   # variable WINDOWS_SIGN_COMMAND is the whole Tauri signCommand (signtool, SignPath or another
-  # tool; %1 is the file). The secrets it may need reach the job as env under fixed names, each
-  # optional: WINDOWS_CERTIFICATE (base64 .pfx) + WINDOWS_CERTIFICATE_PASSWORD, or
-  # SIGNPATH_API_TOKEN. ci/check-release-secrets.sh requires the command and one of the two.
+  # tool; %1 is the file). Its secrets have fixed names, each optional: WINDOWS_CERTIFICATE (base64
+  # .pfx) + WINDOWS_CERTIFICATE_PASSWORD, or SIGNPATH_API_TOKEN. ci/check-release-secrets.sh
+  # requires the command and one of the two. Fix I-1: secrets are mapped per step, never on the
+  # job. The PFX and its password reach only the guard and the import step; the build step gets
+  # only SIGNPATH_API_TOKEN (as a composite input applied to its build step), because the
+  # signCommand runs inside `cargo tauri build`.
+  # Fix I-2: no pre-bundle signing of the two extra [[bin]]s. tauri-bundler signs every non-main
+  # [[bin]] itself (src/bundle.rs, sign_binaries_if_needed: `for bin in settings.binaries() { if
+  # bin.main() { continue; } ... try_sign(&bin_path, settings) }`, tauri-bundler 2.10.1), and its
+  # own comment warns that signing an already-signed binary can give multiple signatures that fail
+  # verification. ci/release-verify-windows.ps1 verifies all three exes from the installer.
   bundle-windows-signed:
     name: bundle-windows-signed (x86_64-pc-windows-msvc, NSIS, Authenticode)
     if: ${{ inputs.release }}
@@ -105,12 +134,10 @@ jobs:
     timeout-minutes: 90
     env:
       TARGET: x86_64-pc-windows-msvc
+      # Variables, not secrets.
       WINDOWS_SIGN_COMMAND: ${{ vars.WINDOWS_SIGN_COMMAND }}
       WINDOWS_CERT_THUMBPRINT: ${{ vars.WINDOWS_CERT_THUMBPRINT }}
       WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
-      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -118,18 +145,28 @@ jobs:
           persist-credentials: false
 
       - name: Signing secrets guard (fails a release run with empty signing values)
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
         run: bash ci/check-release-secrets.sh windows
 
       - name: Import the code-signing certificate (only when WINDOWS_CERTIFICATE is set)
-        if: ${{ env.WINDOWS_CERTIFICATE != '' }}
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          if (-not $env:WINDOWS_CERTIFICATE) { Write-Host 'no WINDOWS_CERTIFICATE: the sign command brings its own credential'; exit 0 }
           $pfx = Join-Path $env:RUNNER_TEMP 'release-signing.pfx'
-          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
-          $pw = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
-          Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $pw | Out-Null
-          Remove-Item -LiteralPath $pfx -Force
+          try {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+            $pw = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+            Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $pw | Out-Null
+          } finally {
+            if (Test-Path -LiteralPath $pfx) { Remove-Item -LiteralPath $pfx -Force }
+          }
 
       - name: Write the release-only signing config (ci/release-signing.windows.json)
         run: |
@@ -151,7 +188,9 @@ jobs:
           cli-archive: cargo-tauri-x86_64-pc-windows-msvc.zip
           cli-sha256: d3919ebe0bf7013dd98293862784dd37b8f76db2d650e13a3ec11c5dd799c519
           release: "true"
+          rust-cache: "false"
           tauri-config: ci/release-signing.windows.json
+          signpath-api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
 
       - name: Check the NSIS installer content (exactly three executables)
         shell: pwsh
@@ -202,11 +241,20 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # Developer ID + notarization (spec §3.2, §2.5). Tauri reads APPLE_CERTIFICATE,
-  # APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY (signing) and APPLE_ID, APPLE_PASSWORD,
-  # APPLE_TEAM_ID (notarization) from the environment. The three [[bin]]s are signed by
-  # ci/sign-macos-bins.sh as beforeBundleCommand (Developer ID, runtime, entitlements, timestamp),
-  # from a keychain this job imports the certificate into.
+  # Developer ID + notarization (spec §3.2, §2.5). Fix I-1: secrets are mapped per step, never on
+  # the job.
+  #   guard          all six (it checks they are non-empty, prints none)
+  #   import         APPLE_CERTIFICATE + APPLE_CERTIFICATE_PASSWORD + APPLE_SIGNING_IDENTITY:
+  #                  ci/import-macos-certificate.sh puts the identity into a job keychain
+  #   config writer  APPLE_SIGNING_IDENTITY (bundle.macOS.signingIdentity)
+  #   build          APPLE_SIGNING_IDENTITY only, as a composite input applied to its build step
+  #                  (ci/sign-macos-bins.sh, the beforeBundleCommand, signs the three [[bin]]s with
+  #                  it; Tauri signs the .app from the keychain). No certificate, no password and no
+  #                  notarization credential enters `cargo tauri build`: without APPLE_ID /
+  #                  APPLE_PASSWORD / APPLE_TEAM_ID Tauri skips notarization ("skipping app
+  #                  notarization", tauri-bundler src/bundle/macos/app.rs).
+  #   notarize       APPLE_ID + APPLE_PASSWORD + APPLE_TEAM_ID: ci/notarize-macos-dmg.sh submits the
+  #                  dmg with notarytool --wait and staples the ticket to the dmg, after the build.
   bundle-macos-arm64-signed:
     name: bundle-macos-arm64-signed (aarch64-apple-darwin, Developer ID, notarized)
     if: ${{ inputs.release }}
@@ -215,12 +263,6 @@ jobs:
     timeout-minutes: 120
     env:
       TARGET: aarch64-apple-darwin
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -228,12 +270,25 @@ jobs:
           persist-credentials: false
 
       - name: Signing secrets guard (fails a release run with empty signing values)
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: bash ci/check-release-secrets.sh macos
 
       - name: Import the Developer ID certificate into a job keychain
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: bash ci/import-macos-certificate.sh
 
       - name: Write the release-only signing config
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
           set -euo pipefail
           node -e '
@@ -242,7 +297,7 @@ jobs:
             require("fs").writeFileSync("ci/release-signing.macos.json", JSON.stringify(cfg));
           '
 
-      - name: Build the .app and .dmg (Developer ID, hardened runtime, notarized)
+      - name: Build the .app and .dmg (Developer ID, hardened runtime)
         uses: ./.github/actions/tauri-bundle
         with:
           target: aarch64-apple-darwin
@@ -251,10 +306,24 @@ jobs:
           cli-archive: cargo-tauri-aarch64-apple-darwin.zip
           cli-sha256: ee35ee364a0c626df7852d9a5bc0c5394b6440772e9864cfb9b11dcb8d33f527
           release: "true"
+          rust-cache: "false"
           tauri-config: ci/release-signing.macos.json
+          apple-signing-identity: ${{ secrets.APPLE_SIGNING_IDENTITY }}
 
       - name: Check the .app in the dmg (bins, arch, hardened runtime, entitlements, CLI)
         run: bash ci/check-macos-bundle.sh "target/$TARGET/release/bundle/dmg" arm64
+
+      # The signing key is not needed after the build: drop the job keychain before notarization.
+      - name: Delete the job keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/atlas-duck-release.keychain-db" || true
+
+      - name: Notarize and staple the dmg (notarytool, after the build)
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: bash ci/notarize-macos-dmg.sh "target/$TARGET/release/bundle/dmg"
 
       - name: Upload bundle-aarch64-apple-darwin
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -307,6 +376,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # Same secret mapping as bundle-macos-arm64-signed.
   bundle-macos-x86_64-signed:
     name: bundle-macos-x86_64-signed (x86_64-apple-darwin on the arm64 runner, Developer ID, notarized)
     if: ${{ inputs.release }}
@@ -315,12 +385,6 @@ jobs:
     timeout-minutes: 120
     env:
       TARGET: x86_64-apple-darwin
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -328,16 +392,29 @@ jobs:
           persist-credentials: false
 
       - name: Signing secrets guard (fails a release run with empty signing values)
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: bash ci/check-release-secrets.sh macos
 
       - name: Install Rosetta 2 and fail loudly if it does not work (§15 V32)
         run: bash ci/install-rosetta.sh
 
       - name: Import the Developer ID certificate into a job keychain
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: bash ci/import-macos-certificate.sh
 
       # The release sign script replaces the ad-hoc one: it also signs the unsigned x86_64 images.
       - name: Write the release-only signing config
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
           set -euo pipefail
           node -e '
@@ -346,7 +423,7 @@ jobs:
             require("fs").writeFileSync("ci/release-signing.macos.json", JSON.stringify(cfg));
           '
 
-      - name: Build the .app and .dmg for x86_64 (Developer ID, hardened runtime, notarized)
+      - name: Build the .app and .dmg for x86_64 (Developer ID, hardened runtime)
         uses: ./.github/actions/tauri-bundle
         with:
           target: x86_64-apple-darwin
@@ -356,10 +433,24 @@ jobs:
           cli-archive: cargo-tauri-aarch64-apple-darwin.zip
           cli-sha256: ee35ee364a0c626df7852d9a5bc0c5394b6440772e9864cfb9b11dcb8d33f527
           release: "true"
+          rust-cache: "false"
           tauri-config: ci/release-signing.macos.json
+          apple-signing-identity: ${{ secrets.APPLE_SIGNING_IDENTITY }}
 
       - name: Check the .app in the dmg (bins, arch, hardened runtime, entitlements, CLI under Rosetta)
         run: bash ci/check-macos-bundle.sh "target/$TARGET/release/bundle/dmg" x86_64
+
+      # The signing key is not needed after the build: drop the job keychain before notarization.
+      - name: Delete the job keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/atlas-duck-release.keychain-db" || true
+
+      - name: Notarize and staple the dmg (notarytool, after the build)
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: bash ci/notarize-macos-dmg.sh "target/$TARGET/release/bundle/dmg"
 
       - name: Upload bundle-x86_64-apple-darwin
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

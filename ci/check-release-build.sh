@@ -131,6 +131,8 @@ self_test() {
   expect_ok  "a generated macOS release config" "$tmp/release-signing.macos.json"
   expect_ok  "today's inline beforeBundleCommand value (bundle.yml x86_64 leg)" '{"build":{"beforeBundleCommand":"bash $GITHUB_WORKSPACE/ci/sign-macos-bins-adhoc.sh $TARGET"}}'
   expect_ok  "no --config" ''
+  expect_ok  "a Windows config with signCommand plus a beforeBundleCommand" '{"bundle":{"windows":{"signCommand":"signtool sign /fd sha256 %1"}},"build":{"beforeBundleCommand":"pwsh -File ci/x.ps1"}}'
+  expect_ok  "an inline value with leading whitespace (same test as the action)" '  {"build":{"beforeBundleCommand":"x"}}'
   expect_bad "a file with features" "$tmp/features.json"
   expect_bad "a file with a profile" "$tmp/profile.json"
   expect_bad "an inline value with features" '{"build":{"features":["testing"]}}'

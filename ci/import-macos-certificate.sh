@@ -18,7 +18,7 @@ printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$p12"
 security create-keychain -p "$keychain_pw" "$keychain"
 security set-keychain-settings -lut 21600 "$keychain"
 security unlock-keychain -p "$keychain_pw" "$keychain"
-security import "$p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+security import "$p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_pw" "$keychain" >/dev/null
 # shellcheck disable=SC2046
 security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')

@@ -6,8 +6,13 @@ name: release
 #
 #   bundle                 bundle.yml with release: true. A job that calls a reusable workflow
 #                          cannot declare `environment:`; the signing jobs inside bundle.yml declare
-#                          it themselves and so see the environment's secrets. `secrets: inherit`
-#                          because the docs say the caller must still pass the secret.
+#                          it themselves and so get the environment's secret values. The caller
+#                          still names each secret (docs, reuse-workflows: "You can pass a secret by
+#                          name even if it only exists in the environment" / "If the caller workflow
+#                          doesn't pass an environment secret, the secret resolves to an empty string
+#                          in the reusable workflow"), so it passes exactly the nine signing secret
+#                          names, not `secrets: inherit` (no other repo or org secret reaches bundle.yml).
+#                          https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows
 #   release-verify-*       signtool / codesign / spctl / stapler checks on the uploaded packages
 #                          (no secret needed, so no environment).
 #   install-probes         install-probes.yml on this run's artifacts (workflow_run does not fire
@@ -37,7 +42,16 @@ jobs:
     uses: ./.github/workflows/bundle.yml
     with:
       release: true
-    secrets: inherit
+    secrets:
+      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
     permissions:
       contents: read
 
