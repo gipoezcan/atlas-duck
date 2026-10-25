@@ -599,7 +599,10 @@ fn shown_version(info: &ConfigReadOnly) -> String {
     }
 }
 
-/// §7.7 (verbatim, with `vX` from `written_by`).
+/// The config banner. §7.7 (verbatim, with `vX` from `written_by`): the read-only text and the
+/// newer-schema "could not be read; upgrade atlas-duck" text. Plan text (L82, PD-90
+/// `config_unreadable`), in no spec sentence: "config could not be read; settings unavailable until
+/// it can be" (a file with no schema that was not parsed at all).
 fn banner(cfg: &ConfigState) -> Option<ConfigBanner> {
     match cfg {
         ConfigState::ReadOnly { info, .. } => Some(ConfigBanner {

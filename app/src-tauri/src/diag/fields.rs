@@ -304,6 +304,54 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+/// Test helper for the modules that own a `LOG_FIELDS`: runs `f` under the allowlist layer and
+/// returns the lines written (M10 T36, M6 M-1).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Arc, Mutex};
+
+    use tracing_subscriber::fmt::MakeWriter;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    use super::{Registry, allowlist_layer};
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Capture {
+        type Writer = Capture;
+        fn make_writer(&'a self) -> Capture {
+            self.clone()
+        }
+    }
+
+    /// The text `f` logged through the allowlist, after `fields` (a module's `LOG_FIELDS`) joined it.
+    pub(crate) fn lines_after_extending(
+        fields: &'static [&'static str],
+        f: impl FnOnce(),
+    ) -> String {
+        super::extend_allowed(fields);
+        let cap = Capture::default();
+        let subscriber = Registry::default().with(allowlist_layer(cap.clone()));
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = cap.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        String::from_utf8(bytes).unwrap_or_default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

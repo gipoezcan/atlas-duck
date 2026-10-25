@@ -196,13 +196,15 @@ pub fn lines(i: &StatusInputs) -> Vec<StatusLineDto> {
     use StatusLevel::{Caution, Info};
     let mut out = Vec::new();
     match i.gate {
-        // §2.5 (verbatim).
+        // PD-90 `locked_refused`; §2.5 verbatim "Locked — N requests refused" (app-generated; the
+        // count is the current gate state's only, L74; "1 requests" for one, L128).
         Some(GateState::Locked(_)) => out.push(line(
             "locked_refused",
             Caution,
             format!("Locked — {} requests refused", i.refused),
         )),
-        // §2.5 (verbatim).
+        // PD-90 `setup_refused`; §2.5 verbatim "Setup required — N requests refused" (spec fix G1,
+        // L46; app-generated, the current gate state's count only, L74).
         Some(GateState::FirstRun) => out.push(line(
             "setup_refused",
             Caution,
@@ -240,6 +242,7 @@ pub fn lines(i: &StatusInputs) -> Vec<StatusLineDto> {
     if i.gate == Some(GateState::StoreNewer) {
         out.push(line("store_newer", Caution, TEXT_STORE_NEWER.to_owned()));
     }
+    // PD-90 `needs_attention`, plan text (L114): "N need attention" is in no spec sentence.
     if i.needs_attention > 0 {
         out.push(line(
             "needs_attention",

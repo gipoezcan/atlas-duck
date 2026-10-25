@@ -77,6 +77,10 @@ pub const PROXY_MAX_BYTES: usize = 300;
 /// error's kind; never a message, a path or a value).
 pub const LOG_EVENT_SETTINGS_FAILED: &str = "settings_failed";
 
+/// The fields this module's lines add to the diagnostic allowlist (M10 T36, M6 M-1): the inner kind
+/// of a failed call (`error_kind`, an error's `Display`: no message, path or value).
+pub const LOG_FIELDS: &[&str] = &["error_kind"];
+
 // ---------- argument newtypes ----------
 
 fn text<'de, D: Deserializer<'de>>(d: D, field: &'static str) -> Result<String, D::Error> {
@@ -689,7 +693,7 @@ pub fn read_ca_bounded(path: &Path) -> Result<Vec<u8>, CommandError> {
     Ok(bytes)
 }
 
-/// `instance_add`. `pick_ca` runs only for `use_custom_ca` and is the one source of the CA bytes
+/// `instance_add`. `pick_ca` runs only for `use_custom_ca`, after core's `check_add` passed, and is the one source of the CA bytes
 /// (the command passes Rust's file dialog; the webview has no way to supply any): a `Cancel` of
 /// the file dialog is `Cancelled`.
 pub fn instance_add_dto(
@@ -705,19 +709,21 @@ pub fn instance_add_dto(
         use_custom_ca,
         is_default,
     } = args;
-    let ca_pem = if use_custom_ca {
-        Some(pick_ca()?)
-    } else {
-        None
-    };
-    Ok(admin.add(AddInstance {
+    let mut req = AddInstance {
         alias: alias.0,
         product: product.0,
         base_url: base_url.0,
         proxy: proxy.0,
-        ca_pem,
+        ca_pem: None,
         is_default,
-    })?)
+    };
+    // M10 T36 (L217): core's own checks (URL, alias, default) come first, so a request core
+    // refuses never opens the file dialog.
+    admin.check_add(&req)?;
+    if use_custom_ca {
+        req.ca_pem = Some(pick_ca()?);
+    }
+    Ok(admin.add(req)?)
 }
 
 pub fn instance_change_url_dto(
@@ -1838,6 +1844,35 @@ pub async fn forget_install<R: Runtime>(
 
 #[cfg(test)]
 mod tests {
+    /// M10 T36 (M6 M-1): a failed call's line carries `error_kind` through the allowlist (it was
+    /// counted as dropped), for core's admin and settings errors.
+    #[test]
+    fn diag_lines_carry_error_kind_settings() {
+        assert_eq!(
+            LOG_FIELDS,
+            ["error_kind"],
+            "the allowlist is shared: pin this module's own"
+        );
+        let log = |e: CommandError| {
+            crate::diag::fields::test_support::lines_after_extending(LOG_FIELDS, || {
+                note_failure::<()>(&Err(e))
+            })
+        };
+        let out = log(CommandError::Admin(AdminError::ConfigReadOnly));
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(
+            out.contains(
+                "event=settings_failed error_class=admin error_kind=config_read_only dropped_fields=0"
+            ),
+            "{out}"
+        );
+        let out = log(CommandError::Settings(SettingsError::Conflict));
+        assert!(
+            out.contains("error_class=settings error_kind=conflict dropped_fields=0"),
+            "{out}"
+        );
+    }
+
     use serde_json::json;
 
     use super::*;

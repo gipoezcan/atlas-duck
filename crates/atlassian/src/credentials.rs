@@ -35,6 +35,14 @@ impl fmt::Debug for PatSecret {
     }
 }
 
+/// M10 T36 (M6 M-13): the token's copy before it is a `PatSecret` is zeroizing memory too; the
+/// secret is built from the borrowed text (exact capacity) and the temporary is wiped on drop.
+impl From<zeroize::Zeroizing<String>> for PatSecret {
+    fn from(token: zeroize::Zeroizing<String>) -> Self {
+        PatSecret(SecretString::from(token.as_str()))
+    }
+}
+
 impl From<SecretString> for PatSecret {
     fn from(s: SecretString) -> Self {
         PatSecret(s)

@@ -1058,6 +1058,8 @@ fn json_node(doc: &mut Doc, key: Option<Key<'_>>, n: &JsonNode) {
         JsonNode::Bool { value } => doc.el("code", if *value { "true" } else { "false" }),
         JsonNode::Number { text } => doc.raw_code_text(text),
         JsonNode::String { text } => doc.raw_quoted(text),
+        // Plan text (M5, PD-90 class; no spec sentence): the placeholder of a collapsed string. The
+        // spec's §5.2 step 4 only requires that such a region is counted as hidden in preview.
         JsonNode::Collapsed { byte_len, .. } => doc.fixed(&format!(
             "string of {byte_len} bytes, not shown here; see Structured or Raw"
         )),

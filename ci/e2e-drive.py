@@ -49,6 +49,8 @@ import urllib.request
 
 ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecf"
 WAIT = 30
+# Characters of a driver error message kept for a "/value" call (webdriver.rs VALUE_CALL_MESSAGE_MAX).
+VALUE_CALL_MESSAGE_MAX = 32
 START_WAIT = 90
 # Seconds a forwarded launch gets to open (or not open) a window before the windows are counted.
 SETTLE = 4
@@ -317,20 +319,26 @@ class Session:
             with opener.open(req, timeout=timeout) as r:
                 text = r.read().decode()
         except urllib.error.HTTPError as e:
-            return Session._http_error(e)
+            return Session._http_error(e, url.endswith("/value"))
         except (urllib.error.URLError, OSError) as e:
             raise Failed("webdriver connection: %s" % e)
         doc = json.loads(text) if text.strip() else {"value": None}
         return doc["value"]
 
     @staticmethod
-    def _http_error(e):
+    def _http_error(e, value_call=False):
+        # An Element Send Keys ("/value") error: some drivers quote the typed text (a PAT or
+        # passphrase canary) in their message, so it is cut (M10 T36, M6 M-13); the code stays.
+        keep = VALUE_CALL_MESSAGE_MAX if value_call else None
         text = e.read().decode(errors="replace")
         try:
             v = json.loads(text)["value"]
-            detail = "webdriver %s: %s" % (v.get("error"), v.get("message"))
+            message = str(v.get("message"))
+            if keep is not None and len(message) > keep:
+                message = message[:keep] + "... (cut)"
+            detail = "webdriver %s: %s" % (v.get("error"), message)
         except (ValueError, KeyError, TypeError, AttributeError):
-            detail = "webdriver HTTP %s: %s" % (e.code, text[:300])
+            detail = "webdriver HTTP %s: %s" % (e.code, text[: (keep if keep is not None else 300)])
         raise Failed(detail)
 
     def call(self, method, path, body=None):

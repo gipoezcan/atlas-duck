@@ -509,6 +509,8 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
       ctx.purpose !== 'restore_backup' &&
       ctx.purpose !== 'change_recovery_passphrase'
     ) {
+      // §2.5 / §10.3 verbatim, app-generated: "Locked — N requests refused" and, for the wizard's
+      // passphrase purpose (spec fix G1, L46), "Setup required — N requests refused".
       const label = ctx.purpose === 'recovery_passphrase' ? 'Setup required' : 'Locked';
       h.append(el('p', 'locked', `${label} \u2014 ${ctx.refusedCount} requests refused`));
     }

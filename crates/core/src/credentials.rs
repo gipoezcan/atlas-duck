@@ -142,7 +142,7 @@ pub(crate) fn decode_blob(bytes: &[u8]) -> Result<StoredCredential, CredentialEr
         None => None,
     };
     Ok(StoredCredential {
-        pat: PatSecret::new(b.pat.0.as_str().to_owned()),
+        pat: pat_copy(&b.pat.0),
         base_url_hash,
         identity: StoredIdentity {
             atlassian_user: b.user,
@@ -189,5 +189,38 @@ impl CredentialProvider for KeychainCredentials {
         self.keys
             .delete(&EntryName::Pat(instance_id.to_owned()))
             .map_err(credential_error)
+    }
+}
+
+/// A `PatSecret` from a copy of `src` whose temporary is `Zeroizing<String>` (M10 T36, M6 M-13):
+/// no plain `String` with the token is left behind.
+pub(crate) fn pat_copy(src: &Zeroizing<String>) -> PatSecret {
+    PatSecret::from(Zeroizing::new(src.as_str().to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M10 T36 (M6 M-13), type level: the copy a `PatSecret` is built from is `Zeroizing<String>`,
+    /// at both sites (`decode_blob`, the connection test's one-entry provider).
+    #[test]
+    fn pat_copies_are_zeroizing() -> Result<(), Box<dyn std::error::Error>> {
+        let _: fn(&Zeroizing<String>) -> PatSecret = pat_copy;
+        let _: fn(Zeroizing<String>) -> PatSecret = PatSecret::from;
+        let src = Zeroizing::new("tok-123".to_owned());
+        assert_eq!(pat_copy(&src).expose_secret(), "tok-123");
+        assert_eq!(*src, "tok-123", "the source is untouched");
+        let blob = encode_blob(&StoredCredential {
+            pat: PatSecret::new("blob-pat".to_owned()),
+            base_url_hash: UrlHash::from_hex(&"ab".repeat(32)).ok_or("hash")?,
+            identity: StoredIdentity {
+                atlassian_user: "u".into(),
+                atlassian_user_key: "k".into(),
+            },
+            expires_at: None,
+        })?;
+        assert_eq!(decode_blob(&blob)?.pat.expose_secret(), "blob-pat");
+        Ok(())
     }
 }

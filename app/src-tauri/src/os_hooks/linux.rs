@@ -20,9 +20,10 @@ use super::ShutdownPort;
 
 /// The inhibitor's `who`.
 pub const INHIBIT_WHO: &str = "atlas-duck";
-/// The inhibitor's `why` (Windows' text while a write is on the wire, `windows::BLOCK_REASON`;
-/// the lock is held from start, so `systemd-inhibit --list` shows it idle too).
-pub const INHIBIT_WHY: &str = super::windows::BLOCK_REASON;
+/// The inhibitor's `why`. Plan text (M10 T36, M6 M-8; in no spec sentence): the lock is held from
+/// start, so `systemd-inhibit --list` shows it while the app is idle, and it must not claim a
+/// write (Windows' `BLOCK_REASON` does, but only while one is on the wire).
+pub const INHIBIT_WHY: &str = "atlas-duck is finishing audit work";
 
 /// Follows logind's `PrepareForShutdown` signals with the delay lock `lock` held: the first
 /// `true` begins the path with `OsShutdown` (or joins it) and waits for its end, at most `wait`;
@@ -217,8 +218,18 @@ mod tests {
             Duration::from_millis(30)
         ));
         assert!(released.load(Ordering::SeqCst));
-        assert_eq!(INHIBIT_WHY, "atlas-duck is finishing an approved write");
         assert_eq!(INHIBIT_WHO, "atlas-duck");
+    }
+
+    /// M10 T36 (M6 M-8): the lock is held from start, so `systemd-inhibit --list` shows its text
+    /// while the app is idle: it claims no write (it was Windows' "finishing an approved write").
+    #[test]
+    fn linux_inhibitor_text_claims_no_write() {
+        assert_eq!(INHIBIT_WHY, "atlas-duck is finishing audit work");
+        for word in ["write", "approved", "sending", "request"] {
+            assert!(!INHIBIT_WHY.contains(word), "{INHIBIT_WHY}");
+        }
+        assert_ne!(INHIBIT_WHY, super::super::windows::BLOCK_REASON);
     }
 
     /// The lock's descriptor is close-on-exec after `close_on_exec`. `dup` makes a descriptor

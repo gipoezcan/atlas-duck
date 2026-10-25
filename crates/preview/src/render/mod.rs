@@ -573,6 +573,8 @@ fn header(doc: &mut Doc, p: &Preview) -> usize {
     if !h.fields_included.is_empty() {
         row_list(doc, "fields included", &h.fields_included);
     }
+    // §6.1 / §6.2 "hidden in preview: N bytes" (label and `N bytes` form); the row is the
+    // header's, its value is inserted once the body is rendered.
     doc.open("tr");
     doc.el("th", "hidden in preview");
     doc.open("td");

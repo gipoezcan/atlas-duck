@@ -205,6 +205,39 @@ pub fn wd_error(status: u16, body: &Value) -> Option<WdError> {
     })
 }
 
+/// Most characters of a driver error message kept for an Element Send Keys (`.../value`) call (M10
+/// T36, M6 M-13): some drivers quote what was typed in their message ("invalid argument: ..."), and
+/// what the E2E types into the credential window is a PAT or passphrase canary. The error code and
+/// the status stay whole.
+pub const VALUE_CALL_MESSAGE_MAX: usize = 32;
+
+/// `wd_error` for the call at `path`: for a `/value` call the message is cut to
+/// [`VALUE_CALL_MESSAGE_MAX`] characters (and says so).
+pub fn wd_error_at(path: &str, status: u16, body: &Value) -> Option<WdError> {
+    let mut e = wd_error(status, body)?;
+    if path.ends_with("/value") && e.message.chars().count() > VALUE_CALL_MESSAGE_MAX {
+        e.message = e
+            .message
+            .chars()
+            .take(VALUE_CALL_MESSAGE_MAX)
+            .collect::<String>()
+            + "... (cut)";
+    }
+    Some(e)
+}
+
+/// `answer_value` for the call at `path` (see [`wd_error_at`]).
+pub fn answer_value_at(
+    path: &str,
+    status: u16,
+    body: &Value,
+) -> std::result::Result<Value, WdError> {
+    match wd_error_at(path, status, body) {
+        Some(e) => Err(e),
+        None => Ok(body["value"].clone()),
+    }
+}
+
 /// The `value` of an answer, or its error.
 pub fn answer_value(status: u16, body: &Value) -> std::result::Result<Value, WdError> {
     match wd_error(status, body) {
@@ -561,7 +594,7 @@ impl WebDriver {
         } else {
             serde_json::from_str(&text)?
         };
-        Ok(answer_value(status, &body)?)
+        Ok(answer_value_at(path, status, &body)?)
     }
 
     async fn get(&self, path: &str) -> Result<Value> {
@@ -881,6 +914,47 @@ mod tests {
         // A legacy `ELEMENT` key is not a W3C reference.
         assert!(parse_element(&json!({"ELEMENT":"x"})).is_err());
         assert!(parse_elements(&json!({"not":"a list"})).is_err());
+    }
+
+    /// M10 T36 (M6 M-13): a `/value` (Send Keys) error keeps its code and status but its message is
+    /// cut, so a driver that quotes the typed text does not carry it into the failure output; every
+    /// other call keeps the whole message.
+    #[test]
+    fn webdriver_value_error_message_truncated() {
+        let typed = "pat-canary-0123456789-abcdefghijklmnopqrstuvwxyz";
+        let body = json!({"value": {
+            "error": "invalid argument",
+            "message": format!("could not send keys: {typed}"),
+            "stacktrace": ""
+        }});
+        let e = wd_error_at("/element/abc/value", 400, &body).unwrap();
+        assert_eq!(e.error, "invalid argument");
+        assert_eq!(e.status, 400);
+        assert!(!e.message.contains(typed), "{}", e.message);
+        assert!(
+            e.message.starts_with("could not send keys: "),
+            "{}",
+            e.message
+        );
+        assert!(e.message.ends_with("(cut)"), "{}", e.message);
+        assert!(e.message.chars().count() <= VALUE_CALL_MESSAGE_MAX + "... (cut)".len());
+        assert!(
+            !answer_value_at("/element/abc/value", 400, &body)
+                .unwrap_err()
+                .to_string()
+                .contains(typed)
+        );
+        // Other calls, and a short message, are as the driver sent them.
+        let whole = wd_error_at("/element/abc/click", 400, &body).unwrap();
+        assert!(whole.message.contains(typed));
+        let short = json!({"value": {"error": "no such element", "message": "gone"}});
+        assert_eq!(
+            wd_error_at("/element/abc/value", 404, &short)
+                .unwrap()
+                .message,
+            "gone"
+        );
+        assert!(wd_error_at("/element/abc/value", 200, &json!({"value": null})).is_none());
     }
 
     #[test]

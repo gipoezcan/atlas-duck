@@ -121,6 +121,15 @@ fn wizard_env(
     })
 }
 
+/// The `LOG_FIELDS` of the modules whose failure lines carry `os_error` or `error_kind` (M10 T36,
+/// M6 M-1); `run_gui` adds them to the diagnostic allowlist before the first of those lines.
+const DIAG_FIELDS_OF_FAILURES: [&[&str]; 4] = [
+    os_hooks::LOG_FIELDS,
+    removal::LOG_FIELDS,
+    commands::settings::LOG_FIELDS,
+    recovery_tier::LOG_FIELDS,
+];
+
 /// GUI and `--background` launches. Order (§2.5, §3.1, §7.7): startup hardening and crash
 /// settings (M6 T2, T09, in `main.rs`, before this call) -> diagnostic log -> Tauri builder -> in
 /// `setup`: the startup gate (pinned file -> data-dir check -> `instance.lock`; in `Ready` it clears
@@ -201,6 +210,11 @@ pub fn run_gui(background: bool) -> ! {
             }
             // M6 T29 (§2.5, §15 V20): every OS end-session source (and Cmd+Q) takes the one
             // shutdown path, in every startup state that keeps the app running.
+            // M10 T36 (M6 M-1): the fields these modules' failure lines carry; without them the
+            // allowlist counts `os_error` and `error_kind` as dropped and the values never arrive.
+            for fields in DIAG_FIELDS_OF_FAILURES {
+                diag.extend_allowed_fields(fields);
+            }
             os_hooks::install(app.handle());
             // The tray text, taken before the `Ready` arm below moves the state.
             let tray_status = tray::tray_status_text(&state);
@@ -300,6 +314,17 @@ pub fn run_gui(background: bool) -> ! {
 #[cfg(test)]
 mod tests {
     use std::alloc::{Layout, LayoutError, alloc};
+
+    /// M10 T36 (M6 M-1): `run_gui` extends the allowlist with exactly these four modules' fields
+    /// (the per-module tests pin each constant and its line).
+    #[test]
+    fn failure_fields_of_four_modules_are_wired() {
+        let all: Vec<&str> = super::DIAG_FIELDS_OF_FAILURES
+            .iter()
+            .flat_map(|f| f.iter().copied())
+            .collect();
+        assert_eq!(all, ["os_error", "error_kind", "error_kind", "error_kind"]);
+    }
 
     /// Plan M8 PD-134: the app links the worker crate, which only exports `ExitOnOomAlloc`; the
     /// app's global allocator stays the system one. With the worker's wrapper installed, the

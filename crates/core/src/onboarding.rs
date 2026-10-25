@@ -211,6 +211,8 @@ pub fn sections() -> Vec<Section> {
 
 /// The whole page as one Markdown text: every section under its heading.
 pub fn text() -> String {
+    // Plan text (PD-80): the intro sentence is in no spec sentence; the sections below are
+    // §12.4 verbatim (constants `RULE_*`).
     let mut out =
         String::from("# atlas-duck\n\nJira and Confluence go through the `atlas-duck` CLI.\n\n");
     for s in sections() {

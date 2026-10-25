@@ -56,6 +56,10 @@ pub const LOG_EVENT_OS_END_SESSION: &str = "os_end_session";
 /// `error_class`: the step). The app runs on; the run loop's fallback ([`on_loop_exit`]) stays.
 pub const LOG_EVENT_OS_HOOK_FAILED: &str = "os_hook_failed";
 
+/// The fields this module's lines add to the diagnostic allowlist (M10 T36, M6 M-1): `os_error`,
+/// the number `GetLastError` returned after a failed Win32 call (a number, never text).
+pub const LOG_FIELDS: &[&str] = &["os_error"];
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }

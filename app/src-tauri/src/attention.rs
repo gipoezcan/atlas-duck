@@ -80,9 +80,9 @@ impl Counts {
     }
 }
 
-/// The toast text (§5.6, counts only): `N pending: x reads, y writes, z scripts`, plus
-/// `M need attention` when failed or unknown write outcomes are unacknowledged; `None` when
-/// there is nothing to say.
+/// The toast text (§5.6, counts only). `N pending: x reads, y writes, z scripts` is §5.6's
+/// wording; the `; M need attention` suffix (failed or unknown write outcomes unacknowledged) is
+/// PD-90 plan text (L114), not §5.6. `None` when there is nothing to say.
 pub fn toast_text(counts: Counts, needs_attention: u32) -> Option<String> {
     let mut parts = Vec::with_capacity(2);
     if counts.pending() > 0 {

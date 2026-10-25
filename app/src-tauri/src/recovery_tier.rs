@@ -625,11 +625,7 @@ pub fn forget(
             // its own failure cannot improve the answer, T9 ruling 3).
             match record(KEY_FORGET_INSTALL, new, after) {
                 Ok(()) => emit_audit_changed(out),
-                Err(err) => tracing::warn!(
-                    event = crate::commands::settings::LOG_EVENT_SETTINGS_FAILED,
-                    error_class = "forget",
-                    error_kind = err.to_string().as_str()
-                ),
+                Err(err) => log_forget_record_failed(&err),
             }
             if !deleted.is_empty() {
                 out.emit(EVENT_SETTINGS_CHANGED, Value::Null);
@@ -643,6 +639,44 @@ pub fn forget(
                 ForgetFailure::Failed
             }))
         }
+    }
+}
+
+/// The fields this module's line adds to the diagnostic allowlist (M10 T36, M6 M-1): the kind of
+/// the failed settings record (a fixed kind, never a message or a value).
+pub const LOG_FIELDS: &[&str] = &["error_kind"];
+
+/// The best-effort record after a failed forget-install, logged by kind.
+fn log_forget_record_failed(err: &impl std::fmt::Display) {
+    tracing::warn!(
+        event = crate::commands::settings::LOG_EVENT_SETTINGS_FAILED,
+        error_class = "forget",
+        error_kind = err.to_string().as_str()
+    );
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    /// M10 T36 (M6 M-1): the forget-install record failure's line carries `error_kind`.
+    #[test]
+    fn diag_lines_carry_error_kind_recovery_tier() {
+        assert_eq!(
+            LOG_FIELDS,
+            ["error_kind"],
+            "the allowlist is shared: pin this module's own"
+        );
+        let out = crate::diag::fields::test_support::lines_after_extending(LOG_FIELDS, || {
+            log_forget_record_failed(&SettingsError::Conflict)
+        });
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(
+            out.contains(
+                "event=settings_failed error_class=forget error_kind=conflict dropped_fields=0"
+            ),
+            "{out}"
+        );
     }
 }
 

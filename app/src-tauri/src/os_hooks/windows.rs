@@ -46,7 +46,8 @@ use super::{ShutdownPort, ShutdownTicket};
 /// write on the wire.
 pub const BLOCK_REASON: &str = "atlas-duck is finishing an approved write";
 /// The reason Windows shows while the app holds the shutdown back with no write on the wire (the
-/// rest of the path: the cancellations, `APP_STOP` and the store's shutdown).
+/// rest of the path: the cancellations, `APP_STOP` and the store's shutdown). Plan text (M6 T29
+/// review wording, in no spec sentence; the lead's docs record it).
 pub const BLOCK_REASON_NO_WRITE: &str = "atlas-duck is saving its log before shutdown";
 /// How long a `WM_QUERYENDSESSION` answer waits for the path (below Windows' 5 s).
 pub const QUERY_WAIT: Duration = Duration::from_secs(4);
@@ -497,6 +498,32 @@ mod window {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// M10 T36 (M6 M-1): a failed Win32 call's line carries `os_error` (the `GetLastError`
+        /// number) through the allowlist; it was counted as dropped.
+        #[test]
+        fn diag_lines_carry_os_error() {
+            assert_eq!(
+                crate::os_hooks::LOG_FIELDS,
+                ["os_error"],
+                "the allowlist is shared: pin this module's own"
+            );
+            let out = crate::diag::fields::test_support::lines_after_extending(
+                crate::os_hooks::LOG_FIELDS,
+                || {
+                    // SAFETY: sets this thread's last-error code; no pointers.
+                    unsafe { windows_sys::Win32::Foundation::SetLastError(1400) };
+                    failed_call("create_window");
+                },
+            );
+            assert_eq!(out.lines().count(), 1, "{out}");
+            assert!(
+                out.contains(
+                    "event=os_hook_failed reason=windows error_class=create_window os_error=1400 dropped_fields=0"
+                ),
+                "{out}"
+            );
+        }
 
         /// A busy state answers 0 (FALSE for `WM_QUERYENDSESSION`), not the default procedure's
         /// TRUE. No Win32 call is reached: the answer comes before the port and the window.

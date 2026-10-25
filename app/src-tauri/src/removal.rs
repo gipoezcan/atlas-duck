@@ -964,12 +964,21 @@ pub fn mark(
 /// cannot improve the answer; it is logged by kind.
 fn record_undo(settings: &dyn SettingsAdmin, key: &str, old: Value, new: Value) {
     if let Err(e) = settings.record_app_change(key, new, old) {
-        tracing::warn!(
-            event = LOG_EVENT_REMOVAL_FAILED,
-            error_class = "settings",
-            error_kind = e.to_string().as_str()
-        );
+        log_record_failed(&e);
     }
+}
+
+/// The fields this module's lines add to the diagnostic allowlist (M10 T36, M6 M-1): the kind of
+/// the failed settings record (a fixed kind, never a message or a value).
+pub const LOG_FIELDS: &[&str] = &["error_kind"];
+
+/// A removal record that failed best-effort, logged by kind.
+fn log_record_failed(e: &impl std::fmt::Display) {
+    tracing::warn!(
+        event = LOG_EVENT_REMOVAL_FAILED,
+        error_class = "settings",
+        error_kind = e.to_string().as_str()
+    );
 }
 
 /// The autostart step: record, then remove; a failure undoes the record. `Ok(true)` removed it,
@@ -1213,11 +1222,7 @@ pub async fn finish(
     })
     .await?;
     if let Err(e) = recorded_end {
-        tracing::warn!(
-            event = LOG_EVENT_REMOVAL_FAILED,
-            error_class = "settings",
-            error_kind = e.to_string().as_str()
-        );
+        log_record_failed(&e);
     }
     // The procedure ended in this process: the log is not read back for it again (if the outcome
     // record failed, the next process resumes it from the choices record, PD-176, and its retry
@@ -1240,6 +1245,27 @@ pub async fn finish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M10 T36 (M6 M-1): the removal line carries `error_kind` through the allowlist (it was
+    /// counted as dropped), and both failing records use the one line.
+    #[test]
+    fn diag_lines_carry_error_kind_removal() {
+        assert_eq!(
+            LOG_FIELDS,
+            ["error_kind"],
+            "the allowlist is shared: pin this module's own"
+        );
+        let out = crate::diag::fields::test_support::lines_after_extending(LOG_FIELDS, || {
+            log_record_failed(&SettingsError::Conflict)
+        });
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(
+            out.contains(
+                "event=removal_failed error_class=settings error_kind=conflict dropped_fields=0"
+            ),
+            "{out}"
+        );
+    }
 
     /// The §12.5 step text reaches the user through the page's own copy (`shared/strings.ts`); the
     /// Rust constant, that copy and the spec's sentence must be one string: each is read from its

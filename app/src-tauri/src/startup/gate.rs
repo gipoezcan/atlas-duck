@@ -23,7 +23,7 @@ pub const MSG_DATA_DIR_NOT_FOUND: &str = "data directory <path> not found";
 /// §3.1 Single instance (verbatim).
 pub const MSG_RUNNING_ON_OTHER_HOST: &str =
     "atlas-duck is running on another machine (<host>) with this data directory";
-/// Spec silent on the text; plan placeholder awaiting user confirmation.
+/// §2.5 (verbatim; the same text at startup and in the wizard; text fixed in L128, spec amended).
 pub const MSG_DATA_DIR_NOT_LOCAL: &str = "data directory <path> is not on a local filesystem";
 /// Spec silent (unreadable pinned file); plan placeholder awaiting user confirmation.
 pub const MSG_PINNED_UNREADABLE: &str = "atlas-duck path settings <path> could not be read";

@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use atlas_duck_atlassian::{
     CredentialError, CredentialProvider, FetchFailure, FetchOutcome, GetCall, IdentityObserved,
-    NormalizedBaseUrl, PatSecret, StoredCredential, StoredIdentity, UnavailableReason,
-    UpstreamResponse, UrlHash, url_hash, username_matches,
+    NormalizedBaseUrl, StoredCredential, StoredIdentity, UnavailableReason, UpstreamResponse,
+    UrlHash, url_hash, username_matches,
 };
 use atlas_duck_registry::{Product, Version};
 use secrecy::ExposeSecret;
@@ -104,7 +104,7 @@ impl CredentialProvider for OneEntry {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         Ok(Some(StoredCredential {
-            pat: PatSecret::new(self.pat.as_str().to_owned()),
+            pat: crate::credentials::pat_copy(&self.pat),
             base_url_hash: self.bound,
             identity,
             expires_at: None,

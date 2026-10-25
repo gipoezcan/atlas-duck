@@ -52,7 +52,8 @@ pub use redaction_preview::RedactionReport;
 /// (§5.2: a rebuild that does not reproduce the revision, or a first build the §5.3 mirror check
 /// refuses); Release stays disabled. Worded per the T7 review M-2 ruling (the plan's "only Deny
 /// remains" was wrong for the mirror case, where dropping the flagged items makes the rest
-/// releasable).
+/// releasable). Plan text, ledger L125 (it amends the M6 plan's text and the M5 plan's quote;
+/// spec §5.2's "only Deny remains" stays right for the hash-mismatch case).
 pub const RELEASE_BLOCKED_INTERNAL: &str = "release blocked: the candidate could not be built exactly (internal); deny it, or drop the flagged items";
 
 /// A session's label when its agent named itself nothing: the T7 implementer's wording (not

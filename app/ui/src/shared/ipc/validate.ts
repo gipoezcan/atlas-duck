@@ -144,7 +144,7 @@ export const isRequestDetail = (v: unknown): v is RequestDetail =>
 export const isQueueDetail = (v: unknown): v is QueueDetail =>
   fields(v, { item: isQueueItem, request: isRequestDetail });
 
-export const isRawPage =(v: unknown): v is RawPage =>
+export const isRawPage = (v: unknown): v is RawPage =>
   fields(v, {
     page: isNum,
     page_count: isNum,
@@ -481,7 +481,7 @@ const isOnboardingSection = (v: unknown): v is OnboardingSection =>
 export const isOnboardingText = (v: unknown): v is OnboardingText =>
   closed(v, { sections: arrayOf(isOnboardingSection) });
 
-export const isRemovalBackupAnswer =(v: unknown): v is RemovalBackupAnswer =>
+export const isRemovalBackupAnswer = (v: unknown): v is RemovalBackupAnswer =>
   fields(v, { saved: isBool }) && Object.keys(v).length === 1;
 
 export const isRemovalFinishAnswer = (v: unknown): v is RemovalFinishAnswer =>
