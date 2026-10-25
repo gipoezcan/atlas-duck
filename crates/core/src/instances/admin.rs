@@ -22,7 +22,8 @@ use super::connection_test::{self, Target};
 use super::state::{CaBundle, DeriveCtx, InstanceRuntime, InstanceState, InstanceTable, parse_ca};
 use super::work::{AdminWork, Job};
 use super::{
-    AddInstance, AdminError, ConnectionFailure, ConnectionReport, InstanceAdmin, InstanceView,
+    AddInstance, AdminError, CaBundleReason, ConnectionFailure, ConnectionReport, InstanceAdmin,
+    InstanceView,
 };
 use crate::config::instances::{
     InstanceConfig, add_instance, instances, is_valid_alias, set_base_url, set_proxy_setting,
@@ -668,15 +669,14 @@ impl CoreInstances {
     }
 }
 
-#[async_trait::async_trait]
-impl InstanceAdmin for CoreInstances {
-    fn list(&self) -> Vec<InstanceView> {
-        let table = self.engine.instances().clone();
-        table.list().iter().map(|i| self.view_of(i)).collect()
-    }
+/// What `add` checks before its first dialog: the normalized origin, the config path and the
+/// parsed CA bundle with its bytes.
+type ValidatedAdd<'a> = (NormalizedBaseUrl, PathBuf, Option<(CaBundle, &'a Vec<u8>)>);
 
-    fn add(&self, req: AddInstance) -> Result<InstanceView, AdminError> {
-        let _job = self.enter()?;
+impl CoreInstances {
+    /// The checks of `add` that show no dialog and write nothing, in the order `add` answers them
+    /// (M10 T36, L217): URL, config writable, alias, duplicate alias, second default, CA bundle.
+    fn validate_add<'a>(&self, req: &'a AddInstance) -> Result<ValidatedAdd<'a>, AdminError> {
         let origin = self
             .engine
             .normalize_origin(&req.base_url)
@@ -699,22 +699,44 @@ impl InstanceAdmin for CoreInstances {
         }
         let existing = instances(&cfg).map_err(|_| audit("config.toml instances are malformed"))?;
         if existing.iter().any(|c| c.alias == req.alias) {
-            return Err(audit("the alias is already used"));
+            return Err(AdminError::DuplicateAlias);
         }
         if req.is_default
             && existing
                 .iter()
                 .any(|c| c.is_default && c.product == req.product)
         {
-            return Err(audit("the product already has a default instance"));
+            return Err(AdminError::SecondDefault {
+                product: req.product,
+            });
         }
         let ca = match &req.ca_pem {
             Some(pem) => Some((
-                parse_ca(pem).ok_or(audit("no certificate in the CA bundle"))?,
+                parse_ca(pem).ok_or(AdminError::UnusableCaBundle {
+                    reason: CaBundleReason::NoCertificate,
+                })?,
                 pem,
             )),
             None => None,
         };
+        Ok((origin, path, ca))
+    }
+}
+
+#[async_trait::async_trait]
+impl InstanceAdmin for CoreInstances {
+    fn list(&self) -> Vec<InstanceView> {
+        let table = self.engine.instances().clone();
+        table.list().iter().map(|i| self.view_of(i)).collect()
+    }
+
+    fn check_add(&self, req: &AddInstance) -> Result<(), AdminError> {
+        self.validate_add(req).map(drop)
+    }
+
+    fn add(&self, req: AddInstance) -> Result<InstanceView, AdminError> {
+        let _job = self.enter()?;
+        let (origin, path, ca) = self.validate_add(&req)?;
         let text = add_text(req.product, &req.alias, &origin);
         self.confirm(&text)?;
         let ca_dialog = match &ca {

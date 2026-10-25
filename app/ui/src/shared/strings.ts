@@ -399,6 +399,7 @@ export const SETTINGS_TEXT = {
   url_change: 'config.toml requests a URL change for',
   url_change_requested: 'Requested URL:',
   url_change_accept: 'Accept the URL change',
+  /** Plan text (T25): the label before Rust's §7.7 banner text (PD-76), which follows it verbatim. */
   read_only_prefix: 'Settings are read-only:',
   instances: 'Instances',
   no_instances: 'No instances are configured',
@@ -671,12 +672,22 @@ export const SETTINGS_TEXT = {
     refused: 'The command was refused',
     cancelled: 'Cancelled: nothing was changed',
     backup: 'The backup failed. If an unfinished backup folder is left in the folder you chose, delete it.',
+    /**
+     * Plan text (T25) for a refused change. The §7.7 banner ("config written by vX; settings
+     * read-only until you upgrade", PD-76) is Rust's text, shown by the page from `config_read_only`.
+     */
     config_read_only: 'config.toml was written by a newer version: settings are read-only',
     no_config_file: 'There is no config.toml to change',
     conflict: 'config.toml changed meanwhile: reload and try again',
     config_write_failed: 'config.toml could not be written',
-    /** Core reports a duplicate alias, a second default and an unusable CA file as this kind too. */
+    /** The neutral text of core's `audit` kind (a record or a file write failed); never a duplicate alias, a second default or a CA file (own kinds below). */
     audit: 'The change was refused',
+    /** Plan text (M10 T36, L217): `AdminError::DuplicateAlias`. */
+    duplicate_alias: 'Another instance already uses that alias: choose another alias',
+    /** Plan text (M10 T36, L217): `AdminError::SecondDefault`; Rust also sends the product, the page does not need it. */
+    second_default: 'That product already has a default instance: it can have only one',
+    /** Plan text (M10 T36, L217): `AdminError::UnusableCaBundle`; the closed `reason` is `no_certificate`. */
+    unusable_ca_bundle: 'That file holds no usable CA certificate: choose a PEM file with the certificate',
     invalid_url: 'That is not a valid URL',
     keychain: 'The token store is not available, or it holds no token for this instance',
     shutting_down: 'The app is shutting down',
@@ -694,6 +705,7 @@ export const SETTINGS_TEXT = {
     use_custom_ca: 'the CA file: choose another file',
   } as Readonly<Record<string, string>>,
 } as const;
+
 /**
  * plan text (PD-82, T30): the Audit window's "Verify now" and its three results. The sentences are
  * the plan's own words; Rust answers one of the three `result` words and the page picks the text

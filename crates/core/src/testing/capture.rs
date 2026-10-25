@@ -360,6 +360,9 @@ impl InstanceAdmin for CapturingInstances {
     fn list(&self) -> Vec<InstanceView> {
         self.rec(self.inner.list())
     }
+    fn check_add(&self, req: &AddInstance) -> Result<(), AdminError> {
+        self.rec(self.inner.check_add(req))
+    }
     fn add(&self, req: AddInstance) -> Result<InstanceView, AdminError> {
         self.rec(self.inner.add(req))
     }

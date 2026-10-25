@@ -32,10 +32,11 @@ import {
   settingsApply,
   settingsGet,
 } from '../shared/ipc/invoke';
+import commandErrorFixtures from '../shared/ipc/fixtures/command_error.json';
 import settingsFixture from '../shared/ipc/fixtures/settings_get.json';
 import type { InstanceView, SettingsGet } from '../shared/ipc/types';
 import { Settings } from './Settings';
-import { expiryWarningText } from './text';
+import { errorText, expiryWarningText } from './text';
 
 vi.mock('../shared/ipc/invoke', () => ({
   cliInstall: vi.fn(),
@@ -951,6 +952,31 @@ describe('Settings', () => {
     expect(await submit({ kind: 'invalid_argument', field: 'secret_field_name' })).toBe(
       'Check the value of a field',
     );
+  });
+
+  it('admin_error_kinds_have_texts', () => {
+    const text = (kind: string, more: object = {}) => errorText({ kind: 'admin', error: { kind, ...more } });
+    const neutral = text('audit');
+    expect(neutral).toBe('The change was refused');
+    // M10 T36 (L217): the three kinds that were the neutral `audit` text have their own.
+    expect(text('duplicate_alias')).toBe('Another instance already uses that alias: choose another alias');
+    expect(text('second_default', { product: 'jira' })).toBe(
+      'That product already has a default instance: it can have only one',
+    );
+    expect(text('unusable_ca_bundle', { reason: 'no_certificate' })).toBe(
+      'That file holds no usable CA certificate: choose a PEM file with the certificate',
+    );
+    // Every admin kind Rust sends (the fixtures) has a text of its own, except the neutral
+    // `audit`; an unlisted kind falls back to the neutral text, so a new kind without a text
+    // fails here once its fixture exists.
+    const kinds = (commandErrorFixtures as { kind: string; error?: { kind: string } }[])
+      .filter((e) => e.kind === 'admin' && e.error !== undefined)
+      .map((e) => e.error?.kind ?? '');
+    expect(kinds).toEqual(expect.arrayContaining(['duplicate_alias', 'second_default', 'unusable_ca_bundle']));
+    for (const kind of kinds) {
+      if (kind === 'audit') continue;
+      expect(text(kind), kind).not.toBe(neutral);
+    }
   });
 
   it('a re-test without a stored token shows the keychain text', async () => {

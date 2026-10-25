@@ -1168,6 +1168,9 @@ impl InstanceAdmin for SettlingInstances {
     fn list(&self) -> Vec<InstanceView> {
         self.inner.list()
     }
+    fn check_add(&self, req: &AddInstance) -> Result<(), AdminError> {
+        self.inner.check_add(req)
+    }
     fn add(&self, req: AddInstance) -> Result<InstanceView, AdminError> {
         self.inner.add(req)
     }

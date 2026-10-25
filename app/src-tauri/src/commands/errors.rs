@@ -490,6 +490,31 @@ mod tests {
             serde_json::to_value(&admin).ok(),
             Some(json!({"kind": "admin", "error": {"kind": "not_found"}}))
         );
+        // M10 T36 (L217): the kinds `add` used to report as `audit`, nested under `admin` with
+        // their fixed data (the product, a closed reason) and no text.
+        for (e, want) in [
+            (
+                AdminError::DuplicateAlias,
+                json!({"kind": "admin", "error": {"kind": "duplicate_alias"}}),
+            ),
+            (
+                AdminError::SecondDefault {
+                    product: atlas_duck_core::Product::Confluence,
+                },
+                json!({"kind": "admin",
+                       "error": {"kind": "second_default", "product": "confluence"}}),
+            ),
+            (
+                AdminError::UnusableCaBundle {
+                    reason: atlas_duck_core::CaBundleReason::NoCertificate,
+                },
+                json!({"kind": "admin",
+                       "error": {"kind": "unusable_ca_bundle", "reason": "no_certificate"}}),
+            ),
+        ] {
+            let e = CommandError::from(e);
+            assert_eq!(serde_json::to_value(&e).ok(), Some(want));
+        }
         let invalid = CommandError::from(SettingsError::Invalid {
             key: "jira_comments_cap",
         });

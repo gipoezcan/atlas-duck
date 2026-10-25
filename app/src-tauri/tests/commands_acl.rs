@@ -2418,6 +2418,84 @@ mod settings_commands {
         Ok(())
     }
 
+    /// M10 T36 (L217): the CA file dialog opens only after core's own checks passed. A request core
+    /// would refuse (a URL that is no https URL, a taken alias, a second default) never asks for a
+    /// file; a good one does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ca_dialog_only_after_url_check() -> TestResult {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let h = Harness::builder()
+            .jira("jira-main")
+            .strict_https()
+            .confirm(vec![Confirm::Ok])
+            .start()
+            .await?;
+        let admin = h.instances();
+        let asked = Arc::new(AtomicBool::new(false));
+        let attempts = [
+            ("plain", "http://jira.corp/jira", AdminError::InsecureScheme),
+            ("plain", "not a url", AdminError::InvalidUrl),
+            (
+                "jira-main",
+                "https://jira.example/other",
+                AdminError::DuplicateAlias,
+            ),
+        ];
+        for (alias, url, want) in attempts {
+            let (a, flag) = (admin.clone(), asked.clone());
+            let args = add_args(alias, url, true)?;
+            let res = blocking(move || {
+                instance_add_dto(&*a, args, move || {
+                    flag.store(true, Ordering::SeqCst);
+                    Err(CommandError::Admin(AdminError::Cancelled))
+                })
+            })
+            .await?;
+            assert_eq!(res.err(), Some(CommandError::Admin(want)), "{url}");
+            assert!(
+                !asked.load(Ordering::SeqCst),
+                "the CA dialog opened for {url}"
+            );
+        }
+        assert!(h.confirmer().texts().is_empty());
+        // A request that passes the checks does ask for the file.
+        let (a, flag) = (admin.clone(), asked.clone());
+        let args = add_args("good", "https://jira.example/good", true)?;
+        let res = blocking(move || {
+            instance_add_dto(&*a, args, move || {
+                flag.store(true, Ordering::SeqCst);
+                Err(CommandError::Admin(AdminError::Cancelled))
+            })
+        })
+        .await?;
+        assert_eq!(res.err(), Some(CommandError::Admin(AdminError::Cancelled)));
+        assert!(asked.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    /// M10 T36 (L217): a CA file without a certificate is `unusable_ca_bundle` on the wire, not
+    /// `audit`, and core shows no dialog for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ca_file_without_certificate_is_unusable_ca_bundle() -> TestResult {
+        let h = rig(vec![Confirm::Ok]).await?;
+        let second = MockDc::start(atlas_duck_atlassian::Product::Jira, "/other").await;
+        let a = h.instances();
+        let args = add_args("pinned", &second.base_url(), true)?;
+        let res = blocking(move || {
+            instance_add_dto(&*a, args, || Ok(b"just some text, no PEM block".to_vec()))
+        })
+        .await?;
+        let err = res.err().ok_or("accepted a file without a certificate")?;
+        assert_eq!(
+            serde_json::to_value(&err)?,
+            json!({"kind": "admin",
+                   "error": {"kind": "unusable_ca_bundle", "reason": "no_certificate"}})
+        );
+        assert!(h.confirmer().texts().is_empty());
+        Ok(())
+    }
+
     /// `retest_token` over the command: the identity answer, a failure class that left the instance
     /// `needs_token`, and the refusal during the shutdown.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

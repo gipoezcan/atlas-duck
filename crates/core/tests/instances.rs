@@ -25,8 +25,8 @@ use atlas_duck_core::proxy::{OsProxy, ProxySetting, SystemProxySource};
 use atlas_duck_core::testing::capture::NullUi;
 use atlas_duck_core::testing::{Harness, InstanceAt, StubConfirmer, TempStore};
 use atlas_duck_core::{
-    AddInstance, AdminError, Confirm, ConnectionFailure, Core, CoreDeps, InstanceView,
-    KeychainCredentials, Pause, TestHooks,
+    AddInstance, AdminError, CaBundleReason, Confirm, ConnectionFailure, Core, CoreDeps,
+    InstanceView, KeychainCredentials, Pause, TestHooks,
 };
 use atlas_duck_ipc::envelope::Status;
 use atlas_duck_registry::Product;
@@ -1034,8 +1034,106 @@ async fn i31_add_with_custom_ca_cancelled_or_invalid_changes_nothing() -> TestRe
     let dialogs = h.confirmer().texts().len();
     let mut req = add("third", &second.base_url());
     req.ca_pem = Some(b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n".to_vec());
-    assert!(matches!(h.instances().add(req), Err(AdminError::Audit(_))));
+    assert_eq!(
+        h.instances().add(req).err(),
+        Some(AdminError::UnusableCaBundle {
+            reason: CaBundleReason::NoCertificate
+        })
+    );
     assert_eq!(h.confirmer().texts().len(), dialogs);
+    Ok(())
+}
+
+/// M10 T36 (L217): a taken alias is not the neutral `audit` kind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplicate_alias_is_its_own_kind() -> TestResult {
+    let h = Harness::builder()
+        .jira("jira-main")
+        .confirm(vec![Confirm::Ok])
+        .start()
+        .await?;
+    let second = MockDc::start(atl(Product::Jira), "/other").await;
+    let before = std::fs::read_to_string(h.config_path())?;
+    let req = add("jira-main", &second.base_url());
+    assert_eq!(
+        h.instances().check_add(&req).err(),
+        Some(AdminError::DuplicateAlias)
+    );
+    assert_eq!(
+        h.instances().add(req).err(),
+        Some(AdminError::DuplicateAlias)
+    );
+    assert_eq!(std::fs::read_to_string(h.config_path())?, before);
+    assert!(
+        h.confirmer().texts().is_empty(),
+        "refused before any dialog"
+    );
+    Ok(())
+}
+
+/// M10 T36 (L217): a second default for a product names the product, not `audit`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn second_default_per_product_is_its_own_kind() -> TestResult {
+    let h = Harness::builder()
+        .jira("jira-main")
+        .confirm(vec![Confirm::Ok])
+        .start()
+        .await?;
+    let second = MockDc::start(atl(Product::Jira), "/other").await;
+    let before = std::fs::read_to_string(h.config_path())?;
+    let mut req = add("second", &second.base_url());
+    req.is_default = true;
+    let want = AdminError::SecondDefault {
+        product: Product::Jira,
+    };
+    assert_eq!(h.instances().check_add(&req).err(), Some(want.clone()));
+    assert_eq!(h.instances().add(req).err(), Some(want.clone()));
+    assert_eq!(std::fs::read_to_string(h.config_path())?, before);
+    assert!(
+        h.confirmer().texts().is_empty(),
+        "refused before any dialog"
+    );
+    assert_eq!(
+        serde_json::to_value(&want)?,
+        j!({"kind": "second_default", "product": "jira"})
+    );
+    Ok(())
+}
+
+/// M10 T36 (L217): a CA bundle that holds no certificate is `unusable_ca_bundle`, with a closed
+/// reason, and `check_add` finds it too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unusable_ca_bundle_is_its_own_kind() -> TestResult {
+    let h = Harness::builder()
+        .jira("jira-main")
+        .confirm(vec![Confirm::Ok])
+        .start()
+        .await?;
+    let second = MockDc::start(atl(Product::Jira), "/other").await;
+    let mut req = add("second", &second.base_url());
+    req.ca_pem = Some(b"not a certificate at all".to_vec());
+    let want = AdminError::UnusableCaBundle {
+        reason: CaBundleReason::NoCertificate,
+    };
+    assert_eq!(h.instances().check_add(&req).err(), Some(want.clone()));
+    assert_eq!(h.instances().add(req).err(), Some(want.clone()));
+    assert!(h.confirmer().texts().is_empty());
+    assert_eq!(
+        serde_json::to_value(&want)?,
+        j!({"kind": "unusable_ca_bundle", "reason": "no_certificate"})
+    );
+    // A good request passes the check and writes nothing.
+    let ok = add("third", &second.base_url());
+    assert_eq!(h.instances().check_add(&ok), Ok(()));
+    assert!(h.confirmer().texts().is_empty());
+    assert!(h.instances().list().iter().all(|i| i.alias != "third"));
+    // The URL is checked first (a bad URL with a bad CA answers the URL).
+    let mut bad = add("fourth", "not a url");
+    bad.ca_pem = Some(b"x".to_vec());
+    assert_eq!(
+        h.instances().check_add(&bad).err(),
+        Some(AdminError::InvalidUrl)
+    );
     Ok(())
 }
 

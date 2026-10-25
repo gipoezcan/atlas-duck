@@ -155,6 +155,31 @@ pub enum AdminError {
     Keychain(CredentialError),
     /// The shutdown began (M3 M-4): the call did nothing.
     ShuttingDown,
+    /// M10 T36 (L217): `add` refused an alias that another instance already has.
+    DuplicateAlias,
+    /// M10 T36 (L217): `add` asked for a default for a product that already has one.
+    SecondDefault {
+        product: Product,
+    },
+    /// M10 T36 (L217): the CA bundle `add` was given cannot be used; `reason` is a closed kind.
+    UnusableCaBundle {
+        reason: CaBundleReason,
+    },
+}
+
+/// Why a CA bundle is unusable (closed: the wire carries the kind only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaBundleReason {
+    /// No PEM certificate in the file, or one that does not parse.
+    NoCertificate,
+}
+
+impl CaBundleReason {
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::NoCertificate => "no_certificate",
+        }
+    }
 }
 
 impl AdminError {
@@ -170,6 +195,9 @@ impl AdminError {
             Self::Audit(_) => "audit",
             Self::Keychain(_) => "keychain",
             Self::ShuttingDown => "shutting_down",
+            Self::DuplicateAlias => "duplicate_alias",
+            Self::SecondDefault { .. } => "second_default",
+            Self::UnusableCaBundle { .. } => "unusable_ca_bundle",
         }
     }
 }
@@ -186,13 +214,18 @@ impl std::fmt::Display for AdminError {
 
 impl std::error::Error for AdminError {}
 
-/// `{kind, failure?}`: no error text (an `AuditError` or keychain message can name paths).
+/// `{kind, failure?, product?, reason?}`: no error text (an `AuditError` or keychain message can name paths).
 impl Serialize for AdminError {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let mut m = s.serialize_map(None)?;
         m.serialize_entry("kind", self.kind())?;
-        if let Self::ConnectionFailed(f) = self {
-            m.serialize_entry("failure", f)?;
+        match self {
+            Self::ConnectionFailed(f) => m.serialize_entry("failure", f)?,
+            Self::SecondDefault { product } => {
+                m.serialize_entry("product", product_str(*product))?
+            }
+            Self::UnusableCaBundle { reason } => m.serialize_entry("reason", reason.kind())?,
+            _ => {}
         }
         m.end()
     }
@@ -204,6 +237,11 @@ impl Serialize for AdminError {
 #[async_trait::async_trait]
 pub trait InstanceAdmin: Send + Sync {
     fn list(&self) -> Vec<InstanceView>;
+    /// M10 T36 (L217): the checks of `add` that need no dialog and write nothing (URL scheme and
+    /// shape, config writable, alias, default, a CA bundle if one is given), in `add`'s order.
+    /// The app runs it before it opens the CA file dialog, so a request `add` would refuse never
+    /// shows one.
+    fn check_add(&self, req: &AddInstance) -> Result<(), AdminError>;
     fn add(&self, req: AddInstance) -> Result<InstanceView, AdminError>;
     fn confirm_config_instance(&self, alias: &str) -> Result<InstanceView, AdminError>;
     fn accept_config_url_change(&self, alias: &str) -> Result<InstanceView, AdminError>;

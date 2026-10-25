@@ -104,7 +104,8 @@ pub use gate::{
     hello_check, ops_describe_local, ops_list_local,
 };
 pub use instances::{
-    AddInstance, AdminError, ConnectionFailure, ConnectionReport, InstanceAdmin, InstanceView,
+    AddInstance, AdminError, CaBundleReason, ConnectionFailure, ConnectionReport, InstanceAdmin,
+    InstanceView,
 };
 pub use ops::{OpImpl, op_table};
 pub use redact::{DropScope, RedactionOp, RedactionPreset, UrlMode};

@@ -182,6 +182,26 @@
     "kind": "admin"
   },
   {
+    "error": {
+      "kind": "duplicate_alias"
+    },
+    "kind": "admin"
+  },
+  {
+    "error": {
+      "kind": "second_default",
+      "product": "jira"
+    },
+    "kind": "admin"
+  },
+  {
+    "error": {
+      "kind": "unusable_ca_bundle",
+      "reason": "no_certificate"
+    },
+    "kind": "admin"
+  },
+  {
     "kind": "busy"
   },
   {

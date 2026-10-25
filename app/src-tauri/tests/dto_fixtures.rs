@@ -54,11 +54,11 @@ use atlas_duck_core::redact::{BlockReason, DropScope, RedactionPreset};
 use atlas_duck_core::running::{KillAnswer as CoreKillAnswer, RunningScriptView};
 use atlas_duck_core::validate::ValidationError;
 use atlas_duck_core::{
-    AdminError, AttentionMode, BatchFailure, BatchOutcome, CandidateRev, ConfigBanner,
-    ConnectionFailure, DecisionError, DecisionOutcome, InstanceView, LimitsView, PreviewDelivery,
-    Product, PruneReport, QueueItem, RELEASE_BLOCKED_INTERNAL, RecentItem, RedactionContext,
-    RedactionOp, RedactionReport, RequestDetail, SessionKey, SettingsError, SettingsView,
-    StoreHealthView, UrlMode, VerifyNow,
+    AdminError, AttentionMode, BatchFailure, BatchOutcome, CaBundleReason, CandidateRev,
+    ConfigBanner, ConnectionFailure, DecisionError, DecisionOutcome, InstanceView, LimitsView,
+    PreviewDelivery, Product, PruneReport, QueueItem, RELEASE_BLOCKED_INTERNAL, RecentItem,
+    RedactionContext, RedactionOp, RedactionReport, RequestDetail, SessionKey, SettingsError,
+    SettingsView, StoreHealthView, UrlMode, VerifyNow,
 };
 use atlas_duck_ipc::envelope::{ErrorCode, Status};
 use atlas_duck_ipc::sandbox::ScriptLimits;
@@ -695,6 +695,14 @@ fn command_errors() -> Vec<CommandError> {
         CommandError::Settings(SettingsError::ShuttingDown),
         CommandError::Admin(AdminError::InsecureScheme),
         CommandError::Admin(AdminError::Unconfirmed),
+        // M10 T36 (L217): the kinds `add` used to report as `audit`.
+        CommandError::Admin(AdminError::DuplicateAlias),
+        CommandError::Admin(AdminError::SecondDefault {
+            product: Product::Jira,
+        }),
+        CommandError::Admin(AdminError::UnusableCaBundle {
+            reason: CaBundleReason::NoCertificate,
+        }),
         CommandError::Busy,
         // M6 T27: "Install CLI to PATH" failures, the kind only (no path, no OS text).
         CommandError::CliInstall(InstallError::NoStablePath),
