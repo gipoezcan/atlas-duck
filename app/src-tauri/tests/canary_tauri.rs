@@ -717,13 +717,9 @@ async fn s16_canary_sweep_tauri_channels() -> TestResult {
             &canary_issue(&w.canaries, "STL-1"),
         )
         .await;
-    let user_b = w.canaries.data("jira-b.myself.name");
+    let user_b = mock_b.user().to_owned();
     mock_b
-        .jira_myself(
-            &user_b,
-            &w.canaries.data("jira-b.myself.key"),
-            XAuser::Missing,
-        )
+        .jira_myself(&user_b, &harness::canary_user_key(&user_b), XAuser::Missing)
         .await;
     d.decide(json!({"request_id": stale, "decision": "approve", "candidate_rev": rev}))
         .await
@@ -744,8 +740,8 @@ async fn s16_canary_sweep_tauri_channels() -> TestResult {
         .await;
     mock_c
         .jira_myself_once(
-            &w.canaries.data("jira-c.myself.name"),
-            &w.canaries.data("jira-c.myself.key"),
+            mock_c.user(),
+            &harness::canary_user_key(mock_c.user()),
             XAuser::Missing,
         )
         .await;
@@ -763,7 +759,7 @@ async fn s16_canary_sweep_tauri_channels() -> TestResult {
             .filter(|(t, _)| *t == EventType::WRITE_STALE)
             .map(|(_, p)| p)
             .collect();
-        if found.iter().any(|p| p.contains("identity_mismatch"))
+        if found.iter().any(|p| p.contains("identity_header_missing"))
             && found.iter().any(|p| p.contains("recheck_failed"))
         {
             break found;
@@ -913,7 +909,7 @@ async fn s16_canary_sweep_tauri_channels() -> TestResult {
         "deny-with-hint: {denied_writes:?}"
     );
     let stale_writes = of(EventType::WRITE_STALE);
-    for reason in ["identity_mismatch", "recheck_failed"] {
+    for reason in ["identity_header_missing", "recheck_failed"] {
         assert!(
             stale_writes.iter().any(|p| p.contains(reason)),
             "{reason}: {stale_writes:?}"

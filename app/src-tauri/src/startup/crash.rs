@@ -265,7 +265,7 @@ fn redirect_stderr_to_file(path: &Path) -> io::Result<()> {
     };
     let handle = open()?.into_raw_handle();
     // SAFETY: `handle` is an open file handle owned by nobody else; the CRT takes it over.
-    let crt_fd = unsafe { libc::open_osfhandle(handle as libc::intptr_t, libc::O_WRONLY) };
+    let crt_fd = unsafe { libc::open_osfhandle(handle as libc::intptr_t, libc::O_APPEND) };
     if crt_fd < 0 {
         return Err(io::Error::other("CRT _open_osfhandle failed"));
     }

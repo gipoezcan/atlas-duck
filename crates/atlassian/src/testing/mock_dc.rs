@@ -52,6 +52,11 @@ impl MockDc {
         }
     }
 
+    /// The user name of fixture responses ([`MockDc::with_user`]).
+    pub fn user(&self) -> &str {
+        &self.user
+    }
+
     /// One more header on every response mounted afterwards (M10 T29: a canary header).
     pub fn with_header(mut self, name: &str, value: &str) -> Self {
         self.extra_headers.push((name.to_owned(), value.to_owned()));

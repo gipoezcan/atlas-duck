@@ -171,6 +171,32 @@ fn agent_visible(records: &[(EventType, Value)]) -> Vec<String> {
     out
 }
 
+/// Splits a CLI stream into the bytes an envelope gates (each envelope line's `data` and
+/// `error.details`) and the rest (every other line, and each envelope with those two nulled).
+fn split_envelopes(bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let (mut gated, mut rest) = (Vec::new(), Vec::new());
+    for line in String::from_utf8_lossy(bytes).lines() {
+        let parsed: Option<Value> = serde_json::from_str(line.trim()).ok();
+        match parsed {
+            Some(mut env) if env.get("status").is_some() => {
+                if let Some(d) = env.get_mut("data") {
+                    gated.extend_from_slice(d.to_string().as_bytes());
+                    *d = Value::Null;
+                }
+                if let Some(d) = env.get_mut("error").and_then(|e| e.get_mut("details")) {
+                    gated.extend_from_slice(d.to_string().as_bytes());
+                    *d = Value::Null;
+                }
+                rest.extend_from_slice(env.to_string().as_bytes());
+            }
+            _ => rest.extend_from_slice(line.as_bytes()),
+        }
+        gated.push(b'\n');
+        rest.push(b'\n');
+    }
+    (gated, rest)
+}
+
 /// Backup and export of the quit store (the app is gone), into `<root>/canary-out`.
 fn backup_and_export(world: &World) -> Result<PathBuf> {
     let DataDirResolution::Local(data) = check_data_dir(world.data_dir())? else {
@@ -368,8 +394,8 @@ async fn s16_canary_sweep_process_channels() -> Result<()> {
         )
         .await;
         let (name, key) = (
-            canaries.data(&format!("{alias}.myself.name")),
-            canaries.data(&format!("{alias}.myself.key")),
+            mock.user().to_owned(),
+            crate::harness::canary_user_key(mock.user()),
         );
         if label == "stale" {
             mock.jira_myself(&name, &key, header).await;
@@ -459,7 +485,10 @@ async fn s16_canary_sweep_process_channels() -> Result<()> {
         .filter(|(label, c)| {
             label == "issue.description"
                 && records.iter().any(|(t, p)| {
-                    *t == EventType::READ_FETCHED && p.to_string().contains(c.as_str())
+                    let text = p.to_string();
+                    *t == EventType::READ_FETCHED
+                        && text.contains("CAN-2")
+                        && text.contains(c.as_str())
                 })
                 && !visible.iter().any(|v| v.contains(c.as_str()))
         })
@@ -521,10 +550,17 @@ async fn s16_canary_sweep_process_channels() -> Result<()> {
         }
     }
     for c in &cap {
-        for canary in hits(&c.bytes, &data) {
-            if !c.agent {
+        if !c.agent {
+            for canary in hits(&c.bytes, &data) {
                 problems.push(format!("{} carries the data canary {canary}", c.name));
-            } else if dropped.iter().any(|d| d == canary) {
+            }
+            continue;
+        }
+        // The agent's channel: a data canary sits only in an envelope's `data` or
+        // `error.details` (X-05, 7494d2a), and only one the agent-visible bytes hold.
+        let (gated, rest) = split_envelopes(&c.bytes);
+        for canary in hits(&gated, &data) {
+            if dropped.iter().any(|d| d == canary) {
                 problems.push(format!("{} carries the dropped field {canary}", c.name));
             } else if !visible.iter().any(|v| v.contains(canary)) {
                 problems.push(format!(
@@ -533,6 +569,13 @@ async fn s16_canary_sweep_process_channels() -> Result<()> {
                     String::from_utf8_lossy(&c.bytes)
                 ));
             }
+        }
+        for canary in hits(&rest, &data) {
+            problems.push(format!(
+                "{} carries the data canary {canary} outside `data` and `error.details`: {}",
+                c.name,
+                String::from_utf8_lossy(&rest)
+            ));
         }
     }
     for (name, bytes) in &file_texts {
@@ -557,7 +600,7 @@ async fn s16_canary_sweep_process_channels() -> Result<()> {
             .collect()
     };
     let stale = payload_of(EventType::WRITE_STALE);
-    for reason in ["identity_mismatch", "recheck_failed"] {
+    for reason in ["identity_header_missing", "recheck_failed"] {
         assert!(
             stale.iter().any(|p| p.contains(reason)),
             "{reason}: {stale:?}"

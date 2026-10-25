@@ -1334,6 +1334,11 @@ pub fn canary_error(c: &Canaries, what: &str) -> String {
     .to_string()
 }
 
+/// The `/myself` key of the canary user `user` (a later `/myself` mount answers the same).
+pub fn canary_user_key(user: &str) -> String {
+    format!("K{user}")
+}
+
 /// A Jira `MockDc` in canary mode: a canary user (`X-AUSERNAME` and `/myself`), a canary header
 /// on every response, a version string with a canary suffix, canary issues, search page, comment
 /// receipt and error bodies, a canary HTML page, and an empty comment answer.
@@ -1345,7 +1350,7 @@ pub async fn canary_jira(c: &Canaries) -> MockDc {
         .with_header("X-Canary", &c.data("header.x-canary"));
     let myself = serde_json::json!({
         "self": format!("https://{}.example/rest/api/2/user", c.data("myself.self")),
-        "key": c.data("myself.key"),
+        "key": canary_user_key(&user),
         "name": user,
         "emailAddress": format!("{}@corp.example", c.data("myself.emailAddress")),
         "displayName": c.data("myself.displayName"),

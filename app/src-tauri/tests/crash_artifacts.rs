@@ -52,6 +52,20 @@ fn child_entry() {
             raw_fd2_write(b"SENTINEL-STDERR-FD2\n");
             std::process::exit(0);
         }
+        // M10 T29: the test build's stderr file, for every writer.
+        #[cfg(feature = "scripted-approver")]
+        "stderr_file" => {
+            use atlas_duck_app_lib::startup::crash::{
+                StderrTarget, redirect_stderr, stderr_target,
+            };
+            let target = stderr_target(&|n| std::env::var_os(n));
+            assert!(matches!(target, StderrTarget::TestFile(_)), "{target:?}");
+            redirect_stderr(&target).expect("redirect_stderr");
+            eprintln!("SENTINEL-FILE-EPRINTLN");
+            let _ = std::io::stderr().write_all(b"SENTINEL-FILE-WRITE-ALL\n");
+            raw_fd2_write(b"SENTINEL-FILE-FD2\n");
+            std::process::exit(0);
+        }
         "apply" => {
             let report = apply_process_crash_settings();
             assert_eq!(applied_report(), Some(&report));
@@ -116,6 +130,33 @@ fn stderr_redirect_reaches_null_device() {
         "stderr was: {stderr:?}"
     );
     assert!(!stderr.contains("SENTINEL"));
+}
+
+/// M10 T29: in the test build, a stderr file under `ATLAS_DUCK_TEST_HOME` receives what each
+/// writer (Rust's `eprintln!`, `Stderr::write_all`, the CRT/libc descriptor 2) writes after the
+/// redirect, and the inherited pipe receives none of it.
+#[cfg(feature = "scripted-approver")]
+#[test]
+fn stderr_file_redirect_receives_every_writer() {
+    let home = tempfile::tempdir().expect("home");
+    let file = home.path().join("app-stderr.txt");
+    let out = child("stderr_file")
+        .env("ATLAS_DUCK_TEST_HOME", home.path())
+        .env("ATLAS_DUCK_TEST_STDERR_FILE", &file)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn child");
+    let piped = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "child failed: {piped}");
+    assert!(!piped.contains("SENTINEL"), "the pipe got: {piped:?}");
+    let written = std::fs::read_to_string(&file).expect("the stderr file");
+    for marker in [
+        "SENTINEL-FILE-EPRINTLN",
+        "SENTINEL-FILE-WRITE-ALL",
+        "SENTINEL-FILE-FD2",
+    ] {
+        assert!(written.contains(marker), "{marker} missing: {written:?}");
+    }
 }
 
 #[test]
