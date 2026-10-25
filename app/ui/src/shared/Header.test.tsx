@@ -21,9 +21,23 @@ describe('Header', () => {
     }));
     render(<Header lines={lines} />);
     const items = screen.getAllByRole('listitem');
-    expect(items).toHaveLength(2);
+    expect(items).toHaveLength(statusLines.length);
     expect(items[0]?.textContent).toMatch(/^Caution: Locked/);
     expect(items[1]?.textContent).toBe('Info: 2 need attention');
+  });
+
+  // T21b: the anchor-directory and keychain-anchor ids of the shared (Rust-pinned) fixture each
+  // render their own text under the caution label.
+  it.each([
+    ['anchor_dir_write_failing', 'Writing to the anchor directory fails; 3 lines wait and will be retried.'],
+    ['anchor_dir_lines_pending', '1 line waits to be written to the anchor directory.'],
+    ['anchors_missing', 'The head anchor entry is missing from the keychain.'],
+  ])('banner_renders_%s', (id, text) => {
+    const line = statusLines.find((l) => l.id === id);
+    expect(line?.text).toBe(text);
+    expect(line?.level).toBe('caution');
+    render(<Header lines={[{ id, text, level: 'caution' }]} />);
+    expect(screen.getByRole('listitem').textContent).toBe(`Caution: ${text}`);
   });
 
   it('buttons_call_open_window_and_quit', () => {

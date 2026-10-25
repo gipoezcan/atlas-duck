@@ -1205,6 +1205,21 @@ fn status_lines() -> Vec<StatusLineDto> {
             text: "2 need attention".into(),
             level: StatusLevel::Info,
         },
+        StatusLineDto {
+            id: "anchor_dir_write_failing",
+            text: "Writing to the anchor directory fails; 3 lines wait and will be retried.".into(),
+            level: StatusLevel::Caution,
+        },
+        StatusLineDto {
+            id: "anchor_dir_lines_pending",
+            text: "1 line waits to be written to the anchor directory.".into(),
+            level: StatusLevel::Caution,
+        },
+        StatusLineDto {
+            id: "anchors_missing",
+            text: "The head anchor entry is missing from the keychain.".into(),
+            level: StatusLevel::Caution,
+        },
     ]
 }
 

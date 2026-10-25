@@ -8,5 +8,20 @@
     "id": "needs_attention",
     "level": "info",
     "text": "2 need attention"
+  },
+  {
+    "id": "anchor_dir_write_failing",
+    "level": "caution",
+    "text": "Writing to the anchor directory fails; 3 lines wait and will be retried."
+  },
+  {
+    "id": "anchor_dir_lines_pending",
+    "level": "caution",
+    "text": "1 line waits to be written to the anchor directory."
+  },
+  {
+    "id": "anchors_missing",
+    "level": "caution",
+    "text": "The head anchor entry is missing from the keychain."
   }
 ]

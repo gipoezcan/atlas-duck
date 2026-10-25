@@ -16,7 +16,7 @@ use crate::sandbox_probe::{SCRIPTS_DEGRADED, scripts_state};
 use crate::state::{AppState, ServeSlot};
 
 /// Every line id in the order [`lines`] emits them (PD-90).
-pub const IDS: [&str; 17] = [
+pub const IDS: [&str; 20] = [
     "locked_refused",
     "setup_refused",
     "waiting_keyring",
@@ -27,6 +27,9 @@ pub const IDS: [&str; 17] = [
     "token_expiry",
     "storage_low",
     "anchor_write_failing",
+    "anchor_dir_write_failing",
+    "anchor_dir_lines_pending",
+    "anchors_missing",
     "integrity_incident",
     "prune_backlog",
     LINE_CHECK_TARGET,
@@ -152,6 +155,41 @@ fn check_target_text(n: u64) -> String {
     }
 }
 
+fn lines_wait(n: u32) -> &'static str {
+    if n == 1 { "line waits" } else { "lines wait" }
+}
+
+/// T21b, §8.5 (a failing anchor-directory append is shown in Settings and the tray, never as an
+/// incident): `anchor_dir_write_failing`. The wording is the Settings window's
+/// (`AUDIT_TEXT.anchor_dir_failing`).
+fn anchor_dir_failing_text(pending: u32) -> String {
+    format!(
+        "Writing to the anchor directory fails; {pending} {} and will be retried.",
+        lines_wait(pending)
+    )
+}
+
+/// T21b, PD-156: `anchor_dir_lines_pending`, the Settings wording (`anchor_dir_pending`).
+fn anchor_dir_pending_text(pending: u32) -> String {
+    format!(
+        "{pending} {} to be written to the anchor directory.",
+        lines_wait(pending)
+    )
+}
+
+/// T21b, PD-170: `anchors_missing`, the Settings wording (`anchors_missing`) by the view's wire
+/// name (`head`, `first_retained`, `both`).
+fn anchors_missing_text(missing: &str) -> &'static str {
+    match missing {
+        "head" => "The head anchor entry is missing from the keychain.",
+        "first_retained" => "The first-retained anchor entry is missing from the keychain.",
+        "both" => {
+            "The head anchor and the first-retained anchor entries are missing from the keychain."
+        }
+        _ => "An anchor entry is missing from the keychain.",
+    }
+}
+
 /// The status lines, in the order of [`IDS`] (a token line per instance). One input gives one line;
 /// nothing here reads a request.
 pub fn lines(i: &StatusInputs) -> Vec<StatusLineDto> {
@@ -222,6 +260,28 @@ pub fn lines(i: &StatusInputs) -> Vec<StatusLineDto> {
                 "anchor_write_failing",
                 Caution,
                 TEXT_ANCHOR_WRITE_FAILING.to_owned(),
+            ));
+        }
+        // T21b: the same `StoreHealthView` Settings reads. The failing line's text carries the
+        // pending count, so the pending line shows only while nothing is failing (as in Settings).
+        if h.anchor_dir_write_failing {
+            out.push(line(
+                "anchor_dir_write_failing",
+                Caution,
+                anchor_dir_failing_text(h.anchor_dir_lines_pending),
+            ));
+        } else if h.anchor_dir_lines_pending > 0 {
+            out.push(line(
+                "anchor_dir_lines_pending",
+                Caution,
+                anchor_dir_pending_text(h.anchor_dir_lines_pending),
+            ));
+        }
+        if let Some(missing) = h.anchors_missing {
+            out.push(line(
+                "anchors_missing",
+                Caution,
+                anchors_missing_text(missing).to_owned(),
             ));
         }
         if h.open_incidents > 0 {
@@ -527,6 +587,106 @@ mod tests {
             (
                 StatusInputs {
                     health: Some(StoreHealthView {
+                        anchor_dir_write_failing: true,
+                        anchor_dir_lines_pending: 3,
+                        ..health()
+                    }),
+                    ..StatusInputs::default()
+                },
+                vec![(
+                    "anchor_dir_write_failing",
+                    "Writing to the anchor directory fails; 3 lines wait and will be retried.",
+                    Caution,
+                )],
+            ),
+            (
+                StatusInputs {
+                    health: Some(StoreHealthView {
+                        anchor_dir_write_failing: true,
+                        anchor_dir_lines_pending: 1,
+                        ..health()
+                    }),
+                    ..StatusInputs::default()
+                },
+                vec![(
+                    "anchor_dir_write_failing",
+                    "Writing to the anchor directory fails; 1 line waits and will be retried.",
+                    Caution,
+                )],
+            ),
+            (
+                StatusInputs {
+                    health: Some(StoreHealthView {
+                        anchor_dir_lines_pending: 1,
+                        ..health()
+                    }),
+                    ..StatusInputs::default()
+                },
+                vec![(
+                    "anchor_dir_lines_pending",
+                    "1 line waits to be written to the anchor directory.",
+                    Caution,
+                )],
+            ),
+            (
+                StatusInputs {
+                    health: Some(StoreHealthView {
+                        anchor_dir_lines_pending: 12,
+                        ..health()
+                    }),
+                    ..StatusInputs::default()
+                },
+                vec![(
+                    "anchor_dir_lines_pending",
+                    "12 lines wait to be written to the anchor directory.",
+                    Caution,
+                )],
+            ),
+            (
+                StatusInputs {
+                    health: Some(StoreHealthView {
+                        anchors_missing: Some("head"),
+                        ..health()
+                    }),
+                    ..StatusInputs::default()
+                },
+                vec![(
+                    "anchors_missing",
+                    "The head anchor entry is missing from the keychain.",
+                    Caution,
+                )],
+            ),
+            (
+                StatusInputs {
+                    health: Some(StoreHealthView {
+                        anchors_missing: Some("first_retained"),
+                        ..health()
+                    }),
+                    ..StatusInputs::default()
+                },
+                vec![(
+                    "anchors_missing",
+                    "The first-retained anchor entry is missing from the keychain.",
+                    Caution,
+                )],
+            ),
+            (
+                StatusInputs {
+                    health: Some(StoreHealthView {
+                        anchors_missing: Some("both"),
+                        ..health()
+                    }),
+                    ..StatusInputs::default()
+                },
+                vec![(
+                    "anchors_missing",
+                    "The head anchor and the first-retained anchor entries are missing from the keychain.",
+                    Caution,
+                )],
+            ),
+            (
+                StatusInputs {
+                    health: Some(StoreHealthView {
                         open_incidents: 2,
                         ..health()
                     }),
@@ -684,6 +844,8 @@ mod tests {
             health: Some(StoreHealthView {
                 storage_low: true,
                 anchor_write_failing: true,
+                anchor_dir_write_failing: true,
+                anchors_missing: Some("both"),
                 open_incidents: 1,
                 prune_backlog: Some("pruning is 1 days behind".into()),
                 ..health()
@@ -704,6 +866,95 @@ mod tests {
             .collect();
         assert_eq!(positions.len(), ids.len());
         assert!(positions.windows(2).all(|w| w[0] <= w[1]), "{ids:?}");
+    }
+
+    /// The anchor-directory and keychain-anchor lines come from the same `StoreHealthView` the
+    /// Settings window reads, each only while its condition holds (clearing it removes the line),
+    /// and the pending line gives way to the failing line (whose text carries the count).
+    #[test]
+    fn anchor_lines_follow_the_health_view_and_clear() {
+        let ids = |h: StoreHealthView| {
+            only(StatusInputs {
+                health: Some(h),
+                ..StatusInputs::default()
+            })
+            .into_iter()
+            .map(|l| l.0)
+            .collect::<Vec<_>>()
+        };
+        assert!(ids(health()).is_empty());
+        let failing = StoreHealthView {
+            anchor_dir_write_failing: true,
+            anchor_dir_lines_pending: 4,
+            ..health()
+        };
+        assert_eq!(ids(failing.clone()), ["anchor_dir_write_failing"]);
+        assert!(
+            ids(StoreHealthView {
+                anchor_dir_write_failing: false,
+                anchor_dir_lines_pending: 0,
+                ..failing
+            })
+            .is_empty()
+        );
+        let pending = StoreHealthView {
+            anchor_dir_lines_pending: 2,
+            ..health()
+        };
+        assert_eq!(ids(pending.clone()), ["anchor_dir_lines_pending"]);
+        assert!(
+            ids(StoreHealthView {
+                anchor_dir_lines_pending: 0,
+                ..pending
+            })
+            .is_empty()
+        );
+        let missing = StoreHealthView {
+            anchors_missing: Some("both"),
+            ..health()
+        };
+        assert_eq!(ids(missing.clone()), ["anchors_missing"]);
+        assert!(
+            ids(StoreHealthView {
+                anchors_missing: None,
+                ..missing
+            })
+            .is_empty()
+        );
+        // The three are independent of each other and of the keychain-side `anchor_write_failing`.
+        assert_eq!(
+            ids(StoreHealthView {
+                anchor_write_failing: true,
+                anchor_dir_write_failing: true,
+                anchors_missing: Some("head"),
+                ..health()
+            }),
+            [
+                "anchor_write_failing",
+                "anchor_dir_write_failing",
+                "anchors_missing"
+            ]
+        );
+    }
+
+    /// Decision (T21b): the spec gives no order for these, so they sit with the other audit-anchor
+    /// health lines, after `anchor_write_failing` and before `integrity_incident`, i.e. below the
+    /// credential and locked states and above the informational lines.
+    #[test]
+    fn the_new_ids_sit_between_the_anchor_line_and_the_incident() {
+        let pos = |id: &str| IDS.iter().position(|x| *x == id);
+        let a = pos("anchor_write_failing");
+        assert!(a.is_some());
+        let chain = [
+            "anchor_write_failing",
+            "anchor_dir_write_failing",
+            "anchor_dir_lines_pending",
+            "anchors_missing",
+            "integrity_incident",
+        ];
+        let at: Vec<Option<usize>> = chain.iter().map(|id| pos(id)).collect();
+        assert!(at.iter().all(Option::is_some), "{at:?}");
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{at:?}");
     }
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
