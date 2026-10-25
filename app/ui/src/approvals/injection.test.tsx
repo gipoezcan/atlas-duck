@@ -14,7 +14,11 @@
 // only Tauri's `invoke` is replaced, so a poisoned answer reaches a component exactly when the
 // runtime's validation lets it through. Three passes: `all` (every string, discriminators too),
 // `free` (discriminators keep their values so every known branch renders) and `keys` (records
-// gain `__proto__`/`constructor` keys). The fixtures are enumerated with a glob: a fixture no
+// gain `__proto__`/`constructor` keys). `keys` keeps every string benign, so it tests the validators
+// and the windows' lookups against hostile keys, not the text path: the strings are the other two
+// passes' business (M6 T31 M-9). Event payloads are poisoned too (`poisonedEvents`, M-3). The credential
+// page takes the poisoned context in every pass, `all` included: it has no validator, so an invalid
+// discriminator shows what the page does with it (M-2). The fixtures are enumerated with a glob: a fixture no
 // window consumes fails `every_fixture_reaches_a_window`.
 import { act, fireEvent, render } from '@testing-library/react';
 import type { ReactElement } from 'react';
@@ -412,6 +416,22 @@ async function emit(name: string, payload: Json): Promise<void> {
   });
 }
 
+/**
+ * Every event a window listened for, sent with a poisoned payload too (M6 T31 M-3): a payload that is
+ * the string, one that is a record with the string in every field, and a record holding the
+ * prototype keys. Most listeners take the event as a trigger and never read it; the ones that do
+ * (udit_job, window_focus) check it first, and what they do not accept must change nothing.
+ */
+async function poisonedEvents(): Promise<void> {
+  // Discriminators valid (a `free` pass keeps them), so a record that skips its own check reaches the bar.
+  const record = { requested: payload, job: 'export', phase: 'progress', kind: payload, seq: payload, done: payload, total: payload, error: payload };
+  for (const name of [...handlers.keys()]) {
+    await emit(name, payload);
+    await emit(name, poison(JSON.parse('{"__proto__":{"polluted":1},"constructor":1}'), payload, 'free'));
+    await emit(name, poison(record, payload, mode));
+  }
+}
+
 // ---- driving a window ----
 
 async function settle(): Promise<void> {
@@ -527,7 +547,7 @@ function credential(k: number): Scenario {
       };
       return mountCredentialPage(root, {
         invoke: (cmd) => {
-          if (cmd === 'credential_context') return Promise.resolve(fx('credential_context', mode === 'all' ? 'free' : mode)[k % 4]);
+          if (cmd === 'credential_context') return Promise.resolve(fx('credential_context')[k % 4]);
           const fixture = answers[cmd];
           const i = n++;
           if (fixture === undefined || i % 4 === 3) {
@@ -647,6 +667,7 @@ async function run(scenario: Scenario): Promise<string[]> {
   }
   await settle();
   await scenario.after?.();
+  await poisonedEvents();
   const where = `${mode}/${scenario.name}`;
   const found = await explore(where);
   if (learning) benignUsed.set(where, current);

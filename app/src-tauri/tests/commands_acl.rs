@@ -5238,6 +5238,31 @@ fn s09_new_commands_outside_grant_rejected() -> TestResult {
             }
         })
         .collect();
+    // The commands M10 added to `COMMANDS`, written out here on purpose (a second source next to
+    // `names.rs`): the table below must name every one, so a new command without its grant row fails.
+    const M10_ADDED: [&str; 21] = [
+        "acknowledge_incident",
+        "anchor_dir_remove",
+        "anchor_dir_set",
+        "audit_payload",
+        "audit_query",
+        "audit_status",
+        "audit_trail",
+        "backup_trigger",
+        "export_cancel",
+        "export_trigger",
+        "forget_install",
+        "orphan_installs",
+        "re_anchor",
+        "recovery_passphrase_change",
+        "removal_export",
+        "restore_begin",
+        "restore_cancel",
+        "restore_from_backup",
+        "wizard_anchor_dir",
+        "wizard_anchor_dir_clear",
+        "wizard_restore",
+    ];
     table.extend([
         ("restore_begin", json!({}), &["settings"] as &[&str]),
         ("restore_cancel", json!({}), &["settings"]),
@@ -5260,6 +5285,12 @@ fn s09_new_commands_outside_grant_rejected() -> TestResult {
         // M10 T16 (PD-176): "Prepare for removal"'s compliance export, Settings only.
         ("removal_export", json!({}), &["settings"]),
     ]);
+    let mut named: Vec<&str> = table.iter().map(|(c, _, _)| *c).collect();
+    named.sort_unstable();
+    assert_eq!(
+        named, M10_ADDED,
+        "the table names every command M10 added, and only those"
+    );
     for (cmd, body, want) in table {
         assert!(COMMANDS.contains(&cmd), "{cmd} is not in COMMANDS");
         let holders: Vec<&str> = S09_GRANTS
@@ -5866,7 +5897,10 @@ fn s09_with(body: &Value, key: &str, value: Value) -> Value {
 /// §10.3 (S-09): one case per command, three ways a body can be wrong, each refused as
 /// `invalid_argument` before the handler: an unknown key, a value of the wrong type (a body that is
 /// no object, for the commands that take nothing), a value past its bound (a 1 MiB pad, for the
-/// commands that take nothing). Every command of `COMMANDS` has its row.
+/// commands that take nothing). Every command of `COMMANDS` has its row. A row checks ONE key per
+/// way (the wrong-type key and the out-of-bounds key it names), not every field of the command: the
+/// bound of each further string or list field is the dto's own and is pinned per field, in
+/// `dto_fixtures.rs` (`dto_bound_plus_one_rejected`) and in the commands' unit tests.
 #[test]
 fn s09_unknown_field_wrong_type_out_of_bounds_rejected() -> TestResult {
     let cases = s09_cases();

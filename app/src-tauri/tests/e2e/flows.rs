@@ -136,9 +136,10 @@ const WINDOWS_ONLY_FLOWS: [(&str, &str); 5] = [
 ];
 
 /// The flows that run on every OS the e2e job runs on (Windows and Linux).
-const COMMON_FLOWS: [&str; 11] = [
+const COMMON_FLOWS: [&str; 12] = [
     "ui06_create_approve_receipt_verify_now",
     "s06_payloads_inert_in_real_webview",
+    "s06_audit_payload_inert_in_real_webview",
     "s08_preview_css_loads_inline_style_and_remote_image_blocked",
     "s09_isolation_invoke_round_trips_every_window",
     "s09_isolation_invoke_setup_window",
@@ -991,6 +992,123 @@ async fn s06(rig: &Rig) -> Result<()> {
     Ok(())
 }
 
+/// How many of the newest records the audit flow opens at most.
+const AUDIT_RECORDS_OPENED: usize = 6;
+
+/// S-06 (webview half, Audit window, M10 T30): a read of an issue whose summary and description are
+/// the payloads is released by the scripted approver (`atlas-test:release`), so the audit log holds a
+/// record whose decrypted payload carries them. In the Audit window the newest records are opened and
+/// their payloads shown: the payload sits only in the sandboxed `Decrypted payload` frame, as text
+/// (the frames of the records that hold the payloads show `<script>` as text); no frame, and not the
+/// window, holds a script, handler or link; the title, the `data-alive` marker and the windows are
+/// unchanged. (`window.__pwned` cannot be read without a script: the payloads set the title.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s06_audit_payload_inert_in_real_webview() -> Result<()> {
+    if !opted_in("s06_audit_payload_inert_in_real_webview") {
+        return Ok(());
+    }
+    let world = jira_world().await?;
+    let joined = PAYLOADS.join(" | ");
+    jira(&world)?
+        .json(
+            "/rest/api/2/issue/ABC-77",
+            200,
+            &issue_json("ABC-77", &joined, &joined)?,
+        )
+        .await;
+    let rig = Rig::approvals(world).await?;
+    let outcome = s06_audit(&rig).await;
+    rig.finish("s06_audit", outcome).await
+}
+
+async fn s06_audit(rig: &Rig) -> Result<()> {
+    let wd = &rig.wd;
+    let run = rig
+        .world
+        .cli(&[
+            "jira",
+            "issue",
+            "get",
+            "ABC-77",
+            "--reason",
+            "atlas-test:release",
+        ])
+        .await?;
+    ensure_eq!(run.exit, 0, "stdout: {}", run.stdout);
+    rig.open_window("Audit", "Audit").await?;
+    let title = wd.title().await?;
+    let handles = wd.window_handles().await?;
+    let alive = wd.find("html").await?;
+    ensure_eq!(
+        wd.attribute(&alive, "data-alive").await?.as_deref(),
+        Some("1")
+    );
+
+    // The list's first read: at least the verify-less log of this run (request, decision, release).
+    wd.wait_find(".audit-line > button", WAIT).await?;
+    let rows = wd.find_all(".audit-line > button").await?.len();
+    ensure!(rows > 0, "the Audit list shows no record");
+    let mut shown = 0usize;
+    let mut as_text = 0usize;
+    for index in 0..rows.min(AUDIT_RECORDS_OPENED) {
+        // The window re-draws its list when a record opens: look the buttons up again each time.
+        let buttons = wd.find_all(".audit-line > button").await?;
+        let Some(open) = buttons.get(index) else {
+            break;
+        };
+        wd.click(open).await?;
+        let show = wd
+            .wait_find_xpath(
+                "//button[normalize-space()='Show the decrypted payload']",
+                WAIT,
+            )
+            .await?;
+        wd.click(&show).await?;
+        // A record whose payload cannot be shown (no body, or gone) answers with a line, no frame:
+        // it is skipped, and the flow fails below when no record showed one.
+        let Ok(frame) = wd
+            .wait_find(
+                "iframe[title^='Decrypted payload']",
+                Duration::from_secs(10),
+            )
+            .await
+        else {
+            continue;
+        };
+        wd.switch_to_frame(&frame).await?;
+        // The payload document renders (a table or tree of text); a record without a body shows
+        // an empty frame, which is no failure.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_inert_document(wd, "audit payload frame").await?;
+        let in_frame = body_text(wd).await?;
+        back_to_top(wd).await?;
+        shown += 1;
+        if in_frame.contains("<script>") || in_frame.contains("&lt;script&gt;") {
+            as_text += 1;
+        }
+        assert_inert_document(wd, "audit window").await?;
+        // The frame is the only one, and sandboxed (`sandbox=""`: the attribute is present, empty).
+        let frames = wd.find_all("iframe").await?;
+        ensure_eq!(frames.len(), 1, "iframes in the Audit window");
+        let sandbox = wd.attribute(&frames[0], "sandbox").await?;
+        ensure_eq!(sandbox.as_deref(), Some(""), "the payload frame's sandbox");
+        ensure_eq!(wd.title().await?, title, "the window title changed");
+    }
+    ensure!(shown > 0, "no payload was opened");
+    ensure!(
+        as_text > 0,
+        "none of the {shown} opened payloads shows the injected markup as text"
+    );
+    ensure!(!title.contains("pwned"));
+    let alive = wd.find("html").await?;
+    ensure_eq!(
+        wd.attribute(&alive, "data-alive").await?.as_deref(),
+        Some("1")
+    );
+    ensure_eq!(wd.window_handles().await?, handles, "a window appeared");
+    Ok(())
+}
+
 // ---- S-07 and the credential page's CSP -----------------------------------------------------------------
 
 /// S-07 (webview half): a value typed into the Approvals window's in-memory state (the deny reason) is
@@ -1366,8 +1484,12 @@ async fn s09(rig: &Rig) -> Result<()> {
     // Settings: settings_get answered (the provisioned instance).
     rig.open_window("Settings", "Settings").await?;
     wait_text(wd, "the instance row", WAIT, |t| t.contains("jira-main")).await?;
-    // Audit: verify_now answered.
+    // Audit: audit_status answered on load (the incident section says so), then verify_now.
     rig.open_window("Audit", "Audit").await?;
+    wait_text(wd, "the incident count (audit_status)", WAIT, |t| {
+        t.contains("No open integrity incidents.")
+    })
+    .await?;
     let verify = wd
         .wait_find_xpath("//button[normalize-space()='Verify now']", WAIT)
         .await?;

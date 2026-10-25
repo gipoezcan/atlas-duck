@@ -2010,3 +2010,101 @@ fn stale_detects_differences() -> TestResult {
     std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
+
+/// M6 T31 M-4 (M10 T30): one bound+1 case for each of the bounded argument fields `alias`, `proxy`,
+/// `new_url` (and `base_url`, the field `new_url` shares its bound with), against the bounds in
+/// `commands::settings`. In each command that takes the field: a value of exactly the bound is
+/// accepted and one more is refused as `invalid_argument` naming that field. The values are
+/// otherwise valid (core's proxy parser has no length rule of its own), so only the bound can
+/// refuse them.
+#[test]
+fn dto_bound_plus_one_rejected() -> TestResult {
+    use atlas_duck_app_lib::commands::dto::parse;
+    use atlas_duck_app_lib::commands::settings::{
+        BASE_URL_MAX_BYTES, InstanceAddArgs, InstanceChangeUrlArgs, InstanceSetProxyArgs,
+        PROXY_MAX_BYTES,
+    };
+    use atlas_duck_core::config::instances::MAX_ALIAS_CHARS;
+
+    let alias = |n: usize| "a".repeat(n);
+    let proxy = |n: usize| format!("{}:80", "h".repeat(n - 3));
+    let url = |n: usize| {
+        format!(
+            "https://h.example/{}",
+            "p".repeat(n - "https://h.example/".len())
+        )
+    };
+    assert_eq!(proxy(PROXY_MAX_BYTES).len(), PROXY_MAX_BYTES);
+    assert_eq!(url(BASE_URL_MAX_BYTES).len(), BASE_URL_MAX_BYTES);
+
+    let add = |alias: String, base_url: String, proxy: String| {
+        json!({"alias": alias, "product": "jira", "base_url": base_url, "proxy": proxy,
+               "use_custom_ca": false, "is_default": false})
+    };
+    let refused = |r: Result<(), CommandError>| match r {
+        Err(CommandError::InvalidArgument { field }) => Some(field),
+        _ => None,
+    };
+
+    // (command, the field, the body at the bound, the body one past it)
+    let cases: Vec<(&str, &str, Value, Value)> = vec![
+        (
+            "instance_add",
+            "alias",
+            add(alias(MAX_ALIAS_CHARS), url(40), String::new()),
+            add(alias(MAX_ALIAS_CHARS + 1), url(40), String::new()),
+        ),
+        (
+            "instance_add",
+            "base_url",
+            add(alias(4), url(BASE_URL_MAX_BYTES), String::new()),
+            add(alias(4), url(BASE_URL_MAX_BYTES + 1), String::new()),
+        ),
+        (
+            "instance_add",
+            "proxy",
+            add(alias(4), url(40), proxy(PROXY_MAX_BYTES)),
+            add(alias(4), url(40), proxy(PROXY_MAX_BYTES + 1)),
+        ),
+        (
+            "instance_change_url",
+            "alias",
+            json!({"alias": alias(MAX_ALIAS_CHARS), "new_url": url(40)}),
+            json!({"alias": alias(MAX_ALIAS_CHARS + 1), "new_url": url(40)}),
+        ),
+        (
+            "instance_change_url",
+            "new_url",
+            json!({"alias": alias(4), "new_url": url(BASE_URL_MAX_BYTES)}),
+            json!({"alias": alias(4), "new_url": url(BASE_URL_MAX_BYTES + 1)}),
+        ),
+        (
+            "instance_set_proxy",
+            "alias",
+            json!({"alias": alias(MAX_ALIAS_CHARS), "proxy": ""}),
+            json!({"alias": alias(MAX_ALIAS_CHARS + 1), "proxy": ""}),
+        ),
+        (
+            "instance_set_proxy",
+            "proxy",
+            json!({"alias": alias(4), "proxy": proxy(PROXY_MAX_BYTES)}),
+            json!({"alias": alias(4), "proxy": proxy(PROXY_MAX_BYTES + 1)}),
+        ),
+    ];
+    for (cmd, field, at, past) in cases {
+        let run = |body: &Value| -> Result<(), CommandError> {
+            match cmd {
+                "instance_add" => parse::<InstanceAddArgs>(body).map(drop),
+                "instance_change_url" => parse::<InstanceChangeUrlArgs>(body).map(drop),
+                _ => parse::<InstanceSetProxyArgs>(body).map(drop),
+            }
+        };
+        assert_eq!(refused(run(&at)), None, "{cmd}.{field} at the bound");
+        assert_eq!(
+            refused(run(&past)),
+            Some(field),
+            "{cmd}.{field} one past the bound"
+        );
+    }
+    Ok(())
+}
