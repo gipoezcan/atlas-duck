@@ -128,11 +128,26 @@ fn files_below(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Reads each listed file. A file that disappeared between the listing and the read (Windows:
+/// WebView2 helper processes outlive the app for a moment and remove their own lock and temp
+/// files under `<data>/webview`) is skipped and named on stdout; it holds nothing to sweep any
+/// more. Any other error names the file.
 fn capture_files(out: &mut Vec<Captured>, what: &str, files: &[PathBuf]) -> Result<()> {
     for f in files {
+        let bytes = match fs::read(f) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!(
+                    "canary sweep: {what} {} vanished before it was read",
+                    f.display()
+                );
+                continue;
+            }
+            Err(e) => return Err(format!("{what} {}: {e}", f.display()).into()),
+        };
         out.push(Captured {
             name: format!("{what} {}", f.display()),
-            bytes: fs::read(f)?,
+            bytes,
             kind: Kind::Quiet,
         });
     }
@@ -369,9 +384,13 @@ async fn s16_canary_sweep_process_channels() -> Result<()> {
             ("jira-b", Product::Jira),
             ("jira-c", Product::Jira),
         ])
-        .await?;
+        .await
+        .map_err(|e| format!("provision_store: {e}"))?;
     // Started by the harness, so the test build writes its stderr to the file.
-    let mut app = world.start_app().await?;
+    let mut app = world
+        .start_app()
+        .await
+        .map_err(|e| format!("start_app: {e}"))?;
     let mut cap: Vec<Captured> = Vec::new();
     let mut ids: Vec<(String, String)> = Vec::new();
     let issue = |key: &str, directive: &str| -> Vec<String> {
@@ -464,7 +483,9 @@ async fn s16_canary_sweep_process_channels() -> Result<()> {
     ];
     for (label, args, want) in &terminal {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let r = run(&world, &args).await?;
+        let r = run(&world, &args)
+            .await
+            .map_err(|e| format!("{label}: {e}"))?;
         let env = r.envelope.as_ref().ok_or("no envelope")?;
         assert_eq!(
             env.status,
@@ -544,7 +565,10 @@ async fn s16_canary_sweep_process_channels() -> Result<()> {
         &["doctor"][..],
         &["instances"][..],
     ] {
-        let r = world.cli(args).await?;
+        let r = world
+            .cli(args)
+            .await
+            .map_err(|e| format!("{args:?}: {e}"))?;
         capture_run(&mut cap, &args.join(" "), &r);
     }
 
@@ -569,8 +593,10 @@ async fn s16_canary_sweep_process_channels() -> Result<()> {
         "webview",
         &files_below(&world.data_dir().join(WEBVIEW_DIR_NAME)),
     )?;
-    let records = world.audit_records()?;
-    let out = backup_and_export(&world)?;
+    let records = world
+        .audit_records()
+        .map_err(|e| format!("audit_records: {e}"))?;
+    let out = backup_and_export(&world).map_err(|e| format!("backup_and_export: {e}"))?;
     let outputs = files_below(&out);
     assert!(
         outputs.iter().any(|p| p.ends_with("recovery.bin")),
@@ -650,7 +676,7 @@ async fn s16_canary_sweep_process_channels() -> Result<()> {
         let note = f.ends_with("recovery-note.txt");
         cap.push(Captured {
             name: format!("backup/export/note {}", f.display()),
-            bytes: fs::read(f)?,
+            bytes: fs::read(f).map_err(|e| format!("read {}: {e}", f.display()))?,
             kind: if note { Kind::Quiet } else { Kind::Store },
         });
     }
