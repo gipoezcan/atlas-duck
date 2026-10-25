@@ -178,13 +178,14 @@ debug_app() {
   APP_PID=""
   LOG=""
   dest="/Applications/Atlas Duck.app"
+  # Before the trap: its cleanup removes $dest, which must be ours.
+  [ ! -e "$dest" ] || die "$dest already exists; this job needs a fresh machine"
   trap debug_cleanup EXIT
 
   mkdir -p "$work/src"
   tar -xzf "${tars[0]}" -C "$work/src"
   src_app="$work/src/Atlas Duck.app"
   [ -d "$src_app" ] || die "the tarball holds no 'Atlas Duck.app'"
-  [ ! -e "$dest" ] || die "$dest already exists; this job needs a fresh machine"
   app_exe="$dest/Contents/MacOS/atlas-duck-app"
   fixture="$work/ci_fixture"
   cp "$art_dir/fixture/ci_fixture" "$fixture"
