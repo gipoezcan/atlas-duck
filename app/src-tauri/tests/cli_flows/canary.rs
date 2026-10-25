@@ -74,24 +74,36 @@ const ALLOWLIST: [(&str, &str); 3] = [
     ),
 ];
 
-/// One captured channel: a name and its bytes.
+/// What a channel may carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// A CLI stream (the agent's channel): data canaries only in an envelope's `data` or
+    /// `error.details`, and only agent-visible ones.
+    Agent,
+    /// Logs, the app's stderr, webview files, the recovery note: no data canary at all.
+    Quiet,
+    /// Decrypted audit payloads, the backup and the export: data allowed, no secret.
+    Store,
+}
+
+/// One captured channel: a name, its bytes and what it may carry.
+#[derive(Debug, Clone)]
 struct Captured {
     name: String,
     bytes: Vec<u8>,
-    /// A CLI stream (the agent's channel); everything else carries no data canary at all.
-    agent: bool,
+    kind: Kind,
 }
 
 fn capture_run(out: &mut Vec<Captured>, label: &str, r: &CliRun) {
     out.push(Captured {
         name: format!("{label} stdout (exit {})", r.exit),
         bytes: r.stdout.clone().into_bytes(),
-        agent: true,
+        kind: Kind::Agent,
     });
     out.push(Captured {
         name: format!("{label} stderr"),
         bytes: r.stderr.clone().into_bytes(),
-        agent: true,
+        kind: Kind::Agent,
     });
 }
 
@@ -121,7 +133,7 @@ fn capture_files(out: &mut Vec<Captured>, what: &str, files: &[PathBuf]) -> Resu
         out.push(Captured {
             name: format!("{what} {}", f.display()),
             bytes: fs::read(f)?,
-            agent: false,
+            kind: Kind::Quiet,
         });
     }
     Ok(())
@@ -195,6 +207,105 @@ fn split_envelopes(bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
         rest.push(b'\n');
     }
     (gated, rest)
+}
+
+/// What the sweep checks every channel against.
+struct Rules {
+    /// (kind, forms) of each PAT and of the passphrase: in no channel.
+    secrets: Vec<(String, Vec<String>)>,
+    /// Every data canary handed out.
+    data: Vec<String>,
+    /// The agent-visible bytes ([`agent_visible`]).
+    visible: Vec<String>,
+    /// The canaries the redaction dropped.
+    dropped: Vec<String>,
+}
+
+impl Rules {
+    /// The findings of one channel. The real sweep and the negative controls share this.
+    fn sweep_one(&self, c: &Captured) -> Vec<String> {
+        let mut problems = Vec::new();
+        for (kind, forms) in &self.secrets {
+            let found = hits(&c.bytes, forms);
+            if !found.is_empty() {
+                problems.push(format!("{} carries the {kind} canary {found:?}", c.name));
+            }
+        }
+        match c.kind {
+            Kind::Store => {}
+            Kind::Quiet => {
+                for canary in hits(&c.bytes, &self.data) {
+                    problems.push(format!("{} carries the data canary {canary}", c.name));
+                }
+            }
+            Kind::Agent => {
+                // A data canary sits only in an envelope's `data` or `error.details` (X-05,
+                // 7494d2a), and only one the agent-visible bytes hold.
+                let (gated, rest) = split_envelopes(&c.bytes);
+                for canary in hits(&gated, &self.data) {
+                    if self.dropped.iter().any(|d| d == canary) {
+                        problems.push(format!("{} carries the dropped field {canary}", c.name));
+                    } else if !self.visible.iter().any(|v| v.contains(canary)) {
+                        problems.push(format!(
+                            "{} carries the data canary {canary}, which no agent-visible bytes \
+                             hold: {}",
+                            c.name,
+                            String::from_utf8_lossy(&c.bytes)
+                        ));
+                    }
+                }
+                for canary in hits(&rest, &self.data) {
+                    problems.push(format!(
+                        "{} carries the data canary {canary} outside `data` and \
+                         `error.details`: {}",
+                        c.name,
+                        String::from_utf8_lossy(&rest)
+                    ));
+                }
+            }
+        }
+        problems
+    }
+
+    /// The negative controls of one channel, through [`Rules::sweep_one`]: a copy with a secret
+    /// form spliced in; unless it is a store, a copy with a data canary outside any envelope; for
+    /// an agent stream, a copy with an envelope carrying a released canary in `meta`. Each must
+    /// add a finding. Returns what was missed.
+    fn missed_controls(&self, c: &Captured) -> Vec<String> {
+        let base = self.sweep_one(c).len();
+        let mut plants: Vec<(&str, Vec<u8>)> = Vec::new();
+        if let Some((_, forms)) = self.secrets.first()
+            && let Some(form) = forms.last()
+        {
+            plants.push(("secret", format!("\n{form}\n").into_bytes()));
+        }
+        if c.kind != Kind::Store
+            && let Some(canary) = self.data.first()
+        {
+            plants.push((
+                "data outside an envelope",
+                format!("\n{canary}\n").into_bytes(),
+            ));
+        }
+        if c.kind == Kind::Agent
+            && let Some(released) = self
+                .data
+                .iter()
+                .find(|d| self.visible.iter().any(|v| v.contains(d.as_str())))
+        {
+            let env = json!({"status": "released", "meta": {"x": released}});
+            plants.push(("released canary in meta", format!("\n{env}\n").into_bytes()));
+        }
+        let mut missed = Vec::new();
+        for (what, bytes) in plants {
+            let mut planted = c.clone();
+            planted.bytes.extend_from_slice(&bytes);
+            if self.sweep_one(&planted).len() <= base {
+                missed.push(format!("{}: the planted {what} was not reported", c.name));
+            }
+        }
+        missed
+    }
 }
 
 /// Backup and export of the quit store (the app is gone), into `<root>/canary-out`.
@@ -527,68 +638,66 @@ async fn s16_canary_sweep_process_channels() -> Result<()> {
         }
     }
 
-    // Every captured channel.
-    let audit_texts: Vec<(String, Vec<u8>)> = records
-        .iter()
-        .map(|(t, p)| (format!("audit payload {t:?}"), p.to_string().into_bytes()))
-        .collect();
-    let mut file_texts: Vec<(String, Vec<u8>)> = Vec::new();
+    // Every captured channel, through the one scanner the negative controls also use.
+    for (t, p) in &records {
+        cap.push(Captured {
+            name: format!("audit payload {t:?}"),
+            bytes: p.to_string().into_bytes(),
+            kind: Kind::Store,
+        });
+    }
     for f in &outputs {
-        file_texts.push((format!("backup/export/note {}", f.display()), fs::read(f)?));
+        let note = f.ends_with("recovery-note.txt");
+        cap.push(Captured {
+            name: format!("backup/export/note {}", f.display()),
+            bytes: fs::read(f)?,
+            kind: if note { Kind::Quiet } else { Kind::Store },
+        });
     }
-    for (name, bytes) in cap
-        .iter()
-        .map(|c| (c.name.clone(), c.bytes.clone()))
-        .chain(audit_texts)
-        .chain(file_texts.iter().cloned())
-    {
-        for (kind, forms) in &secrets {
-            let found = hits(&bytes, forms);
-            if !found.is_empty() {
-                problems.push(format!("{name} carries the {kind} canary {found:?}"));
-            }
-        }
+    // Every input channel is there and not empty (a wrong root or an empty read would leave a
+    // channel with nothing to sweep).
+    let named = |prefix: &str| -> Vec<&Captured> {
+        cap.iter().filter(|c| c.name.starts_with(prefix)).collect()
+    };
+    let logs = named("diagnostic log");
+    assert!(
+        logs.iter().any(|c| c.bytes.contains(&b'\n')),
+        "no diagnostic log line: {}",
+        world.diagnostics()
+    );
+    for prefix in ["app stderr", "audit payload", "backup/export/note"] {
+        assert!(!named(prefix).is_empty(), "no {prefix} channel");
     }
+    assert!(
+        named("backup/export/note")
+            .iter()
+            .any(|c| c.name.ends_with("recovery-note.txt") && !c.bytes.is_empty()),
+        "no recovery note"
+    );
+    assert!(
+        cap.iter()
+            .any(|c| c.kind == Kind::Agent && c.bytes.contains(&b'{')),
+        "no CLI envelope captured"
+    );
+    let rules = Rules {
+        secrets,
+        data,
+        visible,
+        dropped,
+    };
     for c in &cap {
-        if !c.agent {
-            for canary in hits(&c.bytes, &data) {
-                problems.push(format!("{} carries the data canary {canary}", c.name));
-            }
-            continue;
-        }
-        // The agent's channel: a data canary sits only in an envelope's `data` or
-        // `error.details` (X-05, 7494d2a), and only one the agent-visible bytes hold.
-        let (gated, rest) = split_envelopes(&c.bytes);
-        for canary in hits(&gated, &data) {
-            if dropped.iter().any(|d| d == canary) {
-                problems.push(format!("{} carries the dropped field {canary}", c.name));
-            } else if !visible.iter().any(|v| v.contains(canary)) {
-                problems.push(format!(
-                    "{} carries the data canary {canary}, which no agent-visible bytes hold: {}",
-                    c.name,
-                    String::from_utf8_lossy(&c.bytes)
-                ));
-            }
-        }
-        for canary in hits(&rest, &data) {
-            problems.push(format!(
-                "{} carries the data canary {canary} outside `data` and `error.details`: {}",
-                c.name,
-                String::from_utf8_lossy(&rest)
-            ));
-        }
-    }
-    for (name, bytes) in &file_texts {
-        if name.ends_with("recovery-note.txt") && !hits(bytes, &data).is_empty() {
-            problems.push(format!("{name} carries a data canary"));
-        }
+        problems.extend(rules.sweep_one(c));
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+    // The negative controls: a leak spliced into a copy of each channel is reported.
+    let missed: Vec<String> = cap.iter().flat_map(|c| rules.missed_controls(c)).collect();
+    assert!(missed.is_empty(), "{}", missed.join("\n"));
+    let (data, dropped) = (&rules.data, &rules.dropped);
 
     // Not vacuous: released canaries reached the agent, the paths reached their records.
     assert!(
         cap.iter()
-            .any(|c| c.agent && !hits(&c.bytes, &data).is_empty()),
+            .any(|c| c.kind == Kind::Agent && !hits(&c.bytes, data).is_empty()),
         "no CLI stream carries a released canary: the sweep would be blind"
     );
     assert!(!dropped.is_empty(), "the redaction dropped nothing");
@@ -612,4 +721,44 @@ async fn s16_canary_sweep_process_channels() -> Result<()> {
         "no deny hint: {denied:?}"
     );
     Ok(())
+}
+
+/// The scanner itself (pure, runs without the binaries): a clean channel of each kind gives no
+/// finding, each negative control is reported, and a released canary in an envelope's `data` is
+/// allowed while the same canary in `meta` or outside an envelope is not.
+#[test]
+fn sweep_reports_every_planted_leak() {
+    let rules = Rules {
+        secrets: vec![("PAT".into(), secret_forms("PCrunTjiraQ"))],
+        data: vec!["DCrunN0001Q".into(), "DCrunN0002Q".into()],
+        visible: vec![r#"{"summary":"DCrunN0001Q"}"#.into()],
+        dropped: vec!["DCrunN0002Q".into()],
+    };
+    let ch = |kind: Kind, text: &str| Captured {
+        name: format!("{kind:?}"),
+        bytes: text.as_bytes().to_vec(),
+        kind,
+    };
+    let released = ch(
+        Kind::Agent,
+        r#"{"status":"released","data":{"summary":"DCrunN0001Q"},"meta":{}}"#,
+    );
+    let channels = [
+        released.clone(),
+        ch(Kind::Quiet, "INFO serve_started\n"),
+        ch(Kind::Store, r#"{"body":"DCrunN0002Q"}"#),
+    ];
+    for c in &channels {
+        assert_eq!(rules.sweep_one(c), Vec::<String>::new(), "{c:?}");
+        assert_eq!(rules.missed_controls(c), Vec::<String>::new(), "{c:?}");
+    }
+    let dropped = ch(Kind::Agent, r#"{"status":"released","data":"DCrunN0002Q"}"#);
+    assert_eq!(rules.sweep_one(&dropped).len(), 1);
+    let in_error = ch(
+        Kind::Agent,
+        r#"{"status":"failed","error":{"message":"DCrunN0001Q"}}"#,
+    );
+    assert_eq!(rules.sweep_one(&in_error).len(), 1);
+    // A secret is a finding in a store too.
+    assert_eq!(rules.sweep_one(&ch(Kind::Store, "x PCrunTjiraQ")).len(), 1);
 }

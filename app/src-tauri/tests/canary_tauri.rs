@@ -75,18 +75,16 @@ const COMMENT: &str = "jira.comment.add";
 const ISSUE: &str = "jira.issue.get";
 
 /// The commands whose responses may carry Atlassian content (§5.6, §6.4, §8.10: the Approvals
-/// window's queue, preview and raw views, its recent list, and the Audit window's queries and
+/// window's Request tab, preview and raw views, and the Audit window's queries and
 /// payload view show the human what was fetched and logged). Every other command response and
 /// every event carries no data canary.
-const DATA_VIEWS: [(&str, &str); 8] = [
-    ("queue_list", "the queue rows' target display (§5.6)"),
+const DATA_VIEWS: [(&str, &str); 6] = [
     ("queue_get", "the Request tab and the target display (§5.6)"),
     (
         "preview_fetch",
         "the preview of the fetched candidate (§6.4)",
     ),
     ("raw_page", "the raw bytes of the candidate (PD-68)"),
-    ("recent_list", "the recently decided rows (§5.6)"),
     ("audit_query", "the Audit window's rows (§8.10)"),
     (
         "audit_payload",
