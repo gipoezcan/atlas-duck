@@ -17,9 +17,10 @@ name: release
 #                          (no secret needed, so no environment).
 #   install-probes         install-probes.yml on this run's artifacts (workflow_run does not fire
 #                          for a workflow run through workflow_call, so it is called here).
+#   release-go-no-go       ci/check-release-go-no-go.mjs on docs/release/go-no-go-v1.md and
+#                          docs/release/release-checklist.md (Task 33; secret-free, red until the
+#                          named reviewer and every checklist row are filled).
 #   upload                 needs all of the above. Q5 PLACEHOLDER (see the job).
-#
-# Task 33 adds the release-go-no-go job and puts it into upload's needs.
 
 on:
   push:
@@ -116,12 +117,37 @@ jobs:
       contents: read
       actions: read
 
+  # Task 33: the go/no-go gate. Secret-free (no environment, read-only token). It is red until a human
+  # fills docs/release/go-no-go-v1.md (verdict GO, this commit, build id, date, the named reviewer, Q7)
+  # and every row of docs/release/release-checklist.md; `upload` waits for it. The checker is not a
+  # ci.yml step for that reason; only its .test.mjs runs there.
+  release-go-no-go:
+    name: release-go-no-go (record and checklist for this commit)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Check the go/no-go record and the checklist
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+        run: node ci/check-release-go-no-go.mjs docs/release/go-no-go-v1.md --checklist docs/release/release-checklist.md --commit "$RELEASE_SHA"
+
   # Q5 PLACEHOLDER: the upload channel is an open human decision (Q5). Until it is made, the
   # packages go to a DRAFT GitHub Release for the tag and are never published; publishing (or
   # another channel) replaces this job once Q5 is answered.
   upload:
     name: upload (Q5 placeholder, draft GitHub Release)
-    needs: [bundle, release-verify-windows, release-verify-macos, install-probes]
+    needs: [bundle, release-verify-windows, release-verify-macos, install-probes, release-go-no-go]
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     permissions:
