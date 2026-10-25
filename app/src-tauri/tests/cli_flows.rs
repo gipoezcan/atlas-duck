@@ -20,6 +20,11 @@ mod procs;
 #[path = "cli_flows/security.rs"]
 mod security;
 
+// Task 28: S-03 `verify-export` beside the running app (exit codes, no launch/window, audit.db
+// untouched; PowerShell `$LASTEXITCODE` on Windows).
+#[path = "cli_flows/verify_export.rs"]
+mod verify_export;
+
 use atlas_duck_audit::EventType;
 use atlas_duck_registry::Product;
 use harness::{KeystoreKind, Result, World, WorldOpts, instance_rows, opted_in};
