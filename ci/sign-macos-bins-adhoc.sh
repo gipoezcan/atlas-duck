@@ -7,12 +7,18 @@
 # images cross-built on the arm64 runner are unsigned, and the bundler then fails
 # sealing the .app ("code object is not signed at all", CI run 2).
 #
-# usage: ci/sign-macos-bins-adhoc.sh <target-triple>
+# usage: ci/sign-macos-bins-adhoc.sh <target-triple> [release|debug]
+# The profile defaults to release; e2e-bundle.yml's bundle-macos-e2e (M10 T27a) passes debug.
 set -euo pipefail
-target="${1:?usage: sign-macos-bins-adhoc.sh <target-triple>}"
+target="${1:?usage: sign-macos-bins-adhoc.sh <target-triple> [release|debug]}"
+profile="${2:-release}"
+case "$profile" in
+  release | debug) ;;
+  *) echo "sign-macos-bins-adhoc: the profile must be release or debug, got '$profile'" >&2; exit 2 ;;
+esac
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 for bin in atlas-duck-app atlas-duck atlas-duck-sandbox; do
-  f="$root/target/$target/release/$bin"
+  f="$root/target/$target/$profile/$bin"
   test -f "$f" || { echo "sign-macos-bins-adhoc: $f is missing" >&2; exit 1; }
   codesign --force --sign - --options runtime \
     --entitlements "$root/app/src-tauri/entitlements.plist" "$f"

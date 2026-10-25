@@ -20,6 +20,10 @@ name: e2e-bundle
 #   appimage-m6           CI-04 M6 steps: the AppImage through its FUSE runtime, no tray host, Setup window, doctor, forwarded launches, SIGTERM
 #                         and (M8 Task 28) the CI-04 script step: a `script run` that is released and delivered after the CLI exited.
 #                         The CI-07 steps (scripts-enabled matrix, debug bundles) sit in this job and in fedora-no-tray-host, `if: false` until M10.
+#   bundle-macos-e2e      (M10 T27a) per arch: debug scripted-approver .app (ad-hoc) + the ci_fixture test executable,
+#                         artifact bundle-macos-e2e-<target> (never bundle-<target>)
+#   install-test-macos-debug  (M10 T27a) per arch: ci/install-test-macos.sh --debug-app, the I-45 store half on macOS with
+#                         every keychain access through the installed app (PD-179); x86_64 under Rosetta 2
 
 on:
   push:
@@ -287,3 +291,171 @@ jobs:
         if: always()
         run: |
           pkill -x atlas-duck-app || true
+
+  # M10 Task 27a (§13 I-45 macOS store half, PD-179): a debug `scripted-approver` .app per arch
+  # (ad-hoc signed by the same beforeBundleCommand as bundle.yml's unsigned x86_64 job, here with
+  # the debug profile) and the app/src-tauri/tests/ci_fixture.rs test executable, built and never
+  # run. The .app goes into a tarball (upload-artifact drops modes and symlinks, which would break
+  # the code seal). Uploaded as bundle-macos-e2e-<target>, never as bundle-<target>.
+  bundle-macos-e2e:
+    name: bundle-macos-e2e (${{ matrix.target }}, debug scripted-approver .app + ci_fixture)
+    runs-on: macos-15
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: arm64
+          - target: x86_64-apple-darwin
+            arch: x86_64
+    env:
+      TARGET: ${{ matrix.target }}
+      TAURI_CLI_ARCHIVE: cargo-tauri-aarch64-apple-darwin.zip
+      TAURI_CLI_SHA256: ee35ee364a0c626df7852d9a5bc0c5394b6440772e9864cfb9b11dcb8d33f527
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rosetta 2 and fail loudly if it does not work (§15 V32)
+        if: matrix.arch == 'x86_64'
+        run: bash ci/install-rosetta.sh
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml) and the target
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustup show active-toolchain
+          rustup target add "$TARGET"
+          rustc -vV
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: bundle-e2e-${{ matrix.target }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Build the UI (tauri frontendDist)
+        run: |
+          set -euo pipefail
+          npm --prefix app/ui ci --ignore-scripts
+          npm --prefix app/ui run build
+          for page in approvals credential; do test -f "app/ui/dist/$page.html"; done
+
+      # The runner is arm64, so the arm64 cargo-tauri runs for both targets (as in bundle.yml).
+      - name: Install cargo-tauri (prebuilt release, sha256-pinned)
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/cargo-tauri"
+          mkdir -p "$dest"
+          curl --proto '=https' --tlsv1.2 -sSfL -o "$dest/$TAURI_CLI_ARCHIVE" \
+            "https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v${TAURI_CLI_VERSION}/${TAURI_CLI_ARCHIVE}"
+          echo "${TAURI_CLI_SHA256}  $dest/$TAURI_CLI_ARCHIVE" | shasum -a 256 -c -
+          unzip -q -o "$dest/$TAURI_CLI_ARCHIVE" -d "$dest"
+          chmod +x "$dest/cargo-tauri"
+          echo "$dest" >> "$GITHUB_PATH"
+
+      - name: Show the cargo-tauri version
+        run: cargo tauri --version
+
+      # Debug profile (the compile_error! lock of scripted-approver is open there only). The ad-hoc
+      # beforeBundleCommand signs the three debug binaries with the hardened runtime and the app's
+      # entitlements (x86_64 images are unsigned otherwise; arm64 gets the same for one recipe).
+      - name: Build the debug scripted-approver .app (ad-hoc signed, hardened runtime)
+        working-directory: app/src-tauri
+        env:
+          TAURI_CONFIG: '{"build":{"beforeBundleCommand":"bash ${{ github.workspace }}/ci/sign-macos-bins-adhoc.sh ${{ matrix.target }} debug"}}'
+        run: cargo tauri build --ci --debug --features scripted-approver --target "$TARGET" --bundles app --config "$TAURI_CONFIG" -- --locked
+
+      - name: Build the ci_fixture test executable (not run)
+        run: |
+          set -euo pipefail
+          cargo test -p atlas-duck-app --features scripted-approver --locked --target "$TARGET" --test ci_fixture --no-run --message-format=json > "$RUNNER_TEMP/fixture-build.json"
+          exe="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "ci_fixture" and .profile.test == true and .executable != null) | .executable' "$RUNNER_TEMP/fixture-build.json" | tail -n 1)"
+          [ -n "$exe" ] && [ -x "$exe" ] || { echo "::error::no ci_fixture executable in the cargo JSON"; exit 1; }
+          echo "ci_fixture built from $exe ($(lipo -archs "$exe"))"
+          "$exe" --list --ignored | tee "$RUNNER_TEMP/fixture-list.txt"
+          for t in ci_fixture_store_macos ci_fixture_entries_macos ci_fixture_verify_macos; do
+            grep -q "^$t: test" "$RUNNER_TEMP/fixture-list.txt" || { echo "::error::ci_fixture lists no $t"; exit 1; }
+          done
+          mkdir -p "$RUNNER_TEMP/fixture"
+          cp "$exe" "$RUNNER_TEMP/fixture/ci_fixture"
+
+      - name: Stage the artifact (.app tarball, ci_fixture)
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/e2e-bundle-macos"
+          app="target/$TARGET/debug/bundle/macos/Atlas Duck.app"
+          test -d "$app"
+          codesign --verify --deep --strict "$app"
+          codesign -dvvv "$app" 2>&1 | grep -E '^(CDHash|Signature|Format|CodeDirectory)' || true
+          [ "$(lipo -archs "$app/Contents/MacOS/atlas-duck-app")" = "${{ matrix.arch }}" ]
+          mkdir -p "$out/app" "$out/fixture"
+          tar -czf "$out/app/atlas-duck-debug-$TARGET.app.tar.gz" -C "$(dirname "$app")" "Atlas Duck.app"
+          cp "$RUNNER_TEMP/fixture/ci_fixture" "$out/fixture/"
+          ls -lR "$out"
+
+      - name: Upload bundle-macos-e2e-${{ matrix.target }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bundle-macos-e2e-${{ matrix.target }}
+          path: ${{ runner.temp }}/e2e-bundle-macos
+          if-no-files-found: error
+          retention-days: 7
+
+  # M10 Task 27a: installs that debug .app into /Applications and runs the I-45 removal/reinstall
+  # chain with the store created, checked and verified through the installed app's keychain access
+  # (ci/install-test-macos.sh --debug-app). x86_64 runs translated by Rosetta 2. Secret-free.
+  install-test-macos-debug:
+    name: install-test-macos-debug (${{ matrix.target }}, I-45 store half through the installed debug app)
+    needs: bundle-macos-e2e
+    runs-on: macos-15
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: arm64
+          - target: x86_64-apple-darwin
+            arch: x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rosetta 2 and fail loudly if it does not work (§15 V32)
+        if: matrix.arch == 'x86_64'
+        run: bash ci/install-rosetta.sh
+
+      - name: Download bundle-macos-e2e-${{ matrix.target }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle-macos-e2e-${{ matrix.target }}
+          path: dist
+
+      - name: Self-test the install-test script
+        run: /bin/bash ci/install-test-macos.sh --self-test
+
+      - name: Install, store through the app, start, quit, remove, reinstall, verify (I-45 debug-app half)
+        env:
+          INSTALL_PROBE_EVIDENCE: ${{ runner.temp }}/install-test-evidence
+        run: /bin/bash ci/install-test-macos.sh --debug-app dist ${{ matrix.arch }}
+
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: install-test-macos-debug-${{ matrix.target }}
+          path: ${{ runner.temp }}/install-test-evidence
+          if-no-files-found: warn
+          retention-days: 7
