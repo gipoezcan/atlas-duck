@@ -110,7 +110,7 @@ export const SETUP_TEXT = {
     anchor_dir_mismatch: 'The backup does not match the anchor directory. Nothing was changed.',
     store_newer: 'The backup was written by a newer atlas-duck.',
     committed_incomplete: 'The restore will be completed at the next start. Restart atlas-duck.',
-    archive_first: 'The existing audit log cannot be moved aside. Archive it first.',
+    archive_first: 'The existing audit log cannot be moved aside, so no backup can be restored over it.',
     other: 'The step could not be completed.',
   } as Readonly<Record<string, string>>,
   /** A refused command by error kind. */

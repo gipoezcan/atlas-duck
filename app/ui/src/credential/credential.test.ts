@@ -622,6 +622,25 @@ describe('restore_backup purpose (PD-168)', () => {
     expect(h.root.querySelector('b')).toBeNull();
   });
 
+  it('shows no refused count for restore_backup or change_recovery_passphrase, but still for a locked window', async () => {
+    for (const ctx of [RESTORE, CHANGE]) {
+      const h = await mount({ ...ctx, refused_count: 5 });
+      expect(h.root.textContent, String(ctx.purpose)).not.toContain('refused');
+      expect(h.root.textContent, String(ctx.purpose)).not.toContain('Locked');
+    }
+    const control = await mount({ ...LOCKED, refused_count: 5 });
+    expect(control.root.textContent).toContain('Locked — 5 requests refused');
+  });
+
+  it('offers no Close once the restore passphrase is accepted: the restore is still running', async () => {
+    const h = await mount(RESTORE);
+    handlers.submit_secret = () => ({ accepted: {} });
+    type(inputs(h.root)[0] as HTMLInputElement, 'p'.repeat(12));
+    submitForm(h.root);
+    await flush();
+    expect(buttons(h.root)).toEqual(['Quit atlas-duck']);
+  });
+
   it('takes one passphrase of at least 12 characters and sends only that', async () => {
     const h = await mount(RESTORE);
     expect(inputs(h.root)).toHaveLength(1);
@@ -645,7 +664,7 @@ describe('restore_backup purpose (PD-168)', () => {
     expect(h.root.textContent).not.toContain('a'.repeat(12));
   });
 
-  it('offers Cancel before the submit and Close after it, never a second form', async () => {
+  it('offers Cancel before the submit, no Close and never a second form after it', async () => {
     const h = await mount(RESTORE);
     expect(buttons(h.root).sort()).toEqual(['Cancel', 'Quit atlas-duck', 'Restore']);
     button(h.root, 'Cancel').click();
@@ -656,7 +675,7 @@ describe('restore_backup purpose (PD-168)', () => {
     type(inputs(s.root)[0] as HTMLInputElement, 'p'.repeat(12));
     submitForm(s.root);
     await flush();
-    expect(buttons(s.root).sort()).toEqual(['Close', 'Quit atlas-duck']);
+    expect(buttons(s.root)).toEqual(['Quit atlas-duck']);
   });
 
   it('a rejected submit clears the field and shows a fixed text', async () => {

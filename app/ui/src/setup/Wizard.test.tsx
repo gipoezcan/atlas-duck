@@ -605,6 +605,8 @@ describe('Wizard (1b)', () => {
       expect(alert, cls).toBe(T.errors[cls]);
       expect(alert, cls).not.toBe(T.errors['other']);
       expect(T.errors[cls], cls).toBeTruthy();
+      // No instruction the step has no control for (archiving is not reachable here).
+      expect(alert, cls).not.toMatch(/archive it/i);
       expect(screen.getByRole('button', { name: T.restore_offer })).toBeTruthy();
       view.unmount();
     }

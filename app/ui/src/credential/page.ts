@@ -530,10 +530,14 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     }
     // A token, restore or passphrase-change window can always be cancelled; any window can be
     // closed once its work is done.
-    if (isPat(purpose) || purpose === 'restore_backup' || purpose === 'change_recovery_passphrase') {
+    if (purpose === 'restore_backup') {
+      // After the passphrase went to the running restore there is no Close: Rust closes the window
+      // (Settings) or sets it back to its locked purpose (a failure); a close in between is not
+      // defined (PD-181 cancels only before a submit).
+      if (!done) addClose(bar, 'Cancel');
+    } else if (isPat(purpose) || purpose === 'change_recovery_passphrase') {
       addClose(bar, done ? 'Close' : 'Cancel');
-    }
-    else if (done || noteSaved) addClose(bar, 'Close');
+    } else if (done || noteSaved) addClose(bar, 'Close');
     addQuit(bar);
   }
 
