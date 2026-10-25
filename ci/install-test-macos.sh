@@ -17,7 +17,9 @@
 # SIGTERM -> `rm -rf "/Applications/Atlas Duck.app"` -> data dir, config dir, pinned file and
 # anchor dir hashes and the dummy item's presence (`security find-generic-password`, no -w)
 # unchanged -> reinstall -> same check -> start -> floor line -> SIGTERM.
-# V32: RUNTIME_VERSIONS (macOS, WebKit framework version, the arch the app runs as).
+# V32: RUNTIME_VERSIONS (macOS, WebKit framework version, the arch the app runs as); `lipo -archs`
+# of the installed binary must equal the leg's arch. Last: S-04 (ci/s04-no-debug-port.sh, macOS
+# branch) against the installed app.
 set -euo pipefail
 export LC_ALL=C
 
@@ -31,7 +33,9 @@ PAT_PROBE='(^| )event=sandbox_probe( .*)? floor='
 PAT_STOP='(^| )event=app_stop( |$)'
 
 log_count() {
-  if [ -f "$1" ]; then grep -cE "$2" "$1" || true; else echo 0; fi
+  local n=""
+  if [ -f "$1" ]; then n="$(grep -cE "$2" "$1" 2>/dev/null || true)"; fi
+  echo "${n:-0}"
 }
 
 dump_log() {
@@ -177,6 +181,10 @@ app_exe="$dest/Contents/MacOS/atlas-duck-app"
 install_app() {
   if [ -w /Applications ]; then ditto "$src_app" "$dest"; else sudo ditto "$src_app" "$dest"; fi
   [ -x "$app_exe" ] || die "no $app_exe after the install"
+  # V32: the installed binary is of the leg's arch (x86_64 runs translated by Rosetta 2).
+  local archs
+  archs="$(lipo -archs "$app_exe")"
+  [ "$archs" = "$arch" ] || die "$app_exe: lipo -archs is '$archs', expected '$arch'"
 }
 
 remove_app() {
@@ -250,3 +258,12 @@ same_snapshot "$work/s0" "$work/s" "the reinstall"
 run_app "reinstall"
 security find-generic-password -s "$DUMMY_SERVICE" -a "$account" >/dev/null || die "the dummy keychain item is gone after the reinstall run"
 echo "I45 RELEASE OK arch=$arch: removal and reinstall kept data dir, config dir, pinned file, anchor dir and the keychain item"
+
+# S-04 on the installed release .app (fix round 1; PD-179 keeps S-04 on the macOS release legs):
+# the inspector variables and TAURI_WEBVIEW_AUTOMATION=true, no debug or automation port, all five
+# scrubbed. It writes its own pinned file (first-run state: the Setup window is a real WKWebView)
+# and removes it, so it runs last.
+info "S-04 against the installed app (TAURI_WEBVIEW_AUTOMATION=true)"
+stop_apps
+/bin/bash "$here/s04-no-debug-port.sh" "$app_exe" || die "S-04 on the installed $arch .app failed"
+echo "OK: install-test macos $arch"

@@ -935,7 +935,7 @@ jobs:
           retention-days: 14
 
   install-test-macos-arm64:
-    name: install-test-macos-arm64 (release .app removal and reinstall on macos-15)
+    name: install-test-macos-arm64 (release .app removal, reinstall, S-04 on macos-15)
     needs: macos-arm64
     if: github.event_name == 'workflow_dispatch' || (github.event_name != 'workflow_run' && inputs.bundle_run_id != '') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: macos-15
@@ -1002,7 +1002,7 @@ jobs:
       - name: Self-test the install-test script
         run: /bin/bash ci/install-test-macos.sh --self-test
 
-      - name: Install from the dmg, start, quit, remove, reinstall (release half, no store)
+      - name: Install from the dmg, start, quit, remove, reinstall (release half, no store), S-04
         env:
           INSTALL_PROBE_EVIDENCE: ${{ runner.temp }}/install-test-evidence
         run: /bin/bash ci/install-test-macos.sh --release dist arm64
@@ -1017,7 +1017,7 @@ jobs:
           retention-days: 14
 
   install-test-macos-x86_64-rosetta:
-    name: install-test-macos-x86_64-rosetta (x86_64 release .app under Rosetta 2, removal and reinstall)
+    name: install-test-macos-x86_64-rosetta (x86_64 release .app under Rosetta 2, removal, reinstall, S-04)
     needs: macos-x86_64-rosetta
     if: github.event_name == 'workflow_dispatch' || (github.event_name != 'workflow_run' && inputs.bundle_run_id != '') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: macos-15
@@ -1094,7 +1094,7 @@ jobs:
       - name: Self-test the install-test script
         run: /bin/bash ci/install-test-macos.sh --self-test
 
-      - name: Install from the dmg, start, quit, remove, reinstall (release half, no store)
+      - name: Install from the dmg, start, quit, remove, reinstall (release half, no store), S-04
         env:
           INSTALL_PROBE_EVIDENCE: ${{ runner.temp }}/install-test-evidence
         run: /bin/bash ci/install-test-macos.sh --release dist x86_64

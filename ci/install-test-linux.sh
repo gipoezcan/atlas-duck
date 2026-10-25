@@ -39,7 +39,9 @@ die() { printf 'install-test-linux: FAIL: %s\n' "$*" >&2; exit 1; }
 
 # log_count <log> <ERE>: lines of <log> matching <ERE> (0 for a missing log).
 log_count() {
-  if [ -f "$1" ]; then grep -cE "$2" "$1" || true; else echo 0; fi
+  local n=""
+  if [ -f "$1" ]; then n="$(grep -cE "$2" "$1" 2>/dev/null || true)"; fi
+  echo "${n:-0}"
 }
 
 PAT_SERVING='(^| )event=serve_started( .*)? serve_state=core( |$)'

@@ -216,6 +216,13 @@ function Invoke-Uninstall([string]$InstallDir) {
         Start-Sleep -Milliseconds 500
     }
     if ($null -ne (Get-InstallLocation $script:hive)) { Fail 'the uninstall key is still there 300 s after uninstall.exe /S' }
+    # The relaunched uninstaller (%TEMP%\Au_.exe, NSIS) may still remove shortcuts and folders; a
+    # reinstall right away would race it (review M-2). Bounded wait for it to exit.
+    $deadline = (Get-Date).AddSeconds(120)
+    while (@(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -like 'Au_*' -or $_.ProcessName -like 'Un_*' }).Count -gt 0) {
+        if ((Get-Date) -gt $deadline) { Fail 'the relaunched NSIS uninstaller (Au_*/Un_*) did not exit within 120 s' }
+        Start-Sleep -Milliseconds 500
+    }
     foreach ($exe in @($AppExe, $CliExe, $WorkerExe)) {
         if (Test-Path -LiteralPath (Join-Path $InstallDir $exe)) { Fail "$exe is still in $InstallDir after the uninstall" }
     }
