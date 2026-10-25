@@ -1,0 +1,150 @@
+name: tauri-bundle
+description: >
+  Shared bundle steps (M10 Task 26, PD-182 fallback): toolchain, cache, UI, the sha256-pinned
+  cargo-tauri, the release guards and `cargo tauri build`. bundle.yml uses it from an unsigned job
+  (`if: !inputs.release`) and from a signing job (`if: inputs.release`, `environment: release`),
+  because an empty `environment:` name is not documented as "no environment". The caller checks
+  out the repository first and runs the package checks and the upload itself.
+
+inputs:
+  target:
+    description: Rust target triple
+    required: true
+  bundles:
+    description: Value of `cargo tauri build --bundles`
+    required: true
+  cli-archive:
+    description: cargo-tauri release archive name
+    required: true
+  cli-sha256:
+    description: sha256 of that archive
+    required: true
+  cli-version:
+    description: cargo-tauri version
+    required: true
+  extra-rust-target:
+    description: "true: rustup target add <target> (a cross build)"
+    required: false
+    default: "false"
+  release:
+    description: "true on release runs: runs the identity guard"
+    required: false
+    default: "false"
+  tauri-config:
+    description: >
+      Empty, an inline JSON object, or a path (relative to the repository root) of a JSON file,
+      passed as `cargo tauri build --config`. ci/check-release-build.sh checks the same value.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        EXTRA_TARGET: ${{ inputs.extra-rust-target }}
+      run: |
+        set -euo pipefail
+        rustup toolchain install
+        rustup show active-toolchain
+        if [ "$EXTRA_TARGET" = "true" ]; then rustup target add "$TARGET"; fi
+        rustc -vV
+
+    - name: Cache cargo registry and target dir
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        key: bundle-${{ inputs.target }}
+        save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+    - name: Set up Node.js
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: "22"
+        package-manager-cache: false
+
+    - name: Build the UI (tauri frontendDist)
+      shell: bash
+      run: |
+        set -euo pipefail
+        npm --prefix app/ui ci --ignore-scripts
+        npm --prefix app/ui run build
+        for page in approvals credential; do test -f "app/ui/dist/$page.html"; done
+        npm --prefix app/ui run check:bundle
+
+    - name: Install cargo-tauri on Windows (prebuilt release, sha256-pinned)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        TAURI_CLI_VERSION: ${{ inputs.cli-version }}
+        TAURI_CLI_ARCHIVE: ${{ inputs.cli-archive }}
+        TAURI_CLI_SHA256: ${{ inputs.cli-sha256 }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $dest = Join-Path $env:RUNNER_TEMP 'cargo-tauri'
+        New-Item -ItemType Directory -Force -Path $dest | Out-Null
+        $zip = Join-Path $dest $env:TAURI_CLI_ARCHIVE
+        $url = "https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v$($env:TAURI_CLI_VERSION)/$($env:TAURI_CLI_ARCHIVE)"
+        Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $zip
+        $actual = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
+        if ($actual -ne $env:TAURI_CLI_SHA256) {
+          throw "sha256 of $($env:TAURI_CLI_ARCHIVE) is $actual, expected $($env:TAURI_CLI_SHA256)"
+        }
+        Expand-Archive -Path $zip -DestinationPath $dest -Force
+        Add-Content -Path $env:GITHUB_PATH -Value $dest
+
+    - name: Install cargo-tauri on macOS (prebuilt release, sha256-pinned)
+      if: runner.os == 'macOS'
+      shell: bash
+      env:
+        TAURI_CLI_VERSION: ${{ inputs.cli-version }}
+        TAURI_CLI_ARCHIVE: ${{ inputs.cli-archive }}
+        TAURI_CLI_SHA256: ${{ inputs.cli-sha256 }}
+      run: |
+        set -euo pipefail
+        dest="$RUNNER_TEMP/cargo-tauri"
+        mkdir -p "$dest"
+        curl --proto '=https' --tlsv1.2 -sSfL -o "$dest/$TAURI_CLI_ARCHIVE" \
+          "https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v${TAURI_CLI_VERSION}/${TAURI_CLI_ARCHIVE}"
+        echo "${TAURI_CLI_SHA256}  $dest/$TAURI_CLI_ARCHIVE" | shasum -a 256 -c -
+        unzip -q -o "$dest/$TAURI_CLI_ARCHIVE" -d "$dest"
+        chmod +x "$dest/cargo-tauri"
+        echo "$dest" >> "$GITHUB_PATH"
+
+    - name: Show the cargo-tauri version
+      shell: bash
+      run: cargo tauri --version
+
+    # PD-178 / P15 (spec §12.5): a release refuses the placeholder identifier and icons.
+    - name: Release identity guard (bundle identifier and placeholder icons)
+      if: ${{ inputs.release == 'true' }}
+      shell: bash
+      run: bash ci/check-release-identity.sh
+
+    # M4 Task 26 (T21 I-2) + M10 Task 26: no test-only feature, no forced debug assertions, and a
+    # --config whose keys are all in the allowed set (signing keys + build.beforeBundleCommand).
+    - name: Release build guard (no test-only feature, no forced debug assertions, --config keys)
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        TAURI_CONFIG: ${{ inputs.tauri-config }}
+      run: bash ci/check-release-build.sh "$TARGET" --config "$TAURI_CONFIG"
+
+    - name: Build the bundles
+      shell: bash
+      working-directory: app/src-tauri
+      env:
+        TARGET: ${{ inputs.target }}
+        BUNDLES: ${{ inputs.bundles }}
+        TAURI_CONFIG: ${{ inputs.tauri-config }}
+      run: |
+        set -euo pipefail
+        config_args=()
+        if [ -n "$TAURI_CONFIG" ]; then
+          case "$TAURI_CONFIG" in
+            "{"*) config_args=(--config "$TAURI_CONFIG") ;;
+            *) config_args=(--config "$GITHUB_WORKSPACE/$TAURI_CONFIG") ;;
+          esac
+        fi
+        cargo tauri build --ci --target "$TARGET" --bundles "$BUNDLES" ${config_args[@]+"${config_args[@]}"} -- --locked

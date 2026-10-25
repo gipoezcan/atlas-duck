@@ -42,11 +42,27 @@ name: install-probes
 # successful bundle run> -f bundle_sha=<head sha of that bundle run>. bundle_sha pins the checkout
 # to the commit that was bundled, so the scripts match the packages. Every job first checks the pair
 # against the GitHub API (run is of the bundle workflow, succeeded, head_sha == bundle_sha).
+#
+# M10 Task 26: release.yml calls this workflow (workflow_call) with its own run id and sha, because
+# workflow_run does not fire for bundle.yml run through workflow_call. In that case the jobs run on
+# the caller's event (push of a v* tag), the API cross-check is skipped (the run is the caller's own,
+# still in progress, and not named bundle), and the artifacts are the signed release packages.
+# Still no secret is used.
 
 on:
   workflow_run:
     workflows: [bundle]
     types: [completed]
+  workflow_call:
+    inputs:
+      bundle_run_id:
+        description: "Id of the calling run whose bundle-* artifacts are probed (release.yml passes github.run_id)"
+        required: true
+        type: string
+      bundle_sha:
+        description: "The commit that was bundled (release.yml passes github.sha)"
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       bundle_run_id:
@@ -65,7 +81,7 @@ permissions:
 jobs:
   windows-per-user:
     name: windows-per-user (NSIS /CurrentUser on windows-2022)
-    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    if: github.event_name == 'workflow_dispatch' || (github.event_name != 'workflow_run' && inputs.bundle_run_id != '') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: windows-2022
     timeout-minutes: 30
     steps:
@@ -157,7 +173,7 @@ jobs:
 
   windows-per-machine:
     name: windows-per-machine (NSIS /AllUsers on windows-2022)
-    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    if: github.event_name == 'workflow_dispatch' || (github.event_name != 'workflow_run' && inputs.bundle_run_id != '') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: windows-2022
     timeout-minutes: 30
     steps:
@@ -249,7 +265,7 @@ jobs:
 
   macos-arm64:
     name: macos-arm64 (dmg on macos-15)
-    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    if: github.event_name == 'workflow_dispatch' || (github.event_name != 'workflow_run' && inputs.bundle_run_id != '') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: macos-15
     timeout-minutes: 30
     steps:
@@ -339,7 +355,7 @@ jobs:
 
   macos-x86_64-rosetta:
     name: macos-x86_64-rosetta (x86_64 dmg under Rosetta 2 on macos-15)
-    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    if: github.event_name == 'workflow_dispatch' || (github.event_name != 'workflow_run' && inputs.bundle_run_id != '') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: macos-15
     timeout-minutes: 30
     steps:
@@ -451,7 +467,7 @@ jobs:
 
   ubuntu-deb:
     name: ubuntu-deb (apt install on ubuntu-22.04)
-    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    if: github.event_name == 'workflow_dispatch' || (github.event_name != 'workflow_run' && inputs.bundle_run_id != '') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
@@ -540,7 +556,7 @@ jobs:
 
   ubuntu-appimage:
     name: ubuntu-appimage (FUSE runtime on ubuntu-22.04)
-    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    if: github.event_name == 'workflow_dispatch' || (github.event_name != 'workflow_run' && inputs.bundle_run_id != '') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
@@ -629,7 +645,7 @@ jobs:
 
   fedora-rpm:
     name: fedora-rpm (dnf install in a fedora:40 container)
-    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    if: github.event_name == 'workflow_dispatch' || (github.event_name != 'workflow_run' && inputs.bundle_run_id != '') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:

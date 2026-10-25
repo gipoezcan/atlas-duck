@@ -15,14 +15,30 @@ name: bundle
 # are in e2e-bundle.yml, on a debug scripted-approver bundle built there (its test home keeps the runs
 # off the runner's own pinned files; they are driver-free, see that file), and
 # ci/check-release-build.sh keeps --debug and --features out of this file.
+#
+# M10 plan Task 26 (spec §12.2, §3.2, §2.5; PD-182): release.yml calls this workflow with
+# `release: true` on a v* tag; that is the only release run (the tag trigger moved there). Windows
+# and macOS each have an unsigned job (`if: !inputs.release`, ad-hoc on macOS) and a signing job
+# (`if: inputs.release`, `environment: release`, the only jobs that see the signing secrets). Both
+# share .github/actions/tauri-bundle (the PD-182 fallback: an empty `environment:` name is not
+# documented as "no environment"). Signing config is never in tauri.conf.json: the signing jobs
+# generate a release-only JSON and pass it as `cargo tauri build --config <file>`; the guard
+# ci/check-release-build.sh accepts it only if every key is a signing key or
+# build.beforeBundleCommand. A signing job fails at ci/check-release-secrets.sh, before any build,
+# when a signing secret or variable is empty.
 
 on:
   push:
     branches:
       - master
-    tags:
-      - "v*"
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      release:
+        description: "true: a signed release build (tag runs through release.yml)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -37,81 +53,25 @@ env:
 jobs:
   bundle-windows:
     name: bundle-windows (x86_64-pc-windows-msvc, NSIS)
+    if: ${{ !inputs.release }}
     runs-on: windows-2022
     timeout-minutes: 90
     env:
       TARGET: x86_64-pc-windows-msvc
-      TAURI_CLI_ARCHIVE: cargo-tauri-x86_64-pc-windows-msvc.zip
-      TAURI_CLI_SHA256: d3919ebe0bf7013dd98293862784dd37b8f76db2d650e13a3ec11c5dd799c519
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
-        run: |
-          set -euo pipefail
-          rustup toolchain install
-          rustup show active-toolchain
-          rustc -vV
-
-      - name: Cache cargo registry and target dir
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: bundle-${{ env.TARGET }}
-          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
-
-      - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22"
-          package-manager-cache: false
-
-      - name: Build the UI (tauri frontendDist)
-        run: |
-          set -euo pipefail
-          npm --prefix app/ui ci --ignore-scripts
-          npm --prefix app/ui run build
-          for page in approvals credential; do test -f "app/ui/dist/$page.html"; done
-          npm --prefix app/ui run check:bundle
-
-      - name: Install cargo-tauri (prebuilt release, sha256-pinned)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $dest = Join-Path $env:RUNNER_TEMP 'cargo-tauri'
-          New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          $zip = Join-Path $dest $env:TAURI_CLI_ARCHIVE
-          $url = "https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v$($env:TAURI_CLI_VERSION)/$($env:TAURI_CLI_ARCHIVE)"
-          Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $zip
-          $actual = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
-          if ($actual -ne $env:TAURI_CLI_SHA256) {
-            throw "sha256 of $($env:TAURI_CLI_ARCHIVE) is $actual, expected $($env:TAURI_CLI_SHA256)"
-          }
-          Expand-Archive -Path $zip -DestinationPath $dest -Force
-          Add-Content -Path $env:GITHUB_PATH -Value $dest
-
-      - name: Show the cargo-tauri version
-        run: cargo tauri --version
-
-      # M4 plan Task 26 (T21 I-2): the release build must carry no test-only feature and nothing may
-      # force debug assertions (which would open the compile_error! locks). Same target and flags
-      # as the build below; the feature tree is the corrected one (cargo tree has no --release).
-      # PD-178 / P15 (spec §12.5): a release refuses the placeholder bundle identifier, the data-dir
-      # folder name as identifier, and the placeholder icons. Runs only for release builds: T26 adds
-      # the `on: workflow_call` `release: boolean` input; until then inputs.release is empty and the
-      # step is skipped.
-      - name: Release identity guard (bundle identifier and placeholder icons)
-        if: ${{ inputs.release }}
-        run: bash ci/check-release-identity.sh
-
-      - name: Release build guard (no test-only feature, no forced debug assertions)
-        run: bash ci/check-release-build.sh "$TARGET"
-
       - name: Build the NSIS installer (three bins, installMode both)
-        working-directory: app/src-tauri
-        run: cargo tauri build --ci --target "$TARGET" --bundles nsis -- --locked
+        uses: ./.github/actions/tauri-bundle
+        with:
+          target: x86_64-pc-windows-msvc
+          bundles: nsis
+          cli-version: ${{ env.TAURI_CLI_VERSION }}
+          cli-archive: cargo-tauri-x86_64-pc-windows-msvc.zip
+          cli-sha256: d3919ebe0bf7013dd98293862784dd37b8f76db2d650e13a3ec11c5dd799c519
 
       - name: Check the NSIS installer content (exactly three executables)
         shell: pwsh
@@ -132,79 +92,166 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  bundle-macos-arm64:
-    name: bundle-macos-arm64 (aarch64-apple-darwin, app + dmg)
-    runs-on: macos-15
+  # Authenticode (spec §3.2). Provider-neutral (human decisions Q1, Q3 open): the environment
+  # variable WINDOWS_SIGN_COMMAND is the whole Tauri signCommand (signtool, SignPath or another
+  # tool; %1 is the file). The secrets it may need reach the job as env under fixed names, each
+  # optional: WINDOWS_CERTIFICATE (base64 .pfx) + WINDOWS_CERTIFICATE_PASSWORD, or
+  # SIGNPATH_API_TOKEN. ci/check-release-secrets.sh requires the command and one of the two.
+  bundle-windows-signed:
+    name: bundle-windows-signed (x86_64-pc-windows-msvc, NSIS, Authenticode)
+    if: ${{ inputs.release }}
+    environment: release
+    runs-on: windows-2022
     timeout-minutes: 90
     env:
-      TARGET: aarch64-apple-darwin
-      TAURI_CLI_ARCHIVE: cargo-tauri-aarch64-apple-darwin.zip
-      TAURI_CLI_SHA256: ee35ee364a0c626df7852d9a5bc0c5394b6440772e9864cfb9b11dcb8d33f527
+      TARGET: x86_64-pc-windows-msvc
+      WINDOWS_SIGN_COMMAND: ${{ vars.WINDOWS_SIGN_COMMAND }}
+      WINDOWS_CERT_THUMBPRINT: ${{ vars.WINDOWS_CERT_THUMBPRINT }}
+      WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+      - name: Signing secrets guard (fails a release run with empty signing values)
+        run: bash ci/check-release-secrets.sh windows
+
+      - name: Import the code-signing certificate (only when WINDOWS_CERTIFICATE is set)
+        if: ${{ env.WINDOWS_CERTIFICATE != '' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pfx = Join-Path $env:RUNNER_TEMP 'release-signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $pw = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $pw | Out-Null
+          Remove-Item -LiteralPath $pfx -Force
+
+      - name: Write the release-only signing config (ci/release-signing.windows.json)
         run: |
           set -euo pipefail
-          rustup toolchain install
-          rustup show active-toolchain
-          rustc -vV
+          node -e '
+            const w = { signCommand: process.env.WINDOWS_SIGN_COMMAND };
+            if (process.env.WINDOWS_CERT_THUMBPRINT) w.certificateThumbprint = process.env.WINDOWS_CERT_THUMBPRINT;
+            if (process.env.WINDOWS_TIMESTAMP_URL) w.timestampUrl = process.env.WINDOWS_TIMESTAMP_URL;
+            require("fs").writeFileSync("ci/release-signing.windows.json", JSON.stringify({ bundle: { windows: w } }));
+          '
+          node -e 'console.log("signing config keys: " + Object.keys(JSON.parse(require("fs").readFileSync("ci/release-signing.windows.json","utf8")).bundle.windows).join(", "))'
 
-      - name: Cache cargo registry and target dir
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build the signed NSIS installer (three bins, installMode both)
+        uses: ./.github/actions/tauri-bundle
         with:
-          key: bundle-${{ env.TARGET }}
-          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+          target: x86_64-pc-windows-msvc
+          bundles: nsis
+          cli-version: ${{ env.TAURI_CLI_VERSION }}
+          cli-archive: cargo-tauri-x86_64-pc-windows-msvc.zip
+          cli-sha256: d3919ebe0bf7013dd98293862784dd37b8f76db2d650e13a3ec11c5dd799c519
+          release: "true"
+          tauri-config: ci/release-signing.windows.json
 
-      - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - name: Check the NSIS installer content (exactly three executables)
+        shell: pwsh
+        run: ./ci/check-windows-bundle.ps1 -BundleDir "target/$($env:TARGET)/release/bundle/nsis"
+
+      - name: Inspect the generated installer.nsi (app-data deletion, hooks, identifier)
+        shell: pwsh
+        run: ./ci/check-installers.ps1 -NsisDir "target/$($env:TARGET)/release/nsis/x64"
+
+      - name: Upload bundle-x86_64-pc-windows-msvc
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          node-version: "22"
-          package-manager-cache: false
+          name: bundle-x86_64-pc-windows-msvc
+          path: target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          retention-days: 14
 
-      - name: Build the UI (tauri frontendDist)
-        run: |
-          set -euo pipefail
-          npm --prefix app/ui ci --ignore-scripts
-          npm --prefix app/ui run build
-          for page in approvals credential; do test -f "app/ui/dist/$page.html"; done
-          npm --prefix app/ui run check:bundle
-
-      - name: Install cargo-tauri (prebuilt release, sha256-pinned)
-        run: |
-          set -euo pipefail
-          dest="$RUNNER_TEMP/cargo-tauri"
-          mkdir -p "$dest"
-          curl --proto '=https' --tlsv1.2 -sSfL -o "$dest/$TAURI_CLI_ARCHIVE" \
-            "https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v${TAURI_CLI_VERSION}/${TAURI_CLI_ARCHIVE}"
-          echo "${TAURI_CLI_SHA256}  $dest/$TAURI_CLI_ARCHIVE" | shasum -a 256 -c -
-          unzip -q -o "$dest/$TAURI_CLI_ARCHIVE" -d "$dest"
-          chmod +x "$dest/cargo-tauri"
-          echo "$dest" >> "$GITHUB_PATH"
-
-      - name: Show the cargo-tauri version
-        run: cargo tauri --version
-
-      # M4 plan Task 26 (T21 I-2): the release build must carry no test-only feature and nothing may
-      # force debug assertions (which would open the compile_error! locks). Same target and flags
-      # as the build below; the feature tree is the corrected one (cargo tree has no --release).
-      # PD-178 / P15 (spec §12.5): a release refuses the placeholder bundle identifier, the data-dir
-      # folder name as identifier, and the placeholder icons. Runs only for release builds: T26 adds
-      # the `on: workflow_call` `release: boolean` input; until then inputs.release is empty and the
-      # step is skipped.
-      - name: Release identity guard (bundle identifier and placeholder icons)
-        if: ${{ inputs.release }}
-        run: bash ci/check-release-identity.sh
-
-      - name: Release build guard (no test-only feature, no forced debug assertions)
-        run: bash ci/check-release-build.sh "$TARGET"
+  bundle-macos-arm64:
+    name: bundle-macos-arm64 (aarch64-apple-darwin, app + dmg)
+    if: ${{ !inputs.release }}
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      TARGET: aarch64-apple-darwin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Build the .app and .dmg (ad-hoc signed, hardened runtime)
-        working-directory: app/src-tauri
-        run: cargo tauri build --ci --target "$TARGET" --bundles app,dmg -- --locked
+        uses: ./.github/actions/tauri-bundle
+        with:
+          target: aarch64-apple-darwin
+          bundles: app,dmg
+          cli-version: ${{ env.TAURI_CLI_VERSION }}
+          cli-archive: cargo-tauri-aarch64-apple-darwin.zip
+          cli-sha256: ee35ee364a0c626df7852d9a5bc0c5394b6440772e9864cfb9b11dcb8d33f527
+
+      - name: Check the .app in the dmg (bins, arch, hardened runtime, entitlements, CLI)
+        run: bash ci/check-macos-bundle.sh "target/$TARGET/release/bundle/dmg" arm64
+
+      - name: Upload bundle-aarch64-apple-darwin
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bundle-aarch64-apple-darwin
+          path: target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+  # Developer ID + notarization (spec §3.2, §2.5). Tauri reads APPLE_CERTIFICATE,
+  # APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY (signing) and APPLE_ID, APPLE_PASSWORD,
+  # APPLE_TEAM_ID (notarization) from the environment. The three [[bin]]s are signed by
+  # ci/sign-macos-bins.sh as beforeBundleCommand (Developer ID, runtime, entitlements, timestamp),
+  # from a keychain this job imports the certificate into.
+  bundle-macos-arm64-signed:
+    name: bundle-macos-arm64-signed (aarch64-apple-darwin, Developer ID, notarized)
+    if: ${{ inputs.release }}
+    environment: release
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      TARGET: aarch64-apple-darwin
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Signing secrets guard (fails a release run with empty signing values)
+        run: bash ci/check-release-secrets.sh macos
+
+      - name: Import the Developer ID certificate into a job keychain
+        run: bash ci/import-macos-certificate.sh
+
+      - name: Write the release-only signing config
+        run: |
+          set -euo pipefail
+          node -e '
+            const cfg = { bundle: { macOS: { signingIdentity: process.env.APPLE_SIGNING_IDENTITY } },
+              build: { beforeBundleCommand: "bash " + process.env.GITHUB_WORKSPACE + "/ci/sign-macos-bins.sh " + process.env.TARGET } };
+            require("fs").writeFileSync("ci/release-signing.macos.json", JSON.stringify(cfg));
+          '
+
+      - name: Build the .app and .dmg (Developer ID, hardened runtime, notarized)
+        uses: ./.github/actions/tauri-bundle
+        with:
+          target: aarch64-apple-darwin
+          bundles: app,dmg
+          cli-version: ${{ env.TAURI_CLI_VERSION }}
+          cli-archive: cargo-tauri-aarch64-apple-darwin.zip
+          cli-sha256: ee35ee364a0c626df7852d9a5bc0c5394b6440772e9864cfb9b11dcb8d33f527
+          release: "true"
+          tauri-config: ci/release-signing.macos.json
 
       - name: Check the .app in the dmg (bins, arch, hardened runtime, entitlements, CLI)
         run: bash ci/check-macos-bundle.sh "target/$TARGET/release/bundle/dmg" arm64
@@ -219,13 +266,11 @@ jobs:
 
   bundle-macos-x86_64:
     name: bundle-macos-x86_64 (x86_64-apple-darwin on the arm64 runner, app + dmg)
+    if: ${{ !inputs.release }}
     runs-on: macos-15
     timeout-minutes: 90
     env:
       TARGET: x86_64-apple-darwin
-      # The runner is arm64, so the arm64 cargo-tauri runs here. Only the app is cross-built.
-      TAURI_CLI_ARCHIVE: cargo-tauri-aarch64-apple-darwin.zip
-      TAURI_CLI_SHA256: ee35ee364a0c626df7852d9a5bc0c5394b6440772e9864cfb9b11dcb8d33f527
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -233,94 +278,85 @@ jobs:
           persist-credentials: false
 
       - name: Install Rosetta 2 and fail loudly if it does not work (§15 V32)
-        run: |
-          set -euo pipefail
-          machine="$(uname -m)"
-          if [ "$machine" != "arm64" ]; then
-            echo "::error::runner hardware is $machine, expected arm64"
-            exit 1
-          fi
-          if ! sudo softwareupdate --install-rosetta --agree-to-license; then
-            echo "::error::softwareupdate could not install Rosetta 2"
-            exit 1
-          fi
-          if ! arch -x86_64 /usr/bin/true; then
-            echo "::error::Rosetta 2 is installed but cannot run x86_64 code"
-            exit 1
-          fi
-          translated="$(arch -x86_64 /usr/sbin/sysctl -n sysctl.proc_translated)"
-          echo "sysctl.proc_translated under arch -x86_64: $translated"
-          if [ "$translated" != "1" ]; then
-            echo "::error::x86_64 process is not translated by Rosetta"
-            exit 1
-          fi
-
-      - name: Install the pinned Rust toolchain and the x86_64-apple-darwin target
-        run: |
-          set -euo pipefail
-          rustup toolchain install
-          rustup show active-toolchain
-          rustup target add x86_64-apple-darwin
-          rustup target list --installed
-
-      - name: Cache cargo registry and target dir
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: bundle-${{ env.TARGET }}
-          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
-
-      - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22"
-          package-manager-cache: false
-
-      - name: Build the UI (tauri frontendDist)
-        run: |
-          set -euo pipefail
-          npm --prefix app/ui ci --ignore-scripts
-          npm --prefix app/ui run build
-          for page in approvals credential; do test -f "app/ui/dist/$page.html"; done
-          npm --prefix app/ui run check:bundle
-
-      - name: Install cargo-tauri (prebuilt release, sha256-pinned)
-        run: |
-          set -euo pipefail
-          dest="$RUNNER_TEMP/cargo-tauri"
-          mkdir -p "$dest"
-          curl --proto '=https' --tlsv1.2 -sSfL -o "$dest/$TAURI_CLI_ARCHIVE" \
-            "https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v${TAURI_CLI_VERSION}/${TAURI_CLI_ARCHIVE}"
-          echo "${TAURI_CLI_SHA256}  $dest/$TAURI_CLI_ARCHIVE" | shasum -a 256 -c -
-          unzip -q -o "$dest/$TAURI_CLI_ARCHIVE" -d "$dest"
-          chmod +x "$dest/cargo-tauri"
-          echo "$dest" >> "$GITHUB_PATH"
-
-      - name: Show the cargo-tauri version
-        run: cargo tauri --version
+        run: bash ci/install-rosetta.sh
 
       # The x86_64 images cross-built here are unsigned (Apple's linker signs only
       # arm64), which makes the bundler fail sealing the .app. beforeBundleCommand
       # runs after the final cargo build and before the binaries are copied in.
       # (A separate --no-bundle build plus signing did not hold: the bundling build
-      # relinked the binaries, CI run 2.)
-      # M4 plan Task 26 (T21 I-2): the release build must carry no test-only feature and nothing may
-      # force debug assertions (which would open the compile_error! locks). Same target and flags
-      # as the build below; the feature tree is the corrected one (cargo tree has no --release).
-      # PD-178 / P15 (spec §12.5): a release refuses the placeholder bundle identifier, the data-dir
-      # folder name as identifier, and the placeholder icons. Runs only for release builds: T26 adds
-      # the `on: workflow_call` `release: boolean` input; until then inputs.release is empty and the
-      # step is skipped.
-      - name: Release identity guard (bundle identifier and placeholder icons)
-        if: ${{ inputs.release }}
-        run: bash ci/check-release-identity.sh
-
-      - name: Release build guard (no test-only feature, no forced debug assertions)
-        run: bash ci/check-release-build.sh "$TARGET"
-
+      # relinked the binaries, CI run 2.) The runner is arm64, so the arm64 cargo-tauri runs here.
       - name: Build the .app and .dmg for x86_64 (ad-hoc signed, hardened runtime)
-        working-directory: app/src-tauri
+        uses: ./.github/actions/tauri-bundle
+        with:
+          target: x86_64-apple-darwin
+          bundles: app,dmg
+          extra-rust-target: "true"
+          cli-version: ${{ env.TAURI_CLI_VERSION }}
+          cli-archive: cargo-tauri-aarch64-apple-darwin.zip
+          cli-sha256: ee35ee364a0c626df7852d9a5bc0c5394b6440772e9864cfb9b11dcb8d33f527
+          tauri-config: '{"build":{"beforeBundleCommand":"bash ${{ github.workspace }}/ci/sign-macos-bins-adhoc.sh x86_64-apple-darwin"}}'
+
+      - name: Check the .app in the dmg (bins, arch, hardened runtime, entitlements, CLI under Rosetta)
+        run: bash ci/check-macos-bundle.sh "target/$TARGET/release/bundle/dmg" x86_64
+
+      - name: Upload bundle-x86_64-apple-darwin
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bundle-x86_64-apple-darwin
+          path: target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+  bundle-macos-x86_64-signed:
+    name: bundle-macos-x86_64-signed (x86_64-apple-darwin on the arm64 runner, Developer ID, notarized)
+    if: ${{ inputs.release }}
+    environment: release
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      TARGET: x86_64-apple-darwin
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Signing secrets guard (fails a release run with empty signing values)
+        run: bash ci/check-release-secrets.sh macos
+
+      - name: Install Rosetta 2 and fail loudly if it does not work (§15 V32)
+        run: bash ci/install-rosetta.sh
+
+      - name: Import the Developer ID certificate into a job keychain
+        run: bash ci/import-macos-certificate.sh
+
+      # The release sign script replaces the ad-hoc one: it also signs the unsigned x86_64 images.
+      - name: Write the release-only signing config
         run: |
-          cargo tauri build --ci --target "$TARGET" --bundles app,dmg             --config "{\"build\":{\"beforeBundleCommand\":\"bash $GITHUB_WORKSPACE/ci/sign-macos-bins-adhoc.sh $TARGET\"}}"             -- --locked
+          set -euo pipefail
+          node -e '
+            const cfg = { bundle: { macOS: { signingIdentity: process.env.APPLE_SIGNING_IDENTITY } },
+              build: { beforeBundleCommand: "bash " + process.env.GITHUB_WORKSPACE + "/ci/sign-macos-bins.sh " + process.env.TARGET } };
+            require("fs").writeFileSync("ci/release-signing.macos.json", JSON.stringify(cfg));
+          '
+
+      - name: Build the .app and .dmg for x86_64 (Developer ID, hardened runtime, notarized)
+        uses: ./.github/actions/tauri-bundle
+        with:
+          target: x86_64-apple-darwin
+          bundles: app,dmg
+          extra-rust-target: "true"
+          cli-version: ${{ env.TAURI_CLI_VERSION }}
+          cli-archive: cargo-tauri-aarch64-apple-darwin.zip
+          cli-sha256: ee35ee364a0c626df7852d9a5bc0c5394b6440772e9864cfb9b11dcb8d33f527
+          release: "true"
+          tauri-config: ci/release-signing.macos.json
 
       - name: Check the .app in the dmg (bins, arch, hardened runtime, entitlements, CLI under Rosetta)
         run: bash ci/check-macos-bundle.sh "target/$TARGET/release/bundle/dmg" x86_64
@@ -407,9 +443,8 @@ jobs:
       # force debug assertions (which would open the compile_error! locks). Same target and flags
       # as the build below; the feature tree is the corrected one (cargo tree has no --release).
       # PD-178 / P15 (spec §12.5): a release refuses the placeholder bundle identifier, the data-dir
-      # folder name as identifier, and the placeholder icons. Runs only for release builds: T26 adds
-      # the `on: workflow_call` `release: boolean` input; until then inputs.release is empty and the
-      # step is skipped.
+      # folder name as identifier, and the placeholder icons. Runs only for release builds (release.yml
+      # calls this workflow with `release: true`; Linux packages are not signed).
       - name: Release identity guard (bundle identifier and placeholder icons)
         if: ${{ inputs.release }}
         run: bash ci/check-release-identity.sh
