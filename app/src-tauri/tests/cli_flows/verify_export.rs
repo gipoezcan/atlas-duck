@@ -12,7 +12,8 @@
 //! forward, `tray.rs`) and no `window_open*` line (`windows.rs` logs `window_opened` on a
 //! successful open and `window_open_failed` on a failed one)". Before each run the test waits
 //! until the app is idle (two equal hash reads) and its log is live (`serve_started` present).
-//! `FixtureInfo` carries no anchor dir, so the Pass case uses `--manifest-sha256` only.
+//! The PassWithAnchorDir case (T36b, T28 M-4) passes the fixture's anchor dir with
+//! `--anchor-dir` as well as `--manifest-sha256`: exit 0 and the both-roots verdict line.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,6 +30,7 @@ use crate::harness::{CLI_EXE, Result, World, WorldOpts, opted_in};
 
 /// The report line each fixture ends with (`bins.rs` pins the same lines).
 const LAST_PASS: &str = "verified against the manifest SHA-256";
+const LAST_BOTH: &str = "verified against the manifest SHA-256 and the anchor dir";
 const LAST_TAMPER: &str = "TAMPERED:";
 const LAST_NO_ROOT: &str = "internally consistent; trust root NOT verified";
 
@@ -40,18 +42,24 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// One fixture case: its kind, whether the run passes `--manifest-sha256`, the report's last line.
+/// One fixture case: its kind, whether the run passes `--manifest-sha256` (it also passes the
+/// fixture's anchor dir, when it has one), the report's last line.
 struct Case {
     kind: FixtureKind,
     with_root: bool,
     last_line: &'static str,
 }
 
-const CASES: [Case; 3] = [
+const CASES: [Case; 4] = [
     Case {
         kind: FixtureKind::Pass,
         with_root: true,
         last_line: LAST_PASS,
+    },
+    Case {
+        kind: FixtureKind::PassWithAnchorDir,
+        with_root: true,
+        last_line: LAST_BOTH,
     },
     Case {
         kind: FixtureKind::Tamper,
@@ -140,6 +148,15 @@ fn args_of(case: &Case, info: &FixtureInfo) -> Result<Vec<String>> {
     if case.with_root {
         args.push("--manifest-sha256".to_owned());
         args.push(hex(&info.manifest_sha256));
+    }
+    if let Some(anchor) = &info.anchor_dir {
+        args.push("--anchor-dir".to_owned());
+        args.push(
+            anchor
+                .to_str()
+                .ok_or("non-UTF-8 anchor dir path")?
+                .to_owned(),
+        );
     }
     Ok(args)
 }

@@ -649,13 +649,22 @@ pub enum FixtureKind {
     Tamper,
     /// An honest export verified without a trust root: exit 20.
     NoTrustRoot,
+    /// An honest export of a store that had an anchor dir: exit 0 with the `manifest_sha256` and
+    /// `anchor_dir` together (both trust roots).
+    PassWithAnchorDir,
 }
+
+/// The anchor dir [`FixtureKind::PassWithAnchorDir`] leaves next to the export.
+const ANCHOR_DIR_NAME: &str = "atlas-duck-fixture-anchors";
 
 /// A fixture [`export_fixture`] wrote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixtureInfo {
     /// The export directory (inside the `out` given).
     pub dir: PathBuf,
+    /// The anchor dir the store wrote its lines to (inside `out`, next to `dir`): `Some` for
+    /// [`FixtureKind::PassWithAnchorDir`] only.
+    pub anchor_dir: Option<PathBuf>,
     /// SHA-256 of the honest `manifest.json` (what `EXPORT` logged).
     pub manifest_sha256: [u8; 32],
     /// What `verify-export` exits with: with `--manifest-sha256` for `Pass` and `Tamper`,
@@ -690,6 +699,14 @@ pub fn export_fixture(kind: FixtureKind, out: &Path) -> std::io::Result<FixtureI
     // An existing entry of that name is never ours to remove.
     std::fs::create_dir(&store_dir)?;
     let mut cleanup = RemoveOnDrop(Some(store_dir.clone()));
+    // The anchor dir outlives the store (it is what `verify-export --anchor-dir` reads); it is
+    // removed only when the fixture fails.
+    let anchor = (kind == FixtureKind::PassWithAnchorDir).then(|| out.join(ANCHOR_DIR_NAME));
+    let mut anchor_cleanup = RemoveOnDrop(None);
+    if let Some(a) = &anchor {
+        std::fs::create_dir(a)?;
+        anchor_cleanup.0 = Some(a.clone());
+    }
     let data = match check_data_dir(&store_dir) {
         Ok(DataDirResolution::Local(d)) => d,
         _ => return Err(fail("the store directory is not a local data dir")),
@@ -738,6 +755,18 @@ pub fn export_fixture(kind: FixtureKind, out: &Path) -> std::io::Result<FixtureI
         content_type: Some("application/json".into()),
         body_bytes: b"{\"fields\":{}}".to_vec(),
     }];
+    // The anchor dir of `PassWithAnchorDir`: its `CONFIG_CHANGED anchor_dir` row (seq 2) has an
+    // immediate line; the rows after it are covered by the manifest hash only.
+    if let Some(anchor) = &anchor {
+        store
+            .change_anchor_dir(
+                Some(RustChosenPath::from_native_dialog(anchor.clone())),
+                crate::types::Confirmed {
+                    dialog_text_sha256: [7; 32],
+                },
+            )
+            .map_err(|_| fail("anchor dir"))?;
+    }
     let events = vec![
         ev(EventType::REQUEST_RECEIVED, json!({"op": "jira.search"})),
         ev(EventType::READ_FETCHED, json!({"status": 200, "body": "x"})),
@@ -756,6 +785,10 @@ pub fn export_fixture(kind: FixtureKind, out: &Path) -> std::io::Result<FixtureI
         .append_batch(events)
         .map_err(|_| fail("append"))
         .and_then(|_| {
+            // The lines of the rows above are in the anchor dir before the export reads it.
+            if anchor.is_some() && !store.testing_anchor_dir_drain() {
+                return Err(fail("anchor-dir lines not written"));
+            }
             let cancel = AtomicBool::new(false);
             let progress = |_: u64, _: u64| {};
             store
@@ -775,6 +808,7 @@ pub fn export_fixture(kind: FixtureKind, out: &Path) -> std::io::Result<FixtureI
     cleanup.0 = None;
     std::fs::remove_dir_all(&store_dir)?;
     let receipt = exported?;
+    anchor_cleanup.0 = None;
     let dir = out.join(&receipt.dir_name);
     if kind == FixtureKind::Tamper {
         let events = dir.join(crate::export::EVENTS_FILE);
@@ -798,9 +832,10 @@ pub fn export_fixture(kind: FixtureKind, out: &Path) -> std::io::Result<FixtureI
     }
     Ok(FixtureInfo {
         dir,
+        anchor_dir: anchor,
         manifest_sha256: receipt.manifest_sha256,
         expected_exit: match kind {
-            FixtureKind::Pass => 0,
+            FixtureKind::Pass | FixtureKind::PassWithAnchorDir => 0,
             FixtureKind::Tamper => 21,
             FixtureKind::NoTrustRoot => 20,
         },

@@ -498,6 +498,60 @@ fn export_fixture_kinds_verify_as_documented() {
     }
 }
 
+/// T36b item 4 (T28 M-4): the pass fixture with an anchor dir verifies with both trust roots
+/// (exit 0, the "manifest SHA-256 and the anchor dir" verdict); no other kind carries one; the
+/// anchor dir sits beside the export, with the store's lines in it; a wrong manifest hash or a
+/// line that contradicts a row turns the same fixture into exit 21.
+#[test]
+fn export_fixture_with_anchor_dir_verifies_with_both_roots() {
+    let out = tempfile::tempdir().expect("out");
+    let info =
+        testing::export_fixture(FixtureKind::PassWithAnchorDir, out.path()).expect("fixture");
+    let anchor = info.anchor_dir.clone().expect("an anchor dir");
+    assert_eq!(anchor.parent(), Some(out.path()), "beside the export");
+    let mut names: Vec<PathBuf> = std::fs::read_dir(out.path())
+        .expect("out")
+        .map(|e| e.expect("entry").path())
+        .collect();
+    names.sort();
+    let mut want = vec![info.dir.clone(), anchor.clone()];
+    want.sort();
+    assert_eq!(names, want, "the export and the anchor dir, nothing else");
+    assert_eq!(info.expected_exit, 0);
+
+    let v = verify_export(&info.dir, Some(&anchor), Some(info.manifest_sha256));
+    assert_eq!(v.exit_code(), 0, "{:#?}", v.report());
+    assert_eq!(last(&v), BOTH_OK);
+    // The anchor dir proves seq 2 (its `CONFIG_CHANGED`); the manifest hash covers the rest.
+    assert!(
+        has_line(
+            &v,
+            "anchor dir: ok up to seq 2; rows 3..7 covered by the manifest SHA-256 only"
+        ),
+        "{:?}",
+        v.report()
+    );
+
+    let mut wrong = info.manifest_sha256;
+    wrong[0] ^= 1;
+    expect(
+        &verify_export(&info.dir, Some(&anchor), Some(wrong)),
+        21,
+        "wrong manifest hash",
+    );
+
+    // The anchor dir is the one the fixture has to give: the plain kinds have none.
+    for kind in [
+        FixtureKind::Pass,
+        FixtureKind::Tamper,
+        FixtureKind::NoTrustRoot,
+    ] {
+        let plain = tempfile::tempdir().expect("out");
+        let info = testing::export_fixture(kind, plain.path()).expect("fixture");
+        assert_eq!(info.anchor_dir, None, "{kind:?}");
+    }
+}
+
 #[test]
 fn manifest_hash_mismatch_is_21() {
     let (store, _f) = basic_store(6);
