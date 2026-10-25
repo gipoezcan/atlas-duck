@@ -35,6 +35,8 @@ pub struct MockDc {
     context_path: String,
     user: String,
     date: Option<String>,
+    /// Sent on every response mounted afterwards (M10 T29: the canary sweep's header canaries).
+    extra_headers: Vec<(String, String)>,
 }
 
 impl MockDc {
@@ -46,7 +48,14 @@ impl MockDc {
             context_path: context_path.trim_end_matches('/').to_owned(),
             user: TEST_USER.to_owned(),
             date: None,
+            extra_headers: Vec::new(),
         }
+    }
+
+    /// One more header on every response mounted afterwards (M10 T29: a canary header).
+    pub fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.extra_headers.push((name.to_owned(), value.to_owned()));
+        self
     }
 
     /// The `X-AUSERNAME` of fixture responses (`XAuser::Same` in the generic helpers).
@@ -103,7 +112,10 @@ impl MockDc {
             .date
             .clone()
             .unwrap_or_else(|| httpdate::fmt_http_date(std::time::SystemTime::now()));
-        let t = ResponseTemplate::new(status).insert_header("Date", date.as_str());
+        let mut t = ResponseTemplate::new(status).insert_header("Date", date.as_str());
+        for (name, value) in &self.extra_headers {
+            t = t.insert_header(name.as_str(), value.as_str());
+        }
         if self.product != Product::Jira {
             return t;
         }
@@ -136,6 +148,21 @@ impl MockDc {
             .response_with(200, &header, name)
             .set_body_raw(fixtures::jira_myself(name, key), "application/json");
         self.mount_get("/rest/api/2/myself", t).await;
+    }
+
+    /// [`MockDc::jira_myself`] for the first request only, ahead of every mount of the default
+    /// priority (M10 T29: a stale check's identity call that differs from the re-check's).
+    pub async fn jira_myself_once(&self, name: &str, key: &str, header: XAuser) {
+        let t = self
+            .response_with(200, &header, name)
+            .set_body_raw(fixtures::jira_myself(name, key), "application/json");
+        Mock::given(method("GET"))
+            .and(path(self.path("/rest/api/2/myself")))
+            .respond_with(t)
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&self.server)
+            .await;
     }
 
     pub async fn jira_server_info(&self, version: &str) {
@@ -239,6 +266,14 @@ impl MockDc {
             .response(status)
             .set_body_raw(body, "application/json")
             .set_delay(delay);
+        self.mount_any(p, t).await;
+    }
+
+    /// Any method on `p`: `status` with `body` as `content_type` (M10 T29: a canary HTML page).
+    pub async fn raw(&self, p: &str, status: u16, body: &str, content_type: &str) {
+        let t = self
+            .response(status)
+            .set_body_raw(body.to_owned(), content_type);
         self.mount_any(p, t).await;
     }
 

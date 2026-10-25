@@ -25,6 +25,10 @@ mod security;
 #[path = "cli_flows/verify_export.rs"]
 mod verify_export;
 
+// Task 29 (M10): the canary sweep's process half (S-16, S-14) against three canary Jira mocks.
+#[path = "cli_flows/canary.rs"]
+mod canary;
+
 use atlas_duck_audit::EventType;
 use atlas_duck_registry::Product;
 use harness::{KeystoreKind, Result, World, WorldOpts, instance_rows, opted_in};

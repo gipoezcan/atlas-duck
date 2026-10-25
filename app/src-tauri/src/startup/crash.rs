@@ -48,7 +48,8 @@ pub fn apply_process_crash_settings() -> CrashSettingsReport {
     #[cfg(not(windows))]
     let wer_excluded = None;
 
-    let stderr_null = redirect_stderr_to_null().is_ok();
+    // The null device, except in the test build with its stderr file (M10 T29).
+    let stderr_null = redirect_stderr(&stderr_target(&|n| std::env::var_os(n))).is_ok();
 
     let report = CrashSettingsReport {
         stderr_null,
@@ -176,6 +177,115 @@ pub fn set_non_dumpable() -> io::Result<()> {
     ))
 }
 
+/// M10 T29 (S-16, S-14): the file the test build's stderr goes to instead of the null device, so
+/// the canary sweep can read what the app wrote there. Honoured only in a `scripted-approver`
+/// build and only for a path under `ATLAS_DUCK_TEST_HOME`; a release build has none of this.
+#[cfg(feature = "scripted-approver")]
+pub const ENV_TEST_STDERR_FILE: &str = "ATLAS_DUCK_TEST_STDERR_FILE";
+
+/// Where [`apply_process_crash_settings`] points stderr.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StderrTarget {
+    /// The null device (every build but the test build with the variable).
+    Null,
+    /// The test build's stderr file ([`ENV_TEST_STDERR_FILE`]).
+    TestFile(PathBuf),
+}
+
+/// Pure: the stderr target for the environment `env`.
+pub fn stderr_target(env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> StderrTarget {
+    #[cfg(feature = "scripted-approver")]
+    if let Some(file) = test_stderr_file(
+        env(ENV_TEST_STDERR_FILE).as_deref(),
+        env(atlas_duck_ipc::paths::TEST_HOME_ENV).as_deref(),
+    ) {
+        return StderrTarget::TestFile(file);
+    }
+    #[cfg(not(feature = "scripted-approver"))]
+    let _ = env;
+    StderrTarget::Null
+}
+
+/// The stderr file when `file` is an absolute path strictly below the absolute `home`, with no
+/// `..` component.
+#[cfg(feature = "scripted-approver")]
+fn test_stderr_file(
+    file: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let (file, home) = (Path::new(file?), Path::new(home?));
+    let plain = file
+        .components()
+        .all(|c| !matches!(c, std::path::Component::ParentDir));
+    (file.is_absolute() && home.is_absolute() && plain && file != home && file.starts_with(home))
+        .then(|| file.to_path_buf())
+}
+
+/// Points stderr at `target`: [`redirect_stderr_to_null`], or the test build's file.
+pub fn redirect_stderr(target: &StderrTarget) -> io::Result<()> {
+    match target {
+        StderrTarget::Null => redirect_stderr_to_null(),
+        #[cfg(feature = "scripted-approver")]
+        StderrTarget::TestFile(path) => redirect_stderr_to_file(path),
+        #[cfg(not(feature = "scripted-approver"))]
+        StderrTarget::TestFile(_) => redirect_stderr_to_null(),
+    }
+}
+
+/// The test build's stderr file (created, appended to), for fd 2.
+#[cfg(all(feature = "scripted-approver", unix))]
+fn redirect_stderr_to_file(path: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    // SAFETY: `file` is an open descriptor for the duration of the call; dup2 atomically
+    // replaces fd 2 and leaves `file` to be closed on drop.
+    let rc = unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The test build's stderr file (created, appended to), for the CRT descriptor 2 and the Win32
+/// `STD_ERROR_HANDLE`, as [`redirect_stderr_to_null`] does for `NUL`.
+#[cfg(all(feature = "scripted-approver", windows))]
+fn redirect_stderr_to_file(path: &Path) -> io::Result<()> {
+    use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
+
+    let open = || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    };
+    let handle = open()?.into_raw_handle();
+    // SAFETY: `handle` is an open file handle owned by nobody else; the CRT takes it over.
+    let crt_fd = unsafe { libc::open_osfhandle(handle as libc::intptr_t, libc::O_WRONLY) };
+    if crt_fd < 0 {
+        return Err(io::Error::other("CRT _open_osfhandle failed"));
+    }
+    // SAFETY: `crt_fd` is a valid CRT descriptor; `_dup2` makes descriptor 2 a duplicate of it.
+    let rc = unsafe { libc::dup2(crt_fd, 2) };
+    // SAFETY: `crt_fd` is ours and no longer needed after the duplicate.
+    unsafe { libc::close(crt_fd) };
+    if rc < 0 {
+        return Err(io::Error::other("CRT _dup2 onto descriptor 2 failed"));
+    }
+    // Leaked on purpose: it stays the process's stderr until exit.
+    let handle = open()?.into_raw_handle();
+    // SAFETY: `handle` is an open file handle owned by nobody else.
+    let ok = unsafe { SetStdHandle(STD_ERROR_HANDLE, handle) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// `<data>/webview`. Window builders (M6) pass this to `WebviewWindowBuilder::data_directory`;
 /// the `WEBVIEW2_USER_DATA_FOLDER` environment variable is never used (§2.5).
 pub fn webview_data_dir(data: &LocalDataDir) -> PathBuf {
@@ -233,5 +343,63 @@ pub fn clear_crashpad_reports(webview_dir: &Path) -> io::Result<usize> {
     match first_err {
         Some(err) => Err(err),
         None => Ok(removed),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use super::*;
+
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| OsString::from(*v))
+        }
+    }
+
+    /// M10 T29: the test build sends stderr to `ATLAS_DUCK_TEST_STDERR_FILE` only when that path
+    /// is under `ATLAS_DUCK_TEST_HOME`; every other case, and every other build, keeps the null
+    /// device.
+    #[test]
+    fn stderr_file_redirect_only_in_test_build_with_variable() {
+        let home = std::env::temp_dir().join("adt-stderr-home");
+        let inside = home.join("app-stderr.txt");
+        let outside = std::env::temp_dir().join("elsewhere-stderr.txt");
+        let (home_s, inside_s, outside_s) = (
+            home.to_string_lossy().into_owned(),
+            inside.to_string_lossy().into_owned(),
+            outside.to_string_lossy().into_owned(),
+        );
+        let file_var = "ATLAS_DUCK_TEST_STDERR_FILE";
+        let home_var = "ATLAS_DUCK_TEST_HOME";
+        let with_both = [(home_var, home_s.as_str()), (file_var, inside_s.as_str())];
+
+        let expected = if cfg!(feature = "scripted-approver") {
+            StderrTarget::TestFile(inside.clone())
+        } else {
+            StderrTarget::Null
+        };
+        assert_eq!(stderr_target(&env(&with_both)), expected);
+
+        // Never without the variable, outside the test home, without a test home, for a
+        // relative path, or for the home itself.
+        let dotdot = home.join("..").join("x.txt");
+        let dotdot_s = dotdot.to_string_lossy().into_owned();
+        for pairs in [
+            vec![(home_var, home_s.as_str())],
+            vec![(home_var, home_s.as_str()), (file_var, outside_s.as_str())],
+            vec![(file_var, inside_s.as_str())],
+            vec![(home_var, home_s.as_str()), (file_var, "app-stderr.txt")],
+            vec![(home_var, home_s.as_str()), (file_var, home_s.as_str())],
+            vec![(home_var, home_s.as_str()), (file_var, dotdot_s.as_str())],
+            vec![(home_var, home_s.as_str()), (file_var, "")],
+            vec![],
+        ] {
+            assert_eq!(stderr_target(&env(&pairs)), StderrTarget::Null, "{pairs:?}");
+        }
     }
 }

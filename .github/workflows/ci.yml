@@ -149,6 +149,8 @@ jobs:
           # M6 T3: the S-16 capture tests run only with the feature; the fixture check must never be stale.
           # M6 T20: the credential window (I-33 connection test, S-16 PAT/passphrase canary).
           cargo test -p atlas-duck-app --features scripted-approver --locked --test commands_acl --test dto_fixtures --test credential
+          # M10 T29: the canary sweep's Tauri half (mock runtime; the process half is in cli_flows).
+          cargo test -p atlas-duck-app --features scripted-approver --locked --test canary_tauri
 
       # T4 handoff, spec §15 V28: which socket dir the runner gets (`run_user` or `state_fallback`;
       # ubuntu runners are expected to show state_fallback). The line is evidence for T27.

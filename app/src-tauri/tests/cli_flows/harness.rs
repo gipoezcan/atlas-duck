@@ -214,9 +214,18 @@ pub struct WorldOpts {
     /// (`canonical_worker`), so a test can replace the copied worker without touching the build
     /// output.
     pub copy_install: bool,
+    /// M10 T29 canary mode: every mock answers with canaries ([`canary_jira`]), each instance
+    /// gets its own canary PAT, the store this run's canary recovery passphrase, and an app this
+    /// world starts writes its stderr to [`World::stderr_file`].
+    pub canaries: Option<Arc<Canaries>>,
 }
 
 impl WorldOpts {
+    pub fn with_canaries(mut self, canaries: Arc<Canaries>) -> WorldOpts {
+        self.canaries = Some(canaries);
+        self
+    }
+
     pub fn with_env(mut self, name: &str, value: &str) -> WorldOpts {
         self.extra_env.push((name.to_owned(), value.to_owned()));
         self
@@ -440,6 +449,25 @@ impl World {
     pub fn instance_ids(&self) -> &[String] {
         &self.instance_ids
     }
+    /// The PAT the instance `alias` stores: its canary PAT in canary mode, else [`PAT_CANARY`].
+    pub fn pat(&self, alias: &str) -> String {
+        self.opts
+            .canaries
+            .as_ref()
+            .map_or_else(|| PAT_CANARY.to_owned(), |c| c.pat(alias))
+    }
+    /// The store's recovery passphrase: the run's canary in canary mode.
+    pub fn passphrase(&self) -> String {
+        self.opts
+            .canaries
+            .as_ref()
+            .map_or_else(|| PASSPHRASE.to_owned(), |c| c.passphrase())
+    }
+    /// M10 T29: the file an app this world starts writes its stderr to (canary mode only; the
+    /// test build honours it because it is under the test home).
+    pub fn stderr_file(&self) -> PathBuf {
+        self.base.home.join(STDERR_FILE)
+    }
 
     fn local_data(&self) -> Result<LocalDataDir> {
         match check_data_dir(&self.data)? {
@@ -503,8 +531,8 @@ impl World {
             FirstRunInput {
                 install_id: self.install_id.clone(),
                 chain_id,
-                passphrase: SecretString::from(PASSPHRASE.to_owned()),
-                passphrase_confirm: SecretString::from(PASSPHRASE.to_owned()),
+                passphrase: SecretString::from(self.passphrase()),
+                passphrase_confirm: SecretString::from(self.passphrase()),
                 archived_db: None,
                 anchor_dir: None,
                 archive_confirmed: None,
@@ -558,10 +586,17 @@ impl World {
                     CONFLUENCE_8_5_VERSION,
                 ),
             };
-            let mock = MockDc::start(atl, context).await;
-            // `jira_myself` + `server_info` (or Confluence's equivalents): the connection test
-            // and every approved write's stale check need them.
-            mock.mount_fixture_set(version).await;
+            let mock = match (&self.opts.canaries, product) {
+                // Canary mode: Jira only (the Confluence fixtures are D2).
+                (Some(c), Product::Jira) => canary_jira(c).await,
+                _ => {
+                    let mock = MockDc::start(atl, context).await;
+                    // `jira_myself` + `server_info` (or Confluence's equivalents): the connection
+                    // test and every approved write's stale check need them.
+                    mock.mount_fixture_set(version).await;
+                    mock
+                }
+            };
             confirmer.push(Confirm::Ok);
             core.instances()
                 .add(AddInstance {
@@ -575,7 +610,7 @@ impl World {
                 })
                 .map_err(|e| format!("add {alias}: {e:?}"))?;
             core.instances()
-                .set_token(alias, SecretString::from(PAT_CANARY.to_owned()), None)
+                .set_token(alias, SecretString::from(self.pat(alias)), None)
                 .await
                 .map_err(|e| format!("set_token {alias}: {e:?}"))?;
             let state = core
@@ -656,6 +691,10 @@ impl World {
     /// `ATLAS_DUCK_TEST_SERVER_BUILD_ID` is read from the app's own environment at start only).
     pub async fn start_app_with_env(&self, env: &[(&str, &str)]) -> Result<AppProc> {
         let mut cmd = self.command(self.app_exe(), &["--background"]);
+        // M10 T29: in canary mode the test build writes its stderr under the test home.
+        if self.opts.canaries.is_some() {
+            cmd.env(ENV_TEST_STDERR_FILE, self.stderr_file());
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -1132,9 +1171,299 @@ impl Drop for AppProc {
     }
 }
 
+// ---- M10 T29: canary mode (§13 canary sweep, S-16, S-14) ----------------------------------------
+
+/// The test build's stderr file variable (`startup::crash`, honoured under the test home only).
+pub const ENV_TEST_STDERR_FILE: &str = "ATLAS_DUCK_TEST_STDERR_FILE";
+/// The stderr file's name under the test home.
+pub const STDERR_FILE: &str = "app-stderr.txt";
+
+/// The issue keys every canary Jira answers with a canary issue.
+pub const CANARY_ISSUES: [&str; 8] = [
+    "CAN-1", "CAN-2", "CAN-3", "CAN-4", "CAN-5", "CAN-6", "OU-1", "STL-1",
+];
+/// A read answered 500 with a canary error body (upstream-error).
+pub const CANARY_ERR_500: &str = "ERR-500";
+/// An issue (and its transitions) answered 404 with a canary error body: a held write's
+/// enrichment fails (deny-with-details, deny-with-hint).
+pub const CANARY_ERR_404: [&str; 2] = ["ERR-1", "ERR-2"];
+/// A read answered 200 with a canary HTML page (`upstream_unavailable`, body audit-only).
+pub const CANARY_UNAVAILABLE: &str = "UNAV-1";
+/// The issue whose comment endpoint answers an empty 200 (outcome-unknown).
+pub const CANARY_OUTCOME_UNKNOWN: &str = "OU-1";
+
+/// The canaries of one run. Every canary is ASCII letters and digits only, so JSON, HTML and URL
+/// encoding leave it as it is and one substring search finds it in any channel.
+pub struct Canaries {
+    run: String,
+    next: std::sync::Mutex<(u32, Vec<(String, String)>)>,
+}
+
+impl std::fmt::Debug for Canaries {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Canaries({})", self.run)
+    }
+}
+
+impl Canaries {
+    /// A run with a random id (so two runs never share a canary).
+    pub fn new() -> Result<Arc<Canaries>> {
+        let (_, chain) = new_ids().map_err(short_err)?;
+        let run: String = chain
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .take(10)
+            .collect();
+        Ok(Arc::new(Canaries {
+            run,
+            next: std::sync::Mutex::new((0, Vec::new())),
+        }))
+    }
+
+    /// A new data canary for the response field `label` (kept for the sweep).
+    pub fn data(&self, label: &str) -> String {
+        let mut next = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        next.0 += 1;
+        let canary = format!("DC{}N{:04}Q", self.run, next.0);
+        next.1.push((label.to_owned(), canary.clone()));
+        canary
+    }
+
+    /// Every data canary handed out so far, with its label.
+    pub fn data_all(&self) -> Vec<(String, String)> {
+        self.next.lock().map(|n| n.1.clone()).unwrap_or_default()
+    }
+
+    /// The canary PAT of instance `alias` (one per instance).
+    pub fn pat(&self, alias: &str) -> String {
+        let tail: String = alias.chars().filter(char::is_ascii_alphanumeric).collect();
+        format!("PC{}T{tail}Q", self.run)
+    }
+
+    /// The run's recovery passphrase (at least 12 characters).
+    pub fn passphrase(&self) -> String {
+        format!("XC{}PassphraseQ", self.run)
+    }
+}
+
+const B64_STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+fn base64_with(alphabet: &[u8; 64], bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(alphabet[((n >> (18 - 6 * i)) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// Every form §13 names for a secret: raw, base64 (standard and URL-safe, at each of the three
+/// byte alignments, only the characters that depend on the secret alone) and percent-encoded
+/// (every byte, both cases).
+pub fn secret_forms(secret: &str) -> Vec<String> {
+    let mut out = vec![secret.to_owned()];
+    for alphabet in [B64_STD, B64_URL] {
+        for k in 0..3usize {
+            let mut buf = vec![b'x'; k];
+            buf.extend_from_slice(secret.as_bytes());
+            let enc = base64_with(alphabet, &buf);
+            let start = 4 * k.div_ceil(3);
+            let end = 4 * ((k + secret.len()) / 3);
+            if let Some(core) = enc.get(start..end) {
+                out.push(core.to_owned());
+            }
+        }
+    }
+    let upper: String = secret.bytes().map(|b| format!("%{b:02X}")).collect();
+    out.push(upper.to_lowercase());
+    out.push(upper);
+    out
+}
+
+/// The needles of `needles` that `bytes` holds.
+pub fn hits<'a>(bytes: &[u8], needles: &'a [String]) -> Vec<&'a str> {
+    needles
+        .iter()
+        .filter(|n| bytes.windows(n.len()).any(|w| w == n.as_bytes()))
+        .map(String::as_str)
+        .collect()
+}
+
+/// A canary Jira issue: every field a canary.
+pub fn canary_issue(c: &Canaries, key: &str) -> String {
+    serde_json::json!({
+        "expand": c.data("issue.expand"),
+        "id": "10001",
+        "self": format!("https://{}.example/rest/api/2/issue/10001", c.data("issue.self")),
+        "key": key,
+        "fields": {
+            "summary": c.data("issue.summary"),
+            "description": c.data("issue.description"),
+            "status": {"name": c.data("issue.status.name"), "id": "3"},
+            "assignee": {"name": c.data("issue.assignee.name"), "displayName": c.data("issue.assignee.displayName")},
+            "reporter": {"name": c.data("issue.reporter.name"), "displayName": c.data("issue.reporter.displayName")},
+            "priority": {"name": c.data("issue.priority.name"), "id": "3"},
+            "issuetype": {"id": "10002", "name": c.data("issue.issuetype.name"), "subtask": false},
+            "project": {"id": "10000", "key": "CAN", "name": c.data("issue.project.name")},
+            "labels": [c.data("issue.label")],
+            "created": "2026-10-01T09:00:00.000+0200",
+            "updated": "2026-10-06T16:30:00.000+0200"
+        }
+    })
+    .to_string()
+}
+
+/// A canary Jira error body.
+pub fn canary_error(c: &Canaries, what: &str) -> String {
+    serde_json::json!({
+        "errorMessages": [c.data(&format!("{what}.errorMessages"))],
+        "errors": {"field": c.data(&format!("{what}.errors"))}
+    })
+    .to_string()
+}
+
+/// A Jira `MockDc` in canary mode: a canary user (`X-AUSERNAME` and `/myself`), a canary header
+/// on every response, a version string with a canary suffix, canary issues, search page, comment
+/// receipt and error bodies, a canary HTML page, and an empty comment answer.
+pub async fn canary_jira(c: &Canaries) -> MockDc {
+    let user = c.data("myself.name");
+    let mock = MockDc::start(atlas_duck_atlassian::Product::Jira, "/jira")
+        .await
+        .with_user(&user)
+        .with_header("X-Canary", &c.data("header.x-canary"));
+    let myself = serde_json::json!({
+        "self": format!("https://{}.example/rest/api/2/user", c.data("myself.self")),
+        "key": c.data("myself.key"),
+        "name": user,
+        "emailAddress": format!("{}@corp.example", c.data("myself.emailAddress")),
+        "displayName": c.data("myself.displayName"),
+        "active": true,
+        "deleted": false,
+        "timeZone": "Europe/Berlin",
+        "locale": "en_US"
+    })
+    .to_string();
+    mock.json("/rest/api/2/myself", 200, &myself).await;
+    let info = serde_json::json!({
+        "baseUrl": format!("https://{}.example", c.data("serverInfo.baseUrl")),
+        "version": format!("9.12.0-{}", c.data("serverInfo.version")),
+        "versionNumbers": [9, 12, 0],
+        "deploymentType": "Server",
+        "buildNumber": 912000,
+        "buildDate": "2023-11-28T00:00:00.000+0000",
+        "serverTime": "2026-10-07T10:00:00.000+0000",
+        "scmInfo": c.data("serverInfo.scmInfo"),
+        "serverTitle": c.data("serverInfo.serverTitle")
+    })
+    .to_string();
+    mock.json("/rest/api/2/serverInfo", 200, &info).await;
+    for key in CANARY_ISSUES {
+        mock.json(
+            &format!("/rest/api/2/issue/{key}"),
+            200,
+            &canary_issue(c, key),
+        )
+        .await;
+    }
+    let search = serde_json::json!({
+        "startAt": 0, "maxResults": 50, "total": 1,
+        "issues": [{"id": "10001", "key": "CAN-1", "fields": {"summary": c.data("search.summary")}}]
+    })
+    .to_string();
+    mock.json("/rest/api/2/search", 200, &search).await;
+    mock.json(
+        &format!("/rest/api/2/issue/{CANARY_ERR_500}"),
+        500,
+        &canary_error(c, "err500"),
+    )
+    .await;
+    for key in CANARY_ERR_404 {
+        mock.json(
+            &format!("/rest/api/2/issue/{key}"),
+            404,
+            &canary_error(c, key),
+        )
+        .await;
+        mock.json(
+            &format!("/rest/api/2/issue/{key}/transitions"),
+            404,
+            &canary_error(c, key),
+        )
+        .await;
+    }
+    mock.raw(
+        &format!("/rest/api/2/issue/{CANARY_UNAVAILABLE}"),
+        200,
+        &format!("<html><body>{}</body></html>", c.data("unavailable.html")),
+        "text/html; charset=UTF-8",
+    )
+    .await;
+    let receipt = serde_json::json!({
+        "self": format!("https://{}.example/rest/api/2/issue/10001/comment/20001", c.data("comment.self")),
+        "id": "20001",
+        "author": {"name": user, "displayName": c.data("comment.author.displayName")},
+        "body": c.data("comment.body"),
+        "created": "2026-10-06T10:00:00.000+0200",
+        "updated": "2026-10-06T10:00:00.000+0200"
+    })
+    .to_string();
+    for key in ["CAN-1", "STL-1"] {
+        mock.json(&format!("/rest/api/2/issue/{key}/comment"), 201, &receipt)
+            .await;
+    }
+    mock.empty(
+        &format!("/rest/api/2/issue/{CANARY_OUTCOME_UNKNOWN}/comment"),
+        200,
+        Some("application/json;charset=UTF-8"),
+    )
+    .await;
+    mock
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_forms_cover_base64_and_percent_encoding() {
+        let forms = secret_forms("PCabcT1Q");
+        assert!(forms.contains(&"PCabcT1Q".to_owned()));
+        // base64("PCabcT1Q") = "UENhYmNUMVE=": the aligned core is a prefix of it.
+        assert!(forms.iter().any(|f| f == "UENhYmNUMVE" || f == "UENhYmNU"));
+        assert!(forms.contains(&"%50%43%61%62%63%54%31%51".to_owned()));
+        assert_eq!(base64_with(B64_STD, b"Man"), "TWFu");
+        assert_eq!(base64_with(B64_STD, b"Ma"), "TWE=");
+        assert_eq!(base64_with(B64_STD, b"M"), "TQ==");
+        let mut with_secret = b"prefix:".to_vec();
+        with_secret.extend_from_slice(base64_with(B64_STD, b"xxPCabcT1Q").as_bytes());
+        assert!(!hits(&with_secret, &forms).is_empty());
+    }
+
+    #[test]
+    fn canaries_are_unique_and_alphanumeric() -> Result<()> {
+        let c = Canaries::new()?;
+        let (a, b) = (c.data("a"), c.data("b"));
+        assert_ne!(a, b);
+        for s in [a, b, c.pat("jira-main"), c.passphrase()] {
+            assert!(s.chars().all(|ch| ch.is_ascii_alphanumeric()), "{s}");
+        }
+        assert!(c.passphrase().len() >= 12);
+        assert_ne!(c.pat("jira-a"), c.pat("jira-b"));
+        assert_eq!(c.data_all().len(), 2);
+        Ok(())
+    }
 
     #[test]
     fn opt_in_needs_exactly_one() {
