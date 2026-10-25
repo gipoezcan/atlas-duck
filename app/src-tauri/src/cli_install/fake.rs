@@ -36,6 +36,8 @@ pub struct FakeOps {
     fail_read: Mutex<Option<PathBuf>>,
     /// `read_file` of this path answers `InvalidInput`: a FIFO, a device or a directory.
     non_regular: Mutex<Option<PathBuf>>,
+    /// `write_cli_toml` fails.
+    fail_cli_toml: Mutex<bool>,
     /// What `session_path` answers (none by default: the `PATH` of the test process is not read).
     session_path: Mutex<Option<OsString>>,
 }
@@ -85,6 +87,11 @@ impl FakeOps {
 
     pub fn fail_reads_of(&self, p: &Path) {
         *lock(&self.fail_read) = Some(p.to_path_buf());
+    }
+
+    /// Every `write_cli_toml` fails (the undo of an install whose last step failed).
+    pub fn fail_cli_toml_writes(&self) {
+        *lock(&self.fail_cli_toml) = true;
     }
 
     pub fn non_regular_at(&self, p: &Path) {
@@ -176,6 +183,9 @@ impl PlatformOps for FakeOps {
     }
 
     fn write_cli_toml(&self, p: &Path, c: &CliToml) -> Result<(), PinnedError> {
+        if *lock(&self.fail_cli_toml) {
+            return Err(PinnedError::Parse);
+        }
         lock(&self.state)
             .cli_tomls
             .insert(p.to_path_buf(), c.clone());

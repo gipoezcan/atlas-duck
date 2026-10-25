@@ -429,7 +429,14 @@ fn remove_artifacts(
     let wanted = |a: Artifact| only.is_none_or(|o| o.contains(&a));
     let mut removed = Vec::new();
     match &layout.kind {
-        Kind::Windows { .. } => windows::uninstall(ops, &layout.kind, wanted, &mut removed)?,
+        Kind::Windows { .. } => windows::uninstall(
+            ops,
+            &layout.kind,
+            &layout.cli_toml,
+            only.is_some(),
+            wanted,
+            &mut removed,
+        )?,
         Kind::Macos { .. } => macos::uninstall(ops, &layout.kind, wanted, &mut removed)?,
         Kind::AppImage { .. } => linux::uninstall(ops, &layout.kind, wanted, &mut removed)?,
         Kind::Packaged => {}

@@ -6,9 +6,9 @@
 //! folder the app moved away from ([`stale_entry`]).
 //!
 //! The value is read and written unexpanded: a `%USERPROFILE%\bin` entry stays exactly that.
-//! `uninstall` removes every segment equal to the install dir and keeps the others verbatim, in
-//! order; the only text it can change besides the removed segment is a trailing `;` that
-//! `install` swallowed when it appended.
+//! `uninstall` removes every segment exactly equal to the `path_entry` `cli.toml` records (an older
+//! file without it removes nothing) and keeps the others verbatim, in order; the only text it can
+//! change besides the removed segment is a trailing `;` that `install` swallowed when it appended.
 
 use std::path::Path;
 
@@ -191,18 +191,45 @@ fn stale_entry(
     }
 }
 
+/// `current` without the segments that are exactly `entry` (no case, quote or separator folding:
+/// the text install wrote), or `None` when none is.
+fn path_remove_exact(current: &str, entry: &str) -> Option<String> {
+    if !current.split(';').any(|s| s == entry) {
+        return None;
+    }
+    let kept: Vec<&str> = current.split(';').filter(|s| *s != entry).collect();
+    Some(kept.join(";"))
+}
+
+/// Removes the PATH entry install added, and no other. `undo` is the rollback of an install that
+/// failed after appending: the entry is the install dir this call appended, and `cli.toml` does
+/// not record it yet. Otherwise the entry is the one `cli.toml` records (`path_entry`, T19 ruling);
+/// an older file without it, a missing or unreadable `cli.toml` leave the PATH alone: nothing
+/// proves that install added anything (an entry the user had before is not ours to take).
 pub fn uninstall(
     ops: &dyn PlatformOps,
     kind: &Kind,
+    cli_toml: &Path,
+    undo: bool,
     wanted: impl Fn(Artifact) -> bool,
     removed: &mut Vec<Artifact>,
 ) -> Result<(), InstallError> {
     if !wanted(Artifact::PathEntry) {
         return Ok(());
     }
-    let dir = entry(kind)?;
+    let dir = if undo {
+        entry(kind)?
+    } else {
+        match ops.read_cli_toml(cli_toml).ok().flatten() {
+            Some(CliToml {
+                path_entry: Some(e),
+                ..
+            }) => e,
+            _ => return Ok(()),
+        }
+    };
     let current = ops.user_path_get().map_err(|e| registry_error(&e))?;
-    if let Some(next) = current.as_deref().and_then(|c| path_remove(c, &dir)) {
+    if let Some(next) = current.as_deref().and_then(|c| path_remove_exact(c, &dir)) {
         // Nothing else was in the value: it goes, as it was absent before install created it.
         if next.is_empty() {
             ops.user_path_remove().map_err(|e| registry_error(&e))?;
@@ -630,6 +657,82 @@ mod tests {
                 .is_empty()
         );
         assert_eq!((ops.path_sets(), ops.broadcasts()), sets);
+    }
+
+    /// T36b item 2: uninstall removes the entry `cli.toml` says install ADDED, and only that. A
+    /// folder that was on the PATH before install (nothing appended, no record) stays.
+    #[test]
+    fn uninstall_leaves_an_entry_install_did_not_add() {
+        let own = format!(r"C:\Windows;{DIR}");
+        let ops = FakeOps::with_path(&own);
+        let first = install(&ops, &layout()).expect("install");
+        assert_eq!(first.changed, [Artifact::CliToml], "nothing was appended");
+        let sets = (ops.path_sets(), ops.path_removes(), ops.broadcasts());
+        let gone = uninstall(&ops, &layout()).expect("uninstall");
+        assert_eq!(gone.changed, [Artifact::CliToml]);
+        assert_eq!(ops.state().path.as_deref(), Some(own.as_str()));
+        assert_eq!(
+            (ops.path_sets(), ops.path_removes(), ops.broadcasts()),
+            sets,
+            "no registry write, no broadcast"
+        );
+    }
+
+    /// A `cli.toml` of an older build has no `path_entry`: the PATH is left alone (fail safe).
+    #[test]
+    fn uninstall_with_an_old_cli_toml_leaves_the_path_alone() {
+        let own = format!(r"C:\Windows;{DIR}");
+        let ops = FakeOps::with_path(&own);
+        ops.write_cli_toml(
+            &layout().cli_toml,
+            &CliToml {
+                app_path: Some(layout().app_path),
+                path_entry: None,
+            },
+        )
+        .expect("old cli.toml");
+        let gone = uninstall(&ops, &layout()).expect("uninstall");
+        assert_eq!(gone.changed, [Artifact::CliToml]);
+        assert_eq!(ops.state().path.as_deref(), Some(own.as_str()));
+        assert_eq!(ops.path_sets(), 0);
+        assert_eq!(ops.broadcasts(), 0);
+        // No `cli.toml` at all: nothing to go by either.
+        let none = FakeOps::with_path(&own);
+        assert!(
+            uninstall(&none, &layout())
+                .expect("uninstall")
+                .changed
+                .is_empty()
+        );
+        assert_eq!(none.state().path.as_deref(), Some(own.as_str()));
+    }
+
+    /// The match is exact: a segment that only equals the recorded one after case or trailing
+    /// separator folding is somebody else's entry.
+    #[test]
+    fn uninstall_removes_only_the_exactly_recorded_segment() {
+        let ops = FakeOps::with_path(r"C:\Windows");
+        install(&ops, &layout()).expect("install");
+        let other = format!(r"{DIR}\");
+        let upper = DIR.to_uppercase();
+        ops.user_path_set(&format!(r"C:\Windows;{DIR};{other};{upper}"))
+            .expect("user edit");
+        let gone = uninstall(&ops, &layout()).expect("uninstall");
+        assert_eq!(gone.changed, [Artifact::PathEntry, Artifact::CliToml]);
+        assert_eq!(
+            ops.state().path.as_deref(),
+            Some(format!(r"C:\Windows;{other};{upper}").as_str())
+        );
+    }
+
+    /// The failed-install undo removes the entry this call just added, before `cli.toml` has
+    /// recorded it.
+    #[test]
+    fn a_failed_install_undoes_its_path_entry() {
+        let ops = FakeOps::with_path(r"C:\Windows");
+        ops.fail_cli_toml_writes();
+        assert_eq!(install(&ops, &layout()), Err(InstallError::CliToml));
+        assert_eq!(ops.state().path.as_deref(), Some(r"C:\Windows"));
     }
 
     /// CI only (the Windows leg): the real registry, against a scratch key under HKCU so the
