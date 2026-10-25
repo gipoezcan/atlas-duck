@@ -37,6 +37,8 @@ use crate::tray::MSG_STORE_UNAVAILABLE;
 pub const LOG_FIELDS: &[&str] = &["window"];
 /// A window could not be built or shown; `window`, `error_class`.
 pub const LOG_EVENT_WINDOW_OPEN_FAILED: &str = "window_open_failed";
+/// A window was built or brought up; `window` only (the S-03 flow reads it as "a window opened").
+pub const LOG_EVENT_WINDOW_OPENED: &str = "window_opened";
 /// A navigation outside [`nav_allowed`] was refused; `window` only.
 pub const LOG_EVENT_NAVIGATION_BLOCKED: &str = "navigation_blocked";
 /// A `window.open` / `target=_blank` request was refused; `window` only.
@@ -678,8 +680,9 @@ pub(crate) fn open_with<R: Runtime>(
                 })
         }
     };
-    if let Err(e) = result {
-        log_open_failed(label, e.as_str());
+    match &result {
+        Ok(()) => tracing::info!(event = LOG_EVENT_WINDOW_OPENED, window = label.as_str()),
+        Err(e) => log_open_failed(label, e.as_str()),
     }
     result
 }

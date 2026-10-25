@@ -9,7 +9,10 @@
 //!
 //! The app has no window-count query (`testing/control.rs` has none and none is added): the diag
 //! log is the only evidence, so the check is "no `forwarded_launch` line (the single-instance
-//! forward, `tray.rs`) and no `window_open*` line (`windows.rs` logs `window_open_failed`)".
+//! forward, `tray.rs`) and no `window_open*` line (`windows.rs` logs `window_opened` on a
+//! successful open and `window_open_failed` on a failed one)". Before each run the test waits
+//! until the app is idle (two equal hash reads) and its log is live (`serve_started` present).
+//! `FixtureInfo` carries no anchor dir, so the Pass case uses `--manifest-sha256` only.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -89,6 +92,28 @@ fn log_text(world: &World) -> String {
         .iter()
         .filter_map(|f| fs::read_to_string(f).ok())
         .collect()
+}
+
+/// Waits (at most 20 s) until the app is idle and its log is live: two reads of `audit.db` and
+/// `-wal` 300 ms apart agree and the log holds the app's `serve_started` line (so a log check can
+/// not pass on an empty or unreadable log). Returns the agreed hashes.
+async fn wait_idle(world: &World) -> Result<[Option<String>; 2]> {
+    let start = std::time::Instant::now();
+    loop {
+        let first = live_hashes(world)?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let second = live_hashes(world)?;
+        if first == second && log_text(world).contains("serve_started") {
+            return Ok(second);
+        }
+        if start.elapsed() > Duration::from_secs(20) {
+            return Err(format!(
+                "the app was not idle with a live log within 20 s\n{}",
+                world.diagnostics()
+            )
+            .into());
+        }
+    }
 }
 
 /// What the log gained between two snapshots (the whole later text when it does not extend the
@@ -180,6 +205,11 @@ fn assert_report(label: &str, case: &Case, expected: u8, run: &Ran, world: &Worl
         run.stdout
     );
     assert!(
+        run.stdout.lines().count() > 1,
+        "{label}: the report has a body above its verdict line: {}",
+        run.stdout
+    );
+    assert!(
         !run.stdout.trim_start().starts_with('{'),
         "{label}: the CLI prints no envelope: {}",
         run.stdout
@@ -210,8 +240,7 @@ async fn s03_verify_export_runs_beside_the_app() -> Result<()> {
         let label = format!("{:?}", case.kind);
 
         // Direct run.
-        let hashes_before = live_hashes(&world)?;
-        tokio::time::sleep(LOG_SETTLE).await;
+        let hashes_before = wait_idle(&world).await?;
         let log_before = log_text(&world);
         let run = run_child(&world, &cli, &args).await?;
         assert_report(&label, case, info.expected_exit, &run, &world);
@@ -243,7 +272,7 @@ async fn s03_verify_export_runs_beside_the_app() -> Result<()> {
                 "-Command".to_owned(),
                 powershell_command(&cli, &args),
             ];
-            let hashes_before = live_hashes(&world)?;
+            let hashes_before = wait_idle(&world).await?;
             let log_before = log_text(&world);
             let run = run_child(&world, "powershell", &ps_args).await?;
             assert_report(
@@ -252,6 +281,11 @@ async fn s03_verify_export_runs_beside_the_app() -> Result<()> {
                 info.expected_exit,
                 &run,
                 &world,
+            );
+            assert!(
+                run.stderr.is_empty(),
+                "{label} via powershell: stderr must be empty: {:?}",
+                run.stderr
             );
             tokio::time::sleep(LOG_SETTLE).await;
             let log_after = log_text(&world);
@@ -294,6 +328,7 @@ mod helper_tests {
         assert_eq!(gained("x\n", "y\n"), "y\n");
         assert!(shows_launch_or_window("event=forwarded_launch\n").is_some());
         assert!(shows_launch_or_window("event=window_open_failed\n").is_some());
+        assert!(shows_launch_or_window("event=window_opened window=approvals\n").is_some());
         assert!(shows_launch_or_window("event=serve_started\n").is_none());
     }
 }
