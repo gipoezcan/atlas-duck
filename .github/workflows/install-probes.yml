@@ -31,7 +31,7 @@ name: install-probes
 # floor=met failed=none and the installed worker answering in probe mode through the app's spawner;
 # it runs no script (a fresh install is in the first-run state and serves no core). The dry run and
 # the released real run are on the debug scripted-approver bundles (e2e-bundle.yml). The upgrade
-# drain and the uninstall checks are M10.
+# drain and the uninstall checks are the install-test-<pkg> jobs at the end of this file (M10 Task 27).
 #
 # Security (workflow_run executes the scripts of the commit it follows): the token is read-only
 # (contents, actions), no secret is used, checkout does not persist credentials, the commit is the
@@ -745,5 +745,649 @@ jobs:
         with:
           name: install-probe-fedora-rpm
           path: ${{ runner.temp }}/install-probe-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ------------------------------------------------------------------------------------------------
+  # M10 Task 27 (spec §12.2, §12.5, §13 I-40, I-45, S-04, §15 V19, V32; PD-179): installed-package
+  # uninstall/reinstall, the installer's quit (NSIS drain) and the S-04 re-run, one install-test-<pkg>
+  # job per package, each after the probe job of the same package (a fresh runner; `needs` only
+  # orders them). No secret is used. The Windows and Linux jobs also download the ci_fixture test
+  # binary (artifact ci-fixture-<target> of the same bundle run, built by bundle.yml's ci-fixture
+  # job) and stay cargo-free; macOS runs the release half without a store (PD-179; the store half is
+  # T27a). The record is the job log: I45 OK / I40 / DRAIN_LINE / CI_FIXTURE_VERIFY / S04 OK /
+  # RUNTIME_VERSIONS lines (V32).
+
+  install-test-windows-per-user:
+    name: install-test-windows-per-user (NSIS /CurrentUser uninstall, reinstall, drain, S-04)
+    needs: windows-per-user
+    if: github.event_name == 'workflow_dispatch' || (github.event_name != 'workflow_run' && inputs.bundle_run_id != '') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      # A manual run names the bundle run and its commit separately; a mismatched pair would probe
+      # the packages of one commit with the scripts of another. The inputs reach the shell only
+      # through env, are validated, and are compared with what the API says about that run.
+      - name: Cross-check bundle_run_id and bundle_sha
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          BUNDLE_RUN_ID: ${{ inputs.bundle_run_id }}
+          BUNDLE_SHA: ${{ inputs.bundle_sha }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GH_API: ${{ github.api_url }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$BUNDLE_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::bundle_run_id must be digits only"
+            exit 1
+          fi
+          if ! [[ "$BUNDLE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::bundle_sha must be 40 lowercase hex digits"
+            exit 1
+          fi
+          run_json="$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$GH_API/repos/$GH_REPO/actions/runs/$BUNDLE_RUN_ID")"
+          name="$(jq -r '.name' <<<"$run_json")"
+          conclusion="$(jq -r '.conclusion' <<<"$run_json")"
+          head_sha="$(jq -r '.head_sha' <<<"$run_json")"
+          echo "bundle run $BUNDLE_RUN_ID: workflow=$name conclusion=$conclusion head_sha=$head_sha"
+          if [ "$name" != "bundle" ]; then
+            echo "::error::run $BUNDLE_RUN_ID is a run of '$name', not of the bundle workflow"
+            exit 1
+          fi
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::bundle run $BUNDLE_RUN_ID did not succeed (conclusion: $conclusion)"
+            exit 1
+          fi
+          if [ "$head_sha" != "$BUNDLE_SHA" ]; then
+            echo "::error::bundle run $BUNDLE_RUN_ID bundled $head_sha, not bundle_sha $BUNDLE_SHA"
+            exit 1
+          fi
+
+      - name: Checkout the commit that was bundled
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || inputs.bundle_sha }}
+          persist-credentials: false
+
+      - name: Download bundle-x86_64-pc-windows-msvc
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle-x86_64-pc-windows-msvc
+          path: dist
+          run-id: ${{ github.event.workflow_run.id || inputs.bundle_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download ci-fixture-x86_64-pc-windows-msvc
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ci-fixture-x86_64-pc-windows-msvc
+          path: ci-fixture
+          run-id: ${{ github.event.workflow_run.id || inputs.bundle_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Store, install, drain on uninstall and upgrade, uninstall/reinstall keep the data, verify, S-04
+        shell: pwsh
+        env:
+          INSTALL_PROBE_EVIDENCE: ${{ runner.temp }}\install-test-evidence
+        run: ./ci/install-test-windows.ps1 -Mode CurrentUser -InstallerDir dist -FixtureDir ci-fixture
+
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: install-test-windows-per-user
+          path: ${{ runner.temp }}\install-test-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+  install-test-windows-per-machine:
+    name: install-test-windows-per-machine (NSIS /AllUsers uninstall, reinstall, drain, S-04)
+    needs: windows-per-machine
+    if: github.event_name == 'workflow_dispatch' || (github.event_name != 'workflow_run' && inputs.bundle_run_id != '') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      # A manual run names the bundle run and its commit separately; a mismatched pair would probe
+      # the packages of one commit with the scripts of another. The inputs reach the shell only
+      # through env, are validated, and are compared with what the API says about that run.
+      - name: Cross-check bundle_run_id and bundle_sha
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          BUNDLE_RUN_ID: ${{ inputs.bundle_run_id }}
+          BUNDLE_SHA: ${{ inputs.bundle_sha }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GH_API: ${{ github.api_url }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$BUNDLE_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::bundle_run_id must be digits only"
+            exit 1
+          fi
+          if ! [[ "$BUNDLE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::bundle_sha must be 40 lowercase hex digits"
+            exit 1
+          fi
+          run_json="$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$GH_API/repos/$GH_REPO/actions/runs/$BUNDLE_RUN_ID")"
+          name="$(jq -r '.name' <<<"$run_json")"
+          conclusion="$(jq -r '.conclusion' <<<"$run_json")"
+          head_sha="$(jq -r '.head_sha' <<<"$run_json")"
+          echo "bundle run $BUNDLE_RUN_ID: workflow=$name conclusion=$conclusion head_sha=$head_sha"
+          if [ "$name" != "bundle" ]; then
+            echo "::error::run $BUNDLE_RUN_ID is a run of '$name', not of the bundle workflow"
+            exit 1
+          fi
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::bundle run $BUNDLE_RUN_ID did not succeed (conclusion: $conclusion)"
+            exit 1
+          fi
+          if [ "$head_sha" != "$BUNDLE_SHA" ]; then
+            echo "::error::bundle run $BUNDLE_RUN_ID bundled $head_sha, not bundle_sha $BUNDLE_SHA"
+            exit 1
+          fi
+
+      - name: Checkout the commit that was bundled
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || inputs.bundle_sha }}
+          persist-credentials: false
+
+      - name: Download bundle-x86_64-pc-windows-msvc
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle-x86_64-pc-windows-msvc
+          path: dist
+          run-id: ${{ github.event.workflow_run.id || inputs.bundle_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download ci-fixture-x86_64-pc-windows-msvc
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ci-fixture-x86_64-pc-windows-msvc
+          path: ci-fixture
+          run-id: ${{ github.event.workflow_run.id || inputs.bundle_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Store, install, drain on uninstall and upgrade, uninstall/reinstall keep the data, verify, S-04
+        shell: pwsh
+        env:
+          INSTALL_PROBE_EVIDENCE: ${{ runner.temp }}\install-test-evidence
+        run: ./ci/install-test-windows.ps1 -Mode AllUsers -InstallerDir dist -FixtureDir ci-fixture
+
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: install-test-windows-per-machine
+          path: ${{ runner.temp }}\install-test-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+  install-test-macos-arm64:
+    name: install-test-macos-arm64 (release .app removal and reinstall on macos-15)
+    needs: macos-arm64
+    if: github.event_name == 'workflow_dispatch' || (github.event_name != 'workflow_run' && inputs.bundle_run_id != '') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      # A manual run names the bundle run and its commit separately; a mismatched pair would probe
+      # the packages of one commit with the scripts of another. The inputs reach the shell only
+      # through env, are validated, and are compared with what the API says about that run.
+      - name: Cross-check bundle_run_id and bundle_sha
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          BUNDLE_RUN_ID: ${{ inputs.bundle_run_id }}
+          BUNDLE_SHA: ${{ inputs.bundle_sha }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GH_API: ${{ github.api_url }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$BUNDLE_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::bundle_run_id must be digits only"
+            exit 1
+          fi
+          if ! [[ "$BUNDLE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::bundle_sha must be 40 lowercase hex digits"
+            exit 1
+          fi
+          run_json="$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$GH_API/repos/$GH_REPO/actions/runs/$BUNDLE_RUN_ID")"
+          name="$(jq -r '.name' <<<"$run_json")"
+          conclusion="$(jq -r '.conclusion' <<<"$run_json")"
+          head_sha="$(jq -r '.head_sha' <<<"$run_json")"
+          echo "bundle run $BUNDLE_RUN_ID: workflow=$name conclusion=$conclusion head_sha=$head_sha"
+          if [ "$name" != "bundle" ]; then
+            echo "::error::run $BUNDLE_RUN_ID is a run of '$name', not of the bundle workflow"
+            exit 1
+          fi
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::bundle run $BUNDLE_RUN_ID did not succeed (conclusion: $conclusion)"
+            exit 1
+          fi
+          if [ "$head_sha" != "$BUNDLE_SHA" ]; then
+            echo "::error::bundle run $BUNDLE_RUN_ID bundled $head_sha, not bundle_sha $BUNDLE_SHA"
+            exit 1
+          fi
+
+      - name: Checkout the commit that was bundled
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || inputs.bundle_sha }}
+          persist-credentials: false
+
+      - name: Download bundle-aarch64-apple-darwin
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle-aarch64-apple-darwin
+          path: dist
+          run-id: ${{ github.event.workflow_run.id || inputs.bundle_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Self-test the install-test script
+        run: /bin/bash ci/install-test-macos.sh --self-test
+
+      - name: Install from the dmg, start, quit, remove, reinstall (release half, no store)
+        env:
+          INSTALL_PROBE_EVIDENCE: ${{ runner.temp }}/install-test-evidence
+        run: /bin/bash ci/install-test-macos.sh --release dist arm64
+
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: install-test-macos-arm64
+          path: ${{ runner.temp }}/install-test-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+  install-test-macos-x86_64-rosetta:
+    name: install-test-macos-x86_64-rosetta (x86_64 release .app under Rosetta 2, removal and reinstall)
+    needs: macos-x86_64-rosetta
+    if: github.event_name == 'workflow_dispatch' || (github.event_name != 'workflow_run' && inputs.bundle_run_id != '') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      # A manual run names the bundle run and its commit separately; a mismatched pair would probe
+      # the packages of one commit with the scripts of another. The inputs reach the shell only
+      # through env, are validated, and are compared with what the API says about that run.
+      - name: Cross-check bundle_run_id and bundle_sha
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          BUNDLE_RUN_ID: ${{ inputs.bundle_run_id }}
+          BUNDLE_SHA: ${{ inputs.bundle_sha }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GH_API: ${{ github.api_url }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$BUNDLE_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::bundle_run_id must be digits only"
+            exit 1
+          fi
+          if ! [[ "$BUNDLE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::bundle_sha must be 40 lowercase hex digits"
+            exit 1
+          fi
+          run_json="$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$GH_API/repos/$GH_REPO/actions/runs/$BUNDLE_RUN_ID")"
+          name="$(jq -r '.name' <<<"$run_json")"
+          conclusion="$(jq -r '.conclusion' <<<"$run_json")"
+          head_sha="$(jq -r '.head_sha' <<<"$run_json")"
+          echo "bundle run $BUNDLE_RUN_ID: workflow=$name conclusion=$conclusion head_sha=$head_sha"
+          if [ "$name" != "bundle" ]; then
+            echo "::error::run $BUNDLE_RUN_ID is a run of '$name', not of the bundle workflow"
+            exit 1
+          fi
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::bundle run $BUNDLE_RUN_ID did not succeed (conclusion: $conclusion)"
+            exit 1
+          fi
+          if [ "$head_sha" != "$BUNDLE_SHA" ]; then
+            echo "::error::bundle run $BUNDLE_RUN_ID bundled $head_sha, not bundle_sha $BUNDLE_SHA"
+            exit 1
+          fi
+
+      - name: Checkout the commit that was bundled
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || inputs.bundle_sha }}
+          persist-credentials: false
+
+      - name: Install Rosetta 2 and fail loudly if it does not work (V32)
+        run: |
+          set -euo pipefail
+          if ! sudo softwareupdate --install-rosetta --agree-to-license; then
+            echo "::error::softwareupdate could not install Rosetta 2"
+            exit 1
+          fi
+          arch -x86_64 /usr/bin/true || { echo "::error::Rosetta 2 cannot run x86_64 code"; exit 1; }
+          echo "sysctl.proc_translated under arch -x86_64: $(arch -x86_64 /usr/sbin/sysctl -n sysctl.proc_translated)"
+
+      - name: Download bundle-x86_64-apple-darwin
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle-x86_64-apple-darwin
+          path: dist
+          run-id: ${{ github.event.workflow_run.id || inputs.bundle_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Self-test the install-test script
+        run: /bin/bash ci/install-test-macos.sh --self-test
+
+      - name: Install from the dmg, start, quit, remove, reinstall (release half, no store)
+        env:
+          INSTALL_PROBE_EVIDENCE: ${{ runner.temp }}/install-test-evidence
+        run: /bin/bash ci/install-test-macos.sh --release dist x86_64
+
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: install-test-macos-x86_64-rosetta
+          path: ${{ runner.temp }}/install-test-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+  install-test-ubuntu-deb:
+    name: install-test-ubuntu-deb (deb uninstall, reinstall, S-04 on ubuntu-22.04)
+    needs: ubuntu-deb
+    if: github.event_name == 'workflow_dispatch' || (github.event_name != 'workflow_run' && inputs.bundle_run_id != '') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      # A manual run names the bundle run and its commit separately; a mismatched pair would probe
+      # the packages of one commit with the scripts of another. The inputs reach the shell only
+      # through env, are validated, and are compared with what the API says about that run.
+      - name: Cross-check bundle_run_id and bundle_sha
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          BUNDLE_RUN_ID: ${{ inputs.bundle_run_id }}
+          BUNDLE_SHA: ${{ inputs.bundle_sha }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GH_API: ${{ github.api_url }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$BUNDLE_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::bundle_run_id must be digits only"
+            exit 1
+          fi
+          if ! [[ "$BUNDLE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::bundle_sha must be 40 lowercase hex digits"
+            exit 1
+          fi
+          run_json="$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$GH_API/repos/$GH_REPO/actions/runs/$BUNDLE_RUN_ID")"
+          name="$(jq -r '.name' <<<"$run_json")"
+          conclusion="$(jq -r '.conclusion' <<<"$run_json")"
+          head_sha="$(jq -r '.head_sha' <<<"$run_json")"
+          echo "bundle run $BUNDLE_RUN_ID: workflow=$name conclusion=$conclusion head_sha=$head_sha"
+          if [ "$name" != "bundle" ]; then
+            echo "::error::run $BUNDLE_RUN_ID is a run of '$name', not of the bundle workflow"
+            exit 1
+          fi
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::bundle run $BUNDLE_RUN_ID did not succeed (conclusion: $conclusion)"
+            exit 1
+          fi
+          if [ "$head_sha" != "$BUNDLE_SHA" ]; then
+            echo "::error::bundle run $BUNDLE_RUN_ID bundled $head_sha, not bundle_sha $BUNDLE_SHA"
+            exit 1
+          fi
+
+      - name: Checkout the commit that was bundled
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || inputs.bundle_sha }}
+          persist-credentials: false
+
+      - name: Download bundle-x86_64-unknown-linux-gnu
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle-x86_64-unknown-linux-gnu
+          path: dist
+          run-id: ${{ github.event.workflow_run.id || inputs.bundle_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download ci-fixture-x86_64-unknown-linux-gnu
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ci-fixture-x86_64-unknown-linux-gnu
+          path: ci-fixture
+          run-id: ${{ github.event.workflow_run.id || inputs.bundle_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Self-test the install-test script
+        run: bash ci/install-test-linux.sh --self-test
+
+      - name: Store, install, start, quit, uninstall/reinstall keep the data, verify, S-04
+        env:
+          INSTALL_PROBE_EVIDENCE: ${{ runner.temp }}/install-test-evidence
+        run: bash ci/install-test-linux.sh deb dist ci-fixture
+
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: install-test-ubuntu-deb
+          path: ${{ runner.temp }}/install-test-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+  install-test-ubuntu-appimage:
+    name: install-test-ubuntu-appimage (appimage uninstall, reinstall, S-04 on ubuntu-22.04)
+    needs: ubuntu-appimage
+    if: github.event_name == 'workflow_dispatch' || (github.event_name != 'workflow_run' && inputs.bundle_run_id != '') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      # A manual run names the bundle run and its commit separately; a mismatched pair would probe
+      # the packages of one commit with the scripts of another. The inputs reach the shell only
+      # through env, are validated, and are compared with what the API says about that run.
+      - name: Cross-check bundle_run_id and bundle_sha
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          BUNDLE_RUN_ID: ${{ inputs.bundle_run_id }}
+          BUNDLE_SHA: ${{ inputs.bundle_sha }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GH_API: ${{ github.api_url }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$BUNDLE_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::bundle_run_id must be digits only"
+            exit 1
+          fi
+          if ! [[ "$BUNDLE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::bundle_sha must be 40 lowercase hex digits"
+            exit 1
+          fi
+          run_json="$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$GH_API/repos/$GH_REPO/actions/runs/$BUNDLE_RUN_ID")"
+          name="$(jq -r '.name' <<<"$run_json")"
+          conclusion="$(jq -r '.conclusion' <<<"$run_json")"
+          head_sha="$(jq -r '.head_sha' <<<"$run_json")"
+          echo "bundle run $BUNDLE_RUN_ID: workflow=$name conclusion=$conclusion head_sha=$head_sha"
+          if [ "$name" != "bundle" ]; then
+            echo "::error::run $BUNDLE_RUN_ID is a run of '$name', not of the bundle workflow"
+            exit 1
+          fi
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::bundle run $BUNDLE_RUN_ID did not succeed (conclusion: $conclusion)"
+            exit 1
+          fi
+          if [ "$head_sha" != "$BUNDLE_SHA" ]; then
+            echo "::error::bundle run $BUNDLE_RUN_ID bundled $head_sha, not bundle_sha $BUNDLE_SHA"
+            exit 1
+          fi
+
+      - name: Checkout the commit that was bundled
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || inputs.bundle_sha }}
+          persist-credentials: false
+
+      - name: Download bundle-x86_64-unknown-linux-gnu
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle-x86_64-unknown-linux-gnu
+          path: dist
+          run-id: ${{ github.event.workflow_run.id || inputs.bundle_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download ci-fixture-x86_64-unknown-linux-gnu
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ci-fixture-x86_64-unknown-linux-gnu
+          path: ci-fixture
+          run-id: ${{ github.event.workflow_run.id || inputs.bundle_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Self-test the install-test script
+        run: bash ci/install-test-linux.sh --self-test
+
+      - name: Store, install, start, quit, uninstall/reinstall keep the data, verify, S-04
+        env:
+          INSTALL_PROBE_EVIDENCE: ${{ runner.temp }}/install-test-evidence
+        run: bash ci/install-test-linux.sh appimage dist ci-fixture
+
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: install-test-ubuntu-appimage
+          path: ${{ runner.temp }}/install-test-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+  install-test-fedora-rpm:
+    name: install-test-fedora-rpm (dnf remove, reinstall, S-04 in a fedora:40 container)
+    needs: fedora-rpm
+    if: github.event_name == 'workflow_dispatch' || (github.event_name != 'workflow_run' && inputs.bundle_run_id != '') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      # A manual run names the bundle run and its commit separately; a mismatched pair would probe
+      # the packages of one commit with the scripts of another. The inputs reach the shell only
+      # through env, are validated, and are compared with what the API says about that run.
+      - name: Cross-check bundle_run_id and bundle_sha
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          BUNDLE_RUN_ID: ${{ inputs.bundle_run_id }}
+          BUNDLE_SHA: ${{ inputs.bundle_sha }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GH_API: ${{ github.api_url }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$BUNDLE_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::bundle_run_id must be digits only"
+            exit 1
+          fi
+          if ! [[ "$BUNDLE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::bundle_sha must be 40 lowercase hex digits"
+            exit 1
+          fi
+          run_json="$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$GH_API/repos/$GH_REPO/actions/runs/$BUNDLE_RUN_ID")"
+          name="$(jq -r '.name' <<<"$run_json")"
+          conclusion="$(jq -r '.conclusion' <<<"$run_json")"
+          head_sha="$(jq -r '.head_sha' <<<"$run_json")"
+          echo "bundle run $BUNDLE_RUN_ID: workflow=$name conclusion=$conclusion head_sha=$head_sha"
+          if [ "$name" != "bundle" ]; then
+            echo "::error::run $BUNDLE_RUN_ID is a run of '$name', not of the bundle workflow"
+            exit 1
+          fi
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::bundle run $BUNDLE_RUN_ID did not succeed (conclusion: $conclusion)"
+            exit 1
+          fi
+          if [ "$head_sha" != "$BUNDLE_SHA" ]; then
+            echo "::error::bundle run $BUNDLE_RUN_ID bundled $head_sha, not bundle_sha $BUNDLE_SHA"
+            exit 1
+          fi
+
+      - name: Checkout the commit that was bundled
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || inputs.bundle_sha }}
+          persist-credentials: false
+
+      - name: Download bundle-x86_64-unknown-linux-gnu
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle-x86_64-unknown-linux-gnu
+          path: dist
+          run-id: ${{ github.event.workflow_run.id || inputs.bundle_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download ci-fixture-x86_64-unknown-linux-gnu
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ci-fixture-x86_64-unknown-linux-gnu
+          path: ci-fixture
+          run-id: ${{ github.event.workflow_run.id || inputs.bundle_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Self-test the install-test script
+        run: bash ci/install-test-linux.sh --self-test
+
+      # Started as the fedora-rpm probe job starts its container (--tmpfs /tmp:rw,exec: the data-dir
+      # and keyring locality checks fail closed on the overlayfs /tmp). The script brings up the
+      # Secret Service inside the container (dbus-run-session + gnome-keyring-daemon, XDG_DATA_HOME
+      # on the tmpfs, as ci/keyring-ci.sh).
+      - name: Store, dnf install, start, quit, dnf remove/reinstall keep the data, verify, S-04 (Fedora 40)
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/install-test-evidence"
+          mkdir -p "$evidence"
+          docker run --rm \
+            --tmpfs /tmp:rw,exec \
+            --env CI=true \
+            --env INSTALL_PROBE_EVIDENCE=/evidence \
+            --volume "$PWD:/work:ro" \
+            --volume "$evidence:/evidence" \
+            --workdir /work \
+            fedora:40 \
+            bash ci/install-test-linux.sh rpm dist ci-fixture
+
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: install-test-fedora-rpm
+          path: ${{ runner.temp }}/install-test-evidence
           if-no-files-found: warn
           retention-days: 14

@@ -2035,13 +2035,21 @@ jobs:
             # comm is cut at 15 characters (WebKitWebProces), so these two match the command line.
             pkill -f 'WebKit(Web|Network)Process' || true
           fi
+      # M10 Task 27 (L216 (c), L217): TAURI_WEBVIEW_AUTOMATION=true is part of the check. The scripts
+      # set it themselves next to the inspector variables (so the installed-package legs of
+      # install-probes.yml check it too) and assert its scrub line and no driver/automation port;
+      # the step env names it here as well, so this release-build leg visibly carries it.
       - name: S-04 no debug port with the inspector variables set (Linux, release build)
         if: always() && runner.os == 'Linux'
+        env:
+          TAURI_WEBVIEW_AUTOMATION: "true"
         run: bash ci/s04-no-debug-port.sh target/release/atlas-duck-app
 
       - name: S-04 no debug port with the WebView2 variables set (Windows, release build)
         if: always() && runner.os == 'Windows'
         shell: pwsh
+        env:
+          TAURI_WEBVIEW_AUTOMATION: "true"
         run: ./ci/s04-no-debug-port.ps1 -Exe target\release\atlas-duck-app.exe
 
       # The driver kills tauri-driver only; msedgedriver, the webview processes and an app a failed

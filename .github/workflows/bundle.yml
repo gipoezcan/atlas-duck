@@ -10,6 +10,8 @@ name: bundle
 #   bundle-x86_64-unknown-linux-gnu  deb/*.deb, rpm/*.rpm, appimage/*.AppImage (three paths: the
 #                                    common ancestor is .../bundle, so the sub-directories stay)
 # upload-artifact drops file modes, so every consumer runs chmod +x on the AppImage.
+# Not a package: ci-fixture-<target> (Windows, Linux; job ci-fixture, M10 Task 27) holds the
+# ci_fixture test binary (ci_fixture.exe / ci_fixture) for the install-test jobs of install-probes.yml.
 #
 # M6 plan Task 33: the packaged GUI runs (CI-03 Fedora no-tray-host, the CI-04 M6 AppImage steps)
 # are in e2e-bundle.yml, on a debug scripted-approver bundle built there (its test home keeps the runs
@@ -617,3 +619,72 @@ jobs:
 
       - name: Install the deb, then run atlas-duck and the AppImage __cli path
         run: bash ci/appimage-smoke.sh dist
+
+  # M10 Task 27 (I-45, PD-179): the ci_fixture test binary (crates/audit/tests/ci_fixture.rs) for the
+  # cargo-free install-test jobs of install-probes.yml, which use it to create a store with the real
+  # OS keystore before the installed app runs and to verify it after the uninstall/reinstall cycles.
+  # Built once per Windows/Linux target, in its own job (no secrets, no `environment:`; it runs on
+  # unsigned and release runs alike) and uploaded as ci-fixture-<target>: never a bundle-* artifact,
+  # never shipped. A test binary, so the `testing` feature and the test profile are fine here; the
+  # release packages are built in the jobs above. The executable path is taken from cargo's JSON.
+  # The Linux binary is built on ubuntu-22.04 and also runs in the fedora:40 container (newer glibc).
+  ci-fixture:
+    name: ci-fixture (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustup show active-toolchain
+          rustc -vV
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ci-fixture-${{ matrix.target }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Build the ci_fixture test binary (no run)
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          [ "$host" = "$TARGET" ] || { echo "::error::host $host is not $TARGET"; exit 1; }
+          cargo test -p atlas-duck-audit --features testing --locked --test ci_fixture --no-run \
+            --message-format=json > "$RUNNER_TEMP/ci-fixture-build.json"
+          exe="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "ci_fixture" and .profile.test == true and .executable != null) | .executable' \
+            "$RUNNER_TEMP/ci-fixture-build.json" | tail -n 1)"
+          [ -n "$exe" ] && [ -f "$exe" ] || { echo "::error::no ci_fixture executable in cargo's JSON"; exit 1; }
+          mkdir -p ci-fixture-out
+          case "$TARGET" in
+            *windows*) cp "$exe" ci-fixture-out/ci_fixture.exe ;;
+            *) cp "$exe" ci-fixture-out/ci_fixture ;;
+          esac
+          ls -l ci-fixture-out
+          echo "ci_fixture built from $exe"
+          # The test list: the three ignored tests the install-test jobs run.
+          ci-fixture-out/ci_fixture* --list --ignored
+
+      - name: Upload ci-fixture-${{ matrix.target }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-fixture-${{ matrix.target }}
+          path: ci-fixture-out/*
+          if-no-files-found: error
+          retention-days: 14

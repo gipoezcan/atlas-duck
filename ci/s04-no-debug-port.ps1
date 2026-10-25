@@ -4,6 +4,12 @@
 #
 # Usage:  pwsh -NoProfile -File ci/s04-no-debug-port.ps1 -Exe <release atlas-duck-app.exe>
 #
+# -Exe is any release app: target\release\atlas-duck-app.exe (ci.yml) or the installed one in the
+# NSIS install dir (M10 Task 27, install-probes.yml). M10 Task 27 (L216 (c), L217) also sets
+# TAURI_WEBVIEW_AUTOMATION=true and asserts its `startup_env_scrubbed` line and that no
+# driver/automation port is open (no TCP listener owned by the app's process tree, none on the
+# usual driver ports 4444, 4445, 9515).
+#
 # The diag log lives in <data dir>\logs, so the app gets a pinned data dir (ci/pinned-fixture.ps1, CI only).
 # A pinned dir with no store is the first-run state: a no-argument start opens the Setup window,
 # a real WebView2 webview (a cold `--background` start opens no window: the check would be vacuous).
@@ -85,6 +91,7 @@ try {
     $env:WEBKIT_INSPECTOR_SERVER = "127.0.0.1:$port"
     $env:WEBKIT_INSPECTOR_HTTP_SERVER = "127.0.0.1:$port"
     $env:ATLAS_DUCK_E2E_ALLOW_DRIVER = '1'
+    $env:TAURI_WEBVIEW_AUTOMATION = 'true'
     $strays = @(Get-Process -Name msedgewebview2 -ErrorAction SilentlyContinue)
     if ($strays.Count -gt 0) { Fail "$($strays.Count) msedgewebview2 process(es) exist before the app starts (strays from an earlier step)" }
     $app = Start-Process -FilePath $Exe -PassThru -WindowStyle Hidden `
@@ -108,16 +115,29 @@ try {
     foreach ($c in $cmdlines) {
         if ($c -match 'remote-debugging') { Fail 'an msedgewebview2 process carries a remote-debugging switch (S-04)' }
     }
+    # M10 Task 27: no driver/automation port with TAURI_WEBVIEW_AUTOMATION=true. No process of the
+    # app's tree (the app included) holds any TCP listener, and nothing listens on the usual
+    # driver ports.
+    $tree = @(@($app.Id) + @(Get-Descendants $app.Id | ForEach-Object { [int]$_.ProcessId }))
+    $owned = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $tree -contains [int]$_.OwningProcess })
+    if ($owned.Count -gt 0) {
+        $owned | Format-Table -AutoSize LocalAddress, LocalPort, OwningProcess | Out-String | Write-Host
+        Fail "the app's process tree holds $($owned.Count) TCP listener(s) with TAURI_WEBVIEW_AUTOMATION=true (a driver/automation port, S-04)"
+    }
+    foreach ($p in @(4444, 4445, 9515)) {
+        if (Test-Listening $p) { Fail "a listener on the driver port $p with TAURI_WEBVIEW_AUTOMATION=true (S-04)" }
+    }
+    Write-Host "S04 automation: TAURI_WEBVIEW_AUTOMATION=true set, no TCP listener in the app tree ($($tree.Count) processes), none on 4444/4445/9515"
 
     $diag = Join-Path $dataDir 'logs\diag.log'
     if (-not (Test-Path -LiteralPath $diag)) { Fail "no $diag" }
     Write-Host "--- $diag"
     $log = Get-Content -LiteralPath $diag -Raw
     Write-Host $log
-    foreach ($v in @('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS', 'WEBVIEW2_USER_DATA_FOLDER', 'WEBKIT_INSPECTOR_SERVER', 'WEBKIT_INSPECTOR_HTTP_SERVER')) {
-        if ($log -notmatch "startup_env_scrubbed.*removed_var=$v") { Fail "no startup_env_scrubbed line for $v" }
+    foreach ($v in @('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS', 'WEBVIEW2_USER_DATA_FOLDER', 'WEBKIT_INSPECTOR_SERVER', 'WEBKIT_INSPECTOR_HTTP_SERVER', 'TAURI_WEBVIEW_AUTOMATION')) {
+        if ($log -notmatch "startup_env_scrubbed.*removed_var=$v(\s|$)") { Fail "no startup_env_scrubbed line for $v" }
     }
-    Write-Host "S04 OK: no listener on $port with the WebView2 variables set; the release build scrubbed them"
+    Write-Host "S04 OK: no listener on $port and no automation port with the WebView2 variables and TAURI_WEBVIEW_AUTOMATION=true set; the release build scrubbed all five"
 }
 finally {
     $holder.Stop()
