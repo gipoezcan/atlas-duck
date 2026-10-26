@@ -8,13 +8,19 @@
 /* The Guard wrapper (a <fieldset disabled>) must stay invisible. */
 .settings-guard { margin: 0; padding: 0; border: 0; min-width: 0; }
 
-/* Instances table: not in a section, so it is given the card look itself. */
-.window-settings > table.instances {
+/* Instances table: not in a section, so its scroll wrapper gets the card look. The 8 columns keep a
+   minimum width and scroll sideways in a narrow window instead of squeezing. */
+.window-settings > .table-scroll {
   margin-bottom: var(--space-4);
-  font-size: var(--text-sm);
+  overflow-x: auto;
   background: var(--surface);
   border-radius: var(--radius-lg);
   box-shadow: 0 0 0 1px var(--border);
+}
+.table-scroll > table.instances {
+  min-width: 56rem;
+  margin: 0;
+  font-size: var(--text-sm);
 }
 .instances caption {
   caption-side: top;
