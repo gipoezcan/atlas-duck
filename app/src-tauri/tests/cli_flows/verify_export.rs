@@ -168,10 +168,18 @@ struct Ran {
 }
 
 /// Runs `program` with `args` in the world's environment, to its end (60 s).
-async fn run_child(world: &World, program: &str, args: &[String]) -> Result<Ran> {
+async fn run_child(
+    world: &World,
+    program: &str,
+    args: &[String],
+    extra_env: &[(&str, std::ffi::OsString)],
+) -> Result<Ran> {
     let mut cmd = std::process::Command::new(program);
     cmd.args(args).env_clear().current_dir(world.root());
     for (k, v) in world.env() {
+        cmd.env(k, v);
+    }
+    for (k, v) in extra_env {
         cmd.env(k, v);
     }
     let mut cmd = tokio::process::Command::from(cmd);
@@ -200,12 +208,7 @@ fn powershell_command(cli: &str, args: &[String]) -> String {
         text.push(' ');
         text.push_str(&quote(a));
     }
-    // The `| Write-Output` stage makes PowerShell read the native command's stdout through a pipe
-    // and re-emit it on its own stdout. Without it the exit code came back but the report did
-    // not reach PowerShell's stdout (Windows CI run 40232178967: exit 0, empty stdout; the
-    // app checks its stdout writes, so it did write). `$LASTEXITCODE` stays the CLI's: the
-    // last pipeline stage is a cmdlet.
-    text.push_str(" | Write-Output; exit $LASTEXITCODE");
+    text.push_str("; exit $LASTEXITCODE");
     text
 }
 
@@ -264,7 +267,7 @@ async fn s03_verify_export_runs_beside_the_app() -> Result<()> {
         // Direct run.
         let hashes_before = wait_idle(&world).await?;
         let log_before = log_text(&world);
-        let run = run_child(&world, &cli, &args).await?;
+        let run = run_child(&world, &cli, &args, &[]).await?;
         assert_report(&label, case, info.expected_exit, &run, &world);
         assert!(
             run.stderr.is_empty(),
@@ -296,7 +299,12 @@ async fn s03_verify_export_runs_beside_the_app() -> Result<()> {
             ];
             let hashes_before = wait_idle(&world).await?;
             let log_before = log_text(&world);
-            let run = run_child(&world, "powershell", &ps_args).await?;
+            // PowerShell needs `PATHEXT` (the harness environment has none): without it, `& 'x.exe'`
+            // is "a document in the middle of a pipeline", PowerShell prints nothing on stdout or
+            // stderr and exits 0 with `$LASTEXITCODE` unset (reproduced locally, Fix round 2).
+            let pathext =
+                std::env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+            let run = run_child(&world, "powershell", &ps_args, &[("PATHEXT", pathext)]).await?;
             assert_report(
                 &format!("{label} via powershell"),
                 case,
@@ -340,7 +348,7 @@ mod helper_tests {
         let args = vec!["verify-export".to_owned(), "C:\\a b\\o'k".to_owned()];
         assert_eq!(
             powershell_command("C:\\bin\\atlas-duck.exe", &args),
-            "& 'C:\\bin\\atlas-duck.exe' 'verify-export' 'C:\\a b\\o''k' | Write-Output; exit $LASTEXITCODE"
+            "& 'C:\\bin\\atlas-duck.exe' 'verify-export' 'C:\\a b\\o''k'; exit $LASTEXITCODE"
         );
     }
 
