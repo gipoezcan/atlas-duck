@@ -4,6 +4,7 @@
 @import './styles/layout.css';
 @import './styles/components.css';
 @import './styles/approvals.css';
+@import './styles/settings.css';
 
 /* The Tauri isolation iframe is hidden by the inline <style> that isolation.js
    injects, which both policies admit by its sha256 hash (spec 6.4, ruling B1);
@@ -12,7 +13,6 @@
   display: none !important;
 }
 
-.settings-guard { margin: 0; padding: 0; border: 0; min-width: 0; }
 .onboarding-text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 32rem; overflow: auto; padding: 0.5rem; border: 1px solid var(--border); }
 /* The Audit window (M10 T20). A list row is two one-line rows (2 rem each) plus its border: ROW_REM 4.25 in EventList.tsx. */
 .audit section { margin: 0.75rem 0; }

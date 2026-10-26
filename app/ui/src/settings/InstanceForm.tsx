@@ -100,7 +100,7 @@ export function InstanceForm({
         <input type="checkbox" checked={isDefault} onChange={(e) => setIsDefault(e.target.checked)} />
         {T.add_default}
       </label>
-      <button type="button" disabled={action.pending} onClick={submit}>
+      <button type="button" className="primary" disabled={action.pending} onClick={submit}>
         {T.add_submit}
       </button>
       </Guard>

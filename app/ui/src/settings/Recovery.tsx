@@ -244,6 +244,7 @@ export function OldInstalls() {
               <Names label={T.orphan_entries} names={o.entries} />
               <button
                 type="button"
+                className="danger"
                 aria-label={T.orphan_forget_label(o.install_id)}
                 disabled={action.pending}
                 onClick={() => forget(o.install_id)}
