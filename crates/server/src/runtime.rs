@@ -110,6 +110,8 @@ pub struct RuntimeDeps {
     pub clock: Arc<dyn Clock>,
     /// Tests: accept `http://` instances (the atlassian mocks). Never set in production.
     pub allow_http: bool,
+    /// Per-user SSE broadcast capacity ([`SSE_CAPACITY`]; tests use a small one).
+    pub sse_capacity: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,7 +281,7 @@ impl UserRuntime {
             credentials.clone(),
             Arc::new(DateBridge(Arc::new(store.clone()))),
         );
-        let (events, _) = broadcast::channel(SSE_CAPACITY);
+        let (events, _) = broadcast::channel(deps.sse_capacity.max(1));
         let mut extra = Map::new();
         extra.insert("mode".into(), Value::from("server"));
         let core_deps = CoreDeps {

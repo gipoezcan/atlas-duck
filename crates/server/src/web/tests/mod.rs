@@ -68,6 +68,7 @@ impl LoginSink for RecSink {
 
 struct H {
     router: Router,
+    registry: Arc<crate::runtime::Registry>,
     clock: Arc<ManualClock>,
     stub: Arc<StubDirectory>,
     sink: Arc<RecSink>,
@@ -134,6 +135,7 @@ impl H {
                 org_ca: None,
                 clock: clock.clone(),
                 allow_http: true,
+                sse_capacity: crate::runtime::SSE_CAPACITY,
             },
             10,
         ));
@@ -144,7 +146,7 @@ impl H {
             store: store.clone(),
             sessions,
             login,
-            registry,
+            registry: registry.clone(),
             web: crate::static_files::WebDir(web),
             health: Arc::new(crate::health::Health::new(
                 store.clone(),
@@ -154,6 +156,7 @@ impl H {
         }));
         H {
             router: router(state),
+            registry,
             clock,
             stub,
             sink,
@@ -908,4 +911,310 @@ async fn admin_instances_need_the_admin_role() {
     )
     .await;
     assert_eq!((s, c.as_str()), (StatusCode::NOT_FOUND, "instance/unknown"));
+}
+
+// ---- T16: approvals commands and SSE --------------------------------------------------------
+
+use atlas_duck_atlassian::testing::{MockDc, XAuser};
+use atlas_duck_atlassian::testing::{TEST_PAT, TEST_USER, TEST_USER_KEY, fixtures};
+use atlas_duck_atlassian::{
+    CredentialProvider, PatSecret, Product, StoredCredential, StoredIdentity,
+};
+
+/// Stores the user's PAT for `work` (before the user's runtime opens: core reads it at start).
+fn store_pat(h: &H, user: &str, mock: &MockDc) {
+    let uid = user_id_for(user);
+    let master = MasterKey::for_tests("k1", [5; 32]);
+    let wrapped = crate::master_key::WrappedKey::from_json(
+        &h.store.user(&uid).unwrap().unwrap().data_key_wrapped,
+    )
+    .unwrap();
+    let creds = crate::credentials::server_credentials(
+        h.store.clone(),
+        &uid,
+        master.unwrap(&uid, &wrapped).unwrap(),
+        h.clock.clone(),
+    );
+    creds
+        .store(
+            &crate::instances::instance_id_for("work"),
+            StoredCredential {
+                pat: PatSecret::new(TEST_PAT.into()),
+                base_url_hash: atlas_duck_atlassian::url::url_hash(&mock.base()),
+                identity: StoredIdentity {
+                    atlassian_user: TEST_USER.into(),
+                    atlassian_user_key: TEST_USER_KEY.into(),
+                },
+                expires_at: None,
+            },
+        )
+        .unwrap();
+}
+
+/// An agent's read of `ABC-1` on Jira `work` (a mock), pending for the user's release.
+async fn pending_read(h: &H, user: &str, mock: &MockDc) -> String {
+    store_pat(h, user, mock);
+    submit_read(h, user).await
+}
+
+async fn submit_read(h: &H, user: &str) -> String {
+    let uid = user_id_for(user);
+    let rt = h
+        .registry
+        .runtime(&crate::runtime::UserCtx::from_authenticated(&uid))
+        .await
+        .unwrap();
+    let conn = atlas_duck_ipc::proto::ConnectionMeta {
+        connection_id: "conn-1".into(),
+        peer: Default::default(),
+    };
+    rt.handler()
+        .hello(
+            &conn,
+            atlas_duck_ipc::proto::Hello {
+                build_id: atlas_duck_ipc::build_info::BUILD_ID.to_owned(),
+                client_kind: atlas_duck_ipc::proto::ClientKind::Cli,
+                agent_name: Some("agent".into()),
+                agent_name_source: atlas_duck_ipc::proto::AgentNameSource::Flag,
+                cwd_basename: "work".into(),
+            },
+        )
+        .await
+        .map_err(|e| e.to_json_line())
+        .unwrap();
+    let reply = rt
+        .handler()
+        .submit(
+            &conn,
+            atlas_duck_ipc::proto::SubmitParams {
+                op_id: "jira.issue.get".into(),
+                params: json!({"key": "ABC-1"}),
+                instance: None,
+                reason: None,
+            },
+        )
+        .await;
+    let env = serde_json::to_value(&reply.envelope).unwrap();
+    assert_eq!(env["status"], "pending", "{env}");
+    env["request_id"].as_str().unwrap().to_owned()
+}
+
+async fn jira_mock() -> MockDc {
+    let mock = MockDc::start(Product::Jira, "").await;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    mock.jira_server_info("9.12.0").await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path_regex("^/rest/api/2/issue/ABC-1$"))
+        .respond_with(
+            mock.response(200)
+                .set_body_raw(fixtures::JIRA_ISSUE, "application/json"),
+        )
+        .mount(mock.server())
+        .await;
+    mock
+}
+
+fn put_work(h: &H, base_url: &str) {
+    h.store
+        .instance_put(&crate::store::InstanceRecord {
+            alias: "work".into(),
+            product: "jira".into(),
+            base_url: base_url.into(),
+            proxy: Some("direct".into()),
+            ca_ref: None,
+            is_default: true,
+        })
+        .unwrap();
+}
+
+async fn cmd(h: &H, cookie: &str, csrf: &str, name: &str, body: Value) -> Response {
+    admin_call(
+        h,
+        Method::POST,
+        &format!("/api/cmd/{name}"),
+        cookie,
+        csrf,
+        &body.to_string(),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_is_per_user_and_a_release_reaches_the_instance() {
+    let h = H::new();
+    let mock = jira_mock().await;
+    put_work(&h, &mock.base_url());
+    let (ca, ta) = h.session("alice", PW_CANARY).await;
+    let (cb, tb) = h.session("bob", "pw-bob").await;
+    let id = pending_read(&h, "alice", &mock).await;
+    // The read fetches its candidate first; the row appears once it is built.
+    let mut a = json!([]);
+    for _ in 0..200 {
+        a = json_body(cmd(&h, &ca, &ta, "queue_list", json!({})).await).await;
+        if !a.as_array().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(a.as_array().unwrap().len(), 1, "{a}");
+    assert_eq!(a[0]["request_id"], id);
+    let b = json_body(cmd(&h, &cb, &tb, "queue_list", json!({})).await).await;
+    assert_eq!(b, json!([]));
+    // B cannot read A's item either.
+    let res = cmd(&h, &cb, &tb, "queue_get", json!({"request_id": id})).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(json_body(res).await, json!({"kind": "not_found"}));
+    // A opens the preview, then releases that revision.
+    let detail = json_body(cmd(&h, &ca, &ta, "queue_get", json!({"request_id": id})).await).await;
+    assert_eq!(detail["item"]["request_id"], id);
+    let preview =
+        json_body(cmd(&h, &ca, &ta, "preview_fetch", json!({"request_id": id})).await).await;
+    let rev = preview["preview"]["candidate_rev"].clone();
+    assert!(
+        preview["srcdoc"].as_str().unwrap().contains("<"),
+        "{preview}"
+    );
+    let raw = cmd(
+        &h,
+        &ca,
+        &ta,
+        "raw_page",
+        json!({"request_id": id, "candidate_rev": rev, "page": 0}),
+    )
+    .await;
+    assert_eq!(raw.status(), StatusCode::OK);
+    let out = cmd(
+        &h,
+        &ca,
+        &ta,
+        "decide",
+        json!({"request_id": id, "decision": "release", "candidate_rev": rev}),
+    )
+    .await;
+    assert_eq!(out.status(), StatusCode::OK);
+    let outcome = json_body(out).await;
+    assert_eq!(outcome["status"], "released", "{outcome}");
+    let gets = mock
+        .received()
+        .await
+        .iter()
+        .filter(|r| r.url.path() == "/rest/api/2/issue/ABC-1")
+        .count();
+    assert_eq!(gets, 1, "the read fetched once, before the release");
+    assert_eq!(
+        json_body(cmd(&h, &ca, &ta, "queue_list", json!({})).await).await,
+        json!([])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commands_refuse_bad_bodies_unknown_names_and_missing_csrf() {
+    let h = H::new();
+    let (c, t) = h.session("alice", PW_CANARY).await;
+    let res = cmd(&h, &c, &t, "decide_batch", json!({})).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_body(res).await,
+        json!({"kind": "not_found", "code": "api/unknown_command"})
+    );
+    let res = cmd(&h, &c, &t, "queue_get", json!({"request_id": "req_short"})).await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(res).await,
+        json!({"kind": "invalid_argument", "field": "request_id"})
+    );
+    let res = cmd(&h, &c, &t, "queue_list", json!({"x": 1})).await;
+    assert_eq!(
+        json_body(res).await,
+        json!({"kind": "invalid_argument", "field": "payload"})
+    );
+    assert_eq!(
+        json_body(cmd(&h, &c, &t, "app_status", json!({})).await).await,
+        json!([])
+    );
+    let (s, code_) = code(cmd(&h, &c, "wrong-token", "queue_list", json!({})).await).await;
+    assert_eq!(
+        (s, code_.as_str()),
+        (StatusCode::FORBIDDEN, "auth/csrf_mismatch")
+    );
+}
+
+/// Reads SSE frames until one contains `needle` (or the stream ends: `None`).
+async fn frame_with(body: &mut axum::body::BodyDataStream, needle: &str) -> Option<String> {
+    use futures::StreamExt;
+    let mut buf = String::new();
+    loop {
+        let chunk = tokio::time::timeout(LIMIT, body.next())
+            .await
+            .expect("sse hung")?;
+        buf.push_str(&String::from_utf8_lossy(&chunk.ok()?));
+        if let Some(i) = buf.find(needle) {
+            return Some(buf[i..].to_owned());
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sse_delivers_queue_changed_and_ends_at_session_expiry() {
+    let h = H::new();
+    let mock = jira_mock().await;
+    put_work(&h, &mock.base_url());
+    let (c, _) = h.session("alice", PW_CANARY).await;
+    store_pat(&h, "alice", &mock);
+    let res = h
+        .send(
+            Request::builder()
+                .uri("/api/events")
+                .header(header::COOKIE, format!("atlas_duck_session={c}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(
+        res.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream")
+    );
+    let mut body = res.into_body().into_data_stream();
+    submit_read(&h, "alice").await;
+    let f = frame_with(&mut body, "event: queue_changed").await.unwrap();
+    assert!(f.contains("request_ids"), "{f}");
+    assert!(frame_with(&mut body, ": keep-alive").await.is_some());
+    h.clock.advance(1_801);
+    // At the next keep-alive check the stream ends.
+    assert_eq!(frame_with(&mut body, "never-in-a-frame").await, None);
+}
+
+#[tokio::test]
+async fn a_lagging_stream_gets_resync() {
+    use futures::StreamExt;
+    let h = H::new();
+    let (c, _) = h.session("alice", PW_CANARY).await;
+    let (tx, rx) = tokio::sync::broadcast::channel(1);
+    for n in 0..3 {
+        tx.send(crate::runtime::SseEvent {
+            name: "attention",
+            data: json!({"count": n}),
+        })
+        .unwrap();
+    }
+    let sessions =
+        Arc::new(SessionTable::new(h.store.clone(), h.clock.clone(), 28_800, 1_800).unwrap());
+    let sse = crate::sse::stream(rx, None, sessions, c);
+    let mut body = axum::response::IntoResponse::into_response(sse)
+        .into_body()
+        .into_data_stream();
+    let first = tokio::time::timeout(LIMIT, body.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&first).contains("event: resync"),
+        "{first:?}"
+    );
+    drop(tx);
 }

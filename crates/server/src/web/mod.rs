@@ -3,6 +3,7 @@
 
 pub mod admin_routes;
 pub mod auth_routes;
+pub mod cmd_routes;
 pub mod extract;
 
 #[cfg(test)]
@@ -66,7 +67,9 @@ pub fn router(state: AppState) -> Router {
             "/api/admin/instances",
             get(admin_routes::list).post(admin_routes::add),
         )
-        .route("/api/admin/instances/{alias}", delete(admin_routes::remove));
+        .route("/api/admin/instances/{alias}", delete(admin_routes::remove))
+        .route("/api/cmd/{command}", post(cmd_routes::command))
+        .route("/api/events", get(cmd_routes::events));
     for (path, _) in static_files::PAGES {
         r = r.route(path, get(page));
     }

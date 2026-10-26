@@ -17,9 +17,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    AttentionKind, BatchItem, CandidateRev, Decision, DecisionKind, DenyDetails, DropScope, Edits,
-    PreviewDelivery, QueueItem, RedactionContext, RedactionOp, RedactionPreset, RequestDetail,
-    UiEvent, UrlMode,
+    AttentionKind, BatchItem, CandidateRev, Decision, DecisionApi, DecisionError, DecisionKind,
+    DenyDetails, DropScope, Edits, PreviewDelivery, QueueItem, RedactionContext, RedactionOp,
+    RedactionPreset, RequestDetail, UiEvent, UrlMode,
 };
 
 /// `field` of a body that is not a JSON object of the command's argument struct (unknown key,
@@ -745,6 +745,54 @@ pub struct RawPageDto {
     pub total_bytes: u64,
     pub bytes_b64: String,
     pub display: String,
+}
+
+/// Why a Raw page could not be answered.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RawPageError {
+    /// Core refused the read of the candidate (`NotDecidable`, `Stale`, `Invalid(..)`).
+    Decision(DecisionError),
+    /// A page past the last (`invalid_argument {page}` on the wire).
+    PageOutOfRange,
+}
+
+/// One Raw page through `decisions` (PD-68), shared by the desktop command and the server: the
+/// UTF-8 carry into the page is derived from the bytes of the page before it, never taken from
+/// the UI; the last page shows an incomplete tail as bytes.
+pub fn raw_page_response(
+    decisions: &dyn DecisionApi,
+    request_id: &str,
+    rev: CandidateRev,
+    page: u64,
+) -> Result<RawPageDto, RawPageError> {
+    use base64::Engine as _;
+    let current = decisions
+        .raw_page(request_id, rev, page)
+        .map_err(RawPageError::Decision)?;
+    if page >= current.page_count {
+        return Err(RawPageError::PageOutOfRange);
+    }
+    let carry = match page.checked_sub(1) {
+        Some(before) => {
+            let previous = decisions
+                .raw_page(request_id, rev, before)
+                .map_err(RawPageError::Decision)?;
+            render::raw::incomplete_tail(&previous.bytes).to_vec()
+        }
+        None => Vec::new(),
+    };
+    let display = if page + 1 == current.page_count {
+        render::raw_display_last(&current.bytes, &carry)
+    } else {
+        render::raw_display(&current.bytes, &carry)
+    };
+    Ok(RawPageDto {
+        page: current.page,
+        page_count: current.page_count,
+        total_bytes: current.total_bytes,
+        bytes_b64: base64::engine::general_purpose::STANDARD.encode(&current.bytes),
+        display: display.text,
+    })
 }
 
 // ---- UI events (C.10) ----------------------------------------------------------------------

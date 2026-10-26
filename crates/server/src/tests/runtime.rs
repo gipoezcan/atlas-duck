@@ -62,6 +62,7 @@ impl Env {
             org_ca: None,
             clock: ManualClock::at(1_800_000_000),
             allow_http: true,
+            sse_capacity: crate::runtime::SSE_CAPACITY,
         }
     }
 }

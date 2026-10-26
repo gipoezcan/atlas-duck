@@ -1,0 +1,61 @@
+//! `POST /api/cmd/{command}` and `GET /api/events` (SM-3.4, SM-5.1, SM-5.2): session only; the
+//! `/api` guard has already refused a bearer, a foreign Origin and a missing CSRF token, so an
+//! approval decision is reachable only from the user's own browser session.
+
+use axum::Json;
+use axum::extract::{Path, Request, State};
+use axum::response::{IntoResponse, Response};
+use serde_json::Value;
+
+use super::AppState;
+use super::auth_routes::body_bytes;
+use super::extract::{SessionUser, cookie_of};
+use crate::cmd::{self, CmdError};
+use crate::errors::ApiError;
+
+fn cmd_error(e: CmdError) -> Response {
+    (e.status(), Json(e)).into_response()
+}
+
+pub async fn command(
+    State(st): State<AppState>,
+    user: SessionUser,
+    Path(name): Path<String>,
+    req: Request,
+) -> Response {
+    if !cmd::SERVER_COMMANDS.contains(&name.as_str()) {
+        return cmd_error(CmdError::UnknownCommand);
+    }
+    let bytes = match body_bytes(req.into_body()).await {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+    let body: Value = if bytes.is_empty() {
+        Value::Object(Default::default())
+    } else {
+        match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(_) => return cmd_error(CmdError::InvalidArgument { field: "payload" }),
+        }
+    };
+    let rt = match st.registry.runtime(&user.ctx()).await {
+        Ok(rt) => rt,
+        Err(e) => return e.into_response(),
+    };
+    match cmd::run(rt.decisions(), name, body).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => cmd_error(e),
+    }
+}
+
+pub async fn events(
+    State(st): State<AppState>,
+    user: SessionUser,
+    req: Request,
+) -> Result<Response, ApiError> {
+    let cookie = cookie_of(req.headers()).ok_or(ApiError::NO_SESSION)?;
+    let rt = st.registry.runtime(&user.ctx()).await?;
+    let pin = rt.sse_pin();
+    let rx = rt.events();
+    Ok(crate::sse::stream(rx, Some(pin), st.sessions.clone(), cookie).into_response())
+}

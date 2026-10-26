@@ -7,9 +7,6 @@ use atlas_duck_core::{
     BatchOutcome, CandidateRev, DecisionApi, DecisionOutcome, QueueItem, RecentItem,
     RedactionReport,
 };
-use atlas_duck_preview::render;
-use atlas_duck_preview::render::raw::incomplete_tail;
-use base64::Engine;
 use serde::Serialize;
 use tauri::{AppHandle, Runtime};
 
@@ -23,6 +20,7 @@ pub use atlas_duck_core::decision::wire::{
     QueueListArgs, RawPageArgs, RawPageDto, RecentListArgs, RedactionContextDto,
     RedactionPreviewArgs, preview_fetch_response,
 };
+use atlas_duck_core::decision::wire::{RawPageError, raw_page_response};
 
 /// Runs `f` over the serving core's `DecisionApi` on the blocking pool (M3 PD-13) and records the
 /// response (S-16). `NotReady` without a serving core.
@@ -236,45 +234,21 @@ pub async fn preview_fetch<R: Runtime>(
     .await
 }
 
-/// `raw_page {request_id, candidate_rev, page}` (Δ1, PD-68): one Raw page through `decisions` (PD-68): refused like core refuses it (`NotDecidable`,
-/// `Stale`, `Invalid(NotOpened)`), a page past the last is `InvalidArgument {page}`. The UTF-8
-/// carry into the page is derived here from the bytes of the page before it, never taken from the
-/// UI; the last page shows an incomplete tail as bytes.
+/// `raw_page {request_id, candidate_rev, page}` (Δ1, PD-68): one Raw page through `decisions`
+/// (core's `raw_page_response`, shared with the server): refused like core refuses it
+/// (`NotDecidable`, `Stale`, `Invalid(NotOpened)`), a page past the last is
+/// `InvalidArgument {page}`.
 pub fn raw_page_dto(
     decisions: &dyn DecisionApi,
     request_id: &str,
     rev: CandidateRev,
     page: u64,
 ) -> Result<RawPageDto, CommandError> {
-    let current = decisions
-        .raw_page(request_id, rev, page)
-        .map_err(CommandError::from_candidate_read)?;
-    if page >= current.page_count {
-        return Err(CommandError::InvalidArgument { field: "page" });
-    }
-    let carry = match page.checked_sub(1) {
-        Some(before) => {
-            let previous = decisions
-                .raw_page(request_id, rev, before)
-                .map_err(CommandError::from_candidate_read)?;
-            incomplete_tail(&previous.bytes).to_vec()
-        }
-        None => Vec::new(),
-    };
-    let display = if page + 1 == current.page_count {
-        render::raw_display_last(&current.bytes, &carry)
-    } else {
-        render::raw_display(&current.bytes, &carry)
-    };
-    Ok(RawPageDto {
-        page: current.page,
-        page_count: current.page_count,
-        total_bytes: current.total_bytes,
-        bytes_b64: base64::engine::general_purpose::STANDARD.encode(&current.bytes),
-        display: display.text,
+    raw_page_response(decisions, request_id, rev, page).map_err(|e| match e {
+        RawPageError::Decision(e) => CommandError::from_candidate_read(e),
+        RawPageError::PageOutOfRange => CommandError::InvalidArgument { field: "page" },
     })
 }
-
 /// `raw_page` (PD-68): on the blocking pool (a 256 KiB slice, twice, and the projection).
 #[tauri::command]
 pub async fn raw_page<R: Runtime>(

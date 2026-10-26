@@ -142,6 +142,7 @@ pub async fn execute(cmd: AdminCmd, config: &Config, master: Arc<MasterKey>) -> 
             org_ca: config.ca_bundle_file.clone(),
             clock: Arc::new(SystemClock),
             allow_http: false,
+            sse_capacity: crate::runtime::SSE_CAPACITY,
         },
         config.max_open_users,
     );

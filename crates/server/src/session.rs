@@ -172,6 +172,15 @@ impl SessionTable {
         Ok(())
     }
 
+    /// Whether the cookie's session is still live now, without touching it (an open SSE stream's
+    /// keep-alive must not extend the idle expiry).
+    pub fn is_live(&self, cookie_id: &str) -> bool {
+        let now = self.clock.now();
+        self.lock()
+            .get(&id_hash(cookie_id))
+            .is_some_and(|l| now < l.record.absolute_expiry && now < l.record.idle_expiry)
+    }
+
     /// Removes every expired session; answers how many left memory.
     pub fn sweep(&self) -> usize {
         let now = self.clock.now();

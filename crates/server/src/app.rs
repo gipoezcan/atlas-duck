@@ -101,6 +101,7 @@ async fn run(config: Config) -> u8 {
             org_ca: config.ca_bundle_file.clone(),
             clock: clock.clone(),
             allow_http: false,
+            sse_capacity: crate::runtime::SSE_CAPACITY,
         },
         config.max_open_users,
     ));
