@@ -1218,3 +1218,137 @@ async fn a_lagging_stream_gets_resync() {
     );
     drop(tx);
 }
+
+// ---- T17: PAT entry -------------------------------------------------------------------------
+
+const PAT_CANARY: &str = "pat-canary-4c1d9e2b77";
+
+async fn put_pat(h: &H, cookie: &str, csrf: &str, alias: &str, pat: &str) -> Response {
+    admin_call(
+        h,
+        Method::PUT,
+        &format!("/api/me/pats/{alias}"),
+        cookie,
+        csrf,
+        &json!({"pat": pat}).to_string(),
+    )
+    .await
+}
+
+async fn instances_of(h: &H, cookie: &str) -> Value {
+    let req = Request::builder()
+        .uri("/api/instances")
+        .header(header::COOKIE, format!("atlas_duck_session={cookie}"))
+        .body(Body::empty())
+        .unwrap();
+    json_body(h.send(req).await).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_good_pat_is_checked_stored_sealed_and_usable() {
+    let h = H::new();
+    let mock = jira_mock().await;
+    put_work(&h, &mock.base_url());
+    let (ca, ta) = h.session("alice", PW_CANARY).await;
+    let (cb, _) = h.session("bob", "pw-bob").await;
+    assert_eq!(instances_of(&h, &ca).await[0]["pat"], "none");
+    let res = put_pat(&h, &ca, &ta, "work", PAT_CANARY).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = json_body(res).await;
+    assert_eq!(body, json!({"alias": "work", "identity": TEST_USER}));
+    let mine = instances_of(&h, &ca).await;
+    assert_eq!(mine[0]["pat"], "stored", "{mine}");
+    assert_eq!(mine[0]["identity"], TEST_USER);
+    assert!(!mine.to_string().contains(PAT_CANARY));
+    // B sees no PAT of A.
+    let theirs = instances_of(&h, &cb).await;
+    assert_eq!(theirs[0]["pat"], "none");
+    assert!(theirs[0]["identity"].is_null());
+    // The PAT went to the instance (the check), and is usable for an agent read now.
+    let auth_seen = mock.received().await.iter().any(|r| {
+        r.headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v == format!("Bearer {PAT_CANARY}"))
+    });
+    assert!(auth_seen);
+    submit_read(&h, "alice").await;
+    // Sealed: the canary is nowhere in the database bytes.
+    assert!(!contains(&h.db_bytes(), PAT_CANARY.as_bytes()));
+    // Delete: the instance is back to none.
+    let res = admin_call(&h, Method::DELETE, "/api/me/pats/work", &ca, &ta, "").await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert_eq!(instances_of(&h, &ca).await[0]["pat"], "none");
+    assert!(
+        h.store
+            .pat_get(&user_id_for("alice"), "work")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_pat_is_422_and_nothing_is_stored() {
+    let h = H::new();
+    let mock = MockDc::start(Product::Jira, "").await;
+    wiremock::Mock::given(wiremock::matchers::path("/rest/api/2/myself"))
+        .respond_with(mock.response(401))
+        .mount(mock.server())
+        .await;
+    mock.jira_server_info("9.12.0").await;
+    put_work(&h, &mock.base_url());
+    let (c, t) = h.session("alice", PW_CANARY).await;
+    let res = put_pat(&h, &c, &t, "work", PAT_CANARY).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = json_body(res).await;
+    assert_eq!(body["error"]["code"], "pat/check_failed");
+    assert_eq!(body["error"]["reason"], "http_401");
+    assert!(!body.to_string().contains(PAT_CANARY));
+    assert!(
+        h.store
+            .pat_get(&user_id_for("alice"), "work")
+            .unwrap()
+            .is_none()
+    );
+    assert!(!contains(&h.db_bytes(), PAT_CANARY.as_bytes()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreachable_instance_is_502_and_bad_requests_are_refused() {
+    let h = H::new();
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
+    put_work(&h, &format!("http://127.0.0.1:{port}"));
+    let (c, t) = h.session("alice", PW_CANARY).await;
+    let res = put_pat(&h, &c, &t, "work", PAT_CANARY).await;
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        json_body(res).await["error"]["code"],
+        "pat/instance_unreachable"
+    );
+    let (s, code_) = code(put_pat(&h, &c, &t, "nope", PAT_CANARY).await).await;
+    assert_eq!(
+        (s, code_.as_str()),
+        (StatusCode::NOT_FOUND, "instance/unknown")
+    );
+    for bad in [String::new(), "x".repeat(MAX_PAT + 1)] {
+        let (s, code_) = code(put_pat(&h, &c, &t, "work", &bad).await).await;
+        assert_eq!(
+            (s, code_.as_str()),
+            (StatusCode::BAD_REQUEST, "api/bad_request")
+        );
+    }
+    let res = admin_call(
+        &h,
+        Method::PUT,
+        "/api/me/pats/work",
+        &c,
+        &t,
+        r#"{"pat": "x", "y": 1}"#,
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+const MAX_PAT: usize = super::pat_routes::MAX_PAT_CHARS;

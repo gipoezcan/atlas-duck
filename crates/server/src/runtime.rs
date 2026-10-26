@@ -322,6 +322,11 @@ impl UserRuntime {
         self.core.handler()
     }
 
+    /// The instance admin of the user's core (PAT entry, T17: the base-spec credential check).
+    pub fn instances(&self) -> Arc<dyn atlas_duck_core::InstanceAdmin> {
+        self.core.instances()
+    }
+
     /// The approvals commands' API.
     pub fn decisions(&self) -> Arc<dyn DecisionApi> {
         self.core.decisions()

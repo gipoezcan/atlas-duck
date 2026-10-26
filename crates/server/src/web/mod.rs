@@ -5,6 +5,7 @@ pub mod admin_routes;
 pub mod auth_routes;
 pub mod cmd_routes;
 pub mod extract;
+pub mod pat_routes;
 
 #[cfg(test)]
 mod tests;
@@ -17,7 +18,7 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, Method, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 
 use crate::csrf::{CSRF_HEADER, origin_ok, token_ok};
 use crate::errors::ApiError;
@@ -69,7 +70,12 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/admin/instances/{alias}", delete(admin_routes::remove))
         .route("/api/cmd/{command}", post(cmd_routes::command))
-        .route("/api/events", get(cmd_routes::events));
+        .route("/api/events", get(cmd_routes::events))
+        .route("/api/instances", get(pat_routes::instances))
+        .route(
+            "/api/me/pats/{alias}",
+            put(pat_routes::put).delete(pat_routes::delete),
+        );
     for (path, _) in static_files::PAGES {
         r = r.route(path, get(page));
     }

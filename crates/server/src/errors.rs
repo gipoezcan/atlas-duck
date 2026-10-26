@@ -14,6 +14,8 @@ pub struct ApiError {
     pub message: &'static str,
     /// `Retry-After` seconds (429 only).
     pub retry_after: Option<u64>,
+    /// A closed reason kind (`pat/check_failed`, `pat/instance_unreachable`): never text.
+    pub reason: Option<&'static str>,
 }
 
 const fn e(status: StatusCode, code: &'static str, message: &'static str) -> ApiError {
@@ -22,6 +24,7 @@ const fn e(status: StatusCode, code: &'static str, message: &'static str) -> Api
         code,
         message,
         retry_after: None,
+        reason: None,
     }
 }
 
@@ -171,8 +174,17 @@ impl ApiError {
     }
 
     /// The JSON body.
+    /// The same error with a closed reason kind in its body.
+    pub fn with_reason(mut self, reason: &'static str) -> ApiError {
+        self.reason = Some(reason);
+        self
+    }
+
     pub fn body(&self) -> serde_json::Value {
-        json!({"error": {"code": self.code, "message": self.message}})
+        match self.reason {
+            Some(r) => json!({"error": {"code": self.code, "message": self.message, "reason": r}}),
+            None => json!({"error": {"code": self.code, "message": self.message}}),
+        }
     }
 }
 
