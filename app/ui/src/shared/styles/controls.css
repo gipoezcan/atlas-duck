@@ -1,0 +1,144 @@
+/* Buttons and form controls (M11). The base button rule sits in :where() so
+   the .primary / .danger / .ghost modifiers win without specificity games.
+   .tree-select (a row-sized reset button) and [role="tab"] (styled with the
+   Approvals detail) are not given the button look. */
+:where(button, input[type="button"], input[type="submit"], input[type="reset"]):where(:not(.tree-select, [role="tab"])) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  font: inherit;
+  font-weight: var(--weight-medium);
+  min-height: var(--control-height);
+  padding: 0 var(--space-4);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  color: var(--text);
+  cursor: pointer;
+  transition: background-color var(--duration), border-color var(--duration);
+}
+:where(button, input[type="button"], input[type="submit"], input[type="reset"]):where(:not(.tree-select, [role="tab"])):hover {
+  background: var(--surface);
+}
+:where(button, input[type="button"], input[type="submit"], input[type="reset"]):where(:not(.tree-select, [role="tab"])):active {
+  background: var(--surface-sunken);
+}
+.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--text-on-accent);
+}
+.primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: var(--text-on-danger);
+}
+.danger:hover {
+  background: var(--danger-hover);
+  border-color: var(--danger-hover);
+}
+.ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--accent);
+}
+.ghost:hover {
+  background: var(--accent-subtle);
+}
+/* Disabled: dimmed (WCAG exempts inactive components) and no hover change. */
+:where(button, input[type="button"], input[type="submit"], input[type="reset"]):disabled,
+:where(button, input[type="button"], input[type="submit"], input[type="reset"])[aria-disabled="true"] {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+:where(button, input[type="button"], input[type="submit"], input[type="reset"]):disabled:hover {
+  background: var(--surface-raised);
+}
+.primary:disabled:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.danger:disabled:hover {
+  background: var(--danger);
+  border-color: var(--danger);
+}
+.ghost:disabled:hover {
+  background: transparent;
+}
+/* Buttons inside the fixed-height rows must fit the 2rem lines (control height is 2.25rem). */
+.queue-line button, .audit-line button, .tree-row button, .raw-nav button {
+  min-height: 0;
+  padding: 0 var(--space-2);
+}
+.tree-row .tree-toggle {
+  padding: 0;
+}
+.audit-row button[aria-current="true"] {
+  font-weight: 700;
+  background: var(--row-selected);
+}
+
+/* Text-like inputs, selects, textareas (the :not list sits in :where() to keep the specificity at one element). */
+input:where(:not([type="checkbox"], [type="radio"], [type="button"], [type="submit"], [type="reset"], [type="file"])),
+select,
+textarea {
+  font: inherit;
+  color: var(--text);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  min-height: var(--control-height);
+  padding: var(--space-1) var(--space-3);
+  max-width: 100%;
+}
+textarea {
+  min-height: 5rem;
+  resize: vertical;
+  line-height: var(--leading);
+}
+select {
+  padding-right: var(--space-5);
+}
+::placeholder {
+  color: var(--text-muted);
+  opacity: 1;
+}
+[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+input:disabled, select:disabled, textarea:disabled {
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+}
+input[type="checkbox"], input[type="radio"] {
+  accent-color: var(--accent);
+  width: 1.1rem;
+  height: 1.1rem;
+  margin: 0;
+}
+label:has(> input[type="checkbox"]), label:has(> input[type="radio"]) {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+fieldset {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4);
+  min-width: 0;
+}
+legend {
+  padding: 0 var(--space-1);
+  font-weight: var(--weight-bold);
+}
+/* The Guard wrapper must stay invisible. */
+.settings-guard {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
