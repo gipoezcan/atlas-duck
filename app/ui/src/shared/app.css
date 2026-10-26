@@ -2,6 +2,7 @@
 @import './styles/base.css';
 @import './styles/controls.css';
 @import './styles/layout.css';
+@import './styles/components.css';
 
 /* The Tauri isolation iframe is hidden by the inline <style> that isolation.js
    injects, which both policies admit by its sha256 hash (spec 6.4, ruling B1);
@@ -10,16 +11,6 @@
   display: none !important;
 }
 
-.app-header nav { display: flex; gap: 0.5rem; padding: 0.5rem; }
-.banner { list-style: none; margin: 0; padding: 0 0.5rem; }
-.banner-caution { font-weight: 600; }
-.badge { flex: none; display: inline-block; border: 1px solid currentColor; border-radius: 0.25rem; padding: 0 0.35rem; margin: 0 0.25rem; font-size: 0.8em; white-space: nowrap; }
-.badge-caution { font-weight: 600; }
-.badge-fixed { flex: none; display: inline-block; min-width: 6.5em; }
-.agent-text { display: inline-flex; align-items: center; min-width: 0; }
-.agent-text bdi { unicode-bidi: isolate; }
-/* Long agent text is ellipsized so the badges after it (unusual characters) are never pushed out. */
-.agent-text-value { display: block; min-width: 0; max-width: 24em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .windowed-row { box-sizing: border-box; overflow: hidden; border-bottom: 1px solid var(--border); }
 /* Lines 1 and 2 are one line each: shrinkable text is ellipsized, labels and badges are flex: none.
    The flags line wraps. A row is QUEUE_ROW_REM (7.5rem) high, so the rem lines and the row scale together. */
@@ -33,7 +24,6 @@
 .detail { padding: 0.5rem; }
 .detail-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 0.5rem 0; }
 .consequences { flex-basis: 100%; margin: 0; padding-left: 1.25rem; }
-.caution-strip { border: 2px solid currentColor; padding: 0.35rem 0.5rem; margin: 0.5rem 0; }
 .detail [role="tablist"] { display: flex; gap: 0.25rem; }
 .detail [role="tab"][aria-selected="true"] { font-weight: 700; text-decoration: underline; }
 .detail-panel iframe { display: block; width: 100%; height: 28rem; border: 1px solid var(--border); }

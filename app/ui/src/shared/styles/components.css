@@ -1,0 +1,128 @@
+/* Feedback components (M11): notices, header banner, badges, agent text,
+   empty state, toast. State classes the markup already uses (.caution-strip,
+   [role="alert"], [role="status"]) get the notice look by selector, no JSX.
+   .toast is defined but unused: no window shows a transient message today; it
+   is there for the web approvals notifications of M12. */
+
+/* Notices. The role rules leave out .visually-hidden (the Wizard's live region), .caution-strip
+   (a warning, whatever its role) and an explicit .notice class. */
+.notice,
+.caution-strip,
+.window > [role="alert"]:not(.visually-hidden, .caution-strip, .notice),
+.window > section > [role="alert"]:not(.visually-hidden, .caution-strip, .notice),
+.window > [role="status"]:not(.visually-hidden, .caution-strip, .notice),
+.window > section > [role="status"]:not(.visually-hidden, .caution-strip, .notice) {
+  display: block;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text);
+  margin: 0 0 var(--space-4);
+}
+.notice-info,
+.window > [role="status"]:not(.visually-hidden, .caution-strip, .notice),
+.window > section > [role="status"]:not(.visually-hidden, .caution-strip, .notice) {
+  border-left-color: var(--info);
+  background: var(--info-subtle);
+}
+.notice-warning, .caution-strip {
+  border-left-color: var(--warning-border);
+  background: var(--warning-subtle);
+}
+.notice-danger,
+.window > [role="alert"]:not(.visually-hidden, .caution-strip, .notice),
+.window > section > [role="alert"]:not(.visually-hidden, .caution-strip, .notice) {
+  border-left-color: var(--danger);
+  background: var(--danger-subtle);
+}
+.notice-success {
+  border-left-color: var(--success);
+  background: var(--success-subtle);
+}
+.caution-strip {
+  margin: var(--space-2) 0;
+}
+
+/* Header banner (Approvals). */
+.app-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.app-header nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-5);
+  max-width: var(--content-max);
+  margin: 0 auto;
+}
+.banner {
+  list-style: none;
+  margin: 0 auto;
+  padding: 0 var(--space-5) var(--space-2);
+  max-width: var(--content-max);
+}
+.banner li {
+  padding: var(--space-1) 0;
+}
+.banner-caution {
+  color: var(--warning);
+  font-weight: var(--weight-bold);
+}
+.banner-info {
+  color: var(--text-muted);
+}
+
+/* Badges: the metrics (flex: none, margin, nowrap) keep the queue lines' width maths. */
+.badge {
+  flex: none;
+  display: inline-block;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-pill);
+  background: var(--surface-raised);
+  color: var(--text);
+  padding: 0 0.35rem;
+  margin: 0 0.25rem;
+  font-size: 0.8em;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+.badge-caution {
+  color: var(--warning);
+  border-color: var(--warning-border);
+  background: var(--warning-subtle);
+  font-weight: var(--weight-bold);
+}
+.badge-fixed { flex: none; display: inline-block; min-width: 6.5em; }
+
+/* Agent-authored text. */
+.agent-text { display: inline-flex; align-items: center; min-width: 0; }
+.agent-text bdi { unicode-bidi: isolate; }
+/* Long agent text is ellipsized so the badges after it (unusual characters) are never pushed out. */
+.agent-text-value { display: block; min-width: 0; max-width: 24em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Empty list text and transient message. */
+.empty-state {
+  padding: var(--space-6) var(--space-4);
+  text-align: center;
+  color: var(--text-muted);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-lg);
+}
+.toast {
+  position: fixed;
+  inset-inline-end: var(--space-4);
+  inset-block-end: var(--space-4);
+  max-width: 24rem;
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface-raised);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-card);
+}
