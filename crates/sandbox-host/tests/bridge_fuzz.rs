@@ -1796,17 +1796,27 @@ fn s10_queued_answers_are_released_before_the_outcome() -> TestResult {
 fn s10_frames_before_the_terminal_are_accepted() -> TestResult {
     let _serial = serial();
     let rt = runtime()?;
-    let (spawner, observed) = fake(|w| {
+    let (sink, gate) = TestSink::gated();
+    let seen = Arc::clone(&sink);
+    let (spawner, observed) = fake(move |w| {
         w.ready()?;
         w.read()?;
         w.send(&log_frame("from a getter"))?;
         w.send(&call_frame(1))?;
+        // The host dispatches a call as its own task and only while the worker is not reaped: the
+        // terminal frame (and the exit) must not overtake the call, or the sink may never see it.
+        let started = Instant::now();
+        while seen.calls().is_empty() {
+            if w.observed.is_killed() || started.elapsed() > WAIT_BOUND {
+                return w.until_killed();
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
         w.send(&log_frame("another"))?;
         w.send(result_frame("\"done\"").as_bytes())?;
         while w.read()?.is_some() {}
         Ok(0)
     });
-    let (sink, gate) = TestSink::gated();
     let outcome = run_to_end(&rt, &spawner, ScriptLimits::default(), sink.clone())?;
     gate.add_permits(1);
     assert_eq!(outcome.host, HostVerdict::None);

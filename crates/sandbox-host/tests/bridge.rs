@@ -990,6 +990,7 @@ async fn outstanding_counted_until_result_queued() -> TestResult {
     // Queued is enough, written is not needed: the fake reads only the header of call 1's 2 MiB
     // answer, so the writer stays blocked inside that frame, and call 2 is still within the limit.
     let padded = TestSink::padded(2 * MIB);
+    let seen = padded.watch();
     let (spawner, observed) = fake(move |w| {
         w.ready()?;
         w.read()?;
@@ -997,6 +998,11 @@ async fn outstanding_counted_until_result_queued() -> TestResult {
         let len = w.read_header()?;
         assert!(len as usize > 2 * MIB, "call 1's answer is being written");
         w.call(2)?;
+        // The host dispatches a call only while the worker is not yet reaped, and each call runs
+        // as its own task: the terminal frame (and the exit) must not overtake call 2, or the
+        // sink may legitimately never see it. Wait until the sink saw both calls.
+        seen.recv_timeout(WAIT_BOUND).map_err(io::Error::other)?;
+        seen.recv_timeout(WAIT_BOUND).map_err(io::Error::other)?;
         w.result("2")?;
         Ok(0)
     });
