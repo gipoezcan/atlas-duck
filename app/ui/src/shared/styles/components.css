@@ -68,11 +68,10 @@
   margin: var(--space-3) 0;
 }
 
-/* Header banner (Approvals). */
+/* Header banner (Approvals). Not sticky: a sticky banner covers the Approvals h1 (and any focus
+   target scrolled to the top) once the page scrolls, so a click there lands on the banner and the
+   focus stays in the preview frame (CI run 40406728969, e2e chords; WCAG 2.4.11). */
 .app-header {
-  position: sticky;
-  top: 0;
-  z-index: 1;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
 }
