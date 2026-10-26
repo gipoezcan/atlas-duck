@@ -44,6 +44,15 @@
 .caution-strip {
   margin: var(--space-2) 0;
 }
+/* A live region that is in the DOM but has nothing to say draws nothing (it stays, so a screen
+   reader still announces what is put into it). */
+:is([role="status"], [role="alert"], .notice):empty {
+  padding: 0 !important;
+  margin: 0 !important;
+  border: 0 !important;
+  background: none !important;
+  box-shadow: none !important;
+}
 
 /* Progress of a running export, backup or restore (Settings and Audit): the info notice look. */
 .audit-job {

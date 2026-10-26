@@ -125,6 +125,14 @@ describe('check-css', () => {
     assert.ok(hasMatch(v, /extra\.css: colour literal "rgb\("/), v.join('\n'));
   });
 
+  test('outline_none_on_programmatic_focus_targets_passes_but_not_on_controls', () => {
+    const ok = ':is(h1, h2, section)[tabindex="-1"]:focus { outline: none; }\n';
+    assert.deepEqual(violationsFor({ 'shared/styles/extra.css': ok }), []);
+    const bad = ':is(button, h1)[tabindex="-1"]:focus { outline: none; }\n';
+    const v = violationsFor({ 'shared/styles/extra.css': bad });
+    assert.ok(hasMatch(v, /removes the outline/), v.join('\n'));
+  });
+
   test('currentColor_and_var_pass', () => {
     const css = '.x { border: 1px solid currentColor; color: var(--text); background: transparent; outline-color: inherit; }\n' +
       '.y { font-family: var(--font-sans); content: "red"; }\n';
