@@ -2,7 +2,7 @@ use atlas_duck_audit::error::AuditError;
 use atlas_duck_audit::keystore::KeyStoreError;
 use atlas_duck_audit::types::{DecisionColumn, EventFlags, EventType, UtcInstant};
 
-const C3_NAMES: [&str; 49] = [
+const C3_NAMES: [&str; 53] = [
     "REQUEST_RECEIVED",
     "REQUEST_REJECTED",
     "REQUEST_FAILED",
@@ -52,11 +52,16 @@ const C3_NAMES: [&str; 49] = [
     "INTEGRITY_ACK",
     "LEGAL_HOLD_CHANGED",
     "CLOCK_ANOMALY",
+    // M12 PD-216 (SM-6.3), appended.
+    "LOGIN",
+    "API_KEY_CREATED",
+    "API_KEY_REVOKED",
+    "AUDITOR_READ",
 ];
 
 #[test]
 fn event_type_names_round_trip() {
-    assert_eq!(EventType::ALL.len(), 49);
+    assert_eq!(EventType::ALL.len(), 53);
     for t in EventType::ALL {
         assert_eq!(EventType::parse(t.as_str()), Some(t));
     }
@@ -64,6 +69,26 @@ fn event_type_names_round_trip() {
     assert_eq!(names, C3_NAMES);
     assert_eq!(EventType::parse("request_received"), None);
     assert_eq!(EventType::parse("NOPE"), None);
+}
+
+/// M12 PD-216: the server-mode kinds sit at the end, after every desktop kind, and round-trip.
+#[test]
+fn new_server_kinds_round_trip() {
+    let server = [
+        (EventType::LOGIN, "LOGIN"),
+        (EventType::API_KEY_CREATED, "API_KEY_CREATED"),
+        (EventType::API_KEY_REVOKED, "API_KEY_REVOKED"),
+        (EventType::AUDITOR_READ, "AUDITOR_READ"),
+    ];
+    for (t, name) in server {
+        assert_eq!(t.as_str(), name);
+        assert_eq!(EventType::parse(name), Some(t));
+        assert!(
+            t > EventType::CLOCK_ANOMALY,
+            "{name} must follow every desktop kind"
+        );
+    }
+    assert_eq!(&EventType::ALL[49..], server.map(|(t, _)| t).as_slice());
 }
 
 #[test]

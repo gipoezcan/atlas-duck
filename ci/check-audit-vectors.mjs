@@ -328,6 +328,34 @@ function checkRow(row, i, prev, out, notes) {
   return rh;
 }
 
+/** Checks each row and the links between consecutive rows of one chain; appends to `out`. */
+function checkRows(rows, out, notes) {
+  let prev = null;
+  rows.forEach((row, i) => {
+    const rh = checkRow(row, i, prev, out, notes);
+    prev = rh ? { chain_id: row.fields.chain_id, seq: row.fields.seq, record_hash: rh } : null;
+  });
+}
+
+// M12 PD-216: the server-mode kinds, one row each, in a file of their own (format_v1.json is
+// frozen; the kinds change no format, only the event_type text of an ordinary record).
+export const DEFAULT_SERVER_VECTORS = join(REPO_ROOT, "crates", "audit", "tests", "vectors", "server_kinds_v1.json");
+export const SERVER_KINDS = ["LOGIN", "API_KEY_CREATED", "API_KEY_REVOKED", "AUDITOR_READ"];
+
+/** The server-kind vectors: rows only, exactly one per server kind in SERVER_KINDS order. */
+export function checkServerKindVectors(doc, notes = new Set()) {
+  const out = [];
+  if (doc.format_version !== 1) out.push("server kinds: format_version must be 1");
+  if (!Array.isArray(doc.rows)) return [...out, "server kinds: rows must be an array"];
+  const kinds = doc.rows.map((r) => r?.fields?.event_type);
+  if (kinds.join(",") !== SERVER_KINDS.join(",")) {
+    out.push(`server kinds: rows must be one each of ${SERVER_KINDS.join(", ")} in order, found ${kinds.join(", ")}`);
+  }
+  const rowsOut = [];
+  checkRows(doc.rows, rowsOut, notes);
+  return [...out, ...rowsOut.map((m) => `server kinds ${m}`)];
+}
+
 /** Returns the list of mismatches (empty = ok). */
 export function checkVectors(doc, notes = new Set()) {
   const out = [];
@@ -340,11 +368,7 @@ export function checkVectors(doc, notes = new Set()) {
   }
   if (out.length > 0) return out;
 
-  let prev = null;
-  doc.rows.forEach((row, i) => {
-    const rh = checkRow(row, i, prev, out, notes);
-    prev = rh ? { chain_id: row.fields.chain_id, seq: row.fields.seq, record_hash: rh } : null;
-  });
+  checkRows(doc.rows, out, notes);
 
   doc.request_sets.forEach((set, i) => {
     try {
@@ -414,14 +438,25 @@ export function main(argv = process.argv.slice(2)) {
   }
   const notes = new Set();
   const mismatches = checkVectors(doc, notes);
-  if (argv[0] === undefined) mismatches.push(...checkFrozen());
+  let serverRows = 0;
+  if (argv[0] === undefined) {
+    mismatches.push(...checkFrozen());
+    try {
+      const server = JSON.parse(readFileSync(DEFAULT_SERVER_VECTORS, "utf8"));
+      mismatches.push(...checkServerKindVectors(server, notes));
+      serverRows = server.rows?.length ?? 0;
+    } catch (err) {
+      mismatches.push(`server kinds: cannot read ${DEFAULT_SERVER_VECTORS}: ${err.message}`);
+    }
+  }
   for (const n of notes) console.error(n);
   for (const m of mismatches) console.log(m);
   if (mismatches.length > 0) return 1;
   console.error(
     `check-audit-vectors: ok (${doc.rows.length} rows, ${doc.request_sets.length} request sets, ` +
       `${doc.prune_rows.length} prune rows, ${doc.jcs.length} jcs, ${doc.dek_wraps.length} dek wraps, ` +
-      `${doc.query_tags.length} query tags, recovery layout)`,
+      `${doc.query_tags.length} query tags, recovery layout` +
+      (argv[0] === undefined ? `; ${serverRows} server-kind rows)` : ")"),
   );
   return 0;
 }

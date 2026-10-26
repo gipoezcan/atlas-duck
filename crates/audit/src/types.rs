@@ -77,6 +77,12 @@ event_types!(
     INTEGRITY_ACK,
     LEGAL_HOLD_CHANGED,
     CLOCK_ANOMALY,
+    // Server mode (SM-6.3, M12 PD-216): appended so every earlier discriminant keeps its value.
+    // Ordinary caller-appendable records; desktop never writes them, its verifier accepts them.
+    LOGIN,
+    API_KEY_CREATED,
+    API_KEY_REVOKED,
+    AUDITOR_READ,
 );
 
 /// The `flags` column (F.2): a u64 bitset. Bits above `INTEGRITY_INCIDENT` are never valid.

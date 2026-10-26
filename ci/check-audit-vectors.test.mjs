@@ -7,11 +7,14 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  DEFAULT_SERVER_VECTORS,
   DEFAULT_VECTORS,
   FROZEN_SHA256,
   REPO_ROOT,
+  SERVER_KINDS,
   canonicalize,
   checkFrozen,
+  checkServerKindVectors,
   checkVectors,
   frame,
 } from "./check-audit-vectors.mjs";
@@ -47,9 +50,36 @@ test("the committed vectors pass", () => {
   assert.equal(res.status, 0, res.stdout + res.stderr);
   assert.match(
     res.stderr,
-    /^check-audit-vectors: ok \(5 rows, 4 request sets, 3 prune rows, 5 jcs, 3 dek wraps, 7 query tags, recovery layout\)$/m,
+    /^check-audit-vectors: ok \(5 rows, 4 request sets, 3 prune rows, 5 jcs, 3 dek wraps, 7 query tags, recovery layout; 4 server-kind rows\)$/m,
   );
   assert.deepEqual(checkVectors(load()), []);
+});
+
+// ---------- M12 PD-216: server-mode kinds ----------
+
+const loadServer = () => JSON.parse(readFileSync(DEFAULT_SERVER_VECTORS, "utf8"));
+
+test("the server-kind vectors pass, one row per kind", () => {
+  const doc = loadServer();
+  assert.deepEqual(checkServerKindVectors(doc), []);
+  assert.deepEqual(
+    doc.rows.map((r) => r.fields.event_type),
+    SERVER_KINDS,
+  );
+});
+
+test("a tampered or missing server-kind row is caught", () => {
+  const tampered = loadServer();
+  tampered.rows[1].canonical = flipHexAt(tampered.rows[1].canonical, 10);
+  assert.ok(checkServerKindVectors(tampered).some((m) => /rows\[1\] api_key_created: canonical bytes differ/.test(m)));
+  const short = loadServer();
+  short.rows.pop();
+  assert.ok(checkServerKindVectors(short).some((m) => /one each of LOGIN, API_KEY_CREATED/.test(m)));
+  const relabelled = loadServer();
+  relabelled.rows[0].fields.event_type = "APP_START";
+  const errs = checkServerKindVectors(relabelled);
+  assert.ok(errs.some((m) => /found APP_START/.test(m)), errs.join("\n"));
+  assert.ok(errs.some((m) => /record_hash differs/.test(m)), errs.join("\n"));
 });
 
 test("the frozen files match their pinned sha256", () => {

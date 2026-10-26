@@ -840,3 +840,128 @@ fn key_vectors_open() {
     assert_ne!(tags[0]["tag"], tags[6]["tag"], "another KEK");
     assert!(tags[4]["tag"].as_str().unwrap().starts_with("cql:"));
 }
+
+// ---- M12 PD-216: the server-mode kinds -------------------------------------------------------
+
+/// The server-mode kinds' vectors live in a file of their own: `format_v1.json` is frozen, and
+/// the four kinds change no format, only the `event_type` text of an ordinary record. One row per
+/// kind on a chain of their own, linked in order.
+fn server_kinds_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/server_kinds_v1.json")
+}
+
+/// A third chain, for the server-mode rows.
+const CHAIN_ID_3: &str = "3b8f0e6c2d4a49e1b7c5a3f1e9d7b5c3";
+
+fn server_row_specs() -> Vec<Spec> {
+    let on = |name, seq, ts, event_type, payload| Spec {
+        chain_id: CHAIN_ID_3,
+        epoch: Some("2026-10-26"),
+        key_id: 2,
+        payload,
+        ..Spec::empty(name, seq, ts, event_type)
+    };
+    vec![
+        Spec {
+            prev_hash: Some(sha256(b"server chain record 40")),
+            ..on(
+                "login_password_success",
+                41,
+                "2026-10-26T09:00:00.000Z",
+                "LOGIN",
+                json!({"directory": "ldap", "method": "password", "outcome": "success",
+                       "roles": ["user", "admin"], "source_ip": "192.0.2.1"}),
+            )
+        },
+        on(
+            "api_key_created",
+            42,
+            "2026-10-26T09:01:00.000Z",
+            "API_KEY_CREATED",
+            json!({"expires_at": "2026-11-25T09:01:00.000Z", "key_id": "key-1", "name": "laptop",
+                   "prefix": "abcd1234", "scopes": ["propose_write", "read"]}),
+        ),
+        on(
+            "api_key_revoked",
+            43,
+            "2026-10-26T09:02:00.000Z",
+            "API_KEY_REVOKED",
+            json!({"by": "user", "key_id": "key-1", "prefix": "abcd1234"}),
+        ),
+        on(
+            "auditor_read",
+            44,
+            "2026-10-26T09:03:00.000Z",
+            "AUDITOR_READ",
+            json!({"action": "trail", "request_id": "req_0123456789abcdefghij",
+                   "target_user_id": "0123456789abcdef0123456789abcdef"}),
+        ),
+    ]
+}
+
+fn build_server_kinds(compressed: &dyn Fn(&str, &[u8]) -> Vec<u8>) -> Value {
+    let mut prev = ZERO_HASH;
+    let mut rows = Vec::new();
+    for s in server_row_specs() {
+        let (entry, rh) = build_row(&s, &s.prev_hash.unwrap_or(prev), compressed);
+        rows.push(entry);
+        prev = rh;
+    }
+    json!({"format_version": 1, "rows": rows})
+}
+
+/// `ATLAS_DUCK_REGEN_SERVER_VECTORS=1` writes `server_kinds_v1.json` (local only, like
+/// `ATLAS_DUCK_REGEN_VECTORS`); it never touches the frozen `format_v1.json`.
+fn regen_server() -> bool {
+    let on = std::env::var_os("ATLAS_DUCK_REGEN_SERVER_VECTORS").is_some_and(|v| v == "1");
+    assert!(
+        !(on && CI_VARS.iter().any(|v| std::env::var_os(v).is_some())),
+        "ATLAS_DUCK_REGEN_SERVER_VECTORS=1 is refused under CI"
+    );
+    on
+}
+
+#[test]
+fn server_kinds_vectors_match() {
+    if regen_server() {
+        let mut doc = build_server_kinds(&|_, plain| zstd3(plain));
+        doc.sort_all_objects();
+        let text = serde_json::to_string_pretty(&doc).unwrap() + "\n";
+        std::fs::write(server_kinds_path(), text).unwrap();
+        return;
+    }
+    let text = std::fs::read_to_string(server_kinds_path())
+        .expect("tests/vectors/server_kinds_v1.json missing (ATLAS_DUCK_REGEN_SERVER_VECTORS=1)");
+    let file: Value = serde_json::from_str(&text).unwrap();
+    let committed = |name: &str, plain: &[u8]| -> Vec<u8> {
+        let row = file["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == name)
+            .unwrap_or_else(|| panic!("row {name} missing from server_kinds_v1.json"));
+        let z = hex::decode(row["compressed"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            zstd::bulk::decompress(&z, plain.len()).unwrap(),
+            plain,
+            "{name}"
+        );
+        z
+    };
+    assert_eq!(build_server_kinds(&committed), file);
+    let kinds: Vec<&str> = file["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["fields"]["event_type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "LOGIN",
+            "API_KEY_CREATED",
+            "API_KEY_REVOKED",
+            "AUDITOR_READ"
+        ]
+    );
+}

@@ -1701,3 +1701,43 @@ fn u22_latest_prune_that_does_not_decrypt_is_not_reconciled() {
     ));
     assert!(v.anchor_actions.set_first_retained.is_none());
 }
+
+/// M12 PD-216: the four server-mode kinds are ordinary caller-appendable records; a store holding
+/// one of each (between desktop records) verifies clean, startup and full.
+#[test]
+fn server_kinds_verify_clean() {
+    let (store, f) = new_store(fake_clock(START), MemKeyring::new());
+    append_mixed(&store, 3);
+    for (t, payload) in [
+        (
+            EventType::LOGIN,
+            json!({"directory": "stub", "method": "password", "outcome": "success",
+                   "roles": ["user"], "source_ip": "192.0.2.1"}),
+        ),
+        (
+            EventType::API_KEY_CREATED,
+            json!({"expires_at": "2026-11-25T09:00:00.000Z", "key_id": "k1", "name": "laptop",
+                   "prefix": "abcd1234", "scopes": ["read"]}),
+        ),
+        (
+            EventType::API_KEY_REVOKED,
+            json!({"by": "user", "key_id": "k1", "prefix": "abcd1234"}),
+        ),
+        (
+            EventType::AUDITOR_READ,
+            json!({"action": "trail", "request_id": "req_0123456789abcdefghij",
+                   "target_user_id": "0123456789abcdef0123456789abcdef"}),
+        ),
+    ] {
+        store
+            .append(ev(t, None, payload))
+            .expect("append server kind");
+    }
+    append_mixed(&store, 2);
+    anchor_head(&store);
+    store.shutdown();
+    let v = verdict(&f);
+    assert!(v.findings.is_empty(), "{:?}", v.findings);
+    let fs = full_verify_fresh(&f);
+    assert!(fs.is_empty(), "{fs:?}");
+}
