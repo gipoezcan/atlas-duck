@@ -8,9 +8,9 @@
   },
   "scripts": {
     "build": "tsc --noEmit && vite build",
-    "lint": "eslint . && node scripts/check-html-sinks.mjs src",
+    "lint": "eslint . && node scripts/check-html-sinks.mjs src && node scripts/check-css.mjs src",
     "test": "vitest run",
-    "test:scripts": "node --test scripts/check-html-sinks.test.mjs scripts/eslint-credential.test.mjs",
+    "test:scripts": "node --test scripts/check-html-sinks.test.mjs scripts/eslint-credential.test.mjs scripts/check-css.test.mjs",
     "check:bundle": "node ../../ci/check-credential-bundle.mjs dist"
   },
   "dependencies": {

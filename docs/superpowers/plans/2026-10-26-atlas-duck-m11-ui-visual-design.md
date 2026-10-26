@@ -100,7 +100,7 @@ Light scheme on `:root`, dark scheme on `:root` inside `@media (prefers-color-sc
   --accent: #0a58ca;      --accent-hover: #084298; --accent-subtle: #e7f0fd;
   --danger: #b42318;      --danger-hover: #8f1c13; --danger-subtle: #fdecea; --text-on-danger: #ffffff;
   --warning: #7a4d00;     --warning-subtle: #fff4d6; --warning-border: #b07000;
-  --success: #1a7f37;     --success-subtle: #e6f4ea;
+  --success: #166a2e;     --success-subtle: #e6f4ea;
   --info: #0a58ca;        --info-subtle: #e7f0fd;
   --focus: #0a58ca;
   --row-selected: #e7f0fd; --row-hover: #f3f5f7;
