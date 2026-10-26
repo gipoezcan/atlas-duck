@@ -23,7 +23,7 @@
 #   2. start --background -> `event=serve_started serve_state=core` (APP_START appended) ->
 #      `atlas-duck doctor` exit 0 with the core's answer -> SIGTERM -> `event=app_stop` line, app gone
 #   3. snapshot S0 (sha256 of every file of the data dir, config dir, anchor dir, pinned file) ->
-#      uninstall (deb: apt-get remove, then apt-get purge, each checked; rpm: dnf remove;
+#      uninstall (deb: apt-get remove, then dpkg --purge, each checked; rpm: dnf remove;
 #      AppImage: the file is removed) -> S == S0, entries == E0 after each step
 #   4. reinstall -> S == S0 -> start -> serve core -> SIGTERM -> app_stop
 #   5. ci_fixture_verify (Ready, full verification, no incident, APP_START/APP_STOP chained, >= 2)
@@ -394,8 +394,11 @@ case "$package" in
     $sudo_cmd apt-get remove -y atlas-duck >&2
     [ ! -e /usr/bin/atlas-duck-app ] || die "/usr/bin/atlas-duck-app is still there after apt-get remove"
     check_unchanged "apt-get remove"
-    $sudo_cmd apt-get purge -y atlas-duck >&2
-    check_unchanged "apt-get purge"
+    # The package has no conffiles, so apt-get remove already dropped it from the dpkg database and
+    # apt-get purge fails with "Unable to locate package" (it never came from a repository).
+    # dpkg --purge handles both states: it purges leftover config, or warns and exits 0.
+    $sudo_cmd dpkg --purge atlas-duck >&2
+    check_unchanged "dpkg --purge"
     ;;
   rpm)
     dnf -y remove atlas-duck >&2
