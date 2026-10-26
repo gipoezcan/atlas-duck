@@ -2,6 +2,7 @@
 //! body limit) and the auth routes; Task 14 adds the listener, the other routes and static files.
 
 pub mod admin_routes;
+pub mod api_key_routes;
 pub mod auth_routes;
 pub mod cmd_routes;
 pub mod extract;
@@ -42,6 +43,7 @@ pub struct AppInner {
     pub registry: Arc<Registry>,
     pub web: WebDir,
     pub health: Arc<Health>,
+    pub api_keys: Arc<crate::api_keys::ApiKeys>,
 }
 
 #[derive(Clone)]
@@ -75,7 +77,12 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/me/pats/{alias}",
             put(pat_routes::put).delete(pat_routes::delete),
-        );
+        )
+        .route(
+            "/api/me/api-keys",
+            get(api_key_routes::list).post(api_key_routes::create),
+        )
+        .route("/api/me/api-keys/{id}", delete(api_key_routes::revoke));
     for (path, _) in static_files::PAGES {
         r = r.route(path, get(page));
     }

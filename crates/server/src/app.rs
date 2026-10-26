@@ -129,6 +129,14 @@ async fn run(config: Config) -> u8 {
         clock: clock.clone(),
         sink: Arc::new(RegistrySink(registry.clone())),
     };
+    let api_keys = match crate::api_keys::ApiKeys::new(
+        store.clone(),
+        clock.clone(),
+        crate::api_keys::ApiKeyParams::PRODUCTION,
+    ) {
+        Ok(k) => Arc::new(k),
+        Err(_) => return fail("api_keys_unusable"),
+    };
     let state = AppState(Arc::new(AppInner {
         public_origin: config.public_origin(),
         cookie_secure: config.cookie_secure(),
@@ -139,6 +147,7 @@ async fn run(config: Config) -> u8 {
         registry: registry.clone(),
         web: WebDir(config.web_dir.clone()),
         health: Arc::new(Health::new(store.clone(), directory, true)),
+        api_keys,
     }));
     let started = json!({"version": env!("CARGO_PKG_VERSION"), "mode": format!("{:?}", config.mode).to_lowercase()});
     let writer = Arc::new(AnchorWriter::new(

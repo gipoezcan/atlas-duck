@@ -68,6 +68,7 @@ impl LoginSink for RecSink {
 
 struct H {
     router: Router,
+    state: AppState,
     registry: Arc<crate::runtime::Registry>,
     clock: Arc<ManualClock>,
     stub: Arc<StubDirectory>,
@@ -153,9 +154,18 @@ impl H {
                 stub.clone(),
                 true,
             )),
+            api_keys: Arc::new(
+                crate::api_keys::ApiKeys::new(
+                    store.clone(),
+                    clock.clone(),
+                    crate::api_keys::ApiKeyParams::TEST,
+                )
+                .unwrap(),
+            ),
         }));
         H {
-            router: router(state),
+            router: router(state.clone()),
+            state,
             registry,
             clock,
             stub,
@@ -1352,3 +1362,133 @@ async fn an_unreachable_instance_is_502_and_bad_requests_are_refused() {
 }
 
 const MAX_PAT: usize = super::pat_routes::MAX_PAT_CHARS;
+
+// ---- T18: API keys --------------------------------------------------------------------------
+
+async fn bearer_probe(h: &H, auth: Option<&str>) -> Response {
+    use axum::routing::get;
+    let r: Router = Router::new()
+        .route(
+            "/probe",
+            get(
+                |super::extract::BearerUser(k): super::extract::BearerUser| async move {
+                    axum::Json(json!({"user": k.user.user_id(), "scopes": k.scopes}))
+                },
+            ),
+        )
+        .with_state(h.state.clone());
+    let mut b = Request::builder().uri("/probe");
+    if let Some(a) = auth {
+        b = b.header(header::AUTHORIZATION, a);
+    }
+    tokio::time::timeout(LIMIT, r.oneshot(b.body(Body::empty()).unwrap()))
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_keys_over_http_create_once_list_revoke_and_record() {
+    let h = H::new();
+    let (c, t) = h.session("alice", PW_CANARY).await;
+    let res = admin_call(
+        &h,
+        Method::POST,
+        "/api/me/api-keys",
+        &c,
+        &t,
+        r#"{"name": "laptop", "scopes": ["read", "propose_write"], "expires_in_days": 7}"#,
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(res.headers()[header::CACHE_CONTROL], "no-store");
+    let created = json_body(res).await;
+    let key = created["key"].as_str().unwrap().to_owned();
+    assert!(key.starts_with(&format!("adk_{}_", created["prefix"].as_str().unwrap())));
+    let id = created["id"].as_str().unwrap().to_owned();
+    // The key authenticates as alice with its scopes.
+    let ok = bearer_probe(&h, Some(&format!("Bearer {key}"))).await;
+    assert_eq!(ok.status(), StatusCode::OK);
+    let who = json_body(ok).await;
+    assert_eq!(who["user"], user_id_for("alice"));
+    assert_eq!(who["scopes"], json!(["read", "propose_write"]));
+    // Lists never show the key; the DB never holds it.
+    let listed = json_body(admin_call(&h, Method::GET, "/api/me/api-keys", &c, &t, "").await).await;
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert!(!listed.to_string().contains(&key[13..]));
+    assert!(!contains(&h.db_bytes(), key.as_bytes()));
+    assert!(!contains(&h.db_bytes(), &key.as_bytes()[13..]));
+    // Bob sees none of it and cannot revoke it.
+    let (cb, tb) = h.session("bob", "pw-bob").await;
+    assert_eq!(
+        json_body(admin_call(&h, Method::GET, "/api/me/api-keys", &cb, &tb, "").await).await,
+        json!([])
+    );
+    let res = admin_call(
+        &h,
+        Method::DELETE,
+        &format!("/api/me/api-keys/{id}"),
+        &cb,
+        &tb,
+        "",
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    // Revoke: 204, then the key is refused at once, and the refusal is in alice's chain.
+    let rt = h
+        .registry
+        .runtime(&crate::runtime::UserCtx::from_authenticated(&user_id_for(
+            "alice",
+        )))
+        .await
+        .unwrap();
+    let res = admin_call(
+        &h,
+        Method::DELETE,
+        &format!("/api/me/api-keys/{id}"),
+        &c,
+        &t,
+        "",
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    let before = rt.head().1;
+    let refused = bearer_probe(&h, Some(&format!("Bearer {key}"))).await;
+    assert_eq!(
+        code(refused).await,
+        (StatusCode::UNAUTHORIZED, "auth/api_key_invalid".to_owned())
+    );
+    assert_eq!(rt.head().1, before + 1, "LOGIN refused revoked recorded");
+    // Every other bad bearer answers the same, without a record.
+    for auth in [
+        None,
+        Some("Bearer nope"),
+        Some("Basic abc"),
+        Some(format!("Bearer adk_aaaaaaaa_{}", "A".repeat(43)).as_str()),
+    ] {
+        let res = bearer_probe(&h, auth).await;
+        assert_eq!(
+            code(res).await,
+            (StatusCode::UNAUTHORIZED, "auth/api_key_invalid".to_owned()),
+            "{auth:?}"
+        );
+    }
+    assert_eq!(rt.head().1, before + 1);
+    // Validation errors over HTTP.
+    let (s, c_) = code(
+        admin_call(
+            &h,
+            Method::POST,
+            "/api/me/api-keys",
+            &c,
+            &t,
+            r#"{"name": "x", "scopes": []}"#,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        (s, c_.as_str()),
+        (StatusCode::BAD_REQUEST, "api_key/scope_invalid")
+    );
+}
