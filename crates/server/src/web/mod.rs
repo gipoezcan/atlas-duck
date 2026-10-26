@@ -1,0 +1,146 @@
+//! The axum router and the web API. Task 12: the `/api/` guard (bearer refusal, Origin, CSRF,
+//! body limit) and the auth routes; Task 14 adds the listener, the other routes and static files.
+
+pub mod auth_routes;
+pub mod extract;
+
+#[cfg(test)]
+mod tests;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use axum::Router;
+use axum::extract::{ConnectInfo, Request, State};
+use axum::http::{HeaderMap, Method, header};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+
+use crate::config::Config;
+use crate::csrf::{CSRF_HEADER, origin_ok, token_ok};
+use crate::errors::ApiError;
+use crate::login::LoginService;
+use crate::session::{SessionTable, cookie_value};
+use crate::store::ServerStore;
+
+/// Every `/api/*` body is at most 64 KiB (413 `api/body_too_large`).
+pub const BODY_LIMIT: usize = 64 * 1024;
+
+pub struct AppInner {
+    pub public_origin: String,
+    pub cookie_secure: bool,
+    pub trusted_proxy_hops: u32,
+    pub store: Arc<dyn ServerStore>,
+    pub sessions: Arc<SessionTable>,
+    pub login: LoginService,
+}
+
+#[derive(Clone)]
+pub struct AppState(pub Arc<AppInner>);
+
+impl std::ops::Deref for AppState {
+    type Target = AppInner;
+    fn deref(&self) -> &AppInner {
+        &self.0
+    }
+}
+
+pub fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/api/login", post(auth_routes::login))
+        .route("/api/logout", post(auth_routes::logout))
+        .route("/api/session", get(auth_routes::session))
+        .layer(middleware::from_fn_with_state(state.clone(), api_guard))
+        .with_state(state)
+}
+
+/// SM-3.4: agents never approve; these paths take a session cookie only.
+fn session_only_path(path: &str) -> bool {
+    path.starts_with("/api/cmd/")
+        || path == "/api/cmd"
+        || path.starts_with("/api/me/")
+        || path == "/api/me"
+}
+
+fn header_str(h: &HeaderMap, name: impl header::AsHeaderName) -> Option<&str> {
+    h.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// The `/api/` guard, in this order: body size, bearer on session-only paths, then for
+/// state-changing methods Origin (before any body is read) and, except for `/api/login`, the
+/// session and its CSRF token. The checked session rides on the request for the extractor.
+async fn api_guard(State(st): State<AppState>, mut req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_owned();
+    if !path.starts_with("/api/") {
+        return next.run(req).await;
+    }
+    let headers = req.headers();
+    if header_str(headers, header::CONTENT_LENGTH)
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|n| n > BODY_LIMIT)
+    {
+        return ApiError::BODY_TOO_LARGE.into_response();
+    }
+    if session_only_path(&path) && headers.contains_key(header::AUTHORIZATION) {
+        return ApiError::BEARER_NOT_ACCEPTED.into_response();
+    }
+    let changing = req.method() != Method::GET && req.method() != Method::HEAD;
+    if changing {
+        if !origin_ok(header_str(headers, header::ORIGIN), &st.public_origin) {
+            return ApiError::ORIGIN_MISMATCH.into_response();
+        }
+        if path != "/api/login" {
+            let Some(cookie) = header_str(headers, header::COOKIE).and_then(cookie_value) else {
+                return ApiError::NO_SESSION.into_response();
+            };
+            let session = match st.sessions.lookup(cookie) {
+                Ok(s) => s,
+                Err(e) => return e.into_response(),
+            };
+            if !token_ok(header_str(headers, CSRF_HEADER), &session.csrf_token) {
+                return ApiError::CSRF_MISMATCH.into_response();
+            }
+            req.extensions_mut().insert(session);
+        }
+    }
+    next.run(req).await
+}
+
+/// The client address (PD-201): with `hops` > 0 the `hops`-th `X-Forwarded-For` entry from the
+/// right (the address the outermost trusted proxy saw), else the peer address.
+pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>, hops: u32) -> String {
+    let peer_ip = || peer.map_or_else(|| "unknown".to_owned(), |p| p.ip().to_string());
+    if hops == 0 {
+        return peer_ip();
+    }
+    let entries: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let n = hops as usize;
+    match entries.len() {
+        0 => peer_ip(),
+        len if len >= n => entries[len - n].to_owned(),
+        _ => entries[0].to_owned(),
+    }
+}
+
+/// The peer address axum's `into_make_service_with_connect_info` records, if any.
+pub fn peer(req_ext: &axum::http::Extensions) -> Option<SocketAddr> {
+    req_ext.get::<ConnectInfo<SocketAddr>>().map(|c| c.0)
+}
+
+/// Runs the server until shutdown and answers the process exit code. The listener, router and
+/// runtimes arrive with Task 14; until then `serve` stops after a valid configuration.
+pub fn serve(_config: Config) -> u8 {
+    tracing::error!(
+        event = "serve_not_built",
+        "the HTTP server is not built yet (M12 T14)"
+    );
+    crate::cli::EXIT_RUNTIME
+}

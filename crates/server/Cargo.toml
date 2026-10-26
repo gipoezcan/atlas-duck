@@ -65,6 +65,8 @@ rmcp = { workspace = true, features = ["client", "transport-streamable-http-clie
 # Cookie-carrying HTTP client of the in-process API tests.
 reqwest = { workspace = true, features = ["json"] }
 tokio = { workspace = true, features = ["test-util"] }
+# `ServiceExt::oneshot` for in-process router tests (axum's own tower, already locked).
+tower = { workspace = true, features = ["util"] }
 
 # Plan "Global Constraints" (lints).
 [lints.clippy]

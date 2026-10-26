@@ -58,6 +58,9 @@ pub mod recovery;
 mod recovery;
 pub mod request_set;
 pub mod requests;
+/// The server anchor chain's pure hash functions (M12 PD-217), shared by the server and
+/// `verify-export`.
+pub mod server_anchor;
 mod restore;
 // Read-write connections, DDL and the migration runner (I-4: the writer thread is the only
 // read-write user of `audit.db`); production builds re-export only the names below.

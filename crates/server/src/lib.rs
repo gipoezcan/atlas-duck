@@ -11,6 +11,7 @@ pub mod anchor;
 pub mod api_keys;
 pub mod audit_kinds;
 pub mod cli;
+pub mod clock;
 pub mod cmd;
 pub mod config;
 pub mod credentials;
