@@ -168,7 +168,9 @@ describe('check-css', () => {
   });
 
   test('credential_transition_needs_its_own_reduce_block', () => {
-    const text = `${BASELINE['credential/credential.css']}\nbutton { transition: color 1s; }\n`;
+    const withoutBlock = BASELINE['credential/credential.css'].replace(/@media \(prefers-reduced-motion[\s\S]*$/, '');
+    assert.ok(withoutBlock.length < BASELINE['credential/credential.css'].length, 'fixture sanity: the reduce block was removed');
+    const text = `${withoutBlock}\nbutton { transition: color 1s; }\n`;
     const v = violationsFor({ 'credential/credential.css': text });
     assert.ok(hasMatch(v, /credential\.css: transition\/animation without/), v.join('\n'));
   });
