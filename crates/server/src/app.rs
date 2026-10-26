@@ -9,7 +9,7 @@ use atlas_duck_audit::lock::InstanceLock;
 use atlas_duck_ipc::paths::{DataDirResolution, check_data_dir};
 use serde_json::json;
 
-use crate::anchor::append_operational;
+use crate::anchor::AnchorWriter;
 use crate::cli::{EXIT_CONFIG, EXIT_OK, EXIT_RUNTIME, config_error_fields};
 use crate::clock::{Clock, SystemClock};
 use crate::config::{Config, DirectoryConfig};
@@ -28,8 +28,6 @@ use crate::store::ServerStore;
 use crate::store::sqlite::SqliteStore;
 use crate::web::{AppInner, AppState, router};
 
-pub const KIND_SERVER_START: &str = "SERVER_START";
-pub const KIND_SERVER_STOP: &str = "SERVER_STOP";
 const LOCK_HOST: &str = "atlas-duck-server";
 
 fn fail(event: &'static str) -> u8 {
@@ -142,9 +140,15 @@ async fn run(config: Config) -> u8 {
         health: Arc::new(Health::new(store.clone(), directory, true)),
     }));
     let started = json!({"version": env!("CARGO_PKG_VERSION"), "mode": format!("{:?}", config.mode).to_lowercase()});
-    if append_operational(store.as_ref(), clock.now(), KIND_SERVER_START, &started).is_err() {
+    let writer = Arc::new(AnchorWriter::new(
+        store.clone(),
+        registry.clone(),
+        clock.clone(),
+    ));
+    if writer.start(&started).is_err() {
         return fail("anchor_append_failed");
     }
+    let anchor_timer = writer.spawn(config.anchor_interval);
     let Ok(listener) = tokio::net::TcpListener::bind(config.listen).await else {
         return fail("listen_failed");
     };
@@ -156,8 +160,11 @@ async fn run(config: Config) -> u8 {
     .with_graceful_shutdown(shutdown_signal())
     .await;
     sweeper.abort();
-    registry.close_all().await;
-    let _ = append_operational(store.as_ref(), clock.now(), KIND_SERVER_STOP, &json!({}));
+    anchor_timer.abort();
+    // Final heads (RUNTIME_CLOSED per runtime, after its APP_STOP) and SERVER_STOP.
+    if writer.shutdown().await.is_err() {
+        tracing::error!(event = "anchor_append_failed", kind = "SERVER_STOP");
+    }
     match served {
         Ok(()) => {
             tracing::info!(event = "stopped");

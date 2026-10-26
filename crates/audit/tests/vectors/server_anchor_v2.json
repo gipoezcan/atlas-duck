@@ -1,0 +1,61 @@
+{
+  "format": "server-anchor/v2",
+  "heads_body": "{\"leaves\":[\"c208c76c15bffb41d60e19f8f4e1df323eb2f96ec71c8c1239580c3f6b4b084e\",\"d7db9e57f894d36ace592b426119bccbf29c8189bd89f01bd92e9dbcd35c672b\",\"f45effffd3ae76c1794cb68a56477552a8ecdbe7888234eb65911b7a101be6c7\"]}",
+  "leaves": [
+    {
+      "chain_id": "a4c1e9d27b3f4056b8e1c3a5d7f90b2e",
+      "leaf": "c208c76c15bffb41d60e19f8f4e1df323eb2f96ec71c8c1239580c3f6b4b084e",
+      "record_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+      "seq": 1,
+      "user_id": "0123456789abcdef0123456789abcdef"
+    },
+    {
+      "chain_id": "e7d3b1a9c5f24068aa1c3e5f7b9d0c2e",
+      "leaf": "d7db9e57f894d36ace592b426119bccbf29c8189bd89f01bd92e9dbcd35c672b",
+      "record_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "seq": 1250999896491,
+      "user_id": "fedcba9876543210fedcba9876543210"
+    },
+    {
+      "chain_id": "a4c1e9d27b3f4056b8e1c3a5d7f90b2e",
+      "leaf": "f45effffd3ae76c1794cb68a56477552a8ecdbe7888234eb65911b7a101be6c7",
+      "record_hash": "8bd6b59d68ca915f03d98aac8a24290b95e5a25850c4829f7c1aab6f76b344db",
+      "seq": 42,
+      "user_id": "0123456789abcdef0123456789abcdef"
+    }
+  ],
+  "rows": [
+    {
+      "body_jcs": "{}",
+      "hash": "2585c5529fa3f00769eda2ff37708f07c1c4fe109c4066c4be5f95b6801921ee",
+      "kind": "ANCHOR_GENESIS",
+      "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "seq": 1,
+      "ts_utc": "2026-10-26T09:00:00.000Z"
+    },
+    {
+      "body_jcs": "{\"version\":\"0.1.0\"}",
+      "hash": "b4d219211a37fe7243f847783163bc4c030c3e156f7b904f63698da212dee7f8",
+      "kind": "SERVER_START",
+      "prev_hash": "2585c5529fa3f00769eda2ff37708f07c1c4fe109c4066c4be5f95b6801921ee",
+      "seq": 2,
+      "ts_utc": "2026-10-26T09:00:00.001Z"
+    },
+    {
+      "body_jcs": "{\"leaves\":[\"c208c76c15bffb41d60e19f8f4e1df323eb2f96ec71c8c1239580c3f6b4b084e\",\"d7db9e57f894d36ace592b426119bccbf29c8189bd89f01bd92e9dbcd35c672b\",\"f45effffd3ae76c1794cb68a56477552a8ecdbe7888234eb65911b7a101be6c7\"]}",
+      "hash": "c885437d330f1223242988d13300e1e2a31fd65d2e00f893f6a5989eab79f8a9",
+      "kind": "HEADS",
+      "prev_hash": "b4d219211a37fe7243f847783163bc4c030c3e156f7b904f63698da212dee7f8",
+      "seq": 3,
+      "ts_utc": "2026-10-26T09:15:00.000Z"
+    },
+    {
+      "body_jcs": "{\"reason\":\"invalid_credentials\",\"source_ip\":\"192.0.2.1\",\"username\":\"jürgen\"}",
+      "hash": "3eae6283729423dd4a84f09f0b4ee5aa17d63484b0d282f40bb6e65be163c89d",
+      "kind": "LOGIN_FAILED",
+      "prev_hash": "c885437d330f1223242988d13300e1e2a31fd65d2e00f893f6a5989eab79f8a9",
+      "seq": 4,
+      "ts_utc": "2026-10-26T09:16:30.250Z"
+    }
+  ]
+}

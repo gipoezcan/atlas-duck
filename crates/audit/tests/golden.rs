@@ -965,3 +965,93 @@ fn server_kinds_vectors_match() {
         ]
     );
 }
+
+// ---- M12 PD-217: the server anchor chain's row and leaf hashes ------------------------------
+
+fn server_anchor_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/server_anchor_v2.json")
+}
+
+fn build_server_anchor() -> Value {
+    use atlas_duck_audit::server_anchor::{heads_body_jcs, leaf_hash, row_hash};
+    let leaf_inputs = [
+        (
+            "0123456789abcdef0123456789abcdef",
+            CHAIN_ID,
+            1u64,
+            [0x11u8; 32],
+        ),
+        (
+            "fedcba9876543210fedcba9876543210",
+            CHAIN_ID_2,
+            LARGE_SEQ,
+            [0xeeu8; 32],
+        ),
+        (
+            "0123456789abcdef0123456789abcdef",
+            CHAIN_ID,
+            42u64,
+            sha256(b"head 42"),
+        ),
+    ];
+    let leaves: Vec<Value> = leaf_inputs
+        .iter()
+        .map(|(u, c, s, h)| {
+            json!({"user_id": u, "chain_id": c, "seq": s, "record_hash": hex::encode(h),
+                   "leaf": hex::encode(leaf_hash(u, c, *s, h))})
+        })
+        .collect();
+    let leaf_bytes: Vec<[u8; 32]> = leaf_inputs
+        .iter()
+        .map(|(u, c, s, h)| leaf_hash(u, c, *s, h))
+        .collect();
+    let heads = String::from_utf8(heads_body_jcs(&leaf_bytes).unwrap()).unwrap();
+    let mut prev = [0u8; 32];
+    let mut rows = Vec::new();
+    for (seq, ts, kind, body) in [
+        (
+            1u64,
+            "2026-10-26T09:00:00.000Z",
+            "ANCHOR_GENESIS",
+            "{}".to_owned(),
+        ),
+        (
+            2,
+            "2026-10-26T09:00:00.001Z",
+            "SERVER_START",
+            r#"{"version":"0.1.0"}"#.to_owned(),
+        ),
+        (3, "2026-10-26T09:15:00.000Z", "HEADS", heads.clone()),
+        (
+            4,
+            "2026-10-26T09:16:30.250Z",
+            "LOGIN_FAILED",
+            r#"{"reason":"invalid_credentials","source_ip":"192.0.2.1","username":"jürgen"}"#
+                .to_owned(),
+        ),
+    ] {
+        let hash = row_hash(seq, ts, kind, body.as_bytes(), &prev);
+        rows.push(
+            json!({"seq": seq, "ts_utc": ts, "kind": kind, "body_jcs": body,
+                         "prev_hash": hex::encode(prev), "hash": hex::encode(hash)}),
+        );
+        prev = hash;
+    }
+    json!({"format": "server-anchor/v2", "leaves": leaves, "heads_body": heads, "rows": rows})
+}
+
+#[test]
+fn server_anchor_vectors_match() {
+    let built = build_server_anchor();
+    if regen_server() {
+        let mut doc = built;
+        doc.sort_all_objects();
+        let text = serde_json::to_string_pretty(&doc).unwrap() + "\n";
+        std::fs::write(server_anchor_path(), text).unwrap();
+        return;
+    }
+    let text = std::fs::read_to_string(server_anchor_path())
+        .expect("tests/vectors/server_anchor_v2.json missing (ATLAS_DUCK_REGEN_SERVER_VECTORS=1)");
+    let file: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(built, file, "server anchor vectors differ: a format break");
+}

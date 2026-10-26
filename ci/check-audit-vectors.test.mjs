@@ -14,7 +14,9 @@ import {
   SERVER_KINDS,
   canonicalize,
   checkFrozen,
+  checkServerAnchorVectors,
   checkServerKindVectors,
+  DEFAULT_SERVER_ANCHOR_VECTORS,
   checkVectors,
   frame,
 } from "./check-audit-vectors.mjs";
@@ -50,7 +52,7 @@ test("the committed vectors pass", () => {
   assert.equal(res.status, 0, res.stdout + res.stderr);
   assert.match(
     res.stderr,
-    /^check-audit-vectors: ok \(5 rows, 4 request sets, 3 prune rows, 5 jcs, 3 dek wraps, 7 query tags, recovery layout; 4 server-kind rows\)$/m,
+    /^check-audit-vectors: ok \(5 rows, 4 request sets, 3 prune rows, 5 jcs, 3 dek wraps, 7 query tags, recovery layout; 4 server-kind rows; server anchor vectors\)$/m,
   );
   assert.deepEqual(checkVectors(load()), []);
 });
@@ -203,4 +205,24 @@ test("canonicalize follows RFC 8785", () => {
   const emoji = String.fromCodePoint(0x1f600);
   assert.equal(canonicalize({ [dagesh]: 1, [emoji]: 2 }), `{"${emoji}":2,"${dagesh}":1}`);
   assert.equal(canonicalize([-0, 1e21, 1e-7]), "[0,1e+21,1e-7]");
+});
+
+// ---------- M12 PD-217: server anchor chain ----------
+
+const loadAnchor = () => JSON.parse(readFileSync(DEFAULT_SERVER_ANCHOR_VECTORS, "utf8"));
+
+test("the server anchor vectors recompute", () => {
+  assert.deepEqual(checkServerAnchorVectors(loadAnchor()), []);
+});
+
+test("a tampered server anchor vector is caught", () => {
+  const leaf = loadAnchor();
+  leaf.leaves[0].seq += 1;
+  assert.ok(checkServerAnchorVectors(leaf).some((m) => /leaves\[0\]: leaf differs/.test(m)));
+  const body = loadAnchor();
+  body.rows[2].body_jcs = body.rows[2].body_jcs.replace('"leaves"', '"leaves" ');
+  assert.ok(checkServerAnchorVectors(body).some((m) => /rows\[2\]/.test(m)));
+  const link = loadAnchor();
+  link.rows[1].prev_hash = "00".repeat(32);
+  assert.ok(checkServerAnchorVectors(link).some((m) => /rows\[1\]: prev_hash does not link/.test(m)));
 });

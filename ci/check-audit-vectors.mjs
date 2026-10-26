@@ -356,6 +356,69 @@ export function checkServerKindVectors(doc, notes = new Set()) {
   return [...out, ...rowsOut.map((m) => `server kinds ${m}`)];
 }
 
+// M12 PD-217: the server anchor chain (rows v2, user-head leaves, the HEADS body).
+export const DEFAULT_SERVER_ANCHOR_VECTORS = join(REPO_ROOT, "crates", "audit", "tests", "vectors", "server_anchor_v2.json");
+
+/** `SHA-256("atlas-duck/anchor-leaf/v1\0" || user_id || "\0" || chain_id || "\0" || seq_be || record_hash)`. */
+export function anchorLeaf(userId, chainId, seq, recordHashHex) {
+  return sha256(
+    Buffer.from("atlas-duck/anchor-leaf/v1\0", "utf8"),
+    Buffer.from(userId, "utf8"),
+    Buffer.from([0]),
+    Buffer.from(chainId, "utf8"),
+    Buffer.from([0]),
+    u64be(seq, "seq"),
+    hexBytes(recordHashHex, "record_hash"),
+  );
+}
+
+/** `SHA-256("atlas-duck/anchor/v2\0" || seq_be || ts_utc || kind || SHA-256(body_jcs) || prev_hash)`. */
+export function anchorRowHash(seq, tsUtc, kind, bodyJcs, prevHashHex) {
+  return sha256(
+    Buffer.from("atlas-duck/anchor/v2\0", "utf8"),
+    u64be(seq, "seq"),
+    Buffer.from(tsUtc, "utf8"),
+    Buffer.from(kind, "utf8"),
+    sha256(Buffer.from(bodyJcs, "utf8")),
+    hexBytes(prevHashHex, "prev_hash"),
+  );
+}
+
+export function checkServerAnchorVectors(doc) {
+  const out = [];
+  if (doc.format !== "server-anchor/v2") out.push("server anchor: format must be server-anchor/v2");
+  for (const k of ["leaves", "rows"]) {
+    if (!Array.isArray(doc[k]) || doc[k].length === 0) out.push(`server anchor: ${k} must be a non-empty array`);
+  }
+  if (out.length > 0) return out;
+  const leaves = [];
+  doc.leaves.forEach((l, i) => {
+    try {
+      const leaf = anchorLeaf(l.user_id, l.chain_id, l.seq, l.record_hash).toString("hex");
+      if (leaf !== l.leaf) out.push(`server anchor leaves[${i}]: leaf differs`);
+      leaves.push(leaf);
+    } catch (e) {
+      out.push(`server anchor leaves[${i}]: ${e.message}`);
+    }
+  });
+  const body = canonicalize({ leaves: [...leaves].sort() });
+  if (body !== doc.heads_body) out.push("server anchor: heads_body is not the sorted JCS of the leaves");
+  let prev = "00".repeat(32);
+  doc.rows.forEach((r, i) => {
+    try {
+      if (r.seq !== i + 1) out.push(`server anchor rows[${i}]: seq must be ${i + 1}`);
+      if (r.prev_hash !== prev) out.push(`server anchor rows[${i}]: prev_hash does not link`);
+      if (canonicalize(JSON.parse(r.body_jcs)) !== r.body_jcs) out.push(`server anchor rows[${i}]: body is not JCS`);
+      const h = anchorRowHash(r.seq, r.ts_utc, r.kind, r.body_jcs, r.prev_hash).toString("hex");
+      if (h !== r.hash) out.push(`server anchor rows[${i}]: hash differs`);
+      prev = r.hash;
+    } catch (e) {
+      out.push(`server anchor rows[${i}]: ${e.message}`);
+    }
+  });
+  return out;
+}
+
 /** Returns the list of mismatches (empty = ok). */
 export function checkVectors(doc, notes = new Set()) {
   const out = [];
@@ -448,6 +511,12 @@ export function main(argv = process.argv.slice(2)) {
     } catch (err) {
       mismatches.push(`server kinds: cannot read ${DEFAULT_SERVER_VECTORS}: ${err.message}`);
     }
+    try {
+      const anchor = JSON.parse(readFileSync(DEFAULT_SERVER_ANCHOR_VECTORS, "utf8"));
+      mismatches.push(...checkServerAnchorVectors(anchor));
+    } catch (err) {
+      mismatches.push(`server anchor: cannot read ${DEFAULT_SERVER_ANCHOR_VECTORS}: ${err.message}`);
+    }
   }
   for (const n of notes) console.error(n);
   for (const m of mismatches) console.log(m);
@@ -456,7 +525,7 @@ export function main(argv = process.argv.slice(2)) {
     `check-audit-vectors: ok (${doc.rows.length} rows, ${doc.request_sets.length} request sets, ` +
       `${doc.prune_rows.length} prune rows, ${doc.jcs.length} jcs, ${doc.dek_wraps.length} dek wraps, ` +
       `${doc.query_tags.length} query tags, recovery layout` +
-      (argv[0] === undefined ? `; ${serverRows} server-kind rows)` : ")"),
+      (argv[0] === undefined ? `; ${serverRows} server-kind rows; server anchor vectors)` : ")"),
   );
   return 0;
 }
