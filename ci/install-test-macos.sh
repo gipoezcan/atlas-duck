@@ -303,7 +303,8 @@ run_fixture() {
   cat "$out" >&2
   cp "$out" "$evidence/" 2>/dev/null || true
   grep -q '^test result: ok\. 1 passed' "$out" || die "ci_fixture $1 did not report exactly one passed test"
-  grep -E "^$2 " "$out" | tail -n 1 | grep . || die "ci_fixture $1 printed no $2 line"
+  # libtest prints a passing test's output right after "test <name> ... " on the same line.
+  grep -oE "(^|[.][.][.] )$2 .*" "$out" | sed 's/^[.][.][.] //' | tail -n 1 | grep . || die "ci_fixture $1 printed no $2 line"
 }
 
 # debug_run_app <what>: start with a cleared environment, APP_START (serve_started core), SIGTERM,

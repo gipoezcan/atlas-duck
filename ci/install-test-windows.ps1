@@ -235,7 +235,9 @@ function Invoke-Fixture([string]$Test, [string]$Marker) {
     Write-Host $r.Out
     if ($r.Err) { Write-Host $r.Err }
     if ($r.ExitCode -ne 0) { Fail "ci_fixture $Test exited with $($r.ExitCode)" }
-    $line = @(($r.Out -split "`r?`n") | Where-Object { $_.StartsWith($Marker + ' ') }) | Select-Object -Last 1
+    # libtest prints a passing test's output right after "test <name> ... " on the same line.
+    $pat = '(?:^|\.\.\. )(' + [regex]::Escape($Marker) + ' .*)$'
+    $line = @(($r.Out -split "`r?`n") | ForEach-Object { $m = [regex]::Match($_, $pat); if ($m.Success) { $m.Groups[1].Value } }) | Select-Object -Last 1
     if (-not $line) { Fail "ci_fixture $Test printed no $Marker line" }
     if (($r.Out -notmatch '(?m)^test result: ok\. 1 passed')) { Fail "ci_fixture $Test did not report exactly one passed test" }
     return $line

@@ -311,7 +311,8 @@ run_fixture() {
   fi
   cat "$out" >&2
   grep -q '^test result: ok\. 1 passed' "$out" || die "ci_fixture $1 did not report exactly one passed test"
-  grep -E "^$2 " "$out" | tail -n 1 | grep . || die "ci_fixture $1 printed no $2 line"
+  # libtest prints a passing test's output right after "test <name> ... " on the same line.
+  grep -oE "(^|[.][.][.] )$2 .*" "$out" | sed 's/^[.][.][.] //' | tail -n 1 | grep . || die "ci_fixture $1 printed no $2 line"
 }
 
 info "1. pinned fixture, store with the Secret Service, entries"
