@@ -66,7 +66,7 @@ sha2 = "=0.11.0"
 hmac = "=0.13.0"
 hkdf = "=0.13.0"
 argon2 = { version = "=0.6.0", default-features = false, features = ["alloc", "zeroize"] }
-zstd = { version = "=0.14.0", default-features = false }
+zstd = { version = "=0.14.3", default-features = false }
 getrandom = "=0.4.3"
 zeroize = "=1.9.1"
 secrecy = "=0.10.3"
