@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use atlas_duck_core::{AttentionKind, UiEvent, UiSink};
+use atlas_duck_core::{UiEvent, UiSink};
 use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter, Runtime};
 
@@ -123,33 +123,9 @@ pub fn emit_status_changed(out: &dyn EventOut) {
     out.emit(name, payload);
 }
 
-/// The C.10 event name and payload of a core event.
-pub fn wire(e: &UiEvent) -> (&'static str, Value) {
-    match e {
-        UiEvent::QueueChanged { request_ids } => {
-            ("queue_changed", json!({ "request_ids": request_ids }))
-        }
-        UiEvent::Attention { kind, count } => (
-            "attention",
-            json!({ "kind": attention_kind(*kind), "count": count }),
-        ),
-        UiEvent::StatusBanner { line_ids } => ("status_banner", json!({ "line_ids": line_ids })),
-        UiEvent::NeedsAttentionChanged { count } => {
-            ("needs_attention_changed", json!({ "count": count }))
-        }
-        UiEvent::RunningScriptsChanged => ("running_scripts_changed", Value::Null),
-        UiEvent::CredentialContextChanged => ("credential_context_changed", Value::Null),
-    }
-}
-
-fn attention_kind(k: AttentionKind) -> &'static str {
-    match k {
-        AttentionKind::New => "new",
-        AttentionKind::Stale => "stale",
-        AttentionKind::Failed => "failed",
-        AttentionKind::OutcomeUnknown => "outcome_unknown",
-    }
-}
+/// The C.10 event name and payload of a core event (one table with the server's SSE events,
+/// M12 PD-206).
+pub use atlas_duck_core::decision::wire::ui_event_json as wire;
 
 /// Emits every core event as a Tauri event and forwards it to `tee` (the scripted approver of
 /// the test build, Task 21).
@@ -209,6 +185,8 @@ impl UiSink for TauriUiSink {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+
+    use atlas_duck_core::AttentionKind;
 
     use super::*;
 

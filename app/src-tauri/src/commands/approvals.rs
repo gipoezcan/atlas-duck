@@ -4,20 +4,25 @@
 //! decides, this layer only maps the wire types and never decides anything itself.
 
 use atlas_duck_core::{
-    BatchOutcome, CandidateRev, Decision, DecisionApi, DecisionOutcome, PreviewDelivery, QueueItem,
-    RecentItem, RedactionContext, RedactionReport, RequestDetail,
+    BatchOutcome, CandidateRev, DecisionApi, DecisionOutcome, QueueItem, RecentItem,
+    RedactionReport,
 };
+use atlas_duck_preview::render;
 use atlas_duck_preview::render::raw::incomplete_tail;
-use atlas_duck_preview::{Platform, Preview, PreviewBody, render};
 use base64::Engine;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tauri::{AppHandle, Runtime};
 
-use super::dto::{
-    Args, BatchItems, CandidateRevDto, DecisionDto, DenyDetailsDto, EditsDto, PreviewOpsDto,
-    Reason, RedactionOpWire, RedactionOpsDto, RequestId, RequestIds, SessionId,
-};
+use super::dto::{Args, BatchItems, Reason, RequestIds, SessionId};
 use super::{CommandError, blocking, core, finish};
+
+// The argument structs and response DTOs live in core (M12 PD-206), shared with the server.
+pub use atlas_duck_core::decision::wire::{
+    AcknowledgeAttentionArgs, DecideArgs, DecideBatchArgs, DenyBatchArgs, DenyCount,
+    DenySessionArgs, PreviewFetchArgs, PreviewFetchResponse, QueueDetail, QueueGetArgs,
+    QueueListArgs, RawPageArgs, RawPageDto, RecentListArgs, RedactionContextDto,
+    RedactionPreviewArgs, preview_fetch_response,
+};
 
 /// Runs `f` over the serving core's `DecisionApi` on the blocking pool (M3 PD-13) and records the
 /// response (S-16). `NotReady` without a serving core.
@@ -38,10 +43,6 @@ where
 }
 
 /// `queue_list {}` (C.10): the queue rows, oldest first.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct QueueListArgs {}
-
 #[tauri::command]
 pub async fn queue_list<R: Runtime>(
     app: AppHandle<R>,
@@ -52,24 +53,11 @@ pub async fn queue_list<R: Runtime>(
 }
 
 /// `queue_get {request_id}` (C.10): one row; `not_found` once it left the queue.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct QueueGetArgs {
-    pub request_id: RequestId,
-}
-
 pub fn queue_get_dto(d: &dyn DecisionApi, request_id: &str) -> Result<QueueItem, CommandError> {
     d.queue_get(request_id).ok_or(CommandError::NotFound)
 }
 
-/// What `queue_get` returns (T14): the queue row and the Request tab's facts (params, hash,
-/// reason, connection). `queue_list` rows stay light and carry no `request`.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct QueueDetail {
-    pub item: QueueItem,
-    pub request: RequestDetail,
-}
-
+/// What `queue_get` returns (T14): the queue row and the Request tab's facts.
 pub fn queue_detail_dto(
     d: &dyn DecisionApi,
     request_id: &str,
@@ -92,33 +80,6 @@ pub async fn queue_get<R: Runtime>(
 /// (C.10, PD-20, PD-66): one decision on the revision the approver saw. Which combinations make
 /// sense (a release of a write, an approve of an unopened revision, an edit of a target) is
 /// core's call and its refusals pass through unchanged.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DecideArgs {
-    pub request_id: RequestId,
-    pub decision: DecisionDto,
-    pub candidate_rev: CandidateRevDto,
-    pub edits: Option<EditsDto>,
-    pub redactions: Option<RedactionOpsDto>,
-    pub reason: Option<Reason>,
-    pub deny_details: Option<DenyDetailsDto>,
-}
-
-impl DecideArgs {
-    /// The core decision, field for field.
-    pub fn into_decision(self) -> Decision {
-        Decision {
-            request_id: self.request_id.into_inner(),
-            decision: self.decision.0,
-            candidate_rev: self.candidate_rev.0,
-            edits: self.edits.map(|e| e.0),
-            redactions: self.redactions.map(|r| r.0),
-            reason: self.reason.map(Reason::into_inner),
-            deny_details: self.deny_details.map(|d| d.0),
-        }
-    }
-}
-
 pub fn decide_dto(d: &dyn DecisionApi, args: DecideArgs) -> Result<DecisionOutcome, CommandError> {
     Ok(d.decide(args.into_decision())?)
 }
@@ -134,12 +95,6 @@ pub async fn decide<R: Runtime>(
 
 /// `decide_batch {items}` (C.10, L43): the natural positive decision of each item, all or
 /// nothing; core confirms in its own native dialog (U-32).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DecideBatchArgs {
-    pub items: BatchItems,
-}
-
 pub fn decide_batch_dto(
     d: &dyn DecisionApi,
     items: BatchItems,
@@ -156,26 +111,11 @@ pub async fn decide_batch<R: Runtime>(
     with_decisions(&app, move |d| decide_batch_dto(d, items)).await
 }
 
-/// How many items a batch deny denied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct DenyCount {
-    pub denied: u64,
-}
-
 fn deny_count(n: usize) -> DenyCount {
-    DenyCount {
-        denied: u64::try_from(n).unwrap_or(u64::MAX),
-    }
+    DenyCount::of(n)
 }
 
 /// `deny_batch {request_ids, reason}` (Δ1, L43): no dialog, per item, not all-or-nothing.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DenyBatchArgs {
-    pub request_ids: RequestIds,
-    pub reason: Reason,
-}
-
 pub fn deny_batch_dto(
     d: &dyn DecisionApi,
     request_ids: &RequestIds,
@@ -199,13 +139,6 @@ pub async fn deny_batch<R: Runtime>(
 }
 
 /// `deny_session {session_id, reason}` (Δ1, PD-86): denies the queued items of one session.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DenySessionArgs {
-    pub session_id: SessionId,
-    pub reason: Reason,
-}
-
 /// The session key behind `session_id` is found in the queue here, in Rust; no path crosses the
 /// webview boundary. An id no queued item carries is `not_found` and denies nothing.
 pub fn deny_session_dto(
@@ -232,12 +165,6 @@ pub async fn deny_session<R: Runtime>(
 }
 
 /// `acknowledge_attention {request_ids}` (C.10): in memory, not audited.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AcknowledgeAttentionArgs {
-    pub request_ids: RequestIds,
-}
-
 #[tauri::command]
 pub async fn acknowledge_attention<R: Runtime>(
     app: AppHandle<R>,
@@ -252,10 +179,6 @@ pub async fn acknowledge_attention<R: Runtime>(
 }
 
 /// `recent_list {}` (Δ1): the "Recently decided (24 h) / Needs attention" rows.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RecentListArgs {}
-
 #[tauri::command]
 pub async fn recent_list<R: Runtime>(
     app: AppHandle<R>,
@@ -267,14 +190,6 @@ pub async fn recent_list<R: Runtime>(
 
 /// `redaction_preview {request_id, candidate_rev, ops}` (Δ1, Δ2): what `ops` would do to an
 /// opened revision; UI-only, nothing is logged.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RedactionPreviewArgs {
-    pub request_id: RequestId,
-    pub candidate_rev: CandidateRevDto,
-    pub ops: PreviewOpsDto,
-}
-
 pub fn redaction_preview_dto(
     d: &dyn DecisionApi,
     args: &RedactionPreviewArgs,
@@ -291,43 +206,6 @@ pub async fn redaction_preview<R: Runtime>(
     with_decisions(&app, move |d| redaction_preview_dto(d, &args)).await
 }
 
-/// `preview_fetch {request_id, candidate_rev?}` (Δ1). Without `candidate_rev` the current
-/// revision is shown (a missing `Option` field is `None`; no `#[serde(default)]` around a bounded
-/// newtype, `check-commands`).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PreviewFetchArgs {
-    pub request_id: RequestId,
-    pub candidate_rev: Option<CandidateRevDto>,
-}
-
-/// `{preview, srcdoc, redaction}` (Δ1, PD-67; `redaction` M6 T17): the preview model for the
-/// Structured/Raw/Request tabs, the Rust-rendered document the UI sets as the `srcDoc` of the
-/// `<iframe sandbox="">`, and what the redaction panel builds on (`null` for a write or a read
-/// outcome item).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct PreviewFetchResponse {
-    pub preview: Preview,
-    pub srcdoc: String,
-    pub redaction: Option<RedactionContextDto>,
-}
-
-/// `RedactionContext` with its ops in the wire form the UI sends back (`RedactionOpWire`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct RedactionContextDto {
-    pub ops: Vec<RedactionOpWire>,
-    pub url_fields: Vec<&'static str>,
-}
-
-impl From<&RedactionContext> for RedactionContextDto {
-    fn from(c: &RedactionContext) -> Self {
-        RedactionContextDto {
-            ops: c.ops.iter().map(RedactionOpWire::from).collect(),
-            url_fields: c.url_fields.clone(),
-        }
-    }
-}
-
 /// What `preview_fetch` does over a `DecisionApi`: core commits `PREVIEW_SHOWN` before it returns
 /// the preview (§5.6 "Opened"); the document is rendered from that same preview.
 pub fn preview_fetch_dto(
@@ -339,26 +217,6 @@ pub fn preview_fetch_dto(
         .preview_fetch(request_id, rev)
         .map_err(CommandError::from_candidate_read)?;
     Ok(preview_fetch_response(delivery))
-}
-
-/// The response for a delivered preview: the document rendered from it, and the preview without
-/// the attachment thumbnail (T20b review m-1). The thumbnail reaches the screen only through the
-/// document (no UI code reads `thumbnail_data_uri`), so at the 2 MiB cap it is sent once, not
-/// twice.
-pub fn preview_fetch_response(delivery: PreviewDelivery) -> PreviewFetchResponse {
-    let srcdoc = render::document(&delivery.preview, Platform::current());
-    let mut preview = delivery.preview;
-    if let PreviewBody::AttachmentUpload {
-        thumbnail_data_uri, ..
-    } = &mut preview.body
-    {
-        *thumbnail_data_uri = None;
-    }
-    PreviewFetchResponse {
-        redaction: delivery.redaction.as_ref().map(RedactionContextDto::from),
-        preview,
-        srcdoc,
-    }
 }
 
 /// `preview_fetch` (§5.6 "Opened"): on the blocking pool as well (a large candidate takes a
@@ -378,27 +236,7 @@ pub async fn preview_fetch<R: Runtime>(
     .await
 }
 
-/// `raw_page {request_id, candidate_rev, page}` (Δ1, PD-68): the page of an opened revision.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RawPageArgs {
-    pub request_id: RequestId,
-    pub candidate_rev: CandidateRevDto,
-    pub page: u64,
-}
-
-/// `{page, page_count, total_bytes, bytes_b64, display}` (PD-68): the exact slice of the hashed
-/// candidate bytes as base64 (for the copy gesture and X-07 only) and the text the UI shows.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct RawPageDto {
-    pub page: u64,
-    pub page_count: u64,
-    pub total_bytes: u64,
-    pub bytes_b64: String,
-    pub display: String,
-}
-
-/// One Raw page through `decisions` (PD-68): refused like core refuses it (`NotDecidable`,
+/// `raw_page {request_id, candidate_rev, page}` (Δ1, PD-68): one Raw page through `decisions` (PD-68): refused like core refuses it (`NotDecidable`,
 /// `Stale`, `Invalid(NotOpened)`), a page past the last is `InvalidArgument {page}`. The UTF-8
 /// carry into the page is derived here from the bytes of the page before it, never taken from the
 /// UI; the last page shows an incomplete tail as bytes.

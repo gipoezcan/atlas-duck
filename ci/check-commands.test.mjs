@@ -25,6 +25,7 @@ import {
   parseHandlerLists,
   readRepo,
   renderAllowedBlock,
+  WIRE_FILES,
 } from "./check-commands.mjs";
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -111,6 +112,28 @@ function argErrors(src) {
 }
 
 // ---------- the repository ----------
+
+// M12 PD-206: the approvals argument structs live in core's wire module and are still checked.
+test("core wire module is scanned by the argument-struct rules", () => {
+  const r = readRepo(REPO);
+  for (const rel of WIRE_FILES) assert.ok(rel in r.files, rel);
+  const withoutWire = Object.fromEntries(Object.entries(r.files).filter(([f]) => !WIRE_FILES.includes(f)));
+  assert.ok(
+    checkArgStructs(withoutWire).some((e) => /argument struct QueueGetArgs is not defined/.test(e)),
+    "the commands name QueueGetArgs, defined only in the wire module",
+  );
+  const wire = WIRE_FILES[0];
+  const broken = r.files[wire].replace(
+    /#\[serde\(deny_unknown_fields\)\]\r?\npub struct QueueGetArgs/,
+    "pub struct QueueGetArgs",
+  );
+  assert.notEqual(broken, r.files[wire]);
+  assert.ok(
+    checkArgStructs({ ...r.files, [wire]: broken }).includes(
+      `${wire}: argument struct QueueGetArgs lacks #[serde(deny_unknown_fields)]`,
+    ),
+  );
+});
 
 test("repository_passes", () => {
   const r = readRepo(REPO);

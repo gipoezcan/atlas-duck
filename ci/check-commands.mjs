@@ -684,6 +684,9 @@ export function checkAclMutators(files) {
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
 
+/** Files outside `commands/**` whose argument structs and DTOs the argument-struct rules cover. */
+export const WIRE_FILES = ["crates/core/src/decision/wire.rs"];
+
 function rustFiles(dir) {
   const out = [];
   for (const name of readdirSync(dir)) {
@@ -714,6 +717,9 @@ export function readRepo(repo = REPO) {
     srcFiles[rel] = readFileSync(p, "utf8");
     if (rel.startsWith("app/src-tauri/src/commands/")) files[rel] = srcFiles[rel];
   }
+  // M12 PD-206: the approvals argument structs and bounded newtypes live in core's wire module
+  // (shared with the server); the argument-struct rules cover it like the commands' own files.
+  for (const rel of WIRE_FILES) files[rel] = readFileSync(join(repo, rel), "utf8");
   return {
     namesRs: readFileSync(join(app, "src", "commands", "names.rs"), "utf8"),
     modRs: readFileSync(join(app, "src", "commands", "mod.rs"), "utf8"),

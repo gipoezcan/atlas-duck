@@ -28,6 +28,9 @@ mod batch;
 mod offers;
 mod recent;
 mod redaction_preview;
+/// The approvals commands' wire types and the UI event table, shared by desktop and server
+/// (M12 PD-206).
+pub mod wire;
 
 use std::path::PathBuf;
 use std::sync::Arc;
