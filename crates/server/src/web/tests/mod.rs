@@ -89,19 +89,21 @@ impl H {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("server.db");
         let store: Arc<dyn ServerStore> = Arc::new(SqliteStore::open(&db).unwrap());
-        Self::over(dir, db, store)
+        Self::over(dir, db, store, ManualClock::at(T0))
     }
 
-    /// A fresh router (and session table) over the same store: a restart.
+    /// A fresh router (and session table) over the same store and clock: a restart.
     fn restart(self) -> H {
         let store: Arc<dyn ServerStore> = Arc::new(SqliteStore::open(&self.db).unwrap());
-        let mut h = Self::over(self.dir, self.db, store);
-        h.clock = self.clock;
-        h
+        Self::over(self.dir, self.db, store, self.clock)
     }
 
-    fn over(dir: tempfile::TempDir, db: PathBuf, store: Arc<dyn ServerStore>) -> H {
-        let clock = ManualClock::at(T0);
+    fn over(
+        dir: tempfile::TempDir,
+        db: PathBuf,
+        store: Arc<dyn ServerStore>,
+        clock: Arc<ManualClock>,
+    ) -> H {
         let stub = Arc::new(StubDirectory::from_json(STUB).unwrap());
         let sink = Arc::new(RecSink::default());
         let sessions =
@@ -617,6 +619,46 @@ async fn failures_go_to_the_anchor_chain_without_the_password() {
         ]
     );
     assert!(!contains(&h.db_bytes(), b"pw-wrong-canary-1d2e"));
+}
+
+/// An invalid username of any length keys the limiter by its first 64 characters only.
+#[tokio::test]
+async fn huge_invalid_usernames_cost_a_bounded_limiter_key() {
+    let h = H::new();
+    let long = format!("{}*", "A".repeat(10_000));
+    for _ in 0..5 {
+        assert_eq!(h.login(&long, "x").await.status(), StatusCode::UNAUTHORIZED);
+    }
+    // The same 64-character prefix is the same key: the 6th attempt is limited.
+    let other_tail = format!("{})", "a".repeat(9_000));
+    assert_eq!(
+        h.login_from(&other_tail, "x", "192.0.2.99").await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(crate::login::limiter_key(&long), "a".repeat(64));
+    assert_eq!(h.stub.calls(), 0);
+}
+
+/// Global Constraints: on /api/cmd and /api/me the bearer refusal precedes every other check.
+#[tokio::test]
+async fn bearer_refusal_precedes_size_origin_and_session() {
+    let h = H::new();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/cmd/decide")
+        .header(header::AUTHORIZATION, "Bearer x")
+        .header(header::CONTENT_LENGTH, super::BODY_LIMIT + 1)
+        .body(Body::from("x".repeat(super::BODY_LIMIT + 1)))
+        .unwrap();
+    assert_eq!(code(h.send(req).await).await.1, "auth/bearer_not_accepted");
+}
+
+#[test]
+fn client_ip_is_clipped() {
+    use axum::http::HeaderMap;
+    let mut h = HeaderMap::new();
+    h.insert("x-forwarded-for", "9".repeat(500).parse().unwrap());
+    assert_eq!(client_ip(&h, None, 1).len(), super::MAX_IP_CHARS);
 }
 
 #[test]

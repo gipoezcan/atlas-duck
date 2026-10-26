@@ -84,6 +84,12 @@ fn recorded_name(username: &str) -> String {
     username.chars().take(64).collect()
 }
 
+/// The limiter key of a username: lowercased and clipped to 64 characters, so an invalid name
+/// of any length (up to the 64 KiB body) costs a bounded key (PD-201's key cap assumes it).
+pub fn limiter_key(username: &str) -> String {
+    canonical(&recorded_name(username))
+}
+
 impl LoginService {
     fn directory_kind(&self) -> DirectoryKind {
         if self.directory.kind() == "stub" {
@@ -109,7 +115,7 @@ impl LoginService {
 
     fn refuse(&self, username: &str, ip: &str, reason: &str, err: ApiError) -> ApiError {
         self.limiter
-            .record_failure(&canonical(username), ip, self.clock.now());
+            .record_failure(&limiter_key(username), ip, self.clock.now());
         self.failed(username, ip, reason);
         err
     }
@@ -122,7 +128,7 @@ impl LoginService {
     ) -> Result<LoginOk, ApiError> {
         let now = self.clock.now();
         if !valid_username(username) {
-            if let Err(wait) = self.limiter.check(&canonical(username), ip, now) {
+            if let Err(wait) = self.limiter.check(&limiter_key(username), ip, now) {
                 return Err(ApiError::rate_limited(wait.0));
             }
             return Err(self.refuse(

@@ -76,14 +76,15 @@ async fn api_guard(State(st): State<AppState>, mut req: Request, next: Next) -> 
         return next.run(req).await;
     }
     let headers = req.headers();
+    // Global Constraints: the bearer refusal comes before every other check.
+    if session_only_path(&path) && headers.contains_key(header::AUTHORIZATION) {
+        return ApiError::BEARER_NOT_ACCEPTED.into_response();
+    }
     if header_str(headers, header::CONTENT_LENGTH)
         .and_then(|v| v.parse::<usize>().ok())
         .is_some_and(|n| n > BODY_LIMIT)
     {
         return ApiError::BODY_TOO_LARGE.into_response();
-    }
-    if session_only_path(&path) && headers.contains_key(header::AUTHORIZATION) {
-        return ApiError::BEARER_NOT_ACCEPTED.into_response();
     }
     let changing = req.method() != Method::GET && req.method() != Method::HEAD;
     if changing {
@@ -123,12 +124,17 @@ pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>, hops: u32) -> St
         .filter(|s| !s.is_empty())
         .collect();
     let n = hops as usize;
-    match entries.len() {
-        0 => peer_ip(),
-        len if len >= n => entries[len - n].to_owned(),
-        _ => entries[0].to_owned(),
-    }
+    let ip = match entries.len() {
+        0 => return peer_ip(),
+        len if len >= n => entries[len - n],
+        _ => entries[0],
+    };
+    // Header text: bounded, as it keys the rate limiter and lands in LOGIN_FAILED.
+    ip.chars().take(MAX_IP_CHARS).collect()
 }
+
+/// The longest client address kept (an IPv6 address with zone fits).
+pub const MAX_IP_CHARS: usize = 64;
 
 /// The peer address axum's `into_make_service_with_connect_info` records, if any.
 pub fn peer(req_ext: &axum::http::Extensions) -> Option<SocketAddr> {

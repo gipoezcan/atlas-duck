@@ -131,6 +131,24 @@ impl WrappedKey {
     }
 }
 
+/// Configuration table: a key file mode looser than 0600/0400 (any group or other bit; Secret
+/// mounts are 0440 unless M13's chart sets `defaultMode`) is a warning, never a stop.
+#[cfg(unix)]
+fn warn_if_loose_mode(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.permissions().mode() & 0o077 != 0
+    {
+        tracing::warn!(
+            event = "master_key_file_mode",
+            mode = format!("{:o}", meta.permissions().mode() & 0o777)
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_loose_mode(_path: &Path) {}
+
 pub struct MasterKey {
     id: String,
     key: SecretKey,
@@ -161,6 +179,7 @@ impl MasterKey {
     /// Reads the key file: unreadable → `config/master_key_unreadable`, anything but one valid
     /// line (a trailing newline or CRLF allowed) → `config/master_key_invalid`.
     pub fn load(path: &Path) -> Result<MasterKey, ConfigError> {
+        warn_if_loose_mode(path);
         let text = Zeroizing::new(std::fs::read_to_string(path).map_err(|_| ConfigError {
             code: "config/master_key_unreadable",
             key: MASTER_KEY_FILE,
