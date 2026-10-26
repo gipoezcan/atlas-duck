@@ -9,9 +9,9 @@
 .notice,
 .caution-strip,
 .window > [role="alert"]:not(.visually-hidden, .caution-strip, .notice),
-.window > section > [role="alert"]:not(.visually-hidden, .caution-strip, .notice),
+:is(.window, .window-body) > section > [role="alert"]:not(.visually-hidden, .caution-strip, .notice),
 .window > [role="status"]:not(.visually-hidden, .caution-strip, .notice),
-.window > section > [role="status"]:not(.visually-hidden, .caution-strip, .notice) {
+:is(.window, .window-body) > section > [role="status"]:not(.visually-hidden, .caution-strip, .notice) {
   display: block;
   padding: var(--space-3) var(--space-4);
   border: 1px solid var(--border);
@@ -23,7 +23,7 @@
 }
 .notice-info,
 .window > [role="status"]:not(.visually-hidden, .caution-strip, .notice),
-.window > section > [role="status"]:not(.visually-hidden, .caution-strip, .notice) {
+:is(.window, .window-body) > section > [role="status"]:not(.visually-hidden, .caution-strip, .notice) {
   border-left-color: var(--info);
   background: var(--info-subtle);
 }
@@ -33,7 +33,7 @@
 }
 .notice-danger,
 .window > [role="alert"]:not(.visually-hidden, .caution-strip, .notice),
-.window > section > [role="alert"]:not(.visually-hidden, .caution-strip, .notice) {
+:is(.window, .window-body) > section > [role="alert"]:not(.visually-hidden, .caution-strip, .notice) {
   border-left-color: var(--danger);
   background: var(--danger-subtle);
 }

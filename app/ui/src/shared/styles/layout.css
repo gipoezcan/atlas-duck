@@ -2,7 +2,9 @@
    `window window-<name>`; a window's sections are cards. Text controls sit
    below their label: the DOM nests control and text in one <label> (Settings)
    or pairs a <label htmlFor> with a control inside .field (Audit, Edit form),
-   so the rules key on :has() instead of on a <form> ancestor. */
+   so the rules key on :has() instead of on a <form> ancestor. A window whose
+   sections sit in a wrapper div (the Setup wizard's panel) marks it
+   .window-body and gets the same card and notice rules. */
 .window {
   max-width: var(--content-max);
   margin: 0 auto;
@@ -28,7 +30,7 @@
 }
 
 /* Cards. */
-.window > section, .card {
+:is(.window, .window-body) > section, .card {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -36,11 +38,11 @@
   margin: 0 0 var(--space-4);
   box-shadow: var(--shadow-card);
 }
-.window > section > h2:first-child, .card > h2:first-child {
+:is(.window, .window-body) > section > h2:first-child, .card > h2:first-child {
   margin-top: 0;
   font-size: var(--text-lg);
 }
-.window > section section {
+:is(.window, .window-body) > section section {
   background: none;
   border: 0;
   padding: 0;

@@ -159,7 +159,7 @@ function WizardWindow() {
 
   if (state === null) {
     return (
-      <main>
+      <main className="window window-setup">
         <h1>{WINDOW_TITLES.setup}</h1>
         {failed ? (
           <p role="alert">
@@ -178,10 +178,14 @@ function WizardWindow() {
 
   return (
     <>
-      <main>
-        <header>
+      <main className="window window-setup">
+        <header className="page-header">
           <h1>{WINDOW_TITLES.setup}</h1>
-          {state.refused_count === null ? null : <p role="status">{T.required(state.refused_count)}</p>}
+          {state.refused_count === null ? null : (
+            <p role="status" className="notice notice-info">
+              {T.required(state.refused_count)}
+            </p>
+          )}
         </header>
         {failed ? (
           <p role="alert">
@@ -196,7 +200,7 @@ function WizardWindow() {
         </p>
         {/* Rust's fixed text once GENESIS recorded a previous chain (PD-167), as a plain text node. */}
         {state.notice === null ? null : <p role="status">{state.notice}</p>}
-        <div ref={panel}>
+        <div ref={panel} className="window-body">
           <Panel state={state} step={step} pending={action.pending || settling} onChanged={reread} />
         </div>
         {action.error === null ? null : <p role="alert">{action.error}</p>}
@@ -267,6 +271,7 @@ function Panel({
           <StepError error={state.error} />
           <button
             type="button"
+            className="primary"
             disabled={pending}
             onClick={() => step(() => wizardUseDefaultDir(), { destroysWindow: true })}
           >
@@ -293,7 +298,7 @@ function Panel({
             </p>
           )}
           <StepError error={state.error} />
-          <button type="button" disabled={pending} onClick={() => step(() => wizardBegin())}>
+          <button type="button" className="primary" disabled={pending} onClick={() => step(() => wizardBegin())}>
             {T.existing_continue}
           </button>
         </section>
@@ -325,7 +330,7 @@ function Panel({
           )}
           <p>
             {/* The cooldown keeps a double click off the passphrase step's own Begin button. */}
-            <button type="button" disabled={pending} onClick={() => step(() => wizardBegin(), { settle: true })}>
+            <button type="button" className="primary" disabled={pending} onClick={() => step(() => wizardBegin(), { settle: true })}>
               {T.anchor_continue}
             </button>
           </p>
@@ -351,7 +356,7 @@ function Panel({
           <p role="alert">{state.step_text ?? T.errors.other}</p>
           {/* A failed retry (`pinned_write`) says so: it does not look like the first failure. */}
           <StepError error={state.error} />
-          <button type="button" disabled={pending} onClick={() => step(() => wizardBegin())}>
+          <button type="button" className="primary" disabled={pending} onClick={() => step(() => wizardBegin())}>
             {T.pin_retry}
           </button>
         </section>
@@ -365,7 +370,7 @@ function Panel({
           {state.passphrase_window ? (
             <p role="status">{T.passphrase_waiting}</p>
           ) : (
-            <button type="button" disabled={pending} onClick={() => step(() => wizardBegin())}>
+            <button type="button" className="primary" disabled={pending} onClick={() => step(() => wizardBegin())}>
               {T.passphrase_begin}
             </button>
           )}
@@ -383,7 +388,7 @@ function Panel({
         <section aria-label={T.note_heading}>
           <h2 tabIndex={-1}>{T.note_heading}</h2>
           <p>{T.note_intro}</p>
-          <button type="button" disabled={pending} onClick={() => step((rendered) => wizardFinish(rendered), { settle: true })}>
+          <button type="button" className="primary" disabled={pending} onClick={() => step((rendered) => wizardFinish(rendered), { settle: true })}>
             {T.continue}
           </button>
         </section>
@@ -402,6 +407,7 @@ function Panel({
           />
           <button
             type="button"
+            className="primary"
             disabled={pending}
             onClick={() => step((rendered) => wizardSkipInstances(rendered), { settle: true })}
           >
@@ -416,7 +422,7 @@ function Panel({
         <section aria-label={T.onboarding_heading}>
           <h2 tabIndex={-1}>{T.onboarding_heading}</h2>
           <OnboardingText only={WIZARD_SECTION_IDS} level={3} />
-          <button type="button" disabled={pending} onClick={() => step((rendered) => wizardFinish(rendered), { settle: true })}>
+          <button type="button" className="primary" disabled={pending} onClick={() => step((rendered) => wizardFinish(rendered), { settle: true })}>
             {T.onboarding_finish}
           </button>
         </section>
@@ -462,6 +468,7 @@ function CliStep({ pending, step }: { pending: boolean; step: Step }) {
       <p>
         <button
           type="button"
+          className="primary"
           disabled={pending || install.pending}
           onClick={() => step((rendered) => wizardFinish(rendered), { settle: true })}
         >
