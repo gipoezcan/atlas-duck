@@ -7,6 +7,7 @@
 @import './styles/settings.css';
 @import './styles/setup.css';
 @import './styles/audit.css';
+@import './styles/misc-windows.css';
 
 /* The Tauri isolation iframe is hidden by the inline <style> that isolation.js
    injects, which both policies admit by its sha256 hash (spec 6.4, ruling B1);
@@ -14,5 +15,3 @@
 #__tauri_isolation__ {
   display: none !important;
 }
-
-.onboarding-text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 32rem; overflow: auto; padding: 0.5rem; border: 1px solid var(--border); }
