@@ -1,3 +1,4 @@
+import { httpTransport } from './transport-http';
 import { tauriTransport } from './transport-tauri';
 
 /**
@@ -21,10 +22,14 @@ let forTests: Transport | null = null;
 
 /**
  * The transport of this build, selected once at build time (PD-218): Tauri unless the server
- * build sets `VITE_ATLAS_DUCK_TRANSPORT=http` (the HTTP transport arrives with M12 Task 7).
+ * build sets `VITE_ATLAS_DUCK_TRANSPORT=http`. The condition is a build-time constant, so the
+ * desktop bundle drops `transport-http` (checked by `ci/check-desktop-bundle-no-http.mjs`).
  */
+const BUILD_TRANSPORT: Transport =
+  import.meta.env.VITE_ATLAS_DUCK_TRANSPORT === 'http' ? httpTransport : tauriTransport;
+
 export function transport(): Transport {
-  return forTests ?? tauriTransport;
+  return forTests ?? BUILD_TRANSPORT;
 }
 
 /** Replaces the transport inside tests only (`null` restores the build's own). */
