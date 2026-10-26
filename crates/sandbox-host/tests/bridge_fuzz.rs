@@ -239,6 +239,16 @@ impl Observed {
         self.signals.load(Ordering::SeqCst)
     }
 
+    /// The signal count once it reached `want` (bounded by `WAIT_BOUND`, then as it stands): the
+    /// host may return its outcome before the kill is recorded, so a count read at once can lag.
+    fn signals_reaching(&self, want: u32) -> u32 {
+        let started = std::time::Instant::now();
+        while self.signals() < want && started.elapsed() < WAIT_BOUND {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        self.signals()
+    }
+
     /// Waits until the fake's thread ended (its pipes are closed).
     fn wait_finished(&self) -> Result<(), String> {
         let guard = self.finished.lock().map_err(|_| "poisoned")?;
@@ -1175,7 +1185,7 @@ fn check(rt: &tokio::runtime::Runtime, attack: &Attack) -> Result<(), TestCaseEr
                 (HostVerdict::Violation(_), None) => {}
                 (other, _) => prop_assert!(false, "{shown}: host verdict {other:?}"),
             }
-            prop_assert_eq!(observed.signals(), 1, "one kill: {}", shown);
+            prop_assert_eq!(observed.signals_reaching(1), 1, "one kill: {}", shown);
         }
         Verdict::Eof => {
             prop_assert!(
@@ -1202,7 +1212,7 @@ fn check(rt: &tokio::runtime::Runtime, attack: &Attack) -> Result<(), TestCaseEr
                 "{shown}: the terminal did not stand: {:?}",
                 outcome.end
             );
-            prop_assert_eq!(observed.signals(), 1, "one kill: {}", shown);
+            prop_assert_eq!(observed.signals_reaching(1), 1, "one kill: {}", shown);
         }
     }
     // No terminal is ever accepted from a hostile stream (of two terminals the first stands, and
@@ -1409,7 +1419,7 @@ fn s10_fixed_stalled_body_below_the_terminal_cap() -> TestResult {
     let outcome = outcome?;
     assert_eq!(outcome.host, HostVerdict::Limit("timeout_s"));
     assert_eq!(outcome.end, WorkerEnd::None);
-    assert_eq!(observed.signals(), 1);
+    assert_eq!(observed.signals_reaching(1), 1);
     assert!(
         outcome.elapsed < Duration::from_secs(10),
         "ended by the timer: {:?}",
@@ -1533,7 +1543,7 @@ proptest! {
             &HostVerdict::Violation(ViolationKind::TooManyCalls)
         );
         prop_assert_eq!(&outcome.end, &WorkerEnd::None);
-        prop_assert_eq!(observed.signals(), 1);
+        prop_assert_eq!(observed.signals_reaching(1), 1);
         // Only the calls within the limit reached the sink; the rest of the flood was discarded.
         // The calls run as tasks of their own, which may not have started when the run ended.
         let started = Instant::now();
@@ -1611,7 +1621,7 @@ fn s10_worker_that_never_reads_stdin_is_killed_at_the_timer() -> TestResult {
     let outcome = outcome?;
     assert_eq!(outcome.host, HostVerdict::Limit("timeout_s"));
     assert_eq!(outcome.end, WorkerEnd::None);
-    assert_eq!(observed.signals(), 1);
+    assert_eq!(observed.signals_reaching(1), 1);
     assert!(
         outcome.elapsed < Duration::from_secs(10),
         "ended by the timer: {:?}",
@@ -1705,7 +1715,7 @@ fn s10_unread_results_are_capped() -> TestResult {
     );
     assert_eq!(outcome.end, WorkerEnd::None);
     assert_eq!(outcome.diag, vec![DIAG_UNREAD_RESULTS]);
-    assert_eq!(observed.signals(), 1);
+    assert_eq!(observed.signals_reaching(1), 1);
     // The queue (at most the cap), each answer's value and encoding while it is built (one burst),
     // and the fixed allowance.
     let allowed = cap + 2 * BURST as usize * ANSWER + HELD_ALLOWANCE;
