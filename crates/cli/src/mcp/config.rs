@@ -16,12 +16,8 @@ pub(crate) const TIMEOUT_ENV: &str = "ATLAS_DUCK_MCP_TIMEOUT";
 /// §4.6: the default wait of a tool call.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(50);
 
-/// `--tools full|generic` (§4.6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToolSet {
-    Full,
-    Generic,
-}
+/// `--tools full|generic` (§4.6); shared with the server (M12 PD-193).
+pub(crate) use atlas_duck_mcp_tools::toolset::ToolSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct McpConfig {

@@ -296,17 +296,9 @@ fn set_once<T>(slot: &mut Option<T>, flag: &str, value: T) -> Result<(), ParseEr
     Ok(())
 }
 
-/// Longest echo of user text in an error message or detail.
-const CLIP_CHARS: usize = 80;
-
-/// `s` cut to `CLIP_CHARS` characters (never mid-character), with `...` when cut. Keeps a huge
-/// argument from being echoed whole into an error envelope.
-pub(crate) fn clip(s: &str) -> String {
-    match s.char_indices().nth(CLIP_CHARS) {
-        Some((cut, _)) => format!("{}...", &s[..cut]),
-        None => s.to_string(),
-    }
-}
+/// The echo cap of user text in an error message or detail (80 characters), shared with the MCP
+/// tool layer (`atlas-duck-mcp-tools`, M12 PD-193).
+pub(crate) use atlas_duck_mcp_tools::local::clip;
 
 /// Records the first unknown flag with the number of positionals read when it appeared.
 fn note_unknown(

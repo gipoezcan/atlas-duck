@@ -16,7 +16,8 @@ use crate::deadline::Deadline;
 use crate::discover;
 use crate::launch;
 
-pub(crate) const REASON_CONNECTION_LOST: &str = "connection_lost";
+/// Shared with the MCP result mapping (`atlas-duck-mcp-tools`, M12 PD-193).
+pub(crate) use atlas_duck_mcp_tools::result::REASON_CONNECTION_LOST;
 pub(crate) const REASON_APP_UPGRADED: &str = "app_upgraded";
 const MSG_NOT_RUNNING: &str = "the atlas-duck app is not running";
 /// §3.2 (a).

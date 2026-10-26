@@ -22,8 +22,8 @@ use tokio::time::{Instant, Interval, MissedTickBehavior, interval_at};
 
 use super::server::SendFuture;
 
-/// PD-125 (R11): the heartbeat period of a waiting tool call (the rig sets a short one).
-pub(crate) const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
+/// PD-125 (R11): the heartbeat period of a waiting tool call (shared with the server, M12 PD-193).
+pub(crate) use atlas_duck_mcp_tools::progress::HEARTBEAT_EVERY;
 
 /// Where notifications go: the call's rmcp peer (a recording fake in the tests).
 pub(crate) trait ProgressPeer: Send + Sync {

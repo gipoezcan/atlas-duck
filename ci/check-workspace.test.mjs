@@ -65,7 +65,7 @@ function baseEdges() {
     "atlas-duck-sandbox-host": ["atlas-duck-ipc"],
     "atlas-duck-sandbox-worker": [{ name: "atlas-duck-ipc", uses_default_features: false }],
     "atlas-duck-cli": ["atlas-duck-ipc", "atlas-duck-registry", "atlas-duck-mcp-tools"],
-    "atlas-duck-mcp-tools": [{ name: "atlas-duck-ipc", uses_default_features: false }, "atlas-duck-registry"],
+    "atlas-duck-mcp-tools": ["atlas-duck-ipc", "atlas-duck-registry"],
     "atlas-duck-server": [
       "atlas-duck-core",
       "atlas-duck-audit",

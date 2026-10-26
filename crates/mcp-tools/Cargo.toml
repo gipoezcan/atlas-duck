@@ -6,9 +6,11 @@ rust-version.workspace = true
 publish.workspace = true
 
 # The transport-free part of the M9 MCP front end (plan PD-193): tool catalog, argument checks,
-# envelope -> tool-result mapping. No tokio, no HTTP, no IPC session. cli and server use it.
+# envelope -> tool-result mapping. No HTTP, no IPC session. cli and server use it.
 [dependencies]
-atlas-duck-ipc = { path = "../ipc", default-features = false }
+# Default features: the result mapping needs `proto::exit_code`, which lives behind ipc's `async`
+# feature (both users link it anyway).
+atlas-duck-ipc = { path = "../ipc" }
 atlas-duck-registry = { path = "../registry" }
 # `Tool`/`CallToolResult` model types only.
 rmcp = { workspace = true, features = ["server"] }

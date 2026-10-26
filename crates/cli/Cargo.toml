@@ -14,6 +14,8 @@ test-env = []
 [dependencies]
 atlas-duck-ipc = { path = "../ipc" }
 atlas-duck-registry = { path = "../registry" }
+# The transport-free MCP tool layer (M12 PD-193).
+atlas-duck-mcp-tools = { path = "../mcp-tools" }
 lexopt = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

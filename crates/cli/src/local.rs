@@ -4,23 +4,15 @@
 //! as a child process; see `verify_export`.)
 
 use atlas_duck_ipc::envelope::{Envelope, ErrorCode, Status};
-use atlas_duck_ipc::sandbox::ScriptLimits;
-use atlas_duck_registry::{DescribeEnv, LimitsSource, describe, get, ops_list_json};
+use atlas_duck_registry::{describe, get, ops_list_json};
 use serde_json::{Value, json};
 
 use crate::argv::{ParseError, clip};
 use crate::help::help_text;
 
-/// The built-in defaults: what `core::gate` answers for a local `ops list`/`ops describe`. The two
-/// are pinned to each other by T23's `u05_cli_ops_equal_core`.
-pub(crate) fn describe_env() -> DescribeEnv {
-    DescribeEnv {
-        limits_source: LimitsSource::Default,
-        available: None,
-        caps: Value::Null,
-        script_limits: serde_json::to_value(ScriptLimits::default()).unwrap_or(Value::Null),
-    }
-}
+/// The built-in describe environment and the `usage` envelope, shared with the MCP tool layer
+/// (`atlas-duck-mcp-tools`, M12 PD-193).
+pub(crate) use atlas_duck_mcp_tools::local::{describe_env, usage};
 
 fn succeeded(data: Value) -> Envelope {
     Envelope {
@@ -36,17 +28,6 @@ fn succeeded(data: Value) -> Envelope {
         error: None,
         meta: None,
     }
-}
-
-/// A `usage` failure with optional `error.details`.
-pub(crate) fn usage(message: &str, details: serde_json::Map<String, Value>) -> Envelope {
-    let mut env = Envelope::failed(ErrorCode::Usage, false, message);
-    if let Some(err) = env.error.as_mut()
-        && !details.is_empty()
-    {
-        err.details = Some(details);
-    }
-    env
 }
 
 pub(crate) fn parse_error(e: ParseError) -> Envelope {

@@ -1,10 +1,13 @@
 //! Exit codes (§4.3). The matrix itself is `ipc::proto::exit_code`; this adds the one CLI rule
 //! that depends on the command.
 
-use atlas_duck_ipc::envelope::{Envelope, ErrorCode};
-use atlas_duck_ipc::proto::exit_code;
+use atlas_duck_ipc::envelope::Envelope;
 
 use crate::argv::Command;
+
+/// The kinds of call whose exit code differs only for `status` (§4.4), and [`exit_for`] by kind;
+/// shared with the MCP result mapping in `atlas-duck-mcp-tools` (M12 PD-193).
+pub(crate) use atlas_duck_mcp_tools::exit::{CallKind, exit_for_kind};
 
 /// PD-20: `status` exits 0 whenever the request is known (the envelope carries its `request_id`
 /// and is not `unknown_request`): the exit code answers "did the command work", the envelope
@@ -19,30 +22,9 @@ pub(crate) fn exit_for(cmd: &Command, env: &Envelope) -> i32 {
     exit_for_kind(kind, env)
 }
 
-/// The kinds of call whose exit code differs only for `status` (§4.4); MCP maps its results
-/// through this without building a `Command`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CallKind {
-    Submit,
-    Await,
-    Status,
-    Short,
-}
-
-/// [`exit_for`] by kind of call.
-pub(crate) fn exit_for_kind(kind: CallKind, env: &Envelope) -> i32 {
-    if kind == CallKind::Status
-        && env.request_id.is_some()
-        && env.error.as_ref().map(|e| e.code) != Some(ErrorCode::UnknownRequest)
-    {
-        return 0;
-    }
-    exit_code(env)
-}
-
 #[cfg(test)]
 mod tests {
-    use atlas_duck_ipc::envelope::Status;
+    use atlas_duck_ipc::envelope::{ErrorCode, Status};
 
     use super::*;
 
