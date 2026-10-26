@@ -529,6 +529,36 @@ m10_has_focus() {
 m10_diag_over() { [ "$(m10_diag_count "$M10_DIAG" "$1")" -gt "$2" ]; }
 m10_app_gone() { ! pgrep -x atlas-duck-app >/dev/null; }
 
+# m10_dismiss_hint: the one-time no-tray-host hint (windows::show_no_tray_host_hint, app/src-tauri/src/windows.rs:844;
+# lib.rs:288) is a native GTK message dialog titled exactly "atlas-duck" (windows.rs:64), shown at start because
+# no tray host exists under Xvfb. It is modal and holds the focus (CI run 40282065380: _NET_ACTIVE_WINDOW was
+# that dialog, with _NET_WM_STATE_MODAL, while "atlas-duck: Approvals" was stacked below), so it is dismissed
+# with its OK button (Return) before the focus is asserted. Bounded: up to 30 s for it to appear, then up to
+# 10 activate+Return rounds until no window named exactly "atlas-duck" is left.
+m10_hint_ids() { xdotool search --name '^atlas-duck$' 2>/dev/null || true; }
+m10_dismiss_hint() {
+  local end id n=0 round
+  end=$((SECONDS + 30))
+  while [ -z "$(m10_hint_ids)" ]; do
+    if [ "$SECONDS" -ge "$end" ]; then
+      echo "M10 no-tray-host hint: no dialog appeared within 30 s (continuing)"
+      return 0
+    fi
+    sleep 0.5
+  done
+  for round in $(seq 1 10); do
+    for id in $(m10_hint_ids); do
+      xdotool windowactivate "$id" >/dev/null 2>&1 || true
+      sleep 0.3
+      xdotool key --clearmodifiers Return >/dev/null 2>&1 || true
+    done
+    sleep 1
+    n=$(m10_hint_ids | grep -c . || true)
+    [ "$n" -eq 0 ] && break
+  done
+  [ "$n" -eq 0 ] || m10_report "the no-tray-host hint dialog ('atlas-duck') is still open after 10 dismiss rounds"
+  echo "M10 no-tray-host hint: dialog dismissed (Return on its OK button)"
+}
 m10_inner() {
   local appimage="$1" here="$2" work="$3" home="$4" export_dir="$5"
   local code id status pid wm_pid="" i ctl before_forward before_opened windows wrapper last cli_bin stub bad
@@ -566,6 +596,9 @@ m10_inner() {
   done
   [ -n "$M10_DIAG" ] && [ -n "$ctl" ] || m4_fail "no diag.log ($M10_DIAG) or test-control dir ($ctl) under $home after 30 s"
   echo "M10 diag log: $M10_DIAG, control dir: $ctl"
+
+  # The no-tray-host hint dialog is modal and holds the focus: dismiss it before anything asserts focus.
+  m10_dismiss_hint
 
   # (1) a forwarded no-argument launch opens Approvals (the core serves, so Approvals is what the state needs).
   before_opened="$(m10_diag_count "$M10_DIAG" 'event=window_opened window=approvals')"
