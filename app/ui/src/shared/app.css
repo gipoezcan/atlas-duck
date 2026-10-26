@@ -1,4 +1,5 @@
 @import './styles/tokens.css';
+@import './styles/base.css';
 
 /* The Tauri isolation iframe is hidden by the inline <style> that isolation.js
    injects, which both policies admit by its sha256 hash (spec 6.4, ruling B1);
