@@ -826,6 +826,22 @@ Each milestone entry lists: scope (§14, with the placements this plan makes whe
 - **Exit criterion:** every window reviewed in a screenshot on Windows and Linux (and the macOS GUI checklist), UI gates and e2e green.
 - **Status:** not started; detailed plan to be written.
 
+### M12 — Server mode (no local install)
+
+- **Goal:** atlas-duck runs as a hosted service that users and their agents reach over the network, with nothing installed on the user's machine.
+- **Spec impact:** the spec (§1–§14) assumes a per-user desktop process: the OS keychain holds the PATs, approvals happen in local windows and the tray, the audit store and anchor directory are per-user files, and agents connect through the local CLI and MCP over local IPC. Server mode changes the trust model, so a spec addendum comes before the detailed plan (brainstorming, then a spec section, then the plan).
+- **Questions the addendum must settle:**
+  - user authentication: SSO/OIDC against the company IdP;
+  - per-user PAT storage on the server (envelope encryption, KMS/HSM) and the server operator's access to it;
+  - the approval UI as a web app (same React windows, served over HTTPS with a strict CSP) and approval notifications instead of the tray;
+  - agent access: remote MCP over HTTPS (streamable HTTP) with per-user tokens in place of local IPC, and what remains of the CLI (a thin remote client, or none);
+  - multi-tenant isolation of audit chains, scripts and the sandbox (one worker per user/request; Linux container hardening);
+  - audit: per-user chains, server-side anchors, export and `verify-export` for users and auditors;
+  - deployment: container image, configuration, TLS, horizontal scaling and HA of the store, backup, upgrades;
+  - which desktop guarantees (canary sweep, locality checks, no-debug-port) carry over, change or drop.
+- **Depends on:** M10 (the release and audit model it extends); M11 for the shared web UI.
+- **Status:** not started; needs the brainstorming and spec addendum first.
+
 ---
 
 ## Traceability
