@@ -1,6 +1,7 @@
 @import './styles/tokens.css';
 @import './styles/base.css';
 @import './styles/controls.css';
+@import './styles/layout.css';
 
 /* The Tauri isolation iframe is hidden by the inline <style> that isolation.js
    injects, which both policies admit by its sha256 hash (spec 6.4, ruling B1);
@@ -9,8 +10,6 @@
   display: none !important;
 }
 
-/* Text for screen readers only (the setup wizard's step announcement). */
-.visually-hidden { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .app-header nav { display: flex; gap: 0.5rem; padding: 0.5rem; }
 .banner { list-style: none; margin: 0; padding: 0 0.5rem; }
 .banner-caution { font-weight: 600; }
