@@ -125,6 +125,9 @@ axum = { version = "=0.8.9", default-features = false, features = ["http1", "jso
 ldap3 = { version = "=0.12.1", default-features = false, features = ["tls-rustls-ring"] }
 subtle = "=2.6.1"
 futures = { version = "=0.3.34", default-features = false, features = ["std"] }
+# M12 T11: the LDAPS client's verifier when no CA bundle is mounted (the same OS-root verifier
+# reqwest already uses for the instances; locked at this version through reqwest).
+rustls-platform-verifier = "=0.7.1"
 
 # §7.7: release builds use panic = "abort". Profiles are workspace-wide, so this
 # covers atlas-duck-app, atlas-duck and atlas-duck-sandbox.

@@ -31,6 +31,7 @@ rmcp = { workspace = true, features = ["server", "transport-streamable-http-serv
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal", "fs"] }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
+rustls-platform-verifier = { workspace = true }
 rusqlite = { workspace = true }
 aes-gcm = { workspace = true }
 argon2 = { workspace = true }
