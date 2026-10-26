@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Panic-macro gate and cover-minting tripwire (plan Task 30; spec §7.7, §2.2).
 //
-// 1. `crates/{core,atlassian,audit,convert}/src/**/*.rs` outside `#[cfg(test)]` modules and `src/testing/**`
+// 1. `crates/{core,atlassian,audit,convert,server,mcp-tools}/src/**/*.rs` outside `#[cfg(test)]` modules and `src/testing/**`
 //    (and audit's `src/testing.rs`) must not contain `todo!(`, `unimplemented!(`, `panic!(`,
 //    `.unwrap()` or `.expect(` (the clippy lints say the same; this is the check that does not
 //    depend on a lint attribute staying in place).
@@ -27,7 +27,15 @@ import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const PANIC_ROOTS = ["crates/core/src", "crates/atlassian/src", "crates/audit/src", "crates/convert/src"];
+// M12 (plan "Global Constraints", PD-221): the server and the shared MCP tool layer too.
+export const PANIC_ROOTS = [
+  "crates/core/src",
+  "crates/atlassian/src",
+  "crates/audit/src",
+  "crates/convert/src",
+  "crates/server/src",
+  "crates/mcp-tools/src",
+];
 
 export const PANIC_PATTERNS = [
   { re: /\btodo!\s*[(\[{]/g, name: "todo!(" },

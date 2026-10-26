@@ -8,9 +8,12 @@ import { fileURLToPath } from "node:url";
 import {
   BANNED_IN_SANDBOX_HOST,
   GLOBAL_ALLOCATOR_FILES,
+  LINT_PACKAGES,
+  SERVER_ONLY_CRATES,
   TEST_FEATURE_FORWARDERS,
   TEST_ONLY_FEATURES,
   WORKER_EXTERNAL_ALLOW,
+  checkDesktopTrees,
   checkGlobalAllocators,
   checkGraph,
   checkManifests,
@@ -34,6 +37,8 @@ const MEMBERS = [
   "atlas-duck-sandbox-host",
   "atlas-duck-sandbox-worker",
   "atlas-duck-cli",
+  "atlas-duck-mcp-tools",
+  "atlas-duck-server",
 ];
 
 const memberId = (name) => `path+file:///ws/crates/${name}#${name}@0.1.0`;
@@ -59,7 +64,16 @@ function baseEdges() {
     "atlas-duck-ipc": [],
     "atlas-duck-sandbox-host": ["atlas-duck-ipc"],
     "atlas-duck-sandbox-worker": [{ name: "atlas-duck-ipc", uses_default_features: false }],
-    "atlas-duck-cli": ["atlas-duck-ipc", "atlas-duck-registry"],
+    "atlas-duck-cli": ["atlas-duck-ipc", "atlas-duck-registry", "atlas-duck-mcp-tools"],
+    "atlas-duck-mcp-tools": [{ name: "atlas-duck-ipc", uses_default_features: false }, "atlas-duck-registry"],
+    "atlas-duck-server": [
+      "atlas-duck-core",
+      "atlas-duck-audit",
+      "atlas-duck-atlassian",
+      "atlas-duck-ipc",
+      "atlas-duck-registry",
+      "atlas-duck-mcp-tools",
+    ],
   };
 }
 
@@ -150,7 +164,13 @@ expect_used = "deny"
 `;
 const manifests = (over = {}) => ({
   root: ROOT_OK,
-  members: { "atlas-duck-core": LINTS_OK, "atlas-duck-atlassian": LINTS_OK, "atlas-duck-convert": LINTS_OK },
+  members: {
+    "atlas-duck-core": LINTS_OK,
+    "atlas-duck-atlassian": LINTS_OK,
+    "atlas-duck-convert": LINTS_OK,
+    "atlas-duck-mcp-tools": LINTS_OK,
+    "atlas-duck-server": LINTS_OK,
+  },
   ...over,
 });
 
@@ -677,6 +697,9 @@ test("a default feature that reaches a test-only feature is a violation", () => 
   atlassian.features = { default: ["wire"], wire: ["testing"], testing: ["insecure-test-http"], "insecure-test-http": [] };
   const core = m.packages.find((p) => p.name === "atlas-duck-core");
   const dep = core.dependencies.find((d) => d.name === "atlas-duck-atlassian");
+  // Only core's edge is under test (the M12 server depends on atlassian too).
+  const server = m.packages.find((p) => p.name === "atlas-duck-server");
+  server.dependencies.find((d) => d.name === "atlas-duck-atlassian").uses_default_features = false;
   const edgeViolations = () => checkGraph(m).filter((v) => v.includes("normal dependency"));
   assert.deepEqual(edgeViolations().sort(), [
     "atlas-duck-core: normal dependency enables test-only feature atlas-duck-atlassian/insecure-test-http",
@@ -868,6 +891,63 @@ test("convert and preview depend on no workspace crate", () => {
     e[leaf] = ["atlas-duck-core"];
     assert.deepEqual(graph(e), [`${leaf}: must not depend on atlas-duck-core (§2.2)`]);
   }
+});
+
+// ---------- M12 server crates ----------
+
+test("desktop trees without server-only crates pass", () => {
+  const trees = {
+    "atlas-duck-app": ["atlas-duck-app", "tauri", "hyper", "rmcp"],
+    "atlas-duck-cli": ["atlas-duck-cli", "rmcp", "atlas-duck-mcp-tools"],
+  };
+  assert.deepEqual(checkDesktopTrees(trees), []);
+});
+
+test("axum under atlas-duck-app is reported", () => {
+  const trees = { "atlas-duck-app": ["atlas-duck-app", "axum", "tauri"] };
+  assert.deepEqual(checkDesktopTrees(trees), ["atlas-duck-app: links server-only crate axum"]);
+});
+
+test("every server-only crate is reported for a desktop package", () => {
+  assert.deepEqual(
+    checkDesktopTrees({ "atlas-duck-cli": [...SERVER_ONLY_CRATES] }),
+    SERVER_ONLY_CRATES.map((c) => `atlas-duck-cli: links server-only crate ${c}`),
+  );
+});
+
+test("no workspace member may depend on atlas-duck-server", () => {
+  const e = baseEdges();
+  assert.deepEqual(graph(e), []);
+  e["atlas-duck-cli"] = [...e["atlas-duck-cli"], { name: "atlas-duck-server", kind: "dev" }];
+  assert.deepEqual(graph(e), []);
+  e["atlas-duck-cli"] = [...baseEdges()["atlas-duck-cli"], "atlas-duck-server"];
+  assert.ok(graph(e).includes("atlas-duck-cli: must not depend on atlas-duck-server (M12 PD-192)"));
+});
+
+test("mcp-tools and server stay inside their allowed workspace edges", () => {
+  const e = baseEdges();
+  e["atlas-duck-mcp-tools"] = [...e["atlas-duck-mcp-tools"], "atlas-duck-core"];
+  assert.deepEqual(graph(e), ["atlas-duck-mcp-tools: must not depend on atlas-duck-core (§2.2)"]);
+  const s = baseEdges();
+  s["atlas-duck-server"] = [...s["atlas-duck-server"], "atlas-duck-sandbox-host"];
+  assert.deepEqual(graph(s), ["atlas-duck-server: must not depend on atlas-duck-sandbox-host (§2.2)"]);
+});
+
+test("a per-package tree overrides the unified closure for the banned-crate checks", () => {
+  const e = baseEdges();
+  e["atlas-duck-cli"] = [...e["atlas-duck-cli"], "rmcp"];
+  e.rmcp = ["hyper"]; // unified: the server's dev-only rmcp client features
+  assert.deepEqual(graph(e), ["atlas-duck-cli: banned crate hyper in normal-dependency closure (§2.1)"]);
+  const md = makeMetadata(e);
+  assert.deepEqual(checkGraph(md, { "atlas-duck-cli": ["atlas-duck-cli", "rmcp"] }), []);
+  assert.deepEqual(checkGraph(md, { "atlas-duck-cli": ["atlas-duck-cli", "rmcp", "hyper"] }), [
+    "atlas-duck-cli: banned crate hyper in normal-dependency closure (§2.1)",
+  ]);
+});
+
+test("server and mcp-tools are lint packages", () => {
+  assert.ok(LINT_PACKAGES.includes("atlas-duck-server"));
+  assert.ok(LINT_PACKAGES.includes("atlas-duck-mcp-tools"));
 });
 
 // ---------- the real workspace ----------

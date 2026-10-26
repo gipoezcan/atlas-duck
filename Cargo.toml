@@ -11,6 +11,8 @@ members = [
     "crates/sandbox-host",
     "crates/sandbox-worker",
     "crates/cli",
+    "crates/mcp-tools",
+    "crates/server",
     "app/src-tauri",
 ]
 
@@ -115,8 +117,6 @@ lru = "=0.18.5"
 # M9 MCP front end (§4.6): the official Rust SDK. No default features and no `macros`/`reqwest*`/
 # `auth*`/http transports (`reqwest`/`hyper` are banned for cli); each user names its features.
 rmcp = { version = "=3.5.0", default-features = false }
-
-# §7.7: release builds use panic = "abort". Profiles are workspace-wide, so this
 # M12 server mode (plan PD-191): the server binary's HTTP framework, LDAPS client and the
 # constant-time compare of the test directory stub. Only atlas-duck-server depends on them.
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "matched-path", "original-uri"] }
@@ -125,6 +125,8 @@ axum = { version = "=0.8.9", default-features = false, features = ["http1", "jso
 ldap3 = { version = "=0.12.1", default-features = false, features = ["tls-rustls-ring"] }
 subtle = "=2.6.1"
 futures = { version = "=0.3.34", default-features = false, features = ["std"] }
+
+# §7.7: release builds use panic = "abort". Profiles are workspace-wide, so this
 # covers atlas-duck-app, atlas-duck and atlas-duck-sandbox.
 [profile.release]
 panic = "abort"

@@ -371,6 +371,15 @@ test("the real workspace passes: node ci/check-no-panic-macros.mjs exits 0", () 
   assert.equal(res.status, 0);
 });
 
+// ---------- server and mcp-tools (M12 Task 2) ----------
+
+test("server/src and mcp-tools/src are panic-scan roots", () => {
+  assert.ok(PANIC_ROOTS.includes("crates/server/src"));
+  assert.ok(PANIC_ROOTS.includes("crates/mcp-tools/src"));
+  const f = "crates/server/src/x.rs";
+  assert.deepEqual(scanPanicMacros(f, "fn a() {\n    let _ = v.unwrap();\n}\n"), [`${f}:2: .unwrap() outside test code`]);
+});
+
 // ---------- convert (M5 Task 1) ----------
 
 test("convert/src is a panic-scan root and a .unwrap() there is a violation", () => {

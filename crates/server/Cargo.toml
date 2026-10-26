@@ -1,0 +1,69 @@
+[package]
+name = "atlas-duck-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Server mode (spec addendum SM-1.2, plan PD-192): one axum binary serving the web UI, the HTTP
+# API and remote MCP. No desktop package links this crate or its server-only dependencies.
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "atlas-duck-server"
+path = "src/main.rs"
+
+[dependencies]
+atlas-duck-core = { path = "../core" }
+atlas-duck-audit = { path = "../audit" }
+atlas-duck-atlassian = { path = "../atlassian" }
+atlas-duck-ipc = { path = "../ipc" }
+atlas-duck-registry = { path = "../registry" }
+atlas-duck-mcp-tools = { path = "../mcp-tools" }
+axum = { workspace = true }
+ldap3 = { workspace = true }
+rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal", "fs"] }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rusqlite = { workspace = true }
+aes-gcm = { workspace = true }
+argon2 = { workspace = true }
+sha2 = { workspace = true }
+getrandom = { workspace = true }
+zeroize = { workspace = true }
+secrecy = { workspace = true }
+subtle = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_jcs = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+url = { workspace = true }
+tracing = { workspace = true }
+# JSON log lines on stdout (SM-8.3).
+tracing-subscriber = { workspace = true, features = ["json"] }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+atlas-duck-atlassian = { path = "../atlassian", features = ["testing"] }
+atlas-duck-core = { path = "../core", features = ["testing"] }
+tempfile = { workspace = true }
+proptest = { workspace = true }
+wiremock = { workspace = true }
+rcgen = { workspace = true }
+# The exit-flow test's MCP client (PD-191).
+rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
+# Cookie-carrying HTTP client of the in-process API tests.
+reqwest = { workspace = true, features = ["json"] }
+tokio = { workspace = true, features = ["test-util"] }
+
+# Plan "Global Constraints" (lints).
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+print_stdout = "deny"
+print_stderr = "deny"

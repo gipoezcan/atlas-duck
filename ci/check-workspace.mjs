@@ -28,6 +28,8 @@ export const PKG = {
   sandboxHost: "atlas-duck-sandbox-host",
   sandboxWorker: "atlas-duck-sandbox-worker",
   cli: "atlas-duck-cli",
+  mcpTools: "atlas-duck-mcp-tools",
+  server: "atlas-duck-server",
 };
 
 // §2.2, read as workspace-internal normal/build edges (dev-dependencies ignored).
@@ -41,9 +43,18 @@ export const INTERNAL_RULES = [
   // M5 final review M-10: leaf crates (§2.2): no workspace dependency.
   { pkg: PKG.convert, allowed: [] },
   { pkg: PKG.preview, allowed: [] },
-  { pkg: PKG.cli, allowed: [PKG.ipc, PKG.registry] },
+  { pkg: PKG.cli, allowed: [PKG.ipc, PKG.registry, PKG.mcpTools] },
   { pkg: PKG.sandboxWorker, allowed: [PKG.ipc] },
+  // M12 PD-192/PD-193: the shared MCP tool layer and the server binary.
+  { pkg: PKG.mcpTools, allowed: [PKG.ipc, PKG.registry] },
+  { pkg: PKG.server, allowed: [PKG.core, PKG.audit, PKG.atlassian, PKG.ipc, PKG.registry, PKG.mcpTools] },
 ];
+
+// M12 (plan "Global Constraints"): crates only the server links. Checked per desktop package with
+// `cargo tree` (per-package feature resolution), which the unified `cargo metadata` resolve cannot
+// show. rmcp's server-http deps (`sse-stream`, `http-body`) are harmless and not listed.
+export const SERVER_ONLY_CRATES = ["axum", "axum-core", "ldap3", "lber", "atlas-duck-server"];
+export const DESKTOP_PACKAGES = [APP_PACKAGE, PKG.cli, PKG.sandboxHost, PKG.sandboxWorker];
 
 // §13 / §7.7: features that only the test builds may enable. A normal or build dependency
 // edge between workspace packages must not turn one on, directly or through default features.
@@ -142,7 +153,7 @@ export const GLOBAL_ALLOCATOR_FILES = ["app/src-tauri/src/bin/atlas-duck-sandbox
 // library). `src/tests/` modules compile into the crate and are not exempt.
 const CRATE_TESTS_DIR = /^(?:crates\/[^/]+|app\/src-tauri)\/tests\//;
 
-export const LINT_PACKAGES = [PKG.core, PKG.atlassian, PKG.convert];
+export const LINT_PACKAGES = [PKG.core, PKG.atlassian, PKG.convert, PKG.mcpTools, PKG.server];
 export const REQUIRED_DENY_LINTS = ["unwrap_used", "expect_used"];
 
 const isNormalOrBuild = (kind) => kind === null || kind === undefined || kind === "build";
@@ -176,8 +187,14 @@ export function normalClosure(metadata, rootId) {
   return new Set([...seen].map((id) => byId.get(id)?.name).filter(Boolean));
 }
 
-/** Dependency-graph checks on `cargo metadata --format-version 1` output. */
-export function checkGraph(metadata) {
+/**
+ * Dependency-graph checks on `cargo metadata --format-version 1` output. `trees` (optional):
+ * package name -> names in its own `cargo tree` (see cargoTreeNames). The metadata resolve unifies
+ * features across the whole workspace, dev-dependencies included, so since M12 the server's
+ * dev-only rmcp HTTP client puts reqwest/hyper under rmcp for every package; for a package listed
+ * in `trees` the banned-crate checks use its own tree instead of the unified closure.
+ */
+export function checkGraph(metadata, trees = {}) {
   const violations = [];
   const members = workspaceMembers(metadata);
   const memberNames = new Set(members.map((p) => p.name));
@@ -242,6 +259,14 @@ export function checkGraph(metadata) {
     violations.push(...checkFeatureForwarding(pkg));
   }
 
+  // M12: nothing in the workspace depends on the server binary crate.
+  for (const pkg of members) {
+    if (pkg.name === PKG.server) continue;
+    if (pkg.dependencies.some((d) => d.name === PKG.server && isNormalOrBuild(d.kind))) {
+      violations.push(`${pkg.name}: must not depend on ${PKG.server} (M12 PD-192)`);
+    }
+  }
+
   const registry = byName.get(PKG.registry);
   for (const d of registry?.dependencies ?? []) {
     if (isNormalOrBuild(d.kind) && !memberNames.has(d.name) && !REGISTRY_EXTERNAL_ALLOW.includes(d.name)) {
@@ -277,7 +302,8 @@ export function checkGraph(metadata) {
   }
 
   for (const pkg of members) {
-    const closure = normalClosure(metadata, pkg.id);
+    const unified = normalClosure(metadata, pkg.id);
+    const closure = trees[pkg.name] ? new Set(trees[pkg.name].filter((n) => n !== pkg.name)) : unified;
     if (pkg.name !== APP_PACKAGE) {
       for (const t of TAURI_CRATES) {
         if (closure.has(t)) {
@@ -587,6 +613,38 @@ export function collectRustFiles(root, rel = "") {
   return out;
 }
 
+/**
+ * Server-only crates in the desktop packages' own trees (M12). `trees`: package name -> the
+ * package names `cargo tree -p <pkg> -e normal,build --prefix none -f "{p}"` printed for it.
+ */
+export function checkDesktopTrees(trees) {
+  const violations = [];
+  for (const [pkg, names] of Object.entries(trees)) {
+    for (const name of SERVER_ONLY_CRATES) {
+      if (names.includes(name)) violations.push(`${pkg}: links server-only crate ${name}`);
+    }
+  }
+  return violations;
+}
+
+/** Package names in one package's normal+build tree over every target (per-package features). */
+export function cargoTreeNames(manifestPath, pkg) {
+  const res = spawnSync(
+    "cargo",
+    [
+      "tree", "-p", pkg, "-e", "normal,build", "--target", "all", "--prefix", "none",
+      "-f", "{p}", "--locked", "--manifest-path", manifestPath,
+    ],
+    { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+  );
+  if (res.error) throw res.error;
+  if (res.status !== 0) {
+    throw new Error(`cargo tree -p ${pkg} failed (exit ${res.status}): ${res.stderr.trim()}`);
+  }
+  // "{p}" prints "name vX.Y.Z (path)" plus " (*)" for repeats; the name is the first word.
+  return [...new Set(res.stdout.split(/\r?\n/).map((l) => l.trim().split(" ")[0]).filter(Boolean))];
+}
+
 export function cargoMetadata(manifestPath) {
   const res = spawnSync(
     "cargo",
@@ -613,8 +671,16 @@ export function main() {
   for (const pkg of workspaceMembers(metadata)) {
     members[pkg.name] = readFileSync(pkg.manifest_path, "utf8");
   }
+  const trees = {};
+  try {
+    for (const pkg of DESKTOP_PACKAGES) trees[pkg] = cargoTreeNames(rootManifest, pkg);
+  } catch (err) {
+    console.log(`check-workspace: ${err.message}`);
+    return 1;
+  }
   const violations = [
-    ...checkGraph(metadata),
+    ...checkDesktopTrees(trees),
+    ...checkGraph(metadata, trees),
     ...checkManifests({ root: readFileSync(join(metadata.workspace_root, "Cargo.toml"), "utf8"), members }),
     ...checkGlobalAllocators(collectRustFiles(metadata.workspace_root)),
   ];
