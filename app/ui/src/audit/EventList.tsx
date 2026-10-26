@@ -110,7 +110,7 @@ export function EventList({ filter, selected, onOpen }: Props) {
           {T.list_failed}: {error}
         </p>
       )}
-      {nothing ? <p>{T.list_empty}</p> : null}
+      {nothing ? <p className="empty-state">{T.list_empty}</p> : null}
       {rows.length === 0 ? null : (
         <Windowed
           label={T.list_label}

@@ -32,19 +32,5 @@
 .window-settings section ul:not(.consequences) { list-style: none; padding: 0; }
 .window-settings section ul:not(.consequences) > li { padding: var(--space-2) 0; border-bottom: 1px solid var(--border); }
 
-/* Progress of a running export: the info notice look. */
-.window-settings .audit-job {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-3) var(--space-4);
-  border: 1px solid var(--border);
-  border-left: 4px solid var(--info);
-  border-radius: var(--radius-md);
-  background: var(--info-subtle);
-  margin: var(--space-3) 0;
-}
-
 .restart-marker, .restart-waiting, .default-hint { color: var(--text-muted); font-size: var(--text-sm); }
 .window-settings section > button { margin: 0 var(--space-2) var(--space-2) 0; }
