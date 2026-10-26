@@ -1,5 +1,4 @@
-import { listen } from '@tauri-apps/api/event';
-import { getCurrentWindow } from '@tauri-apps/api/window';
+import { transport } from './transport';
 
 export type Unlisten = () => void;
 
@@ -21,9 +20,5 @@ export async function on<E>(
   handler: (payload: E) => void,
   options: OnOptions = {},
 ): Promise<Unlisten> {
-  return listen<E>(
-    name,
-    (event) => handler(event.payload),
-    options.thisWindow === true ? { target: getCurrentWindow().label } : undefined,
-  );
+  return transport().listen<E>(name, handler, options);
 }

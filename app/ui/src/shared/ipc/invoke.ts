@@ -1,5 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
-
+import { transport } from './transport';
 import type {
   Acknowledged,
   AnchorDirAnswer,
@@ -103,7 +102,7 @@ export async function call<T>(
 ): Promise<T> {
   let raw: unknown;
   try {
-    raw = await invoke(cmd, args);
+    raw = await transport().invoke(cmd, args);
   } catch (e) {
     throw toCommandError(e);
   }
