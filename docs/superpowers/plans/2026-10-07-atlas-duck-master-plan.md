@@ -826,22 +826,27 @@ Each milestone entry lists: scope (§14, with the placements this plan makes whe
 - **Exit criterion:** every window reviewed in a screenshot on Windows and Linux (and the macOS GUI checklist), UI gates and e2e green.
 - **Status:** not started; detailed plan to be written.
 
-### M12 — Server mode (no local install)
+### M12 — Server mode core
 
-- **Goal:** atlas-duck runs as a hosted service that users and their agents reach over the network, with nothing installed on the user's machine.
-- **Spec impact:** the spec (§1–§14) assumes a per-user desktop process: the OS keychain holds the PATs, approvals happen in local windows and the tray, the audit store and anchor directory are per-user files, and agents connect through the local CLI and MCP over local IPC. Server mode changes the trust model, so a spec addendum comes before the detailed plan (brainstorming, then a spec section, then the plan).
-- **Questions the addendum must settle:**
-  - user authentication: SSO/OIDC against the company IdP;
-  - per-user PAT storage on the server (envelope encryption, KMS/HSM) and the server operator's access to it;
-  - the approval UI as a web app (same React windows, served over HTTPS with a strict CSP) and approval notifications instead of the tray;
-  - agent access: remote MCP over HTTPS (streamable HTTP) with per-user tokens in place of local IPC, and what remains of the CLI (a thin remote client, or none);
-  - multi-tenant isolation of audit chains, scripts and the sandbox (one worker per user/request; Linux container hardening);
-  - audit: per-user chains, server-side anchors, export and `verify-export` for users and auditors;
-  - deployment: container image, configuration, TLS, horizontal scaling and HA of the store, backup, upgrades;
-  - which desktop guarantees (canary sweep, locality checks, no-debug-port) carry over, change or drop.
-- **Depends on:** M10 (the release and audit model it extends); M11 for the shared web UI.
-- **Status:** not started; needs the brainstorming and spec addendum first.
+- **Spec:** `docs/superpowers/specs/2026-10-26-atlas-duck-server-mode.md` (SM-1 to SM-11; accepted 2026-10-26 after the design interview), glossary `CONTEXT.md`, ADRs `docs/adr/0001`–`0003`.
+- **Scope (SM-10):** UI transport abstraction (the React pages run against Tauri IPC or HTTP), `crates/server` (axum), domain login over LDAPS with rate limits (SM-2.1/2.2), roles from directory groups (SM-2.3), cookie sessions with CSRF (SM-2.4), per-user stores with data keys wrapped by the master key (SM-6.1/6.2), admin-defined instances and user PAT entry (SM-4), web approvals with SSE and browser notifications and `approval_url` (SM-5), remote MCP over streamable HTTP with API keys (SM-3.1/3.2/3.4), new audit kinds and the server anchor chain (SM-6.3), container image runnable locally against a test directory.
+- **Depends on:** M9 (MCP front end), M10, M11 (shared restyled UI).
+- **Exit criterion:** the container runs locally; an MCP client with an API key reads Jira through a user's PAT, proposes a write, the user approves it in the browser, and the write lands; desktop mode CI stays green; per-user isolation tests (user A cannot reach B's data, approvals, keys) pass.
+- **Status:** not started.
 
+### M13 — Server mode deployment and operations
+
+- **Scope (SM-10, SM-8, SM-9):** Helm chart and helmfile, GitLab CI pipeline (kaniko, Harbor/Artifactory, OCI chart, deploy to `team-dux@gip` / `team-dux`, per-branch review environments), Kubernetes Secrets mounted as files, CA bundle ConfigMap, hardening (non-root, read-only rootfs, dropped capabilities, seccomp), admin CLI, retention and offboarding job, `/healthz` `/readyz` `/metrics`, runbooks, threat-model docs (ADR 0002 accepted risk).
+- **Depends on:** M12.
+- **Exit criterion:** a review environment deploys from a branch pipeline and passes the smoke test; master key rotation and backup/restore pass on it; the production deploy is gated behind the user's go-ahead (a deploy to the shared cluster is outward-facing).
+- **Status:** not started.
+
+### M14 — Server mode completion
+
+- **Scope (SM-10):** OAuth 2.1 authorization server for MCP (SM-3.3), scripts in server mode (SM-7), auditor UI and exports (SM-6.4), `verify-export` with anchor-chain excerpts (SM-6.3), end-to-end server test suite.
+- **Depends on:** M13.
+- **Exit criterion:** an MCP client completes the OAuth flow and runs a script; an auditor exports another user's chain and `verify-export` passes on it; the server e2e suite is green in CI.
+- **Status:** not started.
 ---
 
 ## Traceability
