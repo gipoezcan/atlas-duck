@@ -2986,9 +2986,10 @@ mod settings_commands {
 
         // Windows: the user PATH of the registry, not the process PATH.
         let ops = FakeOps::with_path(r"C:\Windows");
-        ops.set_session_path(Some(
-            std::env::join_paths([r"C:\Program Files\atlas-duck"]).expect("paths"),
-        ));
+        // Not `join_paths`: a drive letter holds the unix separator `:`. One entry needs no join.
+        ops.set_session_path(Some(std::ffi::OsString::from(
+            r"C:\Program Files\atlas-duck",
+        )));
         assert_eq!(
             cli_state_of(&ops, &Ok(windows.clone())),
             cli_state(false, true, Some(false))
