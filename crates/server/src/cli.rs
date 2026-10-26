@@ -23,6 +23,8 @@ const USAGE: &str = "usage: atlas-duck-server <serve|version>\n";
 pub enum Command {
     Serve,
     Version,
+    /// The hidden transitional dmin (PD-212).
+    Admin,
     Usage,
 }
 
@@ -30,6 +32,7 @@ pub fn parse(args: &[String]) -> Command {
     match args {
         [cmd] if cmd == "serve" => Command::Serve,
         [cmd] if cmd == "version" || cmd == "--version" => Command::Version,
+        [cmd, ..] if cmd == "admin" => Command::Admin,
         _ => Command::Usage,
     }
 }
@@ -60,6 +63,7 @@ pub fn main() -> ExitCode {
             EXIT_USAGE
         }
         Command::Serve => serve(),
+        Command::Admin => crate::admin_offline::run(&args[1..]),
     })
 }
 
@@ -95,7 +99,10 @@ mod tests {
         assert_eq!(parse(&args(&["version"])), Command::Version);
         assert_eq!(parse(&args(&[])), Command::Usage);
         assert_eq!(parse(&args(&["serve", "x"])), Command::Usage);
-        assert_eq!(parse(&args(&["admin"])), Command::Usage);
+        assert_eq!(
+            parse(&args(&["admin", "instances", "list"])),
+            Command::Admin
+        );
     }
 
     #[test]

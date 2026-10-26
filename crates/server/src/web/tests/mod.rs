@@ -796,3 +796,116 @@ async fn readyz_is_503_when_the_stub_file_vanished() {
     let body = json_body(res).await;
     assert_eq!(body["checks"]["directory"], false);
 }
+
+// ---- T13: admin instances over HTTP --------------------------------------------------------
+
+async fn admin_call(
+    h: &H,
+    method: Method,
+    uri: &str,
+    cookie: &str,
+    csrf: &str,
+    body: &str,
+) -> Response {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::COOKIE, format!("atlas_duck_session={cookie}"))
+        .header("x-csrf-token", csrf)
+        .header(header::ORIGIN, ORIGIN)
+        .body(Body::from(body.to_owned()))
+        .unwrap();
+    h.send(req).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_instances_need_the_admin_role() {
+    let h = H::new();
+    let body = r#"{"alias": "work", "product": "jira", "base_url": "https://jira.example.test", "is_default": true}"#;
+    let (cookie, csrf) = h.session("alice", PW_CANARY).await;
+    for (m, uri) in [
+        (Method::GET, "/api/admin/instances"),
+        (Method::POST, "/api/admin/instances"),
+        (Method::DELETE, "/api/admin/instances/work"),
+    ] {
+        let (s, c) = code(admin_call(&h, m, uri, &cookie, &csrf, body).await).await;
+        assert_eq!(
+            (s, c.as_str()),
+            (StatusCode::FORBIDDEN, "auth/role_required"),
+            "{uri}"
+        );
+    }
+    let (cookie, csrf) = h.session("bob", "pw-bob").await;
+    let res = admin_call(
+        &h,
+        Method::POST,
+        "/api/admin/instances",
+        &cookie,
+        &csrf,
+        body,
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let created = json_body(res).await;
+    assert_eq!(
+        created,
+        json!({"alias": "work", "product": "jira", "base_url": "https://jira.example.test",
+               "proxy": null, "ca_ref": null, "is_default": true})
+    );
+    let (s, c) = code(
+        admin_call(
+            &h,
+            Method::POST,
+            "/api/admin/instances",
+            &cookie,
+            &csrf,
+            body,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!((s, c.as_str()), (StatusCode::CONFLICT, "instance/exists"));
+    let (s, c) = code(
+        admin_call(
+            &h,
+            Method::POST,
+            "/api/admin/instances",
+            &cookie,
+            &csrf,
+            r#"{"alias": "x"}"#,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        (s, c.as_str()),
+        (StatusCode::BAD_REQUEST, "instance/invalid")
+    );
+    let listed =
+        json_body(admin_call(&h, Method::GET, "/api/admin/instances", &cookie, &csrf, "").await)
+            .await;
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    let res = admin_call(
+        &h,
+        Method::DELETE,
+        "/api/admin/instances/work",
+        &cookie,
+        &csrf,
+        "",
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    let (s, c) = code(
+        admin_call(
+            &h,
+            Method::DELETE,
+            "/api/admin/instances/work",
+            &cookie,
+            &csrf,
+            "",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!((s, c.as_str()), (StatusCode::NOT_FOUND, "instance/unknown"));
+}

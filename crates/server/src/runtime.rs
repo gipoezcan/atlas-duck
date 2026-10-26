@@ -89,8 +89,6 @@ pub struct UserCtx {
 }
 
 impl UserCtx {
-    // The session and API-key extractors (T16, T18) are its callers.
-    #[allow(dead_code)]
     pub(crate) fn from_authenticated(user_id: &str) -> UserCtx {
         UserCtx {
             user_id: user_id.to_owned(),
@@ -568,4 +566,4 @@ impl crate::login::LoginSink for RegistrySink {
 
 #[cfg(test)]
 #[path = "tests/runtime.rs"]
-mod tests;
+pub(crate) mod tests;

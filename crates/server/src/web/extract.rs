@@ -8,9 +8,26 @@ use axum::http::request::Parts;
 
 use super::AppState;
 use crate::errors::ApiError;
+use crate::runtime::UserCtx;
 use crate::session::{Session, cookie_value};
 
 pub struct SessionUser(pub Session);
+
+impl SessionUser {
+    /// The request's user for the registry (the only way a web handler names a user).
+    pub fn ctx(&self) -> UserCtx {
+        UserCtx::from_authenticated(&self.0.user_id)
+    }
+
+    /// 403 `auth/role_required` unless the session holds `role`.
+    pub fn require_role(&self, role: &str) -> Result<(), ApiError> {
+        if self.0.roles.iter().any(|r| r == role) {
+            Ok(())
+        } else {
+            Err(ApiError::ROLE_REQUIRED)
+        }
+    }
+}
 
 impl FromRequestParts<AppState> for SessionUser {
     type Rejection = ApiError;

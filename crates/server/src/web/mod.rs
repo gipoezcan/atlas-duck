@@ -1,6 +1,7 @@
 //! The axum router and the web API. Task 12: the `/api/` guard (bearer refusal, Origin, CSRF,
 //! body limit) and the auth routes; Task 14 adds the listener, the other routes and static files.
 
+pub mod admin_routes;
 pub mod auth_routes;
 pub mod extract;
 
@@ -15,7 +16,7 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, Method, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 
 use crate::csrf::{CSRF_HEADER, origin_ok, token_ok};
 use crate::errors::ApiError;
@@ -60,7 +61,12 @@ pub fn router(state: AppState) -> Router {
         .route("/assets/{name}", get(asset))
         .route("/api/login", post(auth_routes::login))
         .route("/api/logout", post(auth_routes::logout))
-        .route("/api/session", get(auth_routes::session));
+        .route("/api/session", get(auth_routes::session))
+        .route(
+            "/api/admin/instances",
+            get(admin_routes::list).post(admin_routes::add),
+        )
+        .route("/api/admin/instances/{alias}", delete(admin_routes::remove));
     for (path, _) in static_files::PAGES {
         r = r.route(path, get(page));
     }
