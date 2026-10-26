@@ -84,8 +84,8 @@ th {
   outline-offset: var(--focus-offset);
 }
 ::selection {
-  background: var(--accent-subtle);
-  color: var(--text);
+  background: var(--accent);
+  color: var(--text-on-accent);
 }
 hr {
   border: 0;
