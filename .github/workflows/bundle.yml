@@ -497,7 +497,9 @@ jobs:
           rustup show active-toolchain
           rustc -vV
 
+      # Release runs build the shipped Linux packages from scratch, like the signed Windows/macOS jobs.
       - name: Cache cargo registry and target dir
+        if: ${{ !inputs.release }}
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: bundle-${{ env.TARGET }}
