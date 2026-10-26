@@ -5,7 +5,14 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { GUARDED_CALLS, PROOF_HELPERS, collectFiles, isExempt, scanDialogProofs } from "./check-dialog-proofs.mjs";
+import {
+  GUARDED_CALLS,
+  PROOF_HELPERS,
+  SERVER_ADMIN_PROOFS,
+  collectFiles,
+  isExempt,
+  scanDialogProofs,
+} from "./check-dialog-proofs.mjs";
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SERVE = "app/src-tauri/src/serve.rs";
@@ -586,4 +593,25 @@ test("accepts_current_tree", () => {
   const r = spawnSync(process.execPath, [join(REPO, "ci", "check-dialog-proofs.mjs")], { encoding: "utf8" });
   assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
   assert.equal(r.stdout, "");
+});
+
+// M12 PD-196: the server's admin confirmation site is accepted; the same literal elsewhere in the
+// server is not.
+test("server_admin_proof_site_only", () => {
+  const body = (name) =>
+    [
+      `fn ${name}(store: &Store) {`,
+      "    let c = Confirmed {",
+      "        dialog_text_sha256: [0; 32],",
+      "    };",
+      "    store.apply(c);",
+      "}",
+    ].join("\n");
+  const site = SERVER_ADMIN_PROOFS[0];
+  assert.deepEqual(scanDialogProofs([{ path: site.file, src: body(site.name) }]), []);
+  const other = scanDialogProofs([{ path: site.file, src: body("elsewhere") }]);
+  assert.equal(other.length, 1);
+  assert.match(other[0], /Confirmed built outside a dialog function/);
+  const otherFile = scanDialogProofs([{ path: "crates/server/src/web/mod.rs", src: body(site.name) }]);
+  assert.equal(otherFile.length, 1);
 });

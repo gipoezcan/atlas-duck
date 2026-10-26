@@ -50,6 +50,16 @@ import { fileURLToPath } from "node:url";
 import { removeCfgTest, stripNonCode } from "./check-no-panic-macros.mjs";
 
 /**
+ * Server mode (M12 PD-196, SM-4.1): there is no native dialog; an administrator's authenticated,
+ * CSRF-checked `POST /api/admin/instances` is the confirmation of an instance's origin and CA for
+ * every user. The one function that turns it into `Confirmed` for a user's store is listed here;
+ * its callers are not dialog functions (they open user runtimes), so it is not a proof helper.
+ */
+export const SERVER_ADMIN_PROOFS = [
+  { file: "crates/server/src/runtime.rs", name: "apply_instance_settings" },
+];
+
+/**
  * The proof helpers: a function that builds `Confirmed` from the confirmer's answer, away from the
  * dialog call itself. Core receives the answer and has no dialog call of its own.
  */
@@ -344,12 +354,16 @@ export function scanDialogProofs(files, helpers = PROOF_HELPERS, guarded = GUARD
   const found = [];
   const add = (file, index, text) => found.push({ file: file.path, index, text: `${file.path}:${lineOf(file.code, index)}: ${text}` });
   const isHelper = (file, fn) => helpers.some((h) => h.file === file.path && h.name === fn.name);
+  const isAdminProof = (file, fn) =>
+    SERVER_ADMIN_PROOFS.some((h) => h.file === file.path && h.name === fn.name);
 
   // 1 and 2: the sites.
   for (const file of prepared) {
     const literal = (m) => {
       const f = enclosing(file.fns, m.index);
-      if (f && (isHelper(file, f) || confirmProvedAt(file.code, f, m.index))) return;
+      if (f && (isHelper(file, f) || isAdminProof(file, f) || confirmProvedAt(file.code, f, m.index))) {
+        return;
+      }
       add(file, m.index, "Confirmed built outside a dialog function and the proof-helper allowlist");
     };
     each(CONFIRMED_LITERAL, file.code, literal);
