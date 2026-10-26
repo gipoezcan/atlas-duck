@@ -115,6 +115,7 @@ export function DecisionBar({
           <Fragment key={p.label}>
             <button
               type="button"
+              className="primary"
               {...marker}
               // Enter/Space do nothing on these buttons (single-key approval): the legend says why.
               aria-describedby={legendId}
@@ -130,12 +131,12 @@ export function DecisionBar({
           </Fragment>
         ))}
         {card?.approveShownDisabled === true ? (
-          <button type="button" {...marker} disabled>
+          <button type="button" className="primary" {...marker} disabled>
             {DETAIL_TEXT.approve}
           </button>
         ) : null}
         {canDeny ? (
-          <button type="button" disabled={busy} aria-expanded={denyDialog !== null} onClick={onDeny}>
+          <button type="button" className="danger" disabled={busy} aria-expanded={denyDialog !== null} onClick={onDeny}>
             {DETAIL_TEXT.deny}
           </button>
         ) : null}

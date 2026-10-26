@@ -3,6 +3,7 @@
 @import './styles/controls.css';
 @import './styles/layout.css';
 @import './styles/components.css';
+@import './styles/approvals.css';
 
 /* The Tauri isolation iframe is hidden by the inline <style> that isolation.js
    injects, which both policies admit by its sha256 hash (spec 6.4, ruling B1);
@@ -11,57 +12,7 @@
   display: none !important;
 }
 
-.windowed-row { box-sizing: border-box; overflow: hidden; border-bottom: 1px solid var(--border); }
-/* Lines 1 and 2 are one line each: shrinkable text is ellipsized, labels and badges are flex: none.
-   The flags line wraps. A row is QUEUE_ROW_REM (7.5rem) high, so the rem lines and the row scale together. */
-.queue-line { display: flex; flex-wrap: nowrap; align-items: center; gap: 0.5rem; height: 2rem; overflow: hidden; white-space: nowrap; }
-.queue-line > * { flex: none; }
-.queue-line > .agent-text, .queue-line > .target { flex: 0 1 auto; min-width: 0; }
-.queue-line > .target { overflow: hidden; text-overflow: ellipsis; }
-.queue-flags { flex-wrap: wrap; height: 3.5rem; row-gap: 0; align-content: center; }
-.queue-group { display: flex; align-items: center; gap: 0.5rem; height: 100%; font-weight: 600; }
-.recent-item { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }.queue-item[aria-current="true"] { background: var(--row-selected); }
-.detail { padding: 0.5rem; }
-.detail-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 0.5rem 0; }
-.consequences { flex-basis: 100%; margin: 0; padding-left: 1.25rem; }
-.detail [role="tablist"] { display: flex; gap: 0.25rem; }
-.detail [role="tab"][aria-selected="true"] { font-weight: 700; text-decoration: underline; }
-.detail-panel iframe { display: block; width: 100%; height: 28rem; border: 1px solid var(--border); }
-.raw-nav { display: flex; gap: 0.5rem; align-items: center; }
-.raw-text, .params-text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 28rem; overflow: auto; }
-.request-tab dt { font-weight: 600; }
-.request-tab dd { margin: 0 0 0.5rem 0; }
-.request-tab .agent-text-value { max-width: none; white-space: pre-wrap; overflow: visible; }
-.deny-dialog { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 0.5rem 0; padding: 0.5rem; border: 1px solid var(--border); }
-.deny-dialog input[type="text"] { flex: 1 1 20rem; min-width: 0; }
-.deny-keys { flex-basis: 100%; font-size: 0.9em; }
-.deny-offers { flex-basis: 100%; margin: 0; }
-.deny-offer-detail { margin-left: 1.5rem; }
 .settings-guard { margin: 0; padding: 0; border: 0; min-width: 0; }
-.edit-form fieldset { margin: 0.5rem 0; border: 1px solid var(--border); }
-.edit-form .field { display: flex; flex-direction: column; gap: 0.2rem; margin: 0.4rem 0; border: 0; padding: 0; }
-.edit-form .field input[type="text"], .edit-form .field textarea, .edit-form .field select { max-width: 100%; }
-.edit-form .json-input { font-family: monospace; min-height: 5rem; }
-.edit-form .read-only, .edit-form .field-hint, .edit-form .field-keys { font-size: 0.9em; }
-.edit-form .pick, .edit-form .as-json { display: flex; gap: 0.35rem; align-items: center; }
-.edit-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
-.keyboard-legend { display: flex; flex-wrap: wrap; gap: 0 1rem; list-style: none; margin: 0 0 0.5rem 0; padding: 0; font-size: 0.85em; }
-.redaction-panel { display: flex; flex-direction: column; gap: 0.5rem; }
-.redaction-ops ul, .redaction-report ul { margin: 0.25rem 0; padding-left: 1.25rem; }
-.redaction-presets, .redaction-release, .redaction-actions, .mask-form { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
-.redaction-url { border: 1px solid var(--border); }
-.tree-row { display: flex; align-items: center; gap: 0.35rem; height: 100%; white-space: nowrap; overflow: hidden; }
-.tree-toggle { flex: none; width: 1.75rem; }
-.tree-leaf { flex: none; width: 1.75rem; text-align: center; }
-.tree-select { display: flex; align-items: center; gap: 0.5rem; min-width: 0; flex: 0 1 auto; overflow: hidden; background: none; border: 0; padding: 0; text-align: left; font: inherit; color: inherit; }
-.tree-select[aria-pressed="true"] { outline: 2px solid currentColor; }
-.tree-scalar, .tree-count { font-family: monospace; }
-.tree-value-full { max-height: 16rem; overflow: auto; border: 1px solid var(--border); padding: 0.35rem; }
-.tree-value-full .agent-text-value { max-width: none; white-space: pre-wrap; overflow-wrap: anywhere; overflow: visible; }
-.unaddressable { margin: 0; }
-.batch { margin: 0.5rem 0; padding: 0.5rem; border: 1px solid var(--border); }
-.batch-actions, .batch-session { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 0.25rem 0; }
-.batch-confirm ul, .batch-excluded ul, .batch-blocked ul { max-height: 12rem; overflow: auto; margin: 0.25rem 0; }
 .onboarding-text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 32rem; overflow: auto; padding: 0.5rem; border: 1px solid var(--border); }
 /* The Audit window (M10 T20). A list row is two one-line rows (2 rem each) plus its border: ROW_REM 4.25 in EventList.tsx. */
 .audit section { margin: 0.75rem 0; }
