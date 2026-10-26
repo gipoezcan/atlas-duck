@@ -146,8 +146,8 @@ runs:
       shell: bash
       env:
         TARGET: ${{ inputs.target }}
-        TAURI_CONFIG: ${{ inputs.tauri-config }}
-      run: bash ci/check-release-build.sh "$TARGET" --config "$TAURI_CONFIG"
+        BUNDLE_CONFIG_INPUT: ${{ inputs.tauri-config }}
+      run: bash ci/check-release-build.sh "$TARGET" --config "$BUNDLE_CONFIG_INPUT"
 
     - name: Build the bundles
       shell: bash
@@ -155,7 +155,7 @@ runs:
       env:
         TARGET: ${{ inputs.target }}
         BUNDLES: ${{ inputs.bundles }}
-        TAURI_CONFIG: ${{ inputs.tauri-config }}
+        BUNDLE_CONFIG_INPUT: ${{ inputs.tauri-config }}
         SIGN_IDENTITY_INPUT: ${{ inputs.apple-signing-identity }}
         SIGNPATH_TOKEN_INPUT: ${{ inputs.signpath-api-token }}
       run: |
@@ -165,11 +165,15 @@ runs:
         unset SIGN_IDENTITY_INPUT SIGNPATH_TOKEN_INPUT
         config_args=()
         # Same inline test as check-release-build.sh: optional leading whitespace, then "{".
-        trimmed="${TAURI_CONFIG#"${TAURI_CONFIG%%[![:space:]]*}"}"
-        if [ -n "$TAURI_CONFIG" ]; then
+        trimmed="${BUNDLE_CONFIG_INPUT#"${BUNDLE_CONFIG_INPUT%%[![:space:]]*}"}"
+        # Never export TAURI_CONFIG: tauri-build (build.rs) parses that env var as JSON, so an empty
+        # value or a file path breaks the build (fix round 2, run 40273073892). A whitespace-only
+        # value is refused; an empty one means no --config at all.
+        if [ -n "$BUNDLE_CONFIG_INPUT" ] && [ -z "$trimmed" ]; then echo "::error::tauri-config is whitespace only"; exit 1; fi
+        if [ -n "$trimmed" ]; then
           case "$trimmed" in
-            "{"*) config_args=(--config "$TAURI_CONFIG") ;;
-            *) config_args=(--config "$GITHUB_WORKSPACE/$TAURI_CONFIG") ;;
+            "{"*) config_args=(--config "$BUNDLE_CONFIG_INPUT") ;;
+            *) config_args=(--config "$GITHUB_WORKSPACE/$BUNDLE_CONFIG_INPUT") ;;
           esac
         fi
         cargo tauri build --ci --target "$TARGET" --bundles "$BUNDLES" ${config_args[@]+"${config_args[@]}"} -- --locked

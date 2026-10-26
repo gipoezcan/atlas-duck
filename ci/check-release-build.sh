@@ -86,6 +86,16 @@ config_check() {
   ' "$value"
 }
 
+# 1b. tauri-build (build.rs) parses an inherited TAURI_CONFIG env var as JSON; the CLI sets it itself
+# from --config. One set by the job (even empty) breaks or overrides the build (fix round 2, CI run
+# 40273073892: an empty TAURI_CONFIG from the composite action). Returns 1 when it is set.
+tauri_config_env_check() {
+  if [ "${TAURI_CONFIG+set}" = set ]; then
+    echo "TAURI_CONFIG is set in the job environment (value length ${#TAURI_CONFIG}); pass the config with --config only"
+    return 1
+  fi
+}
+
 # 2. prints the offending lines and returns 1 when a build line is not allowed.
 lines_check() {
   local files="$1" f line inline rc=0
@@ -144,6 +154,11 @@ self_test() {
   expect_bad "a non-object value" '[1]'
   expect_bad "malformed JSON" "$tmp/broken.json"
   expect_bad "a missing file" "$tmp/does-not-exist.json"
+  expect_bad "a whitespace-only value" '   '
+  n=$((n+1)); if ( unset TAURI_CONFIG; tauri_config_env_check >/dev/null ); then echo "ok $n - passes: TAURI_CONFIG unset"; else echo "self-test FAIL: unset TAURI_CONFIG rejected" >&2; exit 1; fi
+  n=$((n+1)); if ( export TAURI_CONFIG=''; tauri_config_env_check >/dev/null ); then echo "self-test FAIL: empty TAURI_CONFIG env accepted" >&2; exit 1; else echo "ok $n - rejects: an empty TAURI_CONFIG env (CI run 40273073892)"; fi
+  n=$((n+1)); if ( export TAURI_CONFIG='ci/release-signing.macos.json'; tauri_config_env_check >/dev/null ); then echo "self-test FAIL: path TAURI_CONFIG env accepted" >&2; exit 1; else echo "ok $n - rejects: a file path in TAURI_CONFIG env"; fi
+  n=$((n+1)); grep -qE '^[[:space:]]+TAURI_CONFIG:' .github/actions/tauri-bundle/action.yml && { echo "self-test FAIL: action.yml sets a TAURI_CONFIG env" >&2; exit 1; }; echo "ok $n - action.yml sets no TAURI_CONFIG env"
 
   n=$((n+1))
   printf '%s\n' '        run: cargo tauri build --ci --target "$TARGET" --bundles nsis -- --locked' \
@@ -193,6 +208,8 @@ while IFS='=' read -r name value; do
       ;;
   esac
 done < <(env)
+
+if ! reason="$(tauri_config_env_check)"; then fail "$reason"; fi
 
 # 2. the build lines of the bundle workflows and the composite action
 if ! lines_check "$default_workflows"; then
