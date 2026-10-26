@@ -17,11 +17,13 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 
-use crate::config::Config;
 use crate::csrf::{CSRF_HEADER, origin_ok, token_ok};
 use crate::errors::ApiError;
+use crate::health::{self, Health};
 use crate::login::LoginService;
+use crate::runtime::Registry;
 use crate::session::{SessionTable, cookie_value};
+use crate::static_files::{self, WebDir};
 use crate::store::ServerStore;
 
 /// Every `/api/*` body is at most 64 KiB (413 `api/body_too_large`).
@@ -34,6 +36,9 @@ pub struct AppInner {
     pub store: Arc<dyn ServerStore>,
     pub sessions: Arc<SessionTable>,
     pub login: LoginService,
+    pub registry: Arc<Registry>,
+    pub web: WebDir,
+    pub health: Arc<Health>,
 }
 
 #[derive(Clone)]
@@ -46,13 +51,37 @@ impl std::ops::Deref for AppState {
     }
 }
 
+/// Every route group (T14): health, static pages and assets, the auth routes; the command, SSE,
+/// PAT, API-key and MCP groups join in their tasks. An unrouted path is 404.
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let mut r = Router::new()
+        .route("/healthz", get(health::healthz))
+        .route("/readyz", get(readyz))
+        .route("/assets/{name}", get(asset))
         .route("/api/login", post(auth_routes::login))
         .route("/api/logout", post(auth_routes::logout))
-        .route("/api/session", get(auth_routes::session))
+        .route("/api/session", get(auth_routes::session));
+    for (path, _) in static_files::PAGES {
+        r = r.route(path, get(page));
+    }
+    r.fallback(|| async { ApiError::NOT_FOUND })
         .layer(middleware::from_fn_with_state(state.clone(), api_guard))
         .with_state(state)
+}
+
+async fn readyz(State(st): State<AppState>) -> Response {
+    st.health.readyz().await
+}
+
+async fn page(State(st): State<AppState>, uri: axum::http::Uri) -> Response {
+    static_files::page(&st.web, uri.path()).await
+}
+
+async fn asset(
+    State(st): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    static_files::asset(&st.web, &name).await
 }
 
 /// SM-3.4: agents never approve; these paths take a session cookie only.
@@ -139,14 +168,4 @@ pub const MAX_IP_CHARS: usize = 64;
 /// The peer address axum's `into_make_service_with_connect_info` records, if any.
 pub fn peer(req_ext: &axum::http::Extensions) -> Option<SocketAddr> {
     req_ext.get::<ConnectInfo<SocketAddr>>().map(|c| c.0)
-}
-
-/// Runs the server until shutdown and answers the process exit code. The listener, router and
-/// runtimes arrive with Task 14; until then `serve` stops after a valid configuration.
-pub fn serve(_config: Config) -> u8 {
-    tracing::error!(
-        event = "serve_not_built",
-        "the HTTP server is not built yet (M12 T14)"
-    );
-    crate::cli::EXIT_RUNTIME
 }

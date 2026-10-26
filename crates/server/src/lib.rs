@@ -9,6 +9,7 @@ compile_error!("testing must never reach a release build");
 
 pub mod anchor;
 pub mod api_keys;
+pub mod app;
 pub mod audit_kinds;
 pub mod cli;
 pub mod clock;

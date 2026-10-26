@@ -716,6 +716,13 @@ impl Core {
         logged
     }
 
+    /// Reads `config.toml` again and derives the instance table (server mode, M12 PD-196: the
+    /// admin instances changed and the server rewrote the user's config). Additive; the desktop
+    /// does not call it.
+    pub async fn reload_instances(&self) {
+        self.instances.reload_now().await;
+    }
+
     /// The writes the crash reconciliation of this start closed as `outcome_unknown` (§11.3):
     /// the startup notice lists their targets ("check the target before resubmitting").
     pub fn startup_notice(&self) -> Vec<ReconciledWrite> {

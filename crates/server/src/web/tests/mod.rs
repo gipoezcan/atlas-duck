@@ -118,6 +118,25 @@ impl H {
             clock: clock.clone(),
             sink: sink.clone(),
         };
+        let web = dir.path().join("web");
+        let _ = std::fs::create_dir_all(web.join("assets"));
+        let _ = std::fs::write(
+            web.join("login.html"),
+            "<!doctype html><title>login</title>",
+        );
+        let _ = std::fs::write(web.join("assets").join("app-1a2b.js"), "console.log(1)");
+        let _ = std::fs::write(dir.path().join("secret.txt"), "not served");
+        let registry = Arc::new(crate::runtime::Registry::new(
+            crate::runtime::RuntimeDeps {
+                data_dir: dir.path().join("data"),
+                store: store.clone(),
+                master: Arc::new(MasterKey::for_tests("k1", [5; 32])),
+                org_ca: None,
+                clock: clock.clone(),
+                allow_http: true,
+            },
+            10,
+        ));
         let state = AppState(Arc::new(AppInner {
             public_origin: ORIGIN.into(),
             cookie_secure: true,
@@ -125,6 +144,13 @@ impl H {
             store: store.clone(),
             sessions,
             login,
+            registry,
+            web: crate::static_files::WebDir(web),
+            health: Arc::new(crate::health::Health::new(
+                store.clone(),
+                stub.clone(),
+                true,
+            )),
         }));
         H {
             router: router(state),
@@ -673,4 +699,100 @@ fn client_ip_from_forwarded_for() {
     assert_eq!(client_ip(&h, peer, 3), "198.51.100.1");
     assert_eq!(client_ip(&h, peer, 0), "10.0.0.1");
     assert_eq!(client_ip(&HeaderMap::new(), None, 1), "unknown");
+}
+
+// ---- T14: static files and health -----------------------------------------------------------
+
+async fn get(h: &H, uri: &str) -> Response {
+    h.send(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+}
+
+#[tokio::test]
+async fn pages_carry_the_csp_and_no_store() {
+    let h = H::new();
+    let res = get(&h, "/login").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let hd = res.headers();
+    assert_eq!(
+        hd[header::CONTENT_SECURITY_POLICY],
+        crate::static_files::CSP
+    );
+    assert_eq!(
+        crate::static_files::CSP,
+        "default-src 'self'; frame-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    );
+    assert_eq!(hd[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+    assert_eq!(hd[header::REFERRER_POLICY], "no-referrer");
+    assert_eq!(hd[header::CACHE_CONTROL], "no-store");
+    assert!(
+        hd[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html")
+    );
+    let asset = get(&h, "/assets/app-1a2b.js").await;
+    assert_eq!(asset.status(), StatusCode::OK);
+    assert!(
+        asset.headers()[header::CACHE_CONTROL]
+            .to_str()
+            .unwrap()
+            .contains("immutable")
+    );
+}
+
+#[tokio::test]
+async fn static_routes_never_escape_the_web_dir() {
+    let h = H::new();
+    for uri in [
+        "/assets/../secret.txt",
+        "/assets/..%2fsecret.txt",
+        "/assets/%2e%2e",
+        "/assets/missing.js",
+        "/assets/.hidden",
+        "/secret.txt",
+        "/web/login.html",
+        "/approvals", // a page whose file the build lacks
+    ] {
+        assert_eq!(get(&h, uri).await.status(), StatusCode::NOT_FOUND, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn healthz_and_readyz() {
+    let h = H::new();
+    let res = get(&h, "/healthz").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = get(&h, "/readyz").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = json_body(res).await;
+    assert_eq!(body["directory"], "stub");
+    assert_eq!(
+        body["checks"],
+        json!({"store": true, "master_key": true, "directory": true})
+    );
+}
+
+#[tokio::test]
+async fn readyz_is_503_when_the_stub_file_vanished() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("users.json");
+    std::fs::write(&file, STUB).unwrap();
+    let stub = Arc::new(StubDirectory::from_file(&file).unwrap());
+    let store: Arc<dyn ServerStore> = Arc::new(crate::store::memory::MemoryStore::new());
+    let health = crate::health::Health::new(store, stub, true);
+    assert_eq!(health.readyz().await.status(), StatusCode::OK);
+    std::fs::remove_file(&file).unwrap();
+    // The probe result is cached for 30 s; a fresh checker sees the missing file at once.
+    let res = health.readyz().await;
+    assert_eq!(res.status(), StatusCode::OK, "cached for 30 s");
+    let store: Arc<dyn ServerStore> = Arc::new(crate::store::memory::MemoryStore::new());
+    std::fs::write(&file, STUB).unwrap();
+    let stub3 = Arc::new(StubDirectory::from_file(&file).unwrap());
+    std::fs::remove_file(&file).unwrap();
+    let fresh = crate::health::Health::new(store, stub3, true);
+    let res = fresh.readyz().await;
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = json_body(res).await;
+    assert_eq!(body["checks"]["directory"], false);
 }

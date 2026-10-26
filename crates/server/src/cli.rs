@@ -77,7 +77,7 @@ fn serve() -> u8 {
         }
     };
     log::init(&config.rust_log);
-    crate::web::serve(config)
+    crate::app::serve(config)
 }
 
 #[cfg(test)]

@@ -42,6 +42,8 @@ struct StubUser {
 pub struct StubDirectory {
     users: Vec<StubUser>,
     calls: AtomicU64,
+    /// The file it was read from: `probe` checks it is still readable.
+    file: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,7 +61,9 @@ impl StubDirectory {
         let text = zeroize::Zeroizing::new(
             std::fs::read_to_string(path).map_err(|_| StubError::Unreadable)?,
         );
-        Self::from_json(&text)
+        let mut d = Self::from_json(&text)?;
+        d.file = Some(path.to_path_buf());
+        Ok(d)
     }
 
     pub fn from_json(text: &str) -> Result<StubDirectory, StubError> {
@@ -80,6 +84,7 @@ impl StubDirectory {
                 })
                 .collect(),
             calls: AtomicU64::new(0),
+            file: None,
         })
     }
 
@@ -117,8 +122,12 @@ impl Directory for StubDirectory {
         }
     }
 
+    /// The stub's "directory" is its file: it must still be readable.
     async fn probe(&self) -> Result<(), DirectoryError> {
-        Ok(())
+        match &self.file {
+            Some(p) if std::fs::metadata(p).is_err() => Err(DirectoryError::Unavailable),
+            _ => Ok(()),
+        }
     }
 
     fn kind(&self) -> &'static str {
