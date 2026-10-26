@@ -471,12 +471,37 @@ m10_wait() {
   done
 }
 
+# m10_focus_dump: what proves the cause of a focus miss: the window manager, the EWMH root properties,
+# the active and focused ids with their names/class/pid/state, every window xdotool finds by the
+# app's title prefix, and the full app window tree. Never fails.
+m10_focus_dump() {
+  local id
+  echo "--- window manager: openbox pid ${M10_WM_PID:-?} alive=$(kill -0 "${M10_WM_PID:-0}" 2>/dev/null && echo yes || echo no); owner of the display before the app mapped: see 'M10 window manager' line"
+  xprop -root _NET_SUPPORTING_WM_CHECK _NET_ACTIVE_WINDOW _NET_CLIENT_LIST _NET_CLIENT_LIST_STACKING 2>&1 || true
+  echo "--- xdotool: active=$(xdotool getactivewindow 2>&1 || true) focus=$(xdotool getwindowfocus 2>&1 || true)"
+  echo "--- xdotool search --name '^atlas-duck' (id: name)"
+  for id in $(xdotool search --name '^atlas-duck' 2>/dev/null || true); do
+    echo "$id: $(xdotool getwindowname "$id" 2>&1 || true)"
+  done
+  echo "--- xdotool search --name '^atlas-duck: Approvals$'"
+  xdotool search --name '^atlas-duck: Approvals$' 2>&1 || echo "(none)"
+  for id in $(xdotool getactivewindow 2>/dev/null || true) $(xdotool getwindowfocus 2>/dev/null || true) $(xdotool search --name '^atlas-duck: Approvals$' 2>/dev/null || true); do
+    echo "--- xprop $id"
+    xprop -id "$id" WM_NAME _NET_WM_NAME WM_CLASS _NET_WM_PID _NET_WM_STATE WM_STATE 2>&1 || true
+  done
+  echo "--- xwininfo -root -tree (names only)"
+  xwininfo -root -tree 2>/dev/null | grep -E '"' || true
+  echo "--- wmctrl -l"
+  if command -v wmctrl >/dev/null; then wmctrl -l 2>&1 || true; else echo "(wmctrl not installed)"; fi
+}
+
 m10_report() {
   {
     echo "--- mapped app windows"
     m10_windows || true
     echo "--- active/focused window names (xdotool)"
     m10_active_titles || true
+    m10_focus_dump || true
     echo "--- processes"
     ps -eo pid,ppid,stat,args | grep -E 'atlas-duck|AppImage|openbox' | grep -v grep || true
     echo "--- ${M10_DIAG:-?} (end)"
@@ -486,7 +511,21 @@ m10_report() {
 }
 
 m10_has_window() { m10_windows | grep -xF "$1" >/dev/null; }
-m10_has_focus() { m10_active_titles | grep -xF "$1" >/dev/null; }
+# Focus by window id: the window xdotool finds by its title (WM_NAME or _NET_WM_NAME) must be the EWMH-active or the
+# X-focused one (CI run 40273075751: the active window's xdotool name was "atlas-duck", not the title xwininfo shows, so a name compare
+# cannot tell a title mismatch from a real focus miss). The name compare stays as the second accepted form.
+m10_ids_of() { xdotool search --name "^$1$" 2>/dev/null || true; }
+m10_has_focus() {
+  local want act foc
+  want="$(m10_ids_of "$1")"
+  act="$(xdotool getactivewindow 2>/dev/null || true)"
+  foc="$(xdotool getwindowfocus 2>/dev/null || true)"
+  if [ -n "$want" ]; then
+    if [ -n "$act" ] && printf '%s\n' "$want" | grep -qxF "$act"; then return 0; fi
+    if [ -n "$foc" ] && printf '%s\n' "$want" | grep -qxF "$foc"; then return 0; fi
+  fi
+  m10_active_titles | grep -xF "$1" >/dev/null
+}
 m10_diag_over() { [ "$(m10_diag_count "$M10_DIAG" "$1")" -gt "$2" ]; }
 m10_app_gone() { ! pgrep -x atlas-duck-app >/dev/null; }
 
@@ -504,12 +543,14 @@ m10_inner() {
   # The window manager first: new windows get the focus only under one. Bounded wait for its EWMH check window.
   openbox >"$work/openbox.log" 2>&1 &
   wm_pid=$!
+  M10_WM_PID="$wm_pid"
   for i in $(seq 1 60); do
     xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id' && break
     kill -0 "$wm_pid" 2>/dev/null || { cat "$work/openbox.log" >&2 || true; m4_fail "openbox exited before it took the display"; }
     sleep 0.5
   done
   xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id' || m4_fail "openbox did not publish _NET_SUPPORTING_WM_CHECK within 30 s"
+  echo "M10 window manager: _NET_SUPPORTING_WM_CHECK published before the app started; $(xprop -root _NET_SUPPORTING_WM_CHECK 2>&1)"
   echo "M10 window manager: openbox pid $wm_pid"
 
   m8_warm_start "$appimage" "$work"
