@@ -14,6 +14,10 @@ path = "src/lib.rs"
 name = "atlas-duck-server"
 path = "src/main.rs"
 
+[features]
+# In-memory store and test constructors for tests of code above the store. Never a release build.
+testing = []
+
 [dependencies]
 atlas-duck-core = { path = "../core" }
 atlas-duck-audit = { path = "../audit" }

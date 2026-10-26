@@ -66,6 +66,8 @@ export const TEST_ONLY_FEATURES = [
   "atlas-duck-cli/test-env",
   "atlas-duck-ipc/test-paths",
   "atlas-duck-app/scripted-approver",
+  // M12 T10: the server's in-memory store and test constructors.
+  "atlas-duck-server/testing",
 ];
 
 // The only member features that may forward a test-only feature from their own `[features]`

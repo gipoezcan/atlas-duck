@@ -3,6 +3,10 @@
 
 #![forbid(unsafe_code)]
 
+// `testing` carries the in-memory store and test constructors; a release build never has it.
+#[cfg(all(feature = "testing", not(debug_assertions)))]
+compile_error!("testing must never reach a release build");
+
 pub mod anchor;
 pub mod api_keys;
 pub mod audit_kinds;
