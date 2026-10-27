@@ -32,6 +32,12 @@ pub fn user_id_for(username: &str) -> String {
 }
 
 /// `<data>/users/<user_id>`.
+/// Is the user active (M14 seam for M13's deactivation)? Until M13's schema v2 merges this means
+/// "the user row exists"; at merge it also reads `deactivated_at` (T7 consent, T8 bearer, T17).
+pub fn is_active(store: &dyn crate::store::ServerStore, user_id: &str) -> bool {
+    matches!(store.user(user_id), Ok(Some(_)))
+}
+
 pub fn user_dir(data: &Path, user_id: &str) -> PathBuf {
     data.join("users").join(user_id)
 }

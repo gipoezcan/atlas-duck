@@ -5,6 +5,8 @@
 //! bearer check of `/mcp`. AS and RS are one process: tokens are opaque random strings, stored
 //! only as `SHA-256("atlas-duck/oauth/v1\0" || kind || token)` (PD-235).
 
+pub mod authorize;
+pub mod consent;
 pub mod error;
 pub mod metadata;
 pub mod ratelimit;

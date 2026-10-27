@@ -24,6 +24,8 @@ pub const TOUCH_EVERY: i64 = 60;
 /// A live session as handlers see it (no id, no hash).
 #[derive(Clone)]
 pub struct Session {
+    /// SHA-256(id), the store key (M14 binds consent requests to it; never the id).
+    pub id_hash: [u8; 32],
     pub user_id: String,
     pub roles: Vec<String>,
     pub csrf_token: SecretString,
@@ -208,6 +210,7 @@ impl SessionTable {
 
 fn to_session(r: &SessionRecord) -> Session {
     Session {
+        id_hash: r.id_hash,
         user_id: r.user_id.clone(),
         roles: r.roles.clone(),
         csrf_token: SecretString::from(r.csrf_token.clone()),

@@ -115,6 +115,10 @@ pub const ROUTES: &[(&str, &str, Access)] = &[
         Access::Public,
     ),
     ("POST", "/oauth/register", Access::Public),
+    // M14 T7: authorization (session or login redirect) and consent.
+    ("GET", "/oauth/authorize", Access::Public),
+    ("GET", "/api/oauth/consent/{req}", Access::Session),
+    ("POST", "/api/oauth/consent/{req}", Access::Session),
 ];
 
 /// The handler of one [`ROUTES`] row; `None` for the bearer rows, which [`crate::mcp::routes`]
@@ -147,6 +151,9 @@ pub(crate) fn handler(method: &str, path: &str) -> Option<MethodRouter<AppState>
             get(oauth_routes::authorization_server)
         }
         ("POST", "/oauth/register") => post(oauth_routes::register),
+        ("GET", "/oauth/authorize") => get(oauth_routes::authorize),
+        ("GET", "/api/oauth/consent/{req}") => get(oauth_routes::consent_details),
+        ("POST", "/api/oauth/consent/{req}") => post(oauth_routes::consent_decide),
         _ => return None,
     })
 }
@@ -200,6 +207,8 @@ fn session_only_path(path: &str) -> bool {
         || path == "/api/cmd"
         || path.starts_with("/api/me/")
         || path == "/api/me"
+        // M14: consent is the user's decision, never an agent's (SM-3.4).
+        || path.starts_with("/api/oauth/")
 }
 
 fn header_str(h: &HeaderMap, name: impl header::AsHeaderName) -> Option<&str> {
