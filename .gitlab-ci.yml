@@ -40,11 +40,16 @@ variables:
 ui:
   stage: ui
   image: node:22
+  variables:
+    # The runner caps the job at 8Gi; vitest's default (one fork per core) outgrew it and a worker
+    # died mid-run (pipeline 43004). Two forks stay well inside.
+    KUBERNETES_MEMORY_REQUEST: "6Gi"
+    KUBERNETES_MEMORY_LIMIT: "8Gi"
   script:
     - cd app/ui
     - npm ci --ignore-scripts
     - npm run lint
-    - npm test
+    - npm test -- --pool=forks --maxWorkers=2
     - npm run test:scripts
     - npm run build
     - npm run check:bundle
