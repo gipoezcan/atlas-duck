@@ -173,10 +173,9 @@ chart:test:
     APP_NAME: atlas-duck-server
     KUBE_CONTEXT: team-dux@gip
     KUBE_NAMESPACE: team-dux
-    # Q2: review hosts are <slug>.<REVIEW_DOMAIN>. Plan proposal: atlas-duck.dux.intern.gipmbh.de.
-    REVIEW_DOMAIN: CHANGE-ME
-    # Q3: the TLS Secret (wildcard) that covers the review hosts.
-    REVIEW_TLS_SECRET: CHANGE-ME
+    # Review hosts are <slug>.<REVIEW_DOMAIN>; each gets its own cert-manager certificate in the
+    # Secret <release>-tls (no wildcard exists).
+    REVIEW_DOMAIN: atlas-duck.dux.intern.gipmbh.de
 
   # Branch pipelines run the server jobs only when server-relevant paths changed against master
   # (PD-M13-12), so desktop-only branches never touch the cluster; master and server-v* tags
@@ -273,6 +272,8 @@ server:image:
     entrypoint: [""]
   needs: [server:version]
   rules: *server-rules
+  # The runners that build images (dux-deploy's build-container-image uses the same tag).
+  tags: [ubuntu]
   variables:
     <<: *server-vars
     # A Rust release build (CARGO_BUILD_JOBS=4 in the Dockerfile's build stage).
@@ -384,7 +385,7 @@ deploy:review:
     - |
       set -eu
       no_placeholders deployment/values-review.yaml deployment/ca/org-ca.pem \
-        "REVIEW_DOMAIN=${REVIEW_DOMAIN}" "REVIEW_TLS_SECRET=${REVIEW_TLS_SECRET}"
+        "REVIEW_DOMAIN=${REVIEW_DOMAIN}"
       SLUG="$(printf '%s' "${CI_COMMIT_REF_SLUG}" | cut -c1-40 | sed 's/-*$//')"
       export RELEASE_NAME="atlas-duck-${SLUG}"
       HOST="${SLUG}.${REVIEW_DOMAIN}"
@@ -407,7 +408,7 @@ deploy:review:
       ARGS="--set image.repository=${HARBOR_HOST}/${ARTIFACTORY_REPO_KEY}/${APP_NAME}"
       ARGS="${ARGS} --set image.digest=$(cat image.digest)"
       ARGS="${ARGS} --set publicUrl=https://${HOST} --set ingress.host=${HOST}"
-      ARGS="${ARGS} --set ingress.tls.secretName=${REVIEW_TLS_SECRET}"
+      ARGS="${ARGS} --set ingress.tls.secretName=${RELEASE_NAME}-tls"
       ARGS="${ARGS} --set masterKey.existingSecret=${KEY_SECRET}"
       ARGS="${ARGS} --set podAnnotations.commit-sha=${CI_COMMIT_SHORT_SHA}"
       # Server-side schema validation before anything changes (PD-M13-10).
@@ -446,7 +447,7 @@ stop:review:
       helm uninstall "${RELEASE_NAME}" --namespace "${KUBE_NAMESPACE}" --kube-context "${KUBE_CONTEXT}" --ignore-not-found
       # The throwaway volume and the test keys go with it (review only; production keeps its PVC).
       $K delete pvc "${RELEASE_NAME}-data" --ignore-not-found
-      $K delete secret "${RELEASE_NAME}-master-key" "${RELEASE_NAME}-master-key-next" --ignore-not-found
+      $K delete secret "${RELEASE_NAME}-master-key" "${RELEASE_NAME}-master-key-next" "${RELEASE_NAME}-tls" --ignore-not-found
   environment:
     name: review/$CI_COMMIT_REF_SLUG
     action: stop

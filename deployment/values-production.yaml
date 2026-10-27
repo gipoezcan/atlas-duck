@@ -1,56 +1,67 @@
-# Production values (M13 plan T11). Every CHANGE-ME is an open user question; the
-# deploy:production job refuses to run while any CHANGE-ME is left in this file.
-# No secret belongs here (SM-9.1).
+# Production values (M13 plan T11; filled at deploy time 2026-10-27, decisions in the M13
+# ledger). No secret belongs here (SM-9.1): the master key is the Secret atlas-duck-master-key,
+# created out of band (docs/server/deployment.md).
 
 mode: production
 
-# Q2: production hostname. Plan proposal: atlas-duck.dux.intern.gipmbh.de (unconfirmed).
-publicUrl: https://CHANGE-ME
+publicUrl: https://atlas-duck.dux.intern.gipmbh.de
 
 ingress:
-  # Q2 (same host as publicUrl, without the scheme).
-  host: CHANGE-ME
+  # The cluster's controller is nginx.org (IngressClass nginx); chart defaults carry the
+  # nginx.org SSE annotations.
+  className: nginx
+  host: atlas-duck.dux.intern.gipmbh.de
   tls:
-    # Q3: an existing TLS Secret in team-dux (provisioned out of band, PD-M13-6).
-    secretName: CHANGE-ME
+    # Issued by cert-manager (ClusterIssuer letsencrypt), like team-dux's other hosts.
+    secretName: atlas-duck-tls
+    certManager:
+      issuer: letsencrypt
+      issuerKind: ClusterIssuer
 
 persistence:
-  # Q1: a storage class offering ReadWriteOnce block storage (not NFS, ADR 0003).
-  # team-dux-storage is used ReadWriteMany by dux-deploy; whether it offers RWO is open.
-  storageClassName: CHANGE-ME
+  # ADR 0004: no ReadWriteOnce block storage exists in the cluster; the team classes are all
+  # NFS, which SQLite must not use (ADR 0003). local-path is node-local ReadWriteOnce: the pod
+  # is pinned to one node, and a node loss is recovered from the daily backups below.
+  storageClassName: local-path
   size: 10Gi
   keep: true
+  backups:
+    enabled: true
+    storageClassName: team-dux-storage
+    size: 20Gi
+    keep: 14
 
 masterKey:
-  # Q5: created out of band by the key holder (docs/server/deployment.md), never by CI.
   existingSecret: atlas-duck-master-key
 
 directory:
   ldap:
-    # Q4: dux-deploy's values use ldaps://sro-ad-4.intern.gipmbh.de:636, @gipmbh.de and
-    # DC=intern,DC=gipmbh,DC=de; confirm before the first deploy.
-    url: CHANGE-ME
-    upnSuffix: CHANGE-ME
-    baseDn: CHANGE-ME
-  # Q6: only if a read-only service account is approved (PD-M13-14); both or neither.
+    url: ldaps://sro-ad-4.intern.gipmbh.de:636
+    upnSuffix: "@gipmbh.de"
+    baseDn: DC=intern,DC=gipmbh,DC=de
+  # Q6: no read-only service account yet; offboarding is manual (docs/server/offboarding.md).
   serviceBind:
     dn: ""
     existingSecret: ""
 
 groups:
-  # Q4: the group DNs that grant the roles (SM-2.3).
-  users: CHANGE-ME
-  auditors: CHANGE-ME
-  admins: CHANGE-ME
+  # The DUX team group (AD, read 2026-10-27). Admins are the same team: admins have no access to
+  # user data (SM-2.5). No auditors group yet: no auditor role.
+  users: CN=G-DUX,OU=Teams,OU=Gruppen,DC=intern,DC=gipmbh,DC=de
+  auditors: ""
+  admins: CN=G-DUX,OU=Teams,OU=Gruppen,DC=intern,DC=gipmbh,DC=de
 
 testDirectory:
   enabled: false
 
 networkPolicy:
   enabled: true
-  # Q2: labels of the ingress controller and monitoring namespaces.
-  ingressNamespaceSelectors:
-    - kubernetes.io/metadata.name: CHANGE-ME
+  # The ingress controller's namespace is not visible to the team: the HTTP port is open to
+  # every namespace, everything else is closed.
+  ingressFromAllNamespaces: true
+  # LDAPS only to sro-ad-4.intern.gipmbh.de (resolved 2026-10-27).
+  directoryCidrs:
+    - 172.31.0.15/32
 
 resources:
   requests:

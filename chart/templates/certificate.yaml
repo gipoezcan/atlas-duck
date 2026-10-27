@@ -1,0 +1,17 @@
+{{- if and .Values.ingress.enabled .Values.ingress.tls.certManager.issuer }}
+# cert-manager issues the ingress certificate into ingress.tls.secretName (no key in git, no
+# self-signed Secret; PD-M13-6 as decided at deploy time).
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "atlas-duck.fullname" . }}
+  labels:
+    {{- include "atlas-duck.labels" . | nindent 4 }}
+spec:
+  secretName: {{ required "atlas-duck: ingress.tls.secretName is required" .Values.ingress.tls.secretName }}
+  dnsNames:
+    - {{ required "atlas-duck: ingress.host is required" .Values.ingress.host | quote }}
+  issuerRef:
+    name: {{ .Values.ingress.tls.certManager.issuer }}
+    kind: {{ .Values.ingress.tls.certManager.issuerKind }}
+{{- end }}

@@ -56,14 +56,20 @@ ingress:
   enabled: true
   className: ""
   host: ""
-  # SM-5.2 uses SSE: no proxy buffering, long read timeout.
+  # The cluster's controller is nginx.org (NGINX Inc), so only `nginx.org/*` annotations apply.
+  # SM-5.2 uses SSE: no proxy buffering, long read and send timeouts.
   annotations:
-    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
-    nginx.ingress.kubernetes.io/proxy-buffering: "off"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.org/proxy-buffering: "False"
+    nginx.org/proxy-read-timeout: "3600s"
+    nginx.org/proxy-send-timeout: "3600s"
+    nginx.org/client-max-body-size: "1m"
   tls:
-    # An existing Secret (PD-M13-6, Q3); the chart never creates one. Required.
+    # The TLS Secret's name (PD-M13-6). Required. The chart never renders a Secret; with
+    # certManager.issuer set it renders a cert-manager Certificate that fills this Secret.
     secretName: ""
+    certManager:
+      issuer: ""
+      issuerKind: ClusterIssuer
 
 persistence:
   # ADR 0003: SQLite needs ReadWriteOnce block storage; anything else is refused.
@@ -73,6 +79,14 @@ persistence:
   size: 10Gi
   # `helm.sh/resource-policy: keep` so `helm uninstall` never deletes the data (production).
   keep: true
+  # ADR 0004: a second volume for the scheduler's daily backups (may be NFS: only bundles live
+  # there, never the live SQLite files).
+  backups:
+    enabled: false
+    storageClassName: ""
+    size: 20Gi
+    # How many daily bundles stay (ATLAS_DUCK_BACKUP_KEEP).
+    keep: 14
 
 masterKey:
   # Secret with key `key` holding `atlas-duck-master-key/v1 <id> <base64>`. Required.
@@ -114,6 +128,10 @@ networkPolicy:
   enabled: true
   # Namespaces allowed to reach the pod: the ingress controller and monitoring (Q2).
   ingressNamespaceSelectors: []
+  # Allow the HTTP port from every namespace (when the controller's namespace is unknown).
+  ingressFromAllNamespaces: false
+  # LDAPS egress only to these CIDRs (the directory hosts); empty = port 636 to anywhere.
+  directoryCidrs: []
   # Egress besides DNS, LDAPS 636 and HTTPS 443 (for example an instance on 8443).
   extraEgressPorts: []
 

@@ -59,7 +59,16 @@
         "annotations": { "type": "object" },
         "tls": {
           "type": "object",
-          "properties": { "secretName": { "type": "string" } }
+          "properties": {
+            "secretName": { "type": "string" },
+            "certManager": {
+              "type": "object",
+              "properties": {
+                "issuer": { "type": "string" },
+                "issuerKind": { "type": "string" }
+              }
+            }
+          }
         }
       }
     },
@@ -69,7 +78,16 @@
         "accessMode": { "type": "string" },
         "storageClassName": { "type": "string" },
         "size": { "type": "string" },
-        "keep": { "type": "boolean" }
+        "keep": { "type": "boolean" },
+        "backups": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "storageClassName": { "type": "string" },
+            "size": { "type": "string" },
+            "keep": { "type": "integer", "minimum": 1 }
+          }
+        }
       }
     },
     "masterKey": {
@@ -134,6 +152,8 @@
       "properties": {
         "enabled": { "type": "boolean" },
         "ingressNamespaceSelectors": { "type": "array", "items": { "type": "object" } },
+        "ingressFromAllNamespaces": { "type": "boolean" },
+        "directoryCidrs": { "type": "array", "items": { "type": "string" } },
         "extraEgressPorts": { "type": "array", "items": { "type": "integer" } }
       }
     },
