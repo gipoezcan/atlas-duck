@@ -72,8 +72,8 @@ async function errorCode(res: Response): Promise<{ code?: string; body: unknown 
   return { code: err && typeof err.code === 'string' ? err.code : undefined, body };
 }
 
-function post(cmd: string, args: Record<string, unknown>): Promise<Response> {
-  return fetch('/api/cmd/' + encodeURIComponent(cmd), {
+function post(prefix: string, cmd: string, args: Record<string, unknown>): Promise<Response> {
+  return fetch(prefix + '/' + encodeURIComponent(cmd), {
     method: 'POST',
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf() },
@@ -81,10 +81,14 @@ function post(cmd: string, args: Record<string, unknown>): Promise<Response> {
   });
 }
 
-async function invoke(cmd: string, args: Record<string, unknown>): Promise<unknown> {
+function invoke(cmd: string, args: Record<string, unknown>): Promise<unknown> {
+  return invokeAt('/api/cmd', cmd, args);
+}
+
+async function invokeAt(prefix: string, cmd: string, args: Record<string, unknown>): Promise<unknown> {
   let res: Response;
   try {
-    res = await post(cmd, args);
+    res = await post(prefix, cmd, args);
   } catch {
     throw INTERNAL;
   }
@@ -94,7 +98,7 @@ async function invoke(cmd: string, args: Record<string, unknown>): Promise<unkno
       // PD-205: the token may be stale (a new login in another tab); refetch once, retry once.
       await loadSession();
       try {
-        res = await post(cmd, args);
+        res = await post(prefix, cmd, args);
       } catch {
         throw INTERNAL;
       }
@@ -189,3 +193,16 @@ export const httpTransport: Transport = {
   invoke,
   listen: (name, handler) => listen(name, handler),
 };
+
+/**
+ * M14 PD-257: a transport whose commands go to `<prefix>/<cmd>` (the auditor page:
+ * `/api/auditor/users/<user_id>`), with the same session, CSRF and error handling. Events are the
+ * page's own stream (the reused audit components subscribe to none in server mode).
+ */
+export function httpTransportFor(prefix: string): Transport {
+  return {
+    kind: 'http',
+    invoke: (cmd, args) => invokeAt(prefix, cmd, args),
+    listen: (name, handler) => listen(name, handler),
+  };
+}

@@ -10,6 +10,7 @@ export const SHELL_TEXT = {
   connected_apps: 'Connected apps',
   my_audit: 'My audit',
   admin: 'Admin',
+  auditor: 'Auditor',
   sign_out: 'Sign out',
   sign_out_failed: 'Signing out failed. Try again.',
 } as const;
@@ -32,12 +33,13 @@ export async function signOut(): Promise<boolean> {
 
 /**
  * The server pages' header (PD-219): the signed-in user, links to the server pages (Admin only
- * for the admin role) and Sign out. The desktop window buttons do not exist here.
+ * for the admin role, Auditor only for the auditor role) and Sign out. The desktop window buttons do not exist here.
  */
 export function ServerHeader() {
   const session = useSession();
   const [failed, setFailed] = useState(false);
   const admin = session?.roles.includes('admin') ?? false;
+  const auditor = session?.roles.includes('auditor') ?? false;
   return (
     <header className="app-header server-header">
       <nav aria-label="Pages">
@@ -46,6 +48,7 @@ export function ServerHeader() {
         <a href="/api-keys">{SHELL_TEXT.api_keys}</a>
         <a href="/connected-apps">{SHELL_TEXT.connected_apps}</a>
         <a href="/audit">{SHELL_TEXT.my_audit}</a>
+        {auditor ? <a href="/auditor">{SHELL_TEXT.auditor}</a> : null}
         {admin ? <a href="/admin">{SHELL_TEXT.admin}</a> : null}
         <span className="server-user">{session?.user ?? ''}</span>
         <button

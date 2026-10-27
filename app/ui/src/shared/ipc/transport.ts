@@ -19,6 +19,7 @@ export interface Transport {
 }
 
 let forTests: Transport | null = null;
+let forPage: Transport | null = null;
 
 /**
  * The transport of this build, selected once at build time (PD-218): Tauri unless the server
@@ -29,7 +30,15 @@ const BUILD_TRANSPORT: Transport =
   import.meta.env.VITE_ATLAS_DUCK_TRANSPORT === 'http' ? httpTransport : tauriTransport;
 
 export function transport(): Transport {
-  return forTests ?? BUILD_TRANSPORT;
+  return forTests ?? forPage ?? BUILD_TRANSPORT;
+}
+
+/**
+ * M14 PD-257: the server auditor page sends every command of the reused audit components to the
+ * selected user's scoped endpoint (`httpTransportFor`); `null` restores the build's own.
+ */
+export function setPageTransport(t: Transport | null): void {
+  forPage = t;
 }
 
 /** Replaces the transport inside tests only (`null` restores the build's own). */

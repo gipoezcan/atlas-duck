@@ -70,6 +70,19 @@ describe('server shell', () => {
     );
     await flush();
     expect(screen.getByRole('link', { name: SHELL_TEXT.admin }).getAttribute('href')).toBe('/admin');
+    expect(screen.queryByRole('link', { name: SHELL_TEXT.auditor })).toBeNull();
+  });
+
+  it('auditors_see_the_auditor_link', async () => {
+    vi.mocked(loadSession).mockResolvedValue(session(['user', 'auditor']));
+    render(
+      <RequireSession>
+        <ServerHeader />
+      </RequireSession>,
+    );
+    await flush();
+    expect(screen.getByRole('link', { name: SHELL_TEXT.auditor }).getAttribute('href')).toBe('/auditor');
+    expect(screen.queryByRole('link', { name: SHELL_TEXT.admin })).toBeNull();
   });
 
   it('sign_out_posts_logout_with_csrf_then_goes_to_login', async () => {
