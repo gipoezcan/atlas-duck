@@ -633,9 +633,12 @@ dependencies = [
  "async-trait",
  "atlas-duck-core",
  "atlas-duck-ipc",
+ "atlas-duck-registry",
  "atlas-duck-sandbox-host",
  "serde_json",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

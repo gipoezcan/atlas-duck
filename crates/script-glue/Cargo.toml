@@ -18,6 +18,13 @@ atlas-duck-sandbox-host = { path = "../sandbox-host" }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The glue test of WorkerInit.read_op_ids reads the registry itself.
+atlas-duck-registry = { path = "../registry" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+tracing-subscriber = { workspace = true }
 
 [lints.clippy]
 unwrap_used = "deny"

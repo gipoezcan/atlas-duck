@@ -13,7 +13,7 @@ use atlas_duck_ipc::sandbox::probe::ConfinementReport;
 use atlas_duck_sandbox_host::bridge::ExpectedWorker;
 use atlas_duck_sandbox_host::probe::{FloorVerdict, ProbeReport};
 
-use crate::sandbox_probe::FallbackIdentity;
+use crate::probe::FallbackIdentity;
 
 /// Which spawner a spawn uses (§9.4, PD-141 (b)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

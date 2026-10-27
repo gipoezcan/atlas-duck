@@ -24,7 +24,7 @@ use serde_json::json;
 use tokio::sync::{Semaphore, watch};
 
 use super::*;
-use crate::sandbox_probe::FallbackIdentity;
+use crate::probe::FallbackIdentity;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -1670,10 +1670,36 @@ fn capture_on_this_thread(
     let cap = Capture::default();
     let subscriber = tracing_subscriber::layer::SubscriberExt::with(
         tracing_subscriber::Registry::default(),
-        crate::diag::fields::allowlist_layer(cap.clone()),
+        EventLayer(cap.clone()),
     );
     tracing::subscriber::with_default(subscriber, || body(&cap))?;
     Ok(String::from_utf8(lock(&cap.0).clone())?)
+}
+
+/// M14 T11: one line per `atlas_duck*` event, `name=value` per field in order and a closing
+/// `dropped_fields=0`: the line shape of the app's diagnostic allowlist layer for these
+/// all-listed fields (that layer stays in the app, PD-247).
+struct EventLayer(Capture);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventLayer {
+    fn on_event(&self, e: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if !e.metadata().target().starts_with("atlas_duck") {
+            return;
+        }
+        struct Fields(Vec<String>);
+        impl tracing::field::Visit for Fields {
+            fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                self.0.push(format!("{}={v}", f.name()));
+            }
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                self.0.push(format!("{}={v:?}", f.name()));
+            }
+        }
+        let mut v = Fields(Vec::new());
+        e.record(&mut v);
+        let line = format!("{} dropped_fields=0\n", v.0.join(" "));
+        lock(&(self.0).0).extend_from_slice(line.as_bytes());
+    }
 }
 
 /// A current-thread runtime with a single blocking thread (see [`occupy_blocking_pool`]).
