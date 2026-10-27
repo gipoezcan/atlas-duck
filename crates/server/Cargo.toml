@@ -27,6 +27,10 @@ required-features = ["testing"]
 name = "redaction"
 required-features = ["testing"]
 
+[[test]]
+name = "oauth_flow"
+required-features = ["testing"]
+
 [features]
 # In-memory store and test constructors for tests of code above the store, and core's test hooks
 # (plain-HTTP mock instances) for the in-process integration tests. Never a release build.
@@ -81,7 +85,7 @@ rcgen = { workspace = true }
 rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
 # Cookie-carrying HTTP client of the in-process API tests.
 reqwest = { workspace = true, features = ["json"] }
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "io-util"] }
 # `ServiceExt::oneshot` for in-process router tests (axum's own tower, already locked).
 tower = { workspace = true, features = ["util"] }
 

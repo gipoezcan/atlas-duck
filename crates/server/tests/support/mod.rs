@@ -6,6 +6,8 @@
 
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
+pub mod oauth_client;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
