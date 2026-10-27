@@ -44,6 +44,7 @@ pub struct AppInner {
     pub web: WebDir,
     pub health: Arc<Health>,
     pub api_keys: Arc<crate::api_keys::ApiKeys>,
+    pub mcp_sessions: Arc<crate::mcp::McpSessions>,
 }
 
 #[derive(Clone)]
@@ -56,8 +57,8 @@ impl std::ops::Deref for AppState {
     }
 }
 
-/// Every route group (T14): health, static pages and assets, the auth routes; the command, SSE,
-/// PAT, API-key and MCP groups join in their tasks. An unrouted path is 404.
+/// Every route group: health, static pages and assets, auth, commands and SSE, PATs, API keys,
+/// admin instances and `/mcp` (bearer only, its own guard). An unrouted path is 404.
 pub fn router(state: AppState) -> Router {
     let mut r = Router::new()
         .route("/healthz", get(health::healthz))
@@ -86,7 +87,8 @@ pub fn router(state: AppState) -> Router {
     for (path, _) in static_files::PAGES {
         r = r.route(path, get(page));
     }
-    r.fallback(|| async { ApiError::NOT_FOUND })
+    r.merge(crate::mcp::routes(&state))
+        .fallback(|| async { ApiError::NOT_FOUND })
         .layer(middleware::from_fn_with_state(state.clone(), api_guard))
         .with_state(state)
 }

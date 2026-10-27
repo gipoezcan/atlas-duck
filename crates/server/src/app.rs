@@ -148,6 +148,7 @@ async fn run(config: Config) -> u8 {
         web: WebDir(config.web_dir.clone()),
         health: Arc::new(Health::new(store.clone(), directory, true)),
         api_keys,
+        mcp_sessions: Arc::new(crate::mcp::McpSessions::new()),
     }));
     let started = json!({"version": env!("CARGO_PKG_VERSION"), "mode": format!("{:?}", config.mode).to_lowercase()});
     let writer = Arc::new(AnchorWriter::new(

@@ -28,6 +28,9 @@ use crate::store::ServerStore;
 use crate::store::sqlite::SqliteStore;
 use crate::users::user_id_for;
 
+/// `/mcp` (T19) over the same harness.
+mod mcp;
+
 const ORIGIN: &str = "https://duck.example.test";
 const T0: i64 = 1_800_000_000;
 const PW_CANARY: &str = "pw-canary-7f3a9c";
@@ -162,6 +165,7 @@ impl H {
                 )
                 .unwrap(),
             ),
+            mcp_sessions: Arc::new(crate::mcp::McpSessions::new()),
         }));
         H {
             router: router(state.clone()),
