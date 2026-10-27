@@ -175,26 +175,41 @@ pub async fn add(
         return Err(ApiError::INSTANCE_EXISTS);
     }
     validate(&current, &rec, registry.deps().allow_http)?;
+    // Batch-3 review I1: a PAT left from an earlier instance of this alias must never reach the
+    // new origin; purge it before the row exists.
+    purge_pats(store, registry, &rec.alias).await?;
     match store.instance_put(&rec) {
         Ok(()) => {}
         Err(StoreError::Duplicate) => return Err(ApiError::INSTANCE_EXISTS),
         Err(e) => return Err(store_err(e)),
     }
+    operational(store, registry, crate::anchor::KIND_INSTANCE_ADDED, &rec);
     registry.instances_changed().await;
     Ok(InstanceView::from(&rec))
 }
 
-/// Removes an instance: the row, then every user's PAT for it with `CREDENTIAL_CHANGED {alias,
-/// change: deleted, reason: instance_removed}` in that user's chain (opening the runtime if it is
-/// closed), then tells every open runtime (PD-196).
-pub async fn remove(
+/// Records an admin instance change in the anchor chain's operational log (batch-3 review M2).
+/// The change itself is already made, so a failed append is logged, not answered.
+fn operational(store: &dyn ServerStore, registry: &Registry, kind: &str, rec: &InstanceRecord) {
+    let body = serde_json::json!({
+        "alias": rec.alias,
+        "instance_id": instance_id_for(&rec.alias),
+        "product": rec.product,
+        "base_url": rec.base_url,
+    });
+    let now = registry.deps().clock.now();
+    if crate::anchor::append_operational(store, now, kind, &body).is_err() {
+        tracing::error!(event = "anchor_append_failed", kind);
+    }
+}
+
+/// Deletes every user's PAT for `alias`, each after `CREDENTIAL_CHANGED {alias, change: deleted,
+/// reason: instance_removed}` in that user's chain (opening the runtime if it is closed).
+async fn purge_pats(
     store: &dyn ServerStore,
     registry: &Registry,
     alias: &str,
 ) -> Result<(), ApiError> {
-    if !store.instance_delete(alias).map_err(store_err)? {
-        return Err(ApiError::INSTANCE_UNKNOWN);
-    }
     // The record goes into the user's chain before the PAT goes (audit before effect).
     for pat in store.pats_for_alias(alias).map_err(store_err)? {
         let mut payload = Map::new();
@@ -210,10 +225,33 @@ pub async fn remove(
             .await?;
         store.pat_delete(&pat.user_id, alias).map_err(store_err)?;
     }
-    registry.instances_changed().await;
     Ok(())
 }
 
+/// Removes an instance (PD-196): every user's PAT first, then the row, then tells every open
+/// runtime. Batch-3 review I1: the row goes only when every PAT is gone, so a failure part-way
+/// leaves the instance listed and the DELETE can be retried.
+pub async fn remove(
+    store: &dyn ServerStore,
+    registry: &Registry,
+    alias: &str,
+) -> Result<(), ApiError> {
+    let Some(rec) = store
+        .instance_list()
+        .map_err(store_err)?
+        .into_iter()
+        .find(|i| i.alias == alias)
+    else {
+        return Err(ApiError::INSTANCE_UNKNOWN);
+    };
+    purge_pats(store, registry, alias).await?;
+    if !store.instance_delete(alias).map_err(store_err)? {
+        return Err(ApiError::INSTANCE_UNKNOWN);
+    }
+    operational(store, registry, crate::anchor::KIND_INSTANCE_REMOVED, &rec);
+    registry.instances_changed().await;
+    Ok(())
+}
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

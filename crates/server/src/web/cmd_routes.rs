@@ -55,7 +55,7 @@ pub async fn events(
 ) -> Result<Response, ApiError> {
     let cookie = cookie_of(req.headers(), st.cookie_secure).ok_or(ApiError::NO_SESSION)?;
     let rt = st.registry.runtime(&user.ctx()).await?;
-    let pin = rt.sse_pin();
+    let pin = rt.try_sse_pin().ok_or(ApiError::TOO_MANY_STREAMS)?;
     let rx = rt.events();
     Ok(crate::sse::stream(rx, Some(pin), st.sessions.clone(), cookie).into_response())
 }

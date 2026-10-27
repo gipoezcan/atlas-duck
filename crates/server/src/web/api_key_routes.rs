@@ -45,12 +45,22 @@ pub async fn create(
         .create(&ctx, &body.name, &body.scopes, body.expires_in_days)?;
     let v = &created.view;
     let scopes: Vec<&str> = v.scopes.iter().map(String::as_str).collect();
-    let rt = st.registry.runtime(&ctx).await?;
-    rt.append_server_record(
-        EventType::API_KEY_CREATED,
-        api_key_created(&v.id, &v.name, &v.prefix, &scopes, &rfc3339(v.expires_at)),
-    )
-    .await?;
+    // Batch-3 review M3: a key whose API_KEY_CREATED did not commit is revoked again, so no
+    // active, unaudited key remains.
+    let appended = match st.registry.runtime(&ctx).await {
+        Ok(rt) => {
+            rt.append_server_record(
+                EventType::API_KEY_CREATED,
+                api_key_created(&v.id, &v.name, &v.prefix, &scopes, &rfc3339(v.expires_at)),
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    if let Err(e) = appended {
+        let _ = st.api_keys.revoke(&ctx, &v.id);
+        return Err(e);
+    }
     let mut res = (
         StatusCode::CREATED,
         Json(json!({

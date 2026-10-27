@@ -105,6 +105,12 @@ impl ApiError {
         "api/body_too_large",
         "The request body is too large.",
     );
+    /// Batch-3 review M5: at most `MAX_SSE_STREAMS` open event streams per user.
+    pub const TOO_MANY_STREAMS: ApiError = e(
+        StatusCode::TOO_MANY_REQUESTS,
+        "api/too_many_streams",
+        "Too many open event streams.",
+    );
     pub const INSTANCE_INVALID: ApiError = e(
         StatusCode::BAD_REQUEST,
         "instance/invalid",
@@ -245,6 +251,7 @@ mod tests {
             (ApiError::NOT_FOUND, 404),
             (ApiError::UNKNOWN_COMMAND, 404),
             (ApiError::BODY_TOO_LARGE, 413),
+            (ApiError::TOO_MANY_STREAMS, 429),
             (ApiError::INSTANCE_INVALID, 400),
             (ApiError::INSTANCE_EXISTS, 409),
             (ApiError::INSTANCE_UNKNOWN, 404),

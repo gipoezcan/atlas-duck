@@ -226,3 +226,27 @@ fn last_used_is_written_at_most_every_minute() {
         Some(T0 + 61)
     );
 }
+
+#[test]
+fn a_revoke_during_the_verify_is_not_undone_by_the_cache() {
+    // Batch-3 review I2: the revoke lands between the store read and the cache insert.
+    let (keys, _store, _clock, a, _) = setup();
+    let created = keys.create(&a, "k", &scopes(&["read"]), None).unwrap();
+    let id = created.id.clone();
+    let key = created.key.expose_secret().to_owned();
+    *keys.after_verify.lock().unwrap() = Some(Box::new(move |k: &ApiKeys| {
+        let _ = k.revoke(&UserCtx::from_authenticated("a"), &id);
+    }));
+    let _ = keys.authenticate(&key);
+    *keys.after_verify.lock().unwrap() = None;
+    assert!(
+        matches!(
+            keys.authenticate(&key),
+            Err(AuthFail::Refused {
+                reason: "revoked",
+                ..
+            })
+        ),
+        "a revoked key must not be served from the cache"
+    );
+}

@@ -391,6 +391,19 @@ impl UserRuntime {
             && self.decisions().queue_list().is_empty()
     }
 
+    /// An SSE pin unless the user already has [`MAX_SSE_STREAMS`] open (batch-3 review M5).
+    pub fn try_sse_pin(self: &Arc<Self>) -> Option<Pin> {
+        self.sse_streams
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < MAX_SSE_STREAMS).then_some(n + 1)
+            })
+            .ok()?;
+        Some(Pin {
+            rt: self.clone(),
+            sse: true,
+        })
+    }
+
     pub fn sse_pin(self: &Arc<Self>) -> Pin {
         self.sse_streams.fetch_add(1, Ordering::SeqCst);
         Pin {
@@ -407,6 +420,9 @@ impl UserRuntime {
         }
     }
 }
+
+/// Open event streams per user (batch-3 review M5).
+pub const MAX_SSE_STREAMS: usize = 8;
 
 /// Keeps a runtime from eviction while an SSE stream or an MCP call is open.
 pub struct Pin {
@@ -495,7 +511,9 @@ impl Registry {
         if open.len() >= self.max_open {
             let victim = open
                 .values()
-                .filter(|r| r.evictable())
+                // Batch-3 review I3: a runtime a request still holds (any `Arc` besides this
+                // map's, a pin included) is in use and never closed under it.
+                .filter(|r| Arc::strong_count(r) == 1 && r.evictable())
                 .min_by_key(|r| r.last_used.load(Ordering::SeqCst))
                 .map(|r| r.user_id.clone());
             match victim.and_then(|v| open.remove(&v)) {

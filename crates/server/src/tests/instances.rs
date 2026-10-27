@@ -143,6 +143,68 @@ async fn removal_deletes_every_users_pat_with_a_record_in_each_chain() {
     within(reg.close_all()).await;
 }
 
+fn pat(uid: &str, alias: &str) -> PatRecord {
+    PatRecord {
+        user_id: uid.to_owned(),
+        alias: alias.into(),
+        sealed: Sealed {
+            nonce: vec![0; 12],
+            ct: vec![1, 2, 3],
+        },
+        identity_json: "{}".into(),
+        checked_at: 0,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_removal_keeps_the_row_and_can_be_retried() {
+    // Batch-3 review I1: the row goes last, so a PAT whose owner cannot be opened keeps the
+    // instance listed; once the PAT is gone the retry succeeds.
+    let env = Env::new();
+    let a = env.user("alice");
+    env.store.pat_put(&pat(&a, "work")).unwrap();
+    env.store.pat_put(&pat("usr_nobody", "work")).unwrap();
+    let reg = Registry::new(env.deps(), 10);
+    assert!(
+        within(remove(env.store.as_ref(), &reg, "work"))
+            .await
+            .is_err()
+    );
+    assert_eq!(env.store.instance_list().unwrap().len(), 1, "row kept");
+    env.store.pat_delete("usr_nobody", "work").unwrap();
+    within(remove(env.store.as_ref(), &reg, "work"))
+        .await
+        .unwrap();
+    assert!(env.store.pats_for_alias("work").unwrap().is_empty());
+    assert!(env.store.instance_list().unwrap().is_empty());
+    let kinds: Vec<String> = env
+        .store
+        .anchor_all()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.kind)
+        .collect();
+    assert!(kinds.iter().any(|k| k == "INSTANCE_REMOVED"), "{kinds:?}");
+    within(reg.close_all()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_re_added_alias_never_sees_a_leftover_pat() {
+    let env = Env::new();
+    let a = env.user("alice");
+    env.store.pat_put(&pat(&a, "wiki")).unwrap();
+    let reg = Registry::new(env.deps(), 10);
+    within(add(
+        env.store.as_ref(),
+        &reg,
+        spec("wiki", "confluence", "https://other.example.test", false),
+    ))
+    .await
+    .unwrap();
+    assert!(env.store.pats_for_alias("wiki").unwrap().is_empty());
+    within(reg.close_all()).await;
+}
+
 fn config_for(data: &std::path::Path, key_file: &std::path::Path) -> Config {
     let mut vars = HashMap::new();
     for (k, v) in [

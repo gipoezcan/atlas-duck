@@ -128,6 +128,9 @@ struct Cached {
     at: i64,
 }
 
+#[cfg(test)]
+type VerifyHook = Box<dyn Fn(&ApiKeys) + Send>;
+
 pub struct ApiKeys {
     store: Arc<dyn ServerStore>,
     clock: Arc<dyn Clock>,
@@ -136,6 +139,11 @@ pub struct ApiKeys {
     cache: Mutex<HashMap<[u8; 32], Cached>>,
     last_used: Mutex<HashMap<String, i64>>,
     dummy_verifies: AtomicU64,
+    /// Batch-3 review I2: bumped (under the cache lock) by every invalidation; a verify that saw
+    /// another generation does not cache, so a revoke during argon2 is never undone by the cache.
+    generation: AtomicU64,
+    #[cfg(test)]
+    after_verify: Mutex<Option<VerifyHook>>,
 }
 
 fn store_err(_: StoreError) -> ApiError {
@@ -257,6 +265,9 @@ impl ApiKeys {
             cache: Mutex::new(HashMap::new()),
             last_used: Mutex::new(HashMap::new()),
             dummy_verifies: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
+            #[cfg(test)]
+            after_verify: Mutex::new(None),
         })
     }
 
@@ -375,7 +386,9 @@ impl ApiKeys {
 
     /// Evicts every cache entry of key `id`.
     pub fn invalidate(&self, id: &str) {
-        self.cache().retain(|_, c| c.key_id != id);
+        let mut cache = self.cache();
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        cache.retain(|_, c| c.key_id != id);
     }
 
     /// The bearer's key, verified (PD-213, PD-214).
@@ -399,6 +412,7 @@ impl ApiKeys {
             self.dummy(key);
             return Err(AuthFail::Invalid);
         };
+        let generation = self.generation.load(Ordering::SeqCst);
         let rec = match self.store.api_key_by_prefix(prefix) {
             Ok(Some(r)) => r,
             Ok(None) => {
@@ -409,6 +423,15 @@ impl ApiKeys {
         };
         if !verify_key(key, &rec.hash) {
             return Err(AuthFail::Invalid);
+        }
+        #[cfg(test)]
+        if let Some(f) = self
+            .after_verify
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            f(self);
         }
         let reason = if rec.revoked_at.is_some() {
             Some("revoked")
@@ -425,17 +448,21 @@ impl ApiKeys {
                 reason,
             });
         }
-        self.cache().insert(
-            fp,
-            Cached {
-                key_id: rec.id.clone(),
-                user_id: rec.user_id.clone(),
-                prefix: rec.prefix.clone(),
-                scopes: rec.scopes.clone(),
-                expires_at: rec.expires_at,
-                at: now,
-            },
-        );
+        let mut cache = self.cache();
+        if self.generation.load(Ordering::SeqCst) == generation {
+            cache.insert(
+                fp,
+                Cached {
+                    key_id: rec.id.clone(),
+                    user_id: rec.user_id.clone(),
+                    prefix: rec.prefix.clone(),
+                    scopes: rec.scopes.clone(),
+                    expires_at: rec.expires_at,
+                    at: now,
+                },
+            );
+        }
+        drop(cache);
         self.touch(&rec.user_id, &rec.id, now);
         Ok(KeyCtx {
             user: UserCtx::from_authenticated(&rec.user_id),

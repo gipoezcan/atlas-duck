@@ -134,6 +134,48 @@ async fn a_failed_first_creation_is_retried_on_the_next_open() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runtime_held_by_a_request_is_not_evicted() {
+    // Batch-3 review I3: a bare `Arc` from `runtime()` keeps the runtime open.
+    let env = Env::new();
+    let (a, b) = (env.user("alice"), env.user("bob"));
+    let reg = Registry::new(env.deps(), 1);
+    let ra = within(reg.open_user(&a)).await.unwrap();
+    let rb = within(reg.open_user(&b)).await.unwrap();
+    assert!(reg.take_closed_heads().is_empty(), "A is in use");
+    assert_eq!(within(reg.open_runtimes()).await.len(), 2);
+    // The request still works on A's runtime.
+    let seq = ra.head().1;
+    within(ra.append_server_record(
+        atlas_duck_audit::EventType::CREDENTIAL_CHANGED,
+        serde_json::Map::new(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(ra.head().1, seq + 1);
+    drop((ra, rb));
+    within(reg.close_all()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sse_streams_are_capped_per_user() {
+    let env = Env::new();
+    let a = env.user("alice");
+    let reg = Registry::new(env.deps(), 4);
+    let ra = within(reg.open_user(&a)).await.unwrap();
+    let pins: Vec<_> = (0..MAX_SSE_STREAMS)
+        .map(|_| ra.try_sse_pin().expect("under the cap"))
+        .collect();
+    assert!(ra.try_sse_pin().is_none(), "the ninth stream is refused");
+    drop(pins);
+    assert!(
+        ra.try_sse_pin().is_some(),
+        "closed streams free their slots"
+    );
+    drop(ra);
+    within(reg.close_all()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn eviction_honours_pins_and_lru() {
     let env = Env::new();
     let (a, b, c) = (env.user("alice"), env.user("bob"), env.user("carol"));

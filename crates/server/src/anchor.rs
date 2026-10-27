@@ -26,6 +26,9 @@ pub const KIND_HEADS: &str = "HEADS";
 pub const KIND_RUNTIME_CLOSED: &str = "RUNTIME_CLOSED";
 pub const KIND_SERVER_START: &str = "SERVER_START";
 pub const KIND_SERVER_STOP: &str = "SERVER_STOP";
+/// Admin instance changes (batch-3 review M2): `{alias, instance_id, product, base_url}`.
+pub const KIND_INSTANCE_ADDED: &str = "INSTANCE_ADDED";
+pub const KIND_INSTANCE_REMOVED: &str = "INSTANCE_REMOVED";
 /// Every user is anchored at least once per this many seconds.
 pub const REANCHOR_SECS: i64 = 24 * 3600;
 
