@@ -16,14 +16,21 @@ use crate::anchor::KIND_BACKUP_REMOVED;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BundleView {
     pub name: String,
+    /// `data` (`<data>/backups`) or `scheduled` (`ATLAS_DUCK_BACKUP_DIR`, ADR 0004).
+    pub location: &'static str,
     /// A manifest exists: the bundle is complete and restorable.
     pub complete: bool,
     pub created_at: Option<String>,
     pub bytes: u64,
 }
 
-fn backups_dir(ctx: &AdminCtx) -> PathBuf {
-    ctx.registry.deps().data_dir.join("backups")
+/// The bundle directories: `<data>/backups`, then the scheduled backups' volume (ADR 0004).
+fn roots(ctx: &AdminCtx) -> Vec<(&'static str, PathBuf)> {
+    let mut v = vec![("data", ctx.registry.deps().data_dir.join("backups"))];
+    if let Some(d) = &ctx.backup_dir {
+        v.push(("scheduled", d.clone()));
+    }
+    v
 }
 
 /// A bundle name: one plain path component inside `<data>/backups`.
@@ -36,12 +43,11 @@ fn bundle_path(ctx: &AdminCtx, name: &str) -> Result<PathBuf, &'static str> {
     if !plain {
         return Err("backups/name_invalid");
     }
-    let p = backups_dir(ctx).join(name);
-    if p.is_dir() {
-        Ok(p)
-    } else {
-        Err("backups/unknown")
-    }
+    roots(ctx)
+        .into_iter()
+        .map(|(_, root)| root.join(name))
+        .find(|p| p.is_dir())
+        .ok_or("backups/unknown")
 }
 
 fn dir_bytes(p: &std::path::Path) -> u64 {
@@ -58,9 +64,11 @@ fn dir_bytes(p: &std::path::Path) -> u64 {
 }
 
 pub fn list(ctx: &AdminCtx) -> Result<Value, &'static str> {
-    let dir = backups_dir(ctx);
     let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&dir) {
+    for (location, dir) in roots(ctx) {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in rd.filter_map(Result::ok) {
             if !e.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
@@ -71,6 +79,7 @@ pub fn list(ctx: &AdminCtx) -> Result<Value, &'static str> {
                 .and_then(|b| serde_json::from_slice(&b).ok());
             out.push(BundleView {
                 name: e.file_name().to_string_lossy().into_owned(),
+                location,
                 complete: manifest.is_some(),
                 created_at: manifest.map(|m| m.created_at),
                 bytes: dir_bytes(&p),
@@ -99,4 +108,40 @@ pub fn complete_bundle(ctx: &AdminCtx, name: &str) -> Result<PathBuf, &'static s
     } else {
         Err("backups/incomplete")
     }
+}
+
+/// The scheduler's daily backup (ADR 0004): a bundle into `ATLAS_DUCK_BACKUP_DIR`, then all but
+/// the newest `backup_keep` complete scheduled bundles removed (each `BACKUP_REMOVED`). Answers
+/// how many were removed; `Ok(None)` when no backup directory is configured.
+pub async fn scheduled(ctx: &AdminCtx) -> Result<Option<usize>, &'static str> {
+    let Some(dir) = ctx.backup_dir.clone() else {
+        return Ok(None);
+    };
+    std::fs::create_dir_all(&dir).map_err(|_| "backup/target_unusable")?;
+    super::backup::run(ctx, &dir.display().to_string()).await?;
+    let mut bundles: Vec<String> = std::fs::read_dir(&dir)
+        .map_err(|_| "backup/target_unusable")?
+        .filter_map(Result::ok)
+        .filter(|e| e.path().join(MANIFEST).is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(super::backup::BUNDLE_PREFIX))
+        .collect();
+    // Names carry the UTC stamp, so name order is age order.
+    bundles.sort();
+    let keep = usize::try_from(ctx.backup_keep)
+        .unwrap_or(usize::MAX)
+        .max(1);
+    let excess = bundles.len().saturating_sub(keep);
+    let mut removed = 0;
+    for name in &bundles[..excess] {
+        std::fs::remove_dir_all(dir.join(name)).map_err(|_| "backups/remove_failed")?;
+        ctx.writer
+            .operational(
+                KIND_BACKUP_REMOVED,
+                &json!({"bundle": name, "scheduled": true}),
+            )
+            .map_err(|_| "anchor/append_failed")?;
+        removed += 1;
+    }
+    Ok(Some(removed))
 }

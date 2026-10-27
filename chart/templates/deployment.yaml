@@ -91,6 +91,12 @@ spec:
               value: /etc/atlas-duck/ca/ca.pem
             - name: ATLAS_DUCK_ADMIN_SOCKET
               value: /run/atlas-duck/admin.sock
+            {{- if .Values.persistence.backups.enabled }}
+            - name: ATLAS_DUCK_BACKUP_DIR
+              value: /var/lib/atlas-duck-backups/bundles
+            - name: ATLAS_DUCK_BACKUP_KEEP
+              value: {{ .Values.persistence.backups.keep | quote }}
+            {{- end }}
             {{- if .Values.testDirectory.enabled }}
             - name: ATLAS_DUCK_TEST_DIRECTORY_FILE
               value: /etc/atlas-duck/testdir/users.json
@@ -154,6 +160,10 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/atlas-duck
+            {{- if .Values.persistence.backups.enabled }}
+            - name: backups
+              mountPath: /var/lib/atlas-duck-backups
+            {{- end }}
             - name: tmp
               mountPath: /tmp
             - name: run
@@ -183,6 +193,11 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: {{ include "atlas-duck.fullname" . }}-data
+        {{- if .Values.persistence.backups.enabled }}
+        - name: backups
+          persistentVolumeClaim:
+            claimName: {{ include "atlas-duck.fullname" . }}-backups
+        {{- end }}
         - name: tmp
           emptyDir:
             sizeLimit: 1Gi

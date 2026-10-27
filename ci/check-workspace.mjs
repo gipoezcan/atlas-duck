@@ -641,7 +641,10 @@ export function blankCommentsAndStrings(text) {
 
 // Never scanned: build output and dependency trees. Matched against repo-relative paths from the
 // repo root, so a crate directory that happens to be named `target` or `dist` is still scanned.
-const SCAN_SKIP_PATHS = new Set(["target", "node_modules", ".git", "app/ui/dist", "app/ui/node_modules"]);
+// `.cargo-home` is the GitLab jobs' CARGO_HOME (registry sources of every dependency).
+const SCAN_SKIP_PATHS = new Set([
+  "target", "node_modules", ".git", ".cargo-home", "app/ui/dist", "app/ui/node_modules",
+]);
 
 /** Every `.rs` file under `root` (repo-relative paths), skipping build and dependency dirs. */
 export function collectRustFiles(root, rel = "") {

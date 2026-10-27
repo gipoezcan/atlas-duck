@@ -65,6 +65,9 @@ pub struct AdminCtx {
     pub retention_days: u32,
     /// Final review M4: the most file data a streamed restore accepts.
     pub max_stream_bytes: u64,
+    /// ADR 0004: where the scheduler keeps daily backups (`ATLAS_DUCK_BACKUP_DIR`), and how many.
+    pub backup_dir: Option<std::path::PathBuf>,
+    pub backup_keep: u32,
     /// Admin operations run one at a time.
     ops: tokio::sync::Mutex<()>,
 }
@@ -88,6 +91,8 @@ impl AdminCtx {
             clock,
             retention_days,
             max_stream_bytes: stream::DEFAULT_MAX_STREAM_BYTES,
+            backup_dir: None,
+            backup_keep: crate::config::DEFAULT_BACKUP_KEEP,
             ops: tokio::sync::Mutex::new(()),
         }
     }
@@ -97,6 +102,17 @@ impl AdminCtx {
     /// Sets the streamed-restore bound (`ATLAS_DUCK_MAX_RESTORE_BYTES`).
     pub fn with_max_stream_bytes(mut self, n: u64) -> AdminCtx {
         self.max_stream_bytes = n;
+        self
+    }
+
+    /// Sets the scheduled backups' directory and how many bundles it keeps (ADR 0004).
+    pub fn with_scheduled_backups(
+        mut self,
+        dir: Option<std::path::PathBuf>,
+        keep: u32,
+    ) -> AdminCtx {
+        self.backup_dir = dir;
+        self.backup_keep = keep;
         self
     }
 

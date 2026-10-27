@@ -303,7 +303,8 @@ async fn run(config: Config) -> u8 {
             clock.clone(),
             config.retention_days,
         )
-        .with_max_stream_bytes(config.max_restore_bytes),
+        .with_max_stream_bytes(config.max_restore_bytes)
+        .with_scheduled_backups(config.backup_dir.clone(), config.backup_keep),
     );
     let scheduler = Arc::new(Scheduler::new(admin.clone(), lookup, config.offboarding_at));
     let scheduler_task = scheduler.spawn();

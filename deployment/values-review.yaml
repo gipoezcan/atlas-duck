@@ -1,16 +1,19 @@
 # Review environment values (M13 plan T11, PD-M13-8, SM-9.5): test directory, test master key,
-# throwaway volume. The deploy:review job sets publicUrl, ingress.host, ingress.tls.secretName,
-# masterKey.existingSecret and the image per branch; it refuses to run while any CHANGE-ME is
-# left in this file.
+# throwaway volume. deploy:review sets publicUrl, ingress.host, ingress.tls.secretName
+# (atlas-duck-<slug>-tls), masterKey.existingSecret and the image per branch.
 
 mode: review
 
 ingress:
-  className: ""
+  className: nginx
+  tls:
+    certManager:
+      issuer: letsencrypt
+      issuerKind: ClusterIssuer
 
 persistence:
-  # Q1: a storage class offering ReadWriteOnce block storage (not NFS, ADR 0003).
-  storageClassName: CHANGE-ME
+  # ADR 0004: node-local ReadWriteOnce (no RWO block class exists; never NFS for SQLite).
+  storageClassName: local-path
   size: 1Gi
   keep: false
 
@@ -25,9 +28,7 @@ groups:
 
 networkPolicy:
   enabled: true
-  # Q2: labels of the ingress controller namespace (the smoke test reaches the pod through it).
-  ingressNamespaceSelectors:
-    - kubernetes.io/metadata.name: CHANGE-ME
+  ingressFromAllNamespaces: true
 
 # M14 PD-246: one run and one dry run at a time; memory 1Gi + (1 + 1) x 512Mi.
 scripts:

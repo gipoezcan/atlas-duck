@@ -129,16 +129,18 @@ pub fn unique_dir(base: &Path, name: &str) -> PathBuf {
 }
 
 /// The roots a backup may be written to or restored from.
-pub fn allowed_roots(data: &Path) -> Vec<PathBuf> {
+pub fn allowed_roots(data: &Path, extra: Option<&Path>) -> Vec<PathBuf> {
     // `/tmp` is the chart's emptyDir (never the system temp lookup: the server writes no temp files).
     let mut roots = vec![data.join("backups"), PathBuf::from("/tmp")];
+    // ADR 0004: the scheduled backups' volume (`ATLAS_DUCK_BACKUP_DIR`).
+    roots.extend(extra.map(Path::to_path_buf));
     roots.retain(|r| r.exists() || r.ends_with("backups"));
     roots
 }
 
 /// `dir` canonicalized when it lies under an allowed root (`<data>/backups` is created on first
 /// use); else `backup/target_not_allowed`.
-pub fn allowed_dir(data: &Path, dir: &str) -> Result<PathBuf, &'static str> {
+pub fn allowed_dir(data: &Path, extra: Option<&Path>, dir: &str) -> Result<PathBuf, &'static str> {
     let wanted = PathBuf::from(dir);
     let backups = data.join("backups");
     if wanted == backups && !wanted.exists() {
@@ -150,7 +152,7 @@ pub fn allowed_dir(data: &Path, dir: &str) -> Result<PathBuf, &'static str> {
     let under = |p: &Path| p.canonicalize().is_ok_and(|root| real.starts_with(root));
     // Inside the data volume only `<data>/backups`: never the live stores themselves.
     let in_live_data = under(data) && !under(&backups);
-    let ok = !in_live_data && real.is_dir() && allowed_roots(data).iter().any(|r| under(r));
+    let ok = !in_live_data && real.is_dir() && allowed_roots(data, extra).iter().any(|r| under(r));
     if ok {
         Ok(real)
     } else {
@@ -330,7 +332,7 @@ pub(crate) fn write_bundle(
 pub async fn run(ctx: &AdminCtx, dir: &str) -> Result<Value, &'static str> {
     let deps = ctx.registry.deps();
     let data = deps.data_dir.clone();
-    let target = allowed_dir(&data, dir)?;
+    let target = allowed_dir(&data, ctx.backup_dir.as_deref(), dir)?;
     let now = ctx.clock.now();
     let bundle = unique_dir(&target, &format!("{BUNDLE_PREFIX}{}", stamp(now)));
     let master_key_id = deps.master.id().to_owned();

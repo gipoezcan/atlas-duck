@@ -1,0 +1,5 @@
+# expect: atlas-duck: persistence.backups.storageClassName is required
+persistence:
+  backups:
+    enabled: true
+    storageClassName: ""

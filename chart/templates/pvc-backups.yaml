@@ -1,0 +1,21 @@
+{{- if .Values.persistence.backups.enabled }}
+# ADR 0004: the scheduled backups' volume. Only finished bundles live here, so a network
+# filesystem is acceptable; the live SQLite stores stay on the ReadWriteOnce data volume.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "atlas-duck.fullname" . }}-backups
+  labels:
+    {{- include "atlas-duck.labels" . | nindent 4 }}
+  {{- if .Values.persistence.keep }}
+  annotations:
+    helm.sh/resource-policy: keep
+  {{- end }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: {{ required "atlas-duck: persistence.backups.storageClassName is required" .Values.persistence.backups.storageClassName | quote }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.backups.size }}
+{{- end }}

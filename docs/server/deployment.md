@@ -10,35 +10,38 @@ Kubernetes Secret) and ADR 0003 (SQLite, one replica).
 - One pod (`replicas: 1`, `strategy: Recreate`) running `atlas-duck-server serve`, with a hardened
   security context: non-root user 65532, read-only root filesystem, all capabilities dropped,
   seccomp `RuntimeDefault`, and no service-account token.
-- A `ReadWriteOnce` PVC at `/var/lib/atlas-duck`, holding `server/server.db` and one store per
-  user. Production marks it `helm.sh/resource-policy: keep`.
+- A `ReadWriteOnce` PVC at `/var/lib/atlas-duck` on `local-path` (node-local; ADR 0004), holding
+  `server/server.db` and one store per user. Production marks it `helm.sh/resource-policy: keep`.
+- A second PVC on `team-dux-storage` (NFS) at `/var/lib/atlas-duck-backups` for the scheduler's
+  daily backup bundles (newest 14 kept).
 - Secrets created outside the chart, mounted read-only as files:
   - `atlas-duck-master-key`, item `key`, at `/run/secrets/atlas-duck/master-key/key`;
   - during a rotation, the next key at `/run/secrets/atlas-duck/master-key-next/key`;
   - optionally, the directory service-bind password at `/run/secrets/atlas-duck/ldap-bind/password`.
-- A CA bundle ConfigMap built from `deployment/ca/org-ca.pem`.
-- An Ingress, which serves TLS with an existing Secret; the chart never creates a TLS Secret.
-- A NetworkPolicy: ingress only from the selected namespaces; egress only to DNS, LDAPS (636),
-  HTTPS (443) and any extra ports you list.
+- A CA bundle ConfigMap built from `deployment/ca/org-ca.pem` (the root `CN=SRO-AD-3-CA`).
+- An Ingress (class `nginx`, the nginx.org controller, with SSE-friendly `nginx.org/*`
+  annotations) and a cert-manager `Certificate` (ClusterIssuer `letsencrypt`) that fills the TLS
+  Secret; the chart never renders a Secret.
+- A NetworkPolicy: the HTTP port open to every namespace (the ingress controller's namespace is
+  not visible to the team); egress only to DNS, LDAPS (636) on `sro-ad-4` and HTTPS (443).
 - In review environments only: a ConfigMap holding the test users.
 
 Upgrades use `Recreate`, so each one has a short downtime. Sessions survive it because they are
 stored in `server.db`.
 
-## Before the first deploy (open questions)
+## Deployment values (answered 2026-10-27)
 
-Every open item appears as `CHANGE-ME` in `deployment/values-production.yaml`,
-`deployment/values-review.yaml`, `deployment/ca/org-ca.pem` or the `.gitlab-ci.yml` variables
-`REVIEW_DOMAIN` and `REVIEW_TLS_SECRET`. The deploy jobs refuse to run while one is left.
-
-| # | Question | Where it goes |
+| # | Question | Answer |
 |---|---|---|
-| Q1 | A storage class offering `ReadWriteOnce` block storage (not NFS) | `persistence.storageClassName` in both values files |
-| Q2 | Production host, review host pattern, ingress and monitoring namespace labels | `publicUrl`, `ingress.host`, `networkPolicy.ingressNamespaceSelectors`, `REVIEW_DOMAIN` |
-| Q3 | TLS Secret names: production, and the wildcard for review hosts | `ingress.tls.secretName`, `REVIEW_TLS_SECRET` |
-| Q4 | `LDAP_URL`, UPN suffix, base DN, the three group DNs, the organisation's CA certificates | `directory.ldap.*`, `groups.*`, `deployment/ca/org-ca.pem` |
-| Q5 | Who creates the production master key and keeps its offline copy | this document, "Production master key" |
-| Q6 | Is a read-only directory service account approved for the daily offboarding check? | `directory.serviceBind.*` (see [offboarding.md](offboarding.md)) |
+| Q1 | Storage | Live data on `local-path` (no RWO block class exists, NFS is out for SQLite), daily backups on `team-dux-storage` (ADR 0004) |
+| Q2 | Hosts | `atlas-duck.dux.intern.gipmbh.de`; reviews `<slug>.atlas-duck.dux.intern.gipmbh.de` (`REVIEW_DOMAIN`) |
+| Q3 | TLS | cert-manager per host: `atlas-duck-tls`, reviews `atlas-duck-<slug>-tls` |
+| Q4 | Directory | `ldaps://sro-ad-4.intern.gipmbh.de:636`, `@gipmbh.de`, `DC=intern,DC=gipmbh,DC=de`; users and admins `CN=G-DUX,OU=Teams,OU=Gruppen,DC=intern,DC=gipmbh,DC=de`; no auditors group |
+| Q5 | Master key | created out of band before the first production deploy ("Production master key") |
+| Q6 | Service bind | not approved yet: offboarding is manual ([offboarding.md](offboarding.md)) |
+
+The CI variables and cluster objects needed before the first pipeline are listed in
+`deployment/README.md`. The deploy jobs still refuse any `CHANGE-ME` left in their files.
 
 ## Production master key
 
@@ -116,7 +119,7 @@ All server jobs live in `.gitlab-ci.yml`, in the stages `server-prepare` through
 
 ## First production deploy
 
-1. Answer Q1–Q6, fill the values files and the CA bundle, and merge to master.
+1. Merge to master (the values and the CA bundle are filled).
 2. Create the master key Secret, plus the service-bind Secret if Q6 approved it.
 3. Wait for the master pipeline. The image, chart, `chart:test` and `server:guards` jobs must be
    green.

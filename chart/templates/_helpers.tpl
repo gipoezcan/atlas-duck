@@ -72,8 +72,8 @@ matrix (chart/ci-fail/*.yaml, `# expect:`) can match it.
 {{- if and .Values.directory.serviceBind.dn (not .Values.directory.serviceBind.existingSecret) }}
 {{- fail "atlas-duck: directory.serviceBind.existingSecret is required with directory.serviceBind.dn" }}
 {{- end }}
-{{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.ingressNamespaceSelectors) }}
-{{- fail "atlas-duck: networkPolicy.ingressNamespaceSelectors is required when networkPolicy.enabled (Q2)" }}
+{{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.ingressNamespaceSelectors) (not .Values.networkPolicy.ingressFromAllNamespaces) }}
+{{- fail "atlas-duck: networkPolicy.ingressNamespaceSelectors is required when networkPolicy.enabled (Q2), unless ingressFromAllNamespaces" }}
 {{- end }}
 {{- if contains "CHANGE-ME" (toYaml .Values) }}
 {{- fail "atlas-duck: a CHANGE-ME placeholder is left in the values (an open question, see deployment/README.md)" }}

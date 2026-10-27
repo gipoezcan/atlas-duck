@@ -39,6 +39,10 @@ struct S {
 }
 
 fn sqlite_harness(key_id: &str, key: [u8; 32]) -> S {
+    sqlite_harness_with(key_id, key, None, crate::config::DEFAULT_BACKUP_KEEP)
+}
+
+fn sqlite_harness_with(key_id: &str, key: [u8; 32], backup_dir: Option<PathBuf>, keep: u32) -> S {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir_all(data.join("server")).unwrap();
@@ -78,15 +82,18 @@ fn sqlite_harness(key_id: &str, key: [u8; 32]) -> S {
         clock.clone(),
     ));
     writer.start(&json!({})).unwrap();
-    let ctx = Arc::new(AdminCtx::new(
-        store,
-        registry,
-        sessions,
-        api_keys,
-        writer,
-        clock.clone(),
-        DEFAULT_RETENTION_DAYS,
-    ));
+    let ctx = Arc::new(
+        AdminCtx::new(
+            store,
+            registry,
+            sessions,
+            api_keys,
+            writer,
+            clock.clone(),
+            DEFAULT_RETENTION_DAYS,
+        )
+        .with_scheduled_backups(backup_dir, keep),
+    );
     S {
         _dir: dir,
         data,
@@ -962,4 +969,60 @@ async fn a_stream_above_the_bound_is_refused() {
     tar.extend_from_slice(&[0u8; 1024]);
     let r = super::tarball::read_into(&mut tar.as_slice(), &dir.path().join("u"), 1024).await;
     assert_eq!(r.unwrap_err(), "restore/stream_too_large");
+}
+
+/// ADR 0004: the scheduler's daily backup lands on the backup volume, keeps the newest N
+/// bundles (each removal anchored), and a bundle there restores (node loss recovery).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scheduled_backups_keep_the_newest_n_and_restore() {
+    let nfs = tempfile::tempdir().unwrap();
+    let dir = nfs.path().join("backups");
+    let s = sqlite_harness_with("k1", KEY_A, Some(dir.clone()), 2);
+    s.user("alice").await;
+    let sched = crate::scheduler::Scheduler::new(s.ctx.clone(), None, (2, 0));
+    let ran = within(sched.run_due()).await;
+    assert!(
+        ran.contains(&(crate::scheduler::JOB_BACKUP, true)),
+        "{ran:?}"
+    );
+    for _ in 0..2 {
+        s.clock.advance(86_400);
+        within(sched.run_due()).await;
+    }
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(
+        names[0].contains("20270116T") && names[1].contains("20270117T"),
+        "{names:?}"
+    );
+    let removed = s
+        .store()
+        .anchor_all()
+        .unwrap()
+        .iter()
+        .filter(|r| r.kind == crate::anchor::KIND_BACKUP_REMOVED)
+        .count();
+    assert_eq!(removed, 1);
+    let listed = s.call(Request::BackupsList(NoArgs {})).await.data.unwrap();
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["location"] == "scheduled")
+    );
+    // After a node loss: an empty data volume restores the newest scheduled bundle.
+    let fresh = sqlite_harness_with("k1", KEY_A, Some(dir.clone()), 2);
+    fresh.maintenance(true).await;
+    let r = fresh
+        .restore(&dir.join(&names[1]).display().to_string())
+        .await;
+    assert!(r.ok, "{r:?}");
+    assert!(fresh.store().user_by_name("alice").unwrap().is_some());
+    within(s.ctx.registry.close_all()).await;
+    within(fresh.ctx.registry.close_all()).await;
 }

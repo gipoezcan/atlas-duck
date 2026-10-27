@@ -88,6 +88,9 @@ pub struct Config {
     pub service_bind: Option<ServiceBind>,
     /// Final review M4: the most file data `admin restore --stdin` accepts.
     pub max_restore_bytes: u64,
+    /// ADR 0004: the daily scheduled backup target (a second volume) and how many bundles stay.
+    pub backup_dir: Option<PathBuf>,
+    pub backup_keep: u32,
 }
 
 /// A refused configuration: a fixed code and the key it concerns. Never carries a value.
@@ -144,6 +147,9 @@ pub const EXPORT_MAX_CONCURRENT: &str = "ATLAS_DUCK_EXPORT_MAX_CONCURRENT";
 pub const ADMIN_SOCKET: &str = "ATLAS_DUCK_ADMIN_SOCKET";
 pub const OFFBOARDING_AT: &str = "ATLAS_DUCK_OFFBOARDING_AT";
 pub const MAX_RESTORE_BYTES: &str = "ATLAS_DUCK_MAX_RESTORE_BYTES";
+pub const BACKUP_DIR: &str = "ATLAS_DUCK_BACKUP_DIR";
+pub const BACKUP_KEEP: &str = "ATLAS_DUCK_BACKUP_KEEP";
+pub const DEFAULT_BACKUP_KEEP: u32 = 14;
 /// 8 GiB: above the production volume's data, far below a filled disk.
 pub const DEFAULT_MAX_RESTORE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub const RETENTION_DAYS: &str = "ATLAS_DUCK_RETENTION_DAYS";
@@ -320,6 +326,11 @@ impl Config {
             offboarding_at,
             retention_days,
             max_restore_bytes: positive(MAX_RESTORE_BYTES, DEFAULT_MAX_RESTORE_BYTES)?,
+            backup_dir: get(BACKUP_DIR).map(PathBuf::from),
+            backup_keep: small(
+                BACKUP_KEEP,
+                positive(BACKUP_KEEP, u64::from(DEFAULT_BACKUP_KEEP))?,
+            )?,
             service_bind,
             admin_socket: PathBuf::from(
                 get(ADMIN_SOCKET).unwrap_or_else(|| DEFAULT_ADMIN_SOCKET.into()),

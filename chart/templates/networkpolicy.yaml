@@ -13,6 +13,15 @@ spec:
     - Ingress
     - Egress
   ingress:
+    {{- if .Values.networkPolicy.ingressFromAllNamespaces }}
+    # The ingress controller's namespace is not visible to the team (deploy facts): every
+    # namespace may reach the HTTP port, nothing else is open.
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - port: http
+          protocol: TCP
+    {{- else }}
     # The ingress controller and monitoring namespaces (Q2), plus `helm test` pods of this release.
     - from:
         {{- range .Values.networkPolicy.ingressNamespaceSelectors }}
@@ -27,16 +36,26 @@ spec:
       ports:
         - port: http
           protocol: TCP
+    {{- end }}
   egress:
     - ports:
         - port: 53
           protocol: UDP
         - port: 53
           protocol: TCP
-    # LDAPS (SM-2.1) and the Atlassian instances over HTTPS.
+    # LDAPS (SM-2.1): only to the directory hosts when they are listed.
     - ports:
         - port: 636
           protocol: TCP
+      {{- with .Values.networkPolicy.directoryCidrs }}
+      to:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      {{- end }}
+    # The Atlassian instances over HTTPS.
+    - ports:
         - port: 443
           protocol: TCP
         {{- range .Values.networkPolicy.extraEgressPorts }}

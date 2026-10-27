@@ -9,10 +9,18 @@ ingress:
   host: atlas-duck.ci.example.test
   tls:
     secretName: ci-tls
+    certManager:
+      issuer: letsencrypt
+      issuerKind: ClusterIssuer
 persistence:
   storageClassName: ci-rwo
   size: 10Gi
   keep: true
+  backups:
+    enabled: true
+    storageClassName: ci-nfs
+    size: 20Gi
+    keep: 14
 masterKey:
   existingSecret: atlas-duck-master-key
 directory:
@@ -28,9 +36,9 @@ groups:
   auditors: cn=atlas-duck-auditors,dc=ci,dc=example,dc=test
   admins: cn=atlas-duck-admins,dc=ci,dc=example,dc=test
 networkPolicy:
-  ingressNamespaceSelectors:
-    - kubernetes.io/metadata.name: ingress-nginx
-    - kubernetes.io/metadata.name: monitoring
+  ingressFromAllNamespaces: true
+  directoryCidrs:
+    - 192.0.2.15/32
   extraEgressPorts: [8443]
 extraEnv:
   - name: RUST_LOG
