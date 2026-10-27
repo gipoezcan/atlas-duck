@@ -369,6 +369,12 @@ impl UserRuntime {
         (chain, seq, hash)
     }
 
+    /// The user's audit store (integration tests read and verify the chain).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn audit_store(&self) -> &Store {
+        &self.store
+    }
+
     /// PD-196: the admin instances changed; rewrite the config and let core reload it.
     pub async fn instances_changed(&self, deps: &RuntimeDeps) -> Result<(), RuntimeError> {
         apply_instance_settings(&self.store, deps)?;

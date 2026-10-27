@@ -63,6 +63,9 @@ pub struct TestServer {
     pub mock: MockDc,
     pub dir: tempfile::TempDir,
     pub http: reqwest::Client,
+    /// Every response body (and recorded tool result) of the run, for the secret sweep; the
+    /// one create-key answer is left out.
+    pub transcript: std::sync::Mutex<Vec<String>>,
 }
 
 /// A signed-in browser: the session cookie value and its CSRF token.
@@ -167,6 +170,7 @@ impl TestServer {
             mock: jira_mock().await,
             dir,
             http: reqwest::Client::builder().timeout(LIMIT).build().unwrap(),
+            transcript: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -214,6 +218,10 @@ impl TestServer {
         }
     }
 
+    pub fn record(&self, text: &str) {
+        self.transcript.lock().unwrap().push(text.to_owned());
+    }
+
     /// A request from a browser: state-changing methods carry Origin and its CSRF token.
     pub async fn send(
         &self,
@@ -221,6 +229,17 @@ impl TestServer {
         path: &str,
         b: Option<&Browser>,
         body: Option<Value>,
+    ) -> (u16, Value) {
+        self.send_rec(method, path, b, body, true).await
+    }
+
+    async fn send_rec(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        b: Option<&Browser>,
+        body: Option<Value>,
+        record: bool,
     ) -> (u16, Value) {
         let changing = method != reqwest::Method::GET;
         let mut req = self
@@ -233,6 +252,9 @@ impl TestServer {
         let res = req.send().await.unwrap();
         let status = res.status().as_u16();
         let text = res.text().await.unwrap_or_default();
+        if record {
+            self.record(&text);
+        }
         (status, serde_json::from_str(&text).unwrap_or(Value::Null))
     }
 
@@ -277,12 +299,14 @@ impl TestServer {
 
     /// A new API key: `(id, key)`.
     pub async fn api_key(&self, b: &Browser, scopes: &[&str]) -> (String, String) {
+        // The one answer that carries the key: not part of the transcript.
         let (s, v) = self
-            .send(
+            .send_rec(
                 reqwest::Method::POST,
                 "/api/me/api-keys",
                 Some(b),
                 Some(json!({"name": "agent", "scopes": scopes})),
+                false,
             )
             .await;
         assert_eq!(s, 201, "{v}");
@@ -333,4 +357,142 @@ pub fn envelope(r: &CallToolResult) -> Value {
 /// The comment an agent proposes on `ABC-1`.
 pub fn comment_args() -> Value {
     json!({"key": "ABC-1", "body": "Seen on staging.", "body_format": "wiki", "reason": "triage"})
+}
+
+/// What the exit-criterion flow leaves behind.
+pub struct Flow {
+    pub alice: Browser,
+    pub key: String,
+    pub read_id: String,
+    pub write_id: String,
+}
+
+/// The candidate revision of a queued request, from its preview.
+async fn rev_of(s: &TestServer, b: &Browser, id: &str) -> Value {
+    let (status, p) = s.cmd(b, "preview_fetch", json!({"request_id": id})).await;
+    assert_eq!(status, 200, "{p}");
+    p["preview"]["candidate_rev"].clone()
+}
+
+/// The master plan's M12 exit flow over HTTP: the admin adds Jira; alice signs in, stores `pat`
+/// and creates an API key; her MCP agent lists ops, reads `ABC-1` (released in the browser) and
+/// proposes a comment, which pends with its approval URL until alice approves it in the browser;
+/// the agent's `request_await` then answers `succeeded` and the mock got exactly one write with
+/// alice's PAT.
+pub async fn exit_flow(s: &TestServer, pat: &str) -> Flow {
+    s.add_work().await;
+    let alice = s.login(ALICE).await;
+    s.store_pat(&alice, pat).await;
+    let (_, key) = s.api_key(&alice, &["read", "propose_write"]).await;
+    let agent = Arc::new(s.mcp(&key).await);
+    let rec = |r: &CallToolResult| s.record(&serde_json::to_string(r).unwrap());
+
+    let ops = call(&agent, "ops_list", json!({})).await;
+    rec(&ops);
+    assert_eq!(envelope(&ops)["status"], "succeeded");
+
+    // A read: pending until alice releases it, then the data.
+    let reading = {
+        let agent = agent.clone();
+        tokio::spawn(async move { call(&agent, "jira_issue_get", json!({"key": "ABC-1"})).await })
+    };
+    let q = s.queue_of(&alice, 1).await;
+    let read_id = q[0]["request_id"].as_str().unwrap().to_owned();
+    let rev = rev_of(s, &alice, &read_id).await;
+    let (status, out) = s
+        .cmd(
+            &alice,
+            "decide",
+            json!({"request_id": read_id, "decision": "release", "candidate_rev": rev}),
+        )
+        .await;
+    assert_eq!(status, 200, "{out}");
+    let read = tokio::time::timeout(LIMIT, reading)
+        .await
+        .expect("read hung")
+        .unwrap();
+    rec(&read);
+    let env = envelope(&read);
+    assert_eq!(env["status"], "released", "{env}");
+    assert!(env["data"].to_string().contains("ABC-1"), "{env}");
+
+    // A write: pending with its approval URL, approved in the browser.
+    let writing = {
+        let agent = agent.clone();
+        tokio::spawn(async move { call(&agent, "jira_comment_add", comment_args()).await })
+    };
+    let mut write_id = String::new();
+    for _ in 0..300 {
+        let q = s.cmd(&alice, "queue_list", json!({})).await.1;
+        if let Some(row) = q
+            .as_array()
+            .and_then(|a| a.iter().find(|r| r["request_id"] != read_id.as_str()))
+        {
+            write_id = row["request_id"].as_str().unwrap().to_owned();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!write_id.is_empty(), "the write never queued");
+    let status = call(&agent, "request_status", json!({"request_id": write_id})).await;
+    rec(&status);
+    let env = envelope(&status);
+    assert_eq!(env["status"], "pending", "{env}");
+    assert_eq!(
+        env["meta"]["approval_url"],
+        format!("{}/approvals?item={write_id}", s.base)
+    );
+    let rev = rev_of(s, &alice, &write_id).await;
+    let (status, out) = s
+        .cmd(
+            &alice,
+            "decide",
+            json!({"request_id": write_id, "decision": "approve", "candidate_rev": rev}),
+        )
+        .await;
+    assert_eq!(status, 200, "{out}");
+    let wrote = tokio::time::timeout(LIMIT * 3, writing)
+        .await
+        .expect("write hung")
+        .unwrap();
+    rec(&wrote);
+    assert_eq!(
+        envelope(&wrote)["status"],
+        "succeeded",
+        "{:?}",
+        envelope(&wrote)
+    );
+    let awaited = call(&agent, "request_await", json!({"request_id": write_id})).await;
+    rec(&awaited);
+    assert_eq!(
+        envelope(&awaited)["status"],
+        "succeeded",
+        "{:?}",
+        envelope(&awaited)
+    );
+
+    let writes: Vec<_> = s
+        .mock
+        .received()
+        .await
+        .into_iter()
+        .filter(|r| r.method.as_str() == "POST")
+        .collect();
+    assert_eq!(writes.len(), 1, "exactly one write reached Jira");
+    assert_eq!(writes[0].url.path(), "/rest/api/2/issue/ABC-1/comment");
+    assert_eq!(
+        writes[0]
+            .headers
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        format!("Bearer {pat}")
+    );
+    Flow {
+        alice,
+        key,
+        read_id,
+        write_id,
+    }
 }
