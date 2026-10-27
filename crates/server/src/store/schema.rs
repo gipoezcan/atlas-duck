@@ -137,6 +137,7 @@ CREATE INDEX oauth_codes_grant ON oauth_codes(grant_id);
 CREATE TABLE oauth_access (
     hash BLOB PRIMARY KEY,
     grant_id TEXT NOT NULL,
+    scopes TEXT NOT NULL,
     expires_at INTEGER NOT NULL
 );
 CREATE INDEX oauth_access_grant ON oauth_access(grant_id);

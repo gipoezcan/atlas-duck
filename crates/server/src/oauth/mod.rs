@@ -6,12 +6,14 @@
 //! only as `SHA-256("atlas-duck/oauth/v1\0" || kind || token)` (PD-235).
 
 pub mod authorize;
+pub mod bearer;
 pub mod consent;
 pub mod error;
 pub mod metadata;
 pub mod ratelimit;
 pub mod redirect;
 pub mod register;
+pub mod token;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;

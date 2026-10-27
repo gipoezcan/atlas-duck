@@ -12,7 +12,7 @@ use super::extract::SessionUser;
 use super::{AppState, client_ip, peer};
 use crate::errors::ApiError;
 use crate::oauth::error::{OAuthError, no_store};
-use crate::oauth::{authorize, consent, metadata, register};
+use crate::oauth::{authorize, consent, metadata, register, token};
 
 fn cached(v: serde_json::Value) -> Response {
     let mut res = Json(v).into_response();
@@ -161,6 +161,62 @@ pub async fn consent_decide(
     {
         Ok(redirect) => {
             let mut res = Json(serde_json::json!({ "redirect": redirect })).into_response();
+            no_store(&mut res);
+            res
+        }
+        Err(e) => e.into_response(),
+    }
+}
+
+/// The token and revocation endpoints' common part: the switch, the per-IP limit, the body.
+async fn protocol_body(st: &AppState, req: Request<Body>) -> Result<axum::body::Bytes, Response> {
+    if !st.oauth.cfg.enabled {
+        return Err(ApiError::OAUTH_DISABLED.into_response());
+    }
+    let ip = client_ip(req.headers(), peer(req.extensions()), st.trusted_proxy_hops);
+    if let Err(wait) = st.oauth.token_limiter.hit(&ip, st.clock.now()) {
+        return Err(OAuthError::rate_limited(wait).into_response());
+    }
+    body_bytes(req, token::BODY_LIMIT)
+        .await
+        .ok_or_else(|| OAuthError::INVALID_REQUEST.into_response())
+}
+
+fn token_ctx(st: &AppState) -> token::Ctx<'_> {
+    token::Ctx {
+        o: &st.oauth,
+        store: st.store.as_ref(),
+        registry: &st.registry,
+        anchor: &st.anchor,
+        now: st.clock.now(),
+    }
+}
+
+/// `POST /oauth/token` (T8): form-encoded, RFC 6749 answers.
+pub async fn token_endpoint(State(st): State<AppState>, req: Request<Body>) -> Response {
+    let body = match protocol_body(&st, req).await {
+        Ok(b) => b,
+        Err(res) => return res,
+    };
+    match token::token(&token_ctx(&st), &body).await {
+        Ok(v) => {
+            let mut res = Json(v).into_response();
+            no_store(&mut res);
+            res
+        }
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /oauth/revoke` (T8, RFC 7009): 200 for every well-formed request.
+pub async fn revoke_endpoint(State(st): State<AppState>, req: Request<Body>) -> Response {
+    let body = match protocol_body(&st, req).await {
+        Ok(b) => b,
+        Err(res) => return res,
+    };
+    match token::revoke(&token_ctx(&st), &body).await {
+        Ok(()) => {
+            let mut res = StatusCode::OK.into_response();
             no_store(&mut res);
             res
         }

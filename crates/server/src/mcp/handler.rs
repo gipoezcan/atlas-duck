@@ -403,7 +403,7 @@ impl ServerMcp {
         drop(rt);
         // PD-194: one approval session per MCP session (per key without one).
         let conn = ConnectionMeta {
-            connection_id: session_of(context).unwrap_or_else(|| format!("mcp-{}", key.key_id)),
+            connection_id: session_of(context).unwrap_or_else(|| format!("mcp-{}", key.credential)),
             peer: Default::default(),
         };
         let client_name = context

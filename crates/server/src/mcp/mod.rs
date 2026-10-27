@@ -28,8 +28,24 @@ pub const MCP_PATH: &str = "/mcp";
 pub const BODY_LIMIT: usize = 4 * 1024 * 1024;
 /// The MCP session header (streamable HTTP).
 pub const SESSION_HEADER: &str = "mcp-session-id";
-/// PD-204: no `resource_metadata` before M14.
+/// PD-204: the challenge without OAuth (`ATLAS_DUCK_OAUTH=disabled`, API keys only).
 pub const WWW_AUTHENTICATE: &str = "Bearer realm=\"atlas-duck\"";
+
+/// M14 PD-243 (RFC 9728 §5.1, RFC 6750 §3): the 401 challenge names the protected-resource
+/// metadata, and `error="invalid_token"` when a token was presented.
+pub fn challenge(st: &AppState, presented: bool) -> String {
+    if !st.oauth.cfg.enabled {
+        return WWW_AUTHENTICATE.to_owned();
+    }
+    let mut c = format!(
+        "{WWW_AUTHENTICATE}, resource_metadata=\"{}\"",
+        st.oauth.resource_metadata_url()
+    );
+    if presented {
+        c.push_str(", error=\"invalid_token\"");
+    }
+    c
+}
 
 /// The `/mcp` routes, guarded.
 pub fn routes(state: &AppState) -> Router<AppState> {
@@ -50,12 +66,11 @@ pub fn routes(state: &AppState) -> Router<AppState> {
         .layer(middleware::from_fn_with_state(state.clone(), guard))
 }
 
-fn unauthorized(e: ApiError) -> Response {
+fn unauthorized(e: ApiError, challenge: &str) -> Response {
     let mut res = e.into_response();
-    res.headers_mut().insert(
-        header::WWW_AUTHENTICATE,
-        HeaderValue::from_static(WWW_AUTHENTICATE),
-    );
+    let v = HeaderValue::from_str(challenge)
+        .unwrap_or_else(|_| HeaderValue::from_static(WWW_AUTHENTICATE));
+    res.headers_mut().insert(header::WWW_AUTHENTICATE, v);
     res
 }
 
@@ -71,19 +86,24 @@ async fn guard(State(st): State<AppState>, req: Request, next: Next) -> Response
         return ApiError::BODY_TOO_LARGE.into_response();
     }
     let (mut parts, body) = req.into_parts();
+    let presented = parts.headers.contains_key(header::AUTHORIZATION);
     let key = match BearerUser::from_request_parts(&mut parts, &st).await {
         Ok(BearerUser(key)) => key,
-        Err(e) if e.status == StatusCode::UNAUTHORIZED => return unauthorized(e),
+        Err(e) if e.status == StatusCode::UNAUTHORIZED => {
+            return unauthorized(e, &challenge(&st, presented));
+        }
         Err(e) => return e.into_response(),
     };
     let user_id = key.user.user_id().to_owned();
+    let credential = key.credential.clone();
     let sid = parts
         .headers
         .get(SESSION_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    // PD-243: a session continues only with the credential that created it.
     if let Some(s) = &sid
-        && !st.mcp_sessions.may_use(s, &user_id)
+        && !st.mcp_sessions.may_use(s, &user_id, &credential)
     {
         return ApiError::NOT_FOUND.into_response();
     }
@@ -97,7 +117,7 @@ async fn guard(State(st): State<AppState>, req: Request, next: Next) -> Response
                 .get(SESSION_HEADER)
                 .and_then(|v| v.to_str().ok())
             {
-                st.mcp_sessions.bind(new, &user_id);
+                st.mcp_sessions.bind(new, &user_id, &credential);
             }
         }
         Some(s) if delete && res.status().is_success() => st.mcp_sessions.forget(s),

@@ -108,13 +108,17 @@ impl From<&ApiKeyRecord> for KeyView {
     }
 }
 
-/// An authenticated agent: its user and the key's scopes.
+/// An authenticated agent: its user and the credential's scopes. Built by the API-key check and,
+/// since M14, the OAuth access-token check (PD-243): `key_id` is then the grant id and `prefix`
+/// empty; `credential` tags both (`api_key:<id>` / `oauth:<grant_id>`) for the MCP session
+/// binding and the connection id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyCtx {
     pub user: UserCtx,
     pub key_id: String,
     pub prefix: String,
     pub scopes: Vec<String>,
+    pub credential: String,
 }
 
 /// Why a bearer was not accepted. The answer is the same 401 for every case (PD-214); a revoked
@@ -436,6 +440,7 @@ impl ApiKeys {
                 key_id: c.key_id.clone(),
                 prefix: c.prefix.clone(),
                 scopes: c.scopes.clone(),
+                credential: format!("api_key:{}", c.key_id),
             };
             self.touch(&c.user_id.clone(), &c.key_id.clone(), now);
             return Ok(ctx);
@@ -498,6 +503,7 @@ impl ApiKeys {
         self.touch(&rec.user_id, &rec.id, now);
         Ok(KeyCtx {
             user: UserCtx::from_authenticated(&rec.user_id),
+            credential: format!("api_key:{}", rec.id),
             key_id: rec.id,
             prefix: rec.prefix,
             scopes: rec.scopes,

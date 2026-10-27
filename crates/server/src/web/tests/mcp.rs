@@ -96,9 +96,10 @@ async fn no_bearer_or_a_cookie_only_is_401_with_www_authenticate() {
     let (cookie, _) = h.session("alice", PW_CANARY).await;
     let res = h.send(mcp_post(INIT, None, None)).await;
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    // M14 PD-243: the challenge names the protected-resource metadata (RFC 9728 §5.1).
     assert_eq!(
         res.headers()[header::WWW_AUTHENTICATE],
-        "Bearer realm=\"atlas-duck\""
+        "Bearer realm=\"atlas-duck\", resource_metadata=\"https://duck.example.test/.well-known/oauth-protected-resource/mcp\""
     );
     let mut req = mcp_post(INIT, None, None);
     req.headers_mut().insert(
@@ -111,6 +112,23 @@ async fn no_bearer_or_a_cookie_only_is_401_with_www_authenticate() {
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     let res = h.send(mcp_post(INIT, Some("adk_nope"), None)).await;
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    // A presented token adds error="invalid_token" (RFC 6750 §3.1).
+    assert!(
+        res.headers()[header::WWW_AUTHENTICATE]
+            .to_str()
+            .unwrap()
+            .ends_with(", error=\"invalid_token\"")
+    );
+    // With OAuth off: M12's challenge, no metadata.
+    let off = H::with_oauth(crate::oauth::OAuthConfig {
+        enabled: false,
+        ..crate::oauth::OAuthConfig::DEFAULT
+    });
+    let res = off.send(mcp_post(INIT, None, None)).await;
+    assert_eq!(
+        res.headers()[header::WWW_AUTHENTICATE],
+        "Bearer realm=\"atlas-duck\""
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

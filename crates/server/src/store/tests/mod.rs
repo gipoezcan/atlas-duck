@@ -687,6 +687,7 @@ fn purge_removes_stale_clients_and_expired_rows() {
         s.access_insert(&AccessRecord {
             hash: [5; 32],
             grant_id: "gl".into(),
+            scopes: vec!["read".into()],
             expires_at: now - 1,
         })
         .unwrap();

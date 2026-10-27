@@ -1004,8 +1004,8 @@ impl ServerStore for SqliteStore {
     fn access_insert(&self, a: &AccessRecord) -> StoreResult<()> {
         self.conn()
             .execute(
-                "INSERT INTO oauth_access (hash, grant_id, expires_at) VALUES (?1, ?2, ?3)",
-                params![a.hash.as_slice(), a.grant_id, a.expires_at],
+                "INSERT INTO oauth_access (hash, grant_id, scopes, expires_at) VALUES (?1, ?2, ?3, ?4)",
+                params![a.hash.as_slice(), a.grant_id, json_list(&a.scopes), a.expires_at],
             )
             .map_err(db)?;
         Ok(())
@@ -1014,13 +1014,14 @@ impl ServerStore for SqliteStore {
     fn access_get(&self, hash: &[u8; 32]) -> StoreResult<Option<AccessRecord>> {
         self.conn()
             .query_row(
-                "SELECT hash, grant_id, expires_at FROM oauth_access WHERE hash = ?1",
+                "SELECT hash, grant_id, scopes, expires_at FROM oauth_access WHERE hash = ?1",
                 [hash.as_slice()],
                 |r| {
                     Ok(AccessRecord {
                         hash: hash32(r.get(0)?)?,
                         grant_id: r.get(1)?,
-                        expires_at: r.get(2)?,
+                        scopes: parse_list(&r.get::<_, String>(2)?),
+                        expires_at: r.get(3)?,
                     })
                 },
             )

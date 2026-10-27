@@ -208,6 +208,8 @@ impl fmt::Debug for CodeRecord {
 pub struct AccessRecord {
     pub hash: [u8; 32],
     pub grant_id: String,
+    /// The grant's scopes, or the subset a refresh asked for.
+    pub scopes: Vec<String>,
     pub expires_at: i64,
 }
 

@@ -792,3 +792,533 @@ async fn deny_expiry_and_re_consent() {
     let old = grants.iter().find(|g| !g.live(h.clock.now())).unwrap();
     assert_eq!(old.revoke_reason.as_deref(), Some("replaced"));
 }
+
+// ---- T8: token, revocation, bearer --------------------------------------------------------------
+
+pub(super) const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+const MCP_INIT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}"#;
+
+fn form(pairs: &[(&str, &str)]) -> String {
+    url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
+        .finish()
+}
+
+impl H {
+    pub(super) async fn post_form(
+        &self,
+        path: &str,
+        pairs: &[(&str, &str)],
+    ) -> (StatusCode, Value) {
+        let res = self
+            .send(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header("x-forwarded-for", "192.0.2.50")
+                    .body(Body::from(form(pairs)))
+                    .unwrap(),
+            )
+            .await;
+        let s = res.status();
+        if s == StatusCode::OK || s.is_client_error() {
+            assert_eq!(res.headers()[header::CACHE_CONTROL], "no-store", "{path}");
+        }
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (s, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    pub(super) async fn redeem(&self, client: &str, code: &str) -> (StatusCode, Value) {
+        self.post_form(
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("redirect_uri", "http://127.0.0.1:51000/callback"),
+                ("client_id", client),
+                ("code_verifier", VERIFIER),
+                ("resource", RESOURCE),
+            ],
+        )
+        .await
+    }
+
+    pub(super) async fn refresh(
+        &self,
+        client: &str,
+        rt: &str,
+        scope: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut p = vec![
+            ("grant_type", "refresh_token"),
+            ("refresh_token", rt),
+            ("client_id", client),
+            ("resource", RESOURCE),
+        ];
+        if let Some(s) = scope {
+            p.push(("scope", s));
+        }
+        self.post_form("/oauth/token", &p).await
+    }
+
+    /// `initialize` at `/mcp` with `bearer`; answers the response.
+    pub(super) async fn mcp_init(&self, bearer: &str, session: Option<&str>) -> Response {
+        let mut b = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header(header::HOST, "duck.example.test")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+        if let Some(s) = session {
+            b = b.header("mcp-session-id", s);
+        }
+        self.send(b.body(Body::from(MCP_INIT)).unwrap()).await
+    }
+
+    /// A client, alice's consent for `scopes`, and the redeemed token pair.
+    pub(super) async fn tokens_for(&self, scopes: &[&str]) -> (String, (String, String), Value) {
+        let client = self.client_id().await;
+        let alice = self.session("alice", PW_CANARY).await;
+        let q = self.code_for(&alice, &client, scopes).await;
+        let (s, v) = self.redeem(&client, &q["code"]).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        (client, alice, v)
+    }
+
+    fn chain_kinds(
+        &self,
+        rt: &crate::runtime::UserRuntime,
+    ) -> Vec<(atlas_duck_audit::EventType, Value)> {
+        let page = rt
+            .audit_store()
+            .query(
+                &atlas_duck_audit::types::AuditFilter::default(),
+                atlas_duck_audit::types::AuditCursor::first(500),
+            )
+            .unwrap();
+        page.rows
+            .iter()
+            .map(|r| {
+                let p = rt
+                    .audit_store()
+                    .payload_view(r.seq, 0)
+                    .ok()
+                    .and_then(|v| serde_json::from_slice::<Value>(&v.bytes).ok())
+                    .unwrap_or(Value::Null);
+                (r.event_type, p)
+            })
+            .collect()
+    }
+
+    pub(super) async fn alice_chain(&self) -> Vec<(atlas_duck_audit::EventType, Value)> {
+        let rt = self
+            .registry
+            .runtime(&UserCtxT::from_authenticated(&user_id_for("alice")))
+            .await
+            .unwrap();
+        self.chain_kinds(&rt)
+    }
+
+    fn anchor_kinds(&self) -> Vec<String> {
+        self.store
+            .anchor_all()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.kind)
+            .collect()
+    }
+}
+
+fn s(v: &Value, k: &str) -> String {
+    v[k].as_str().unwrap_or_default().to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_for_tokens_and_the_access_token_opens_mcp() {
+    let h = H::new();
+    let (_, _, v) = h.tokens_for(&["read", "scripts"]).await;
+    assert!(s(&v, "access_token").starts_with("ado_at_"));
+    assert!(s(&v, "refresh_token").starts_with("ado_rt_"));
+    assert_eq!(v["token_type"], "Bearer");
+    assert_eq!(v["expires_in"], 900);
+    assert_eq!(v["scope"], "read scripts");
+    let res = h.mcp_init(&s(&v, "access_token"), None).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(res.headers().contains_key("mcp-session-id"));
+    // Only hashes are stored.
+    let db = h.db_bytes();
+    for t in [s(&v, "access_token"), s(&v, "refresh_token")] {
+        assert!(
+            !db.windows(t.len()).any(|w| w == t.as_bytes()),
+            "token in server.db"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_redemption_revokes_the_grant_and_its_tokens() {
+    let h = H::new();
+    let client = h.client_id().await;
+    let alice = h.session("alice", PW_CANARY).await;
+    let q = h.code_for(&alice, &client, &["read"]).await;
+    let (st, v) = h.redeem(&client, &q["code"]).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let access = s(&v, "access_token");
+    assert_eq!(h.mcp_init(&access, None).await.status(), StatusCode::OK);
+    let (st, e) = h.redeem(&client, &q["code"]).await;
+    assert_eq!(
+        (st, e["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+    );
+    // The tokens of the first redemption are dead at once.
+    let res = h.mcp_init(&access, None).await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let (st, e) = h.refresh(&client, &s(&v, "refresh_token"), None).await;
+    assert_eq!(
+        (st, e["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+    );
+    let g = &h.store.grant_list(&user_id_for("alice")).unwrap()[0];
+    assert_eq!(g.revoke_reason.as_deref(), Some("code_reuse"));
+    let chain = h.alice_chain().await;
+    assert!(
+        chain.iter().any(
+            |(k, p)| *k == atlas_duck_audit::EventType::OAUTH_GRANT_REVOKED
+                && p.to_string().contains("reuse_detected")
+        ),
+        "{chain:?}"
+    );
+    assert!(h.anchor_kinds().contains(&"OAUTH_REUSE".to_owned()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redemption_refusals() {
+    let h = H::new();
+    let client = h.client_id().await;
+    let other = h.client_id().await;
+    let alice = h.session("alice", PW_CANARY).await;
+    let redeem_with = |code: String, over: Vec<(&'static str, String)>| {
+        let client = client.clone();
+        async move {
+            let mut p: Vec<(String, String)> = vec![
+                ("grant_type".into(), "authorization_code".into()),
+                ("code".into(), code),
+                (
+                    "redirect_uri".into(),
+                    "http://127.0.0.1:51000/callback".into(),
+                ),
+                ("client_id".into(), client),
+                ("code_verifier".into(), VERIFIER.into()),
+                ("resource".into(), RESOURCE.into()),
+            ];
+            for (k, v) in over {
+                p.retain(|(x, _)| x != k);
+                p.push((k.into(), v));
+            }
+            p
+        }
+    };
+    // A wrong verifier burns the code: the right one afterwards is refused too.
+    let code = h.code_for(&alice, &client, &["read"]).await["code"].clone();
+    let p = redeem_with(code.clone(), vec![("code_verifier", "x".repeat(43))]).await;
+    let refs: Vec<(&str, &str)> = p.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let (st, e) = h.post_form("/oauth/token", &refs).await;
+    assert_eq!(
+        (st, e["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+    );
+    let (st, _) = h.redeem(&client, &code).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    for (over, status, want) in [
+        (
+            vec![("redirect_uri", "http://127.0.0.1:51001/callback".to_owned())],
+            400,
+            "invalid_grant",
+        ),
+        (vec![("client_id", other.clone())], 400, "invalid_grant"),
+        (
+            vec![("client_id", "adc_nobody00000000000000".to_owned())],
+            401,
+            "invalid_client",
+        ),
+        (
+            vec![("resource", "https://evil.example/mcp".to_owned())],
+            400,
+            "invalid_target",
+        ),
+        (
+            vec![("code_verifier", String::new())],
+            400,
+            "invalid_request",
+        ),
+        (
+            vec![("grant_type", "password".to_owned())],
+            400,
+            "unsupported_grant_type",
+        ),
+        (vec![("grant_type", String::new())], 400, "invalid_request"),
+    ] {
+        let code = h.code_for(&alice, &client, &["read"]).await["code"].clone();
+        let p = redeem_with(code, over.clone()).await;
+        let refs: Vec<(&str, &str)> = p.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let (st, e) = h.post_form("/oauth/token", &refs).await;
+        assert_eq!(
+            (st.as_u16(), e["error"].as_str()),
+            (status, Some(want)),
+            "{over:?}"
+        );
+        assert!(e.get("access_token").is_none());
+    }
+    // A plain-method client presenting the challenge as verifier gets nothing.
+    let code = h.code_for(&alice, &client, &["read"]).await["code"].clone();
+    let p = redeem_with(code, vec![("code_verifier", CHALLENGE.to_owned())]).await;
+    let refs: Vec<(&str, &str)> = p.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    assert_eq!(
+        h.post_form("/oauth/token", &refs).await.0,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_rotates_and_a_reused_refresh_token_revokes_the_grant() {
+    let h = H::new();
+    let (client, _, v) = h.tokens_for(&["read", "scripts"]).await;
+    let rt1 = s(&v, "refresh_token");
+    // A broader scope is refused before the token is spent; a narrower one is honoured.
+    let (st, e) = h.refresh(&client, &rt1, Some("read propose_write")).await;
+    assert_eq!(
+        (st, e["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("invalid_scope"))
+    );
+    let (st, e) = h
+        .post_form(
+            "/oauth/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &rt1),
+                ("client_id", &client),
+                ("resource", "https://duck.example.test/other"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        (st, e["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("invalid_target"))
+    );
+    let (st, v2) = h.refresh(&client, &rt1, Some("read")).await;
+    assert_eq!(st, StatusCode::OK, "{v2}");
+    assert_eq!(v2["scope"], "read");
+    let rt2 = s(&v2, "refresh_token");
+    assert_ne!(rt1, rt2);
+    // The old access token stays valid until its expiry; the new one works.
+    assert_eq!(
+        h.mcp_init(&s(&v, "access_token"), None).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.mcp_init(&s(&v2, "access_token"), None).await.status(),
+        StatusCode::OK
+    );
+    // Reusing rt1: invalid_grant, the whole grant revoked, every token dead.
+    let (st, e) = h.refresh(&client, &rt1, None).await;
+    assert_eq!(
+        (st, e["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+    );
+    for t in [s(&v, "access_token"), s(&v2, "access_token")] {
+        assert_eq!(
+            h.mcp_init(&t, None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        h.refresh(&client, &rt2, None).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    let g = &h.store.grant_list(&user_id_for("alice")).unwrap()[0];
+    assert_eq!(g.revoke_reason.as_deref(), Some("refresh_reuse"));
+    let chain = h.alice_chain().await;
+    assert!(chain.iter().any(
+        |(k, p)| *k == atlas_duck_audit::EventType::OAUTH_GRANT_REVOKED
+            && p.to_string().contains("reuse_detected")
+    ));
+    assert_eq!(
+        h.anchor_kinds()
+            .iter()
+            .filter(|k| *k == "OAUTH_REUSE")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_access_token_is_401_and_recorded() {
+    let h = H::new();
+    let (_, _, v) = h.tokens_for(&["read"]).await;
+    h.clock.advance(900);
+    let res = h.mcp_init(&s(&v, "access_token"), None).await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let www = res.headers()[header::WWW_AUTHENTICATE]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(www.contains("resource_metadata=\"https://duck.example.test/.well-known/oauth-protected-resource/mcp\""), "{www}");
+    assert!(www.ends_with("error=\"invalid_token\""), "{www}");
+    let chain = h.alice_chain().await;
+    assert!(
+        chain
+            .iter()
+            .any(|(k, p)| *k == atlas_duck_audit::EventType::LOGIN
+                && p.to_string().contains("\"oauth\"")
+                && p.to_string().contains("\"expired\"")),
+        "{chain:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revocation_endpoint_and_deactivation() {
+    let h = H::new();
+    let (client, _, v) = h.tokens_for(&["read"]).await;
+    let access = s(&v, "access_token");
+    // Unknown and other clients' tokens: 200, nothing happens; a missing token is 400.
+    let other = h.client_id().await;
+    for (token, cid) in [
+        ("ado_at_unknown", client.as_str()),
+        (access.as_str(), other.as_str()),
+    ] {
+        let (st, _) = h
+            .post_form("/oauth/revoke", &[("token", token), ("client_id", cid)])
+            .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    assert_eq!(h.mcp_init(&access, None).await.status(), StatusCode::OK);
+    let (st, e) = h
+        .post_form("/oauth/revoke", &[("client_id", &client)])
+        .await;
+    assert_eq!(
+        (st, e["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("invalid_request"))
+    );
+    let (st, _) = h
+        .post_form(
+            "/oauth/revoke",
+            &[("token", &s(&v, "refresh_token")), ("client_id", &client)],
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    // The very next request with the access token is refused.
+    assert_eq!(
+        h.mcp_init(&access, None).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let chain = h.alice_chain().await;
+    assert!(chain.iter().any(
+        |(k, p)| *k == atlas_duck_audit::EventType::OAUTH_GRANT_REVOKED
+            && p.to_string().contains("revocation_endpoint")
+    ));
+    // Δ-M14-4: deactivation revokes every grant with a record each.
+    let (_, _, v) = h.tokens_for(&["read"]).await;
+    let n = crate::oauth::token::revoke_all_for_user(
+        h.store.as_ref(),
+        &h.registry,
+        &user_id_for("alice"),
+        h.clock.now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(
+        h.mcp_init(&s(&v, "access_token"), None).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let chain = h.alice_chain().await;
+    assert!(chain.iter().any(
+        |(k, p)| *k == atlas_duck_audit::EventType::OAUTH_GRANT_REVOKED
+            && p.to_string().contains("deactivation")
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oauth_token_never_approves_and_sessions_bind_to_the_credential() {
+    let h = H::new();
+    let (_, alice, v) = h.tokens_for(&["read"]).await;
+    let bearer = format!("Bearer {}", s(&v, "access_token"));
+    for (method, path, body) in [
+        (
+            Method::POST,
+            "/api/cmd/decide",
+            json!({"request_id": "req_x", "decision": "approve"}),
+        ),
+        (
+            Method::POST,
+            "/api/me/api-keys",
+            json!({"name": "x", "scopes": ["read"]}),
+        ),
+        (Method::GET, "/api/me/api-keys", Value::Null),
+    ] {
+        let res = h
+            .send(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::COOKIE, cookie_header(&alice.0))
+                    .header("x-csrf-token", &alice.1)
+                    .header(header::ORIGIN, ORIGIN)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, &bearer)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "{path}");
+        assert_eq!(
+            json_body(res).await["error"]["code"],
+            "auth/bearer_not_accepted"
+        );
+    }
+    // An MCP session opened with the token cannot be continued with an API key of the same user.
+    let res = h.mcp_init(&s(&v, "access_token"), None).await;
+    let sid = res.headers()["mcp-session-id"].to_str().unwrap().to_owned();
+    let created = h
+        .state
+        .api_keys
+        .create(
+            &UserCtxT::from_authenticated(&user_id_for("alice")),
+            "k",
+            &["read".into()],
+            None,
+        )
+        .unwrap();
+    let key = secrecy::ExposeSecret::expose_secret(&created.key).to_owned();
+    assert_eq!(
+        h.mcp_init(&key, Some(&sid)).await.status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn the_token_endpoint_is_rate_limited_per_ip() {
+    let h = H::new();
+    for _ in 0..60 {
+        let (st, _) = h
+            .post_form("/oauth/token", &[("grant_type", "password")])
+            .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+    let res = h
+        .send(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/oauth/token")
+                .header("x-forwarded-for", "192.0.2.50")
+                .body(Body::from("grant_type=password"))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(res.headers().contains_key(header::RETRY_AFTER));
+}
