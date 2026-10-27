@@ -1,0 +1,2 @@
+script:
+  - /kaniko/executor --skip-tls-verify --destination x

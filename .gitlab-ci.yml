@@ -222,6 +222,15 @@ chart:test:
       done
       [ "$bad" = 0 ]
     }
+# T12 (SM-9.1, SM-9.2, PD-M13-7): no secret material, no disabled TLS verification, the CA bundle
+# holds public certificates only. Cheap, so it runs in every pipeline.
+server:guards:
+  stage: server-prepare
+  image: alpine:3.20.3
+  needs: []
+  script:
+    - sh ci/check-no-secret-material.test.sh
+    - sh ci/check-no-secret-material.sh
 server:version:
   stage: server-prepare
   image: alpine:3.20.3
