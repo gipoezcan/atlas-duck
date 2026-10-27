@@ -106,7 +106,8 @@ fn users_crud() {
             "{name}"
         );
         assert_eq!(s.user("missing").unwrap(), None, "{name}");
-        // Upsert updates roles and the wrapped key, keeps username and created_at.
+        // Upsert updates roles, keeps username, created_at and (M13 T7) the wrapped key: a login
+        // racing a rotation must never put the old wrapping back.
         let mut changed = user(A, "alice");
         changed.roles = vec!["user".into(), "auditor".into()];
         changed.data_key_wrapped = "rewrapped".into();
@@ -114,8 +115,22 @@ fn users_crud() {
         s.upsert_user(&changed).unwrap();
         let got = s.user(A).unwrap().unwrap();
         assert_eq!(got.roles, changed.roles, "{name}");
-        assert_eq!(got.data_key_wrapped, "rewrapped", "{name}");
+        assert_eq!(
+            got.data_key_wrapped,
+            user(A, "alice").data_key_wrapped,
+            "{name}"
+        );
         assert_eq!(got.created_at, 100, "{name}");
+        // Only a compare-and-set replaces it.
+        let old = got.data_key_wrapped;
+        assert!(!s.user_set_wrapped(A, "stale", "x").unwrap(), "{name}");
+        assert!(s.user_set_wrapped(A, &old, "rewrapped").unwrap(), "{name}");
+        assert_eq!(
+            s.user(A).unwrap().unwrap().data_key_wrapped,
+            "rewrapped",
+            "{name}"
+        );
+        assert!(!s.user_set_wrapped("missing", "x", "y").unwrap(), "{name}");
     }
 }
 

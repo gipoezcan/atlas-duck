@@ -82,6 +82,11 @@ spec:
               value: /var/lib/atlas-duck
             - name: ATLAS_DUCK_MASTER_KEY_FILE
               value: /run/secrets/atlas-duck/master-key/key
+            {{- if .Values.masterKey.nextSecret }}
+            # Rotation only (M13 T7): the next key is accepted alongside until the swap.
+            - name: ATLAS_DUCK_MASTER_KEY_NEXT_FILE
+              value: /run/secrets/atlas-duck/master-key-next/key
+            {{- end }}
             - name: ATLAS_DUCK_CA_BUNDLE_FILE
               value: /etc/atlas-duck/ca/ca.pem
             - name: ATLAS_DUCK_ADMIN_SOCKET

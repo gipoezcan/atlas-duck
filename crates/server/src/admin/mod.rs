@@ -9,12 +9,15 @@ pub mod client;
 pub mod instances;
 pub mod maintenance;
 pub mod restore;
+pub mod rotate;
 #[cfg(unix)]
 pub mod socket;
 pub mod users;
 
 #[cfg(test)]
 mod backup_tests;
+#[cfg(test)]
+mod rotate_tests;
 #[cfg(test)]
 mod tests;
 
@@ -116,6 +119,12 @@ pub struct DirArg {
     pub dir: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyFileArg {
+    pub new_key_file: String,
+}
+
 /// One admin request (`{"op": "...", ...}`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -128,6 +137,7 @@ pub enum Request {
     Maintenance(SwitchArg),
     Backup(DirArg),
     Restore(DirArg),
+    RotateMasterKey(KeyFileArg),
 }
 
 impl Request {
@@ -142,6 +152,7 @@ impl Request {
             Request::Maintenance(_) => "maintenance",
             Request::Backup(_) => "backup",
             Request::Restore(_) => "restore",
+            Request::RotateMasterKey(_) => "rotate_master_key",
         }
     }
 }
@@ -188,6 +199,7 @@ pub async fn handle(ctx: &AdminCtx, req: Request) -> Response {
         Request::Maintenance(m) => maintenance::set(ctx, m.on),
         Request::Backup(d) => backup::run(ctx, &d.dir).await,
         Request::Restore(d) => restore::run(ctx, &d.dir).await,
+        Request::RotateMasterKey(k) => rotate::run(ctx, &k.new_key_file).await,
     };
     match out {
         Ok(v) => {

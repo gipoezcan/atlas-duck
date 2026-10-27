@@ -12,6 +12,7 @@ use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::directory::Directory;
+use crate::master_key::{MasterKey, WrappedKey};
 use crate::store::ServerStore;
 
 pub const PROBE_CACHE: Duration = Duration::from_secs(30);
@@ -20,6 +21,8 @@ pub struct Health {
     store: Arc<dyn ServerStore>,
     directory: Arc<dyn Directory>,
     master_key_loaded: bool,
+    /// M13 T7: the loaded keys, checked against the key ids the users' data keys carry.
+    master: Option<Arc<MasterKey>>,
     probe: Mutex<Option<(Instant, bool)>>,
 }
 
@@ -33,8 +36,27 @@ impl Health {
             store,
             directory,
             master_key_loaded,
+            master: None,
             probe: Mutex::new(None),
         }
+    }
+
+    /// Also checks that every user's data key is wrapped under a loaded master key.
+    pub fn with_master(mut self, master: Arc<MasterKey>) -> Health {
+        self.master = Some(master);
+        self
+    }
+
+    /// "master_key_mismatch" when some user's data key is wrapped under a key id that is not
+    /// loaded (for example the old key mounted again after a completed rotation).
+    fn master_key_reason(&self) -> Option<&'static str> {
+        let master = self.master.as_ref()?;
+        let users = self.store.users_all().ok()?;
+        users
+            .iter()
+            .filter_map(|(u, _)| WrappedKey::from_json(&u.data_key_wrapped).ok())
+            .any(|w| !master.knows(&w.master_key_id))
+            .then_some("master_key_mismatch")
     }
 
     async fn directory_ok(&self) -> bool {
@@ -52,11 +74,16 @@ impl Health {
     pub async fn readyz(&self) -> Response {
         let store = self.store.instance_list().is_ok();
         let directory = self.directory_ok().await;
-        let ok = store && self.master_key_loaded && directory;
-        let body = json!({
-            "checks": {"store": store, "master_key": self.master_key_loaded, "directory": directory},
+        let key_reason = self.master_key_reason();
+        let master_key = self.master_key_loaded && key_reason.is_none();
+        let ok = store && master_key && directory;
+        let mut body = json!({
+            "checks": {"store": store, "master_key": master_key, "directory": directory},
             "directory": self.directory.kind(),
         });
+        if let Some(r) = key_reason {
+            body["reasons"] = json!([r]);
+        }
         let status = if ok {
             StatusCode::OK
         } else {

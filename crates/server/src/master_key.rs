@@ -149,15 +149,28 @@ fn warn_if_loose_mode(path: &Path) {
 #[cfg(not(unix))]
 fn warn_if_loose_mode(_path: &Path) {}
 
-pub struct MasterKey {
+/// One master key: its non-secret id and its bytes.
+struct Entry {
     id: String,
     key: SecretKey,
+}
+
+/// The loaded master keys (M13 T7): the primary wraps new data keys; every key here unwraps the
+/// data keys wrapped under its id. Outside a rotation there is exactly one.
+struct Ring {
+    primary: Entry,
+    others: Vec<Entry>,
+}
+
+pub struct MasterKey {
+    ring: std::sync::RwLock<Ring>,
 }
 
 impl fmt::Debug for MasterKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MasterKey")
-            .field("id", &self.id)
+            .field("id", &self.id())
+            .field("ids", &self.ids())
             .finish_non_exhaustive()
     }
 }
@@ -175,6 +188,15 @@ fn valid_key_id(id: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// Why a key cannot join the ring (M13 T7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RingError {
+    /// The same bytes are already loaded (under this or another id).
+    SameKey,
+    /// The id is loaded with other bytes.
+    IdConflict,
+}
+
 impl MasterKey {
     /// Reads the key file: unreadable → `config/master_key_unreadable`, anything but one valid
     /// line (a trailing newline or CRLF allowed) → `config/master_key_invalid`.
@@ -188,6 +210,18 @@ impl MasterKey {
             code: "config/master_key_invalid",
             key: MASTER_KEY_FILE,
         })
+    }
+
+    fn single(id: &str, key: SecretKey) -> MasterKey {
+        MasterKey {
+            ring: std::sync::RwLock::new(Ring {
+                primary: Entry {
+                    id: id.to_owned(),
+                    key,
+                },
+                others: Vec::new(),
+            }),
+        }
     }
 
     fn parse(text: &str) -> Option<MasterKey> {
@@ -208,52 +242,119 @@ impl MasterKey {
             return None;
         }
         let bytes = Zeroizing::new(STANDARD.decode(b64).ok()?);
-        Some(MasterKey {
-            id: id.to_owned(),
-            key: SecretKey::from_slice(&bytes)?,
-        })
+        Some(Self::single(id, SecretKey::from_slice(&bytes)?))
     }
 
-    pub fn id(&self) -> &str {
-        &self.id
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Ring> {
+        self.ring.read().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Wraps `dk` for `user_id` (PD-208).
-    pub fn wrap(&self, user_id: &str, dk: &DataKey) -> Result<WrappedKey, KeyError> {
-        let s = seal(&self.key, &data_key_aad(user_id), dk.0.as_slice())?;
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Ring> {
+        self.ring.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The primary key's id (the one new data keys are wrapped with).
+    pub fn id(&self) -> String {
+        self.read().primary.id.clone()
+    }
+
+    /// Every loaded key id, the primary first.
+    pub fn ids(&self) -> Vec<String> {
+        let r = self.read();
+        std::iter::once(r.primary.id.clone())
+            .chain(r.others.iter().map(|e| e.id.clone()))
+            .collect()
+    }
+
+    pub fn knows(&self, id: &str) -> bool {
+        let r = self.read();
+        r.primary.id == id || r.others.iter().any(|e| e.id == id)
+    }
+
+    /// Adds `other`'s primary key as an accepted key (unwrap only). Loading the same key again
+    /// under its own id is a no-op.
+    pub fn accept(&self, other: MasterKey) -> Result<(), RingError> {
+        let Ring { primary: new, .. } = other.ring.into_inner().unwrap_or_else(|e| e.into_inner());
+        let mut r = self.write();
+        for e in std::iter::once(&r.primary).chain(r.others.iter()) {
+            let same_bytes = bool::from(subtle::ConstantTimeEq::ct_eq(
+                e.key.0.as_slice(),
+                new.key.0.as_slice(),
+            ));
+            match (e.id == new.id, same_bytes) {
+                (true, true) => return Ok(()),
+                (true, false) => return Err(RingError::IdConflict),
+                (false, true) => return Err(RingError::SameKey),
+                (false, false) => {}
+            }
+        }
+        r.others.push(new);
+        Ok(())
+    }
+
+    /// Makes the loaded key `id` the primary; the old primary stays accepted. False if unknown.
+    pub fn promote(&self, id: &str) -> bool {
+        let mut r = self.write();
+        if r.primary.id == id {
+            return true;
+        }
+        let Some(i) = r.others.iter().position(|e| e.id == id) else {
+            return false;
+        };
+        let next = r.others.remove(i);
+        let old = std::mem::replace(&mut r.primary, next);
+        r.others.push(old);
+        true
+    }
+
+    fn wrap_entry(e: &Entry, user_id: &str, dk: &DataKey) -> Result<WrappedKey, KeyError> {
+        let s = seal(&e.key, &data_key_aad(user_id), dk.0.as_slice())?;
         Ok(WrappedKey {
             v: WRAP_VERSION,
-            master_key_id: self.id.clone(),
+            master_key_id: e.id.clone(),
             nonce: STANDARD.encode(&s.nonce),
             ct: STANDARD.encode(&s.ct),
         })
+    }
+
+    /// Wraps `dk` for `user_id` with the primary key (PD-208).
+    pub fn wrap(&self, user_id: &str, dk: &DataKey) -> Result<WrappedKey, KeyError> {
+        Self::wrap_entry(&self.read().primary, user_id, dk)
+    }
+
+    /// Wraps `dk` with the loaded key `id` (a rotation's target).
+    pub fn wrap_with(&self, id: &str, user_id: &str, dk: &DataKey) -> Result<WrappedKey, KeyError> {
+        let r = self.read();
+        let e = std::iter::once(&r.primary)
+            .chain(r.others.iter())
+            .find(|e| e.id == id)
+            .ok_or(KeyError::WrongMasterKey)?;
+        Self::wrap_entry(e, user_id, dk)
     }
 
     pub fn unwrap(&self, user_id: &str, w: &WrappedKey) -> Result<DataKey, KeyError> {
         if w.v != WRAP_VERSION {
             return Err(KeyError::UnknownVersion);
         }
-        if w.master_key_id != self.id {
-            return Err(KeyError::WrongMasterKey);
-        }
+        let r = self.read();
+        let e = std::iter::once(&r.primary)
+            .chain(r.others.iter())
+            .find(|e| e.id == w.master_key_id)
+            .ok_or(KeyError::WrongMasterKey)?;
         let sealed = Sealed {
             nonce: STANDARD.decode(&w.nonce).map_err(|_| KeyError::Corrupt)?,
             ct: STANDARD.decode(&w.ct).map_err(|_| KeyError::Corrupt)?,
         };
-        let plain = open(&self.key, &data_key_aad(user_id), &sealed)?;
+        let plain = open(&e.key, &data_key_aad(user_id), &sealed)?;
         SecretKey::from_slice(&plain).ok_or(KeyError::Corrupt)
     }
 
     /// A master key from raw parts (tests of code above this module).
     #[cfg(any(test, feature = "testing"))]
     pub fn for_tests(id: &str, bytes: [u8; 32]) -> MasterKey {
-        MasterKey {
-            id: id.to_owned(),
-            key: SecretKey(Zeroizing::new(bytes)),
-        }
+        Self::single(id, SecretKey(Zeroizing::new(bytes)))
     }
 }
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

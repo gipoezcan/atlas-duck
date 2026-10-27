@@ -50,6 +50,8 @@ pub struct Config {
     pub listen: SocketAddr,
     pub data_dir: LocalDataDir,
     pub master_key_file: PathBuf,
+    /// During a rotation only (M13 T7): the next key, accepted for unwrapping alongside.
+    pub master_key_next_file: Option<PathBuf>,
     pub ca_bundle_file: Option<PathBuf>,
     pub web_dir: PathBuf,
     pub trusted_proxy_hops: u32,
@@ -87,6 +89,7 @@ pub const PUBLIC_URL: &str = "ATLAS_DUCK_PUBLIC_URL";
 pub const LISTEN: &str = "ATLAS_DUCK_LISTEN";
 pub const DATA_DIR: &str = "ATLAS_DUCK_DATA_DIR";
 pub const MASTER_KEY_FILE: &str = "ATLAS_DUCK_MASTER_KEY_FILE";
+pub const MASTER_KEY_NEXT_FILE: &str = "ATLAS_DUCK_MASTER_KEY_NEXT_FILE";
 pub const CA_BUNDLE_FILE: &str = "ATLAS_DUCK_CA_BUNDLE_FILE";
 pub const WEB_DIR: &str = "ATLAS_DUCK_WEB_DIR";
 pub const TRUSTED_PROXY_HOPS: &str = "ATLAS_DUCK_TRUSTED_PROXY_HOPS";
@@ -151,6 +154,7 @@ impl Config {
             _ => return Err(err("config/data_dir_invalid", DATA_DIR)),
         };
         let master_key_file = PathBuf::from(required(MASTER_KEY_FILE)?);
+        let master_key_next_file = get(MASTER_KEY_NEXT_FILE).map(PathBuf::from);
         let ca_bundle_file = get(CA_BUNDLE_FILE).map(PathBuf::from);
         let web_dir = PathBuf::from(get(WEB_DIR).unwrap_or_else(|| "/app/web".into()));
         let num = |k: &'static str, default: u64| -> Result<u64, ConfigError> {
@@ -214,6 +218,7 @@ impl Config {
             listen,
             data_dir,
             master_key_file,
+            master_key_next_file,
             ca_bundle_file,
             web_dir,
             trusted_proxy_hops,
@@ -334,6 +339,7 @@ mod tests {
         assert_eq!(c.rust_log, "info");
         assert_eq!(c.admin_socket, PathBuf::from("/run/atlas-duck/admin.sock"));
         assert_eq!(c.ca_bundle_file, None);
+        assert_eq!(c.master_key_next_file, None);
         assert_eq!(c.groups.auditors, None);
         assert_eq!(c.public_origin(), "https://duck.example.test");
         assert!(c.cookie_secure());

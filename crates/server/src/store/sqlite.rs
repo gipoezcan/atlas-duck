@@ -224,7 +224,7 @@ impl ServerStore for SqliteStore {
                 "INSERT INTO users (user_id, username, display_name, roles, data_key_wrapped, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(user_id) DO UPDATE SET display_name = excluded.display_name,
-                     roles = excluded.roles, data_key_wrapped = excluded.data_key_wrapped",
+                     roles = excluded.roles",
                 params![
                     u.user_id,
                     u.username,
@@ -307,6 +307,17 @@ impl ServerStore for SqliteStore {
                 "UPDATE users SET deactivated_at = ?2, deactivated_by = ?3, retention_until = ?4
                  WHERE user_id = ?1 AND deactivated_at IS NULL",
                 params![user_id, at, by, retention_until],
+            )
+            .map_err(db)?;
+        Ok(n > 0)
+    }
+
+    fn user_set_wrapped(&self, user_id: &str, expected: &str, new: &str) -> StoreResult<bool> {
+        let n = self
+            .conn()
+            .execute(
+                "UPDATE users SET data_key_wrapped = ?3 WHERE user_id = ?1 AND data_key_wrapped = ?2",
+                params![user_id, expected, new],
             )
             .map_err(db)?;
         Ok(n > 0)

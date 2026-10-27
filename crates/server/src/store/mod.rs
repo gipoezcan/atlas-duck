@@ -168,7 +168,11 @@ pub type AnchorHasher<'a> = &'a dyn Fn(u64, &[u8; 32]) -> [u8; 32];
 
 pub trait ServerStore: Send + Sync {
     // ---- users ----
+    /// Inserts the user, or refreshes its display name and roles; an existing user's wrapped data
+    /// key is never replaced here (only [ServerStore::user_set_wrapped] does, M13 T7).
     fn upsert_user(&self, user: &UserRecord) -> StoreResult<()>;
+    /// Rotation: replaces the wrapped data key if it still is `expected`; answers whether it did.
+    fn user_set_wrapped(&self, user_id: &str, expected: &str, new: &str) -> StoreResult<bool>;
     fn user(&self, user_id: &str) -> StoreResult<Option<UserRecord>>;
     fn user_by_name(&self, username: &str) -> StoreResult<Option<UserRecord>>;
     /// Every user with its lifecycle state, by username (admin `users list`, the scheduler).

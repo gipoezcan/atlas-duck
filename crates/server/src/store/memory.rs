@@ -52,7 +52,6 @@ impl ServerStore for MemoryStore {
             .or_insert_with(|| u.clone());
         entry.display_name = u.display_name.clone();
         entry.roles = u.roles.clone();
-        entry.data_key_wrapped = u.data_key_wrapped.clone();
         Ok(())
     }
 
@@ -120,6 +119,16 @@ impl ServerStore for MemoryStore {
         st.deactivated_by = Some(by.to_owned());
         st.retention_until = Some(retention_until);
         Ok(true)
+    }
+
+    fn user_set_wrapped(&self, user_id: &str, expected: &str, new: &str) -> StoreResult<bool> {
+        match self.lock().users.get_mut(user_id) {
+            Some(u) if u.data_key_wrapped == expected => {
+                new.clone_into(&mut u.data_key_wrapped);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     fn ks_get(&self, user_id: &str, entry: &str) -> StoreResult<Option<Sealed>> {

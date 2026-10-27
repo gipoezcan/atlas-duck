@@ -238,9 +238,12 @@ async fn unknown_user_and_bad_wrapped_key_refuse() {
         Some(RuntimeError::UnknownUser)
     );
     let uid = env.user("alice");
-    let mut u = env.store.user(&uid).unwrap().unwrap();
-    u.data_key_wrapped = "{\"v\":1}".into();
-    env.store.upsert_user(&u).unwrap();
+    let u = env.store.user(&uid).unwrap().unwrap();
+    assert!(
+        env.store
+            .user_set_wrapped(&uid, &u.data_key_wrapped, "{\"v\":1}")
+            .unwrap()
+    );
     assert_eq!(
         within(reg.open_user(&uid)).await.err(),
         Some(RuntimeError::DataKey)

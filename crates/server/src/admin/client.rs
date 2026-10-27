@@ -9,7 +9,9 @@ use std::io::Write;
 
 use serde_json::{Map, Value};
 
-use super::{AliasArg, DirArg, InstanceArgs, NoArgs, Request, Response, SwitchArg, UsernameArg};
+use super::{
+    AliasArg, DirArg, InstanceArgs, KeyFileArg, NoArgs, Request, Response, SwitchArg, UsernameArg,
+};
 use crate::cli::{EXIT_OK, EXIT_RUNTIME, EXIT_USAGE};
 use crate::config::{ADMIN_SOCKET, DEFAULT_ADMIN_SOCKET};
 
@@ -24,6 +26,7 @@ pub const USAGE: &str = "usage: atlas-duck-server admin <command>
   maintenance on|off
   backup <dir>          (under <data>/backups or the temp directory)
   restore <bundle-dir>  (maintenance on first)
+  rotate-master-key --new-key-file <path>
 ";
 
 /// What argv asks for.
@@ -59,6 +62,11 @@ pub fn parse(args: &[String]) -> Option<Parsed> {
         ["restore", dir] if !dir.starts_with('-') => Some(Parsed::Run(Request::Restore(DirArg {
             dir: (*dir).to_owned(),
         }))),
+        ["rotate-master-key", "--new-key-file", path] if !path.starts_with('-') => {
+            Some(Parsed::Run(Request::RotateMasterKey(KeyFileArg {
+                new_key_file: (*path).to_owned(),
+            })))
+        }
         _ => None,
     }
 }

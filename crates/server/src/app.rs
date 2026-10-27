@@ -15,7 +15,7 @@ use crate::admin::{AdminCtx, DEFAULT_RETENTION_DAYS};
 use crate::anchor::AnchorWriter;
 use crate::cli::{EXIT_CONFIG, EXIT_OK, EXIT_RUNTIME, config_error_fields};
 use crate::clock::{Clock, SystemClock};
-use crate::config::{Config, DirectoryConfig};
+use crate::config::{Config, ConfigError, DirectoryConfig};
 use crate::directory::Directory;
 use crate::directory::ldap::LdapDirectory;
 use crate::directory::stub::StubDirectory;
@@ -57,6 +57,21 @@ async fn run(config: Config) -> u8 {
             return EXIT_CONFIG;
         }
     };
+    // M13 T7: during a rotation the next key is accepted too, so a restart mid-way still opens
+    // every user (rows already re-wrapped carry the next key's id).
+    if let Some(next) = &config.master_key_next_file {
+        let accepted = MasterKey::load(next).ok().map(|k| master.accept(k).is_ok());
+        if accepted != Some(true) {
+            crate::log::stderr_line(
+                "error",
+                config_error_fields(&ConfigError {
+                    code: "config/master_key_next_invalid",
+                    key: crate::config::MASTER_KEY_NEXT_FILE,
+                }),
+            );
+            return EXIT_CONFIG;
+        }
+    }
     let data = config.data_dir.path().to_path_buf();
     let server_dir = data.join("server");
     if std::fs::create_dir_all(&server_dir).is_err() {
@@ -125,7 +140,7 @@ async fn run(config: Config) -> u8 {
     let sweeper = sessions.spawn_sweeper();
     let login = LoginService {
         store: store.clone(),
-        master,
+        master: master.clone(),
         directory: directory.clone(),
         limiter: Arc::new(LoginLimiter::new(
             config.login_limit_user,
@@ -154,7 +169,7 @@ async fn run(config: Config) -> u8 {
         login,
         registry: registry.clone(),
         web: WebDir(config.web_dir.clone()),
-        health: Arc::new(Health::new(store.clone(), directory, true)),
+        health: Arc::new(Health::new(store.clone(), directory, true).with_master(master.clone())),
         api_keys,
         mcp_sessions: Arc::new(crate::mcp::McpSessions::new()),
     }));
