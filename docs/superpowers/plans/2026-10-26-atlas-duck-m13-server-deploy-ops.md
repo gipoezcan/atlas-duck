@@ -44,6 +44,30 @@ Column "M12 decision" cites the M12 plan section; "M13 consequence" names the M1
 | A-14 | Account-state lookup without the user's password | Not possible in M12 (A-6); M12 refuses disabled or missing accounts at login only | Open user question Q6; the plan works either way (PD-M13-14): login-time refusal + admin `users deactivate` always; daily directory check only if the optional service bind Secret is configured |
 | A-15 | Users table | `users(username, user_id, display_name, roles, data_key_wrapped)` (T10); no `deactivated_at`, `last_login_at` | Schema v2 adds `deactivated_at`, `deactivated_by`, `last_login_at`, `retention_until` and `scheduler_state` (T5, Δ-M13-3); login refuses a deactivated user with `auth/not_permitted` (T5) |
 
+### A-table against the M12 code (Task 1, `m12-server-core` at `c2a15cd`)
+
+Paths below are under `crates/server/` unless stated.
+
+| # | Code | Divergence from the plan text |
+|---|---|---|
+| A-1 | `src/config.rs:85` (`ATLAS_DUCK_LISTEN`), `src/config.rs:138-141` (default `0.0.0.0:8080`), `src/cli.rs:31-38` (`serve`, `version`, `admin`), `Dockerfile` `EXPOSE 8080` | none |
+| A-2 | `src/health.rs:17` (`PROBE_CACHE` 30 s), `src/health.rs:52-66` (`readyz`: `checks{store,master_key,directory}` + `directory` kind, 503 on any false), `src/web/mod.rs:75-76,102-103,151` (routes, public) | none; no `/metrics` (T10) |
+| A-3 | `src/master_key.rs:22` (prefix), `:171-176` (key id shape), `:181-215` (`load`/`parse`), `:115-122` (`WrappedKey`), `:232-245` (`unwrap` refuses another `master_key_id` with `WrongMasterKey`) | one key only (T7 adds the next key) |
+| A-4 | `src/config.rs:83-105` (all names), `:131-136` (`ATLAS_DUCK_MODE` `production`/`review`/`dev`), `:123-128` (any `*MASTER_KEY` variable refused) | none |
+| A-5 | `src/config.rs:88,147`, `src/directory/tls.rs:24` (`client_config`: bundle-only roots when set) | none |
+| A-6 | `src/directory/ldap.rs:3,112,133-137` (user bind, `memberOf`/`userAccountControl`, fail closed) | none |
+| A-7 | `src/config.rs:167-173` (exit 78 `config/test_directory_in_production`), `src/directory/stub.rs:60-90`, `src/app.rs:87-93` (warn `test_directory_active`) | none |
+| A-8 | `Dockerfile` (stages `node:22.13.1-bookworm-slim` → `rust:1.95.0-bookworm` → `distroless/cc-debian12:nonroot`, `USER 65532:65532`, `ENTRYPOINT`/`CMD`) | none |
+| A-9 | `src/app.rs:57-69` (writes only `<data>/server/` and, via the runtimes, `<data>/users/<id>/`) | checked further in T2 |
+| A-10 | `src/admin_offline.rs:80-169`, `src/cli.rs:26-27,35,66`, `ci/server-smoke.sh:67-73` | none |
+| A-11 | `src/store/mod.rs:151-221` (`ServerStore`), `src/store/sqlite.rs:76-88` (`user_version` 1, `Newer` refusal, no migration), `src/runtime.rs:478-575` (`Registry`, LRU, pins, `close_all`) | none |
+| A-12 | `src/anchor.rs:23-31` (kinds), `:122` (`operational`), `:150` (`tick`), `:202` (`spawn`), `:247` (`verify`) | the tick is `tick()`, not `tick_now()`; M12 also has `INSTANCE_ADDED`/`INSTANCE_REMOVED` (additive; `verify` accepts any operational kind without heads, `:276`) |
+| A-13 | `src/app.rs:167-186` (graceful shutdown, `writer.shutdown()`), `:188-207` (SIGTERM/Ctrl-C) | none |
+| A-14 | `src/directory/mod.rs:37-47` (`Directory`: `authenticate`, `probe`, `kind` only) | none |
+| A-15 | `src/store/schema.rs:4,7-14` | v1 `users` also has `created_at` |
+
+Env names and port T3 consumes: `ATLAS_DUCK_MODE`, `ATLAS_DUCK_PUBLIC_URL`, `ATLAS_DUCK_LISTEN` (unset → `0.0.0.0:8080`), `ATLAS_DUCK_DATA_DIR`, `ATLAS_DUCK_MASTER_KEY_FILE`, `ATLAS_DUCK_CA_BUNDLE_FILE`, `ATLAS_DUCK_WEB_DIR` (default `/app/web`), `ATLAS_DUCK_TRUSTED_PROXY_HOPS` (default 1), `ATLAS_DUCK_MAX_OPEN_USERS` (default 200), `ATLAS_DUCK_TEST_DIRECTORY_FILE`, `LDAP_URL`, `LDAP_UPN_SUFFIX`, `LDAP_BASE_DN`, `GROUP_USERS`, `GROUP_AUDITORS`, `GROUP_ADMINS`, `ATLAS_DUCK_LOGIN_LIMIT_USER`, `ATLAS_DUCK_LOGIN_LIMIT_IP`, `ATLAS_DUCK_LOGIN_WINDOW_SECS`, `ATLAS_DUCK_SESSION_ABSOLUTE_SECS`, `ATLAS_DUCK_SESSION_IDLE_SECS`, `ATLAS_DUCK_ANCHOR_INTERVAL_SECS`, `RUST_LOG`; port 8080.
+
 ---
 
 ## Decisions resolved in this plan (PD-M13-n)

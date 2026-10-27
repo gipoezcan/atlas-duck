@@ -839,6 +839,7 @@ Each milestone entry lists: scope (§14, with the placements this plan makes whe
 - **Scope (SM-10, SM-8, SM-9):** Helm chart and helmfile, GitLab CI pipeline (kaniko, Harbor/Artifactory, OCI chart, deploy to `team-dux@gip` / `team-dux`, per-branch review environments), Kubernetes Secrets mounted as files, CA bundle ConfigMap, hardening (non-root, read-only rootfs, dropped capabilities, seccomp), admin CLI, retention and offboarding job, `/healthz` `/readyz` `/metrics`, runbooks, threat-model docs (ADR 0002 accepted risk).
 - **Depends on:** M12.
 - **Exit criterion:** a review environment deploys from a branch pipeline and passes the smoke test; master key rotation and backup/restore pass on it; the production deploy is gated behind the user's go-ahead (a deploy to the shared cluster is outward-facing).
+- **Contract deltas (M13 plan, Task 1):** Δ-M13-1 new operational server anchor-chain kinds `MASTER_KEY_ROTATED`, `USER_DEACTIVATED` (body `{"leaf"}` with an `anchor_heads` entry, PD-217 v2), `CHAIN_DELETED`, `BACKUP_TAKEN`, `RESTORED`, `RETENTION_RUN`, `MAINTENANCE`; Δ-M13-2 the admin CLI talks to the running server over a Unix socket and replaces M12's hidden offline `admin instances` (PD-212); Δ-M13-3 `server.db` schema v2 with an up-migration path (M14 numbers its migration v3).
 - **Status:** not started.
 
 ### M14 — Server mode completion
