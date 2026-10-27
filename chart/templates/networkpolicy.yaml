@@ -14,11 +14,10 @@ spec:
     - Egress
   ingress:
     {{- if .Values.networkPolicy.ingressFromAllNamespaces }}
-    # The ingress controller's namespace is not visible to the team (deploy facts): every
-    # namespace may reach the HTTP port, nothing else is open.
-    - from:
-        - namespaceSelector: {}
-      ports:
+    # The ingress controller's namespace is not visible to the team (deploy facts), and its
+    # traffic can arrive from node addresses (host networking) that no namespaceSelector matches.
+    # So any source may reach the HTTP port; nothing else is open.
+    - ports:
         - port: http
           protocol: TCP
     {{- else }}
