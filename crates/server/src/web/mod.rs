@@ -143,7 +143,9 @@ async fn api_guard(State(st): State<AppState>, mut req: Request, next: Next) -> 
             return ApiError::ORIGIN_MISMATCH.into_response();
         }
         if path != "/api/login" {
-            let Some(cookie) = header_str(headers, header::COOKIE).and_then(cookie_value) else {
+            let Some(cookie) =
+                header_str(headers, header::COOKIE).and_then(|h| cookie_value(h, st.cookie_secure))
+            else {
                 return ApiError::NO_SESSION.into_response();
             };
             let session = match st.sessions.lookup(cookie) {
@@ -160,7 +162,9 @@ async fn api_guard(State(st): State<AppState>, mut req: Request, next: Next) -> 
 }
 
 /// The client address (PD-201): with `hops` > 0 the `hops`-th `X-Forwarded-For` entry from the
-/// right (the address the outermost trusted proxy saw), else the peer address.
+/// right (the address the outermost trusted proxy saw), else the peer address. Review M1: only
+/// the configured number of entries from the right is trusted; a shorter list, or an entry that
+/// is not an IP address, falls back to the peer address (the leftmost entries are client text).
 pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>, hops: u32) -> String {
     let peer_ip = || peer.map_or_else(|| "unknown".to_owned(), |p| p.ip().to_string());
     if hops == 0 {
@@ -175,13 +179,14 @@ pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>, hops: u32) -> St
         .filter(|s| !s.is_empty())
         .collect();
     let n = hops as usize;
-    let ip = match entries.len() {
-        0 => return peer_ip(),
-        len if len >= n => entries[len - n],
-        _ => entries[0],
-    };
-    // Header text: bounded, as it keys the rate limiter and lands in LOGIN_FAILED.
-    ip.chars().take(MAX_IP_CHARS).collect()
+    let len = entries.len();
+    if len < n {
+        return peer_ip();
+    }
+    match entries[len - n].parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.to_string(),
+        Err(_) => peer_ip(),
+    }
 }
 
 /// The longest client address kept (an IPv6 address with zone fits).

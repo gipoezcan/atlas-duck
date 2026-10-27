@@ -25,8 +25,10 @@ impl ServerKeyStore {
         }
     }
 
+    /// Review M6: a domain prefix keeps these blobs apart from every other use of the data key.
     fn aad(&self, entry: &str) -> Vec<u8> {
-        let mut aad = entry.as_bytes().to_vec();
+        let mut aad = b"atlas-duck/keystore/v1\0".to_vec();
+        aad.extend_from_slice(entry.as_bytes());
         aad.push(0);
         aad.extend_from_slice(self.user_id.as_bytes());
         aad

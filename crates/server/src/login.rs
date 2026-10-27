@@ -113,9 +113,8 @@ impl LoginService {
         }
     }
 
+    /// A counted failure: the reserved attempt stays in the windows; LOGIN_FAILED is appended.
     fn refuse(&self, username: &str, ip: &str, reason: &str, err: ApiError) -> ApiError {
-        self.limiter
-            .record_failure(&limiter_key(username), ip, self.clock.now());
         self.failed(username, ip, reason);
         err
     }
@@ -128,7 +127,7 @@ impl LoginService {
     ) -> Result<LoginOk, ApiError> {
         let now = self.clock.now();
         if !valid_username(username) {
-            if let Err(wait) = self.limiter.check(&limiter_key(username), ip, now) {
+            if let Err(wait) = self.limiter.reserve(&limiter_key(username), ip, now) {
                 return Err(ApiError::rate_limited(wait.0));
             }
             return Err(self.refuse(
@@ -142,7 +141,9 @@ impl LoginService {
             return Err(ApiError::EMPTY_PASSWORD);
         }
         let name = canonical(username);
-        if let Err(wait) = self.limiter.check(&name, ip, now) {
+        // Review I1: the attempt is counted before the bind, under the limiter's lock, and taken
+        // back only on success or when the directory could not answer.
+        if let Err(wait) = self.limiter.reserve(&name, ip, now) {
             return Err(ApiError::rate_limited(wait.0));
         }
         let outcome = self.directory.authenticate(&name, &password).await;
@@ -161,6 +162,7 @@ impl LoginService {
                 return Err(self.refuse(&name, ip, "not_permitted", ApiError::NOT_PERMITTED));
             }
             Err(DirectoryError::Unavailable) => {
+                self.limiter.release(&name, ip, now);
                 self.failed(&name, ip, "directory_unavailable");
                 return Err(ApiError::DIRECTORY_UNAVAILABLE);
             }
@@ -184,6 +186,7 @@ impl LoginService {
         if created {
             self.sink.user_created(&record.user_id).await?;
         }
+        self.limiter.release(&name, ip, now);
         self.limiter.record_success(&name);
         let session = self.sessions.create(&record.user_id, roles.clone())?;
         let role_refs: Vec<&str> = roles.iter().map(String::as_str).collect();

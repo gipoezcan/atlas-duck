@@ -208,7 +208,7 @@ impl H {
         let cookie = set_cookie(&res);
         let body = json_body(res).await;
         let id = cookie
-            .strip_prefix("atlas_duck_session=")
+            .strip_prefix("__Host-atlas_duck_session=")
             .and_then(|r| r.split(';').next())
             .unwrap()
             .to_owned();
@@ -218,7 +218,10 @@ impl H {
     async fn get_session(&self, cookie: &str) -> Response {
         let req = Request::builder()
             .uri("/api/session")
-            .header(header::COOKIE, format!("atlas_duck_session={cookie}"))
+            .header(
+                header::COOKIE,
+                format!("__Host-atlas_duck_session={cookie}"),
+            )
             .body(Body::empty())
             .unwrap();
         self.send(req).await
@@ -228,7 +231,10 @@ impl H {
         let mut b = Request::builder()
             .method(Method::POST)
             .uri("/api/logout")
-            .header(header::COOKIE, format!("atlas_duck_session={cookie}"));
+            .header(
+                header::COOKIE,
+                format!("__Host-atlas_duck_session={cookie}"),
+            );
         if let Some(c) = csrf {
             b = b.header("x-csrf-token", c);
         }
@@ -280,7 +286,9 @@ async fn login_success_sets_cookie_with_exact_attributes() {
     assert_eq!(res.status(), StatusCode::OK);
     let cookie = set_cookie(&res);
     let (name_value, attrs) = cookie.split_once("; ").unwrap();
-    let value = name_value.strip_prefix("atlas_duck_session=").unwrap();
+    let value = name_value
+        .strip_prefix("__Host-atlas_duck_session=")
+        .unwrap();
     assert_eq!(value.len(), 43, "32 bytes base64url");
     assert!(
         value
@@ -339,6 +347,76 @@ async fn sixth_failure_for_a_username_is_limited_without_a_bind() {
         5,
         "the limited attempt never reached the directory"
     );
+}
+
+/// A directory that answers after a delay and counts its binds.
+struct SlowDirectory {
+    inner: Arc<StubDirectory>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl crate::directory::Directory for SlowDirectory {
+    async fn authenticate(
+        &self,
+        username: &str,
+        password: &secrecy::SecretString,
+    ) -> Result<crate::directory::DirectoryUser, crate::directory::DirectoryError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        self.inner.authenticate(username, password).await
+    }
+    async fn probe(&self) -> Result<(), crate::directory::DirectoryError> {
+        Ok(())
+    }
+    fn kind(&self) -> &'static str {
+        "stub"
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_failures_never_exceed_the_username_limit() {
+    // Batch-2 review I1: the check and the count are one step, so ten parallel attempts with a
+    // slow directory reach it at most five times.
+    let h = H::new();
+    let slow = Arc::new(SlowDirectory {
+        inner: h.stub.clone(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let l = &h.state.login;
+    let svc = Arc::new(LoginService {
+        store: l.store.clone(),
+        master: l.master.clone(),
+        directory: slow.clone(),
+        limiter: Arc::new(LoginLimiter::new(5, 20, 900)),
+        sessions: l.sessions.clone(),
+        groups: l.groups.clone(),
+        clock: l.clock.clone(),
+        sink: l.sink.clone(),
+    });
+    let mut tasks = Vec::new();
+    for i in 0..10 {
+        let svc = svc.clone();
+        tasks.push(tokio::spawn(async move {
+            svc.login(
+                "alice",
+                secrecy::SecretString::from("wrong".to_owned()),
+                &format!("198.51.100.{i}"),
+            )
+            .await
+            .map(|_| ())
+        }));
+    }
+    let results = tokio::time::timeout(LIMIT, futures::future::join_all(tasks))
+        .await
+        .expect("logins hung");
+    let limited = results
+        .iter()
+        .filter(|r| matches!(r, Ok(Err(e)) if e.code == "auth/rate_limited"))
+        .count();
+    let calls = slow.calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(calls <= 5, "directory reached {calls} times");
+    assert_eq!(limited, 10 - calls);
 }
 
 #[tokio::test]
@@ -528,7 +606,10 @@ async fn bearer_is_refused_on_cmd_and_me() {
             .method(method)
             .uri(uri)
             .header(header::AUTHORIZATION, "Bearer adk_abcdefgh_secret")
-            .header(header::COOKIE, format!("atlas_duck_session={cookie}"))
+            .header(
+                header::COOKIE,
+                format!("__Host-atlas_duck_session={cookie}"),
+            )
             .header("x-csrf-token", &csrf)
             .header(header::ORIGIN, ORIGIN)
             .body(Body::empty())
@@ -692,12 +773,23 @@ async fn bearer_refusal_precedes_size_origin_and_session() {
     assert_eq!(code(h.send(req).await).await.1, "auth/bearer_not_accepted");
 }
 
+/// Review M1: an entry that is not an IP address is never used; the peer address is.
 #[test]
-fn client_ip_is_clipped() {
+fn client_ip_must_be_an_ip_address() {
     use axum::http::HeaderMap;
+    let peer = Some("10.0.0.1:5555".parse().unwrap());
+    for forged in [
+        "9".repeat(500),
+        "evil, not-an-ip".into(),
+        "1.2.3.4.5".into(),
+    ] {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", forged.parse().unwrap());
+        assert_eq!(client_ip(&h, peer, 1), "10.0.0.1", "{forged}");
+    }
     let mut h = HeaderMap::new();
-    h.insert("x-forwarded-for", "9".repeat(500).parse().unwrap());
-    assert_eq!(client_ip(&h, None, 1).len(), super::MAX_IP_CHARS);
+    h.insert("x-forwarded-for", "2001:db8::1".parse().unwrap());
+    assert_eq!(client_ip(&h, peer, 1), "2001:db8::1");
 }
 
 #[test]
@@ -709,7 +801,8 @@ fn client_ip_from_forwarded_for() {
     h.insert("x-forwarded-for", "198.51.100.1, 10.1.1.1".parse().unwrap());
     assert_eq!(client_ip(&h, peer, 1), "10.1.1.1");
     assert_eq!(client_ip(&h, peer, 2), "198.51.100.1");
-    assert_eq!(client_ip(&h, peer, 3), "198.51.100.1");
+    // Fewer entries than trusted hops: the leftmost is client text, the peer is used.
+    assert_eq!(client_ip(&h, peer, 3), "10.0.0.1");
     assert_eq!(client_ip(&h, peer, 0), "10.0.0.1");
     assert_eq!(client_ip(&HeaderMap::new(), None, 1), "unknown");
 }
@@ -823,7 +916,10 @@ async fn admin_call(
     let req = Request::builder()
         .method(method)
         .uri(uri)
-        .header(header::COOKIE, format!("atlas_duck_session={cookie}"))
+        .header(
+            header::COOKIE,
+            format!("__Host-atlas_duck_session={cookie}"),
+        )
         .header("x-csrf-token", csrf)
         .header(header::ORIGIN, ORIGIN)
         .body(Body::from(body.to_owned()))
@@ -1176,7 +1272,7 @@ async fn sse_delivers_queue_changed_and_ends_at_session_expiry() {
         .send(
             Request::builder()
                 .uri("/api/events")
-                .header(header::COOKIE, format!("atlas_duck_session={c}"))
+                .header(header::COOKIE, format!("__Host-atlas_duck_session={c}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1248,7 +1344,10 @@ async fn put_pat(h: &H, cookie: &str, csrf: &str, alias: &str, pat: &str) -> Res
 async fn instances_of(h: &H, cookie: &str) -> Value {
     let req = Request::builder()
         .uri("/api/instances")
-        .header(header::COOKIE, format!("atlas_duck_session={cookie}"))
+        .header(
+            header::COOKIE,
+            format!("__Host-atlas_duck_session={cookie}"),
+        )
         .body(Body::empty())
         .unwrap();
     json_body(h.send(req).await).await

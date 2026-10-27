@@ -40,18 +40,18 @@ impl FromRequestParts<AppState> for SessionUser {
             .headers
             .get(header::COOKIE)
             .and_then(|v| v.to_str().ok())
-            .and_then(cookie_value)
+            .and_then(|h| cookie_value(h, st.cookie_secure))
             .ok_or(ApiError::NO_SESSION)?;
         st.sessions.lookup(cookie).map(SessionUser)
     }
 }
 
 /// The session cookie's value (logout needs it to delete the session).
-pub fn cookie_of(parts: &axum::http::HeaderMap) -> Option<String> {
+pub fn cookie_of(parts: &axum::http::HeaderMap, secure: bool) -> Option<String> {
     parts
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
-        .and_then(cookie_value)
+        .and_then(|h| cookie_value(h, secure))
         .map(str::to_owned)
 }
 

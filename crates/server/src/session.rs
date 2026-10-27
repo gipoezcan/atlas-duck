@@ -216,10 +216,21 @@ fn to_session(r: &SessionRecord) -> Session {
     }
 }
 
+/// Review M4: with `Secure` the cookie is `__Host-atlas_duck_session` (Secure, Path=/, no Domain:
+/// a sibling subdomain can neither set nor shadow it); without (`dev` on plain-HTTP localhost,
+/// PD-203) the plain name, since browsers refuse `__Host-` cookies without `Secure`.
+pub fn cookie_name(secure: bool) -> &'static str {
+    if secure { COOKIE_HOST } else { COOKIE }
+}
+
+/// The `__Host-` form of [`COOKIE`].
+pub const COOKIE_HOST: &str = "__Host-atlas_duck_session";
+
 /// `Set-Cookie` of a new session (PD-203: `Secure` unless dev on plain-HTTP localhost).
 pub fn set_cookie(id: &SecretString, secure: bool) -> String {
     format!(
-        "{COOKIE}={}; HttpOnly;{} SameSite=Strict; Path=/",
+        "{}={}; HttpOnly;{} SameSite=Strict; Path=/",
+        cookie_name(secure),
         id.expose_secret(),
         if secure { " Secure;" } else { "" }
     )
@@ -228,15 +239,17 @@ pub fn set_cookie(id: &SecretString, secure: bool) -> String {
 /// `Set-Cookie` that removes the session cookie.
 pub fn clear_cookie(secure: bool) -> String {
     format!(
-        "{COOKIE}=; HttpOnly;{} SameSite=Strict; Path=/; Max-Age=0",
+        "{}=; HttpOnly;{} SameSite=Strict; Path=/; Max-Age=0",
+        cookie_name(secure),
         if secure { " Secure;" } else { "" }
     )
 }
 
-/// The session cookie's value from a `Cookie` header.
-pub fn cookie_value(header: &str) -> Option<&str> {
+/// The session cookie's value from a `Cookie` header, under this server's cookie name only.
+pub fn cookie_value(header: &str, secure: bool) -> Option<&str> {
+    let want = cookie_name(secure);
     header.split(';').find_map(|part| {
         let (name, value) = part.trim().split_once('=')?;
-        (name == COOKIE && !value.is_empty()).then_some(value)
+        (name == want && !value.is_empty()).then_some(value)
     })
 }

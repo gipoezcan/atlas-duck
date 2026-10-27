@@ -51,6 +51,41 @@ impl LoginLimiter {
     /// `Err` with the wait when either the username or the IP is at its limit.
     pub fn check(&self, user: &str, ip: &str, now: i64) -> Result<(), RetryAfter> {
         let mut map = self.lock();
+        self.wait_locked(&mut map, user, ip, now)
+    }
+
+    /// Batch-2 review I1: the check and the count of this attempt under one lock, so parallel
+    /// attempts cannot all pass before any failure is recorded. The attempt counts as a failure
+    /// until [`Self::release`] takes it back (success, or a directory that could not answer).
+    pub fn reserve(&self, user: &str, ip: &str, now: i64) -> Result<(), RetryAfter> {
+        let mut map = self.lock();
+        self.wait_locked(&mut map, user, ip, now)?;
+        self.push_locked(&mut map, user, ip, now);
+        Ok(())
+    }
+
+    /// Takes back one attempt [`Self::reserve`] counted at `at`.
+    pub fn release(&self, user: &str, ip: &str, at: i64) {
+        let mut map = self.lock();
+        for key in [(Kind::User, user.to_owned()), (Kind::Ip, ip.to_owned())] {
+            if let Some(q) = map.get_mut(&key) {
+                if let Some(pos) = q.iter().rposition(|t| *t == at) {
+                    q.remove(pos);
+                }
+                if q.is_empty() {
+                    map.remove(&key);
+                }
+            }
+        }
+    }
+
+    fn wait_locked(
+        &self,
+        map: &mut HashMap<(Kind, String), VecDeque<i64>>,
+        user: &str,
+        ip: &str,
+        now: i64,
+    ) -> Result<(), RetryAfter> {
         let mut wait = None;
         for (key, limit) in [
             ((Kind::User, user.to_owned()), self.limit_user),
@@ -77,6 +112,16 @@ impl LoginLimiter {
 
     pub fn record_failure(&self, user: &str, ip: &str, now: i64) {
         let mut map = self.lock();
+        self.push_locked(&mut map, user, ip, now);
+    }
+
+    fn push_locked(
+        &self,
+        map: &mut HashMap<(Kind, String), VecDeque<i64>>,
+        user: &str,
+        ip: &str,
+        now: i64,
+    ) {
         for key in [(Kind::User, user.to_owned()), (Kind::Ip, ip.to_owned())] {
             if !map.contains_key(&key) && map.len() >= self.max_keys {
                 let victim = map
@@ -108,6 +153,20 @@ impl LoginLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserve_counts_at_once_and_release_takes_it_back() {
+        let l = LoginLimiter::new(2, 20, 900);
+        assert_eq!(l.reserve("alice", "1.1.1.1", 10), Ok(()));
+        assert_eq!(l.reserve("alice", "1.1.1.2", 10), Ok(()));
+        // Two attempts in flight already fill alice's window.
+        assert!(l.reserve("alice", "1.1.1.3", 10).is_err());
+        l.release("alice", "1.1.1.1", 10);
+        assert_eq!(l.reserve("alice", "1.1.1.3", 11), Ok(()));
+        l.release("alice", "1.1.1.2", 10);
+        l.release("alice", "1.1.1.3", 11);
+        assert!(l.is_empty() || l.check("alice", "9.9.9.9", 12).is_ok());
+    }
 
     #[test]
     fn username_limit_and_retry_after() {

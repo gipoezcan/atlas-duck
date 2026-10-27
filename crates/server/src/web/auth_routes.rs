@@ -65,7 +65,7 @@ pub async fn logout(
     SessionUser(_): SessionUser,
     req: Request,
 ) -> Result<Response, ApiError> {
-    if let Some(id) = cookie_of(req.headers()) {
+    if let Some(id) = cookie_of(req.headers(), st.cookie_secure) {
         st.sessions.delete(&id)?;
     }
     Ok(with_cookie(

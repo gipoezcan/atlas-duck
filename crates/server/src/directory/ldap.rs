@@ -130,14 +130,17 @@ impl LdapDirectory {
             .ok_or(DirectoryError::NotFound)?;
         let _ = done;
         let first = |k: &str| entry.attrs.get(k).and_then(|v| v.first()).cloned();
-        let uac: u64 = first("userAccountControl")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+        // Review M3: fail closed. A missing or unreadable `userAccountControl` is a disabled
+        // account (the directory is AD; every user entry carries it).
+        let disabled = match first("userAccountControl").and_then(|v| v.parse::<u64>().ok()) {
+            Some(uac) => uac & UAC_DISABLED != 0,
+            None => true,
+        };
         Ok(DirectoryUser {
             username: username.to_owned(),
             display_name: first("displayName"),
             groups: entry.attrs.get("memberOf").cloned().unwrap_or_default(),
-            disabled: uac & UAC_DISABLED != 0,
+            disabled,
         })
     }
 }

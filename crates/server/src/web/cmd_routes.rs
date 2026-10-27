@@ -53,7 +53,7 @@ pub async fn events(
     user: SessionUser,
     req: Request,
 ) -> Result<Response, ApiError> {
-    let cookie = cookie_of(req.headers()).ok_or(ApiError::NO_SESSION)?;
+    let cookie = cookie_of(req.headers(), st.cookie_secure).ok_or(ApiError::NO_SESSION)?;
     let rt = st.registry.runtime(&user.ctx()).await?;
     let pin = rt.sse_pin();
     let rx = rt.events();

@@ -124,6 +124,8 @@ fn ca(name: &str) -> io::Result<Ca> {
 enum Mode {
     /// Bind succeeds; the search finds the entry with this `userAccountControl`.
     Entry { uac: u32 },
+    /// Bind succeeds; the entry has this `userAccountControl` text (`None`: no such attribute).
+    EntryUacText(Option<&'static str>),
     /// Bind succeeds; the search finds nothing.
     NoEntry,
     /// Bind answers this result code.
@@ -279,7 +281,12 @@ impl FakeLdap {
                             0x63 => {
                                 f.lock().unwrap().push(body.to_vec());
                                 let mut out = Vec::new();
-                                if let Mode::Entry { uac } = mode {
+                                let uac_text = match mode {
+                                    Mode::Entry { uac } => Some(Some(uac.to_string())),
+                                    Mode::EntryUacText(t) => Some(t.map(str::to_owned)),
+                                    _ => None,
+                                };
+                                if let Some(uac_text) = uac_text {
                                     let mut attrs = attribute(
                                         "memberOf",
                                         &[
@@ -287,10 +294,9 @@ impl FakeLdap {
                                             "CN=Duck Admins,DC=example,DC=test",
                                         ],
                                     );
-                                    attrs.extend(attribute(
-                                        "userAccountControl",
-                                        &[&uac.to_string()],
-                                    ));
+                                    if let Some(text) = uac_text {
+                                        attrs.extend(attribute("userAccountControl", &[&text]));
+                                    }
                                     attrs.extend(attribute("displayName", &["Alice Example"]));
                                     let mut entry = tlv(0x04, b"CN=alice,DC=example,DC=test");
                                     entry.extend(tlv(0x30, &attrs));
@@ -470,5 +476,22 @@ async fn ldap_closed_port_is_unavailable_within_11s() {
         started.elapsed() < Duration::from_secs(11),
         "{:?}",
         started.elapsed()
+    );
+}
+
+/// Review M3: a missing or unreadable `userAccountControl` is a disabled account (fail closed).
+#[tokio::test]
+async fn ldap_missing_or_bad_uac_is_disabled() {
+    for text in [None, Some("not-a-number"), Some("")] {
+        let fake = FakeLdap::start(Mode::EntryUacText(text)).await;
+        let u = auth(&fake.directory(), "alice", "pw").await.unwrap();
+        assert!(u.disabled, "{text:?}");
+    }
+    let fake = FakeLdap::start(Mode::EntryUacText(Some("512"))).await;
+    assert!(
+        !auth(&fake.directory(), "alice", "pw")
+            .await
+            .unwrap()
+            .disabled
     );
 }
