@@ -92,6 +92,9 @@ key material, PATs or audit contents.
 - **Review environments use a test directory and a test key.** That is fine only because they
   never hold real data. Never sign in there with a real account and never store a real PAT
   there. Production refuses the test directory twice (chart guard, then server exit 78).
+- **Daily backups on NFS (ADR 0004).** The backups volume on `team-dux-storage` holds the
+  wrapped keys and every chain of the last 14 days: whoever can read that share and the master
+  key Secret can read every PAT of that period.
 - **Backups contain the wrapped keys.** A bundle is useless without the master key whose id is
   in its manifest. Store bundles off-cluster and apart from the key escrow
   ([backup-restore.md](backup-restore.md)).

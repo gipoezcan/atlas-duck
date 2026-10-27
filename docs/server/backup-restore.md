@@ -142,13 +142,31 @@ Run a restore drill at least quarterly, and after every change to the backup or 
 a review environment: `verify:review-ops-drill`. It backs up, rotates the key, refuses the old
 bundle, restores the new one and checks login. Keep the job log as evidence.
 
-## Losing the PVC
+## Scheduled backups (ADR 0004)
 
-1. Recreate the PVC: redeploy, which creates an empty one.
-2. Make sure the master key Secret is the one named in the latest off-cluster bundle's manifest
-   (`master_key_id`).
-3. `admin maintenance on`, `admin restore --stdin < bundle.tar`, `admin anchor verify`,
+The live data sits on a node-local `local-path` volume. With `persistence.backups.enabled` the
+server also writes a backup bundle every day at `ATLAS_DUCK_OFFBOARDING_AT` (UTC, default 02:00)
+to the second volume `<release>-backups` (NFS, mounted at `/var/lib/atlas-duck-backups`) and
+keeps the newest `persistence.backups.keep` (default 14); each removed bundle is anchored as
+`BACKUP_REMOVED`. `admin backups list` shows them with location `scheduled`. Watch
+`atlas_duck_scheduler_last_success_seconds{job="backup"}`. Copy a weekly one off the cluster too
+(`admin backups export <name> --stdout`): the NFS share is in the same data centre.
+
+## Losing the node or the data volume
+
+The data volume lives on one node. If the node is gone (or the volume is lost):
+
+1. `kubectl $NS scale deploy/atlas-duck --replicas=0`.
+2. Remove the old claim: `kubectl $NS annotate pvc atlas-duck-data helm.sh/resource-policy-`, then
+   `kubectl $NS delete pvc atlas-duck-data` (a lost node's local volume cannot come back).
+3. Redeploy (`deploy:production` or `helm upgrade` with the same values): Helm creates a new data
+   volume on a healthy node; the backups volume is untouched.
+4. Make sure the master key Secret is the one named in the bundle's manifest
+   (`master_key_id`, `key_ids`).
+5. `admin maintenance on`, `admin backups list`, then
+   `admin restore /var/lib/atlas-duck-backups/bundles/<newest bundle>`, `admin anchor verify`,
    `admin maintenance off`.
 
-Anything after the bundle's time is lost: sessions, API keys created later, and audit records
-written later. The anchor chain shows where the restored history ends (`RESTORED`).
+Anything after the bundle's time is lost (at most a day): sessions, API keys created later and
+audit records written later. The anchor chain shows where the restored history ends
+(`RESTORED`). A bundle copied off the cluster restores the same way with `restore --stdin`.
