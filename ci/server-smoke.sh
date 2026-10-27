@@ -111,8 +111,10 @@ sid="$(sed -n 's/^[Mm]cp-[Ss]ession-[Ii]d: *\([^[:space:]]*\).*/\1/p' "$WORK/ini
 "${CURL[@]}" -H "Authorization: Bearer $key" -H "Mcp-Session-Id: $sid" \
   -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' "$BASE/mcp" > "$WORK/tools.body"
-grep -q 'jira_issue_get' "$WORK/tools.body" || fail "tools/list lacks jira_issue_get"
-if grep -q 'jira_issue_edit' "$WORK/tools.body"; then fail "a read key lists a write tool"; fi
+# Exact tool names: the read tool jira_issue_editmeta contains the write tool's name as a prefix.
+grep -q '"name":"jira_issue_get"' "$WORK/tools.body" || fail "tools/list lacks jira_issue_get"
+grep -q '"name":"jira_issue_editmeta"' "$WORK/tools.body" || fail "tools/list lacks jira_issue_editmeta"
+if grep -q '"name":"jira_issue_edit"' "$WORK/tools.body"; then fail "a read key lists a write tool"; fi
 status="$("${CURL[@]}" -o /dev/null -w '%{http_code}' -X POST "$BASE/mcp")"
 [[ "$status" == 401 ]] || fail "/mcp without a key answered $status"
 
