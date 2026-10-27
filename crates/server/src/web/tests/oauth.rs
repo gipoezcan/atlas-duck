@@ -1322,3 +1322,102 @@ async fn the_token_endpoint_is_rate_limited_per_ip() {
     assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(res.headers().contains_key(header::RETRY_AFTER));
 }
+
+// ---- T9: connected apps ----------------------------------------------------------------------
+
+impl H {
+    async fn grants(&self, cookie: &str) -> (StatusCode, Value) {
+        let res = self
+            .send(
+                Request::builder()
+                    .uri("/api/me/oauth/grants")
+                    .header(header::COOKIE, cookie_header(cookie))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        let s = res.status();
+        (s, json_body(res).await)
+    }
+
+    async fn revoke_grant(&self, sess: &(String, String), id: &str) -> StatusCode {
+        self.send(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/me/oauth/grants/{id}"))
+                .header(header::COOKIE, cookie_header(&sess.0))
+                .header("x-csrf-token", &sess.1)
+                .header(header::ORIGIN, ORIGIN)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .status()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grants_are_listed_and_revoked_per_user() {
+    let h = H::new();
+    let (_, alice, v) = h.tokens_for(&["read", "scripts"]).await;
+    let bob = h.session("bob", "pw-bob").await;
+    let (st, list) = h.grants(&alice.0).await;
+    assert_eq!(st, StatusCode::OK);
+    let rows = list.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    let g = &rows[0];
+    assert_eq!(g["client_name"], "Claude Code");
+    assert_eq!(g["redirect_hosts"], json!(["127.0.0.1"]));
+    assert_eq!(g["scopes"], json!(["read", "scripts"]));
+    assert!(g["revoked_at"].is_null());
+    // Never a token or a hash in the list.
+    let text = list.to_string();
+    for t in [s(&v, "access_token"), s(&v, "refresh_token")] {
+        assert!(!text.contains(&t));
+    }
+    assert!(!text.contains("hash"));
+    let id = g["grant_id"].as_str().unwrap().to_owned();
+    // Bob sees nothing and cannot revoke alice's grant (answered like an unknown id).
+    assert_eq!(h.grants(&bob.0).await.1, json!([]));
+    assert_eq!(h.revoke_grant(&bob, &id).await, StatusCode::NOT_FOUND);
+    assert_eq!(
+        h.revoke_grant(&bob, "grt_unknown").await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        h.mcp_init(&s(&v, "access_token"), None).await.status(),
+        StatusCode::OK
+    );
+    // Alice revokes: the token dies at once and the chain records it.
+    assert_eq!(h.revoke_grant(&alice, &id).await, StatusCode::NO_CONTENT);
+    assert_eq!(
+        h.mcp_init(&s(&v, "access_token"), None).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(h.revoke_grant(&alice, &id).await, StatusCode::NO_CONTENT);
+    let chain = h.alice_chain().await;
+    assert_eq!(
+        chain
+            .iter()
+            .filter(
+                |(k, p)| *k == atlas_duck_audit::EventType::OAUTH_GRANT_REVOKED
+                    && p["by"] == "user"
+            )
+            .count(),
+        1
+    );
+    assert!(!h.grants(&alice.0).await.1[0]["revoked_at"].is_null());
+    // Without CSRF: refused by the guard.
+    let res = h
+        .send(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/me/oauth/grants/{id}"))
+                .header(header::COOKIE, cookie_header(&alice.0))
+                .header(header::ORIGIN, ORIGIN)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+}

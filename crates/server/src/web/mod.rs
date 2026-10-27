@@ -6,6 +6,7 @@ pub mod api_key_routes;
 pub mod auth_routes;
 pub mod cmd_routes;
 pub mod extract;
+pub mod grant_routes;
 pub mod oauth_routes;
 pub mod pat_routes;
 
@@ -122,6 +123,9 @@ pub const ROUTES: &[(&str, &str, Access)] = &[
     // M14 T8: token and revocation (public clients, PKCE; RFC answers).
     ("POST", "/oauth/token", Access::Public),
     ("POST", "/oauth/revoke", Access::Public),
+    // M14 T9: connected apps.
+    ("GET", "/api/me/oauth/grants", Access::Session),
+    ("DELETE", "/api/me/oauth/grants/{id}", Access::Session),
 ];
 
 /// The handler of one [`ROUTES`] row; `None` for the bearer rows, which [`crate::mcp::routes`]
@@ -159,6 +163,8 @@ pub(crate) fn handler(method: &str, path: &str) -> Option<MethodRouter<AppState>
         ("POST", "/api/oauth/consent/{req}") => post(oauth_routes::consent_decide),
         ("POST", "/oauth/token") => post(oauth_routes::token_endpoint),
         ("POST", "/oauth/revoke") => post(oauth_routes::revoke_endpoint),
+        ("GET", "/api/me/oauth/grants") => get(grant_routes::list),
+        ("DELETE", "/api/me/oauth/grants/{id}") => delete(grant_routes::revoke),
         _ => return None,
     })
 }

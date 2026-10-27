@@ -188,6 +188,75 @@ export function isInstanceView(v: unknown): v is InstanceView {
   );
 }
 
+// ---- /api/oauth/consent, /api/me/oauth/grants (M14 T9) -----------------------------------
+
+export interface ConsentScope {
+  name: string;
+  text: string;
+}
+
+export interface ConsentDetails {
+  client_name: string;
+  client_id: string;
+  redirect_host: string;
+  redirect_uri: string;
+  scopes: ConsentScope[];
+  expires_at: string;
+}
+
+const isConsentScope = (v: unknown): v is ConsentScope =>
+  isRecord(v) && isString(v.name) && (SCOPES as readonly string[]).includes(v.name) && isString(v.text);
+
+export function isConsentDetails(v: unknown): v is ConsentDetails {
+  return (
+    isRecord(v) &&
+    isString(v.client_name) &&
+    isString(v.client_id) &&
+    isString(v.redirect_host) &&
+    isString(v.redirect_uri) &&
+    Array.isArray(v.scopes) &&
+    v.scopes.every(isConsentScope) &&
+    isString(v.expires_at)
+  );
+}
+
+export interface ConsentRedirect {
+  redirect: string;
+}
+
+export function isConsentRedirect(v: unknown): v is ConsentRedirect {
+  return isRecord(v) && isString(v.redirect);
+}
+
+export interface GrantView {
+  grant_id: string;
+  client_id: string;
+  client_name: string;
+  redirect_hosts: string[];
+  scopes: string[];
+  created_at: number;
+  last_used_at: number | null;
+  expires_at: number;
+  revoked_at: number | null;
+}
+
+export function isGrantView(v: unknown): v is GrantView {
+  return (
+    isRecord(v) &&
+    isString(v.grant_id) &&
+    isString(v.client_id) &&
+    isString(v.client_name) &&
+    Array.isArray(v.redirect_hosts) &&
+    v.redirect_hosts.every(isString) &&
+    Array.isArray(v.scopes) &&
+    v.scopes.every(isString) &&
+    isNumber(v.created_at) &&
+    isNullableNumber(v.last_used_at) &&
+    isNumber(v.expires_at) &&
+    isNullableNumber(v.revoked_at)
+  );
+}
+
 /** A Unix time in seconds as a short UTC date and time. */
 export function when(secs: number): string {
   return new Date(secs * 1000).toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
