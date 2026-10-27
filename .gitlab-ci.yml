@@ -509,3 +509,26 @@ verify:review-smoke:
   rules: *review-rules
   script:
     - sh ci/review-smoke.sh
+# T15 (master-plan exit criterion: key rotation and backup/restore pass on a review environment).
+# On demand: it rotates the review environment's key, restores, and deactivates a test user.
+# Required once for the M13 exit; keep the job log as evidence.
+verify:review-ops-drill:
+  stage: server-verify
+  image:
+    name: ghcr.io/helmfile/helmfile:v0.169.1
+    entrypoint: [""]
+  needs: [server:version, server:chart-package, deploy:review]
+  variables: *server-vars
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == "master"
+      when: never
+    - if: $CI_COMMIT_BRANCH
+      changes:
+        paths: *server-paths
+        compare_to: refs/heads/master
+      when: manual
+  allow_failure: true
+  script:
+    - sh ci/review-ops-drill.sh
