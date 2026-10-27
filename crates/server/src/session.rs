@@ -172,6 +172,19 @@ impl SessionTable {
         Ok(())
     }
 
+    /// Deactivation (M13 T5): every session of the user ends now, in memory and in the store;
+    /// answers how many were live in memory.
+    pub fn delete_for_user(&self, user_id: &str) -> Result<usize, StoreError> {
+        let removed = {
+            let mut map = self.lock();
+            let before = map.len();
+            map.retain(|_, l| l.record.user_id != user_id);
+            before - map.len()
+        };
+        self.store.sessions_delete_for_user(user_id)?;
+        Ok(removed)
+    }
+
     /// Whether the cookie's session is still live now, without touching it (an open SSE stream's
     /// keep-alive must not extend the idle expiry).
     pub fn is_live(&self, cookie_id: &str) -> bool {

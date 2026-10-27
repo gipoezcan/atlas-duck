@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use super::schema::{SCHEMA_VERSION, V1};
 use super::{
     AnchorHasher, AnchorHead, AnchorRow, ApiKeyRecord, InstanceRecord, PatRecord, Sealed,
-    ServerStore, SessionRecord, StoreError, StoreResult, UserRecord,
+    ServerStore, SessionRecord, StoreError, StoreResult, UserRecord, UserState,
 };
 
 pub struct SqliteStore {
@@ -82,10 +82,11 @@ impl SqliteStore {
         if version == 0 {
             let tx = conn.unchecked_transaction().map_err(db)?;
             tx.execute_batch(V1).map_err(db)?;
-            tx.execute_batch(&format!("PRAGMA user_version={SCHEMA_VERSION};"))
-                .map_err(db)?;
+            tx.execute_batch("PRAGMA user_version=1;").map_err(db)?;
             tx.commit().map_err(db)?;
         }
+        // M13 Δ-M13-3: every file, new or old, climbs the same up-migration path.
+        super::migrate::to_current(&conn)?;
         Ok(SqliteStore {
             conn: Mutex::new(conn),
         })
@@ -114,6 +115,16 @@ fn user_row(r: &Row<'_>) -> rusqlite::Result<UserRecord> {
 }
 
 const USER_COLS: &str = "user_id, username, display_name, roles, data_key_wrapped, created_at";
+const STATE_COLS: &str = "deactivated_at, deactivated_by, last_login_at, retention_until";
+
+fn state_row(r: &Row<'_>, at: usize) -> rusqlite::Result<UserState> {
+    Ok(UserState {
+        deactivated_at: r.get(at)?,
+        deactivated_by: r.get(at + 1)?,
+        last_login_at: r.get(at + 2)?,
+        retention_until: r.get(at + 3)?,
+    })
+}
 
 fn pat_row(r: &Row<'_>) -> rusqlite::Result<PatRecord> {
     Ok(PatRecord {
@@ -247,6 +258,58 @@ impl ServerStore for SqliteStore {
             )
             .optional()
             .map_err(db)
+    }
+
+    fn users_all(&self) -> StoreResult<Vec<(UserRecord, UserState)>> {
+        let c = self.conn();
+        let mut st = c
+            .prepare(&format!(
+                "SELECT {USER_COLS}, {STATE_COLS} FROM users ORDER BY username"
+            ))
+            .map_err(db)?;
+        collect(
+            st.query_map([], |r| Ok((user_row(r)?, state_row(r, 6)?)))
+                .map_err(db)?,
+        )
+    }
+
+    fn user_state(&self, user_id: &str) -> StoreResult<Option<UserState>> {
+        self.conn()
+            .query_row(
+                &format!("SELECT {STATE_COLS} FROM users WHERE user_id = ?1"),
+                [user_id],
+                |r| state_row(r, 0),
+            )
+            .optional()
+            .map_err(db)
+    }
+
+    fn user_set_last_login(&self, user_id: &str, at: i64) -> StoreResult<()> {
+        self.conn()
+            .execute(
+                "UPDATE users SET last_login_at = ?2 WHERE user_id = ?1",
+                params![user_id, at],
+            )
+            .map_err(db)?;
+        Ok(())
+    }
+
+    fn user_deactivate(
+        &self,
+        user_id: &str,
+        at: i64,
+        by: &str,
+        retention_until: i64,
+    ) -> StoreResult<bool> {
+        let n = self
+            .conn()
+            .execute(
+                "UPDATE users SET deactivated_at = ?2, deactivated_by = ?3, retention_until = ?4
+                 WHERE user_id = ?1 AND deactivated_at IS NULL",
+                params![user_id, at, by, retention_until],
+            )
+            .map_err(db)?;
+        Ok(n > 0)
     }
 
     fn ks_get(&self, user_id: &str, entry: &str) -> StoreResult<Option<Sealed>> {
@@ -426,6 +489,14 @@ impl ServerStore for SqliteStore {
         collect(st.query_map([], session_row).map_err(db)?)
     }
 
+    fn sessions_delete_for_user(&self, user_id: &str) -> StoreResult<u64> {
+        let n = self
+            .conn()
+            .execute("DELETE FROM sessions WHERE user_id = ?1", [user_id])
+            .map_err(db)?;
+        Ok(n as u64)
+    }
+
     fn api_key_insert(&self, k: &ApiKeyRecord) -> StoreResult<()> {
         self.conn()
             .execute(
@@ -501,6 +572,33 @@ impl ServerStore for SqliteStore {
             )
             .map_err(db)?;
         Ok(to_u64(n))
+    }
+
+    fn api_keys_revoke_all(&self, user_id: &str, at: i64) -> StoreResult<Vec<ApiKeyRecord>> {
+        let mut c = self.conn();
+        let tx = c.transaction().map_err(db)?;
+        let keys = {
+            let mut st = tx
+                .prepare(&format!(
+                    "SELECT {KEY_COLS} FROM api_keys WHERE user_id = ?1 AND revoked_at IS NULL
+                     ORDER BY created_at, id"
+                ))
+                .map_err(db)?;
+            collect(st.query_map([user_id], key_row).map_err(db)?)?
+        };
+        tx.execute(
+            "UPDATE api_keys SET revoked_at = ?2 WHERE user_id = ?1 AND revoked_at IS NULL",
+            params![user_id, at],
+        )
+        .map_err(db)?;
+        tx.commit().map_err(db)?;
+        Ok(keys
+            .into_iter()
+            .map(|k| ApiKeyRecord {
+                revoked_at: Some(at),
+                ..k
+            })
+            .collect())
     }
 
     fn instance_put(&self, i: &InstanceRecord) -> StoreResult<()> {

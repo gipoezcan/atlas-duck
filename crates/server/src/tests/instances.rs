@@ -1,13 +1,11 @@
-//! Admin instances (T13): validation, add/remove across user runtimes, the transitional CLI.
+//! Admin instances (T13): validation, add/remove across user runtimes. The admin CLI's tests are
+//! `admin::tests` (M13 T5).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use super::*;
-use crate::admin_offline::{AdminCmd, execute, parse};
-use crate::config::Config;
 use crate::runtime::tests::Env;
 use crate::store::{PatRecord, Sealed};
 
@@ -203,96 +201,4 @@ async fn a_re_added_alias_never_sees_a_leftover_pat() {
     .unwrap();
     assert!(env.store.pats_for_alias("wiki").unwrap().is_empty());
     within(reg.close_all()).await;
-}
-
-fn config_for(data: &std::path::Path, key_file: &std::path::Path) -> Config {
-    let mut vars = HashMap::new();
-    for (k, v) in [
-        ("ATLAS_DUCK_MODE", "review"),
-        ("ATLAS_DUCK_PUBLIC_URL", "https://duck.example.test"),
-        ("ATLAS_DUCK_TEST_DIRECTORY_FILE", "/x.json"),
-        ("GROUP_USERS", "cn=users"),
-    ] {
-        vars.insert(k.to_owned(), v.to_owned());
-    }
-    vars.insert("ATLAS_DUCK_DATA_DIR".into(), data.display().to_string());
-    vars.insert(
-        "ATLAS_DUCK_MASTER_KEY_FILE".into(),
-        key_file.display().to_string(),
-    );
-    Config::from_env(&|k| vars.get(k).cloned(), &|| {
-        vars.keys().cloned().collect()
-    })
-    .unwrap()
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_refuses_while_the_server_lock_is_held() {
-    let env = Env::new();
-    let key = env.dir.path().join("mk");
-    std::fs::write(&key, "unused").unwrap();
-    let cfg = config_for(env.dir.path(), &key);
-    let server_dir = env.dir.path().join("server");
-    std::fs::create_dir_all(&server_dir).unwrap();
-    let local = match atlas_duck_ipc::paths::check_data_dir(&server_dir).unwrap() {
-        atlas_duck_ipc::paths::DataDirResolution::Local(l) => l,
-        other => panic!("{other:?}"),
-    };
-    let held = atlas_duck_audit::lock::InstanceLock::acquire(&local, "serve").unwrap();
-    assert_eq!(
-        within(execute(AdminCmd::List, &cfg, env.master.clone())).await,
-        crate::cli::EXIT_RUNTIME
-    );
-    drop(held);
-    assert_eq!(
-        within(execute(
-            AdminCmd::Add(spec("work", "jira", "https://jira.example.test", true)),
-            &cfg,
-            env.master.clone()
-        ))
-        .await,
-        crate::cli::EXIT_OK
-    );
-    assert_eq!(
-        within(execute(AdminCmd::List, &cfg, env.master.clone())).await,
-        crate::cli::EXIT_OK
-    );
-}
-
-#[test]
-fn cli_argument_table() {
-    let a = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-    assert_eq!(parse(&a(&["instances", "list"])), Some(AdminCmd::List));
-    assert_eq!(
-        parse(&a(&[
-            "instances",
-            "add",
-            "--alias",
-            "work",
-            "--product",
-            "jira",
-            "--url",
-            "https://j.example.test",
-            "--default",
-            "--ca-org"
-        ])),
-        Some(AdminCmd::Add(InstanceSpec {
-            ca_ref: Some("org".into()),
-            ..spec("work", "jira", "https://j.example.test", true)
-        }))
-    );
-    assert_eq!(
-        parse(&a(&["instances", "remove", "--alias", "work"])),
-        Some(AdminCmd::Remove("work".into()))
-    );
-    for bad in [
-        &["instances"][..],
-        &["instances", "add", "--alias", "x"],
-        &["instances", "list", "--x"],
-        &["users", "list"],
-        &["instances", "remove"],
-        &["instances", "add", "--alias"],
-    ] {
-        assert_eq!(parse(&a(bad)), None, "{bad:?}");
-    }
 }

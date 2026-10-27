@@ -6,12 +6,13 @@ use std::sync::{Mutex, MutexGuard};
 
 use super::{
     AnchorHasher, AnchorHead, AnchorRow, ApiKeyRecord, InstanceRecord, PatRecord, Sealed,
-    ServerStore, SessionRecord, StoreError, StoreResult, UserRecord,
+    ServerStore, SessionRecord, StoreError, StoreResult, UserRecord, UserState,
 };
 
 #[derive(Default)]
 struct Inner {
     users: BTreeMap<String, UserRecord>,
+    states: BTreeMap<String, UserState>,
     keystore: BTreeMap<(String, String), Sealed>,
     pats: BTreeMap<(String, String), PatRecord>,
     sessions: BTreeMap<[u8; 32], SessionRecord>,
@@ -66,6 +67,59 @@ impl ServerStore for MemoryStore {
             .values()
             .find(|u| u.username == username)
             .cloned())
+    }
+
+    fn users_all(&self) -> StoreResult<Vec<(UserRecord, UserState)>> {
+        let g = self.lock();
+        let mut v: Vec<(UserRecord, UserState)> = g
+            .users
+            .values()
+            .map(|u| {
+                let st = g.states.get(&u.user_id).cloned().unwrap_or_default();
+                (u.clone(), st)
+            })
+            .collect();
+        v.sort_by(|a, b| a.0.username.cmp(&b.0.username));
+        Ok(v)
+    }
+
+    fn user_state(&self, user_id: &str) -> StoreResult<Option<UserState>> {
+        let g = self.lock();
+        Ok(g.users
+            .contains_key(user_id)
+            .then(|| g.states.get(user_id).cloned().unwrap_or_default()))
+    }
+
+    fn user_set_last_login(&self, user_id: &str, at: i64) -> StoreResult<()> {
+        let mut g = self.lock();
+        if g.users.contains_key(user_id) {
+            g.states
+                .entry(user_id.to_owned())
+                .or_default()
+                .last_login_at = Some(at);
+        }
+        Ok(())
+    }
+
+    fn user_deactivate(
+        &self,
+        user_id: &str,
+        at: i64,
+        by: &str,
+        retention_until: i64,
+    ) -> StoreResult<bool> {
+        let mut g = self.lock();
+        if !g.users.contains_key(user_id) {
+            return Ok(false);
+        }
+        let st = g.states.entry(user_id.to_owned()).or_default();
+        if st.deactivated_at.is_some() {
+            return Ok(false);
+        }
+        st.deactivated_at = Some(at);
+        st.deactivated_by = Some(by.to_owned());
+        st.retention_until = Some(retention_until);
+        Ok(true)
     }
 
     fn ks_get(&self, user_id: &str, entry: &str) -> StoreResult<Option<Sealed>> {
@@ -172,6 +226,24 @@ impl ServerStore for MemoryStore {
         Ok(self.lock().sessions.values().cloned().collect())
     }
 
+    fn sessions_delete_for_user(&self, user_id: &str) -> StoreResult<u64> {
+        let mut g = self.lock();
+        let before = g.sessions.len();
+        g.sessions.retain(|_, s| s.user_id != user_id);
+        Ok((before - g.sessions.len()) as u64)
+    }
+
+    fn api_keys_revoke_all(&self, user_id: &str, at: i64) -> StoreResult<Vec<ApiKeyRecord>> {
+        let mut out: Vec<ApiKeyRecord> = Vec::new();
+        for k in self.lock().keys.values_mut() {
+            if k.user_id == user_id && k.revoked_at.is_none() {
+                k.revoked_at = Some(at);
+                out.push(k.clone());
+            }
+        }
+        out.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        Ok(out)
+    }
     fn api_key_insert(&self, k: &ApiKeyRecord) -> StoreResult<()> {
         let mut g = self.lock();
         if g.keys.contains_key(&k.id) || g.keys.values().any(|o| o.prefix == k.prefix) {

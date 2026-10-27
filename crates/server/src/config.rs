@@ -63,6 +63,8 @@ pub struct Config {
     pub session_idle: Duration,
     pub anchor_interval: Duration,
     pub rust_log: String,
+    /// The admin CLI's Unix socket (M13 PD-M13-1).
+    pub admin_socket: PathBuf,
 }
 
 /// A refused configuration: a fixed code and the key it concerns. Never carries a value.
@@ -103,6 +105,11 @@ pub const SESSION_ABSOLUTE_SECS: &str = "ATLAS_DUCK_SESSION_ABSOLUTE_SECS";
 pub const SESSION_IDLE_SECS: &str = "ATLAS_DUCK_SESSION_IDLE_SECS";
 pub const ANCHOR_INTERVAL_SECS: &str = "ATLAS_DUCK_ANCHOR_INTERVAL_SECS";
 pub const RUST_LOG: &str = "RUST_LOG";
+pub const ADMIN_SOCKET: &str = "ATLAS_DUCK_ADMIN_SOCKET";
+
+/// Where the admin socket lives unless ATLAS_DUCK_ADMIN_SOCKET says otherwise (the chart's
+/// in-memory emptyDir).
+pub const DEFAULT_ADMIN_SOCKET: &str = "/run/atlas-duck/admin.sock";
 
 /// SM-6.3 "at least every 15 minutes".
 pub const MAX_ANCHOR_INTERVAL_SECS: u64 = 900;
@@ -220,6 +227,9 @@ impl Config {
             session_idle: Duration::from_secs(positive(SESSION_IDLE_SECS, 1_800)?),
             anchor_interval: Duration::from_secs(anchor),
             rust_log: get(RUST_LOG).unwrap_or_else(|| "info".into()),
+            admin_socket: PathBuf::from(
+                get(ADMIN_SOCKET).unwrap_or_else(|| DEFAULT_ADMIN_SOCKET.into()),
+            ),
         })
     }
 
@@ -322,6 +332,7 @@ mod tests {
         assert_eq!(c.session_idle, Duration::from_secs(1_800));
         assert_eq!(c.anchor_interval, Duration::from_secs(900));
         assert_eq!(c.rust_log, "info");
+        assert_eq!(c.admin_socket, PathBuf::from("/run/atlas-duck/admin.sock"));
         assert_eq!(c.ca_bundle_file, None);
         assert_eq!(c.groups.auditors, None);
         assert_eq!(c.public_origin(), "https://duck.example.test");

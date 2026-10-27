@@ -11,6 +11,7 @@ use atlas_duck_audit::lock::InstanceLock;
 use atlas_duck_ipc::paths::{DataDirResolution, check_data_dir};
 use serde_json::json;
 
+use crate::admin::{AdminCtx, DEFAULT_RETENTION_DAYS};
 use crate::anchor::AnchorWriter;
 use crate::cli::{EXIT_CONFIG, EXIT_OK, EXIT_RUNTIME, config_error_fields};
 use crate::clock::{Clock, SystemClock};
@@ -26,8 +27,8 @@ use crate::ratelimit::LoginLimiter;
 use crate::runtime::{Registry, RegistrySink, RuntimeDeps};
 use crate::session::SessionTable;
 use crate::static_files::WebDir;
-use crate::store::ServerStore;
 use crate::store::sqlite::SqliteStore;
+use crate::store::{ServerStore, StoreError};
 use crate::web::{AppInner, AppState, router};
 
 const LOCK_HOST: &str = "atlas-duck-server";
@@ -70,6 +71,11 @@ async fn run(config: Config) -> u8 {
     };
     let store: Arc<dyn ServerStore> = match SqliteStore::open(&server_dir.join("server.db")) {
         Ok(s) => Arc::new(s),
+        Err(StoreError::Migration { from, to }) => {
+            // M13 Δ-M13-3: the file stays at `from`; an older build can still open it.
+            tracing::error!(event = "store/migration_failed", from, to);
+            return EXIT_RUNTIME;
+        }
         Err(_) => return fail("server_store_unavailable"),
     };
     let directory: Arc<dyn Directory> = match &config.directory {
@@ -162,6 +168,18 @@ async fn run(config: Config) -> u8 {
         return fail("anchor_append_failed");
     }
     let anchor_timer = writer.spawn(config.anchor_interval);
+    let admin = Arc::new(AdminCtx::new(
+        store.clone(),
+        registry.clone(),
+        state.sessions.clone(),
+        state.api_keys.clone(),
+        writer.clone(),
+        clock.clone(),
+        DEFAULT_RETENTION_DAYS,
+    ));
+    let Some(admin_task) = start_admin_socket(&config, admin) else {
+        return fail("admin_socket_unusable");
+    };
     let Ok(listener) = tokio::net::TcpListener::bind(config.listen).await else {
         return fail("listen_failed");
     };
@@ -169,6 +187,8 @@ async fn run(config: Config) -> u8 {
     let served = serve_until(listener, state, &writer, shutdown_signal(), DRAIN).await;
     sweeper.abort();
     anchor_timer.abort();
+    admin_task.abort();
+    let _ = std::fs::remove_file(&config.admin_socket);
     match served {
         Ok(()) => {
             tracing::info!(event = "stopped");
@@ -176,6 +196,27 @@ async fn run(config: Config) -> u8 {
         }
         Err(_) => fail("serve_failed"),
     }
+}
+
+/// Binds the admin socket (M13 PD-M13-1) and serves it; `None` when it cannot be bound (the
+/// server does not start without its admin interface).
+#[cfg(unix)]
+fn start_admin_socket(config: &Config, ctx: Arc<AdminCtx>) -> Option<tokio::task::JoinHandle<()>> {
+    let (listener, uid) = crate::admin::socket::bind(&config.admin_socket).ok()?;
+    tracing::info!(event = "admin_socket_listening");
+    Some(tokio::spawn(crate::admin::socket::serve(
+        listener, uid, ctx,
+    )))
+}
+
+/// No Unix sockets here: the admin CLI is unavailable (the server image is Linux only).
+#[cfg(not(unix))]
+fn start_admin_socket(
+    _config: &Config,
+    _ctx: Arc<AdminCtx>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    tracing::warn!(event = "admin_socket_unsupported");
+    Some(tokio::spawn(async {}))
 }
 
 /// How long open connections may drain after the shutdown signal. SSE streams never end on their

@@ -1,7 +1,30 @@
-//! Schema v1 of `server.db` (PD-202, PD-208, PD-210, PD-211, PD-213, PD-217).
+//! Schema of `server.db`: v1 (PD-202, PD-208, PD-210, PD-211, PD-213, PD-217) and the
+//! up-migrations after it (M13 Δ-M13-3). A new database is created as v1 and migrated up, so
+//! every file reaches the current version by the same path.
 
 /// `PRAGMA user_version` of this build.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// v1 → v2 (M13 T5): user lifecycle columns and the scheduler's last runs (T9).
+pub const V1_TO_V2: &str = r#"
+ALTER TABLE users ADD COLUMN deactivated_at INTEGER;
+ALTER TABLE users ADD COLUMN deactivated_by TEXT;
+ALTER TABLE users ADD COLUMN last_login_at INTEGER;
+ALTER TABLE users ADD COLUMN retention_until INTEGER;
+CREATE TABLE scheduler_state (
+    job TEXT PRIMARY KEY,
+    last_run_at INTEGER,
+    last_success_at INTEGER
+);
+"#;
+
+/// The migration from `from` to `from + 1`.
+pub fn up_from(from: u32) -> Option<&'static str> {
+    match from {
+        1 => Some(V1_TO_V2),
+        _ => None,
+    }
+}
 
 pub const V1: &str = r#"
 CREATE TABLE users (

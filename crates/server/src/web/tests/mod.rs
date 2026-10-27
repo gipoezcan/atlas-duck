@@ -1743,3 +1743,33 @@ async fn shutdown_completes_within_25s() {
     );
     drop(sse);
 }
+
+/// M13 T5 (SM-6.5): a deactivated user is refused at login even though the directory accepts
+/// the password, and the refusal is a counted `not_permitted` with `LOGIN_FAILED`.
+#[tokio::test]
+async fn deactivated_user_login_refused_not_permitted() {
+    let h = H::new();
+    assert_eq!(h.login("alice", PW_CANARY).await.status(), StatusCode::OK);
+    let uid = user_id_for("alice");
+    assert_eq!(
+        h.store.user_state(&uid).unwrap().unwrap().last_login_at,
+        Some(T0),
+        "a login records last_login_at"
+    );
+    assert!(
+        h.store
+            .user_deactivate(&uid, T0 + 1, "admin", T0 + 2)
+            .unwrap()
+    );
+    let before = h.store.anchor_all().unwrap().len();
+    let (status, code) = code(h.login("alice", PW_CANARY).await).await;
+    assert_eq!(
+        (status, code.as_str()),
+        (StatusCode::FORBIDDEN, "auth/not_permitted")
+    );
+    let rows = h.store.anchor_all().unwrap();
+    assert_eq!(rows.len(), before + 1);
+    assert_eq!(rows.last().unwrap().kind, crate::anchor::KIND_LOGIN_FAILED);
+    // Bob is not affected.
+    assert_eq!(h.login("bob", "pw-bob").await.status(), StatusCode::OK);
+}

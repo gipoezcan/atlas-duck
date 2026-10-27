@@ -2,7 +2,7 @@
 # M12 T25: smoke test of the built image `atlas-duck-server:ci` (SM-1.3, SM-7.1, SM-9.5). Proves
 # the image runs as uid 65532 with a read-only root, serves the pages with the CSP, signs in a
 # test-directory user, creates an API key, answers MCP `initialize` + `tools/list` with it,
-# refuses the offline admin CLI while serving, and refuses the test directory in production
+# answers the admin CLI over its socket (M13 T5), and refuses the test directory in production
 # (exit 78). The Jira write flow itself is crates/server/tests/exit_flow.rs (in process).
 set -euo pipefail
 
@@ -43,6 +43,7 @@ common_env=(
 )
 mounts=(
   --tmpfs /data:uid=65532,gid=65532,mode=0700
+  --tmpfs /run/atlas-duck:uid=65532,gid=65532,mode=0700
   -v "$KEY_FILE:/run/secrets/master-key:ro"
   -v "$FIXTURES:/fixtures:ro"
 )
@@ -64,13 +65,12 @@ done
 user="$(docker inspect --format '{{.Config.User}}' "$NAME")"
 [[ "$user" == "65532:65532" ]] || fail "container user is '$user', not 65532:65532"
 
-# The offline admin CLI refuses while the server holds the data lock.
+# The admin CLI reaches the running server over its socket (M13 T5, Δ-M13-2).
 set +e
 docker exec "$NAME" /app/atlas-duck-server admin instances list > "$WORK/admin.out" 2>&1
 code=$?
 set -e
-[[ "$code" == 1 ]] || fail "admin CLI while serving exited $code, not 1"
-grep -q 'admin/server_running' "$WORK/admin.out" || fail "admin CLI did not say admin/server_running"
+[[ "$code" == 0 ]] || fail "admin instances list exited $code: $(cat "$WORK/admin.out")"
 
 login() { # user password jar
   "${CURL[@]}" -c "$3" -H "Origin: $BASE" -H 'Content-Type: application/json' \

@@ -1,5 +1,5 @@
-//! Command line: `serve`, `version` (plan "Configuration", exit codes). `admin instances` is
-//! Task 13's.
+//! Command line: `serve`, `version` (plan "Configuration", exit codes) and `admin …`, the admin
+//! socket client (M13 PD-M13-1, `admin::client`).
 //!
 //! Exit codes: 0 clean shutdown, 1 runtime failure, 2 usage, 78 configuration (`EX_CONFIG`).
 
@@ -16,14 +16,14 @@ pub const EXIT_RUNTIME: u8 = 1;
 pub const EXIT_USAGE: u8 = 2;
 pub const EXIT_CONFIG: u8 = 78;
 
-const USAGE: &str = "usage: atlas-duck-server <serve|version>\n";
+const USAGE: &str = "usage: atlas-duck-server <serve|version|admin …>\n";
 
 /// What argv asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Serve,
     Version,
-    /// The hidden transitional dmin (PD-212).
+    /// `admin …`: one request to the running server over the admin socket.
     Admin,
     Usage,
 }
@@ -63,7 +63,7 @@ pub fn main() -> ExitCode {
             EXIT_USAGE
         }
         Command::Serve => serve(),
-        Command::Admin => crate::admin_offline::run(&args[1..]),
+        Command::Admin => crate::admin::client::run(&args[1..]),
     })
 }
 

@@ -29,6 +29,15 @@ pub const KIND_SERVER_STOP: &str = "SERVER_STOP";
 /// Admin instance changes (batch-3 review M2): `{alias, instance_id, product, base_url}`.
 pub const KIND_INSTANCE_ADDED: &str = "INSTANCE_ADDED";
 pub const KIND_INSTANCE_REMOVED: &str = "INSTANCE_REMOVED";
+/// M13 Δ-M13-1: a deactivation (`{"leaf"}` of the user's final head, with its `anchor_heads`
+/// entry, as `RUNTIME_CLOSED`), and the operational kinds of the admin CLI.
+pub const KIND_USER_DEACTIVATED: &str = "USER_DEACTIVATED";
+pub const KIND_MASTER_KEY_ROTATED: &str = "MASTER_KEY_ROTATED";
+pub const KIND_CHAIN_DELETED: &str = "CHAIN_DELETED";
+pub const KIND_BACKUP_TAKEN: &str = "BACKUP_TAKEN";
+pub const KIND_RESTORED: &str = "RESTORED";
+pub const KIND_RETENTION_RUN: &str = "RETENTION_RUN";
+pub const KIND_MAINTENANCE: &str = "MAINTENANCE";
 /// Every user is anchored at least once per this many seconds.
 pub const REANCHOR_SECS: i64 = 24 * 3600;
 
@@ -130,19 +139,31 @@ impl AnchorWriter {
     }
 
     fn closed_rows(&self, closed: &[(String, Head)]) -> Result<usize, StoreError> {
-        let now = self.clock.now();
         for (user_id, head) in closed {
-            let (entry, leaf) = anchor_head(user_id, head);
-            append_raw(
-                self.store.as_ref(),
-                now,
-                KIND_RUNTIME_CLOSED,
-                &leaf_body_jcs(&leaf),
-                &[entry],
-            )?;
-            self.anchored().insert(user_id.clone(), (head.clone(), now));
+            self.leaf_row(KIND_RUNTIME_CLOSED, user_id, head)?;
         }
         Ok(closed.len())
+    }
+
+    /// One single-leaf row of `kind` for the user's `head`.
+    fn leaf_row(&self, kind: &str, user_id: &str, head: &Head) -> Result<AnchorRow, StoreError> {
+        let now = self.clock.now();
+        let (entry, leaf) = anchor_head(user_id, head);
+        let row = append_raw(
+            self.store.as_ref(),
+            now,
+            kind,
+            &leaf_body_jcs(&leaf),
+            &[entry],
+        )?;
+        self.anchored()
+            .insert(user_id.to_owned(), (head.clone(), now));
+        Ok(row)
+    }
+
+    /// `USER_DEACTIVATED` with the user's final head (SM-6.3 "on each user's deactivation").
+    pub fn user_deactivated(&self, user_id: &str, head: &Head) -> Result<AnchorRow, StoreError> {
+        self.leaf_row(KIND_USER_DEACTIVATED, user_id, head)
     }
 
     /// One `HEADS` row: the open users whose head changed since their last anchoring, and every
@@ -269,7 +290,7 @@ pub fn verify(store: &dyn ServerStore) -> Result<AnchorReport, AnchorError> {
             .collect();
         let want = match r.kind.as_str() {
             KIND_HEADS => heads_body_jcs(&leaves).ok(),
-            KIND_RUNTIME_CLOSED => match leaves.as_slice() {
+            KIND_RUNTIME_CLOSED | KIND_USER_DEACTIVATED => match leaves.as_slice() {
                 [one] => Some(leaf_body_jcs(one)),
                 _ => None,
             },

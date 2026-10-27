@@ -7,7 +7,7 @@
 #[cfg(all(feature = "testing", not(debug_assertions)))]
 compile_error!("testing must never reach a release build");
 
-pub mod admin_offline;
+pub mod admin;
 pub mod anchor;
 pub mod api_keys;
 pub mod app;
