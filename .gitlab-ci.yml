@@ -17,7 +17,7 @@
 # artifact (tauri::generate_context! needs it at compile time, so clippy and the tests
 # cannot run without it), and the checks that need both (ci/check-workspace.mjs runs
 # `cargo metadata`) run in the Node job after installing a minimal rustup toolchain.
-stages: [ui, check, supply-chain]
+stages: [ui, check, supply-chain, server-prepare]
 
 default:
   image: rust:1.95
@@ -132,3 +132,30 @@ supply-chain:
   script:
     - cargo deny --locked check
     - cargo audit
+
+# ---- M13 server mode deployment (plan 2026-10-26-atlas-duck-m13-server-deploy-ops.md) ----
+# New jobs use `needs:` so they never wait on the desktop jobs above.
+
+# T4 (PD-M13-10): helm lint/template over chart/ci (positive) and chart/ci-fail (must fail with
+# their `# expect:` text), then the policy check over the rendered YAML and its self-test.
+chart:test:
+  stage: server-prepare
+  image:
+    name: alpine/helm:3.16.3
+    entrypoint: [""]
+  needs: []
+  rules:
+    - changes:
+        - chart/**/*
+        - deployment/**/*
+        - ci/check-chart-*
+        - ci/fixtures/chart-policy/**/*
+        - .gitlab-ci.yml
+  script:
+    - sh ci/check-chart-policy.test.sh
+    - sh ci/check-chart-matrix.sh
+    - sh ci/check-chart-policy.sh rendered/*.yaml
+  artifacts:
+    when: always
+    paths: [rendered/]
+    expire_in: 1 week

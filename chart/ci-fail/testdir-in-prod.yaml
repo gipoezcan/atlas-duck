@@ -1,0 +1,5 @@
+# expect: atlas-duck: testDirectory.enabled is not allowed with mode production
+mode: production
+testDirectory:
+  enabled: true
+  usersJson: '{"users":[]}'

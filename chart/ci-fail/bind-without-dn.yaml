@@ -1,0 +1,4 @@
+# expect: atlas-duck: directory.serviceBind.dn is required
+directory:
+  serviceBind:
+    existingSecret: atlas-duck-ldap-bind

@@ -1,0 +1,2 @@
+# expect: atlas-duck: replicaCount must be 1
+replicaCount: 2

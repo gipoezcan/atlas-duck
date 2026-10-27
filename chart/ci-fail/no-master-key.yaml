@@ -1,0 +1,3 @@
+# expect: atlas-duck: masterKey.existingSecret is required
+masterKey:
+  existingSecret: ""
