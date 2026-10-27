@@ -412,7 +412,7 @@ deploy:review:
       ARGS="${ARGS} --set publicUrl=https://${HOST} --set ingress.host=${HOST}"
       ARGS="${ARGS} --set ingress.tls.secretName=${RELEASE_NAME}-tls"
       ARGS="${ARGS} --set masterKey.existingSecret=${KEY_SECRET}"
-      ARGS="${ARGS} --set-string podAnnotations.commit-sha=${CI_COMMIT_SHORT_SHA}"
+      ARGS="${ARGS} --set podAnnotations.commit-sha=${CI_COMMIT_SHORT_SHA}"
       # Server-side schema validation before anything changes (PD-M13-10).
       # The cluster's /openapi/v2 answers 503 (an aggregated API is down; /openapi/v3 works):
       # nothing here may fetch it. Client-side validation is off everywhere; the server-side
@@ -510,7 +510,7 @@ deploy:production:
       fi
       ARGS="--set image.repository=${HARBOR_HOST}/${ARTIFACTORY_REPO_KEY}/${APP_NAME}"
       ARGS="${ARGS} --set image.digest=$(cat image.digest)"
-      ARGS="${ARGS} --set-string podAnnotations.commit-sha=${CI_COMMIT_SHORT_SHA}"
+      ARGS="${ARGS} --set podAnnotations.commit-sha=${CI_COMMIT_SHORT_SHA}"
       # The cluster's /openapi/v2 answers 503 (an aggregated API is down; /openapi/v3 works):
       # nothing here may fetch it. Client-side validation is off everywhere; the server-side
       # dry run and the apply itself still get every schema and admission error from the server.
