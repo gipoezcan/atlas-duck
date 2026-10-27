@@ -1055,3 +1055,88 @@ fn server_anchor_vectors_match() {
     let file: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(built, file, "server anchor vectors differ: a format break");
 }
+
+// ---- M14 PD-253: the anchor-chain excerpt lines ---------------------------------------------
+
+fn server_excerpt_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/server_anchor_excerpt_v1.json")
+}
+
+/// The excerpt of `CHAIN_ID`'s head 42 over the four rows of [`build_server_anchor`]: the `HEADS`
+/// row is a full line with its leaf entry, every other row opaque.
+fn build_server_excerpt() -> Value {
+    use atlas_duck_audit::server_anchor::{
+        EXCERPT_FORMAT, ExcerptLimits, ExcerptManifest, LeafEntry, body_leaves, excerpt_line_jcs,
+        leaf_hash,
+    };
+    let anchor = build_server_anchor();
+    let head = sha256(b"head 42");
+    let user = "0123456789abcdef0123456789abcdef";
+    let mut lines = Vec::new();
+    let mut last_hash = String::new();
+    for r in anchor["rows"].as_array().unwrap() {
+        let h = |k: &str| -> [u8; 32] {
+            hex::decode(r[k].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap()
+        };
+        let body = r["body_jcs"].as_str().unwrap().as_bytes();
+        let kind = r["kind"].as_str().unwrap();
+        let full = (kind == "HEADS").then(|| {
+            let leaves = body_leaves(body, &ExcerptLimits::DEFAULT).unwrap();
+            let mine = leaf_hash(user, CHAIN_ID, 42, &head);
+            LeafEntry {
+                user_id: user.into(),
+                chain_id: CHAIN_ID.into(),
+                head_seq: 42,
+                record_hash: head,
+                leaf_index: leaves.iter().position(|l| *l == mine).unwrap() as u64,
+            }
+        });
+        let line = excerpt_line_jcs(
+            r["seq"].as_u64().unwrap(),
+            r["ts_utc"].as_str().unwrap(),
+            kind,
+            body,
+            &h("prev_hash"),
+            &h("hash"),
+            full.as_ref().map(Some),
+        );
+        lines.push(Value::from(String::from_utf8(line).unwrap()));
+        last_hash = r["hash"].as_str().unwrap().to_owned();
+    }
+    let manifest = ExcerptManifest {
+        format: EXCERPT_FORMAT.into(),
+        issuer: "https://duck.example.test".into(),
+        first_seq: 1,
+        last_seq: 4,
+        last_hash,
+        chain_id: CHAIN_ID.into(),
+    };
+    json!({"format": EXCERPT_FORMAT, "lines": lines,
+           "manifest": String::from_utf8(manifest.to_jcs()).unwrap()})
+}
+
+#[test]
+fn server_excerpt_vectors_match_and_parse() {
+    use atlas_duck_audit::server_anchor::{ExcerptLimits, parse_excerpt_line};
+    let built = build_server_excerpt();
+    for l in built["lines"].as_array().unwrap() {
+        let row =
+            parse_excerpt_line(l.as_str().unwrap().as_bytes(), &ExcerptLimits::DEFAULT).unwrap();
+        row.check(&ExcerptLimits::DEFAULT).unwrap();
+    }
+    if regen_server() {
+        let mut doc = built;
+        doc.sort_all_objects();
+        let text = serde_json::to_string_pretty(&doc).unwrap() + "\n";
+        std::fs::write(server_excerpt_path(), text).unwrap();
+        return;
+    }
+    let text = std::fs::read_to_string(server_excerpt_path()).expect(
+        "tests/vectors/server_anchor_excerpt_v1.json missing (ATLAS_DUCK_REGEN_SERVER_VECTORS=1)",
+    );
+    let file: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(built, file, "server excerpt vectors differ: a format break");
+}

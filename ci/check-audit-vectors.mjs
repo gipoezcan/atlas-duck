@@ -384,6 +384,78 @@ export function anchorRowHash(seq, tsUtc, kind, bodyJcs, prevHashHex) {
   );
 }
 
+// M14 PD-253: the anchor-chain excerpt lines.
+export const DEFAULT_SERVER_EXCERPT_VECTORS = join(
+  REPO_ROOT,
+  "crates",
+  "audit",
+  "tests",
+  "vectors",
+  "server_anchor_excerpt_v1.json",
+);
+
+/** The v2 row hash from the body's SHA-256 (an opaque excerpt line). */
+export function anchorRowHashFromBodyHash(seq, tsUtc, kind, bodyShaHex, prevHashHex) {
+  return sha256(
+    Buffer.from("atlas-duck/anchor/v2\0", "utf8"),
+    u64be(seq, "seq"),
+    Buffer.from(tsUtc, "utf8"),
+    Buffer.from(kind, "utf8"),
+    hexBytes(bodyShaHex, "body_sha256"),
+    hexBytes(prevHashHex, "prev_hash"),
+  );
+}
+
+const EXCERPT_KEYS = new Set(["v", "seq", "ts_utc", "kind", "body_sha256", "prev_hash", "hash", "body", "leaf_entry"]);
+
+export function checkServerExcerptVectors(doc) {
+  const out = [];
+  if (doc.format !== "atlas-duck-anchor-excerpt/1") out.push("excerpt: format must be atlas-duck-anchor-excerpt/1");
+  if (!Array.isArray(doc.lines) || doc.lines.length === 0) out.push("excerpt: lines must be a non-empty array");
+  if (out.length > 0) return out;
+  let prev = null;
+  let full = 0;
+  doc.lines.forEach((text, i) => {
+    try {
+      const l = JSON.parse(text);
+      if (canonicalize(l) !== text) out.push(`excerpt lines[${i}]: not JCS`);
+      for (const k of Object.keys(l)) if (!EXCERPT_KEYS.has(k)) out.push(`excerpt lines[${i}]: unknown key ${k}`);
+      if (l.v !== 2) out.push(`excerpt lines[${i}]: v must be 2`);
+      if (prev !== null && l.prev_hash !== prev) out.push(`excerpt lines[${i}]: prev_hash does not link`);
+      const h = anchorRowHashFromBodyHash(l.seq, l.ts_utc, l.kind, l.body_sha256, l.prev_hash).toString("hex");
+      if (h !== l.hash) out.push(`excerpt lines[${i}]: hash differs`);
+      if (l.body !== undefined) {
+        full += 1;
+        if (sha256(Buffer.from(l.body, "utf8")).toString("hex") !== l.body_sha256) {
+          out.push(`excerpt lines[${i}]: body_sha256 differs`);
+        }
+      }
+      if (l.leaf_entry !== undefined) {
+        const e = l.leaf_entry;
+        const body = JSON.parse(l.body);
+        const leaves = body.leaves ?? [body.leaf];
+        const leaf = anchorLeaf(e.user_id, e.chain_id, e.head_seq, e.record_hash).toString("hex");
+        if (leaves[e.leaf_index] !== leaf) out.push(`excerpt lines[${i}]: leaf not at leaf_index`);
+      }
+      prev = l.hash;
+    } catch (e) {
+      out.push(`excerpt lines[${i}]: ${e.message}`);
+    }
+  });
+  if (full === 0) out.push("excerpt: no full line");
+  try {
+    const m = JSON.parse(doc.manifest);
+    if (canonicalize(m) !== doc.manifest) out.push("excerpt manifest: not JCS");
+    const last = JSON.parse(doc.lines[doc.lines.length - 1]);
+    if (m.format !== doc.format) out.push("excerpt manifest: format differs");
+    if (m.last_seq !== last.seq || m.last_hash !== last.hash) out.push("excerpt manifest: last row differs");
+    if (m.first_seq !== JSON.parse(doc.lines[0]).seq) out.push("excerpt manifest: first_seq differs");
+  } catch (e) {
+    out.push(`excerpt manifest: ${e.message}`);
+  }
+  return out;
+}
+
 export function checkServerAnchorVectors(doc) {
   const out = [];
   if (doc.format !== "server-anchor/v2") out.push("server anchor: format must be server-anchor/v2");
@@ -516,6 +588,12 @@ export function main(argv = process.argv.slice(2)) {
       mismatches.push(...checkServerAnchorVectors(anchor));
     } catch (err) {
       mismatches.push(`server anchor: cannot read ${DEFAULT_SERVER_ANCHOR_VECTORS}: ${err.message}`);
+    }
+    try {
+      const excerpt = JSON.parse(readFileSync(DEFAULT_SERVER_EXCERPT_VECTORS, "utf8"));
+      mismatches.push(...checkServerExcerptVectors(excerpt));
+    } catch (err) {
+      mismatches.push(`excerpt: cannot read ${DEFAULT_SERVER_EXCERPT_VECTORS}: ${err.message}`);
     }
   }
   for (const n of notes) console.error(n);

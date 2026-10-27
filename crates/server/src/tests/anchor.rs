@@ -247,3 +247,47 @@ async fn eviction_writes_runtime_closed_with_the_heads_leaf() {
     within(registry.close_all()).await;
     verify(env.store.as_ref()).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anchor_user_now_names_the_users_head_even_unchanged() {
+    let env = Env::new();
+    let a = env.user("alice");
+    let registry = Arc::new(crate::runtime::Registry::new(env.deps(), 10));
+    let clock = ManualClock::at(1_800_000_000);
+    let w = AnchorWriter::new(env.store.clone(), registry.clone(), clock.clone());
+    w.start(&json!({"version": "test"})).unwrap();
+    let ra = within(registry.open_user(&a)).await.unwrap();
+    within(w.tick()).await.unwrap().unwrap();
+    // The head did not change since that tick; anchor-now still writes a row.
+    let r = w.anchor_user_now(&a, &ra.head()).unwrap();
+    let row = env.store.anchor_last().unwrap().unwrap();
+    assert_eq!(
+        (row.seq, row.hash, row.kind.as_str()),
+        (r.seq, r.hash, KIND_HEADS)
+    );
+    let (chain, seq, hash) = ra.head();
+    assert_eq!(r.head_seq, seq);
+    assert_eq!(
+        row.body_jcs,
+        heads_body_jcs(&[leaf_hash(&a, &chain, seq, &hash)]).unwrap()
+    );
+    let heads = env.store.anchor_heads_for(r.seq).unwrap();
+    assert_eq!(heads.len(), 1);
+    assert_eq!(
+        (
+            heads[0].user_id.as_str(),
+            heads[0].chain_id.clone(),
+            heads[0].head_seq,
+            heads[0].record_hash
+        ),
+        (a.as_str(), chain, seq, hash)
+    );
+    assert_eq!(
+        super::head(env.store.as_ref()).unwrap(),
+        Some((r.seq, r.hash))
+    );
+    // It counts as an anchoring: the next tick has nothing due.
+    clock.advance(900);
+    assert_eq!(within(w.tick()).await.unwrap(), None);
+    verify(env.store.as_ref()).unwrap();
+}

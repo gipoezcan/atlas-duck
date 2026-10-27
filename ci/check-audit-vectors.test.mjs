@@ -17,6 +17,8 @@ import {
   checkServerAnchorVectors,
   checkServerKindVectors,
   DEFAULT_SERVER_ANCHOR_VECTORS,
+  DEFAULT_SERVER_EXCERPT_VECTORS,
+  checkServerExcerptVectors,
   checkVectors,
   frame,
 } from "./check-audit-vectors.mjs";
@@ -225,4 +227,30 @@ test("a tampered server anchor vector is caught", () => {
   const link = loadAnchor();
   link.rows[1].prev_hash = "00".repeat(32);
   assert.ok(checkServerAnchorVectors(link).some((m) => /rows\[1\]: prev_hash does not link/.test(m)));
+});
+
+// ---------- M14 PD-253: anchor-chain excerpt ----------
+
+const loadExcerpt = () => JSON.parse(readFileSync(DEFAULT_SERVER_EXCERPT_VECTORS, "utf8"));
+
+test("the excerpt vectors recompute and have one full line", () => {
+  const doc = loadExcerpt();
+  assert.deepEqual(checkServerExcerptVectors(doc), []);
+  assert.equal(doc.lines.filter((l) => JSON.parse(l).body !== undefined).length, 1);
+});
+
+test("a tampered excerpt is caught", () => {
+  const edit = (i, f) => {
+    const doc = loadExcerpt();
+    const l = JSON.parse(doc.lines[i]);
+    f(l);
+    doc.lines[i] = canonicalize(l);
+    return checkServerExcerptVectors(doc);
+  };
+  const full = loadExcerpt().lines.findIndex((l) => JSON.parse(l).body !== undefined);
+  assert.ok(edit(0, (l) => (l.ts_utc += "x")).some((m) => /lines\[0\]: hash differs/.test(m)));
+  assert.ok(edit(full, (l) => (l.body += " ")).some((m) => /body_sha256 differs/.test(m)));
+  assert.ok(edit(full, (l) => (l.leaf_entry.head_seq += 1)).some((m) => /leaf not at leaf_index/.test(m)));
+  assert.ok(edit(1, (l) => (l.prev_hash = "00".repeat(32))).some((m) => /lines\[1\]: prev_hash does not link/.test(m)));
+  assert.ok(edit(1, (l) => (l.extra = 1)).some((m) => /unknown key extra/.test(m)));
 });

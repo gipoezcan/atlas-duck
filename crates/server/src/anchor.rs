@@ -183,6 +183,33 @@ impl AnchorWriter {
         Ok(Some(row))
     }
 
+    /// M14 PD-254: a `HEADS` row naming only `user_id`'s current `head`, written even when the
+    /// head did not change since its last anchoring (an export forces anchoring of everything it
+    /// exports).
+    pub fn anchor_user_now(&self, user_id: &str, head: &Head) -> Result<AnchorRef, StoreError> {
+        let (entry, leaf) = anchor_head(user_id, head);
+        let body = heads_body_jcs(&[leaf]).map_err(|_| StoreError::Db("duplicate leaf".into()))?;
+        let now = self.clock.now();
+        let row = append_raw(self.store.as_ref(), now, KIND_HEADS, &body, &[entry])?;
+        self.anchored()
+            .insert(user_id.to_owned(), (head.clone(), now));
+        Ok(AnchorRef {
+            seq: row.seq,
+            hash: row.hash,
+            head_seq: head.1,
+        })
+    }
+
+    /// One tick with its `anchor_head` log line (PD-259: the cluster's log store is the
+    /// out-of-band witness of the chain's head).
+    pub async fn tick_logged(&self) -> Result<Option<AnchorRow>, StoreError> {
+        let row = self.tick().await;
+        if let Ok(Some((seq, hash))) = head(self.store.as_ref()) {
+            tracing::info!(event = "anchor_head", seq, hash = %hex::encode(hash));
+        }
+        row
+    }
+
     /// Shutdown: closes every runtime (`APP_STOP` in each chain), anchors their final heads as
     /// `RUNTIME_CLOSED`, then `SERVER_STOP`.
     pub async fn shutdown(&self) -> Result<(), StoreError> {
@@ -206,12 +233,26 @@ impl AnchorWriter {
             t.tick().await;
             loop {
                 t.tick().await;
-                if w.tick().await.is_err() {
+                if w.tick_logged().await.is_err() {
                     tracing::error!(event = "anchor_append_failed", kind = KIND_HEADS);
                 }
             }
         })
     }
+}
+
+/// A row [`AnchorWriter::anchor_user_now`] wrote, and the user head it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnchorRef {
+    pub seq: u64,
+    pub hash: [u8; 32],
+    pub head_seq: u64,
+}
+
+/// `(seq, hash)` of the chain's last row: the pin of `verify-export --anchor-chain-head`
+/// (`GET /api/anchor/head`, and M13's `admin anchor head` at merge).
+pub fn head(store: &dyn ServerStore) -> Result<Option<(u64, [u8; 32])>, StoreError> {
+    Ok(store.anchor_last()?.map(|r| (r.seq, r.hash)))
 }
 
 /// What a verification found intact.
