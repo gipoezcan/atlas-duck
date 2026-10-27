@@ -496,3 +496,16 @@ deploy:production:
       helmfile -e production -f build/helmfile.yaml apply ${ARGS}
   environment:
     name: production
+# T14 (master-plan exit criterion): the review environment answers through the ingress with TLS
+# verified against the org CA, signs in a test user, serves MCP to an API key and refuses it once
+# revoked, and passes `helm test`.
+verify:review-smoke:
+  stage: server-verify
+  image:
+    name: ghcr.io/helmfile/helmfile:v0.169.1
+    entrypoint: [""]
+  needs: [deploy:review]
+  variables: *server-vars
+  rules: *review-rules
+  script:
+    - sh ci/review-smoke.sh
