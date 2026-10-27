@@ -215,6 +215,9 @@ pub struct UserRuntime {
     events: broadcast::Sender<SseEvent>,
     config_path: PathBuf,
     sse_streams: AtomicUsize,
+    /// Tests: the next server-record append fails as if the store were unavailable.
+    #[cfg(any(test, feature = "testing"))]
+    pub fail_next_append: std::sync::atomic::AtomicBool,
     mcp_calls: AtomicUsize,
     last_used: AtomicU64,
     _lock: InstanceLock,
@@ -307,6 +310,8 @@ impl UserRuntime {
             events,
             config_path,
             sse_streams: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "testing"))]
+            fail_next_append: std::sync::atomic::AtomicBool::new(false),
             mcp_calls: AtomicUsize::new(0),
             last_used: AtomicU64::new(0),
             _lock: lock,
@@ -343,6 +348,10 @@ impl UserRuntime {
         kind: EventType,
         payload: Map<String, Value>,
     ) -> Result<(), ApiError> {
+        #[cfg(any(test, feature = "testing"))]
+        if self.fail_next_append.swap(false, Ordering::SeqCst) {
+            return Err(ApiError::STORE_UNAVAILABLE);
+        }
         let store = self.store.clone();
         let ev = NewEvent {
             event_type: kind,

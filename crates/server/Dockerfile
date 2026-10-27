@@ -11,6 +11,7 @@
 #     -e ATLAS_DUCK_TEST_DIRECTORY_FILE=/fixtures/test-directory.json \
 #     -e GROUP_USERS=cn=atlas-duck-users,ou=groups,dc=test \
 #     -e GROUP_ADMINS=cn=atlas-duck-admins,ou=groups,dc=test \
+#     -e GROUP_AUDITORS=cn=atlas-duck-auditors,ou=groups,dc=test \
 #     -v $PWD/data:/data -v $PWD/master-key:/run/secrets/master-key:ro \
 #     -v $PWD/crates/server/fixtures:/fixtures:ro atlas-duck-server:dev
 #

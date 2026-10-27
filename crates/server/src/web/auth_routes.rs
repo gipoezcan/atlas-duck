@@ -20,7 +20,14 @@ use crate::session::{clear_cookie, set_cookie};
 #[serde(deny_unknown_fields)]
 struct LoginBody {
     username: String,
-    password: String,
+    /// Final review M2: a `SecretString` straight from the parser, never a plain field.
+    #[serde(deserialize_with = "secret_string")]
+    password: SecretString,
+}
+
+fn secret_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<SecretString, D::Error> {
+    let s = zeroize::Zeroizing::new(<String as serde::Deserialize>::deserialize(d)?);
+    Ok(SecretString::from(s.as_str()))
 }
 
 /// Reads at most `BODY_LIMIT` bytes of a body.
@@ -45,7 +52,6 @@ pub async fn login(State(st): State<AppState>, req: Request) -> Result<Response,
     let body: LoginBody = serde_json::from_slice(&bytes).map_err(|_| ApiError::BAD_REQUEST)?;
     drop(bytes);
     let LoginBody { username, password } = body;
-    let password = SecretString::from(password);
     let ok = st.login.login(&username, password, &ip).await?;
     let s = &ok.created.session;
     let answer = Json(json!({

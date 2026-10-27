@@ -66,7 +66,8 @@ user="$(docker inspect --format '{{.Config.User}}' "$NAME")"
 
 # The offline admin CLI refuses while the server holds the data lock.
 set +e
-docker exec "$NAME" /app/atlas-duck-server admin instances list > "$WORK/admin.out" 2>&1
+docker exec "$NAME" /app/atlas-duck-server admin instances add --alias offline --product jira \
+  --url https://offline.example.test > "$WORK/admin.out" 2>&1
 code=$?
 set -e
 [[ "$code" == 1 ]] || fail "admin CLI while serving exited $code, not 1"

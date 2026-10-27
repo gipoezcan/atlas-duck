@@ -68,6 +68,18 @@ pub struct CreatedKey {
     pub view: KeyView,
 }
 
+/// A key drawn but not stored yet ([ApiKeys::prepare], then [ApiKeys::insert]).
+pub struct Prepared {
+    rec: ApiKeyRecord,
+    key: SecretString,
+}
+
+impl Prepared {
+    pub fn view(&self) -> KeyView {
+        KeyView::from(&self.rec)
+    }
+}
+
 /// What lists and answers show of a key: never the key or its hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct KeyView {
@@ -285,7 +297,7 @@ impl ApiKeys {
         let _ = verify_key(key, &self.dummy_hash);
     }
 
-    /// Creates a key for `user` (PD-213 limits). The caller appends `API_KEY_CREATED`.
+    /// Creates and stores a key for `user` (tests and callers that audit afterwards).
     pub fn create(
         &self,
         user: &UserCtx,
@@ -293,6 +305,32 @@ impl ApiKeys {
         scopes: &[String],
         expires_in_days: Option<u64>,
     ) -> Result<CreatedKey, ApiError> {
+        let p = self.prepare(user, name, scopes, expires_in_days)?;
+        self.insert(p)
+    }
+
+    /// Final review I2: stores a prepared key. The route appends `API_KEY_CREATED` first, so a
+    /// key is never usable before its audit record exists.
+    pub fn insert(&self, p: Prepared) -> Result<CreatedKey, ApiError> {
+        match self.store.api_key_insert(&p.rec) {
+            Ok(()) => Ok(CreatedKey {
+                id: p.rec.id.clone(),
+                view: KeyView::from(&p.rec),
+                key: p.key,
+            }),
+            Err(StoreError::Duplicate) => Err(ApiError::INTERNAL),
+            Err(e) => Err(store_err(e)),
+        }
+    }
+
+    /// A new key for `user` (PD-213 limits), not yet stored: its id, prefix and view are final.
+    pub fn prepare(
+        &self,
+        user: &UserCtx,
+        name: &str,
+        scopes: &[String],
+        expires_in_days: Option<u64>,
+    ) -> Result<Prepared, ApiError> {
         if !valid_name(name) {
             return Err(ApiError::API_KEY_NAME_INVALID);
         }
@@ -320,7 +358,7 @@ impl ApiKeys {
             return Err(ApiError::API_KEY_LIMIT_REACHED);
         }
         let expires_at = now.saturating_add(i64::try_from(days * 86_400).unwrap_or(i64::MAX));
-        // A prefix collision is retried with a fresh one.
+        // A prefix already taken is drawn again (36^8 prefixes; the insert still refuses a race).
         for _ in 0..5 {
             let prefix = random_prefix()?;
             let secret = Zeroizing::new(URL_SAFE_NO_PAD.encode(random(32)?));
@@ -338,15 +376,9 @@ impl ApiKeys {
                 last_used_at: None,
                 revoked_at: None,
             };
-            match self.store.api_key_insert(&rec) {
-                Ok(()) => {
-                    return Ok(CreatedKey {
-                        id,
-                        key,
-                        view: KeyView::from(&rec),
-                    });
-                }
-                Err(StoreError::Duplicate) => continue,
+            match self.store.api_key_by_prefix(&rec.prefix) {
+                Ok(None) => return Ok(Prepared { rec, key }),
+                Ok(Some(_)) => continue,
                 Err(e) => return Err(store_err(e)),
             }
         }
