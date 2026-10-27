@@ -442,6 +442,10 @@ impl CoreInstances {
             table.keep_newer(current);
             table
         });
+        // A rebuilt table can carry another origin, proxy or CA for the same instance id (an
+        // instance replaced in config.toml, M14 server mode): no client built for the old one
+        // may serve the next request. Calls in flight keep the client they hold.
+        self.engine.invalidate_all_clients();
         Ok(())
     }
 

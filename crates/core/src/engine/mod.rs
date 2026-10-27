@@ -898,6 +898,11 @@ impl Engine {
 
     /// Drops the cached client of `instance_id` (its origin, CA or proxy changed): the next use
     /// builds a new one.
+    /// Drops every cached client (a reload of the instance table).
+    pub(crate) fn invalidate_all_clients(&self) {
+        lock(&self.clients).clear();
+    }
+
     pub(crate) fn invalidate_client(&self, instance_id: &str) {
         lock(&self.clients).remove(instance_id);
     }

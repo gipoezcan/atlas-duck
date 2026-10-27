@@ -280,3 +280,147 @@ async fn auditor_exports_another_users_chain_and_verify_passes() {
     })
     .await;
 }
+
+/// The ids in `b`'s approval queue.
+async fn queue_ids(s: &TestServer, b: &Browser) -> Vec<String> {
+    let (_, q) = s.cmd(b, "queue_list", json!({})).await;
+    q.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|r| r["request_id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A read through `agent` must pend in alice's queue; answers its id and the still running call.
+async fn read_pends(
+    s: &TestServer,
+    alice: &Browser,
+    agent: &Arc<rmcp::service::RunningService<rmcp::RoleClient, ()>>,
+) -> (String, tokio::task::JoinHandle<rmcp::model::CallToolResult>) {
+    let before = queue_ids(s, alice).await;
+    let task = {
+        let agent = agent.clone();
+        tokio::spawn(async move { call(&agent, "jira_issue_get", json!({"key": "ABC-1"})).await })
+    };
+    for _ in 0..300 {
+        if let Some(id) = queue_ids(s, alice)
+            .await
+            .into_iter()
+            .find(|i| !before.contains(i))
+        {
+            assert!(!task.is_finished(), "the read answered before any approval");
+            return (id, task);
+        }
+        if task.is_finished() {
+            let r = task.await.unwrap();
+            panic!("the read never queued; it answered {:?}", envelope(&r));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the read never queued");
+}
+
+/// Concern from batch 5: replacing an instance (same alias, other base URL) must not let a read
+/// through without approval, nor carry the old PAT or an earlier release across.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replaced_instance_still_needs_approval_and_keeps_nothing() {
+    within(async {
+        let s = TestServer::start().await;
+        s.add_work().await;
+        let alice = s.login(ALICE).await;
+        s.store_pat(&alice, TEST_PAT).await;
+        let (_, key) = s.api_key(&alice, &["read"]).await;
+        let agent = Arc::new(s.mcp(&key).await);
+        let (id, task) = read_pends(&s, &alice, &agent).await;
+        let (st, p) = s
+            .cmd(&alice, "preview_fetch", json!({"request_id": id}))
+            .await;
+        assert_eq!(st, 200, "{p}");
+        let rev = p["preview"]["candidate_rev"].clone();
+        let (st, out) = s
+            .cmd(
+                &alice,
+                "decide",
+                json!({"request_id": id, "decision": "release", "candidate_rev": rev}),
+            )
+            .await;
+        assert_eq!(st, 200, "{out}");
+        assert_eq!(envelope(&task.await.unwrap())["status"], "released");
+
+        // The admin replaces `work` with another Jira.
+        let old_seen = s.mock.received().await.len();
+        let carol = s.login(CAROL).await;
+        let (st, v) = s
+            .send(
+                Method::DELETE,
+                "/api/admin/instances/work",
+                Some(&carol),
+                None,
+            )
+            .await;
+        assert_eq!(st, 204, "{v}");
+        let other = jira_mock().await;
+        let (st, v) = s
+            .send(
+                Method::POST,
+                "/api/admin/instances",
+                Some(&carol),
+                Some(
+                    json!({"alias": "work", "product": "jira", "base_url": other.base_url(),
+                            "proxy": "direct", "is_default": true}),
+                ),
+            )
+            .await;
+        assert_eq!(st, 201, "{v}");
+        // The old PAT is gone: a read now fails for want of a credential, it is never served.
+        let before_other = other.received().await.len();
+        let env = envelope(&call(&agent, "jira_issue_get", json!({"key": "ABC-1"})).await);
+        assert_ne!(env["status"], "released", "{env}");
+        assert_ne!(env["status"], "succeeded", "{env}");
+        assert_eq!(
+            other.received().await.len(),
+            before_other,
+            "the new Jira saw the old PAT"
+        );
+        // With a new PAT a read pends again and needs its own release.
+        s.store_pat(&alice, TEST_PAT).await;
+        let (id2, task2) = read_pends(&s, &alice, &agent).await;
+        let old_after: Vec<_> = s.mock.received().await.split_off(old_seen);
+        assert_ne!(id2, id);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!task2.is_finished(), "served without a release");
+        let (st, p) = s
+            .cmd(&alice, "preview_fetch", json!({"request_id": id2}))
+            .await;
+        assert_eq!(st, 200, "{p}");
+        let rev = p["preview"]["candidate_rev"].clone();
+        let (st, out) = s
+            .cmd(
+                &alice,
+                "decide",
+                json!({"request_id": id2, "decision": "deny", "candidate_rev": rev}),
+            )
+            .await;
+        assert_eq!(st, 200, "{out}");
+        let env = envelope(&task2.await.unwrap());
+        assert_ne!(env["status"], "released", "{env}");
+        assert!(!env.to_string().contains("ABC-1 summary"), "{env}");
+        // The read went to the new Jira with the new PAT, never to the replaced one.
+        let to_new = other.received().await;
+        assert!(
+            to_new
+                .iter()
+                .any(|r| r.url.path().ends_with("/issue/ABC-1")),
+            "new host unused"
+        );
+        assert!(
+            old_after
+                .iter()
+                .all(|r| !r.url.path().ends_with("/issue/ABC-1")),
+            "the replaced Jira was asked"
+        );
+    })
+    .await;
+}
