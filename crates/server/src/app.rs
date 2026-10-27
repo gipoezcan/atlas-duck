@@ -137,6 +137,15 @@ async fn run(config: Config) -> u8 {
         Ok(k) => Arc::new(k),
         Err(_) => return fail("api_keys_unusable"),
     };
+    let writer = Arc::new(AnchorWriter::new(
+        store.clone(),
+        registry.clone(),
+        clock.clone(),
+    ));
+    let oauth = Arc::new(crate::oauth::OAuth::new(
+        config.oauth,
+        &config.public_origin(),
+    ));
     let state = AppState(Arc::new(AppInner {
         public_origin: config.public_origin(),
         cookie_secure: config.cookie_secure(),
@@ -149,17 +158,26 @@ async fn run(config: Config) -> u8 {
         health: Arc::new(Health::new(store.clone(), directory, true)),
         api_keys,
         mcp_sessions: Arc::new(crate::mcp::McpSessions::new()),
+        clock: clock.clone(),
+        anchor: writer.clone(),
+        oauth,
     }));
     let started = json!({"version": env!("CARGO_PKG_VERSION"), "mode": format!("{:?}", config.mode).to_lowercase()});
-    let writer = Arc::new(AnchorWriter::new(
-        store.clone(),
-        registry.clone(),
-        clock.clone(),
-    ));
     if writer.start(&started).is_err() {
         return fail("anchor_append_failed");
     }
     let anchor_timer = writer.spawn(config.anchor_interval);
+    // M14 PD-240: the daily `oauth_purge` job (M13's scheduler takes it over at merge).
+    let purge_store = store.clone();
+    let purge_clock = clock.clone();
+    let oauth_purge = tokio::spawn(async move {
+        let mut t = tokio::time::interval(std::time::Duration::from_secs(86_400));
+        loop {
+            t.tick().await;
+            let (s, now) = (purge_store.clone(), purge_clock.now());
+            let _ = tokio::task::spawn_blocking(move || crate::oauth::purge(s.as_ref(), now)).await;
+        }
+    });
     let Ok(listener) = tokio::net::TcpListener::bind(config.listen).await else {
         return fail("listen_failed");
     };
@@ -172,6 +190,7 @@ async fn run(config: Config) -> u8 {
     .await;
     sweeper.abort();
     anchor_timer.abort();
+    oauth_purge.abort();
     // Final heads (RUNTIME_CLOSED per runtime, after its APP_STOP) and SERVER_STOP.
     if writer.shutdown().await.is_err() {
         tracing::error!(event = "anchor_append_failed", kind = "SERVER_STOP");

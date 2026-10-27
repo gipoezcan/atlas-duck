@@ -21,6 +21,7 @@ use atlas_duck_server::health::Health;
 use atlas_duck_server::login::LoginService;
 use atlas_duck_server::master_key::MasterKey;
 use atlas_duck_server::mcp::McpSessions;
+use atlas_duck_server::oauth::{OAuth, OAuthConfig};
 use atlas_duck_server::ratelimit::LoginLimiter;
 use atlas_duck_server::runtime::{Registry, RegistrySink, RuntimeDeps, SSE_CAPACITY};
 use atlas_duck_server::session::SessionTable;
@@ -138,6 +139,11 @@ impl TestServer {
         };
         let web = dir.path().join("web");
         std::fs::create_dir_all(web.join("assets")).unwrap();
+        let anchor = Arc::new(AnchorWriter::new(
+            store.clone(),
+            registry.clone(),
+            clock.clone(),
+        ));
         let state = AppState(Arc::new(AppInner {
             public_origin: base.clone(),
             cookie_secure: false,
@@ -152,8 +158,10 @@ impl TestServer {
                 ApiKeys::new(store.clone(), clock.clone(), ApiKeyParams::TEST).unwrap(),
             ),
             mcp_sessions: Arc::new(McpSessions::new()),
+            clock: clock.clone(),
+            anchor: anchor.clone(),
+            oauth: Arc::new(OAuth::new(OAuthConfig::DEFAULT, &base)),
         }));
-        let anchor = Arc::new(AnchorWriter::new(store.clone(), registry.clone(), clock));
         anchor
             .start(&json!({"version": "test", "mode": "test"}))
             .unwrap();

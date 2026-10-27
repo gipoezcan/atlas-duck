@@ -27,6 +27,7 @@ pub mod log;
 pub mod login;
 pub mod master_key;
 pub mod mcp;
+pub mod oauth;
 pub mod ratelimit;
 pub mod runtime;
 pub mod session;

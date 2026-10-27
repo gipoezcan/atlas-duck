@@ -30,6 +30,8 @@ use crate::users::user_id_for;
 
 /// `/mcp` (T19) over the same harness.
 mod mcp;
+/// M14: OAuth discovery, registration, authorization, tokens.
+mod oauth;
 
 const ORIGIN: &str = "https://duck.example.test";
 const T0: i64 = 1_800_000_000;
@@ -97,6 +99,14 @@ impl H {
         Self::over(dir, db, store, ManualClock::at(T0))
     }
 
+    /// [H::new] with an OAuth configuration of its own (M14).
+    fn with_oauth(cfg: crate::oauth::OAuthConfig) -> H {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("server.db");
+        let store: Arc<dyn ServerStore> = Arc::new(SqliteStore::open(&db).unwrap());
+        Self::over_with(dir, db, store, ManualClock::at(T0), cfg)
+    }
+
     /// A fresh router (and session table) over the same store and clock: a restart.
     fn restart(self) -> H {
         let store: Arc<dyn ServerStore> = Arc::new(SqliteStore::open(&self.db).unwrap());
@@ -108,6 +118,16 @@ impl H {
         db: PathBuf,
         store: Arc<dyn ServerStore>,
         clock: Arc<ManualClock>,
+    ) -> H {
+        Self::over_with(dir, db, store, clock, crate::oauth::OAuthConfig::DEFAULT)
+    }
+
+    fn over_with(
+        dir: tempfile::TempDir,
+        db: PathBuf,
+        store: Arc<dyn ServerStore>,
+        clock: Arc<ManualClock>,
+        oauth: crate::oauth::OAuthConfig,
     ) -> H {
         let stub = Arc::new(StubDirectory::from_json(STUB).unwrap());
         let sink = Arc::new(RecSink::default());
@@ -166,6 +186,13 @@ impl H {
                 .unwrap(),
             ),
             mcp_sessions: Arc::new(crate::mcp::McpSessions::new()),
+            clock: clock.clone(),
+            anchor: Arc::new(crate::anchor::AnchorWriter::new(
+                store.clone(),
+                registry.clone(),
+                clock.clone(),
+            )),
+            oauth: Arc::new(crate::oauth::OAuth::new(oauth, ORIGIN)),
         }));
         H {
             router: router(state.clone()),

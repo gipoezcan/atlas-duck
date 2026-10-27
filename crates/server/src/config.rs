@@ -63,6 +63,8 @@ pub struct Config {
     pub session_idle: Duration,
     pub anchor_interval: Duration,
     pub rust_log: String,
+    /// M14 PD-233..PD-245.
+    pub oauth: crate::oauth::OAuthConfig,
 }
 
 /// A refused configuration: a fixed code and the key it concerns. Never carries a value.
@@ -103,6 +105,12 @@ pub const SESSION_ABSOLUTE_SECS: &str = "ATLAS_DUCK_SESSION_ABSOLUTE_SECS";
 pub const SESSION_IDLE_SECS: &str = "ATLAS_DUCK_SESSION_IDLE_SECS";
 pub const ANCHOR_INTERVAL_SECS: &str = "ATLAS_DUCK_ANCHOR_INTERVAL_SECS";
 pub const RUST_LOG: &str = "RUST_LOG";
+pub const OAUTH: &str = "ATLAS_DUCK_OAUTH";
+pub const OAUTH_ACCESS_TTL_SECS: &str = "ATLAS_DUCK_OAUTH_ACCESS_TTL_SECS";
+pub const OAUTH_REFRESH_IDLE_DAYS: &str = "ATLAS_DUCK_OAUTH_REFRESH_IDLE_DAYS";
+pub const OAUTH_GRANT_MAX_DAYS: &str = "ATLAS_DUCK_OAUTH_GRANT_MAX_DAYS";
+pub const OAUTH_REGISTER_PER_IP_HOUR: &str = "ATLAS_DUCK_OAUTH_REGISTER_PER_IP_HOUR";
+pub const OAUTH_MAX_CLIENTS: &str = "ATLAS_DUCK_OAUTH_MAX_CLIENTS";
 
 /// SM-6.3 "at least every 15 minutes".
 pub const MAX_ANCHOR_INTERVAL_SECS: u64 = 900;
@@ -198,6 +206,7 @@ impl Config {
             admins: get(GROUP_ADMINS),
         };
         let anchor = positive(ANCHOR_INTERVAL_SECS, MAX_ANCHOR_INTERVAL_SECS)?;
+        let oauth = oauth_config(&get, &num)?;
         if anchor > MAX_ANCHOR_INTERVAL_SECS {
             return Err(err("config/anchor_interval_too_long", ANCHOR_INTERVAL_SECS));
         }
@@ -220,6 +229,7 @@ impl Config {
             session_idle: Duration::from_secs(positive(SESSION_IDLE_SECS, 1_800)?),
             anchor_interval: Duration::from_secs(anchor),
             rust_log: get(RUST_LOG).unwrap_or_else(|| "info".into()),
+            oauth,
         })
     }
 
@@ -232,6 +242,40 @@ impl Config {
     pub fn cookie_secure(&self) -> bool {
         !(self.mode == Mode::Dev && self.public_url.scheme() == "http")
     }
+}
+
+/// The M14 OAuth keys (plan "Configuration"): ranges per key, `ATLAS_DUCK_OAUTH` is
+/// `enabled|disabled`. The three lifetimes refuse with `config/oauth_ttl_out_of_range`, the two
+/// registration limits with `config/invalid_value`.
+fn oauth_config(
+    get: &dyn Fn(&str) -> Option<String>,
+    num: &dyn Fn(&'static str, u64) -> Result<u64, ConfigError>,
+) -> Result<crate::oauth::OAuthConfig, ConfigError> {
+    let enabled = match get(OAUTH).as_deref() {
+        None | Some("enabled") => true,
+        Some("disabled") => false,
+        Some(_) => return Err(err("config/invalid_value", OAUTH)),
+    };
+    let ranged = |k: &'static str, default: u64, lo: u64, hi: u64, code: &'static str| {
+        let v = num(k, default)?;
+        if (lo..=hi).contains(&v) {
+            Ok(i64::try_from(v).unwrap_or(i64::MAX))
+        } else {
+            Err(err(code, k))
+        }
+    };
+    let ttl = "config/oauth_ttl_out_of_range";
+    let bad = "config/invalid_value";
+    Ok(crate::oauth::OAuthConfig {
+        enabled,
+        access_ttl_secs: ranged(OAUTH_ACCESS_TTL_SECS, 900, 60, 3600, ttl)?,
+        refresh_idle_secs: ranged(OAUTH_REFRESH_IDLE_DAYS, 14, 1, 30, ttl)? * 86_400,
+        grant_max_secs: ranged(OAUTH_GRANT_MAX_DAYS, 90, 1, 90, ttl)? * 86_400,
+        register_per_ip_hour: u32::try_from(ranged(OAUTH_REGISTER_PER_IP_HOUR, 10, 1, 100, bad)?)
+            .unwrap_or(100),
+        max_clients: u64::try_from(ranged(OAUTH_MAX_CLIENTS, 1000, 10, 100_000, bad)?)
+            .unwrap_or(100_000),
+    })
 }
 
 /// `https://host[:port]` without path or query; `dev` also allows plain HTTP on localhost.
@@ -428,6 +472,59 @@ mod tests {
         ];
         for (env, want) in cases {
             assert_eq!(code(env), want);
+        }
+    }
+
+    #[test]
+    fn oauth_keys_defaults_and_ranges() {
+        let c = Env::ok().load().unwrap();
+        assert_eq!(c.oauth, crate::oauth::OAuthConfig::DEFAULT);
+        let c = Env::ok()
+            .set(OAUTH, "disabled")
+            .set(OAUTH_ACCESS_TTL_SECS, "60")
+            .set(OAUTH_REFRESH_IDLE_DAYS, "30")
+            .set(OAUTH_GRANT_MAX_DAYS, "1")
+            .set(OAUTH_REGISTER_PER_IP_HOUR, "100")
+            .set(OAUTH_MAX_CLIENTS, "10")
+            .load()
+            .unwrap();
+        assert!(!c.oauth.enabled);
+        assert_eq!(
+            (
+                c.oauth.access_ttl_secs,
+                c.oauth.refresh_idle_secs,
+                c.oauth.grant_max_secs
+            ),
+            (60, 30 * 86_400, 86_400)
+        );
+        assert_eq!(
+            (c.oauth.register_per_ip_hour, c.oauth.max_clients),
+            (100, 10)
+        );
+        for (k, v, want) in [
+            (OAUTH, "on", "config/invalid_value"),
+            (OAUTH_ACCESS_TTL_SECS, "59", "config/oauth_ttl_out_of_range"),
+            (
+                OAUTH_ACCESS_TTL_SECS,
+                "3601",
+                "config/oauth_ttl_out_of_range",
+            ),
+            (
+                OAUTH_REFRESH_IDLE_DAYS,
+                "0",
+                "config/oauth_ttl_out_of_range",
+            ),
+            (
+                OAUTH_REFRESH_IDLE_DAYS,
+                "31",
+                "config/oauth_ttl_out_of_range",
+            ),
+            (OAUTH_GRANT_MAX_DAYS, "91", "config/oauth_ttl_out_of_range"),
+            (OAUTH_REGISTER_PER_IP_HOUR, "101", "config/invalid_value"),
+            (OAUTH_MAX_CLIENTS, "9", "config/invalid_value"),
+            (OAUTH_MAX_CLIENTS, "x", "config/invalid_value"),
+        ] {
+            assert_eq!(code(Env::ok().set(k, v)), (want, k), "{k}={v}");
         }
     }
 

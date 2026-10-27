@@ -161,6 +161,28 @@ impl ApiError {
         "store/unavailable",
         "The store is not available.",
     );
+    /// M14: OAuth is switched off (`ATLAS_DUCK_OAUTH=disabled`).
+    pub const OAUTH_DISABLED: ApiError = e(
+        StatusCode::NOT_FOUND,
+        "oauth/disabled",
+        "OAuth is not enabled on this server.",
+    );
+    /// A consent request id that is unknown, expired and swept, or another session's.
+    pub const OAUTH_REQUEST_UNKNOWN: ApiError = e(
+        StatusCode::NOT_FOUND,
+        "oauth/request_unknown",
+        "This authorization request is unknown.",
+    );
+    pub const OAUTH_REQUEST_EXPIRED: ApiError = e(
+        StatusCode::GONE,
+        "oauth/request_expired",
+        "This authorization request expired; start again from the app.",
+    );
+    pub const OAUTH_GRANT_UNKNOWN: ApiError = e(
+        StatusCode::NOT_FOUND,
+        "oauth/grant_unknown",
+        "No such connected app.",
+    );
     pub const INTERNAL: ApiError = e(
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal",
@@ -262,6 +284,10 @@ mod tests {
             (ApiError::API_KEY_NAME_INVALID, 400),
             (ApiError::API_KEY_SCOPE_INVALID, 400),
             (ApiError::STORE_UNAVAILABLE, 503),
+            (ApiError::OAUTH_DISABLED, 404),
+            (ApiError::OAUTH_REQUEST_UNKNOWN, 404),
+            (ApiError::OAUTH_REQUEST_EXPIRED, 410),
+            (ApiError::OAUTH_GRANT_UNKNOWN, 404),
             (ApiError::INTERNAL, 500),
         ] {
             assert_eq!(err.status.as_u16(), status, "{}", err.code);

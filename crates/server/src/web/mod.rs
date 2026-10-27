@@ -6,6 +6,7 @@ pub mod api_key_routes;
 pub mod auth_routes;
 pub mod cmd_routes;
 pub mod extract;
+pub mod oauth_routes;
 pub mod pat_routes;
 
 #[cfg(test)]
@@ -45,6 +46,11 @@ pub struct AppInner {
     pub health: Arc<Health>,
     pub api_keys: Arc<crate::api_keys::ApiKeys>,
     pub mcp_sessions: Arc<crate::mcp::McpSessions>,
+    /// M14: the clock of the OAuth, auditor and export handlers.
+    pub clock: Arc<dyn crate::clock::Clock>,
+    /// M14: operational anchor rows from handlers (registration, reuse, auditor reads, exports).
+    pub anchor: Arc<crate::anchor::AnchorWriter>,
+    pub oauth: Arc<crate::oauth::OAuth>,
 }
 
 #[derive(Clone)]
@@ -92,6 +98,23 @@ pub const ROUTES: &[(&str, &str, Access)] = &[
     ("POST", "/mcp", Access::Bearer),
     ("GET", "/mcp", Access::Bearer),
     ("DELETE", "/mcp", Access::Bearer),
+    // M14 T6: OAuth discovery and registration.
+    (
+        "GET",
+        "/.well-known/oauth-protected-resource",
+        Access::Public,
+    ),
+    (
+        "GET",
+        "/.well-known/oauth-protected-resource/mcp",
+        Access::Public,
+    ),
+    (
+        "GET",
+        "/.well-known/oauth-authorization-server",
+        Access::Public,
+    ),
+    ("POST", "/oauth/register", Access::Public),
 ];
 
 /// The handler of one [`ROUTES`] row; `None` for the bearer rows, which [`crate::mcp::routes`]
@@ -116,6 +139,14 @@ pub(crate) fn handler(method: &str, path: &str) -> Option<MethodRouter<AppState>
         ("GET", "/api/me/api-keys") => get(api_key_routes::list),
         ("POST", "/api/me/api-keys") => post(api_key_routes::create),
         ("DELETE", "/api/me/api-keys/{id}") => delete(api_key_routes::revoke),
+        ("GET", "/.well-known/oauth-protected-resource")
+        | ("GET", "/.well-known/oauth-protected-resource/mcp") => {
+            get(oauth_routes::protected_resource)
+        }
+        ("GET", "/.well-known/oauth-authorization-server") => {
+            get(oauth_routes::authorization_server)
+        }
+        ("POST", "/oauth/register") => post(oauth_routes::register),
         _ => return None,
     })
 }
