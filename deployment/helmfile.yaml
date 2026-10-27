@@ -1,0 +1,43 @@
+# atlas-duck-server deployment (M13 plan T11). The pipeline unpacks the packaged chart into
+# ./chart next to this file. No repositories block (local chart) and no secret anywhere in values
+# or `set` (SM-9.1): the master key and the optional directory service-bind password are Secrets
+# created out of band (production) or by the review deploy job, referenced here only by name.
+#
+# Environments: `review` (per-branch, test directory, test master key) and `production`.
+# Per-deploy, non-secret values (release name, host, image digest, Secret names) come from the
+# job as `--set` arguments.
+
+helmDefaults:
+  kubeContext: team-dux@gip
+  cleanupOnFail: true
+  createNamespace: false
+  wait: true
+  timeout: 600
+
+environments:
+  review:
+    values:
+      - valuesFile: values-review.yaml
+        testDirectory: true
+  production:
+    values:
+      - valuesFile: values-production.yaml
+        testDirectory: false
+
+---
+
+releases:
+  - name: {{ requiredEnv "RELEASE_NAME" }}
+    namespace: team-dux
+    chart: ./chart # Do not change the path, it is set up by the pipeline
+    values:
+      - {{ .Values.valuesFile }}
+    set:
+      # Public CA certificates only (PD-M13-7); checked by ci/check-no-secret-material.sh.
+      - name: caBundle.pem
+        file: ca/org-ca.pem
+      {{- if .Values.testDirectory }}
+      # Review only (PD-M13-8): fixed, non-secret test users.
+      - name: testDirectory.usersJson
+        file: testdir/users.json
+      {{- end }}

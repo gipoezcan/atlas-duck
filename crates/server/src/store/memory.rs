@@ -7,13 +7,16 @@ use std::sync::{Mutex, MutexGuard};
 use super::{
     AccessRecord, AnchorHasher, AnchorHead, AnchorRow, ApiKeyRecord, CLIENT_ENDED_SECS,
     CLIENT_UNUSED_SECS, CodeRecord, ConsentRequestRecord, ExportJobRecord, GrantRecord,
-    InstanceRecord, OAuthClientRecord, PatRecord, Redeem, RefreshRecord, Rotate, Sealed,
-    ServerStore, SessionRecord, StoreError, StoreResult, UserRecord,
+    InstanceRecord, JobState, OAuthClientRecord, PatRecord, Redeem, RefreshRecord, Rotate, Sealed,
+    ServerStore, SessionRecord, StoreError, StoreResult, UserRecord, UserState,
 };
 
 #[derive(Default)]
 struct Inner {
     users: BTreeMap<String, UserRecord>,
+    states: BTreeMap<String, UserState>,
+    jobs: BTreeMap<String, JobState>,
+    gone: BTreeMap<String, i64>,
     keystore: BTreeMap<(String, String), Sealed>,
     pats: BTreeMap<(String, String), PatRecord>,
     sessions: BTreeMap<[u8; 32], SessionRecord>,
@@ -27,7 +30,7 @@ struct Inner {
     codes: BTreeMap<[u8; 32], CodeRecord>,
     access: BTreeMap<[u8; 32], AccessRecord>,
     refresh: BTreeMap<[u8; 32], RefreshRecord>,
-    jobs: BTreeMap<String, ExportJobRecord>,
+    export_jobs: BTreeMap<String, ExportJobRecord>,
 }
 
 #[derive(Default)]
@@ -60,7 +63,6 @@ impl ServerStore for MemoryStore {
             .or_insert_with(|| u.clone());
         entry.display_name = u.display_name.clone();
         entry.roles = u.roles.clone();
-        entry.data_key_wrapped = u.data_key_wrapped.clone();
         Ok(())
     }
 
@@ -81,6 +83,85 @@ impl ServerStore for MemoryStore {
         let mut v: Vec<UserRecord> = self.lock().users.values().cloned().collect();
         v.sort_by(|a, b| a.username.cmp(&b.username));
         Ok(v)
+    }
+
+    fn users_all(&self) -> StoreResult<Vec<(UserRecord, UserState)>> {
+        let g = self.lock();
+        let mut v: Vec<(UserRecord, UserState)> = g
+            .users
+            .values()
+            .map(|u| {
+                let st = g.states.get(&u.user_id).cloned().unwrap_or_default();
+                (u.clone(), st)
+            })
+            .collect();
+        v.sort_by(|a, b| a.0.username.cmp(&b.0.username));
+        Ok(v)
+    }
+
+    fn user_state(&self, user_id: &str) -> StoreResult<Option<UserState>> {
+        let g = self.lock();
+        Ok(g.users
+            .contains_key(user_id)
+            .then(|| g.states.get(user_id).cloned().unwrap_or_default()))
+    }
+
+    fn user_set_last_login(&self, user_id: &str, at: i64) -> StoreResult<()> {
+        let mut g = self.lock();
+        if g.users.contains_key(user_id) {
+            g.states
+                .entry(user_id.to_owned())
+                .or_default()
+                .last_login_at = Some(at);
+        }
+        Ok(())
+    }
+
+    fn user_purge(&self, user_id: &str, at: i64) -> StoreResult<()> {
+        let mut g = self.lock();
+        g.keystore.retain(|(u, _), _| u != user_id);
+        g.pats.retain(|(u, _), _| u != user_id);
+        g.sessions.retain(|_, s| s.user_id != user_id);
+        g.keys.retain(|_, k| k.user_id != user_id);
+        if let Some(u) = g.users.get_mut(user_id) {
+            u.data_key_wrapped.clear();
+            g.states
+                .entry(user_id.to_owned())
+                .or_default()
+                .chain_deleted_at = Some(at);
+        }
+        Ok(())
+    }
+
+    fn user_deactivate(
+        &self,
+        user_id: &str,
+        at: i64,
+        by: &str,
+        retention_until: i64,
+    ) -> StoreResult<bool> {
+        let mut g = self.lock();
+        if !g.users.contains_key(user_id) {
+            return Ok(false);
+        }
+        let st = g.states.entry(user_id.to_owned()).or_default();
+        if st.deactivated_at.is_some() {
+            return Ok(false);
+        }
+        st.deactivated_at = Some(at);
+        st.deactivated_by = Some(by.to_owned());
+        st.retention_until = Some(retention_until);
+        Ok(true)
+    }
+
+    fn user_set_wrapped(&self, user_id: &str, expected: &str, new: &str) -> StoreResult<bool> {
+        match self.lock().users.get_mut(user_id) {
+            Some(u) if u.data_key_wrapped == expected => {
+                new.clone_into(&mut u.data_key_wrapped);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     fn ks_get(&self, user_id: &str, entry: &str) -> StoreResult<Option<Sealed>> {
@@ -187,6 +268,24 @@ impl ServerStore for MemoryStore {
         Ok(self.lock().sessions.values().cloned().collect())
     }
 
+    fn sessions_delete_for_user(&self, user_id: &str) -> StoreResult<u64> {
+        let mut g = self.lock();
+        let before = g.sessions.len();
+        g.sessions.retain(|_, s| s.user_id != user_id);
+        Ok((before - g.sessions.len()) as u64)
+    }
+
+    fn api_keys_revoke_all(&self, user_id: &str, at: i64) -> StoreResult<Vec<ApiKeyRecord>> {
+        let mut out: Vec<ApiKeyRecord> = Vec::new();
+        for k in self.lock().keys.values_mut() {
+            if k.user_id == user_id && k.revoked_at.is_none() {
+                k.revoked_at = Some(at);
+                out.push(k.clone());
+            }
+        }
+        out.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        Ok(out)
+    }
     fn api_key_insert(&self, k: &ApiKeyRecord) -> StoreResult<()> {
         let mut g = self.lock();
         if g.keys.contains_key(&k.id) || g.keys.values().any(|o| o.prefix == k.prefix) {
@@ -300,6 +399,45 @@ impl ServerStore for MemoryStore {
             .filter(|r| (first..=last).contains(&r.seq))
             .cloned()
             .collect())
+    }
+
+    fn scheduler_get(&self, job: &str) -> StoreResult<JobState> {
+        Ok(self.lock().jobs.get(job).copied().unwrap_or_default())
+    }
+
+    fn scheduler_put(&self, job: &str, s: &JobState) -> StoreResult<()> {
+        self.lock().jobs.insert(job.to_owned(), *s);
+        Ok(())
+    }
+
+    fn gone_since(&self, user_id: &str) -> StoreResult<Option<i64>> {
+        Ok(self.lock().gone.get(user_id).copied())
+    }
+
+    fn gone_mark(&self, user_id: &str, at: i64) -> StoreResult<()> {
+        self.lock().gone.entry(user_id.to_owned()).or_insert(at);
+        Ok(())
+    }
+
+    fn gone_clear(&self, user_id: &str) -> StoreResult<()> {
+        self.lock().gone.remove(user_id);
+        Ok(())
+    }
+
+    fn anchor_latest_heads(&self) -> StoreResult<Vec<AnchorHead>> {
+        let mut latest: BTreeMap<String, AnchorHead> = BTreeMap::new();
+        for (_, h) in &self.lock().heads {
+            latest.insert(h.user_id.clone(), h.clone());
+        }
+        Ok(latest.into_values().collect())
+    }
+
+    fn snapshot_to(&self, _path: &std::path::Path) -> StoreResult<()> {
+        Err(StoreError::Db("the memory store has no file".into()))
+    }
+
+    fn restore_from(&self, _path: &std::path::Path) -> StoreResult<()> {
+        Err(StoreError::Db("the memory store has no file".into()))
     }
 
     fn anchor_last(&self) -> StoreResult<Option<AnchorRow>> {
@@ -593,19 +731,19 @@ impl ServerStore for MemoryStore {
 
     fn export_job_insert(&self, j: &ExportJobRecord) -> StoreResult<()> {
         let mut g = self.lock();
-        if g.jobs.contains_key(&j.job_id) {
+        if g.export_jobs.contains_key(&j.job_id) {
             return Err(StoreError::Duplicate);
         }
-        g.jobs.insert(j.job_id.clone(), j.clone());
+        g.export_jobs.insert(j.job_id.clone(), j.clone());
         Ok(())
     }
 
     fn export_job_get(&self, job_id: &str) -> StoreResult<Option<ExportJobRecord>> {
-        Ok(self.lock().jobs.get(job_id).cloned())
+        Ok(self.lock().export_jobs.get(job_id).cloned())
     }
 
     fn export_job_update(&self, j: &ExportJobRecord) -> StoreResult<()> {
-        if let Some(x) = self.lock().jobs.get_mut(&j.job_id) {
+        if let Some(x) = self.lock().export_jobs.get_mut(&j.job_id) {
             x.state = j.state.clone();
             x.expires_at = j.expires_at;
             x.manifest_sha256 = j.manifest_sha256.clone();
@@ -620,7 +758,7 @@ impl ServerStore for MemoryStore {
     fn export_jobs_running(&self) -> StoreResult<Vec<ExportJobRecord>> {
         let mut v: Vec<ExportJobRecord> = self
             .lock()
-            .jobs
+            .export_jobs
             .values()
             .filter(|j| j.state == "running")
             .cloned()
@@ -632,7 +770,7 @@ impl ServerStore for MemoryStore {
     fn export_jobs_expired(&self, now: i64) -> StoreResult<Vec<ExportJobRecord>> {
         let mut v: Vec<ExportJobRecord> = self
             .lock()
-            .jobs
+            .export_jobs
             .values()
             .filter(|j| j.expires_at <= now)
             .cloned()
@@ -642,6 +780,6 @@ impl ServerStore for MemoryStore {
     }
 
     fn export_job_delete(&self, job_id: &str) -> StoreResult<bool> {
-        Ok(self.lock().jobs.remove(job_id).is_some())
+        Ok(self.lock().export_jobs.remove(job_id).is_some())
     }
 }

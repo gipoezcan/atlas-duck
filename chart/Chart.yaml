@@ -1,0 +1,7 @@
+apiVersion: v2
+name: atlas-duck-server
+description: atlas-duck in server mode (one replica, SQLite on a ReadWriteOnce volume, ADR 0003)
+type: application
+# CI (server:chart-package) sets both from PROJECT_VERSION; these are the in-repo defaults.
+version: 0.1.0
+appVersion: "0.1.0"

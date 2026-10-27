@@ -34,6 +34,14 @@ pub enum DirectoryConfig {
     },
 }
 
+/// The optional read-only directory service account of the daily offboarding check (M13 T9,
+/// PD-M13-14): its DN, and the file its password is read from (a mounted Secret, never env).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceBind {
+    pub dn: String,
+    pub password_file: PathBuf,
+}
+
 /// The group DNs that grant the roles (SM-2.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Groups {
@@ -50,6 +58,8 @@ pub struct Config {
     pub listen: SocketAddr,
     pub data_dir: LocalDataDir,
     pub master_key_file: PathBuf,
+    /// During a rotation only (M13 T7): the next key, accepted for unwrapping alongside.
+    pub master_key_next_file: Option<PathBuf>,
     pub ca_bundle_file: Option<PathBuf>,
     pub web_dir: PathBuf,
     pub trusted_proxy_hops: u32,
@@ -69,6 +79,15 @@ pub struct Config {
     pub scripts: crate::scripts::ScriptsConfig,
     /// M14 PD-254: export job lifetime and the server-wide cap.
     pub exports: crate::export_job::ExportConfig,
+    /// The admin CLI's Unix socket (M13 PD-M13-1).
+    pub admin_socket: PathBuf,
+    /// Daily offboarding and retention time, UTC `(hour, minute)` (M13 T9).
+    pub offboarding_at: (u32, u32),
+    /// SM-6.5 retention period of a deactivated user's chain.
+    pub retention_days: u32,
+    pub service_bind: Option<ServiceBind>,
+    /// Final review M4: the most file data `admin restore --stdin` accepts.
+    pub max_restore_bytes: u64,
 }
 
 /// A refused configuration: a fixed code and the key it concerns. Never carries a value.
@@ -91,6 +110,7 @@ pub const PUBLIC_URL: &str = "ATLAS_DUCK_PUBLIC_URL";
 pub const LISTEN: &str = "ATLAS_DUCK_LISTEN";
 pub const DATA_DIR: &str = "ATLAS_DUCK_DATA_DIR";
 pub const MASTER_KEY_FILE: &str = "ATLAS_DUCK_MASTER_KEY_FILE";
+pub const MASTER_KEY_NEXT_FILE: &str = "ATLAS_DUCK_MASTER_KEY_NEXT_FILE";
 pub const CA_BUNDLE_FILE: &str = "ATLAS_DUCK_CA_BUNDLE_FILE";
 pub const WEB_DIR: &str = "ATLAS_DUCK_WEB_DIR";
 pub const TRUSTED_PROXY_HOPS: &str = "ATLAS_DUCK_TRUSTED_PROXY_HOPS";
@@ -121,6 +141,20 @@ pub const SCRIPT_RUNS_MAX: &str = "ATLAS_DUCK_SCRIPT_RUNS_MAX";
 pub const SCRIPT_DRY_RUNS_MAX: &str = "ATLAS_DUCK_SCRIPT_DRY_RUNS_MAX";
 pub const EXPORT_TTL_HOURS: &str = "ATLAS_DUCK_EXPORT_TTL_HOURS";
 pub const EXPORT_MAX_CONCURRENT: &str = "ATLAS_DUCK_EXPORT_MAX_CONCURRENT";
+pub const ADMIN_SOCKET: &str = "ATLAS_DUCK_ADMIN_SOCKET";
+pub const OFFBOARDING_AT: &str = "ATLAS_DUCK_OFFBOARDING_AT";
+pub const MAX_RESTORE_BYTES: &str = "ATLAS_DUCK_MAX_RESTORE_BYTES";
+/// 8 GiB: above the production volume's data, far below a filled disk.
+pub const DEFAULT_MAX_RESTORE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub const RETENTION_DAYS: &str = "ATLAS_DUCK_RETENTION_DAYS";
+pub const SERVICE_BIND_DN: &str = "ATLAS_DUCK_LDAP_SERVICE_BIND_DN";
+pub const SERVICE_BIND_PASSWORD_FILE: &str = "ATLAS_DUCK_LDAP_SERVICE_BIND_PASSWORD_FILE";
+/// The longest retention period accepted (100 years).
+pub const MAX_RETENTION_DAYS: u64 = 36_500;
+
+/// Where the admin socket lives unless ATLAS_DUCK_ADMIN_SOCKET says otherwise (the chart's
+/// in-memory emptyDir).
+pub const DEFAULT_ADMIN_SOCKET: &str = "/run/atlas-duck/admin.sock";
 
 /// SM-6.3 "at least every 15 minutes".
 pub const MAX_ANCHOR_INTERVAL_SECS: u64 = 900;
@@ -169,6 +203,7 @@ impl Config {
             _ => return Err(err("config/data_dir_invalid", DATA_DIR)),
         };
         let master_key_file = PathBuf::from(required(MASTER_KEY_FILE)?);
+        let master_key_next_file = get(MASTER_KEY_NEXT_FILE).map(PathBuf::from);
         let ca_bundle_file = get(CA_BUNDLE_FILE).map(PathBuf::from);
         let web_dir = PathBuf::from(get(WEB_DIR).unwrap_or_else(|| "/app/web".into()));
         let num = |k: &'static str, default: u64| -> Result<u64, ConfigError> {
@@ -222,6 +257,28 @@ impl Config {
             auditors: get(GROUP_AUDITORS),
             admins: get(GROUP_ADMINS),
         };
+        let offboarding_at = match get(OFFBOARDING_AT) {
+            None => (2, 0),
+            Some(v) => hh_mm(&v).ok_or(err("config/invalid_value", OFFBOARDING_AT))?,
+        };
+        let retention_days = match positive(RETENTION_DAYS, 365)? {
+            n if n > MAX_RETENTION_DAYS => return Err(err("config/invalid_value", RETENTION_DAYS)),
+            n => small(RETENTION_DAYS, n)?,
+        };
+        let service_bind = match (get(SERVICE_BIND_DN), get(SERVICE_BIND_PASSWORD_FILE)) {
+            (None, None) => None,
+            (Some(dn), Some(file)) => Some(ServiceBind {
+                dn,
+                password_file: PathBuf::from(file),
+            }),
+            (Some(_), None) => {
+                return Err(err(
+                    "config/service_bind_incomplete",
+                    SERVICE_BIND_PASSWORD_FILE,
+                ));
+            }
+            (None, Some(_)) => return Err(err("config/service_bind_incomplete", SERVICE_BIND_DN)),
+        };
         let anchor = positive(ANCHOR_INTERVAL_SECS, MAX_ANCHOR_INTERVAL_SECS)?;
         let oauth = oauth_config(&get, &num)?;
         let scripts = scripts_config(&get, &num)?;
@@ -243,6 +300,7 @@ impl Config {
             listen,
             data_dir,
             master_key_file,
+            master_key_next_file,
             ca_bundle_file,
             web_dir,
             trusted_proxy_hops,
@@ -259,6 +317,13 @@ impl Config {
             oauth,
             scripts,
             exports,
+            offboarding_at,
+            retention_days,
+            max_restore_bytes: positive(MAX_RESTORE_BYTES, DEFAULT_MAX_RESTORE_BYTES)?,
+            service_bind,
+            admin_socket: PathBuf::from(
+                get(ADMIN_SOCKET).unwrap_or_else(|| DEFAULT_ADMIN_SOCKET.into()),
+            ),
         })
     }
 
@@ -339,6 +404,16 @@ fn scripts_config(
         runs_max: pool(SCRIPT_RUNS_MAX)?,
         dry_runs_max: pool(SCRIPT_DRY_RUNS_MAX)?,
     })
+}
+
+/// `HH:MM` (24 h) as `(hour, minute)`.
+fn hh_mm(v: &str) -> Option<(u32, u32)> {
+    let (h, m) = v.split_once(':')?;
+    if h.len() != 2 || m.len() != 2 {
+        return None;
+    }
+    let (h, m): (u32, u32) = (h.parse().ok()?, m.parse().ok()?);
+    (h < 24 && m < 60).then_some((h, m))
 }
 
 /// `https://host[:port]` without path or query; `dev` also allows plain HTTP on localhost.
@@ -429,7 +504,12 @@ mod tests {
         assert_eq!(c.session_idle, Duration::from_secs(1_800));
         assert_eq!(c.anchor_interval, Duration::from_secs(900));
         assert_eq!(c.rust_log, "info");
+        assert_eq!(c.admin_socket, PathBuf::from("/run/atlas-duck/admin.sock"));
         assert_eq!(c.ca_bundle_file, None);
+        assert_eq!(c.master_key_next_file, None);
+        assert_eq!(c.offboarding_at, (2, 0));
+        assert_eq!(c.retention_days, 365);
+        assert_eq!(c.service_bind, None);
         assert_eq!(c.groups.auditors, None);
         assert_eq!(c.public_origin(), "https://duck.example.test");
         assert!(c.cookie_secure());
@@ -687,5 +767,54 @@ mod tests {
             e.to_string(),
             "config/master_key_in_env ATLAS_DUCK_MASTER_KEY_FILE"
         );
+    }
+
+    #[test]
+    fn service_bind_dn_without_password_file_is_config_error() {
+        let dn = "cn=svc,dc=example,dc=test";
+        assert_eq!(
+            code(Env::ok().set(SERVICE_BIND_DN, dn)),
+            ("config/service_bind_incomplete", SERVICE_BIND_PASSWORD_FILE)
+        );
+        assert_eq!(
+            code(Env::ok().set(SERVICE_BIND_PASSWORD_FILE, "/run/secrets/p")),
+            ("config/service_bind_incomplete", SERVICE_BIND_DN)
+        );
+        let c = Env::ok()
+            .set(SERVICE_BIND_DN, dn)
+            .set(SERVICE_BIND_PASSWORD_FILE, "/run/secrets/p")
+            .load()
+            .unwrap();
+        assert_eq!(
+            c.service_bind,
+            Some(ServiceBind {
+                dn: dn.into(),
+                password_file: PathBuf::from("/run/secrets/p"),
+            })
+        );
+    }
+
+    #[test]
+    fn offboarding_time_and_retention_days() {
+        let c = Env::ok()
+            .set(OFFBOARDING_AT, "23:59")
+            .set(RETENTION_DAYS, "30")
+            .load()
+            .unwrap();
+        assert_eq!((c.offboarding_at, c.retention_days), ((23, 59), 30));
+        for bad in ["24:00", "2:00", "02:60", "0200", "ab:cd", "02:00:00"] {
+            assert_eq!(
+                code(Env::ok().set(OFFBOARDING_AT, bad)),
+                ("config/invalid_value", OFFBOARDING_AT),
+                "{bad}"
+            );
+        }
+        for bad in ["0", "36501", "-1", "x"] {
+            assert_eq!(
+                code(Env::ok().set(RETENTION_DAYS, bad)),
+                ("config/invalid_value", RETENTION_DAYS),
+                "{bad}"
+            );
+        }
     }
 }

@@ -2,6 +2,7 @@
 //! client (PD-200), the test directory stub (PD-198), RFC 4515 filter escaping and the TLS client
 //! configuration (SM-9.2: verification is never turned off).
 
+pub mod account;
 pub mod escape;
 pub mod ldap;
 pub mod stub;

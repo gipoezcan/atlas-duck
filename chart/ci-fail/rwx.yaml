@@ -1,0 +1,3 @@
+# expect: atlas-duck: persistence.accessMode must be ReadWriteOnce
+persistence:
+  accessMode: ReadWriteMany

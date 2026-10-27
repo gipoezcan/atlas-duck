@@ -1,0 +1,7 @@
+{"users": [
+  {"username": "alice", "password": "alice-test-password", "groups": ["cn=atlas-duck-users,ou=groups,dc=test"]},
+  {"username": "bob", "password": "bob-test-password", "groups": ["cn=atlas-duck-users,ou=groups,dc=test"]},
+  {"username": "carol-admin", "password": "carol-test-password", "groups": ["cn=atlas-duck-users,ou=groups,dc=test", "cn=atlas-duck-admins,ou=groups,dc=test"]},
+  {"username": "dave-auditor", "password": "dave-test-password", "groups": ["cn=atlas-duck-users,ou=groups,dc=test", "cn=atlas-duck-auditors,ou=groups,dc=test"]},
+  {"username": "erin-leaver", "password": "erin-test-password", "groups": ["cn=atlas-duck-users,ou=groups,dc=test"]}
+]}

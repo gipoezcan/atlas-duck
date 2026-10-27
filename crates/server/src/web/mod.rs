@@ -87,6 +87,8 @@ pub enum Access {
 pub const ROUTES: &[(&str, &str, Access)] = &[
     ("GET", "/healthz", Access::Public),
     ("GET", "/readyz", Access::Public),
+    // M13 T10: never through the ingress (refused with any X-Forwarded-For).
+    ("GET", "/metrics", Access::Public),
     ("GET", "/assets/{name}", Access::Public),
     ("POST", "/api/login", Access::Public),
     ("POST", "/api/logout", Access::Session),
@@ -172,6 +174,7 @@ pub(crate) fn handler(method: &str, path: &str) -> Option<MethodRouter<AppState>
     Some(match (method, path) {
         ("GET", "/healthz") => get(health::healthz),
         ("GET", "/readyz") => get(readyz),
+        ("GET", "/metrics") => get(metrics),
         ("GET", "/assets/{name}") => get(asset),
         ("POST", "/api/login") => post(auth_routes::login),
         ("POST", "/api/logout") => post(auth_routes::logout),
@@ -242,11 +245,50 @@ pub fn router(state: AppState) -> Router {
     r.merge(crate::mcp::routes(&state))
         .fallback(|| async { ApiError::NOT_FOUND })
         .layer(middleware::from_fn_with_state(state.clone(), api_guard))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            count_requests,
+        ))
         .with_state(state)
 }
 
 async fn readyz(State(st): State<AppState>) -> Response {
+    if st.registry.maintenance() {
+        let mut reasons = vec!["maintenance"];
+        if crate::admin::restore::interrupted(&st.registry.deps().data_dir) {
+            reasons.push("restore_interrupted");
+        }
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"ready": false, "reasons": reasons})),
+        )
+            .into_response();
+    }
     st.health.readyz().await
+}
+
+/// M13 T10: Prometheus text for in-cluster scrapes only. A request that passed a proxy carries
+/// `X-Forwarded-For` (the ingress always sets it) and gets the plain 404 of an unknown path.
+async fn metrics(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if headers.contains_key("x-forwarded-for") || headers.contains_key(header::FORWARDED) {
+        return ApiError::NOT_FOUND.into_response();
+    }
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        st.health.metrics().await,
+    )
+        .into_response()
+}
+
+/// M13 T10: every answer is counted by method and status class (`atlas_duck_requests_total`).
+async fn count_requests(State(st): State<AppState>, req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let res = next.run(req).await;
+    st.health.count(&method, res.status());
+    res
 }
 
 async fn page(State(st): State<AppState>, uri: axum::http::Uri) -> Response {
@@ -283,6 +325,10 @@ fn header_str(h: &HeaderMap, name: impl header::AsHeaderName) -> Option<&str> {
 /// session and its CSRF token. The checked session rides on the request for the extractor.
 async fn api_guard(State(st): State<AppState>, mut req: Request, next: Next) -> Response {
     let path = req.uri().path().to_owned();
+    // M13 T6: in maintenance only the probes answer (the admin CLI uses its socket).
+    if st.registry.maintenance() && !["/healthz", "/readyz", "/metrics"].contains(&path.as_str()) {
+        return ApiError::MAINTENANCE.into_response();
+    }
     if !path.starts_with("/api/") {
         return next.run(req).await;
     }

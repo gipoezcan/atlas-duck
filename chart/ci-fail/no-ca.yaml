@@ -1,0 +1,3 @@
+# expect: atlas-duck: caBundle.pem is required
+caBundle:
+  pem: ""

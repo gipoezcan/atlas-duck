@@ -8,6 +8,7 @@
 
 #[cfg(any(test, feature = "testing"))]
 pub mod memory;
+pub mod migrate;
 pub mod schema;
 pub mod sqlite;
 
@@ -38,6 +39,27 @@ pub struct UserRecord {
     pub roles: Vec<String>,
     pub data_key_wrapped: String,
     pub created_at: i64,
+}
+
+/// Lifecycle columns of a user (schema v2, M13 Δ-M13-3): kept apart from [`UserRecord`] so the
+/// login's upsert never touches them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UserState {
+    pub deactivated_at: Option<i64>,
+    /// `admin` or `offboarding`.
+    pub deactivated_by: Option<String>,
+    pub last_login_at: Option<i64>,
+    /// When retention may delete the user's chain (deactivation time + the retention period).
+    pub retention_until: Option<i64>,
+    /// When retention deleted the user's chain (M13 T8); the row stays so the user stays refused.
+    pub chain_deleted_at: Option<i64>,
+}
+
+/// A scheduler job's last run and last successful run (M13 T9, `scheduler_state`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JobState {
+    pub last_run_at: Option<i64>,
+    pub last_success_at: Option<i64>,
 }
 
 /// A stored PAT (PD-211), sealed with the user's data key.
@@ -294,12 +316,17 @@ pub enum StoreError {
     Duplicate,
     /// The database refused or failed; the text is SQLite's, never a value.
     Db(String),
+    /// An up-migration failed and was rolled back; the file stays at `from`.
+    Migration { from: u32, to: u32 },
 }
 
 impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StoreError::Newer(v) => write!(f, "store/newer: schema version {v}"),
+            StoreError::Migration { from, to } => {
+                write!(f, "store/migration_failed: {from} -> {to}")
+            }
             StoreError::Duplicate => f.write_str("store/duplicate"),
             StoreError::Db(e) => write!(f, "store/db: {e}"),
         }
@@ -316,11 +343,30 @@ pub type AnchorHasher<'a> = &'a dyn Fn(u64, &[u8; 32]) -> [u8; 32];
 
 pub trait ServerStore: Send + Sync {
     // ---- users ----
+    /// Inserts the user, or refreshes its display name and roles; an existing user's wrapped data
+    /// key is never replaced here (only [ServerStore::user_set_wrapped] does, M13 T7).
     fn upsert_user(&self, user: &UserRecord) -> StoreResult<()>;
+    /// Rotation: replaces the wrapped data key if it still is `expected`; answers whether it did.
+    fn user_set_wrapped(&self, user_id: &str, expected: &str, new: &str) -> StoreResult<bool>;
     fn user(&self, user_id: &str) -> StoreResult<Option<UserRecord>>;
     fn user_by_name(&self, username: &str) -> StoreResult<Option<UserRecord>>;
     /// M14 PD-257: every user, by username (the auditor's list; no secret column is shown).
     fn user_list(&self) -> StoreResult<Vec<UserRecord>>;
+    /// Every user with its lifecycle state, by username (admin `users list`, the scheduler).
+    fn users_all(&self) -> StoreResult<Vec<(UserRecord, UserState)>>;
+    fn user_state(&self, user_id: &str) -> StoreResult<Option<UserState>>;
+    fn user_set_last_login(&self, user_id: &str, at: i64) -> StoreResult<()>;
+    /// Retention (M13 T8), one transaction: the user's keystore entries, PATs, sessions and API
+    /// keys go, the wrapped data key is wiped and `chain_deleted_at` set. The row stays.
+    fn user_purge(&self, user_id: &str, at: i64) -> StoreResult<()>;
+    /// Marks the user deactivated unless it already is; answers whether this call did it.
+    fn user_deactivate(
+        &self,
+        user_id: &str,
+        at: i64,
+        by: &str,
+        retention_until: i64,
+    ) -> StoreResult<bool>;
 
     // ---- per-user keystore entries (PD-210) ----
     fn ks_get(&self, user_id: &str, entry: &str) -> StoreResult<Option<Sealed>>;
@@ -349,6 +395,8 @@ pub trait ServerStore: Send + Sync {
     fn session_delete_expired(&self, now: i64) -> StoreResult<u64>;
     /// Every live session (loaded once at start).
     fn sessions_all(&self) -> StoreResult<Vec<SessionRecord>>;
+    /// Deactivation: deletes every session of the user; answers how many.
+    fn sessions_delete_for_user(&self, user_id: &str) -> StoreResult<u64>;
 
     // ---- API keys (PD-213) ----
     fn api_key_insert(&self, k: &ApiKeyRecord) -> StoreResult<()>;
@@ -359,6 +407,8 @@ pub trait ServerStore: Send + Sync {
     fn api_key_touch_last_used(&self, user_id: &str, id: &str, at: i64) -> StoreResult<()>;
     /// Keys neither revoked nor expired at `now`.
     fn api_key_count_active(&self, user_id: &str, now: i64) -> StoreResult<u64>;
+    /// Deactivation: revokes every unrevoked key of the user at `at`; answers those keys.
+    fn api_keys_revoke_all(&self, user_id: &str, at: i64) -> StoreResult<Vec<ApiKeyRecord>>;
 
     // ---- instances (PD-196) ----
     /// Inserts; `Duplicate` when the alias exists.
@@ -380,6 +430,24 @@ pub trait ServerStore: Send + Sync {
     fn anchor_all(&self) -> StoreResult<Vec<AnchorRow>>;
     /// M14 PD-253: the rows `first..=last` in seq order (an excerpt span, read in batches).
     fn anchor_range(&self, first: u64, last: u64) -> StoreResult<Vec<AnchorRow>>;
+
+    /// The most recently anchored head of every user (backup manifests).
+    fn anchor_latest_heads(&self) -> StoreResult<Vec<AnchorHead>>;
+
+    // ---- scheduler (M13 T9) ----
+    fn scheduler_get(&self, job: &str) -> StoreResult<JobState>;
+    fn scheduler_put(&self, job: &str, state: &JobState) -> StoreResult<()>;
+    /// Offboarding (batch-2 review I4): since when the directory has said the user is gone.
+    fn gone_since(&self, user_id: &str) -> StoreResult<Option<i64>>;
+    /// Records the first gone answer; a later one keeps the first time.
+    fn gone_mark(&self, user_id: &str, at: i64) -> StoreResult<()>;
+    fn gone_clear(&self, user_id: &str) -> StoreResult<()>;
+
+    // ---- backup and restore (M13 T6) ----
+    /// A consistent copy of the whole store into the new file `path`.
+    fn snapshot_to(&self, path: &std::path::Path) -> StoreResult<()>;
+    /// Replaces the whole store's content with the file at `path`, atomically.
+    fn restore_from(&self, path: &std::path::Path) -> StoreResult<()>;
     fn anchor_last(&self) -> StoreResult<Option<AnchorRow>>;
     fn anchor_heads_for(&self, anchor_seq: u64) -> StoreResult<Vec<AnchorHead>>;
     /// `(anchor_seq, head)` of every head of `chain_id` with `head_seq <= upto_seq`, in order.

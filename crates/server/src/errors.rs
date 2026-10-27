@@ -215,6 +215,12 @@ impl ApiError {
         "audit/export_failed",
         "The export failed; start a new one.",
     );
+    /// M13 T6: the server is in maintenance (backup restore); only the probes answer.
+    pub const MAINTENANCE: ApiError = e(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "server/maintenance",
+        "The server is in maintenance.",
+    );
     pub const INTERNAL: ApiError = e(
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal",
@@ -326,6 +332,7 @@ mod tests {
             (ApiError::EXPORT_UNKNOWN, 404),
             (ApiError::EXPORT_EXPIRED, 410),
             (ApiError::EXPORT_FAILED, 500),
+            (ApiError::MAINTENANCE, 503),
             (ApiError::INTERNAL, 500),
         ] {
             assert_eq!(err.status.as_u16(), status, "{}", err.code);

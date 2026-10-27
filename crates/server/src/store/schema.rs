@@ -1,7 +1,36 @@
-//! Schema v1 of `server.db` (PD-202, PD-208, PD-210, PD-211, PD-213, PD-217).
+//! Schema of `server.db`: v1 (PD-202, PD-208, PD-210, PD-211, PD-213, PD-217) and the
+//! up-migrations after it (M13 Δ-M13-3). A new database is created as v1 and migrated up, so
+//! every file reaches the current version by the same path.
 
 /// `PRAGMA user_version` of this build.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 3;
+
+/// v1 → v2 (M13 T5): user lifecycle columns and the scheduler's last runs (T9).
+pub const V1_TO_V2: &str = r#"
+ALTER TABLE users ADD COLUMN deactivated_at INTEGER;
+ALTER TABLE users ADD COLUMN deactivated_by TEXT;
+ALTER TABLE users ADD COLUMN last_login_at INTEGER;
+ALTER TABLE users ADD COLUMN retention_until INTEGER;
+ALTER TABLE users ADD COLUMN chain_deleted_at INTEGER;
+CREATE TABLE offboarding_gone (
+    user_id TEXT PRIMARY KEY,
+    first_seen_at INTEGER NOT NULL
+);
+CREATE TABLE scheduler_state (
+    job TEXT PRIMARY KEY,
+    last_run_at INTEGER,
+    last_success_at INTEGER
+);
+"#;
+
+/// The migration from `from` to `from + 1`.
+pub fn up_from(from: u32) -> Option<&'static str> {
+    match from {
+        1 => Some(V1_TO_V2),
+        2 => Some(M14_TABLES),
+        _ => None,
+    }
+}
 
 pub const V1: &str = r#"
 CREATE TABLE users (
@@ -86,9 +115,9 @@ CREATE TRIGGER anchor_heads_no_delete BEFORE DELETE ON anchor_heads
     BEGIN SELECT RAISE(ABORT, 'anchor_heads is append-only'); END;
 "#;
 
-/// The tables M14 adds (OAuth, export jobs; plan T3). Applied at open, in one transaction, when
-/// `oauth_clients` is absent. Decision (M14 T1): no `user_version` bump here, because schema v2 is
-/// M13's; when M13's migration path merges, this becomes its v2 → v3 step.
+/// v2 → v3 (M14 T3): the OAuth tables and export jobs. Decision (M13 merge): M14's tables are
+/// their own step after M13's v2, not folded into it, so a file M13 already moved to v2 climbs
+/// the same path.
 pub const M14_TABLES: &str = r#"
 CREATE TABLE oauth_clients (
     client_id TEXT PRIMARY KEY,

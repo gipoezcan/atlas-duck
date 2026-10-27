@@ -15,6 +15,7 @@ use secrecy::{ExposeSecret, SecretString};
 use tokio::net::TcpStream;
 use url::Url;
 
+use super::account::{AccountLookup, AccountState};
 use super::escape::filter_value;
 use super::{Directory, DirectoryError, DirectoryUser};
 
@@ -142,6 +143,121 @@ impl LdapDirectory {
             groups: entry.attrs.get("memberOf").cloned().unwrap_or_default(),
             disabled,
         })
+    }
+}
+
+/// The daily offboarding check's lookup (M13 T9, PD-M13-14): binds as the read-only service
+/// account (its password read from a mounted Secret file, never env), searches the user by UPN
+/// and reads `userAccountControl`. A failed bind, search or a missing `userAccountControl` is
+/// `Unavailable`: the check never deactivates on doubt.
+pub struct LdapServiceLookup {
+    url: Url,
+    upn_suffix: String,
+    base_dn: String,
+    tls: Arc<ClientConfig>,
+    bind_dn: String,
+    password: SecretString,
+}
+
+impl std::fmt::Debug for LdapServiceLookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LdapServiceLookup")
+            .field("url", &self.url.as_str())
+            .finish_non_exhaustive()
+    }
+}
+
+impl LdapServiceLookup {
+    pub fn new(
+        url: Url,
+        upn_suffix: String,
+        base_dn: String,
+        tls: Arc<ClientConfig>,
+        bind_dn: String,
+        password: SecretString,
+    ) -> Self {
+        LdapServiceLookup {
+            url,
+            upn_suffix,
+            base_dn,
+            tls,
+            bind_dn,
+            password,
+        }
+    }
+
+    async fn lookup(&self, username: &str) -> Result<AccountState, DirectoryError> {
+        let settings = LdapConnSettings::new()
+            .set_config(self.tls.clone())
+            .set_conn_timeout(CONNECT_TIMEOUT);
+        let (conn, mut ldap) = tokio::time::timeout(
+            CONNECT_TIMEOUT + Duration::from_secs(1),
+            LdapConnAsync::with_settings(settings, self.url.as_str()),
+        )
+        .await
+        .map_err(unavailable("service_connect_timeout"))?
+        .map_err(unavailable("service_connect"))?;
+        let driver = tokio::spawn(async move {
+            let _ = conn.drive().await;
+        });
+        let outcome = async {
+            let bind = ldap
+                .with_timeout(OP_TIMEOUT)
+                .simple_bind(&self.bind_dn, self.password.expose_secret())
+                .await
+                .map_err(unavailable("service_bind"))?;
+            if bind.rc != 0 {
+                tracing::warn!(
+                    event = "directory_unavailable",
+                    step = "service_bind",
+                    rc = bind.rc
+                );
+                return Err(DirectoryError::Unavailable);
+            }
+            let upn = format!("{username}{}", self.upn_suffix);
+            let filter = format!(
+                "(&(objectClass=user)(userPrincipalName={}))",
+                filter_value(&upn)
+            );
+            let res = ldap
+                .with_timeout(OP_TIMEOUT)
+                .search(
+                    &self.base_dn,
+                    Scope::Subtree,
+                    &filter,
+                    vec!["userAccountControl"],
+                )
+                .await
+                .map_err(unavailable("service_search"))?;
+            let (entries, _) = res.success().map_err(unavailable("service_search"))?;
+            let Some(entry) = entries.into_iter().next().map(SearchEntry::construct) else {
+                return Ok(AccountState::Gone);
+            };
+            let uac = entry
+                .attrs
+                .get("userAccountControl")
+                .and_then(|v| v.first())
+                .and_then(|v| v.parse::<u64>().ok())
+                .ok_or(DirectoryError::Unavailable)?;
+            Ok(if uac & UAC_DISABLED != 0 {
+                AccountState::Disabled
+            } else {
+                AccountState::Active
+            })
+        }
+        .await;
+        let _ = ldap.with_timeout(OP_TIMEOUT).unbind().await;
+        driver.abort();
+        outcome
+    }
+}
+
+#[async_trait]
+impl AccountLookup for LdapServiceLookup {
+    async fn account_state(&self, username: &str) -> Result<AccountState, DirectoryError> {
+        tokio::time::timeout(CONNECT_TIMEOUT + 3 * OP_TIMEOUT, self.lookup(username))
+            .await
+            .unwrap_or(Err(DirectoryError::Unavailable))
     }
 }
 

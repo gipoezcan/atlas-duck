@@ -1,0 +1,3 @@
+# expect: atlas-duck: persistence.storageClassName is required
+persistence:
+  storageClassName: ""

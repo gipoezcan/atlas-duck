@@ -57,7 +57,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync"
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-platform-verifier = { workspace = true }
-rusqlite = { workspace = true }
+# `backup`: the online backup API of admin backup/restore (M13 T6); a feature, no new crate.
+rusqlite = { workspace = true, features = ["backup"] }
 aes-gcm = { workspace = true }
 argon2 = { workspace = true }
 sha2 = { workspace = true }

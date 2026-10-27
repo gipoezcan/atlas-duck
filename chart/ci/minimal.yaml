@@ -1,0 +1,27 @@
+# Chart CI (T4): the smallest production-shaped value set; every chart/ci-fail file is layered on
+# top of this one.
+publicUrl: https://atlas-duck.ci.example.test
+ingress:
+  host: atlas-duck.ci.example.test
+  tls:
+    secretName: ci-tls
+persistence:
+  storageClassName: ci-rwo
+masterKey:
+  existingSecret: atlas-duck-master-key
+directory:
+  ldap:
+    url: ldaps://dc.ci.example.test:636
+    upnSuffix: "@ci.example.test"
+    baseDn: dc=ci,dc=example,dc=test
+groups:
+  users: cn=atlas-duck-users,dc=ci,dc=example,dc=test
+networkPolicy:
+  ingressNamespaceSelectors:
+    - kubernetes.io/metadata.name: ingress-nginx
+caBundle:
+  # Not a real certificate: the chart only checks for the PEM marker.
+  pem: |
+    -----BEGIN CERTIFICATE-----
+    Q0ktb25seS1ub3QtYS1yZWFsLWNlcnRpZmljYXRl
+    -----END CERTIFICATE-----

@@ -73,3 +73,5 @@ A restored log starts a new chain. An old installation that keeps running next t
 ## Packages
 
 The release workflow signs the Windows installer and the macOS bundle. The Linux packages are not signed in this build. Get them only from the project's release page.
+
+Server mode (atlas-duck running in the cluster) has its own page: [docs/server/threat-model.md](../server/threat-model.md).

@@ -1,0 +1,125 @@
+# atlas-duck-server chart (M13 plan T3). No secret ever goes into these values (SM-9.1): the master
+# key and the optional directory service-bind password are Secrets created out of band and only
+# referenced here by name (PD-M13-5, PD-M13-14).
+
+# `production` or `review`; rendered as ATLAS_DUCK_MODE (A-4, PD-M13-8).
+mode: production
+
+# `https://host`, no path (ATLAS_DUCK_PUBLIC_URL). Required.
+publicUrl: ""
+
+# ATLAS_DUCK_TRUSTED_PROXY_HOPS: the ingress controller is one hop.
+trustedProxyHops: 1
+
+# ATLAS_DUCK_MAX_OPEN_USERS (M12 default 200).
+maxOpenUsers: 200
+
+image:
+  repository: atlas-duck-server
+  # CI deploys by digest (PD-M13-9); the tag is only a fallback for local renders.
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+# Pod hardening (SM-7.1, SM-9.4). The ids are the distroless `nonroot` user of the image (A-8).
+uid: 65532
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+# Generous: the server opens and verifies its stores before it listens.
+startupProbe:
+  periodSeconds: 5
+  failureThreshold: 60
+
+service:
+  port: 8080
+
+ingress:
+  enabled: true
+  className: ""
+  host: ""
+  # SM-5.2 uses SSE: no proxy buffering, long read timeout.
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+  tls:
+    # An existing Secret (PD-M13-6, Q3); the chart never creates one. Required.
+    secretName: ""
+
+persistence:
+  # ADR 0003: SQLite needs ReadWriteOnce block storage; anything else is refused.
+  accessMode: ReadWriteOnce
+  # Required (Q1); no default.
+  storageClassName: ""
+  size: 10Gi
+  # `helm.sh/resource-policy: keep` so `helm uninstall` never deletes the data (production).
+  keep: true
+
+masterKey:
+  # Secret with key `key` holding `atlas-duck-master-key/v1 <id> <base64>`. Required.
+  existingSecret: ""
+  # Only during a rotation (T7): the next key, mounted at /run/secrets/atlas-duck/master-key-next.
+  nextSecret: ""
+
+# PEM of the organisation's CA certificates (public only, PD-M13-7). Required; helmfile sets it
+# from deployment/ca/org-ca.pem.
+caBundle:
+  pem: ""
+
+directory:
+  ldap:
+    url: ""
+    upnSuffix: ""
+    baseDn: ""
+  # Optional read-only service bind for the daily offboarding check (PD-M13-14, Q6).
+  serviceBind:
+    dn: ""
+    # Secret with key `password`.
+    existingSecret: ""
+
+groups:
+  users: ""
+  auditors: ""
+  admins: ""
+
+# Review environments only (PD-M13-8): the stub directory file in M12 PD-198 format, mounted
+# from a ConfigMap. Refused with mode production.
+testDirectory:
+  enabled: false
+  usersJson: ""
+
+# Further non-secret settings as {name, value}; names that look like secrets are refused.
+extraEnv: []
+
+networkPolicy:
+  enabled: true
+  # Namespaces allowed to reach the pod: the ingress controller and monitoring (Q2).
+  ingressNamespaceSelectors: []
+  # Egress besides DNS, LDAPS 636 and HTTPS 443 (for example an instance on 8443).
+  extraEgressPorts: []
+
+tests:
+  image: curlimages/curl:8.10.1
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

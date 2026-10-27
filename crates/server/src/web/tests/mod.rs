@@ -956,8 +956,10 @@ async fn healthz_and_readyz() {
     );
 }
 
+/// PD-M13-13 (M13 T10, a deliberate change of M12's /readyz): an unreachable directory is a
+/// degraded field on a 200, never a 503.
 #[tokio::test]
-async fn readyz_is_503_when_the_stub_file_vanished() {
+async fn readyz_200_with_directory_degraded_when_unreachable() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("users.json");
     std::fs::write(&file, STUB).unwrap();
@@ -975,9 +977,12 @@ async fn readyz_is_503_when_the_stub_file_vanished() {
     std::fs::remove_file(&file).unwrap();
     let fresh = crate::health::Health::new(store, stub3, true);
     let res = fresh.readyz().await;
-    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(res.status(), StatusCode::OK);
     let body = json_body(res).await;
     assert_eq!(body["checks"]["directory"], false);
+    assert_eq!(body["degraded"], json!(["directory_unreachable"]));
+    assert_eq!(body["reasons"], json!([]));
+    assert_eq!(body["ready"], true);
 }
 
 // ---- T13: admin instances over HTTP --------------------------------------------------------
@@ -1723,6 +1728,368 @@ fn every_route_row_has_a_handler_and_bearer_rows_are_mcp() {
             "duplicate row {method} {path}"
         );
     }
+}
+
+/// M13 T2 (A-13): SIGTERM with an open runtime and an open SSE stream still finishes inside
+/// the chart's 30 s grace period: connections drain at most `DRAIN`, then the runtimes close and
+/// `SERVER_STOP` is appended.
+#[tokio::test(start_paused = true)]
+async fn shutdown_completes_within_25s() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let h = H::new();
+    let (cookie, _) = h.session("alice", PW_CANARY).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let writer = Arc::new(crate::anchor::AnchorWriter::new(
+        h.store.clone(),
+        h.registry.clone(),
+        h.clock.clone(),
+    ));
+    writer.start(&json!({})).unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let state = h.state.clone();
+    let w = writer.clone();
+    let server = tokio::spawn(async move {
+        crate::app::serve_until(
+            listener,
+            state,
+            &w,
+            async move {
+                let _ = stop_rx.await;
+            },
+            crate::app::DRAIN,
+        )
+        .await
+    });
+
+    let mut sse = tokio::net::TcpStream::connect(addr).await.unwrap();
+    sse.write_all(
+        format!(
+            "GET /api/events HTTP/1.1\r\nHost: duck.example.test\r\nCookie: __Host-atlas_duck_session={cookie}\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut head = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !contains(&head, b"\r\n\r\n") {
+        let n = tokio::time::timeout(LIMIT, sse.read(&mut buf))
+            .await
+            .expect("no SSE answer")
+            .unwrap();
+        assert!(n > 0, "SSE connection closed early");
+        head.extend_from_slice(&buf[..n]);
+    }
+    assert!(
+        head.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&head)
+    );
+    assert_eq!(
+        h.registry.open_runtimes().await.len(),
+        1,
+        "the stream pins a runtime"
+    );
+
+    let started = tokio::time::Instant::now();
+    stop_tx.send(()).unwrap();
+    let served = tokio::time::timeout(Duration::from_secs(25), server)
+        .await
+        .expect("shutdown took longer than 25 s")
+        .unwrap();
+    assert!(served.is_ok());
+    assert!(started.elapsed() <= Duration::from_secs(25));
+    assert!(h.registry.open_runtimes().await.is_empty());
+    let kinds: Vec<String> = h
+        .store
+        .anchor_all()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.kind)
+        .collect();
+    assert_eq!(
+        kinds.last().map(String::as_str),
+        Some(crate::anchor::KIND_SERVER_STOP)
+    );
+    assert!(
+        kinds
+            .iter()
+            .any(|k| k == crate::anchor::KIND_RUNTIME_CLOSED),
+        "{kinds:?}"
+    );
+    drop(sse);
+}
+
+/// M13 T5 (SM-6.5): a deactivated user is refused at login even though the directory accepts
+/// the password, and the refusal is a counted `not_permitted` with `LOGIN_FAILED`.
+#[tokio::test]
+async fn deactivated_user_login_refused_not_permitted() {
+    let h = H::new();
+    assert_eq!(h.login("alice", PW_CANARY).await.status(), StatusCode::OK);
+    let uid = user_id_for("alice");
+    assert_eq!(
+        h.store.user_state(&uid).unwrap().unwrap().last_login_at,
+        Some(T0),
+        "a login records last_login_at"
+    );
+    assert!(
+        h.store
+            .user_deactivate(&uid, T0 + 1, "admin", T0 + 2)
+            .unwrap()
+    );
+    let before = h.store.anchor_all().unwrap().len();
+    let (status, code) = code(h.login("alice", PW_CANARY).await).await;
+    assert_eq!(
+        (status, code.as_str()),
+        (StatusCode::FORBIDDEN, "auth/not_permitted")
+    );
+    let rows = h.store.anchor_all().unwrap();
+    assert_eq!(rows.len(), before + 1);
+    assert_eq!(rows.last().unwrap().kind, crate::anchor::KIND_LOGIN_FAILED);
+    // Bob is not affected.
+    assert_eq!(h.login("bob", "pw-bob").await.status(), StatusCode::OK);
+}
+
+/// M13 T6: in maintenance only the probes answer; `/readyz` says why it is not ready.
+#[tokio::test]
+async fn maintenance_refuses_everything_but_the_probes() {
+    let h = H::new();
+    let (cookie, _) = h.session("alice", PW_CANARY).await;
+    h.registry.set_maintenance(true);
+    let ready = get(&h, "/readyz").await;
+    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json_body(ready).await,
+        json!({"ready": false, "reasons": ["maintenance"]})
+    );
+    assert_eq!(get(&h, "/healthz").await.status(), StatusCode::OK);
+    let (status, c) = code(h.get_session(&cookie).await).await;
+    assert_eq!(
+        (status, c.as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, "server/maintenance")
+    );
+    let (status, c) = code(h.login("bob", "pw-bob").await).await;
+    assert_eq!(
+        (status, c.as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, "server/maintenance")
+    );
+    assert_eq!(
+        get(&h, "/login").await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    h.registry.set_maintenance(false);
+    assert_eq!(h.get_session(&cookie).await.status(), StatusCode::OK);
+}
+
+// ---- M13 T10: health, readiness, metrics ------------------------------------------------------
+
+async fn ready_body(h: &crate::health::Health) -> (StatusCode, Value) {
+    let res = h.readyz().await;
+    let status = res.status();
+    (status, json_body(res).await)
+}
+
+#[tokio::test]
+async fn readyz_503_when_master_key_missing_stores_unopened_or_maintenance() {
+    let stub = Arc::new(StubDirectory::from_json(STUB).unwrap());
+    // The master key is not loaded.
+    let store: Arc<dyn ServerStore> = Arc::new(crate::store::memory::MemoryStore::new());
+    let (status, body) = ready_body(&crate::health::Health::new(store, stub.clone(), false)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body,
+        json!({"ready": false, "reasons": ["master_key_missing"], "degraded": [],
+               "checks": {"store": true, "master_key": false, "directory": true},
+               "directory": "stub", "scripts": "disabled"})
+    );
+    // The server store does not answer.
+    let dir = tempfile::tempdir().unwrap();
+    let sqlite = SqliteStore::open(&dir.path().join("server.db")).unwrap();
+    sqlite.raw().execute_batch("DROP TABLE instances;").unwrap();
+    let store: Arc<dyn ServerStore> = Arc::new(sqlite);
+    let (status, body) = ready_body(&crate::health::Health::new(store, stub, true)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["reasons"], json!(["store_unavailable"]));
+    // Maintenance (the web layer's reason).
+    let h = H::new();
+    h.registry.set_maintenance(true);
+    let res = get(&h, "/readyz").await;
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(json_body(res).await["reasons"], json!(["maintenance"]));
+}
+
+#[tokio::test]
+async fn healthz_200_without_dependencies() {
+    let h = H::new();
+    // Not ready (maintenance), but alive.
+    h.registry.set_maintenance(true);
+    let res = get(&h, "/healthz").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+    assert_eq!(&bytes[..], b"ok");
+    assert_eq!(crate::health::healthz().await, "ok");
+}
+
+#[tokio::test]
+async fn readyz_reports_directory_stub() {
+    let h = H::new();
+    let res = get(&h, "/readyz").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = json_body(res).await;
+    assert_eq!(body["directory"], "stub");
+    assert_eq!(body["ready"], true);
+}
+
+/// A Health over `h`'s store and registry the way `serve` builds it, with master key "k1".
+fn full_health(h: &H) -> crate::health::Health {
+    crate::health::Health::new(h.store.clone(), h.stub.clone(), true)
+        .with_master(Arc::new(MasterKey::for_tests("k1", [5; 32])))
+        .with_offboarding("stub")
+        .with_registry(h.registry.clone())
+}
+
+#[tokio::test]
+async fn metrics_include_requests_approvals_scheduler_offboarding_test_directory_and_key_id() {
+    let h = H::new();
+    h.session("alice", PW_CANARY).await;
+    h.store
+        .scheduler_put(
+            crate::scheduler::JOB_RETENTION,
+            &crate::store::JobState {
+                last_run_at: Some(T0),
+                last_success_at: Some(T0),
+            },
+        )
+        .unwrap();
+    let health = full_health(&h);
+    health.count(&Method::POST, StatusCode::OK);
+    health.count(&Method::GET, StatusCode::NOT_FOUND);
+    let text = health.metrics().await;
+    for line in [
+        "atlas_duck_requests_total{method=\"POST\",status=\"2xx\"} 1",
+        "atlas_duck_requests_total{method=\"GET\",status=\"4xx\"} 1",
+        "atlas_duck_approvals_pending 0",
+        &format!("atlas_duck_scheduler_last_success_seconds{{job=\"retention\"}} {T0}"),
+        "atlas_duck_offboarding_enabled 1",
+        "atlas_duck_test_directory_enabled 1",
+        "atlas_duck_master_key_info{key_id=\"k1\",role=\"primary\"} 1",
+        "# TYPE atlas_duck_requests_total counter",
+    ] {
+        assert!(text.lines().any(|l| l == line), "missing {line}:\n{text}");
+    }
+    // Manual offboarding reports 0.
+    let manual = crate::health::Health::new(h.store.clone(), h.stub.clone(), true)
+        .with_offboarding("manual");
+    assert!(
+        manual
+            .metrics()
+            .await
+            .contains("atlas_duck_offboarding_enabled 0")
+    );
+    // The router counts what it answers.
+    let res = get(&h, "/metrics").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        text.contains("atlas_duck_requests_total{method=\"POST\",status=\"2xx\"}"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn metrics_contain_no_usernames_hostnames_or_ids() {
+    let h = H::new();
+    h.session("alice", PW_CANARY).await;
+    h.session("bob", "pw-bob").await;
+    h.store
+        .instance_put(&crate::store::InstanceRecord {
+            alias: "work".into(),
+            product: "jira".into(),
+            base_url: "https://jira.internal.example.test".into(),
+            proxy: None,
+            ca_ref: None,
+            is_default: true,
+        })
+        .unwrap();
+    let health = full_health(&h);
+    for m in [Method::GET, Method::POST, Method::PATCH] {
+        health.count(&m, StatusCode::OK);
+    }
+    let text = health.metrics().await;
+    let allowed = [
+        "GET",
+        "POST",
+        "PUT",
+        "DELETE",
+        "HEAD",
+        "other",
+        "1xx",
+        "2xx",
+        "3xx",
+        "4xx",
+        "5xx",
+        "offboarding",
+        "retention",
+        "k1",
+        "primary",
+        "accepted",
+        env!("CARGO_PKG_VERSION"),
+    ];
+    for line in text.lines().filter(|l| !l.starts_with('#')) {
+        if let Some((_, rest)) = line.split_once('{') {
+            let labels = rest.split_once('}').unwrap().0;
+            for pair in labels.split(',') {
+                let value = pair.split_once('=').unwrap().1.trim_matches('"');
+                assert!(allowed.contains(&value), "label value {value:?} in {line}");
+            }
+        }
+    }
+    for leak in [
+        "alice",
+        "bob",
+        &user_id_for("alice"),
+        "jira.internal.example.test",
+        "work",
+    ] {
+        assert!(!text.contains(leak), "{leak} in\n{text}");
+    }
+}
+
+#[tokio::test]
+async fn metrics_not_served_to_requests_with_x_forwarded_for() {
+    let h = H::new();
+    for (name, value) in [
+        ("x-forwarded-for", "203.0.113.7"),
+        ("forwarded", "for=203.0.113.7"),
+    ] {
+        let req = Request::builder()
+            .uri("/metrics")
+            .header(name, value)
+            .body(Body::empty())
+            .unwrap();
+        let (status, code) = code(h.send(req).await).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (StatusCode::NOT_FOUND, "api/not_found"),
+            "{name}"
+        );
+    }
+    let res = get(&h, "/metrics").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(
+        res.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain; version=0.0.4")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

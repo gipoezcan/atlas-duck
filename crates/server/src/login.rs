@@ -114,6 +114,22 @@ impl LoginService {
         }
     }
 
+    /// Whether the (canonical) username belongs to a deactivated user.
+    fn deactivated(&self, name: &str) -> Result<bool, ApiError> {
+        let Some(u) = self
+            .store
+            .user_by_name(name)
+            .map_err(|_| ApiError::STORE_UNAVAILABLE)?
+        else {
+            return Ok(false);
+        };
+        Ok(self
+            .store
+            .user_state(&u.user_id)
+            .map_err(|_| ApiError::STORE_UNAVAILABLE)?
+            .is_some_and(|s| s.deactivated_at.is_some()))
+    }
+
     /// A counted failure: the reserved attempt stays in the windows; LOGIN_FAILED is appended.
     fn refuse(&self, username: &str, ip: &str, reason: &str, err: ApiError) -> ApiError {
         self.failed(username, ip, reason);
@@ -172,6 +188,10 @@ impl LoginService {
         if user.disabled || !roles.iter().any(|r| r == ROLE_USER) {
             return Err(self.refuse(&name, ip, "not_permitted", ApiError::NOT_PERMITTED));
         }
+        // M13 T5 (SM-6.5): a deactivated user stays out, whatever the directory says now.
+        if self.deactivated(&name)? {
+            return Err(self.refuse(&name, ip, "not_permitted", ApiError::NOT_PERMITTED));
+        }
         let (record, created) = ensure_user(
             self.store.as_ref(),
             &self.master,
@@ -189,6 +209,13 @@ impl LoginService {
         }
         self.limiter.release(&name, ip, now);
         self.limiter.record_success(&name);
+        if self
+            .store
+            .user_set_last_login(&record.user_id, now)
+            .is_err()
+        {
+            tracing::warn!(event = "last_login_not_recorded", user_id = %record.user_id);
+        }
         tracing::info!(event = "login_succeeded", user_id = %record.user_id, source_ip = ip);
         let session = self.sessions.create(&record.user_id, roles.clone())?;
         let role_refs: Vec<&str> = roles.iter().map(String::as_str).collect();

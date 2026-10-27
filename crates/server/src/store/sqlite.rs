@@ -8,37 +8,16 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use super::schema::{M14_TABLES, SCHEMA_VERSION, V1};
+use super::schema::{SCHEMA_VERSION, V1};
 use super::{
     AccessRecord, AnchorHasher, AnchorHead, AnchorRow, ApiKeyRecord, CLIENT_ENDED_SECS,
     CLIENT_UNUSED_SECS, CodeRecord, ConsentRequestRecord, ExportJobRecord, GrantRecord,
-    InstanceRecord, OAuthClientRecord, PatRecord, Redeem, RefreshRecord, Rotate, Sealed,
-    ServerStore, SessionRecord, StoreError, StoreResult, UserRecord,
+    InstanceRecord, JobState, OAuthClientRecord, PatRecord, Redeem, RefreshRecord, Rotate, Sealed,
+    ServerStore, SessionRecord, StoreError, StoreResult, UserRecord, UserState,
 };
 
 pub struct SqliteStore {
     conn: Mutex<Connection>,
-}
-
-/// Applies an additive table set in one transaction when its first table (`oauth_clients`) is
-/// absent; a failure leaves the database as it was (M14 T3; becomes M13's v2 → v3 step).
-pub(crate) fn add_tables(conn: &Connection, sql: &str) -> StoreResult<()> {
-    let present: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'oauth_clients'",
-            [],
-            |r| r.get(0),
-        )
-        .map_err(db)?;
-    if present > 0 {
-        return Ok(());
-    }
-    let tx = conn.unchecked_transaction().map_err(db)?;
-    tx.execute_batch(sql).map_err(|e| {
-        tracing::error!(event = "store_migration_failed", step = "m14_tables");
-        db(e)
-    })?;
-    tx.commit().map_err(db)
 }
 
 fn db(e: rusqlite::Error) -> StoreError {
@@ -105,11 +84,11 @@ impl SqliteStore {
         if version == 0 {
             let tx = conn.unchecked_transaction().map_err(db)?;
             tx.execute_batch(V1).map_err(db)?;
-            tx.execute_batch(&format!("PRAGMA user_version={SCHEMA_VERSION};"))
-                .map_err(db)?;
+            tx.execute_batch("PRAGMA user_version=1;").map_err(db)?;
             tx.commit().map_err(db)?;
         }
-        add_tables(&conn, M14_TABLES)?;
+        // M13 Δ-M13-3: every file, new or old, climbs the same up-migration path.
+        super::migrate::to_current(&conn)?;
         Ok(SqliteStore {
             conn: Mutex::new(conn),
         })
@@ -138,6 +117,18 @@ fn user_row(r: &Row<'_>) -> rusqlite::Result<UserRecord> {
 }
 
 const USER_COLS: &str = "user_id, username, display_name, roles, data_key_wrapped, created_at";
+const STATE_COLS: &str =
+    "deactivated_at, deactivated_by, last_login_at, retention_until, chain_deleted_at";
+
+fn state_row(r: &Row<'_>, at: usize) -> rusqlite::Result<UserState> {
+    Ok(UserState {
+        deactivated_at: r.get(at)?,
+        deactivated_by: r.get(at + 1)?,
+        last_login_at: r.get(at + 2)?,
+        retention_until: r.get(at + 3)?,
+        chain_deleted_at: r.get(at + 4)?,
+    })
+}
 
 fn pat_row(r: &Row<'_>) -> rusqlite::Result<PatRecord> {
     Ok(PatRecord {
@@ -237,7 +228,7 @@ impl ServerStore for SqliteStore {
                 "INSERT INTO users (user_id, username, display_name, roles, data_key_wrapped, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(user_id) DO UPDATE SET display_name = excluded.display_name,
-                     roles = excluded.roles, data_key_wrapped = excluded.data_key_wrapped",
+                     roles = excluded.roles",
                 params![
                     u.user_id,
                     u.username,
@@ -279,6 +270,88 @@ impl ServerStore for SqliteStore {
             .prepare(&format!("SELECT {USER_COLS} FROM users ORDER BY username"))
             .map_err(db)?;
         collect(st.query_map([], user_row).map_err(db)?)
+    }
+
+    fn users_all(&self) -> StoreResult<Vec<(UserRecord, UserState)>> {
+        let c = self.conn();
+        let mut st = c
+            .prepare(&format!(
+                "SELECT {USER_COLS}, {STATE_COLS} FROM users ORDER BY username"
+            ))
+            .map_err(db)?;
+        collect(
+            st.query_map([], |r| Ok((user_row(r)?, state_row(r, 6)?)))
+                .map_err(db)?,
+        )
+    }
+
+    fn user_state(&self, user_id: &str) -> StoreResult<Option<UserState>> {
+        self.conn()
+            .query_row(
+                &format!("SELECT {STATE_COLS} FROM users WHERE user_id = ?1"),
+                [user_id],
+                |r| state_row(r, 0),
+            )
+            .optional()
+            .map_err(db)
+    }
+
+    fn user_set_last_login(&self, user_id: &str, at: i64) -> StoreResult<()> {
+        self.conn()
+            .execute(
+                "UPDATE users SET last_login_at = ?2 WHERE user_id = ?1",
+                params![user_id, at],
+            )
+            .map_err(db)?;
+        Ok(())
+    }
+
+    fn user_purge(&self, user_id: &str, at: i64) -> StoreResult<()> {
+        let mut c = self.conn();
+        let tx = c.transaction().map_err(db)?;
+        for sql in [
+            "DELETE FROM user_keystore WHERE user_id = ?1",
+            "DELETE FROM user_pats WHERE user_id = ?1",
+            "DELETE FROM sessions WHERE user_id = ?1",
+            "DELETE FROM api_keys WHERE user_id = ?1",
+        ] {
+            tx.execute(sql, [user_id]).map_err(db)?;
+        }
+        tx.execute(
+            "UPDATE users SET data_key_wrapped = '', chain_deleted_at = ?2 WHERE user_id = ?1",
+            params![user_id, at],
+        )
+        .map_err(db)?;
+        tx.commit().map_err(db)
+    }
+
+    fn user_deactivate(
+        &self,
+        user_id: &str,
+        at: i64,
+        by: &str,
+        retention_until: i64,
+    ) -> StoreResult<bool> {
+        let n = self
+            .conn()
+            .execute(
+                "UPDATE users SET deactivated_at = ?2, deactivated_by = ?3, retention_until = ?4
+                 WHERE user_id = ?1 AND deactivated_at IS NULL",
+                params![user_id, at, by, retention_until],
+            )
+            .map_err(db)?;
+        Ok(n > 0)
+    }
+
+    fn user_set_wrapped(&self, user_id: &str, expected: &str, new: &str) -> StoreResult<bool> {
+        let n = self
+            .conn()
+            .execute(
+                "UPDATE users SET data_key_wrapped = ?3 WHERE user_id = ?1 AND data_key_wrapped = ?2",
+                params![user_id, expected, new],
+            )
+            .map_err(db)?;
+        Ok(n > 0)
     }
 
     fn ks_get(&self, user_id: &str, entry: &str) -> StoreResult<Option<Sealed>> {
@@ -458,6 +531,14 @@ impl ServerStore for SqliteStore {
         collect(st.query_map([], session_row).map_err(db)?)
     }
 
+    fn sessions_delete_for_user(&self, user_id: &str) -> StoreResult<u64> {
+        let n = self
+            .conn()
+            .execute("DELETE FROM sessions WHERE user_id = ?1", [user_id])
+            .map_err(db)?;
+        Ok(n as u64)
+    }
+
     fn api_key_insert(&self, k: &ApiKeyRecord) -> StoreResult<()> {
         self.conn()
             .execute(
@@ -533,6 +614,33 @@ impl ServerStore for SqliteStore {
             )
             .map_err(db)?;
         Ok(to_u64(n))
+    }
+
+    fn api_keys_revoke_all(&self, user_id: &str, at: i64) -> StoreResult<Vec<ApiKeyRecord>> {
+        let mut c = self.conn();
+        let tx = c.transaction().map_err(db)?;
+        let keys = {
+            let mut st = tx
+                .prepare(&format!(
+                    "SELECT {KEY_COLS} FROM api_keys WHERE user_id = ?1 AND revoked_at IS NULL
+                     ORDER BY created_at, id"
+                ))
+                .map_err(db)?;
+            collect(st.query_map([user_id], key_row).map_err(db)?)?
+        };
+        tx.execute(
+            "UPDATE api_keys SET revoked_at = ?2 WHERE user_id = ?1 AND revoked_at IS NULL",
+            params![user_id, at],
+        )
+        .map_err(db)?;
+        tx.commit().map_err(db)?;
+        Ok(keys
+            .into_iter()
+            .map(|k| ApiKeyRecord {
+                revoked_at: Some(at),
+                ..k
+            })
+            .collect())
     }
 
     fn instance_put(&self, i: &InstanceRecord) -> StoreResult<()> {
@@ -652,6 +760,93 @@ impl ServerStore for SqliteStore {
             st.query_map(params![to_i64(first)?, to_i64(last)?], anchor_row)
                 .map_err(db)?,
         )
+    }
+
+    fn scheduler_get(&self, job: &str) -> StoreResult<JobState> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT last_run_at, last_success_at FROM scheduler_state WHERE job = ?1",
+                [job],
+                |r| {
+                    Ok(JobState {
+                        last_run_at: r.get(0)?,
+                        last_success_at: r.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db)?
+            .unwrap_or_default())
+    }
+
+    fn scheduler_put(&self, job: &str, s: &JobState) -> StoreResult<()> {
+        self.conn()
+            .execute(
+                "INSERT INTO scheduler_state (job, last_run_at, last_success_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(job) DO UPDATE SET last_run_at = excluded.last_run_at,
+                     last_success_at = excluded.last_success_at",
+                params![job, s.last_run_at, s.last_success_at],
+            )
+            .map_err(db)?;
+        Ok(())
+    }
+
+    fn gone_since(&self, user_id: &str) -> StoreResult<Option<i64>> {
+        self.conn()
+            .query_row(
+                "SELECT first_seen_at FROM offboarding_gone WHERE user_id = ?1",
+                [user_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db)
+    }
+
+    fn gone_mark(&self, user_id: &str, at: i64) -> StoreResult<()> {
+        self.conn()
+            .execute(
+                "INSERT OR IGNORE INTO offboarding_gone (user_id, first_seen_at) VALUES (?1, ?2)",
+                params![user_id, at],
+            )
+            .map_err(db)?;
+        Ok(())
+    }
+
+    fn gone_clear(&self, user_id: &str) -> StoreResult<()> {
+        self.conn()
+            .execute("DELETE FROM offboarding_gone WHERE user_id = ?1", [user_id])
+            .map_err(db)?;
+        Ok(())
+    }
+
+    fn anchor_latest_heads(&self) -> StoreResult<Vec<AnchorHead>> {
+        let c = self.conn();
+        let mut st = c
+            .prepare(
+                "SELECT anchor_seq, user_id, chain_id, head_seq, record_hash FROM anchor_heads
+                 WHERE rowid IN (SELECT MAX(rowid) FROM anchor_heads GROUP BY user_id)
+                 ORDER BY user_id",
+            )
+            .map_err(db)?;
+        let rows = collect(st.query_map([], head_row).map_err(db)?)?;
+        Ok(rows.into_iter().map(|(_, h)| h).collect())
+    }
+
+    fn snapshot_to(&self, path: &Path) -> StoreResult<()> {
+        self.conn()
+            .backup(rusqlite::MAIN_DB, path, None)
+            .map_err(db)
+    }
+
+    fn restore_from(&self, path: &Path) -> StoreResult<()> {
+        self.conn()
+            .restore(
+                rusqlite::MAIN_DB,
+                path,
+                None::<fn(rusqlite::backup::Progress)>,
+            )
+            .map_err(db)
     }
 
     fn anchor_last(&self) -> StoreResult<Option<AnchorRow>> {

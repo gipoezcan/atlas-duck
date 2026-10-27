@@ -2,19 +2,23 @@
 //! directory → registry → anchor rows → listen; on SIGTERM / Ctrl-C stop accepting, close every
 //! runtime (`APP_STOP` in each chain), append `SERVER_STOP`, exit 0.
 
+use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use atlas_duck_audit::lock::InstanceLock;
 use atlas_duck_ipc::paths::{DataDirResolution, check_data_dir};
 use serde_json::json;
 
+use crate::admin::AdminCtx;
 use crate::anchor::AnchorWriter;
 use crate::cli::{EXIT_CONFIG, EXIT_OK, EXIT_RUNTIME, config_error_fields};
 use crate::clock::{Clock, SystemClock};
-use crate::config::{Config, DirectoryConfig};
+use crate::config::{Config, ConfigError, DirectoryConfig};
 use crate::directory::Directory;
-use crate::directory::ldap::LdapDirectory;
+use crate::directory::account::AccountLookup;
+use crate::directory::ldap::{LdapDirectory, LdapServiceLookup};
 use crate::directory::stub::StubDirectory;
 use crate::directory::tls::client_config;
 use crate::health::Health;
@@ -22,10 +26,11 @@ use crate::login::LoginService;
 use crate::master_key::MasterKey;
 use crate::ratelimit::LoginLimiter;
 use crate::runtime::{Registry, RegistrySink, RuntimeDeps};
+use crate::scheduler::Scheduler;
 use crate::session::SessionTable;
 use crate::static_files::WebDir;
-use crate::store::ServerStore;
 use crate::store::sqlite::SqliteStore;
+use crate::store::{ServerStore, StoreError};
 use crate::web::{AppInner, AppState, router};
 
 const LOCK_HOST: &str = "atlas-duck-server";
@@ -54,6 +59,25 @@ async fn run(config: Config) -> u8 {
             return EXIT_CONFIG;
         }
     };
+    // M13 T7: during a rotation the next key is accepted too, so a restart mid-way still opens
+    // every user (rows already re-wrapped carry the next key's id).
+    let mut next_id = None;
+    if let Some(next) = &config.master_key_next_file {
+        let accepted = MasterKey::load(next).ok().map(|k| {
+            next_id = Some(k.id());
+            master.accept(k).is_ok()
+        });
+        if accepted != Some(true) {
+            crate::log::stderr_line(
+                "error",
+                config_error_fields(&ConfigError {
+                    code: "config/master_key_next_invalid",
+                    key: crate::config::MASTER_KEY_NEXT_FILE,
+                }),
+            );
+            return EXIT_CONFIG;
+        }
+    }
     let data = config.data_dir.path().to_path_buf();
     let server_dir = data.join("server");
     if std::fs::create_dir_all(&server_dir).is_err() {
@@ -68,29 +92,78 @@ async fn run(config: Config) -> u8 {
     };
     let store: Arc<dyn ServerStore> = match SqliteStore::open(&server_dir.join("server.db")) {
         Ok(s) => Arc::new(s),
+        Err(StoreError::Migration { from, to }) => {
+            // M13 Δ-M13-3: the file stays at `from`; an older build can still open it.
+            tracing::error!(event = "store/migration_failed", from, to);
+            return EXIT_RUNTIME;
+        }
         Err(_) => return fail("server_store_unavailable"),
     };
-    let directory: Arc<dyn Directory> = match &config.directory {
-        DirectoryConfig::Ldap {
-            url,
-            upn_suffix,
-            base_dn,
-        } => match client_config(config.ca_bundle_file.as_deref()) {
-            Ok(tls) => Arc::new(LdapDirectory::new(
-                url.clone(),
-                upn_suffix.clone(),
-                base_dn.clone(),
-                tls,
-            )),
-            Err(_) => return fail("ca_bundle_unusable"),
-        },
-        DirectoryConfig::Stub { file } => match StubDirectory::from_file(file) {
-            Ok(d) => {
-                tracing::warn!(event = "test_directory_active", users = d.user_count());
-                Arc::new(d)
+    // Batch-2 review I1: a rotation under way (the next key already wraps rows) keeps the next key
+    // as the primary across restarts, so no new data key goes under the key about to retire.
+    if let Some(id) = &next_id {
+        match crate::admin::rotate::promote_next_if_in_use(&master, store.as_ref(), id) {
+            Ok(true) => tracing::warn!(event = "rotation_in_progress", primary = %id),
+            Ok(false) => {}
+            Err(_) => return fail("server_store_unavailable"),
+        }
+    }
+    // The login directory, and the offboarding check's account lookup (M13 T9, PD-M13-14): the
+    // LDAP service bind when configured, the test directory's file, else none (manual).
+    let (directory, lookup): (Arc<dyn Directory>, Option<Arc<dyn AccountLookup>>) =
+        match &config.directory {
+            DirectoryConfig::Ldap {
+                url,
+                upn_suffix,
+                base_dn,
+            } => {
+                let Ok(tls) = client_config(config.ca_bundle_file.as_deref()) else {
+                    return fail("ca_bundle_unusable");
+                };
+                let lookup: Option<Arc<dyn AccountLookup>> = match &config.service_bind {
+                    None => None,
+                    Some(bind) => {
+                        let Some(password) = read_secret_file(&bind.password_file) else {
+                            crate::log::stderr_line(
+                                "error",
+                                config_error_fields(&ConfigError {
+                                    code: "config/service_bind_password_unreadable",
+                                    key: crate::config::SERVICE_BIND_PASSWORD_FILE,
+                                }),
+                            );
+                            return EXIT_CONFIG;
+                        };
+                        Some(Arc::new(LdapServiceLookup::new(
+                            url.clone(),
+                            upn_suffix.clone(),
+                            base_dn.clone(),
+                            tls.clone(),
+                            bind.dn.clone(),
+                            password,
+                        )))
+                    }
+                };
+                let dir = Arc::new(LdapDirectory::new(
+                    url.clone(),
+                    upn_suffix.clone(),
+                    base_dn.clone(),
+                    tls,
+                ));
+                (dir, lookup)
             }
-            Err(_) => return fail("test_directory_unusable"),
-        },
+            DirectoryConfig::Stub { file } => match StubDirectory::from_file(file) {
+                Ok(d) => {
+                    tracing::warn!(event = "test_directory_active", users = d.user_count());
+                    let d = Arc::new(d);
+                    (d.clone(), Some(d))
+                }
+                Err(_) => return fail("test_directory_unusable"),
+            },
+        };
+    let offboarding = match (&lookup, &config.directory) {
+        (None, _) => "manual",
+        (Some(_), DirectoryConfig::Stub { .. }) => "stub",
+        (Some(_), DirectoryConfig::Ldap { .. }) => "directory",
     };
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     // M14 PD-246..PD-249: the worker must exist before listening; the probe runs in the
@@ -140,7 +213,7 @@ async fn run(config: Config) -> u8 {
     let sweeper = sessions.spawn_sweeper();
     let login = LoginService {
         store: store.clone(),
-        master,
+        master: master.clone(),
         directory: directory.clone(),
         limiter: Arc::new(LoginLimiter::new(
             config.login_limit_user,
@@ -193,7 +266,13 @@ async fn run(config: Config) -> u8 {
         login,
         registry: registry.clone(),
         web: WebDir(config.web_dir.clone()),
-        health: Arc::new(Health::new(store.clone(), directory, true).with_scripts(scripts.clone())),
+        health: Arc::new(
+            Health::new(store.clone(), directory, true)
+                .with_master(master.clone())
+                .with_offboarding(offboarding)
+                .with_registry(registry.clone())
+                .with_scripts(scripts.clone()),
+        ),
         api_keys,
         mcp_sessions: Arc::new(crate::mcp::McpSessions::new()),
         clock: clock.clone(),
@@ -206,7 +285,32 @@ async fn run(config: Config) -> u8 {
         return fail("anchor_append_failed");
     }
     let anchor_timer = writer.spawn(config.anchor_interval);
-    // M14 PD-240: the daily `oauth_purge` job (M13's scheduler takes it over at merge).
+    // Batch-1 review I-1: a restore interrupted by a crash keeps the server in maintenance.
+    if crate::admin::restore::interrupted(config.data_dir.path()) {
+        registry.set_maintenance(true);
+        tracing::error!(
+            event = "store/restore_interrupted",
+            recover = "admin restore --resume (finish) or admin restore <data>/backups/pre-restore-* (go back), then admin maintenance off"
+        );
+    }
+    let admin = Arc::new(
+        AdminCtx::new(
+            store.clone(),
+            registry.clone(),
+            state.sessions.clone(),
+            state.api_keys.clone(),
+            writer.clone(),
+            clock.clone(),
+            config.retention_days,
+        )
+        .with_max_stream_bytes(config.max_restore_bytes),
+    );
+    let scheduler = Arc::new(Scheduler::new(admin.clone(), lookup, config.offboarding_at));
+    let scheduler_task = scheduler.spawn();
+    let Some(admin_task) = start_admin_socket(&config, admin) else {
+        return fail("admin_socket_unusable");
+    };
+    // M14 PD-240: the daily `oauth_purge` job (an interval task: M13's scheduler runs daily slots only).
     let purge_store = store.clone();
     let purge_clock = clock.clone();
     let oauth_purge = tokio::spawn(async move {
@@ -226,7 +330,7 @@ async fn run(config: Config) -> u8 {
             views_registry.close_idle_views().await;
         }
     });
-    // M14 PD-254: the hourly `export_ttl` job (M13's scheduler takes it over at merge).
+    // M14 PD-254: the hourly `export_ttl` job (an interval task: M13's scheduler runs daily slots only).
     let ttl_exports = exports.clone();
     let export_ttl = tokio::spawn(async move {
         let mut t = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -240,23 +344,15 @@ async fn run(config: Config) -> u8 {
         return fail("listen_failed");
     };
     tracing::info!(event = "listening", addr = %config.listen);
-    let served = axum::serve(
-        listener,
-        router(state).into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await;
+    let served = serve_until(listener, state, &writer, shutdown_signal(), DRAIN).await;
     sweeper.abort();
     anchor_timer.abort();
     oauth_purge.abort();
     idle_views.abort();
     export_ttl.abort();
-    // PD-254: running exports are cancelled and awaited before the stores close.
-    exports.shutdown().await;
-    // Final heads (RUNTIME_CLOSED per runtime, after its APP_STOP) and SERVER_STOP.
-    if writer.shutdown().await.is_err() {
-        tracing::error!(event = "anchor_append_failed", kind = "SERVER_STOP");
-    }
+    admin_task.abort();
+    scheduler_task.abort();
+    let _ = std::fs::remove_file(&config.admin_socket);
     match served {
         Ok(()) => {
             tracing::info!(event = "stopped");
@@ -264,6 +360,91 @@ async fn run(config: Config) -> u8 {
         }
         Err(_) => fail("serve_failed"),
     }
+}
+
+/// A secret file's content without its trailing newline (the service-bind password, M13 T9).
+/// Never logged; `None` when unreadable or empty.
+pub fn read_secret_file(path: &std::path::Path) -> Option<secrecy::SecretString> {
+    let text = zeroize::Zeroizing::new(std::fs::read_to_string(path).ok()?);
+    let line = text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .unwrap_or(&text);
+    (!line.is_empty()).then(|| secrecy::SecretString::from(line.to_owned()))
+}
+
+/// Binds the admin socket (M13 PD-M13-1) and serves it; `None` when it cannot be bound (the
+/// server does not start without its admin interface).
+#[cfg(unix)]
+fn start_admin_socket(config: &Config, ctx: Arc<AdminCtx>) -> Option<tokio::task::JoinHandle<()>> {
+    let (listener, uid) = match crate::admin::socket::bind(&config.admin_socket) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(event = "admin_socket_bind_failed", error = %e);
+            return None;
+        }
+    };
+    tracing::info!(event = "admin_socket_listening");
+    Some(tokio::spawn(crate::admin::socket::serve(
+        listener, uid, ctx,
+    )))
+}
+
+/// No Unix sockets here: the admin CLI is unavailable (the server image is Linux only).
+#[cfg(not(unix))]
+fn start_admin_socket(
+    _config: &Config,
+    _ctx: Arc<AdminCtx>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    tracing::warn!(event = "admin_socket_unsupported");
+    Some(tokio::spawn(async {}))
+}
+
+/// How long open connections may drain after the shutdown signal. SSE streams never end on their
+/// own, so the wait is bounded: drain plus closing the runtimes stays inside the chart's 30 s
+/// `terminationGracePeriodSeconds` (M13 A-13).
+pub const DRAIN: Duration = Duration::from_secs(10);
+
+/// Serves `state` on `listener` until `signal`, lets connections drain for at most `drain`, then
+/// closes every runtime and appends the final heads and `SERVER_STOP`.
+pub async fn serve_until(
+    listener: tokio::net::TcpListener,
+    state: AppState,
+    writer: &AnchorWriter,
+    signal: impl Future<Output = ()> + Send + 'static,
+    drain: Duration,
+) -> std::io::Result<()> {
+    let exports = state.0.exports.clone();
+    let (fired_tx, fired_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve = axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        signal.await;
+        let _ = fired_tx.send(());
+    });
+    let drained = async move {
+        if fired_rx.await.is_ok() {
+            tokio::time::sleep(drain).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    let served = tokio::select! {
+        r = serve.into_future() => r,
+        () = drained => {
+            tracing::warn!(event = "shutdown_drain_elapsed");
+            Ok(())
+        }
+    };
+    // M14 PD-254: running exports are cancelled and awaited before the stores close.
+    exports.shutdown().await;
+    // Final heads (RUNTIME_CLOSED per runtime, after its APP_STOP) and SERVER_STOP.
+    if writer.shutdown().await.is_err() {
+        tracing::error!(event = "anchor_append_failed", kind = "SERVER_STOP");
+    }
+    served
 }
 
 async fn shutdown_signal() {

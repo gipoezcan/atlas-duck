@@ -1,0 +1,62 @@
+# Fixture of ci/check-chart-policy.test.sh: a rendered chart that passes the policy. Each bad
+# variant is made from this file by one sed edit in the test.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: duck-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: "ci-rwo"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: duck
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: server
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            privileged: false
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: ATLAS_DUCK_MASTER_KEY_FILE
+              value: /run/secrets/atlas-duck/master-key/key
+            - name: ATLAS_DUCK_MODE
+              value: "production"
+          startupProbe:
+            httpGet:
+              path: /healthz
+          livenessProbe:
+            httpGet:
+              path: /healthz
+          readinessProbe:
+            httpGet:
+              path: /readyz
+          resources:
+            limits:
+              cpu: "2"
+            requests:
+              cpu: 250m
+          volumeMounts:
+            - name: master-key
+              mountPath: /run/secrets/atlas-duck/master-key
+      volumes:
+        - name: master-key
+          secret:
+            secretName: atlas-duck-master-key

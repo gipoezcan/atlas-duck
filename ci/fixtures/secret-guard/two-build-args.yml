@@ -1,0 +1,3 @@
+build:
+  script:
+    - /kaniko/executor --build-arg "GIT_SHA=${CI_COMMIT_SHA}" --build-arg "FAKE_TOKEN=x"

@@ -1,0 +1,35 @@
+{{- if .Values.ingress.enabled }}
+{{- $host := required "atlas-duck: ingress.host is required" .Values.ingress.host }}
+# `/metrics` cannot be excluded by a plain Ingress path list; the server answers it only to
+# requests that carry no X-Forwarded-For, i.e. not through the ingress (M13 T3/T10 decision).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "atlas-duck.fullname" . }}
+  labels:
+    {{- include "atlas-duck.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  tls:
+    - hosts:
+        - {{ $host | quote }}
+      # An existing Secret; this chart never templates one (PD-M13-6).
+      secretName: {{ required "atlas-duck: ingress.tls.secretName is required" .Values.ingress.tls.secretName }}
+  rules:
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "atlas-duck.fullname" . }}
+                port:
+                  name: http
+{{- end }}

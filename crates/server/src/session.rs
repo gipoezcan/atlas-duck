@@ -151,6 +151,18 @@ impl SessionTable {
             let _ = self.store.session_delete(&key);
             return Err(ApiError::SESSION_EXPIRED);
         }
+        // Batch-1 review M-3: a session a login created while the user was being deactivated dies
+        // at its first use.
+        let user_id = live.record.user_id.clone();
+        if matches!(self.store.user_state(&user_id), Ok(Some(s)) if s.deactivated_at.is_some()) {
+            map.remove(&key);
+            drop(map);
+            let _ = self.store.session_delete(&key);
+            return Err(ApiError::NO_SESSION);
+        }
+        let Some(live) = map.get_mut(&key) else {
+            return Err(ApiError::NO_SESSION);
+        };
         live.record.last_seen = now;
         live.record.idle_expiry = now
             .saturating_add(self.idle)
@@ -172,6 +184,35 @@ impl SessionTable {
         self.lock().remove(&key);
         self.store.session_delete(&key).map_err(store_err)?;
         Ok(())
+    }
+
+    /// After a restore (M13 T6): the memory map becomes the restored store's sessions.
+    pub fn reload(&self) -> Result<(), StoreError> {
+        let mut fresh = HashMap::new();
+        for record in self.store.sessions_all()? {
+            fresh.insert(
+                record.id_hash,
+                Live {
+                    stored_last_seen: record.last_seen,
+                    record,
+                },
+            );
+        }
+        *self.lock() = fresh;
+        Ok(())
+    }
+
+    /// Deactivation (M13 T5): every session of the user ends now, in memory and in the store;
+    /// answers how many were live in memory.
+    pub fn delete_for_user(&self, user_id: &str) -> Result<usize, StoreError> {
+        let removed = {
+            let mut map = self.lock();
+            let before = map.len();
+            map.retain(|_, l| l.record.user_id != user_id);
+            before - map.len()
+        };
+        self.store.sessions_delete_for_user(user_id)?;
+        Ok(removed)
     }
 
     /// Whether the cookie's session is still live now, without touching it (an open SSE stream's

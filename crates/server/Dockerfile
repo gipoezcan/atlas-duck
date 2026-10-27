@@ -30,9 +30,14 @@ FROM rust:1.95.0-bookworm AS build
 # The image's own toolchain (rust-toolchain.toml names the same version but also every desktop
 # target, which this build does not need).
 ENV RUSTUP_TOOLCHAIN=1.95.0
+# M13 T11: a bounded parallel build inside the kaniko job's memory limit (build stage only).
+ENV CARGO_BUILD_JOBS=4
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
+# The one non-test include_str! input outside crates/ in the server's closure:
+# crates/preview/src/sanitize.rs embeds the preview stylesheet.
+COPY app/ui/public/preview.css app/ui/public/preview.css
 # A workspace member; copied only so the workspace resolves with --locked. The server's closure
 # links no Tauri, so no GTK/WebKit packages are needed.
 COPY app/src-tauri/ app/src-tauri/
@@ -55,6 +60,13 @@ USER 65532:65532
 ENTRYPOINT ["/app/confined_scripts"]
 
 FROM gcr.io/distroless/cc-debian12:nonroot
+# M13 T2: the commit only (CI passes $CI_COMMIT_SHA, never a secret; SM-9.1).
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.title="atlas-duck-server" \
+      org.opencontainers.image.source="https://gitlab.intern.gipmbh.de/gip/teams/g-dux/atlas-duck" \
+      org.opencontainers.image.revision="${GIT_SHA}"
+# Writable at run time (read-only root, M13 A-9): ATLAS_DUCK_DATA_DIR and
+# /run/atlas-duck (admin socket); /tmp only as an optional backup target. The chart mounts all three.
 COPY --from=build /src/target/release/atlas-duck-server /app/atlas-duck-server
 # Owned by root, read-only and executable for the server user (PD-250: no capability, no setcap).
 COPY --from=build --chmod=0555 /src/target/release/atlas-duck-sandbox-worker /app/atlas-duck-sandbox

@@ -1,5 +1,6 @@
-//! Command line: `serve`, `version` (plan "Configuration", exit codes). `admin instances` is
-//! Task 13's. M14 T19: `verify-export`, the desktop verifier offline (no configuration, no store).
+//! Command line: `serve`, `version` (plan "Configuration", exit codes), `admin …`, the admin
+//! socket client (M13 PD-M13-1, `admin::client`), and M14 T19's `verify-export`, the desktop
+//! verifier offline (no configuration, no store).
 //!
 //! Exit codes: 0 clean shutdown, 1 runtime failure, 2 usage, 78 configuration (`EX_CONFIG`);
 //! `verify-export` has its own (§12.1: 0, 20, 21, 22, a usage error included).
@@ -18,14 +19,14 @@ pub const EXIT_RUNTIME: u8 = 1;
 pub const EXIT_USAGE: u8 = 2;
 pub const EXIT_CONFIG: u8 = 78;
 
-const USAGE: &str = "usage: atlas-duck-server <serve|version|verify-export <dir> ...>\n";
+const USAGE: &str = "usage: atlas-duck-server <serve|version|admin …|verify-export <dir> ...>\n";
 
 /// What argv asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Serve,
     Version,
-    /// The hidden transitional dmin (PD-212).
+    /// `admin …`: one request to the running server over the admin socket.
     Admin,
     /// M14 T12 (hidden): probe the sandbox worker once, print the report as JSON.
     SandboxProbe,
@@ -78,7 +79,7 @@ pub fn main() -> ExitCode {
             EXIT_USAGE
         }
         Command::Serve => serve(),
-        Command::Admin => crate::admin_offline::run(&args[1..]),
+        Command::Admin => crate::admin::client::run(&args[1..]),
         Command::SandboxProbe => sandbox_probe(),
         Command::VerifyExport => verify_export(
             &os[1..],

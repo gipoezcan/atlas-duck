@@ -1,0 +1,46 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "atlas-duck.fullname" . }}
+  labels:
+    {{- include "atlas-duck.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "atlas-duck.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # The ingress controller and monitoring namespaces (Q2), plus `helm test` pods of this release.
+    - from:
+        {{- range .Values.networkPolicy.ingressNamespaceSelectors }}
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+        {{- end }}
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              atlas-duck/role: helm-test
+      ports:
+        - port: http
+          protocol: TCP
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # LDAPS (SM-2.1) and the Atlassian instances over HTTPS.
+    - ports:
+        - port: 636
+          protocol: TCP
+        - port: 443
+          protocol: TCP
+        {{- range .Values.networkPolicy.extraEgressPorts }}
+        - port: {{ . }}
+          protocol: TCP
+        {{- end }}
+{{- end }}

@@ -1,0 +1,12 @@
+{{- if .Values.testDirectory.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "atlas-duck.fullname" . }}-test-directory
+  labels:
+    {{- include "atlas-duck.labels" . | nindent 4 }}
+data:
+  # Review only (PD-M13-8): test users with fixed, non-secret test passwords (M12 PD-198 format).
+  users.json: |
+    {{- .Values.testDirectory.usersJson | nindent 4 }}
+{{- end }}

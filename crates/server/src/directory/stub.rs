@@ -92,6 +92,38 @@ impl StubDirectory {
         self.users.len()
     }
 
+    /// The offboarding check's view (M13 T9): the file as it is now (re-read; unreadable or
+    /// invalid is `Unavailable`), else the users loaded at start.
+    pub fn account_state_now(
+        &self,
+        username: &str,
+    ) -> Result<super::account::AccountState, DirectoryError> {
+        use super::account::AccountState;
+        let wanted = username.to_lowercase();
+        let state = |disabled: bool| {
+            if disabled {
+                AccountState::Disabled
+            } else {
+                AccountState::Active
+            }
+        };
+        match &self.file {
+            Some(p) => {
+                let fresh = Self::from_file(p).map_err(|_| DirectoryError::Unavailable)?;
+                Ok(fresh
+                    .users
+                    .iter()
+                    .find(|u| u.username == wanted)
+                    .map_or(AccountState::Gone, |u| state(u.disabled)))
+            }
+            None => Ok(self
+                .users
+                .iter()
+                .find(|u| u.username == wanted)
+                .map_or(AccountState::Gone, |u| state(u.disabled))),
+        }
+    }
+
     /// How many `authenticate` calls reached the stub (tests: limited logins never do).
     pub fn calls(&self) -> u64 {
         self.calls.load(Ordering::SeqCst)

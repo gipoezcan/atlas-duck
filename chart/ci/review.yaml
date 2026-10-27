@@ -1,0 +1,37 @@
+# Chart CI (T4): a review environment with the test directory and a rotation in progress.
+mode: review
+publicUrl: https://ci-branch.atlas-duck.ci.example.test
+image:
+  repository: harbor.ci.example.test/dux/atlas-duck-server
+  tag: ci-branch
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+ingress:
+  host: ci-branch.atlas-duck.ci.example.test
+  tls:
+    secretName: ci-wildcard-tls
+persistence:
+  storageClassName: ci-rwo
+  size: 1Gi
+  keep: false
+masterKey:
+  existingSecret: atlas-duck-ci-branch-master-key
+  nextSecret: atlas-duck-ci-branch-master-key-next
+testDirectory:
+  enabled: true
+  usersJson: '{"users":[{"username":"alice","password":"alice-test-password","groups":["cn=atlas-duck-users,ou=groups,dc=test"]}]}'
+groups:
+  users: cn=atlas-duck-users,ou=groups,dc=test
+networkPolicy:
+  enabled: false
+caBundle:
+  # Not a real certificate: the chart only checks for the PEM marker.
+  pem: |
+    -----BEGIN CERTIFICATE-----
+    Q0ktb25seS1ub3QtYS1yZWFsLWNlcnRpZmljYXRl
+    -----END CERTIFICATE-----

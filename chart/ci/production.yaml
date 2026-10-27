@@ -1,0 +1,43 @@
+# Chart CI (T4): production with every production option set.
+mode: production
+publicUrl: https://atlas-duck.ci.example.test
+image:
+  repository: harbor.ci.example.test/dux/atlas-duck-server
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+ingress:
+  className: nginx
+  host: atlas-duck.ci.example.test
+  tls:
+    secretName: ci-tls
+persistence:
+  storageClassName: ci-rwo
+  size: 10Gi
+  keep: true
+masterKey:
+  existingSecret: atlas-duck-master-key
+directory:
+  ldap:
+    url: ldaps://dc.ci.example.test:636
+    upnSuffix: "@ci.example.test"
+    baseDn: dc=ci,dc=example,dc=test
+  serviceBind:
+    dn: cn=svc-atlas-duck,ou=service,dc=ci,dc=example,dc=test
+    existingSecret: atlas-duck-ldap-bind
+groups:
+  users: cn=atlas-duck-users,dc=ci,dc=example,dc=test
+  auditors: cn=atlas-duck-auditors,dc=ci,dc=example,dc=test
+  admins: cn=atlas-duck-admins,dc=ci,dc=example,dc=test
+networkPolicy:
+  ingressNamespaceSelectors:
+    - kubernetes.io/metadata.name: ingress-nginx
+    - kubernetes.io/metadata.name: monitoring
+  extraEgressPorts: [8443]
+extraEnv:
+  - name: RUST_LOG
+    value: info
+caBundle:
+  # Not a real certificate: the chart only checks for the PEM marker.
+  pem: |
+    -----BEGIN CERTIFICATE-----
+    Q0ktb25seS1ub3QtYS1yZWFsLWNlcnRpZmljYXRl
+    -----END CERTIFICATE-----

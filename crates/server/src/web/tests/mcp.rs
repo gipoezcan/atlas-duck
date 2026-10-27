@@ -145,6 +145,8 @@ async fn a_read_key_lists_read_tools_only_and_cannot_propose() {
     assert_eq!(got, want);
     assert!(got.contains(&"jira_issue_get".to_owned()));
     assert!(got.contains(&"ops_list".to_owned()));
+    // A read op whose name starts with a write op's (the smoke test's former false alarm).
+    assert!(got.contains(&"jira_issue_editmeta".to_owned()));
     for absent in ["jira_issue_edit", "request_cancel", "script_run", "call"] {
         assert!(!got.contains(&absent.to_owned()), "{absent} listed");
     }

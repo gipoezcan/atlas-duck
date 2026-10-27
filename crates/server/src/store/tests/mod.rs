@@ -106,7 +106,8 @@ fn users_crud() {
             "{name}"
         );
         assert_eq!(s.user("missing").unwrap(), None, "{name}");
-        // Upsert updates roles and the wrapped key, keeps username and created_at.
+        // Upsert updates roles, keeps username, created_at and (M13 T7) the wrapped key: a login
+        // racing a rotation must never put the old wrapping back.
         let mut changed = user(A, "alice");
         changed.roles = vec!["user".into(), "auditor".into()];
         changed.data_key_wrapped = "rewrapped".into();
@@ -114,8 +115,22 @@ fn users_crud() {
         s.upsert_user(&changed).unwrap();
         let got = s.user(A).unwrap().unwrap();
         assert_eq!(got.roles, changed.roles, "{name}");
-        assert_eq!(got.data_key_wrapped, "rewrapped", "{name}");
+        assert_eq!(
+            got.data_key_wrapped,
+            user(A, "alice").data_key_wrapped,
+            "{name}"
+        );
         assert_eq!(got.created_at, 100, "{name}");
+        // Only a compare-and-set replaces it.
+        let old = got.data_key_wrapped;
+        assert!(!s.user_set_wrapped(A, "stale", "x").unwrap(), "{name}");
+        assert!(s.user_set_wrapped(A, &old, "rewrapped").unwrap(), "{name}");
+        assert_eq!(
+            s.user(A).unwrap().unwrap().data_key_wrapped,
+            "rewrapped",
+            "{name}"
+        );
+        assert!(!s.user_set_wrapped("missing", "x", "y").unwrap(), "{name}");
     }
 }
 
@@ -364,12 +379,169 @@ fn reopen_keeps_sessions_and_newer_schema_is_refused() {
     }
     let s = SqliteStore::open(&path).unwrap();
     assert_eq!(s.session_get(&[7; 32]).unwrap(), Some(session(7, A)));
-    s.raw().execute_batch("PRAGMA user_version = 2;").unwrap();
+    s.raw().execute_batch("PRAGMA user_version = 4;").unwrap();
     drop(s);
     assert!(matches!(
         SqliteStore::open(&path),
-        Err(StoreError::Newer(2))
+        Err(StoreError::Newer(4))
     ));
+}
+
+#[test]
+fn user_state_deactivation_sessions_and_key_revocation() {
+    for (name, s) in stores() {
+        let s = s.as_ref();
+        with_users(s);
+        assert_eq!(
+            s.user_state(A).unwrap(),
+            Some(UserState::default()),
+            "{name}"
+        );
+        assert_eq!(s.user_state("nobody").unwrap(), None, "{name}");
+        s.user_set_last_login(A, 50).unwrap();
+        assert!(s.user_deactivate(A, 60, "admin", 70).unwrap(), "{name}");
+        assert!(
+            !s.user_deactivate(A, 99, "offboarding", 99).unwrap(),
+            "{name}"
+        );
+        let want = UserState {
+            deactivated_at: Some(60),
+            deactivated_by: Some("admin".into()),
+            last_login_at: Some(50),
+            retention_until: Some(70),
+            chain_deleted_at: None,
+        };
+        assert_eq!(s.user_state(A).unwrap(), Some(want.clone()), "{name}");
+        // The login's upsert never clears the lifecycle columns.
+        s.upsert_user(&user(A, "alice")).unwrap();
+        assert_eq!(s.user_state(A).unwrap(), Some(want.clone()), "{name}");
+        let all = s.users_all().unwrap();
+        let names: Vec<&str> = all.iter().map(|(u, _)| u.username.as_str()).collect();
+        assert_eq!(names, ["alice", "bob"], "{name}");
+        assert_eq!(all[0].1, want, "{name}");
+        assert_eq!(all[1].1, UserState::default(), "{name}");
+
+        s.session_put(&session(1, A)).unwrap();
+        s.session_put(&session(2, A)).unwrap();
+        s.session_put(&session(3, B)).unwrap();
+        assert_eq!(s.sessions_delete_for_user(A).unwrap(), 2, "{name}");
+        let left: Vec<String> = s
+            .sessions_all()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.user_id)
+            .collect();
+        assert_eq!(left, [B.to_owned()], "{name}");
+
+        s.api_key_insert(&key("k1", A, "aaaa0001")).unwrap();
+        s.api_key_insert(&key("k2", A, "aaaa0002")).unwrap();
+        s.api_key_insert(&key("k3", B, "bbbb0003")).unwrap();
+        assert!(s.api_key_revoke(A, "k2", 20).unwrap());
+        let revoked = s.api_keys_revoke_all(A, 30).unwrap();
+        let ids: Vec<&str> = revoked.iter().map(|k| k.id.as_str()).collect();
+        assert_eq!(ids, ["k1"], "{name}: only the unrevoked key");
+        assert_eq!(revoked[0].revoked_at, Some(30), "{name}");
+        let a_keys = s.api_key_list(A).unwrap();
+        assert_eq!(
+            a_keys.iter().map(|k| k.revoked_at).collect::<Vec<_>>(),
+            [Some(30), Some(20)],
+            "{name}: k2 keeps its first revocation"
+        );
+        assert_eq!(s.api_key_list(B).unwrap()[0].revoked_at, None, "{name}");
+        assert!(s.api_keys_revoke_all(A, 40).unwrap().is_empty(), "{name}");
+    }
+}
+
+/// A v1 file as M12 wrote it: the v1 schema, `user_version = 1`, a user and a session.
+fn v1_file(path: &std::path::Path) {
+    let c = rusqlite::Connection::open(path).unwrap();
+    c.execute_batch(super::schema::V1).unwrap();
+    c.execute_batch("PRAGMA user_version = 1;").unwrap();
+    c.execute(
+        "INSERT INTO users (user_id, username, display_name, roles, data_key_wrapped, created_at)
+         VALUES (?1, 'alice', 'Alice', '[\"user\"]', '{}', 100)",
+        [A],
+    )
+    .unwrap();
+    c.execute(
+        "INSERT INTO sessions (id_hash, user_id, roles, csrf_token, created_at, last_seen,
+             absolute_expiry, idle_expiry) VALUES (?1, ?2, '[\"user\"]', 'csrf-7', 10, 10, 1000, 500)",
+        rusqlite::params![[7u8; 32].as_slice(), A],
+    )
+    .unwrap();
+}
+
+fn columns(c: &rusqlite::Connection, table: &str) -> Vec<String> {
+    let mut st = c
+        .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+        .unwrap();
+    st.query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<String>>>()
+        .unwrap()
+}
+
+#[test]
+fn migrate_v1_to_v2_keeps_rows_and_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.db");
+    v1_file(&path);
+    let s = SqliteStore::open(&path).unwrap();
+    let v: u32 = s
+        .raw()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, super::schema::SCHEMA_VERSION);
+    assert_eq!(v, 3);
+    let u = s.user(A).unwrap().unwrap();
+    assert_eq!((u.username.as_str(), u.created_at), ("alice", 100));
+    assert_eq!(s.user_state(A).unwrap(), Some(UserState::default()));
+    assert_eq!(s.sessions_all().unwrap().len(), 1);
+    assert_eq!(
+        s.session_get(&[7; 32]).unwrap().unwrap().csrf_token,
+        "csrf-7"
+    );
+    assert!(columns(&s.raw(), "scheduler_state").contains(&"last_success_at".to_owned()));
+    // Reopening a v2 file migrates nothing and keeps everything.
+    drop(s);
+    let s = SqliteStore::open(&path).unwrap();
+    assert_eq!(s.sessions_all().unwrap().len(), 1);
+    // A fresh file climbs the same path.
+    let fresh = SqliteStore::open(&dir.path().join("fresh.db")).unwrap();
+    assert_eq!(
+        columns(&fresh.raw(), "users"),
+        columns(&s.raw(), "users"),
+        "fresh and migrated files have one schema"
+    );
+}
+
+#[test]
+fn failed_migration_leaves_v1() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.db");
+    v1_file(&path);
+    // A table the v2 step creates already exists, so the step fails part-way (after the ALTERs).
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE TABLE scheduler_state (x INTEGER);")
+        .unwrap();
+    assert!(matches!(
+        SqliteStore::open(&path),
+        Err(StoreError::Migration { from: 1, to: 2 })
+    ));
+    let c = rusqlite::Connection::open(&path).unwrap();
+    let v: u32 = c
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 1);
+    assert!(
+        !columns(&c, "users").contains(&"deactivated_at".to_owned()),
+        "the ALTERs were rolled back"
+    );
+    let n: i64 = c
+        .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
 }
 
 #[test]
@@ -788,7 +960,7 @@ fn has_table(c: &rusqlite::Connection, name: &str) -> bool {
 }
 
 #[test]
-fn m14_tables_are_added_to_an_m12_database_keeping_its_rows() {
+fn m14_tables_are_the_v3_step_and_keep_the_rows() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("server.db");
     v1_db_with_rows(&path);
@@ -810,7 +982,7 @@ fn m14_tables_are_added_to_an_m12_database_keeping_its_rows() {
     let v: u32 = c
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 1, "M14 bumps no version (v2 is M13's)");
+    assert_eq!(v, 3, "M13's v2, then M14's v3");
     drop(c);
     drop(s);
     // Reopening is a no-op.
@@ -819,15 +991,22 @@ fn m14_tables_are_added_to_an_m12_database_keeping_its_rows() {
 }
 
 #[test]
-fn a_failed_table_step_leaves_the_database_unchanged() {
+fn a_failed_v3_step_leaves_the_database_at_v2() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("server.db");
     v1_db_with_rows(&path);
     let c = rusqlite::Connection::open(&path).unwrap();
-    let broken = format!("{}\nCREATE TABLE broken (;", super::schema::M14_TABLES);
-    assert!(super::sqlite::add_tables(&c, &broken).is_err());
-    assert!(!has_table(&c, "oauth_clients"));
+    super::migrate::migrate(&c, 1, 2).unwrap();
+    // A table in the way makes the v2 -> v3 step fail inside its transaction.
+    c.execute_batch("CREATE TABLE oauth_clients (x INTEGER);")
+        .unwrap();
+    assert!(super::migrate::migrate(&c, 2, 3).is_err());
     assert!(!has_table(&c, "export_jobs"));
+    assert!(!has_table(&c, "oauth_grants"));
+    let v: u32 = c
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 2);
     let users: i64 = c
         .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
         .unwrap();
