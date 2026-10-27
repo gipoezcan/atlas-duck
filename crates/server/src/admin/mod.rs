@@ -20,12 +20,16 @@ pub mod tarball;
 pub mod users;
 
 #[cfg(test)]
+#[path = "../tests/admin_backup.rs"]
 mod backup_tests;
 #[cfg(test)]
+#[path = "../tests/admin_retention.rs"]
 mod retention_tests;
 #[cfg(test)]
+#[path = "../tests/admin_rotate.rs"]
 mod rotate_tests;
 #[cfg(test)]
+#[path = "../tests/admin.rs"]
 mod tests;
 
 use std::sync::Arc;
