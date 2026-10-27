@@ -172,6 +172,8 @@ chart:test:
   vars: &server-vars
     APP_NAME: atlas-duck-server
     KUBE_CONTEXT: team-dux@gip
+    # The g-dux group's file variable KUBECONFIG_DUX holds the team-dux@gip context.
+    KUBECONFIG: ${KUBECONFIG_DUX}
     KUBE_NAMESPACE: team-dux
     # Review hosts are <slug>.<REVIEW_DOMAIN>; each gets its own cert-manager certificate in the
     # Secret <release>-tls (no wildcard exists).
