@@ -29,6 +29,8 @@ FROM rust:1.95.0-bookworm AS build
 # The image's own toolchain (rust-toolchain.toml names the same version but also every desktop
 # target, which this build does not need).
 ENV RUSTUP_TOOLCHAIN=1.95.0
+# M13 T11: a bounded parallel build inside the kaniko job's memory limit (build stage only).
+ENV CARGO_BUILD_JOBS=4
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/

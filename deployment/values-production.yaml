@@ -1,0 +1,61 @@
+# Production values (M13 plan T11). Every CHANGE-ME is an open user question; the
+# deploy:production job refuses to run while any CHANGE-ME is left in this file.
+# No secret belongs here (SM-9.1).
+
+mode: production
+
+# Q2: production hostname. Plan proposal: atlas-duck.dux.intern.gipmbh.de (unconfirmed).
+publicUrl: https://CHANGE-ME
+
+ingress:
+  # Q2 (same host as publicUrl, without the scheme).
+  host: CHANGE-ME
+  tls:
+    # Q3: an existing TLS Secret in team-dux (provisioned out of band, PD-M13-6).
+    secretName: CHANGE-ME
+
+persistence:
+  # Q1: a storage class offering ReadWriteOnce block storage (not NFS, ADR 0003).
+  # team-dux-storage is used ReadWriteMany by dux-deploy; whether it offers RWO is open.
+  storageClassName: CHANGE-ME
+  size: 10Gi
+  keep: true
+
+masterKey:
+  # Q5: created out of band by the key holder (docs/server/deployment.md), never by CI.
+  existingSecret: atlas-duck-master-key
+
+directory:
+  ldap:
+    # Q4: dux-deploy's values use ldaps://sro-ad-4.intern.gipmbh.de:636, @gipmbh.de and
+    # DC=intern,DC=gipmbh,DC=de; confirm before the first deploy.
+    url: CHANGE-ME
+    upnSuffix: CHANGE-ME
+    baseDn: CHANGE-ME
+  # Q6: only if a read-only service account is approved (PD-M13-14); both or neither.
+  serviceBind:
+    dn: ""
+    existingSecret: ""
+
+groups:
+  # Q4: the group DNs that grant the roles (SM-2.3).
+  users: CHANGE-ME
+  auditors: CHANGE-ME
+  admins: CHANGE-ME
+
+testDirectory:
+  enabled: false
+
+networkPolicy:
+  enabled: true
+  # Q2: labels of the ingress controller and monitoring namespaces.
+  ingressNamespaceSelectors:
+    - kubernetes.io/metadata.name: CHANGE-ME
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi

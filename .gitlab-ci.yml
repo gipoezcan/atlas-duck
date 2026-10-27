@@ -17,7 +17,7 @@
 # artifact (tauri::generate_context! needs it at compile time, so clippy and the tests
 # cannot run without it), and the checks that need both (ci/check-workspace.mjs runs
 # `cargo metadata`) run in the Node job after installing a minimal rustup toolchain.
-stages: [ui, check, supply-chain, server-prepare]
+stages: [ui, check, supply-chain, server-prepare, server-build, server-package, server-publish, server-deploy, server-verify]
 
 default:
   image: rust:1.95
@@ -159,3 +159,331 @@ chart:test:
     when: always
     paths: [rendered/]
     expire_in: 1 week
+
+# T11 (SM-1.4, SM-9, PD-M13-5, -9, -11, -12): build, publish and deploy the server.
+# CI variables hold only registry credentials (HARBOR_*, ARTIFACTORY_*) and the cluster context
+# of the runner; no secret reaches the chart, an image layer or a log (SM-9.1). Logins read the
+# password from stdin. Images are deployed by digest.
+#
+# Open questions (plan Q1-Q6) are CHANGE-ME placeholders: the deploy jobs refuse to run while
+# one is left in the files or variables they use.
+# Anchors only (a hidden key, never a job).
+.server-anchors:
+  vars: &server-vars
+    APP_NAME: atlas-duck-server
+    KUBE_CONTEXT: team-dux@gip
+    KUBE_NAMESPACE: team-dux
+    # Q2: review hosts are <slug>.<REVIEW_DOMAIN>. Plan proposal: atlas-duck.dux.intern.gipmbh.de.
+    REVIEW_DOMAIN: CHANGE-ME
+    # Q3: the TLS Secret (wildcard) that covers the review hosts.
+    REVIEW_TLS_SECRET: CHANGE-ME
+
+  # Branch pipelines run the server jobs only when server-relevant paths changed against master
+  # (PD-M13-12), so desktop-only branches never touch the cluster; master and server-v* tags
+  # always.
+  paths: &server-paths
+    - crates/server*/**/*
+    - crates/mcp-tools/**/*
+    - app/ui/**/*
+    - chart/**/*
+    - deployment/**/*
+    - .gitlab-ci.yml
+
+  rules: &server-rules
+    - if: $CI_COMMIT_TAG =~ /^server-v/
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == "master"
+    - if: $CI_COMMIT_BRANCH
+      changes:
+        paths: *server-paths
+        compare_to: refs/heads/master
+
+  review-rules: &review-rules
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == "master"
+      when: never
+    - if: $CI_COMMIT_BRANCH
+      changes:
+        paths: *server-paths
+        compare_to: refs/heads/master
+
+  # Refuses to go on while a placeholder is left (call with the files and NAME=value pairs).
+  no-placeholders: &no-placeholders |
+    no_placeholders() {
+      bad=0
+      for f in "$@"; do
+        case "$f" in
+          *=*) name="${f%%=*}"; value="${f#*=}"
+               if [ "$value" = CHANGE-ME ] || [ -z "$value" ]; then echo "open question: CI variable $name is not set (see plan Q1-Q6)"; bad=1; fi ;;
+          *) if grep -n 'CHANGE-ME' "$f"; then echo "open question: CHANGE-ME left in $f (see plan Q1-Q6)"; bad=1; fi ;;
+        esac
+      done
+      [ "$bad" = 0 ]
+    }
+server:version:
+  stage: server-prepare
+  image: alpine:3.20.3
+  needs: []
+  variables: *server-vars
+  rules: *server-rules
+  script:
+    - |
+      set -eu
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        PROJECT_VERSION="${CI_COMMIT_TAG#server-v}"
+        ARTIFACTORY_URL="${DOCKER_RELEASE_REPO:-central-docker-appinternal-release-local.intern.gipmbh.de}"
+        ARTIFACTORY_HELM_URL="${HELM_RELEASE_REPO:-central-helm-integration-local.intern.gipmbh.de}"
+      else
+        # dux-deploy's date+slug+time+sha scheme, as SemVer (no leading zeros in minor/patch).
+        DAY="${CI_JOB_STARTED_AT%%T*}"
+        Y="${DAY%%-*}"; REST="${DAY#*-}"; M="${REST%%-*}"; D="${REST#*-}"
+        M="${M#0}"; D="${D#0}"
+        TIME_PART="${CI_JOB_STARTED_AT#*T}"; TIME_PART="${TIME_PART%Z}"; TIME_PART="${TIME_PART%+*}"
+        HMS="$(echo "$TIME_PART" | awk -F: '{printf "%sh%sm%s", $1, $2, int($3)}')"
+        SLUG="$(printf '%s' "${CI_COMMIT_REF_SLUG}" | cut -c1-25 | sed 's/-*$//')"
+        PROJECT_VERSION="${Y}.${M}.${D}-${SLUG}-${HMS}-${CI_COMMIT_SHORT_SHA}"
+        ARTIFACTORY_URL="${DOCKER_DEV_REPO:-central-docker-appinternal-dev-local.intern.gipmbh.de}"
+        ARTIFACTORY_HELM_URL="${HELM_DEV_REPO:-central-helm-dev-local.intern.gipmbh.de}"
+      fi
+      {
+        echo "PROJECT_VERSION=${PROJECT_VERSION}"
+        echo "ARTIFACTORY_URL=${ARTIFACTORY_URL}"
+        echo "ARTIFACTORY_REPO_KEY=${ARTIFACTORY_URL%%.*}"
+        echo "ARTIFACTORY_HELM_URL=${ARTIFACTORY_HELM_URL}"
+      } | tee build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+
+server:image:
+  stage: server-build
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
+  needs: [server:version]
+  rules: *server-rules
+  variables:
+    <<: *server-vars
+    # A Rust release build (CARGO_BUILD_JOBS=4 in the Dockerfile's build stage).
+    KUBERNETES_CPU_REQUEST: "2000m"
+    KUBERNETES_CPU_LIMIT: "4000m"
+    KUBERNETES_MEMORY_REQUEST: "6Gi"
+    KUBERNETES_MEMORY_LIMIT: "12Gi"
+  script:
+    - mkdir -p /kaniko/.docker
+    # The registry login lands in the job's own filesystem only (as dux-deploy), never in a log.
+    - |
+      cat <<EOF > /kaniko/.docker/config.json
+      {"auths":{"${HARBOR_HOST}":{"username":"${HARBOR_USERNAME}","password":"${HARBOR_PASSWORD}"}}}
+      EOF
+    # The only build argument is the commit (SM-9.1, PD-M13-9).
+    - /kaniko/executor
+      --context "${CI_PROJECT_DIR}"
+      --dockerfile "${CI_PROJECT_DIR}/crates/server/Dockerfile"
+      --destination "${HARBOR_HOST}/${HARBOR_PROJECT}/${APP_NAME}:${CI_COMMIT_REF_SLUG}"
+      --build-arg "GIT_SHA=${CI_COMMIT_SHA}"
+      --digest-file "${CI_PROJECT_DIR}/image.digest"
+      --cache=true
+      --cache-ttl=24h
+  artifacts:
+    paths: [image.digest]
+    expire_in: 30 days
+
+server:publish-harbor:
+  stage: server-publish
+  image:
+    name: quay.io/skopeo/stable:v1.16.1
+    entrypoint: [""]
+  needs: [server:version, server:image]
+  rules: *server-rules
+  variables: *server-vars
+  # The persistent Harbor project named after the Artifactory repo key (dux-deploy pattern): the
+  # deploy jobs pull from here, by digest.
+  script:
+    - printf '%s' "${HARBOR_PASSWORD}" | skopeo login --username "${HARBOR_USERNAME}" --password-stdin "${HARBOR_HOST}"
+    - skopeo copy --preserve-digests
+      "docker://${HARBOR_HOST}/${HARBOR_PROJECT}/${APP_NAME}@$(cat image.digest)"
+      "docker://${HARBOR_HOST}/${ARTIFACTORY_REPO_KEY}/${APP_NAME}:${PROJECT_VERSION}"
+  retry:
+    max: 2
+    when: [runner_system_failure, stuck_or_timeout_failure, unknown_failure, api_failure]
+
+server:publish-artifactory:
+  stage: server-publish
+  image:
+    name: quay.io/skopeo/stable:v1.16.1
+    entrypoint: [""]
+  needs: [server:version, server:image]
+  rules: *server-rules
+  variables: *server-vars
+  script:
+    - printf '%s' "${HARBOR_PASSWORD}" | skopeo login --username "${HARBOR_USERNAME}" --password-stdin "${HARBOR_HOST}"
+    - printf '%s' "${ARTIFACTORY_PASSWORD}" | skopeo login --username "${ARTIFACTORY_USERNAME}" --password-stdin "${ARTIFACTORY_URL}"
+    - skopeo copy --preserve-digests
+      "docker://${HARBOR_HOST}/${HARBOR_PROJECT}/${APP_NAME}@$(cat image.digest)"
+      "docker://${ARTIFACTORY_URL}/${APP_NAME}:${PROJECT_VERSION}"
+
+server:chart-package:
+  stage: server-package
+  image:
+    name: alpine/helm:3.16.3
+    entrypoint: [""]
+  needs: [server:version]
+  rules: *server-rules
+  variables: *server-vars
+  script:
+    - 'sed -i "s/^version: .*/version: ${PROJECT_VERSION}/" chart/Chart.yaml'
+    - 'sed -i "s/^appVersion: .*/appVersion: \"${PROJECT_VERSION}\"/" chart/Chart.yaml'
+    - helm lint --strict chart -f chart/ci/minimal.yaml
+    - helm package chart
+  artifacts:
+    paths: ["${APP_NAME}-${PROJECT_VERSION}.tgz"]
+    expire_in: 30 days
+
+server:chart-publish:
+  stage: server-publish
+  image:
+    name: alpine/helm:3.16.3
+    entrypoint: [""]
+  needs: [server:version, server:chart-package]
+  rules: *server-rules
+  variables: *server-vars
+  script:
+    - printf '%s' "${ARTIFACTORY_PASSWORD}" | helm registry login --username "${ARTIFACTORY_USERNAME}" --password-stdin "${ARTIFACTORY_HELM_URL}"
+    - helm push "${APP_NAME}-${PROJECT_VERSION}.tgz" "oci://${ARTIFACTORY_HELM_URL}/"
+
+.deploy-base: &deploy-base
+  image:
+    name: ghcr.io/helmfile/helmfile:v0.169.1
+    entrypoint: [""]
+  stage: server-deploy
+  needs: [server:version, server:image, server:publish-harbor, server:chart-package]
+  before_script:
+    - mkdir -p build
+    - tar xzf "${APP_NAME}-${PROJECT_VERSION}.tgz" -C build
+    - mv build/${APP_NAME} build/chart
+    - cp -Rp deployment/* build/
+
+deploy:review:
+  <<: *deploy-base
+  variables: *server-vars
+  rules: *review-rules
+  script:
+    - *no-placeholders
+    - |
+      set -eu
+      no_placeholders deployment/values-review.yaml deployment/ca/org-ca.pem \
+        "REVIEW_DOMAIN=${REVIEW_DOMAIN}" "REVIEW_TLS_SECRET=${REVIEW_TLS_SECRET}"
+      SLUG="$(printf '%s' "${CI_COMMIT_REF_SLUG}" | cut -c1-40 | sed 's/-*$//')"
+      export RELEASE_NAME="atlas-duck-${SLUG}"
+      HOST="${SLUG}.${REVIEW_DOMAIN}"
+      KEY_SECRET="${RELEASE_NAME}-master-key"
+      K="kubectl --context ${KUBE_CONTEXT} -n ${KUBE_NAMESPACE}"
+      # PD-M13-5: a per-environment test master key, generated here into a job-local tmpfs file
+      # and written straight into a Secret; never echoed, never a CI variable. Only if absent, so
+      # a redeploy keeps the data readable. stop:review deletes it.
+      if ! $K get secret "${KEY_SECRET}" -o name > /dev/null 2>&1; then
+        set +x
+        KEY_DIR="$(mktemp -d /dev/shm/atlas-duck-key.XXXXXX)"
+        chmod 700 "${KEY_DIR}"
+        ( umask 077
+          printf 'atlas-duck-master-key/v1 review-%s %s\n' "${CI_PIPELINE_ID}" \
+            "$(head -c 32 /dev/urandom | base64 | tr -d '\n')" > "${KEY_DIR}/key" )
+        $K create secret generic "${KEY_SECRET}" --from-file=key="${KEY_DIR}/key" > /dev/null
+        rm -rf "${KEY_DIR}"
+        echo "created review master key Secret ${KEY_SECRET}"
+      fi
+      ARGS="--set image.repository=${HARBOR_HOST}/${ARTIFACTORY_REPO_KEY}/${APP_NAME}"
+      ARGS="${ARGS} --set image.digest=$(cat image.digest)"
+      ARGS="${ARGS} --set publicUrl=https://${HOST} --set ingress.host=${HOST}"
+      ARGS="${ARGS} --set ingress.tls.secretName=${REVIEW_TLS_SECRET}"
+      ARGS="${ARGS} --set masterKey.existingSecret=${KEY_SECRET}"
+      ARGS="${ARGS} --set podAnnotations.commit-sha=${CI_COMMIT_SHORT_SHA}"
+      # Server-side schema validation before anything changes (PD-M13-10).
+      helmfile -e review -f build/helmfile.yaml template ${ARGS} > rendered-review.yaml
+      $K apply --dry-run=server -f rendered-review.yaml > /dev/null
+      helmfile -e review -f build/helmfile.yaml apply ${ARGS}
+      echo "REVIEW_URL=https://${HOST}" > review.env
+      echo "RELEASE_NAME=${RELEASE_NAME}" >> review.env
+  artifacts:
+    reports:
+      dotenv: review.env
+    paths: [rendered-review.yaml]
+    expire_in: 3 days
+  environment:
+    name: review/$CI_COMMIT_REF_SLUG
+    url: $REVIEW_URL
+    on_stop: stop:review
+    auto_stop_in: 3 days
+
+# Self-contained (dux-deploy's lesson): runs days later when artifacts and the branch are gone.
+stop:review:
+  image:
+    name: ghcr.io/helmfile/helmfile:v0.169.1
+    entrypoint: [""]
+  stage: server-deploy
+  needs: []
+  variables:
+    <<: *server-vars
+    GIT_STRATEGY: none
+  script:
+    - |
+      set -eu
+      SLUG="$(printf '%s' "${CI_COMMIT_REF_SLUG}" | cut -c1-40 | sed 's/-*$//')"
+      RELEASE_NAME="atlas-duck-${SLUG}"
+      K="kubectl --context ${KUBE_CONTEXT} -n ${KUBE_NAMESPACE}"
+      helm uninstall "${RELEASE_NAME}" --namespace "${KUBE_NAMESPACE}" --kube-context "${KUBE_CONTEXT}" --ignore-not-found
+      # The throwaway volume and the test keys go with it (review only; production keeps its PVC).
+      $K delete pvc "${RELEASE_NAME}-data" --ignore-not-found
+      $K delete secret "${RELEASE_NAME}-master-key" "${RELEASE_NAME}-master-key-next" --ignore-not-found
+  environment:
+    name: review/$CI_COMMIT_REF_SLUG
+    action: stop
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == "master"
+      when: never
+    - if: $CI_COMMIT_BRANCH
+      changes:
+        paths: *server-paths
+        compare_to: refs/heads/master
+      when: manual
+  allow_failure: true
+
+# PD-M13-11: master only, manual, and the pipeline stays blocked until someone decides. The
+# lead triggers it only after the user's explicit go-ahead.
+deploy:production:
+  <<: *deploy-base
+  variables: *server-vars
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+      when: manual
+  allow_failure: false
+  script:
+    - *no-placeholders
+    - |
+      set -eu
+      no_placeholders deployment/values-production.yaml deployment/ca/org-ca.pem
+      export RELEASE_NAME="atlas-duck"
+      K="kubectl --context ${KUBE_CONTEXT} -n ${KUBE_NAMESPACE}"
+      # The production master key is created out of band (PD-M13-5): check it exists, by name only.
+      if ! $K get secret atlas-duck-master-key -o name > /dev/null 2>&1; then
+        echo "Secret atlas-duck-master-key is missing in ${KUBE_NAMESPACE}: create it first (docs/server/deployment.md)"
+        exit 1
+      fi
+      BIND_SECRET="$(sed -n 's/^    existingSecret: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' deployment/values-production.yaml | tail -n 1)"
+      if [ -n "${BIND_SECRET}" ] && ! $K get secret "${BIND_SECRET}" -o name > /dev/null 2>&1; then
+        echo "Secret ${BIND_SECRET} (directory service bind) is missing"
+        exit 1
+      fi
+      ARGS="--set image.repository=${HARBOR_HOST}/${ARTIFACTORY_REPO_KEY}/${APP_NAME}"
+      ARGS="${ARGS} --set image.digest=$(cat image.digest)"
+      ARGS="${ARGS} --set podAnnotations.commit-sha=${CI_COMMIT_SHORT_SHA}"
+      helmfile -e production -f build/helmfile.yaml template ${ARGS} > rendered-production.yaml
+      $K apply --dry-run=server -f rendered-production.yaml > /dev/null
+      helmfile -e production -f build/helmfile.yaml apply ${ARGS}
+  environment:
+    name: production
