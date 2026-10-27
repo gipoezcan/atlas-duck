@@ -99,8 +99,10 @@ sid="$(sed -n 's/^[Mm]cp-[Ss]ession-[Ii]d: *\([^[:space:]]*\).*/\1/p' "$WORK/mcp
 mcp '{"jsonrpc":"2.0","method":"notifications/initialized"}' -H "Mcp-Session-Id: $sid" > /dev/null
 st="$(mcp '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' -H "Mcp-Session-Id: $sid")"
 [ "$st" = 200 ] || fail "tools/list answered $st"
-grep -q 'jira_issue_get' "$WORK/mcp" || fail "tools/list lacks jira_issue_get"
-if grep -q 'jira_issue_edit' "$WORK/mcp"; then fail "a read key lists a write tool"; fi
+# Exact tool names: the read tool jira_issue_editmeta contains the write tool's name as a prefix.
+grep -q '"name":"jira_issue_get"' "$WORK/mcp" || fail "tools/list lacks jira_issue_get"
+grep -q '"name":"jira_issue_editmeta"' "$WORK/mcp" || fail "tools/list lacks jira_issue_editmeta"
+if grep -q '"name":"jira_issue_edit"' "$WORK/mcp"; then fail "a read key lists a write tool"; fi
 
 # Revoked: the key is refused at once.
 st="$(status_of "$BASE/api/me/api-keys/$key_id" -X DELETE -b "$JAR" -H "Origin: $BASE" \
