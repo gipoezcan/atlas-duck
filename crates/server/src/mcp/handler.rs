@@ -21,7 +21,7 @@ use atlas_duck_mcp_tools::tools::{
     FIXED_TOOLS, catalog, op_for_tool, split_op_args, validate_fixed_args,
 };
 use atlas_duck_mcp_tools::toolset::ToolSet;
-use atlas_duck_registry::OpClass;
+use atlas_duck_registry::{OpClass, SCRIPT_RUN};
 use axum::http::request::Parts;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, ListToolsResult,
@@ -61,10 +61,11 @@ fn has(scopes: &[String], s: &str) -> bool {
     scopes.iter().any(|x| x == s)
 }
 
-/// PD-215: may a key with `scopes` use `tool`? `script_run` is never served in M12 (L224).
+/// PD-215: may a key with `scopes` use `tool`? M14 PD-242 (SM-7.1): `script_run` needs the
+/// `scripts` scope (API key or OAuth); awaiting a script's request needs `read` like any other.
 pub fn allowed(tool: &str, scopes: &[String]) -> bool {
     match tool {
-        "script_run" => false,
+        "script_run" => has(scopes, "scripts"),
         "request_cancel" => has(scopes, "propose_write"),
         t if READ_FIXED.contains(&t) => has(scopes, "read"),
         t => match op_for_tool(t) {
@@ -242,7 +243,11 @@ impl Call<'_> {
     }
 
     async fn submit_and_wait(&self, sp: SubmitParams, progress: &mut Progress) -> Envelope {
-        let reply = self.handler.submit(&self.conn, sp).await;
+        let reply = if sp.op_id == SCRIPT_RUN.id {
+            self.handler.submit_script(&self.conn, sp).await
+        } else {
+            self.handler.submit(&self.conn, sp).await
+        };
         let env = reply.envelope;
         if env.status != Status::Pending {
             return env;
@@ -326,6 +331,37 @@ impl Call<'_> {
                     .await
             }
             "instances_list" => h.instances_list().await,
+            // §9.1 `{source, args, limits?, dry_run?}`; a script names no instance (PD-124).
+            "script_run" => {
+                let mut params = Map::new();
+                params.insert(
+                    "source".into(),
+                    Value::from(string_arg(&args, "source").unwrap_or_default()),
+                );
+                params.insert(
+                    "args".into(),
+                    args.get("args")
+                        .cloned()
+                        .unwrap_or_else(|| Value::Object(Map::new())),
+                );
+                if let Some(limits) = args.get("limits") {
+                    params.insert("limits".into(), limits.clone());
+                }
+                if let Some(d) = args
+                    .get("dry_run")
+                    .and_then(Value::as_str)
+                    .filter(|d| *d == "full" || *d == "sparse")
+                {
+                    params.insert("dry_run".into(), Value::from(d));
+                }
+                let sp = SubmitParams {
+                    op_id: SCRIPT_RUN.id.to_owned(),
+                    params: Value::Object(params),
+                    instance: None,
+                    reason: string_arg(&args, "reason"),
+                };
+                self.submit_and_wait(sp, progress).await
+            }
             op => match op_for_tool(op) {
                 Some(spec) => match split_op_args(args) {
                     Ok((params, reason, instance)) => {

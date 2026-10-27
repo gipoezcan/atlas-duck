@@ -1,6 +1,7 @@
-//! T19 Step 3 (PD-193, PD-215, L224): the server's tool list is M9's catalog, filtered by scope.
-//! `read + propose_write` serves `catalog(ToolSet::Full)` minus `script_run`, byte for byte;
-//! `read` serves the read op tools and the six read fixed tools.
+//! T19 Step 3 (PD-193, PD-215) and M14 T13 (PD-242, SM-7.1): the server's tool list is M9's
+//! `catalog(ToolSet::Full)`, filtered by scope, byte for byte, for every scope set. The rule,
+//! written out here independently of the handler: write op tools and `request_cancel` need
+//! `propose_write`, `script_run` needs `scripts`, every other tool needs `read`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -13,22 +14,48 @@ fn scopes(s: &[&str]) -> Vec<String> {
     s.iter().map(|x| (*x).to_owned()).collect()
 }
 
+/// The documented rule.
+fn needs(tool: &str) -> &'static str {
+    match tool {
+        "script_run" => "scripts",
+        "request_cancel" => "propose_write",
+        t => match op_for_tool(t) {
+            Some(spec) if spec.class == OpClass::Write => "propose_write",
+            _ => "read",
+        },
+    }
+}
+
 #[test]
-fn read_and_propose_write_serve_the_full_catalog_without_script_run() {
-    let want: Vec<_> = catalog(ToolSet::Full)
-        .into_iter()
-        .filter(|t| t.name != "script_run")
-        .collect();
-    let got = tools_for(&scopes(&["read", "propose_write"]));
+fn every_scope_set_serves_the_catalog_filtered_by_the_rule() {
+    let all = ["read", "propose_write", "scripts"];
+    for mask in 1u8..8 {
+        let set: Vec<&str> = all
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| mask & (1 << i) != 0)
+            .map(|(_, s)| *s)
+            .collect();
+        let want: Vec<_> = catalog(ToolSet::Full)
+            .into_iter()
+            .filter(|t| set.contains(&needs(&t.name)))
+            .collect();
+        let got = tools_for(&scopes(&set));
+        assert_eq!(
+            serde_json::to_string(&got).unwrap(),
+            serde_json::to_string(&want).unwrap(),
+            "{set:?}"
+        );
+        assert_eq!(
+            got.iter().any(|t| t.name == "script_run"),
+            set.contains(&"scripts"),
+            "{set:?}"
+        );
+    }
+    // All three scopes serve the whole catalog.
     assert_eq!(
-        serde_json::to_string(&got).unwrap(),
-        serde_json::to_string(&want).unwrap()
-    );
-    // `scripts` lists nothing more before M14.
-    let with_scripts = tools_for(&scopes(&["read", "propose_write", "scripts"]));
-    assert_eq!(
-        serde_json::to_string(&with_scripts).unwrap(),
-        serde_json::to_string(&want).unwrap()
+        serde_json::to_string(&tools_for(&scopes(&all))).unwrap(),
+        serde_json::to_string(&catalog(ToolSet::Full)).unwrap()
     );
 }
 
@@ -55,6 +82,7 @@ fn read_serves_the_read_subset() {
         serde_json::to_string(&want).unwrap()
     );
     assert!(!got.iter().any(|t| t.name == "request_cancel"));
+    assert!(!got.iter().any(|t| t.name == "script_run"));
 }
 
 #[test]

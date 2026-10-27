@@ -160,7 +160,7 @@ async fn a_read_key_lists_read_tools_only_and_cannot_propose() {
     .await;
     assert_eq!(w.is_error, Some(true));
     assert_eq!(envelope(&w)["error"]["code"], "scope_missing", "{w:?}");
-    // A full key lists the write tools too, never `script_run`.
+    // A read + propose_write key lists the write tools too, not `script_run` (no scripts scope).
     let full = client(&url, &key_for(&h, "alice", &["read", "propose_write"])).await;
     let all = names(&full).await;
     assert!(all.contains(&"jira_issue_edit".to_owned()));
@@ -283,4 +283,113 @@ async fn unknown_sessions_and_oversized_bodies_are_refused() {
     );
     let res = h.send(big).await;
     assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+// ---- M14 T13: script_run by scope ------------------------------------------------------------
+
+fn h_with_scripts(plans: Vec<atlas_duck_core::testing::ScriptPlan>) -> H {
+    let fake = atlas_duck_core::testing::FakeScriptRunner::new(plans);
+    let scripts =
+        crate::scripts::ServerScripts::with_runner(crate::scripts::ScriptsConfig::defaults(), fake);
+    H::with(Opts {
+        scripts: Some(std::sync::Arc::new(scripts)),
+        ..Opts::default()
+    })
+}
+
+fn result_plan(value: Value) -> atlas_duck_core::testing::ScriptPlan {
+    atlas_duck_core::testing::ScriptPlan::new(
+        Vec::new(),
+        atlas_duck_core::RunEnd::Result {
+            value,
+            logs: Vec::new(),
+            stderr: String::new(),
+        },
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_run_needs_the_scripts_scope() {
+    let h = h_with_scripts(vec![result_plan(json!(1))]);
+    h.session("alice", PW_CANARY).await;
+    let url = serve(&h).await;
+    let read = client(&url, &key_for(&h, "alice", &["read", "propose_write"])).await;
+    assert!(!names(&read).await.contains(&"script_run".to_owned()));
+    let r = call(&read, "script_run", json!({"source": "return 1;"})).await;
+    assert_eq!(r.is_error, Some(true));
+    assert_eq!(envelope(&r)["error"]["code"], "scope_missing", "{r:?}");
+    let scripts = client(&url, &key_for(&h, "alice", &["read", "scripts"])).await;
+    assert!(names(&scripts).await.contains(&"script_run".to_owned()));
+    // A dry run answers at once with its (fake) result.
+    let d = call(
+        &scripts,
+        "script_run",
+        json!({"source": "return 1;", "dry_run": "sparse"}),
+    )
+    .await;
+    assert_eq!(envelope(&d)["status"], "succeeded", "{d:?}");
+    let _ = read.cancel().await;
+    let _ = scripts.cancel().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_real_script_run_pends_with_its_approval_url() {
+    let h = h_with_scripts(vec![result_plan(json!({"summary": "3 open"}))]);
+    let (ca, ta) = h.session("alice", PW_CANARY).await;
+    let url = serve(&h).await;
+    let agent =
+        std::sync::Arc::new(client(&url, &key_for(&h, "alice", &["read", "scripts"])).await);
+    let running = {
+        let agent = agent.clone();
+        tokio::spawn(
+            async move { call(&agent, "script_run", json!({"source": "return 1;"})).await },
+        )
+    };
+    let mut q = json!([]);
+    for _ in 0..400 {
+        q = json_body(cmd(&h, &ca, &ta, "queue_list", json!({})).await).await;
+        if !q.as_array().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let id = q[0]["request_id"]
+        .as_str()
+        .expect("the script's result queued")
+        .to_owned();
+    let status = call(&agent, "request_status", json!({"request_id": id})).await;
+    let env = envelope(&status);
+    assert_eq!(env["status"], "pending", "{env}");
+    assert_eq!(
+        env["meta"]["approval_url"],
+        format!("{ORIGIN}/approvals?item={id}")
+    );
+    running.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oauth_token_with_scripts_lists_script_run_like_a_key() {
+    let h = h_with_scripts(vec![result_plan(json!(1))]);
+    let url = serve(&h).await;
+    let (_, _, with) = h.tokens_for(&["read", "scripts"]).await;
+    let c = client(&url, with["access_token"].as_str().unwrap()).await;
+    assert!(names(&c).await.contains(&"script_run".to_owned()));
+    let d = call(
+        &c,
+        "script_run",
+        json!({"source": "return 1;", "dry_run": "sparse"}),
+    )
+    .await;
+    assert_eq!(envelope(&d)["status"], "succeeded", "{d:?}");
+    let _ = c.cancel().await;
+    // The same user's token without `scripts`: no script_run.
+    let client_id = h.client_id().await;
+    let alice = h.session("alice", PW_CANARY).await;
+    let q = h.code_for(&alice, &client_id, &["read"]).await;
+    let (_, without) = h.redeem(&client_id, &q["code"]).await;
+    let c = client(&url, without["access_token"].as_str().unwrap()).await;
+    assert!(!names(&c).await.contains(&"script_run".to_owned()));
+    let r = call(&c, "script_run", json!({"source": "return 1;"})).await;
+    assert_eq!(envelope(&r)["error"]["code"], "scope_missing");
+    let _ = c.cancel().await;
 }

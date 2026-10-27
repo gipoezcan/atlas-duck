@@ -71,6 +71,21 @@ impl LoginSink for RecSink {
     }
 }
 
+/// M14 harness options.
+struct Opts {
+    oauth: crate::oauth::OAuthConfig,
+    scripts: Option<Arc<crate::scripts::ServerScripts>>,
+}
+
+impl Default for Opts {
+    fn default() -> Opts {
+        Opts {
+            oauth: crate::oauth::OAuthConfig::DEFAULT,
+            scripts: None,
+        }
+    }
+}
+
 struct H {
     router: Router,
     state: AppState,
@@ -101,10 +116,18 @@ impl H {
 
     /// [H::new] with an OAuth configuration of its own (M14).
     fn with_oauth(cfg: crate::oauth::OAuthConfig) -> H {
+        Self::with(Opts {
+            oauth: cfg,
+            ..Opts::default()
+        })
+    }
+
+    /// [H::new] with M14 options (OAuth configuration, script state).
+    fn with(opts: Opts) -> H {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("server.db");
         let store: Arc<dyn ServerStore> = Arc::new(SqliteStore::open(&db).unwrap());
-        Self::over_with(dir, db, store, ManualClock::at(T0), cfg)
+        Self::over_with(dir, db, store, ManualClock::at(T0), opts)
     }
 
     /// A fresh router (and session table) over the same store and clock: a restart.
@@ -119,7 +142,7 @@ impl H {
         store: Arc<dyn ServerStore>,
         clock: Arc<ManualClock>,
     ) -> H {
-        Self::over_with(dir, db, store, clock, crate::oauth::OAuthConfig::DEFAULT)
+        Self::over_with(dir, db, store, clock, Opts::default())
     }
 
     fn over_with(
@@ -127,8 +150,9 @@ impl H {
         db: PathBuf,
         store: Arc<dyn ServerStore>,
         clock: Arc<ManualClock>,
-        oauth: crate::oauth::OAuthConfig,
+        opts: Opts,
     ) -> H {
+        let Opts { oauth, scripts } = opts;
         let stub = Arc::new(StubDirectory::from_json(STUB).unwrap());
         let sink = Arc::new(RecSink::default());
         let sessions =
@@ -160,7 +184,7 @@ impl H {
                 clock: clock.clone(),
                 allow_http: true,
                 sse_capacity: crate::runtime::SSE_CAPACITY,
-                scripts: None,
+                scripts,
             },
             10,
         ));
