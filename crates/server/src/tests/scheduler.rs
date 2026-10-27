@@ -122,7 +122,13 @@ async fn daily_offboarding_deactivates_disabled_and_missing_users() {
     assert_eq!(ran, [(JOB_OFFBOARDING, true), (JOB_RETENTION, true)]);
     assert_eq!(t.deactivated_by(&a), None);
     assert_eq!(t.deactivated_by(&b).as_deref(), Some("offboarding"));
+    // I4: gone only after a second daily run says so too.
+    assert_eq!(t.deactivated_by(&c), None);
+    assert_eq!(t.env.store.gone_since(&c).unwrap(), Some(T0));
+    t.clock.advance(86_400);
+    within(s.run_due()).await;
     assert_eq!(t.deactivated_by(&c).as_deref(), Some("offboarding"));
+    assert_eq!(t.env.store.gone_since(&c).unwrap(), None);
     within(t.ctx.registry.close_all()).await;
 
     // The same over an LDAP-shaped lookup.
@@ -135,6 +141,9 @@ async fn daily_offboarding_deactivates_disabled_and_missing_users() {
     within(s.run_due()).await;
     assert_eq!(t.deactivated_by(&a), None);
     assert_eq!(t.deactivated_by(&b).as_deref(), Some("offboarding"));
+    assert_eq!(t.deactivated_by(&c), None, "one empty answer is no proof");
+    t.clock.advance(86_400);
+    within(s.run_due()).await;
     assert_eq!(t.deactivated_by(&c).as_deref(), Some("offboarding"));
     // Deactivated users are not looked up again the next day.
     let calls = fake.calls.load(Ordering::SeqCst);
@@ -180,7 +189,7 @@ async fn offboarding_refuses_an_implausible_mass_deactivation() {
         let name = format!("user{i}");
         uids.push(t.env.user(&name));
         if i < 4 {
-            fake.set(&name, Ok(AccountState::Gone));
+            fake.set(&name, Ok(AccountState::Disabled));
         }
     }
     let s = Scheduler::new(t.ctx.clone(), Some(fake), (2, 0));
@@ -370,7 +379,8 @@ async fn jobs_never_overlap() {
     .await;
     // A second check while the first is inside offboarding runs nothing.
     assert!(within(s.run_due()).await.is_empty());
-    // An admin command waits for the job's operation lock.
+    // M2: the lookups hold no operation lock, so an admin command is not blocked by a slow
+    // directory (the deactivations themselves take the lock).
     let ctx = t.ctx.clone();
     let cmd = tokio::spawn(async move {
         crate::admin::handle(
@@ -379,14 +389,12 @@ async fn jobs_never_overlap() {
         )
         .await
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(!cmd.is_finished(), "the command waits for the job");
+    assert!(within(cmd).await.unwrap().ok, "answered during the lookups");
     gate.notify_one();
     assert_eq!(
         within(first).await.unwrap(),
         [(JOB_OFFBOARDING, true), (JOB_RETENTION, true)]
     );
-    assert!(within(cmd).await.unwrap().ok);
 }
 
 #[tokio::test(start_paused = true)]
@@ -425,4 +433,68 @@ fn last_slot_is_the_latest_daily_time_at_or_before_now() {
     assert_eq!(s.last_slot(T0), day + 2 * 3600);
     assert_eq!(s.last_slot(day + 2 * 3600), day + 2 * 3600);
     assert_eq!(s.last_slot(day + 2 * 3600 - 1), day + 2 * 3600 - 86_400);
+}
+
+/// Batch-2 review I3: with part of the lookups failing, nobody is deactivated, even when the
+/// answered part says gone or disabled for a few users.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partial_directory_outage_deactivates_nobody() {
+    let t = harness();
+    let fake = Arc::new(FakeLookup::default());
+    let mut uids = Vec::new();
+    for i in 0..10 {
+        let name = format!("user{i}");
+        uids.push(t.env.user(&name));
+        fake.set(
+            &name,
+            match i {
+                0 => Ok(AccountState::Disabled),
+                1 => Ok(AccountState::Gone),
+                _ => Err(DirectoryError::Unavailable),
+            },
+        );
+    }
+    let s = Scheduler::new(t.ctx.clone(), Some(fake), (2, 0));
+    let ran = within(s.run_due()).await;
+    assert_eq!(ran[0], (JOB_OFFBOARDING, false));
+    assert!(uids.iter().all(|u| t.deactivated_by(u).is_none()));
+}
+
+/// Batch-2 review I4: a user the directory reports again (a fixed OU permission) is no longer a
+/// gone suspect; one empty answer never deactivates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gone_answer_that_is_not_repeated_never_deactivates() {
+    let t = harness();
+    let a = t.env.user("alice");
+    let fake = Arc::new(FakeLookup::default());
+    fake.set("alice", Ok(AccountState::Gone));
+    let s = Scheduler::new(t.ctx.clone(), Some(fake.clone()), (2, 0));
+    within(s.run_due()).await;
+    fake.set("alice", Ok(AccountState::Active));
+    t.clock.advance(86_400);
+    within(s.run_due()).await;
+    assert_eq!(t.env.store.gone_since(&a).unwrap(), None);
+    fake.set("alice", Ok(AccountState::Gone));
+    t.clock.advance(86_400);
+    within(s.run_due()).await;
+    assert_eq!(t.deactivated_by(&a), None, "the count starts again");
+}
+
+/// Batch-2 review M1: a panicking job is a failed run; the scheduler keeps going.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panicking_job_does_not_stop_the_scheduler() {
+    struct Panics;
+    #[async_trait]
+    impl AccountLookup for Panics {
+        async fn account_state(&self, _: &str) -> Result<AccountState, DirectoryError> {
+            panic!("lookup bug");
+        }
+    }
+    let t = harness();
+    t.env.user("alice");
+    let s = Scheduler::new(t.ctx.clone(), Some(Arc::new(Panics)), (2, 0));
+    let ran = within(s.run_due()).await;
+    assert_eq!(ran, [(JOB_OFFBOARDING, false), (JOB_RETENTION, true)]);
+    t.clock.advance(RETRY_SECS);
+    assert_eq!(within(s.run_due()).await, [(JOB_OFFBOARDING, false)]);
 }

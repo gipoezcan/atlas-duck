@@ -14,6 +14,7 @@ struct Inner {
     users: BTreeMap<String, UserRecord>,
     states: BTreeMap<String, UserState>,
     jobs: BTreeMap<String, JobState>,
+    gone: BTreeMap<String, i64>,
     keystore: BTreeMap<(String, String), Sealed>,
     pats: BTreeMap<(String, String), PatRecord>,
     sessions: BTreeMap<[u8; 32], SessionRecord>,
@@ -381,6 +382,20 @@ impl ServerStore for MemoryStore {
 
     fn scheduler_put(&self, job: &str, s: &JobState) -> StoreResult<()> {
         self.lock().jobs.insert(job.to_owned(), *s);
+        Ok(())
+    }
+
+    fn gone_since(&self, user_id: &str) -> StoreResult<Option<i64>> {
+        Ok(self.lock().gone.get(user_id).copied())
+    }
+
+    fn gone_mark(&self, user_id: &str, at: i64) -> StoreResult<()> {
+        self.lock().gone.entry(user_id.to_owned()).or_insert(at);
+        Ok(())
+    }
+
+    fn gone_clear(&self, user_id: &str) -> StoreResult<()> {
+        self.lock().gone.remove(user_id);
         Ok(())
     }
 

@@ -16,7 +16,8 @@ use crate::store::AnchorHead;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Finding {
-    /// `anchor_chain`, `store_missing`, `truncated`, `chain_mismatch` or `head_mismatch`.
+    /// `anchor_chain`, `store_missing`, `truncated`, `chain_mismatch`, `head_mismatch` or
+    /// `chain_deleted_unrecorded`.
     pub kind: &'static str,
     pub username: Option<String>,
     pub seq: Option<u64>,
@@ -84,8 +85,24 @@ pub fn run(ctx: &AdminCtx) -> Result<VerifyReport, &'static str> {
         .map_err(|_| "store/unavailable")?;
     let data = ctx.registry.deps().data_dir.clone();
     let mut checked = 0;
+    // M5: a deleted chain must be explained by a CHAIN_DELETED row naming the user.
+    let deleted_rows: std::collections::HashSet<String> = store
+        .anchor_all()
+        .map_err(|_| "store/unavailable")?
+        .into_iter()
+        .filter(|r| r.kind == crate::anchor::KIND_CHAIN_DELETED)
+        .filter_map(|r| serde_json::from_slice::<Value>(&r.body_jcs).ok())
+        .filter_map(|v| v["user_id"].as_str().map(str::to_owned))
+        .collect();
     for (u, s) in &users {
         if s.chain_deleted_at.is_some() {
+            if !deleted_rows.contains(&u.user_id) {
+                findings.push(Finding {
+                    kind: "chain_deleted_unrecorded",
+                    username: Some(u.username.clone()),
+                    seq: None,
+                });
+            }
             continue;
         }
         let Some(head) = heads.iter().find(|h| h.user_id == u.user_id) else {

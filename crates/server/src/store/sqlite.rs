@@ -769,6 +769,34 @@ impl ServerStore for SqliteStore {
         Ok(())
     }
 
+    fn gone_since(&self, user_id: &str) -> StoreResult<Option<i64>> {
+        self.conn()
+            .query_row(
+                "SELECT first_seen_at FROM offboarding_gone WHERE user_id = ?1",
+                [user_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db)
+    }
+
+    fn gone_mark(&self, user_id: &str, at: i64) -> StoreResult<()> {
+        self.conn()
+            .execute(
+                "INSERT OR IGNORE INTO offboarding_gone (user_id, first_seen_at) VALUES (?1, ?2)",
+                params![user_id, at],
+            )
+            .map_err(db)?;
+        Ok(())
+    }
+
+    fn gone_clear(&self, user_id: &str) -> StoreResult<()> {
+        self.conn()
+            .execute("DELETE FROM offboarding_gone WHERE user_id = ?1", [user_id])
+            .map_err(db)?;
+        Ok(())
+    }
+
     fn anchor_latest_heads(&self) -> StoreResult<Vec<AnchorHead>> {
         let c = self.conn();
         let mut st = c

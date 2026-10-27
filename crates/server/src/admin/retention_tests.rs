@@ -177,7 +177,10 @@ async fn retention_keeps_active_users_chains() {
     within(t.ctx.registry.close_all()).await;
     t.clock.advance(364 * DAY);
     let out = t.retention(false).await;
-    assert_eq!(out, json!({"dry_run": false, "due": [], "deleted": 0}));
+    assert_eq!(
+        out,
+        json!({"dry_run": false, "due": [], "deleted": 0, "failed": 0})
+    );
     for uid in [&b, &c] {
         assert!(crate::users::user_dir(t.env.dir.path(), uid).is_dir());
         assert_eq!(
@@ -298,4 +301,75 @@ async fn anchor_verify_detects_truncated_user_chain() {
     std::fs::remove_dir_all(crate::users::user_dir(t.env.dir.path(), &a)).unwrap();
     let r = t.call(Request::AnchorVerify(NoArgs {})).await;
     assert_eq!(r.data.unwrap()["findings"][0]["kind"], "store_missing");
+}
+
+/// Batch-2 review M3/M4: one user whose deletion fails does not stop the others; the run is
+/// recorded as partial, and the failed user's CHAIN_DELETED (anchored before the deletion) is
+/// completed by the next run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_deletion_is_partial_and_finished_by_the_next_run() {
+    let t = harness();
+    let a = t.anchored_user("alice").await;
+    let b = t.env.user("bob");
+    within(t.ctx.registry.close_all()).await;
+    for uid in [&a, &b] {
+        t.env.store.user_deactivate(uid, 0, "admin", 0).unwrap();
+    }
+    // Bob's store path is a file: removing it as a directory fails.
+    let bob_dir = crate::users::user_dir(t.env.dir.path(), &b);
+    std::fs::create_dir_all(bob_dir.parent().unwrap()).unwrap();
+    std::fs::write(&bob_dir, "not a directory").unwrap();
+    let out = t.retention(false).await;
+    assert_eq!(
+        (out["deleted"].clone(), out["failed"].clone()),
+        (json!(1), json!(1))
+    );
+    assert!(
+        t.env
+            .store
+            .user_state(&a)
+            .unwrap()
+            .unwrap()
+            .chain_deleted_at
+            .is_some()
+    );
+    assert!(
+        t.env
+            .store
+            .user_state(&b)
+            .unwrap()
+            .unwrap()
+            .chain_deleted_at
+            .is_none()
+    );
+    let rows = t.env.store.anchor_all().unwrap();
+    let body: Value = serde_json::from_slice(&rows.last().unwrap().body_jcs).unwrap();
+    assert_eq!(body["failed"], 1);
+    let deleted_rows = rows.iter().filter(|r| r.kind == KIND_CHAIN_DELETED).count();
+    assert_eq!(
+        deleted_rows, 2,
+        "intent anchored before the delete, for bob too"
+    );
+    std::fs::remove_file(&bob_dir).unwrap();
+    let out = t.retention(false).await;
+    assert_eq!(
+        (out["deleted"].clone(), out["failed"].clone()),
+        (json!(1), json!(0))
+    );
+    assert!(t.call(Request::AnchorVerify(NoArgs {})).await.ok);
+}
+
+/// Batch-2 review M5: a chain marked deleted without a CHAIN_DELETED row is a finding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anchor_verify_reports_a_deleted_chain_without_its_record() {
+    let t = harness();
+    let a = t.anchored_user("alice").await;
+    t.env.store.user_deactivate(&a, 0, "admin", 0).unwrap();
+    t.env.store.user_purge(&a, 1).unwrap();
+    let r = t.call(Request::AnchorVerify(NoArgs {})).await;
+    assert_eq!(r.error.as_deref(), Some("anchor/verify_failed"));
+    assert_eq!(
+        r.data.unwrap()["findings"],
+        json!([{"kind": "chain_deleted_unrecorded", "username": "alice", "seq": null}])
+    );
 }

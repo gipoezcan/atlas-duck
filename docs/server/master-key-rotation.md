@@ -44,11 +44,16 @@ A="kubectl $NS exec deploy/atlas-duck -- /app/atlas-duck-server admin"
    # {"old_key_id":"prod-2026-11","new_key_id":"prod-2027-11","rewrapped":N,"already_rewrapped":0}
    ```
 
-   Each user's row is re-wrapped in its own step (compare-and-set), so every row is always
-   wrapped under one of the two loaded keys. The new key becomes the primary, and
-   `MASTER_KEY_ROTATED {old_key_id, new_key_id}` goes into the anchor chain. The output shows key
-   ids and counts only.
-4. Swap the production Secret to the new key, then remove the next one:
+   The file must be the mounted next key; any other is refused
+   (`rotate/next_key_not_mounted`), so a restart can never find rows under a key nobody mounts.
+   The new key becomes the primary first, so first logins during the run already go under it.
+   Every row is then re-wrapped in its own step (compare-and-set), pass after pass, until none is
+   left under the old key, and `MASTER_KEY_ROTATED {old_key_id, new_key_id}` goes into the anchor
+   chain. The output shows key ids and counts only, ending with `rows_not_primary: 0`. A restart
+   while the next key is mounted and already in use keeps it as the primary.
+4. Check before the swap: ` master-key status` must show `rows_not_primary: 0`. If not, run
+   step 3 again.
+5. Swap the production Secret to the new key, then remove the next one:
 
    ```sh
    kubectl $NS create secret generic atlas-duck-master-key --from-file=key=/media/offline/new-key \
@@ -57,12 +62,12 @@ A="kubectl $NS exec deploy/atlas-duck -- /app/atlas-duck-server admin"
 
    Set `masterKey.nextSecret: ""`, deploy, then
    `kubectl $NS delete secret atlas-duck-master-key-next`.
-5. Verify:
+6. Verify:
    - `/readyz` is 200, with no `master_key_mismatch`;
    - `atlas_duck_master_key_info` shows only the new id, as `primary`;
    - a user can sign in and an existing API key works;
    - `$A anchor verify` exits 0.
-6. Destroy every copy of the old key except the sealed escrow kept for old backups. Record the
+7. Destroy every copy of the old key except the sealed escrow kept for old backups. Record the
    date and the new key id in the key log.
 
 ## If something goes wrong

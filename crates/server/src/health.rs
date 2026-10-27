@@ -43,6 +43,8 @@ pub struct Health {
     /// M13 T10: the open runtimes (approvals pending).
     registry: Option<Arc<Registry>>,
     probe: Mutex<Option<(Instant, bool)>>,
+    /// Batch-2 review M6: the key-id scan of every user, cached like the directory probe.
+    key_check: std::sync::Mutex<Option<(Instant, Option<&'static str>)>>,
     /// `(method, status class)` → requests answered.
     requests: std::sync::Mutex<BTreeMap<(&'static str, &'static str), u64>>,
 }
@@ -83,6 +85,7 @@ impl Health {
             offboarding: None,
             registry: None,
             probe: Mutex::new(None),
+            key_check: std::sync::Mutex::new(None),
             requests: std::sync::Mutex::new(BTreeMap::new()),
         }
     }
@@ -115,6 +118,18 @@ impl Health {
     /// "master_key_mismatch" when some user's data key is wrapped under a key id that is not
     /// loaded (for example the old key mounted again after a completed rotation).
     fn master_key_reason(&self) -> Option<&'static str> {
+        let mut cached = self.key_check.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, r)) = *cached
+            && at.elapsed() < PROBE_CACHE
+        {
+            return r;
+        }
+        let r = self.scan_key_ids();
+        *cached = Some((Instant::now(), r));
+        r
+    }
+
+    fn scan_key_ids(&self) -> Option<&'static str> {
         let master = self.master.as_ref()?;
         let users = self.store.users_all().ok()?;
         users

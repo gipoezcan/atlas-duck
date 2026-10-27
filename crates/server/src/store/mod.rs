@@ -266,6 +266,11 @@ pub trait ServerStore: Send + Sync {
     // ---- scheduler (M13 T9) ----
     fn scheduler_get(&self, job: &str) -> StoreResult<JobState>;
     fn scheduler_put(&self, job: &str, state: &JobState) -> StoreResult<()>;
+    /// Offboarding (batch-2 review I4): since when the directory has said the user is gone.
+    fn gone_since(&self, user_id: &str) -> StoreResult<Option<i64>>;
+    /// Records the first gone answer; a later one keeps the first time.
+    fn gone_mark(&self, user_id: &str, at: i64) -> StoreResult<()>;
+    fn gone_clear(&self, user_id: &str) -> StoreResult<()>;
 
     // ---- backup and restore (M13 T6) ----
     /// A consistent copy of the whole store into the new file `path`.

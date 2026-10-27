@@ -104,6 +104,16 @@ All server jobs live in `.gitlab-ci.yml`, in the stages `server-prepare` through
 - `deploy:production` runs only on master, is triggered manually, and blocks the pipeline until
   someone decides. It is triggered only after the product owner's explicit go-ahead.
 
+## GitLab settings (once, before the first production deploy)
+
+- Protect `master` (Settings > Repository > Protected branches). `deploy:production` refuses to
+  run from an unprotected ref.
+- Protect the `production` environment and require an approval from the product owner (Settings >
+  CI/CD > Protected environments). Without it, anyone who can run pipelines on master can trigger
+  the manual job.
+- `deploy:review` reaches the cluster from any branch whose server paths changed (PD-M13-12).
+  Review environments hold test data only.
+
 ## First production deploy
 
 1. Answer Q1–Q6, fill the values files and the CA bundle, and merge to master.

@@ -61,8 +61,12 @@ async fn run(config: Config) -> u8 {
     };
     // M13 T7: during a rotation the next key is accepted too, so a restart mid-way still opens
     // every user (rows already re-wrapped carry the next key's id).
+    let mut next_id = None;
     if let Some(next) = &config.master_key_next_file {
-        let accepted = MasterKey::load(next).ok().map(|k| master.accept(k).is_ok());
+        let accepted = MasterKey::load(next).ok().map(|k| {
+            next_id = Some(k.id());
+            master.accept(k).is_ok()
+        });
         if accepted != Some(true) {
             crate::log::stderr_line(
                 "error",
@@ -95,6 +99,15 @@ async fn run(config: Config) -> u8 {
         }
         Err(_) => return fail("server_store_unavailable"),
     };
+    // Batch-2 review I1: a rotation under way (the next key already wraps rows) keeps the next key
+    // as the primary across restarts, so no new data key goes under the key about to retire.
+    if let Some(id) = &next_id {
+        match crate::admin::rotate::promote_next_if_in_use(&master, store.as_ref(), id) {
+            Ok(true) => tracing::warn!(event = "rotation_in_progress", primary = %id),
+            Ok(false) => {}
+            Err(_) => return fail("server_store_unavailable"),
+        }
+    }
     // The login directory, and the offboarding check's account lookup (M13 T9, PD-M13-14): the
     // LDAP service bind when configured, the test directory's file, else none (manual).
     let (directory, lookup): (Arc<dyn Directory>, Option<Arc<dyn AccountLookup>>) =

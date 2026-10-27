@@ -28,7 +28,10 @@ pub const USAGE: &str = "usage: atlas-duck-server admin <command>
   backup <dir>          (under <data>/backups or the temp directory)
   restore <bundle-dir>  (maintenance on first)
   restore --resume      (finish a restore a crash interrupted)
-  rotate-master-key --new-key-file <path>
+  backup --stdout       (a bundle as a tar stream on stdout; report on stderr)
+  restore --stdin       (a bundle tar stream from stdin; maintenance on first)
+  rotate-master-key --new-key-file <path>   (the mounted next key)
+  master-key status
   retention run [--dry-run]
   anchor verify
 ";
@@ -63,6 +66,8 @@ pub fn parse(args: &[String]) -> Option<Parsed> {
         ["backup", dir] if !dir.starts_with('-') => Some(Parsed::Run(Request::Backup(DirArg {
             dir: (*dir).to_owned(),
         }))),
+        ["backup", "--stdout"] => Some(Parsed::Run(Request::BackupStream(NoArgs {}))),
+        ["restore", "--stdin"] => Some(Parsed::Run(Request::RestoreStream(NoArgs {}))),
         ["restore", "--resume"] => Some(Parsed::Run(Request::RestoreResume(NoArgs {}))),
         ["restore", dir] if !dir.starts_with('-') => Some(Parsed::Run(Request::Restore(DirArg {
             dir: (*dir).to_owned(),
@@ -78,6 +83,7 @@ pub fn parse(args: &[String]) -> Option<Parsed> {
         ["retention", "run", "--dry-run"] => Some(Parsed::Run(Request::RetentionRun(DryRunArg {
             dry_run: true,
         }))),
+        ["master-key", "status"] => Some(Parsed::Run(Request::MasterKeyStatus(NoArgs {}))),
         ["anchor", "verify"] => Some(Parsed::Run(Request::AnchorVerify(NoArgs {}))),
         _ => None,
     }
@@ -163,6 +169,9 @@ pub fn run(args: &[String]) -> u8 {
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| DEFAULT_ADMIN_SOCKET.to_owned());
+    if matches!(req, Request::BackupStream(_) | Request::RestoreStream(_)) {
+        return send_stream(std::path::Path::new(&path), &req);
+    }
     match send(std::path::Path::new(&path), &req) {
         Ok(resp) => finish(&resp),
         Err(code) => {
@@ -196,4 +205,72 @@ pub fn send(path: &std::path::Path, req: &Request) -> Result<Response, &'static 
 #[cfg(not(unix))]
 pub fn send(_path: &std::path::Path, _req: &Request) -> Result<Response, &'static str> {
     Err("admin/unsupported_platform")
+}
+
+/// A streaming request: `backup --stdout` copies the tar stream after the answer line to stdout
+/// (the answer itself to stderr); `restore --stdin` sends stdin after the request line.
+#[cfg(unix)]
+pub fn send_stream(path: &std::path::Path, req: &Request) -> u8 {
+    use std::io::{BufRead, BufReader, Read};
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+
+    let Ok(mut s) = UnixStream::connect(path) else {
+        error_line("admin/server_unreachable");
+        return EXIT_UNREACHABLE;
+    };
+    let mut line = serde_json::to_vec(req).unwrap_or_default();
+    line.push(b'\n');
+    if s.write_all(&line).is_err() {
+        error_line("admin/server_unreachable");
+        return EXIT_UNREACHABLE;
+    }
+    if matches!(req, Request::RestoreStream(_)) {
+        if std::io::copy(&mut std::io::stdin().lock(), &mut s).is_err()
+            || s.shutdown(Shutdown::Write).is_err()
+        {
+            error_line("admin/stream_failed");
+            return EXIT_RUNTIME;
+        }
+        let mut buf = Vec::new();
+        if s.read_to_end(&mut buf).is_err() {
+            error_line("admin/server_unreachable");
+            return EXIT_UNREACHABLE;
+        }
+        return match serde_json::from_slice::<Response>(&buf) {
+            Ok(resp) => finish(&resp),
+            Err(_) => {
+                error_line("admin/bad_response");
+                EXIT_RUNTIME
+            }
+        };
+    }
+    let mut r = BufReader::new(s);
+    let mut head = Vec::new();
+    if r.read_until(b'\n', &mut head).is_err() {
+        error_line("admin/server_unreachable");
+        return EXIT_UNREACHABLE;
+    }
+    let Ok(resp) = serde_json::from_slice::<Response>(&head) else {
+        error_line("admin/bad_response");
+        return EXIT_RUNTIME;
+    };
+    if !resp.ok {
+        return finish(&resp);
+    }
+    if let Some(d) = &resp.data {
+        print_data(&mut std::io::stderr(), d);
+    }
+    let mut out = std::io::stdout().lock();
+    if std::io::copy(&mut r, &mut out).is_err() || out.flush().is_err() {
+        error_line("admin/stream_failed");
+        return EXIT_RUNTIME;
+    }
+    EXIT_OK
+}
+
+#[cfg(not(unix))]
+pub fn send_stream(_path: &std::path::Path, _req: &Request) -> u8 {
+    error_line("admin/unsupported_platform");
+    EXIT_UNREACHABLE
 }

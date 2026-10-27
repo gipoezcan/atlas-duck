@@ -56,9 +56,13 @@ Every day at `ATLAS_DUCK_OFFBOARDING_AT` (UTC, default `02:00`) the server binds
 looks up every active user by UPN, and deactivates those whose account is disabled or gone. Then:
 
 - **A failed or doubtful lookup** (unreachable directory, failed bind, missing
-  `userAccountControl`) never deactivates anyone. The run counts as failed and is retried an
-  hour later.
-- **Implausibly many leavers.** If one run would deactivate more than `max(3, users / 4)` users,
+  `userAccountControl`) never deactivates anyone. If any lookup in a run fails, that run
+  deactivates nobody at all, counts as failed, and is retried an hour later.
+- **Gone needs two runs.** An empty search is not proof: a lost read right on an OU or a wrong
+  base DN looks the same. A user the directory does not find is deactivated only when a run at
+  least 20 h earlier did not find them either. A disabled account is deactivated at once.
+- **Implausibly many leavers.** If one run would deactivate more than `max(3, answered / 4)`
+  users,
   it deactivates nobody (`offboarding_implausible` in the log). A permission change on the
   service account must not offboard everyone overnight. Investigate, then deactivate by hand if
   it is real.

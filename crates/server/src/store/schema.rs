@@ -12,6 +12,10 @@ ALTER TABLE users ADD COLUMN deactivated_by TEXT;
 ALTER TABLE users ADD COLUMN last_login_at INTEGER;
 ALTER TABLE users ADD COLUMN retention_until INTEGER;
 ALTER TABLE users ADD COLUMN chain_deleted_at INTEGER;
+CREATE TABLE offboarding_gone (
+    user_id TEXT PRIMARY KEY,
+    first_seen_at INTEGER NOT NULL
+);
 CREATE TABLE scheduler_state (
     job TEXT PRIMARY KEY,
     last_run_at INTEGER,

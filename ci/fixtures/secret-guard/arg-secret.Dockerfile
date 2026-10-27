@@ -1,0 +1,2 @@
+FROM scratch
+ARG FAKE_API_KEY

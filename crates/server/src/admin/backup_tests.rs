@@ -698,6 +698,7 @@ async fn restore_upgrades_a_v1_bundle() {
              ALTER TABLE users DROP COLUMN retention_until;
              ALTER TABLE users DROP COLUMN chain_deleted_at;
              DROP TABLE scheduler_state;
+             DROP TABLE offboarding_gone;
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -713,4 +714,97 @@ async fn restore_upgrades_a_v1_bundle() {
     );
     s.maintenance(false).await;
     within(s.ctx.registry.close_all()).await;
+}
+
+/// Lead decision after batch 3: `backup --stdout` streams a bundle as tar after its answer line,
+/// keeps nothing on the volume, and `restore --stdin` restores that stream on another server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backup_streams_as_tar_and_restore_reads_the_stream() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let s = sqlite_harness("k1", KEY_A);
+    s.user("alice").await;
+    let (mut client, server) = tokio::io::duplex(1 << 16);
+    let ctx = s.ctx.clone();
+    let task = tokio::spawn(async move { serve_conn(&ctx, server).await });
+    client
+        .write_all(b"{\"op\":\"backup_stream\"}\n")
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    within(client.read_to_end(&mut out)).await.unwrap();
+    within(task).await.unwrap().unwrap();
+    let nl = out.iter().position(|&b| b == b'\n').unwrap();
+    let head: Response = serde_json::from_slice(&out[..nl]).unwrap();
+    assert!(head.ok, "{head:?}");
+    let tar = out[nl + 1..].to_vec();
+    assert_eq!(tar.len() % 512, 0);
+    let left: Vec<_> = std::fs::read_dir(s.backups()).unwrap().collect();
+    assert!(
+        left.is_empty(),
+        "the streamed bundle is not kept on the volume"
+    );
+
+    let other = sqlite_harness("k1", KEY_A);
+    // Not in maintenance: refused.
+    let refused = stream_restore(&other, &tar).await;
+    assert_eq!(refused.error.as_deref(), Some("admin/maintenance_required"));
+    other.maintenance(true).await;
+    let r = stream_restore(&other, &tar).await;
+    assert!(r.ok, "{r:?}");
+    assert!(other.store().user_by_name("alice").unwrap().is_some());
+    let uploads = std::fs::read_dir(other.backups())
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("upload-")
+        })
+        .count();
+    assert_eq!(uploads, 0, "the upload is removed");
+    // A damaged stream is refused before anything live changes.
+    let mut bad = tar.clone();
+    let mid = 512 * 3 + 10;
+    bad[mid] ^= 0xff;
+    let r = stream_restore(&other, &bad).await;
+    assert!(!r.ok);
+    within(s.ctx.registry.close_all()).await;
+    within(other.ctx.registry.close_all()).await;
+}
+
+async fn stream_restore(s: &S, tar: &[u8]) -> Response {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut client, server) = tokio::io::duplex(1 << 16);
+    let ctx = s.ctx.clone();
+    let task = tokio::spawn(async move { serve_conn(&ctx, server).await });
+    let body = tar.to_vec();
+    let writer = tokio::spawn(async move {
+        // The server may answer (a refusal) before it reads the stream: write errors are fine.
+        let _ = client.write_all(b"{\"op\":\"restore_stream\"}\n").await;
+        let _ = client.write_all(&body).await;
+        let _ = client.shutdown().await;
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        out
+    });
+    let out = within(writer).await.unwrap();
+    within(task).await.unwrap().unwrap();
+    serde_json::from_slice(&out).unwrap()
+}
+
+/// The stream reader refuses paths that leave the upload directory.
+#[tokio::test]
+async fn a_tar_stream_with_an_escaping_path_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["../evil", "/abs/evil", "bundle/../../evil"] {
+        let mut tar = super::tarball::header(name, 3, false).unwrap().to_vec();
+        tar.extend_from_slice(b"abc");
+        tar.resize(1024, 0);
+        tar.extend_from_slice(&[0u8; 1024]);
+        let dest = dir.path().join(format!("u{}", name.len()));
+        let r = super::tarball::read_into(&mut tar.as_slice(), &dest, 1 << 20).await;
+        assert_eq!(r.unwrap_err(), "restore/stream_invalid", "{name}");
+        assert!(!dir.path().join("evil").exists());
+    }
 }

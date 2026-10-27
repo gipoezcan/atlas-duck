@@ -14,7 +14,8 @@ clean() {
   mkdir -p "$work/tree/ci" "$work/tree/chart" "$work/tree/deployment/ca" "$work/tree/crates/server"
   printf '%s\n' '# a clean pipeline' 'job:' '  script:' \
     '    - /kaniko/executor --build-arg "GIT_SHA=${CI_COMMIT_SHA}"' \
-    '    - curl --cacert ca.pem -fsS https://example.test/healthz' > "$work/tree/.gitlab-ci.yml"
+    '    - curl --cacert ca.pem -fsS https://example.test/healthz' \
+    '    - curl --cacert ca.pem -fsS https://example.test/a-bank/foo-kit' > "$work/tree/.gitlab-ci.yml"
   printf '%s\n' 'FROM scratch' 'ENV RUSTUP_TOOLCHAIN=1.95.0' > "$work/tree/crates/server/Dockerfile"
   printf '%s\n' '# CA' '-----BEGIN CERTIFICATE-----' 'ZmFrZQ==' '-----END CERTIFICATE-----' '' \
     > "$work/tree/deployment/ca/org-ca.pem"
@@ -46,6 +47,16 @@ expect_refused skip-tls-verify.yml ci/build.yml
 expect_refused tls-verify-false.sh ci/copy2.sh
 expect_refused curl-k.sh ci/smoke.sh
 expect_refused ca-with-key.pem deployment/ca/org-ca.pem
+expect_refused two-build-args.yml .gitlab-ci.yml
+expect_refused env-continued.Dockerfile crates/server/Dockerfile
+expect_refused arg-secret.Dockerfile crates/server/Dockerfile
+expect_refused wget-no-check.sh ci/fetch.sh
+expect_refused git-ssl-no-verify.sh ci/git1.sh
+expect_refused git-sslverify.sh ci/git2.sh
+expect_refused tls-verify-space.sh ci/copy3.sh
+expect_refused python-verify.sh ci/py.sh
+expect_refused values-password.yaml deployment/values-production.yaml
+expect_refused rust-danger.rs.txt crates/server/src/client.rs
 
 # A CA file with anything but comments and certificate blocks is refused too.
 clean

@@ -25,6 +25,8 @@ pub struct RetentionReport {
     pub dry_run: bool,
     pub due: Vec<Due>,
     pub deleted: usize,
+    /// Users whose deletion failed this run (still due; the next run tries again).
+    pub failed: usize,
 }
 
 /// One retention pass at the context's clock.
@@ -52,6 +54,7 @@ pub async fn run(ctx: &AdminCtx, dry_run: bool) -> Result<RetentionReport, &'sta
             dry_run,
             due: listed,
             deleted: 0,
+            failed: 0,
         });
     }
     let latest = ctx
@@ -59,54 +62,74 @@ pub async fn run(ctx: &AdminCtx, dry_run: bool) -> Result<RetentionReport, &'sta
         .anchor_latest_heads()
         .map_err(|_| "store/unavailable")?;
     let data = ctx.registry.deps().data_dir.clone();
-    let mut deleted = 0;
+    let (mut deleted, mut failed) = (0usize, 0usize);
     for (u, _) in &due {
-        // The final head: the open runtime's, else the last one anchored.
-        let head = match ctx.registry.close_user(&u.user_id).await {
-            Some(h) => {
-                ctx.writer
-                    .record_heads(&[(u.user_id.clone(), h.clone())])
-                    .map_err(|_| "anchor/append_failed")?;
-                Some((h.0, h.1))
+        // M3: one user's failure never stops the others; the run is recorded as partial.
+        match delete_one(ctx, &data, &latest, &u.user_id, now).await {
+            Ok(()) => deleted += 1,
+            Err(code) => {
+                tracing::error!(event = "chain_delete_failed", user_id = %u.user_id, code);
+                failed += 1;
             }
-            None => latest
-                .iter()
-                .find(|h| h.user_id == u.user_id)
-                .map(|h| (h.chain_id.clone(), h.head_seq)),
-        };
-        let dir = crate::users::user_dir(&data, &u.user_id);
-        match std::fs::remove_dir_all(&dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err("retention/delete_failed"),
         }
-        ctx.store
-            .user_purge(&u.user_id, now)
-            .map_err(|_| "store/unavailable")?;
-        ctx.writer.forget_user(&u.user_id);
-        let (chain_id, head_seq) = head.unwrap_or_default();
-        ctx.writer
-            .operational(
-                KIND_CHAIN_DELETED,
-                &json!({"user_id": u.user_id, "chain_id": chain_id, "head_seq": head_seq}),
-            )
-            .map_err(|_| "anchor/append_failed")?;
-        tracing::info!(event = "chain_deleted", user_id = %u.user_id);
-        deleted += 1;
     }
     ctx.writer
         .operational(
             KIND_RETENTION_RUN,
-            &json!({"deleted": deleted, "due": due.len()}),
+            &json!({"deleted": deleted, "due": due.len(), "failed": failed}),
         )
         .map_err(|_| "anchor/append_failed")?;
     Ok(RetentionReport {
         dry_run,
         due: listed,
         deleted,
+        failed,
     })
 }
 
+/// One user's deletion. M4: `CHAIN_DELETED` is anchored before anything is deleted, so the anchor
+/// chain explains every missing chain; a crash after it is finished by the next run (the user is
+/// still due), which anchors once more.
+async fn delete_one(
+    ctx: &AdminCtx,
+    data: &std::path::Path,
+    latest: &[crate::store::AnchorHead],
+    user_id: &str,
+    now: i64,
+) -> Result<(), &'static str> {
+    // The final head: the open runtime's, else the last one anchored.
+    let head = match ctx.registry.close_user(user_id).await {
+        Some(h) => {
+            ctx.writer
+                .record_heads(&[(user_id.to_owned(), h.clone())])
+                .map_err(|_| "anchor/append_failed")?;
+            Some((h.0, h.1))
+        }
+        None => latest
+            .iter()
+            .find(|h| h.user_id == user_id)
+            .map(|h| (h.chain_id.clone(), h.head_seq)),
+    };
+    let (chain_id, head_seq) = head.unwrap_or_default();
+    ctx.writer
+        .operational(
+            KIND_CHAIN_DELETED,
+            &json!({"user_id": user_id, "chain_id": chain_id, "head_seq": head_seq}),
+        )
+        .map_err(|_| "anchor/append_failed")?;
+    let dir = crate::users::user_dir(data, user_id);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("retention/delete_failed"),
+    }
+    ctx.store
+        .user_purge(user_id, now)
+        .map_err(|_| "store/unavailable")?;
+    ctx.writer.forget_user(user_id);
+    tracing::info!(event = "chain_deleted", user_id);
+    Ok(())
+}
 /// `admin retention run [--dry-run]`.
 pub async fn admin(ctx: &AdminCtx, dry_run: bool) -> Result<Value, &'static str> {
     serde_json::to_value(run(ctx, dry_run).await?).map_err(|_| "admin/internal")

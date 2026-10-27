@@ -27,6 +27,8 @@ Admin commands run one at a time, and the scheduler's jobs take the same lock.
 | `maintenance on\|off` | Maintenance: `/readyz` 503 and every request except the probes and `/metrics` answers 503 `server/maintenance` |
 | `backup <dir>` | A consistent snapshot of every store ([backup-restore.md](backup-restore.md)) |
 | `restore <bundle-dir>` | Restore a bundle; requires maintenance mode. The live data is first kept as the bundle `backups/pre-restore-<stamp>` |
+| `backup --stdout` / `restore --stdin` | The same, as a tar stream through `kubectl exec` (`> bundle.tar` / `-i ... < bundle.tar`); the streamed backup is not kept on the volume |
+| `master-key status` | Loaded key ids and how many users each wraps; `rows_not_primary` must be 0 before a key Secret swap |
 | `restore --resume` | Finish a restore that a crash interrupted (`/readyz` reason `restore_interrupted`) |
 | `rotate-master-key --new-key-file <path>` | Re-wrap every data key ([master-key-rotation.md](master-key-rotation.md)) |
 | `retention run [--dry-run]` | Delete the chains of users deactivated more than `ATLAS_DUCK_RETENTION_DAYS` ago (default 365) |

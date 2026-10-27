@@ -14,6 +14,8 @@ pub mod retention;
 pub mod rotate;
 #[cfg(unix)]
 pub mod socket;
+pub mod stream;
+pub mod tarball;
 pub mod users;
 
 #[cfg(test)]
@@ -160,6 +162,11 @@ pub enum Request {
     Restore(DirArg),
     RestoreResume(NoArgs),
     RotateMasterKey(KeyFileArg),
+    MasterKeyStatus(NoArgs),
+    /// `backup --stdout`: the answer line, then the bundle as a tar stream.
+    BackupStream(NoArgs),
+    /// `restore --stdin`: the request line, then the bundle as a tar stream.
+    RestoreStream(NoArgs),
     RetentionRun(DryRunArg),
     AnchorVerify(NoArgs),
 }
@@ -178,6 +185,9 @@ impl Request {
             Request::Restore(_) => "restore",
             Request::RestoreResume(_) => "restore_resume",
             Request::RotateMasterKey(_) => "rotate_master_key",
+            Request::MasterKeyStatus(_) => "master_key_status",
+            Request::BackupStream(_) => "backup_stream",
+            Request::RestoreStream(_) => "restore_stream",
             Request::RetentionRun(_) => "retention_run",
             Request::AnchorVerify(_) => "anchor_verify",
         }
@@ -237,6 +247,9 @@ pub async fn handle(ctx: &AdminCtx, req: Request) -> Response {
         Request::Restore(d) => restore::run(ctx, &d.dir).await,
         Request::RestoreResume(_) => restore::resume(ctx).await,
         Request::RotateMasterKey(k) => rotate::run(ctx, &k.new_key_file).await,
+        Request::MasterKeyStatus(_) => rotate::status(ctx),
+        // Streams exist only on a connection (`serve_conn`).
+        Request::BackupStream(_) | Request::RestoreStream(_) => Err("admin/stream_only"),
         Request::RetentionRun(d) => retention::admin(ctx, d.dry_run).await,
         Request::AnchorVerify(_) => {
             let resp = anchor::admin(ctx);
@@ -271,11 +284,12 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (r, mut w) = tokio::io::split(stream);
+    let mut reader = BufReader::new(r);
     let mut line = Vec::new();
     // Batch-1 review M-2: an idle peer cannot hold a task forever.
     tokio::time::timeout(
         READ_TIMEOUT,
-        BufReader::new(r)
+        (&mut reader)
             .take(MAX_LINE as u64 + 1)
             .read_until(b'\n', &mut line),
     )
@@ -285,12 +299,28 @@ where
         Response::err("admin/request_too_large")
     } else {
         match parse_line(&line) {
+            Ok(Request::BackupStream(_)) => {
+                let _one = ctx.ops.lock().await;
+                return stream::backup_out(ctx, &mut w).await;
+            }
+            Ok(Request::RestoreStream(_)) => {
+                let _one = ctx.ops.lock().await;
+                stream::restore_in(ctx, &mut reader).await
+            }
             Ok(req) => handle(ctx, req).await,
             Err(code) => Response::err(code),
         }
     };
-    let mut out = serde_json::to_vec(&resp).map_err(std::io::Error::other)?;
-    out.push(b'\n');
-    w.write_all(&out).await?;
+    write_line(&mut w, &resp).await?;
     w.shutdown().await
+}
+
+/// One JSON answer line.
+pub(crate) async fn write_line<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    resp: &Response,
+) -> std::io::Result<()> {
+    let mut out = serde_json::to_vec(resp).map_err(std::io::Error::other)?;
+    out.push(b'\n');
+    w.write_all(&out).await
 }

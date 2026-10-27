@@ -55,6 +55,14 @@ fn ctx_with(env: &Env, master: Arc<MasterKey>) -> Arc<AdminCtx> {
     ))
 }
 
+/// The ring as the server loads it during a rotation: the old key, and the next key from
+/// `ATLAS_DUCK_MASTER_KEY_NEXT_FILE`.
+fn mounted() -> Arc<MasterKey> {
+    let m = MasterKey::for_tests("k1", OLD);
+    m.accept(MasterKey::for_tests("k2", NEW)).unwrap();
+    Arc::new(m)
+}
+
 fn key_file(dir: &std::path::Path, id: &str, bytes: &[u8]) -> String {
     let p = dir.join(format!("{id}.key"));
     std::fs::write(
@@ -107,7 +115,7 @@ async fn rotate_rewraps_every_user_data_key_with_new_version() {
     }
     // Stores exist (first open), then close: the data keys are now in use.
     all_open_with(&env, MasterKey::for_tests("k1", OLD)).await;
-    let ctx = ctx_with(&env, Arc::new(MasterKey::for_tests("k1", OLD)));
+    let ctx = ctx_with(&env, mounted());
     let r = rotate(&ctx, &key_file(env.dir.path(), "k2", &NEW)).await;
     assert!(r.ok, "{r:?}");
     assert_eq!(r.data.unwrap()["rewrapped"], 3);
@@ -141,7 +149,7 @@ async fn rotate_is_crash_safe() {
         env.user(name);
     }
     all_open_with(&env, MasterKey::for_tests("k1", OLD)).await;
-    let ctx = ctx_with(&env, Arc::new(MasterKey::for_tests("k1", OLD)));
+    let ctx = ctx_with(&env, mounted());
     // A crash after one row.
     assert_eq!(
         run_with(&ctx, MasterKey::for_tests("k2", NEW), Some(1)).unwrap_err(),
@@ -156,6 +164,9 @@ async fn rotate_is_crash_safe() {
     all_open_with(&env, both).await;
     let both = MasterKey::for_tests("k1", OLD);
     both.accept(MasterKey::for_tests("k2", NEW)).unwrap();
+    // I1b: at start the next key, already in use, is the primary again.
+    assert!(super::rotate::promote_next_if_in_use(&both, env.store.as_ref(), "k2").unwrap());
+    assert_eq!(both.id(), "k2");
     let ctx = ctx_with(&env, Arc::new(both));
     // Running it again re-wraps only what is left.
     let out = run_with(&ctx, MasterKey::for_tests("k2", NEW), None).unwrap();
@@ -171,18 +182,18 @@ async fn rotate_refuses_same_key() {
     env.user("alice");
     let ctx = ctx_with(&env, Arc::new(MasterKey::for_tests("k1", OLD)));
     let dir = env.dir.path();
-    for (file, why) in [
-        (key_file(dir, "k1", &OLD), "same id and bytes"),
-        (key_file(dir, "k9", &OLD), "same bytes under a new id"),
-    ] {
+    for (file, why) in [(key_file(dir, "k1", &OLD), "same id and bytes")] {
         let r = rotate(&ctx, &file).await;
         assert_eq!(r.error.as_deref(), Some("rotate/same_key"), "{why}");
     }
+    // Same bytes under a new id: not the mounted next key.
+    let r = rotate(&ctx, &key_file(dir, "k9", &OLD)).await;
+    assert_eq!(r.error.as_deref(), Some("rotate/next_key_not_mounted"));
     // Same id, other bytes: refused too (the id must change with the key).
     let other = dir.join("other");
     std::fs::create_dir_all(&other).unwrap();
     let r = rotate(&ctx, &key_file(&other, "k1", &NEW)).await;
-    assert_eq!(r.error.as_deref(), Some("rotate/same_key"));
+    assert_eq!(r.error.as_deref(), Some("rotate/key_id_conflict"));
     assert_eq!(key_ids(&env), ["k1"]);
     assert_eq!(ctx.registry.deps().master.ids(), ["k1"]);
 }
@@ -214,7 +225,7 @@ async fn rotate_appends_master_key_rotated_with_old_and_new_key_ids_only() {
     for name in ["alice", "bob"] {
         env.user(name);
     }
-    let ctx = ctx_with(&env, Arc::new(MasterKey::for_tests("k1", OLD)));
+    let ctx = ctx_with(&env, mounted());
     assert!(rotate(&ctx, &key_file(env.dir.path(), "k2", &NEW)).await.ok);
     let last = env.store.anchor_last().unwrap().unwrap();
     assert_eq!(last.kind, KIND_MASTER_KEY_ROTATED);
@@ -231,7 +242,7 @@ async fn rotate_appends_master_key_rotated_with_old_and_new_key_ids_only() {
 async fn startup_with_old_key_after_completed_rotation_fails_readyz_with_clear_reason() {
     let env = Env::new();
     env.user("alice");
-    let ctx = ctx_with(&env, Arc::new(MasterKey::for_tests("k1", OLD)));
+    let ctx = ctx_with(&env, mounted());
     assert!(rotate(&ctx, &key_file(env.dir.path(), "k2", &NEW)).await.ok);
     let stub = Arc::new(StubDirectory::from_json(r#"{"users": []}"#).unwrap());
     // The old key mounted again (the Secret was not swapped): not ready, and it says why.
@@ -257,7 +268,7 @@ async fn startup_with_old_key_after_completed_rotation_fails_readyz_with_clear_r
 async fn rotate_output_contains_no_key_bytes() {
     let env = Env::new();
     let a = env.user("alice");
-    let ctx = ctx_with(&env, Arc::new(MasterKey::for_tests("k1", OLD)));
+    let ctx = ctx_with(&env, mounted());
     let before = env.store.user(&a).unwrap().unwrap().data_key_wrapped;
     let r = rotate(&ctx, &key_file(env.dir.path(), "k2", &NEW)).await;
     assert!(r.ok);
@@ -276,7 +287,8 @@ async fn rotate_output_contains_no_key_bytes() {
     }
     assert_eq!(
         r.data.unwrap(),
-        json!({"old_key_id": "k1", "new_key_id": "k2", "rewrapped": 1, "already_rewrapped": 0})
+        json!({"old_key_id": "k1", "new_key_id": "k2", "rewrapped": 1, "already_rewrapped": 0,
+               "rows_not_primary": 0})
     );
     // Debug output of the loaded keys shows ids only.
     let shown = format!("{:?}", ctx.registry.deps().master);
@@ -291,7 +303,7 @@ async fn rotate_skips_users_whose_chain_retention_deleted() {
     let env = Env::new();
     let a = env.user("alice");
     let b = env.user("bob");
-    let ctx = ctx_with(&env, Arc::new(MasterKey::for_tests("k1", OLD)));
+    let ctx = ctx_with(&env, mounted());
     // Alice was deactivated long ago and retention deleted her chain: a tombstone row remains.
     env.store.user_deactivate(&a, 0, "admin", 0).unwrap();
     let r = crate::admin::retention::run(&ctx, false).await.unwrap();
@@ -301,4 +313,57 @@ async fn rotate_skips_users_whose_chain_retention_deleted() {
     assert_eq!(env.store.user(&a).unwrap().unwrap().data_key_wrapped, "");
     let w = env.store.user(&b).unwrap().unwrap().data_key_wrapped;
     assert_eq!(WrappedKey::from_json(&w).unwrap().master_key_id, "k2");
+}
+
+/// Batch-2 review I2: a key file that is not the mounted next key is refused, so a restart can
+/// never find rows under a key nobody mounts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotate_refuses_a_key_that_is_not_the_mounted_next_key() {
+    let env = Env::new();
+    env.user("alice");
+    let ctx = ctx_with(&env, Arc::new(MasterKey::for_tests("k1", OLD)));
+    let r = rotate(&ctx, &key_file(env.dir.path(), "k2", &NEW)).await;
+    assert_eq!(r.error.as_deref(), Some("rotate/next_key_not_mounted"));
+    assert_eq!(key_ids(&env), ["k1"]);
+    assert_eq!(ctx.registry.deps().master.ids(), ["k1"]);
+}
+
+/// Batch-2 review I1a: data keys created while a rotation runs go under the new key, and the run
+/// ends only when no row is left under the old one (`master-key status` says 0).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_logins_during_a_rotation_wrap_under_the_new_key() {
+    let env = Env::new();
+    env.user("alice");
+    let ctx = ctx_with(&env, mounted());
+    // The run is cut before its first re-wrap: the new key is already the primary.
+    assert_eq!(
+        run_with(&ctx, MasterKey::for_tests("k2", NEW), Some(0)).unwrap_err(),
+        "rotate/interrupted"
+    );
+    let master = ctx.registry.deps().master.clone();
+    let (dave, _) = crate::users::ensure_user(
+        env.store.as_ref(),
+        &master,
+        "dave",
+        None,
+        vec!["user".into()],
+        0,
+    )
+    .unwrap();
+    let w = WrappedKey::from_json(&dave.data_key_wrapped).unwrap();
+    assert_eq!(w.master_key_id, "k2");
+    let st = within(handle(&ctx, Request::MasterKeyStatus(NoArgs {}))).await;
+    assert_eq!(
+        st.data.unwrap()["rows_not_primary"],
+        1,
+        "alice is still under k1"
+    );
+    let out = run_with(&ctx, MasterKey::for_tests("k2", NEW), None).unwrap();
+    assert_eq!(out["rows_not_primary"], 0);
+    let st = within(handle(&ctx, Request::MasterKeyStatus(NoArgs {}))).await;
+    assert_eq!(
+        st.data.unwrap(),
+        json!({"primary": "k2", "loaded": ["k2", "k1"], "rows_by_key_id": {"k2": 2},
+               "rows_not_primary": 0})
+    );
 }

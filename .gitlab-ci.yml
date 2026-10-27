@@ -476,6 +476,12 @@ deploy:production:
     - |
       set -eu
       no_placeholders deployment/values-production.yaml deployment/ca/org-ca.pem
+      # Batch-2 review M7: only from a protected master (with the protected "production"
+      # environment and its required approval configured in GitLab, docs/server/deployment.md).
+      if [ "${CI_COMMIT_REF_PROTECTED:-false}" != true ]; then
+        echo "master is not a protected branch: refusing to deploy production"
+        exit 1
+      fi
       export RELEASE_NAME="atlas-duck"
       K="kubectl --context ${KUBE_CONTEXT} -n ${KUBE_NAMESPACE}"
       # The production master key is created out of band (PD-M13-5): check it exists, by name only.
@@ -496,6 +502,7 @@ deploy:production:
       helmfile -e production -f build/helmfile.yaml apply ${ARGS}
   environment:
     name: production
+    deployment_tier: production
 # T14 (master-plan exit criterion): the review environment answers through the ingress with TLS
 # verified against the org CA, signs in a test user, serves MCP to an API key and refuses it once
 # revoked, and passes `helm test`.
