@@ -4,6 +4,12 @@
 //! `trace`), in any HTTP response body, tool result or SSE frame (except the one create-key
 //! answer, which is not recorded), or in the raw bytes of `server.db` and its WAL. A grep test
 //! keeps TLS verification switches out of `crates/server/src`.
+//!
+//! M14 T21: a second run with canaries for the OAuth authorization code, both access and refresh
+//! tokens, the PKCE verifier, the registering client's address (stored hashed only), the data
+//! directory (no path in an answer) and a script source (never in a log line), swept across the
+//! logs, the answers (except the token responses and the one consent redirect), `server.db` with
+//! the anchor chain, the users' stores and the exported tar.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -16,6 +22,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use atlas_duck_server::api_keys;
 use base64::Engine;
 use futures::StreamExt as _;
+use serde_json::json;
+use support::oauth_client::{OAuthClient, Pkce, discover};
 use support::*;
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::fmt::MakeWriter;
@@ -80,6 +88,8 @@ struct Sweep {
     sse: Vec<u8>,
     server_db: Vec<u8>,
     user_dbs: Vec<(String, Vec<u8>)>,
+    /// M14: a downloaded export archive.
+    tar: Vec<u8>,
 }
 
 impl Sweep {
@@ -99,6 +109,7 @@ impl Sweep {
             sse: frames.lock().unwrap().clone(),
             server_db: bytes_of(&data.join("server").join("server.db")),
             user_dbs,
+            tar: Vec::new(),
         }
     }
 
@@ -110,6 +121,7 @@ impl Sweep {
             ("answers", &self.transcript),
             ("sse", &self.sse),
             ("server.db", &self.server_db),
+            ("tar", &self.tar),
         ] {
             if contains(hay, needle) {
                 at.push(name.to_owned());
@@ -264,4 +276,143 @@ fn tls_verification_is_never_switched_off() {
             assert!(!text.contains(n.as_str()), "{} contains {n}", f.display());
         }
     }
+}
+
+const SCRIPT_CANARY: &str = "script-source-canary-71c3a9";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m14_oauth_export_and_script_secrets_never_leak() {
+    let _ = logs();
+    let s = TestServer::start().await;
+    let alice = s.login(ALICE).await;
+    // OAuth: discovery, registration, consent, code, tokens, a refresh.
+    let d = discover(&s).await;
+    let client = OAuthClient::register(&s, &d, "Redaction client").await;
+    let pkce = Pkce::new();
+    let q = client
+        .authorize(&s, &alice, &pkce, "read scripts", "st", &["scripts"])
+        .await;
+    let code = q["code"].clone();
+    // The consent answer is the one redirect that carries the code.
+    let consent = s.transcript.lock().unwrap().pop().unwrap();
+    assert!(
+        consent.contains(&code),
+        "the redirect is the consent answer"
+    );
+    let (status, tok) = client.redeem(&s, &code, &pkce.verifier).await;
+    assert_eq!(status, 200);
+    let (status, tok2) = client
+        .refresh(&s, tok["refresh_token"].as_str().unwrap())
+        .await;
+    assert_eq!(status, 200);
+    let access = tok2["access_token"].as_str().unwrap().to_owned();
+    // MCP with the token: a tool call and a script whose source is a canary.
+    let agent = s.mcp(&access).await;
+    let ops = call(&agent, "ops_list", json!({})).await;
+    s.record(&serde_json::to_string(&ops).unwrap());
+    let script = call(
+        &agent,
+        "script_run",
+        json!({"source": format!("// {SCRIPT_CANARY}\nreturn 1;"), "dry_run": "sparse"}),
+    )
+    .await;
+    s.record(&serde_json::to_string(&script).unwrap());
+    // An export of alice's chain, followed and downloaded.
+    let (status, job) = s
+        .send(
+            reqwest::Method::POST,
+            "/api/me/audit/exports",
+            Some(&alice),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, 202, "{job}");
+    s.state.exports.wait_idle().await;
+    let id = job["job_id"].as_str().unwrap();
+    let (status, done) = s
+        .send(
+            reqwest::Method::GET,
+            &format!("/api/me/audit/exports/{id}"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (status, done["state"].as_str()),
+        (200, Some("done")),
+        "{done}"
+    );
+    let tar = s
+        .http
+        .get(s.url(&format!("/api/me/audit/exports/{id}/download")))
+        .header("cookie", format!("{COOKIE}={}", alice.cookie))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap()
+        .to_vec();
+    assert!(contains(&tar, b"ustar"), "the archive was read");
+
+    let frames = Mutex::new(Vec::new());
+    let mut sweep = Sweep::take(&s, &frames);
+    sweep.tar = tar;
+    let data = s.dir.path().join("data");
+    let data_text = data.display().to_string();
+    let data_json = serde_json::to_string(&data_text).unwrap();
+    let canaries: Vec<(&str, Vec<u8>)> = vec![
+        ("auth_code", code.as_bytes().to_vec()),
+        (
+            "access_token_1",
+            tok["access_token"].as_str().unwrap().as_bytes().to_vec(),
+        ),
+        (
+            "refresh_token_1",
+            tok["refresh_token"].as_str().unwrap().as_bytes().to_vec(),
+        ),
+        ("access_token_2", access.as_bytes().to_vec()),
+        (
+            "refresh_token_2",
+            tok2["refresh_token"].as_str().unwrap().as_bytes().to_vec(),
+        ),
+        ("pkce_verifier", pkce.verifier.as_bytes().to_vec()),
+    ];
+    for (what, canary) in &canaries {
+        let at = sweep.find(canary);
+        assert!(at.is_empty(), "{what} found in {at:?}");
+    }
+    // The registering address is stored hashed only: no raw `source_ip` in the server store
+    // or the anchor chain (no failed login in this run writes one).
+    assert!(!contains(&sweep.server_db, b"\"source_ip\":"));
+    let reg = s
+        .store
+        .anchor_all()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.kind == "OAUTH_CLIENT_REGISTERED")
+        .expect("the registration row");
+    let body: serde_json::Value = serde_json::from_slice(&reg.body_jcs).unwrap();
+    let hash = body["source_ip_hash"].as_str().unwrap();
+    assert_eq!(hash.len(), 64);
+    assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert!(body.get("source_ip").is_none());
+    // No answer names the data directory (export paths included).
+    for needle in [
+        data_text.as_bytes(),
+        data_json.as_bytes(),
+        b"exports/".as_slice(),
+    ] {
+        assert!(
+            !contains(&sweep.transcript, needle),
+            "{}",
+            String::from_utf8_lossy(needle)
+        );
+    }
+    // The script source never reaches a log line.
+    assert!(!contains(&sweep.logs, SCRIPT_CANARY.as_bytes()));
+    // Self-test: the tar channel is swept.
+    let mut probe = Sweep::take(&s, &frames);
+    probe.tar = b"x-leak-canary-tar-x".to_vec();
+    assert_eq!(probe.find(b"leak-canary-tar"), ["tar"]);
 }

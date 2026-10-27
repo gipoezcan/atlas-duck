@@ -20,6 +20,7 @@ use atlas_duck_server::web::{Access, ROUTES};
 use futures::StreamExt as _;
 use reqwest::Method;
 use serde_json::{Value, json};
+use support::oauth_client::{OAuthClient, Pkce, consent_request, discover};
 use support::*;
 
 /// A's agent proposes a comment; answers A's browser, A's key and the request id (pending).
@@ -665,4 +666,381 @@ async fn agent_cannot_approve() {
     let agent = s.mcp(&key).await;
     let listed = agent.list_all_tools().await.unwrap();
     assert_eq!(listed.len(), all.len());
+}
+
+// ---- M14 T21: OAuth, auditor, exports, scripts ---------------------------------------------
+
+/// `b`'s OAuth access token for `scope` from a freshly registered client (every optional scope
+/// asked for is allowed).
+async fn oauth_token(s: &TestServer, b: &Browser, scope: &str) -> String {
+    let d = discover(s).await;
+    let client = OAuthClient::register(s, &d, "isolation probe").await;
+    let pkce = Pkce::new();
+    let allow: Vec<&str> = scope.split(' ').filter(|x| *x != "read").collect();
+    let q = client.authorize(s, b, &pkce, scope, "st", &allow).await;
+    let (status, tok) = client.redeem(s, &q["code"], &pkce.verifier).await;
+    assert_eq!(status, 200, "{tok}");
+    tok["access_token"].as_str().unwrap().to_owned()
+}
+
+/// `POST /mcp` initialize with `token`: the status and the session id.
+async fn mcp_init(s: &TestServer, token: &str) -> (u16, Option<String>) {
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}"#;
+    let res = s
+        .http
+        .post(s.url("/mcp"))
+        .bearer_auth(token)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(init)
+        .send()
+        .await
+        .unwrap();
+    let sid = res
+        .headers()
+        .get("mcp-session-id")
+        .map(|v| v.to_str().unwrap().to_owned());
+    (res.status().as_u16(), sid)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn b_token_cannot_reach_a() {
+    let s = TestServer::start().await;
+    let (_a, a_key, id, waiting) = a_pending_write(&s).await;
+    let b = s.login(BOB).await;
+    let b_token = oauth_token(&s, &b, "read propose_write").await;
+    let agent = s.mcp(&b_token).await;
+    for tool in ["request_status", "request_await", "request_cancel"] {
+        let r = tokio::time::timeout(
+            Duration::from_secs(10),
+            call(&agent, tool, json!({"request_id": id})),
+        )
+        .await
+        .expect("{tool} waited on a foreign request");
+        let env = envelope(&r);
+        assert!(not_found_envelope(&env), "{tool}: {env}");
+    }
+    let list = envelope(&call(&agent, "request_list", json!({})).await);
+    assert!(!list.to_string().contains(&id), "{list}");
+    // A's MCP session (opened with A's key) with B's token: not found.
+    let (status, sid) = mcp_init(&s, &a_key).await;
+    assert_eq!(status, 200);
+    let res = s
+        .http
+        .post(s.url("/mcp"))
+        .bearer_auth(&b_token)
+        .header("mcp-session-id", sid.unwrap())
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+    let a = s.login(ALICE).await;
+    assert_eq!(s.queue_of(&a, 1).await[0]["request_id"], id);
+    waiting.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn b_cannot_revoke_a_grant() {
+    let s = TestServer::start().await;
+    let a = s.login(ALICE).await;
+    let b = s.login(BOB).await;
+    let a_token = oauth_token(&s, &a, "read").await;
+    let (_, grants) = s
+        .send(Method::GET, "/api/me/oauth/grants", Some(&a), None)
+        .await;
+    let gid = grants[0]["grant_id"].as_str().unwrap().to_owned();
+    let (_, mine) = s
+        .send(Method::GET, "/api/me/oauth/grants", Some(&b), None)
+        .await;
+    assert_eq!(mine, json!([]));
+    let (status, v) = s
+        .send(
+            Method::DELETE,
+            &format!("/api/me/oauth/grants/{gid}"),
+            Some(&b),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (status, v["error"]["code"].as_str()),
+        (404, Some("oauth/grant_unknown"))
+    );
+    assert_eq!(mcp_init(&s, &a_token).await.0, 200, "A's token still works");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consent_request_bound_to_session() {
+    let s = TestServer::start().await;
+    let a = s.login(ALICE).await;
+    let b = s.login(BOB).await;
+    let d = discover(&s).await;
+    let client = OAuthClient::register(&s, &d, "bound probe").await;
+    let pkce = Pkce::new();
+    let req = consent_request(&s, &a, &client.authorize_url(&pkce, "read", "st")).await;
+    let path = format!("/api/oauth/consent/{req}");
+    let (status, v) = s.send(Method::GET, &path, Some(&b), None).await;
+    assert_eq!(
+        (status, v["error"]["code"].as_str()),
+        (404, Some("oauth/request_unknown"))
+    );
+    let allow = json!({"decision": "allow", "scopes": []});
+    let (status, _) = s
+        .send(Method::POST, &path, Some(&b), Some(allow.clone()))
+        .await;
+    assert_eq!(status, 404);
+    // B has no grant; A's request is still A's to decide.
+    let (_, bg) = s
+        .send(Method::GET, "/api/me/oauth/grants", Some(&b), None)
+        .await;
+    assert_eq!(bg, json!([]));
+    let (status, v) = s.send(Method::POST, &path, Some(&a), Some(allow)).await;
+    assert_eq!(status, 200, "{v}");
+}
+
+/// Every `/api/auditor/*` route needs the auditor role and no other route does.
+fn auditor_rows() -> Vec<(&'static str, &'static str)> {
+    for (_, path, access) in ROUTES {
+        assert_eq!(
+            path.starts_with("/api/auditor/"),
+            *access == Access::Auditor,
+            "{path} {access:?}"
+        );
+    }
+    ROUTES
+        .iter()
+        .filter(|(_, _, a)| *a == Access::Auditor)
+        .map(|(m, p, _)| (*m, *p))
+        .collect()
+}
+
+async fn refused_on_auditor_routes(s: &TestServer, who: &Browser) {
+    let rows = auditor_rows();
+    assert!(rows.len() >= 5, "{rows:?}");
+    for (method, path) in rows {
+        let url = concrete(path).replace(&user_id_for(BOB.0), &user_id_for(ALICE.0));
+        let (status, v) = s
+            .send(
+                reqwest_method(method),
+                &url,
+                Some(who),
+                body_for(method, path),
+            )
+            .await;
+        assert_eq!(
+            (status, v["error"]["code"].as_str()),
+            (403, Some("auth/role_required")),
+            "{method} {path}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn user_cannot_use_auditor_routes() {
+    let s = TestServer::start().await;
+    let _ = s.login(ALICE).await;
+    let b = s.login(BOB).await;
+    refused_on_auditor_routes(&s, &b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_cannot_use_auditor_routes() {
+    let s = TestServer::start().await;
+    let _ = s.login(ALICE).await;
+    let carol = s.login(CAROL).await;
+    refused_on_auditor_routes(&s, &carol).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auditor_cannot_decide_for_target() {
+    let s = TestServer::start().await;
+    let (a, _key, id, waiting) = a_pending_write(&s).await;
+    let rev = rev_of(&s, &a, &id).await;
+    let dave = s.login(DAVE).await;
+    let decide =
+        |rid: &str| json!({"request_id": rid, "decision": "approve", "candidate_rev": rev});
+    let got = s.cmd(&dave, "decide", decide(&id)).await;
+    assert_ne!(got.0, 400, "{got:?}");
+    assert_eq!(got, s.cmd(&dave, "decide", decide(NOBODY)).await);
+    // No decision path under the auditor routes either.
+    let alice_id = user_id_for(ALICE.0);
+    for cmd in ["decide", "deny_batch", "queue_list"] {
+        let (status, _) = s
+            .send(
+                Method::POST,
+                &format!("/api/auditor/users/{alice_id}/{cmd}"),
+                Some(&dave),
+                Some(decide(&id)),
+            )
+            .await;
+        assert_eq!(status, 404, "{cmd}");
+    }
+    assert_eq!(s.queue_of(&a, 1).await[0]["request_id"], id);
+    assert_eq!(writes_seen(&s.mock.received().await), 0);
+    waiting.abort();
+}
+
+/// The `AUDITOR_READ` payloads of `user`'s chain, oldest first.
+async fn auditor_reads(s: &TestServer, user: &str) -> Vec<Value> {
+    let uid = user_id_for(user);
+    let rt = s
+        .registry
+        .open_runtimes()
+        .await
+        .into_iter()
+        .find(|r| r.user_id() == uid)
+        .expect("the auditor's runtime is open");
+    let store = rt.audit_store();
+    let page = store
+        .query(
+            &atlas_duck_audit::types::AuditFilter::default(),
+            atlas_duck_audit::types::AuditCursor::first(500),
+        )
+        .unwrap();
+    let mut out: Vec<Value> = page
+        .rows
+        .iter()
+        .filter(|r| r.event_type == atlas_duck_audit::EventType::AUDITOR_READ)
+        .map(|r| serde_json::from_slice(&store.payload_view(r.seq, 0).unwrap().bytes).unwrap())
+        .collect();
+    out.reverse();
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auditor_reads_are_recorded() {
+    let s = TestServer::start().await;
+    let _ = s.login(ALICE).await;
+    let dave = s.login(DAVE).await;
+    let alice_id = user_id_for(ALICE.0);
+    let base = format!("/api/auditor/users/{alice_id}");
+    let (status, _) = s
+        .send(Method::GET, "/api/auditor/users", Some(&dave), None)
+        .await;
+    assert_eq!(status, 200);
+    for (cmd, body) in [
+        ("audit_query", json!({"filter": {}})),
+        (
+            "audit_trail",
+            json!({"request_id": "req_0123456789abcdefghij"}),
+        ),
+        ("audit_payload", json!({"seq": 1})),
+    ] {
+        let (status, v) = s
+            .send(
+                Method::POST,
+                &format!("{base}/{cmd}"),
+                Some(&dave),
+                Some(body),
+            )
+            .await;
+        assert_eq!(status, 200, "{cmd}: {v}");
+    }
+    let (status, job) = s
+        .send(
+            Method::POST,
+            &format!("{base}/exports"),
+            Some(&dave),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, 202, "{job}");
+    s.state.exports.wait_idle().await;
+    let reads = auditor_reads(&s, DAVE.0).await;
+    let actions: Vec<&str> = reads
+        .iter()
+        .map(|r| r["action"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        actions,
+        ["list_users", "query", "trail", "payload", "export"]
+    );
+    assert!(
+        reads[1..]
+            .iter()
+            .all(|r| r["target_user_id"] == alice_id.as_str())
+    );
+    assert_eq!(reads[4]["job_id"], job["job_id"]);
+    let ops = s
+        .store
+        .anchor_all()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.kind == "AUDITOR_READ")
+        .count();
+    assert_eq!(ops, 5);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn export_job_bound_to_requester() {
+    let s = TestServer::start().await;
+    let a = s.login(ALICE).await;
+    let b = s.login(BOB).await;
+    let dave = s.login(DAVE).await;
+    let (status, job) = s
+        .send(
+            Method::POST,
+            "/api/me/audit/exports",
+            Some(&a),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, 202, "{job}");
+    s.state.exports.wait_idle().await;
+    let id = job["job_id"].as_str().unwrap().to_owned();
+    let alice_id = user_id_for(ALICE.0);
+    for (who, path) in [
+        (&b, format!("/api/me/audit/exports/{id}")),
+        (&b, format!("/api/me/audit/exports/{id}/download")),
+        (&dave, format!("/api/me/audit/exports/{id}")),
+        (&dave, format!("/api/auditor/users/{alice_id}/exports/{id}")),
+        (
+            &dave,
+            format!("/api/auditor/users/{alice_id}/exports/{id}/download"),
+        ),
+    ] {
+        let (status, v) = s.send(Method::GET, &path, Some(who), None).await;
+        assert_eq!(
+            (status, v["error"]["code"].as_str()),
+            (404, Some("audit/export_unknown")),
+            "{path}"
+        );
+    }
+    let (status, v) = s
+        .send(
+            Method::GET,
+            &format!("/api/me/audit/exports/{id}"),
+            Some(&a),
+            None,
+        )
+        .await;
+    assert_eq!((status, v["state"].as_str()), (200, Some("done")), "{v}");
+}
+
+/// The per-user script slots are pinned in the server's lib suite
+/// (`tests::scripts::per_user_slots_are_independent`, fake runner); here the scope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scripts_scope_needed() {
+    let s = TestServer::start().await;
+    let a = s.login(ALICE).await;
+    let names = |c: &rmcp::service::RunningService<rmcp::RoleClient, ()>| {
+        let c = c.peer().clone();
+        async move {
+            c.list_all_tools()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|t| t.name.into_owned())
+                .collect::<Vec<_>>()
+        }
+    };
+    let read = s.mcp(&oauth_token(&s, &a, "read").await).await;
+    assert!(!names(&read).await.contains(&"script_run".to_owned()));
+    let r = call(&read, "script_run", json!({"source": "return 1;"})).await;
+    assert_eq!(r.is_error, Some(true));
+    assert_eq!(envelope(&r)["error"]["code"], "scope_missing", "{r:?}");
+    let scripts = s.mcp(&oauth_token(&s, &a, "read scripts").await).await;
+    assert!(names(&scripts).await.contains(&"script_run".to_owned()));
 }
