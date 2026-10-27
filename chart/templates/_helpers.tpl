@@ -72,6 +72,9 @@ matrix (chart/ci-fail/*.yaml, `# expect:`) can match it.
 {{- if and .Values.directory.serviceBind.dn (not .Values.directory.serviceBind.existingSecret) }}
 {{- fail "atlas-duck: directory.serviceBind.existingSecret is required with directory.serviceBind.dn" }}
 {{- end }}
+{{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.ingressNamespaceSelectors) }}
+{{- fail "atlas-duck: networkPolicy.ingressNamespaceSelectors is required when networkPolicy.enabled (Q2)" }}
+{{- end }}
 {{- range .Values.extraEnv }}
 {{- if and (regexMatch "(?i)(KEY|TOKEN|PASSWORD|SECRET)" .name) (not (hasSuffix "_FILE" .name)) }}
 {{- fail (printf "atlas-duck: extraEnv %s looks like a secret; mount a file instead (SM-9.1)" .name) }}

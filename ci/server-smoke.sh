@@ -44,6 +44,7 @@ common_env=(
 mounts=(
   --tmpfs /data:uid=65532,gid=65532,mode=0700
   --tmpfs /run/atlas-duck:uid=65532,gid=65532,mode=0700
+  --tmpfs /tmp:uid=65532,gid=65532,mode=1777
   -v "$KEY_FILE:/run/secrets/master-key:ro"
   -v "$FIXTURES:/fixtures:ro"
 )

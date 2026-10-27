@@ -16,7 +16,7 @@ printf 'atlas-duck-master-key/v1 local %s\n' "$(head -c 32 /dev/urandom | base64
 mkdir -p data
 
 docker run --rm --name atlas-duck -p 8080:8080 --read-only --cap-drop ALL --security-opt no-new-privileges \
-  --tmpfs /run/atlas-duck:uid=65532,gid=65532,mode=0700 \
+  --tmpfs /run/atlas-duck:uid=65532,gid=65532,mode=0700 --tmpfs /tmp:mode=1777 \
   -e ATLAS_DUCK_MODE=dev -e ATLAS_DUCK_PUBLIC_URL=http://localhost:8080 \
   -e ATLAS_DUCK_DATA_DIR=/data -e ATLAS_DUCK_MASTER_KEY_FILE=/run/secrets/master-key \
   -e ATLAS_DUCK_TEST_DIRECTORY_FILE=/fixtures/test-directory.json \
@@ -45,7 +45,7 @@ on **Approvals**; the agent never approves anything.
 The admin CLI talks to the running server over its socket in `/run/atlas-duck` (M13):
 `docker exec atlas-duck /app/atlas-duck-server admin instances list` (also `instances add|remove`,
 `users list`, `users deactivate <username>`; `admin --help` lists them). Without a writable
-`/run/atlas-duck` the server does not start.
+`/run/atlas-duck` the server does not start; `/tmp` must be writable for instance validation.
 
 ## Test directory format
 

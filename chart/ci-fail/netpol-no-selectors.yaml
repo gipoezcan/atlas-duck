@@ -1,0 +1,4 @@
+# expect: atlas-duck: networkPolicy.ingressNamespaceSelectors is required
+networkPolicy:
+  enabled: true
+  ingressNamespaceSelectors: []

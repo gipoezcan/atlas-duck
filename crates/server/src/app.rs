@@ -202,7 +202,13 @@ async fn run(config: Config) -> u8 {
 /// server does not start without its admin interface).
 #[cfg(unix)]
 fn start_admin_socket(config: &Config, ctx: Arc<AdminCtx>) -> Option<tokio::task::JoinHandle<()>> {
-    let (listener, uid) = crate::admin::socket::bind(&config.admin_socket).ok()?;
+    let (listener, uid) = match crate::admin::socket::bind(&config.admin_socket) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(event = "admin_socket_bind_failed", error = %e);
+            return None;
+        }
+    };
     tracing::info!(event = "admin_socket_listening");
     Some(tokio::spawn(crate::admin::socket::serve(
         listener, uid, ctx,
