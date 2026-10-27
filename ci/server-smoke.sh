@@ -68,8 +68,7 @@ user="$(docker inspect --format '{{.Config.User}}' "$NAME")"
 
 # The admin CLI reaches the running server over its socket (M13 T5, Δ-M13-2).
 set +e
-docker exec "$NAME" /app/atlas-duck-server admin instances add --alias offline --product jira \
-  --url https://offline.example.test > "$WORK/admin.out" 2>&1
+docker exec "$NAME" /app/atlas-duck-server admin instances list > "$WORK/admin.out" 2>&1
 code=$?
 set -e
 [[ "$code" == 0 ]] || fail "admin instances list exited $code: $(cat "$WORK/admin.out")"
@@ -112,8 +111,10 @@ sid="$(sed -n 's/^[Mm]cp-[Ss]ession-[Ii]d: *\([^[:space:]]*\).*/\1/p' "$WORK/ini
 "${CURL[@]}" -H "Authorization: Bearer $key" -H "Mcp-Session-Id: $sid" \
   -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' "$BASE/mcp" > "$WORK/tools.body"
-grep -q 'jira_issue_get' "$WORK/tools.body" || fail "tools/list lacks jira_issue_get"
-if grep -q 'jira_issue_edit' "$WORK/tools.body"; then fail "a read key lists a write tool"; fi
+# Exact tool names: the read tool jira_issue_editmeta contains the write tool's name as a prefix.
+grep -q '"name":"jira_issue_get"' "$WORK/tools.body" || fail "tools/list lacks jira_issue_get"
+grep -q '"name":"jira_issue_editmeta"' "$WORK/tools.body" || fail "tools/list lacks jira_issue_editmeta"
+if grep -q '"name":"jira_issue_edit"' "$WORK/tools.body"; then fail "a read key lists a write tool"; fi
 status="$("${CURL[@]}" -o /dev/null -w '%{http_code}' -X POST "$BASE/mcp")"
 [[ "$status" == 401 ]] || fail "/mcp without a key answered $status"
 
