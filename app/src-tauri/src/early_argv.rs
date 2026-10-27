@@ -3,11 +3,12 @@
 //! check and `instance.lock`. The markers are entry-point switches, not security controls (§3.2 (b)).
 
 use std::ffi::{OsStr, OsString};
-use std::io::Write;
-use std::path::{Path, PathBuf};
 
-use atlas_duck_audit::ExportVerdict;
-use atlas_duck_ipc::envelope::VERIFY_EXPORT_USAGE_IO;
+// M14: the `verify-export` command line lives in the audit crate, shared with
+// `atlas-duck-server verify-export`.
+pub use atlas_duck_audit::verify_export_cli::{
+    VERIFY_EXPORT_USAGE, VerifyExportArgs, parse_verify_export_args, run_verify_export,
+};
 
 /// AppImage CLI dispatch marker (§12.1).
 pub const MARKER_CLI: &str = "__cli";
@@ -17,10 +18,6 @@ pub const MARKER_VERIFY_EXPORT: &str = "__verify-export";
 pub const ALIAS_VERIFY_EXPORT: &str = "--verify-export";
 /// Autostart / CLI launch flag (§2.5, §4.7).
 pub const FLAG_BACKGROUND: &str = "--background";
-
-/// The usage line `__verify-export` prints on stderr after a usage error (exit 22).
-pub const VERIFY_EXPORT_USAGE: &str =
-    "usage: verify-export <dir> [--anchor-dir <dir>] [--manifest-sha256 <64 lowercase hex>]";
 
 /// What `main` does with this process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,155 +51,18 @@ pub fn classify_argv(args: &[OsString]) -> EarlyMode {
     EarlyMode::Gui { background }
 }
 
-/// What `__verify-export` was asked to verify (§12.1).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifyExportArgs {
-    pub dir: PathBuf,
-    pub anchor_dir: Option<PathBuf>,
-    pub manifest_sha256: Option<[u8; 32]>,
-}
-
-/// Parses `<dir> [--anchor-dir <dir>] [--manifest-sha256 <hex>]` (also `--opt=value`, any order).
-/// `Err` carries the one-line reason; the caller adds [`VERIFY_EXPORT_USAGE`]. A flag spelled
-/// `--opt=value` must be valid UTF-8 as a whole; a non-UTF-8 path goes in the separate form.
-pub fn parse_verify_export_args(args: &[OsString]) -> Result<VerifyExportArgs, String> {
-    let mut dir: Option<PathBuf> = None;
-    let mut anchor_dir: Option<PathBuf> = None;
-    let mut manifest_sha256: Option<[u8; 32]> = None;
-    let mut rest = args.iter();
-    while let Some(arg) = rest.next() {
-        if !arg.as_encoded_bytes().starts_with(b"-") {
-            if arg.is_empty() {
-                return Err("the export directory is empty".to_owned());
-            }
-            if dir.replace(PathBuf::from(arg)).is_some() {
-                return Err(format!("unexpected argument: {}", shown(arg)));
-            }
-            continue;
-        }
-        let Some(text) = arg.to_str() else {
-            return Err(
-                "an option is not valid UTF-8 (use --option value for such paths)".to_owned(),
-            );
-        };
-        let (name, inline) = match text.split_once('=') {
-            Some((name, value)) => (name, Some(OsString::from(value))),
-            None => (text, None),
-        };
-        if name != "--anchor-dir" && name != "--manifest-sha256" {
-            return Err(format!("unknown flag: {}", shown(OsStr::new(name))));
-        }
-        let value = match inline.or_else(|| rest.next().cloned()) {
-            Some(v) if !v.is_empty() => v,
-            Some(_) => return Err(format!("{name} needs a non-empty value")),
-            None => return Err(format!("{name} needs a value")),
-        };
-        if name == "--anchor-dir" {
-            if anchor_dir.replace(PathBuf::from(value)).is_some() {
-                return Err("--anchor-dir given twice".to_owned());
-            }
-        } else {
-            let Some(hash) = value.to_str().and_then(sha256_hex) else {
-                return Err("--manifest-sha256 must be 64 lowercase hex digits".to_owned());
-            };
-            if manifest_sha256.replace(hash).is_some() {
-                return Err("--manifest-sha256 given twice".to_owned());
-            }
-        }
-    }
-    let Some(dir) = dir else {
-        return Err("no export directory given".to_owned());
-    };
-    Ok(VerifyExportArgs {
-        dir,
-        anchor_dir,
-        manifest_sha256,
-    })
-}
-
-/// An argument for an error line: lossy, cut to 80 characters.
-fn shown(arg: &OsStr) -> String {
-    arg.to_string_lossy().chars().take(80).collect()
-}
-
-/// 64 lowercase hex digits as 32 bytes.
-fn sha256_hex(text: &str) -> Option<[u8; 32]> {
-    let digits = text.as_bytes();
-    if digits.len() != 64 {
-        return None;
-    }
-    let nibble = |d: u8| match d {
-        b'0'..=b'9' => Some(d - b'0'),
-        b'a'..=b'f' => Some(d - b'a' + 10),
-        _ => None,
-    };
-    let mut out = [0u8; 32];
-    for (byte, pair) in out.iter_mut().zip(digits.chunks_exact(2)) {
-        *byte = nibble(*pair.first()?)? << 4 | nibble(*pair.get(1)?)?;
-    }
-    Some(out)
-}
-
-/// The §8.10 export verifier as a process mode: the report goes to `stdout`, usage errors to
-/// `stderr`, and the return value is the exit code (§12.1: 0, 20, 21, 22). It reads only the export
-/// directory and the anchor directory the arguments name; it holds no key and touches no store,
-/// keychain, data dir or instance lock, so it can never leave a tray instance behind (§2.5 Scope).
-/// `verify` is the verifier (`atlas_duck_audit::verify_export` in the process).
-pub fn run_verify_export<V, O, E>(
-    args: &[OsString],
-    verify: V,
-    stdout: &mut O,
-    stderr: &mut E,
-) -> i32
-where
-    V: FnOnce(&Path, Option<&Path>, Option<[u8; 32]>) -> ExportVerdict,
-    O: Write,
-    E: Write,
-{
-    let parsed = match parse_verify_export_args(args) {
-        Ok(parsed) => parsed,
-        Err(reason) => {
-            let _ = writeln!(stderr, "verify-export: {reason}");
-            let _ = writeln!(stderr, "{VERIFY_EXPORT_USAGE}");
-            return VERIFY_EXPORT_USAGE_IO;
-        }
-    };
-    let verdict = verify(
-        &parsed.dir,
-        parsed.anchor_dir.as_deref(),
-        parsed.manifest_sha256,
-    );
-    let written = verdict
-        .report()
-        .iter()
-        .try_for_each(|line| writeln!(stdout, "{line}"))
-        .and_then(|()| stdout.flush());
-    let code = i32::from(verdict.exit_code());
-    if written.is_err() {
-        // A closed or full stdout: never exit 0 (or 20) with no report. Tampering stays 21.
-        let _ = writeln!(
-            stderr,
-            "verify-export: could not write the report to stdout"
-        );
-        if code != 21 {
-            return VERIFY_EXPORT_USAGE_IO;
-        }
-    }
-    code
-}
-
 /// [`run_verify_export`] on the real verifier and the process's stdio.
 pub fn verify_export_main(args: Vec<OsString>) -> i32 {
-    run_verify_export(
-        &args,
-        atlas_duck_audit::verify_export,
-        &mut std::io::stdout().lock(),
-        &mut std::io::stderr().lock(),
-    )
+    atlas_duck_audit::verify_export_cli::verify_export_main(&args)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    use atlas_duck_audit::ExportVerdict;
+
     use super::*;
 
     fn os(items: &[&str]) -> Vec<OsString> {
@@ -314,20 +174,16 @@ mod tests {
     }
 
     fn only_dir(dir: &str) -> VerifyExportArgs {
-        VerifyExportArgs {
-            dir: PathBuf::from(dir),
-            anchor_dir: None,
-            manifest_sha256: None,
-        }
+        VerifyExportArgs::dir_only(dir)
     }
 
     #[test]
     fn verify_export_args_parse_and_reject_unknown() {
         assert_eq!(parsed(&["d"]), only_dir("d"));
         let full = VerifyExportArgs {
-            dir: PathBuf::from("d"),
             anchor_dir: Some(PathBuf::from("a")),
             manifest_sha256: Some(hex_bytes()),
+            ..only_dir("d")
         };
         let manifest_flag = format!("--manifest-sha256={HEX}");
         for items in [
@@ -352,11 +208,7 @@ mod tests {
         let raw = non_utf8();
         assert_eq!(
             parse_verify_export_args(std::slice::from_ref(&raw)).expect("non-UTF-8 dir"),
-            VerifyExportArgs {
-                dir: PathBuf::from(&raw),
-                anchor_dir: None,
-                manifest_sha256: None
-            }
+            VerifyExportArgs::dir_only(&raw)
         );
         assert_eq!(
             parse_verify_export_args(&[
@@ -439,8 +291,8 @@ mod tests {
         let mut calls: Vec<Call> = Vec::new();
         let code = run_verify_export(
             &os(items),
-            |dir, anchor, manifest| {
-                calls.push((dir.to_path_buf(), anchor.map(Path::to_path_buf), manifest));
+            |a| {
+                calls.push((a.dir.clone(), a.anchor_dir.clone(), a.manifest_sha256));
                 verdict()
             },
             &mut out,
@@ -499,7 +351,7 @@ mod tests {
         ];
         for (verdict, expected) in cases {
             let mut err = Vec::new();
-            let code = run_verify_export(&os(&["d"]), |_, _, _| verdict, &mut Broken, &mut err);
+            let code = run_verify_export(&os(&["d"]), |_| verdict, &mut Broken, &mut err);
             assert_eq!(code, expected);
             let text = String::from_utf8(err).expect("UTF-8");
             assert!(text.contains("could not write the report"), "{text}");

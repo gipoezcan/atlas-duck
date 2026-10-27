@@ -50,14 +50,25 @@ After an atlas-duck upgrade, restart the MCP server.
 /// envelope, no global flags.
 const VERIFY_EXPORT_HELP: &str = "\
 Usage: atlas-duck verify-export <dir> [--anchor-dir <dir>] [--manifest-sha256 <64 lowercase hex>]
+       atlas-duck verify-export <dir> --anchor-chain <file> [--anchor-chain-head <seq>:<hex>]
+                                [--manifest-sha256 <64 lowercase hex>]
 
 Verify an audit export directory offline. Needs no running app, no keychain and no key; it
-reads only <dir> and the anchor directory. The report goes to stdout (no JSON envelope).
+reads only <dir> and the anchor directory or anchor-chain excerpt. The report goes to stdout
+(no JSON envelope).
 
 Flags:
-  --anchor-dir <dir>            the anchor directory the export was anchored to
+  --anchor-dir <dir>            the anchor directory the export was anchored to (desktop)
+  --anchor-chain <file>         a server export's anchor-chain.jsonl (its manifest beside it)
+  --anchor-chain-head <seq>:<hex>
+                                the server's anchor head you obtained out of band (the
+                                auditor page, the server log line anchor_head, or the
+                                administrator); without it the excerpt is checked for
+                                consistency only
   --manifest-sha256 <hex>       the SHA-256 of manifest.json, obtained from the exporter
   --help                        show this help
+
+--anchor-dir and --anchor-chain cannot be given together: one export comes from one mode.
 
 verify-export must be the first argument; the global flags do not apply to it.
 A --help or -h anywhere shows this help, so a directory named like a flag needs a path prefix

@@ -841,3 +841,161 @@ pub fn export_fixture(kind: FixtureKind, out: &Path) -> std::io::Result<FixtureI
         },
     })
 }
+
+// ---- M14 T19: an in-memory server anchor sequence and its excerpt ---------------------------
+
+/// One row of an [`AnchorSeq`].
+struct SeqRow {
+    seq: u64,
+    ts_utc: String,
+    kind: String,
+    body: Vec<u8>,
+    prev: [u8; 32],
+    hash: [u8; 32],
+    entry: Option<crate::server_anchor::LeafEntry>,
+}
+
+/// A server anchor chain built in memory (v2 rows), to write excerpts the way the server's
+/// export job does (PD-253) without a server.
+#[derive(Default)]
+pub struct AnchorSeq {
+    rows: Vec<SeqRow>,
+}
+
+impl AnchorSeq {
+    pub fn new() -> Self {
+        AnchorSeq::default()
+    }
+
+    fn push(
+        &mut self,
+        kind: &str,
+        body: Vec<u8>,
+        entry: Option<crate::server_anchor::LeafEntry>,
+    ) -> u64 {
+        let seq = self.rows.len() as u64 + 1;
+        let prev = self
+            .rows
+            .last()
+            .map_or(crate::server_anchor::GENESIS_PREV, |r| r.hash);
+        let ts_utc = format!("2026-10-27T10:{:02}:{:02}.000Z", (seq / 60) % 60, seq % 60);
+        let hash = crate::server_anchor::row_hash(seq, &ts_utc, kind, &body, &prev);
+        self.rows.push(SeqRow {
+            seq,
+            ts_utc,
+            kind: kind.to_owned(),
+            body,
+            prev,
+            hash,
+            entry,
+        });
+        seq
+    }
+
+    /// An operational row (its body never goes into an excerpt).
+    pub fn op(&mut self, kind: &str) -> u64 {
+        let body = format!("{{\"n\":{}}}", self.rows.len() + 1).into_bytes();
+        self.push(kind, body, None)
+    }
+
+    /// A `HEADS` row with `others` other users' leaves and, when given, the leaf of
+    /// `(user_id, chain_id, head_seq, record_hash)`.
+    pub fn heads(&mut self, mine: Option<(&str, &str, u64, [u8; 32])>, others: usize) -> u64 {
+        use crate::server_anchor::{LeafEntry, heads_body_jcs, leaf_hash};
+        let n = self.rows.len() as u64 + 1;
+        let mut leaves: Vec<[u8; 32]> = (0..others)
+            .map(|i| leaf_hash(&format!("other{i}"), "c-other", n, &[0x5a; 32]))
+            .collect();
+        let my_leaf = mine.map(|(u, c, s, h)| (leaf_hash(u, c, s, &h), (u, c, s, h)));
+        if let Some((l, _)) = &my_leaf {
+            leaves.push(*l);
+        }
+        let body = heads_body_jcs(&leaves).unwrap_or_default();
+        let mut sorted: Vec<[u8; 32]> = leaves;
+        // Lowercase hex sorts like the bytes.
+        sorted.sort();
+        let entry = my_leaf.map(|(l, (u, c, s, h))| LeafEntry {
+            user_id: u.to_owned(),
+            chain_id: c.to_owned(),
+            head_seq: s,
+            record_hash: h,
+            leaf_index: sorted.iter().position(|x| *x == l).unwrap_or(0) as u64,
+        });
+        self.push("HEADS", body, entry)
+    }
+
+    /// The last row: `(seq, hash)`.
+    pub fn head(&self) -> (u64, [u8; 32]) {
+        self.rows
+            .last()
+            .map_or((0, crate::server_anchor::GENESIS_PREV), |r| (r.seq, r.hash))
+    }
+
+    /// The excerpt lines of `[first, last]`: full where a leaf entry is, opaque elsewhere.
+    pub fn lines(&self, first: u64, last: u64) -> Vec<Vec<u8>> {
+        self.rows
+            .iter()
+            .filter(|r| (first..=last).contains(&r.seq))
+            .map(|r| {
+                crate::server_anchor::excerpt_line_jcs(
+                    r.seq,
+                    &r.ts_utc,
+                    &r.kind,
+                    &r.body,
+                    &r.prev,
+                    &r.hash,
+                    r.entry.as_ref().map(Some),
+                )
+            })
+            .collect()
+    }
+
+    /// The excerpt manifest of `[first, last]` for `chain_id`.
+    pub fn manifest(
+        &self,
+        first: u64,
+        last: u64,
+        chain_id: &str,
+    ) -> crate::server_anchor::ExcerptManifest {
+        let last_hash = self
+            .rows
+            .iter()
+            .find(|r| r.seq == last)
+            .map_or([0; 32], |r| r.hash);
+        crate::server_anchor::ExcerptManifest {
+            format: crate::server_anchor::EXCERPT_FORMAT.to_owned(),
+            issuer: "https://duck.example.test".to_owned(),
+            first_seq: first,
+            last_seq: last,
+            last_hash: hex::encode(last_hash),
+            chain_id: chain_id.to_owned(),
+        }
+    }
+
+    /// Writes `anchor-chain.jsonl` and `anchor-chain.manifest.json` of `[first, last]` into `dir`.
+    pub fn write(&self, dir: &Path, first: u64, last: u64, chain_id: &str) -> std::io::Result<()> {
+        write_excerpt(
+            dir,
+            &self.lines(first, last),
+            &self.manifest(first, last, chain_id),
+        )
+    }
+}
+
+/// Writes excerpt `lines` (each ended by a newline) and `manifest` into `dir`.
+pub fn write_excerpt(
+    dir: &Path,
+    lines: &[Vec<u8>],
+    manifest: &crate::server_anchor::ExcerptManifest,
+) -> std::io::Result<()> {
+    let mut text = Vec::new();
+    for l in lines {
+        text.extend_from_slice(l);
+        text.push(b'\n');
+    }
+    std::fs::write(dir.join(crate::server_anchor::EXCERPT_FILE), text)?;
+    std::fs::write(
+        dir.join(crate::server_anchor::EXCERPT_MANIFEST_FILE),
+        manifest.to_jcs(),
+    )
+}

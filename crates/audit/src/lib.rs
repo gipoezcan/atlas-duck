@@ -58,10 +58,10 @@ pub mod recovery;
 mod recovery;
 pub mod request_set;
 pub mod requests;
+mod restore;
 /// The server anchor chain's pure hash functions (M12 PD-217), shared by the server and
 /// `verify-export`.
 pub mod server_anchor;
-mod restore;
 // Read-write connections, DDL and the migration runner (I-4: the writer thread is the only
 // read-write user of `audit.db`); production builds re-export only the names below.
 #[cfg(any(test, feature = "testing"))]
@@ -78,6 +78,7 @@ pub mod verify;
 #[cfg(not(any(test, feature = "testing")))]
 mod verify;
 pub mod verify_export;
+pub mod verify_export_cli;
 mod writer;
 
 pub use admission::FreeSpaceProbe;
@@ -121,7 +122,7 @@ pub use types::{
     QueryKind, RustChosenPath, TimeRange, UtcInstant,
 };
 pub use verify::{FindingKind, VerifyFinding, VerifyOutcome};
-pub use verify_export::verify_export;
+pub use verify_export::{AnchorChain, verify_export, verify_export_full};
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

@@ -2032,6 +2032,7 @@ fn small_limits() -> Limits {
         prune_log_line: 4096,
         anchor_file: 64 * 1024,
         anchor_files: 16,
+        ..Limits::default()
     }
 }
 

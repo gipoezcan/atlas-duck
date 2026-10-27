@@ -96,6 +96,10 @@ use crate::export::{
 };
 use crate::open::is_id;
 use crate::request_set::REQUEST_SET_DOMAIN;
+use crate::server_anchor::{
+    EXCERPT_FILE, EXCERPT_FORMAT, EXCERPT_MANIFEST_FILE, ExcerptLimits, ExcerptManifest,
+    ExcerptRow, parse_excerpt_line,
+};
 use crate::settings::{Settings, snapshot_has_unknown_key};
 use crate::types::{EventFlags, EventType, ExportVerdict};
 use crate::verify::{Findings, PruneLogRow, check_prune_log, hex32};
@@ -133,6 +137,13 @@ const ANCHOR_OK: &str = "verified against the anchor dir";
 const BOTH_OK: &str = "verified against the manifest SHA-256 and the anchor dir";
 /// §8.10 verbatim.
 const NO_ROOT: &str = "internally consistent; trust root NOT verified";
+/// M14 PD-259: a pinned anchor-chain head binds the whole export.
+pub const ANCHOR_CHAIN_OK: &str = "verified against the anchor chain";
+/// M14 PD-259: the manifest hash and a pinned anchor-chain head that binds rows of the export.
+pub const MANIFEST_AND_CHAIN_OK: &str =
+    "verified against the manifest SHA-256 and the anchor chain";
+/// `anchor-chain.manifest.json` is at most this long (an honest one is about 300 bytes).
+const MAX_EXCERPT_MANIFEST_BYTES: u64 = 64 * 1024;
 
 // ---------------------------------------------------------------------------------------
 // File access
@@ -203,6 +214,10 @@ pub struct Limits {
     pub anchor_file: u64,
     /// `*.jsonl` names in the anchor dir.
     pub anchor_files: usize,
+    /// M14 PD-259: the server anchor-chain excerpt file, one of its lines, its lines.
+    pub anchor_chain_file: u64,
+    pub anchor_chain_line: u64,
+    pub anchor_chain_rows: u64,
 }
 
 impl Default for Limits {
@@ -215,6 +230,9 @@ impl Default for Limits {
             prune_log_line: MAX_PRUNE_LOG_LINE_BYTES,
             anchor_file: anchor_dir::MAX_FILE_BYTES,
             anchor_files: MAX_ANCHOR_FILES,
+            anchor_chain_file: ExcerptLimits::DEFAULT.file,
+            anchor_chain_line: ExcerptLimits::DEFAULT.line as u64,
+            anchor_chain_rows: ExcerptLimits::DEFAULT.rows,
         }
     }
 }
@@ -226,7 +244,45 @@ pub fn verify_export(
     anchor_dir: Option<&Path>,
     manifest_sha256: Option<[u8; 32]>,
 ) -> ExportVerdict {
-    run(&OsFs, &Limits::default(), dir, anchor_dir, manifest_sha256)
+    run(
+        &OsFs,
+        &Limits::default(),
+        dir,
+        anchor_dir,
+        None,
+        manifest_sha256,
+    )
+}
+
+/// A server export's anchor-chain excerpt (M14 PD-253, PD-259) and the head its recipient pinned.
+#[derive(Debug, Clone, Copy)]
+pub struct AnchorChain<'a> {
+    /// `anchor-chain.jsonl`; its manifest `anchor-chain.manifest.json` is read from beside it.
+    pub excerpt: &'a Path,
+    /// `--anchor-chain-head <seq>:<hex>`: the anchor row the recipient trusts.
+    pub head: Option<(u64, [u8; 32])>,
+}
+
+/// The usage error of an anchor dir and an excerpt given together (PD-259).
+pub const MSG_ONE_MODE: &str =
+    "--anchor-dir and --anchor-chain cannot be given together: one export comes from one mode";
+
+/// [`verify_export`] with a server export's anchor-chain excerpt (PD-259). An anchor dir and an
+/// excerpt together are refused (22): one export comes from one mode.
+pub fn verify_export_full(
+    dir: &Path,
+    anchor_dir: Option<&Path>,
+    anchor_chain: Option<AnchorChain<'_>>,
+    manifest_sha256: Option<[u8; 32]>,
+) -> ExportVerdict {
+    run(
+        &OsFs,
+        &Limits::default(),
+        dir,
+        anchor_dir,
+        anchor_chain,
+        manifest_sha256,
+    )
 }
 
 /// [`verify_export`] through another file access and with other bounds (tests).
@@ -238,7 +294,20 @@ pub fn verify_export_with(
     anchor_dir: Option<&Path>,
     manifest_sha256: Option<[u8; 32]>,
 ) -> ExportVerdict {
-    run(fs, &limits, dir, anchor_dir, manifest_sha256)
+    run(fs, &limits, dir, anchor_dir, None, manifest_sha256)
+}
+
+/// [`verify_export_full`] through another file access and with other bounds (tests).
+#[cfg(any(test, feature = "testing"))]
+pub fn verify_export_full_with(
+    fs: &dyn FsRead,
+    limits: Limits,
+    dir: &Path,
+    anchor_dir: Option<&Path>,
+    anchor_chain: Option<AnchorChain<'_>>,
+    manifest_sha256: Option<[u8; 32]>,
+) -> ExportVerdict {
+    run(fs, &limits, dir, anchor_dir, anchor_chain, manifest_sha256)
 }
 
 /// The input cannot be read as an export (exit 22). Fixed text, file names and numbers only.
@@ -1244,6 +1313,14 @@ struct Outcome {
     range: Option<(u64, u64)>,
     /// The report line naming entries of the export directory beside its three files.
     others: Option<String>,
+    /// M14 PD-259: an anchor-chain excerpt was given.
+    chain_given: bool,
+    /// Its pinned head is in the excerpt with the pinned hash.
+    chain_pinned: bool,
+    /// The excerpt contradicts itself, the pin or the export.
+    chain_mismatch: Option<String>,
+    /// The highest export row a leaf entry of the pinned excerpt names (and matches).
+    chain_last: Option<u64>,
 }
 
 impl Outcome {
@@ -1262,6 +1339,39 @@ impl Outcome {
     fn anchor_mismatch(&mut self, why: impl Into<String>) {
         if self.anchor_mismatch.is_none() {
             self.anchor_mismatch = Some(why.into());
+        }
+    }
+
+    fn chain_mismatch(&mut self, why: impl Into<String>) {
+        if self.chain_mismatch.is_none() {
+            self.chain_mismatch = Some(why.into());
+        }
+    }
+
+    fn chain_line(&self) -> String {
+        if let Some(c) = &self.chain_mismatch {
+            return format!("anchor chain: mismatch: {c}");
+        }
+        let Some((first, last)) = self.range else {
+            return "anchor chain: not checked".into();
+        };
+        if !self.chain_pinned {
+            return "anchor chain: internally consistent; no head pinned (give --anchor-chain-head)"
+                .into();
+        }
+        let tail = if self.manifest == Root::Match {
+            "covered by the manifest SHA-256 only"
+        } else {
+            "not covered by a trust root; give --manifest-sha256"
+        };
+        match self.chain_last {
+            Some(l) if l >= last => "anchor chain: ok".into(),
+            Some(l) => format!(
+                "anchor chain: ok up to seq {l}; rows after seq {l} are not anchored ({tail})"
+            ),
+            None => format!(
+                "anchor chain: no row names a row of this export; rows {first}..{last} {tail}"
+            ),
         }
     }
 
@@ -1377,6 +1487,9 @@ impl Outcome {
             .into(),
         );
         report.push(self.anchor_line());
+        if self.chain_given {
+            report.push(self.chain_line());
+        }
         if let Some(others) = &self.others {
             report.push(others.clone());
         }
@@ -1392,7 +1505,10 @@ impl Outcome {
                 None => Some(format!("FORK: {f}")),
             }
         } else {
-            self.anchor_mismatch.as_deref().map(tampered)
+            self.anchor_mismatch
+                .as_deref()
+                .or(self.chain_mismatch.as_deref())
+                .map(tampered)
         };
         if let Some(last) = found {
             report.push(last);
@@ -1409,6 +1525,23 @@ impl Outcome {
         if !self.walked {
             report.push("cannot verify: events.jsonl was not read to its end".into());
             return ExportVerdict::UsageOrIo { report };
+        }
+        if self.chain_given {
+            // PD-259: a pinned excerpt binds the rows up to its highest in-range leaf entry,
+            // exactly the anchor-dir rule; unpinned it contributes internal consistency only.
+            let any = self.chain_pinned && self.chain_last.is_some();
+            let all = self.chain_pinned
+                && matches!((self.chain_last, self.range), (Some(l), Some((_, last))) if l >= last);
+            match (self.manifest == Root::Match, any, all) {
+                (true, true, _) => report.push(MANIFEST_AND_CHAIN_OK.into()),
+                (true, false, _) => report.push(MANIFEST_OK.into()),
+                (false, _, true) => report.push(ANCHOR_CHAIN_OK.into()),
+                _ => {
+                    report.push(NO_ROOT.into());
+                    return ExportVerdict::NoTrustRoot { report };
+                }
+            }
+            return ExportVerdict::Verified { report };
         }
         let anchored_all =
             matches!((self.last_anchored, self.range), (Some(l), Some((_, last))) if l >= last);
@@ -1449,13 +1582,20 @@ fn run(
     lim: &Limits,
     dir: &Path,
     anchor: Option<&Path>,
+    chain: Option<AnchorChain<'_>>,
     given: Option<[u8; 32]>,
 ) -> ExportVerdict {
+    if anchor.is_some() && chain.is_some() {
+        return ExportVerdict::UsageOrIo {
+            report: vec![format!("cannot verify: {MSG_ONE_MODE}")],
+        };
+    }
     let mut o = Outcome {
         anchor_given: anchor.is_some(),
+        chain_given: chain.is_some(),
         ..Outcome::default()
     };
-    match check(fs, lim, dir, anchor, given, &mut o) {
+    match check(fs, lim, dir, anchor, chain, given, &mut o) {
         Ok(()) => o.verdict(),
         Err(Unreadable(why)) => ExportVerdict::UsageOrIo {
             report: vec![format!("cannot verify: {why}")],
@@ -1468,6 +1608,7 @@ fn check(
     lim: &Limits,
     dir: &Path,
     anchor: Option<&Path>,
+    chain: Option<AnchorChain<'_>>,
     given: Option<[u8; 32]>,
     o: &mut Outcome,
 ) -> Result<(), Unreadable> {
@@ -1500,7 +1641,12 @@ fn check(
              that was never renamed), never a valid one",
         ));
     }
-    o.others = other_entries(fs, dir);
+    // The excerpt files are verified when the excerpt given is the one in the export directory.
+    let excerpt_here = chain.is_some_and(|c| {
+        let parent = c.excerpt.parent().and_then(|p| fs.canonicalize(p).ok());
+        parent.is_some() && parent == fs.canonicalize(dir).ok()
+    });
+    o.others = other_entries(fs, dir, excerpt_here);
 
     // (1) The manifest: its hash first, then its shape.
     let bytes = match read_capped(fs, &dir.join(MANIFEST_FILE), lim.manifest) {
@@ -1543,6 +1689,12 @@ fn check(
         None => None,
     };
 
+    // (2b) The server anchor-chain excerpt (M14 PD-259).
+    let excerpt = match chain {
+        Some(c) => read_excerpt(fs, lim, c, &m, o),
+        None => None,
+    };
+
     // (3) prune_log.jsonl.
     let prune = read_prune_log(fs, lim, dir, &m, o)?;
     if let (Some(a), Some(rows)) = (&anchors, &prune) {
@@ -1556,7 +1708,12 @@ fn check(
         Err(why) => return Err(unreadable(format!("events.jsonl {why}"))),
     };
     let mut r = LineReader::new(f, lim.line);
-    let mut w = Walk::new(&m, anchors.as_ref(), prune.as_deref().unwrap_or_default());
+    let mut w = Walk::new(
+        &m,
+        anchors.as_ref(),
+        excerpt.as_ref(),
+        prune.as_deref().unwrap_or_default(),
+    );
     let mut n = 0u64;
     let mut walking = true;
     loop {
@@ -1594,7 +1751,197 @@ fn check(
         o.walked = o.unreadable.is_none();
     }
     o.last_anchored = w.last_anchored;
+    o.chain_last = w.chain_last;
     Ok(())
+}
+
+/// Per export row a leaf entry of the excerpt names: its chain and record hash.
+type ExcerptHeads = BTreeMap<u64, (String, [u8; 32])>;
+
+/// Reads the excerpt and its manifest (PD-259), streaming and bounded: every line parses, its
+/// hashes recompute, the rows are contiguous and linked, the span is the manifest's, the pinned
+/// head is in it with the pinned hash. Returns the in-range leaf entries of the export's chains
+/// (with a pin, of the rows at or before it) for the walk; `None` once a finding is recorded.
+fn read_excerpt(
+    fs: &dyn FsRead,
+    lim: &Limits,
+    c: AnchorChain<'_>,
+    m: &Manifest,
+    o: &mut Outcome,
+) -> Option<ExcerptHeads> {
+    let el = ExcerptLimits {
+        line: usize::try_from(lim.anchor_chain_line).unwrap_or(usize::MAX),
+        leaves: ExcerptLimits::DEFAULT.leaves,
+        rows: lim.anchor_chain_rows,
+        file: lim.anchor_chain_file,
+    };
+    let manifest_path = c.excerpt.parent().map_or_else(
+        || PathBuf::from(EXCERPT_MANIFEST_FILE),
+        |p| p.join(EXCERPT_MANIFEST_FILE),
+    );
+    let em = match read_capped(fs, &manifest_path, MAX_EXCERPT_MANIFEST_BYTES) {
+        Ok(Some(b)) => match serde_json::from_slice::<ExcerptManifest>(&b) {
+            Ok(em) if depth_ok(&b, MAX_JSON_DEPTH) && em.format == EXCERPT_FORMAT => em,
+            _ => {
+                o.unreadable("anchor-chain.manifest.json is not an excerpt manifest");
+                return None;
+            }
+        },
+        Ok(None) => {
+            o.unreadable("anchor-chain.manifest.json is missing beside the excerpt");
+            return None;
+        }
+        Err(why) => {
+            o.unreadable(format!("anchor-chain.manifest.json {why}"));
+            return None;
+        }
+    };
+    let Some(last_hash) = hex32(&em.last_hash) else {
+        o.unreadable("anchor-chain.manifest.json has a malformed last_hash");
+        return None;
+    };
+    if em.first_seq == 0 || em.first_seq > em.last_seq || em.last_seq - em.first_seq >= el.rows {
+        o.unreadable(format!(
+            "anchor-chain.manifest.json names a span that is not 1 to {} rows",
+            el.rows
+        ));
+        return None;
+    }
+    if !m.chain_ids.contains(&em.chain_id) {
+        o.chain_mismatch("the excerpt is of a chain this export does not hold");
+        return None;
+    }
+    let f = match open_regular(fs, c.excerpt) {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            o.unreadable("anchor-chain.jsonl is missing");
+            return None;
+        }
+        Err(why) => {
+            o.unreadable(format!("anchor-chain.jsonl {why}"));
+            return None;
+        }
+    };
+    let too_long = format!("anchor-chain.jsonl is longer than {} bytes", el.file);
+    if f.metadata().map(|md| md.len()).unwrap_or(0) > el.file {
+        o.unreadable(too_long);
+        return None;
+    }
+    let mut r = LineReader::new(f, lim.anchor_chain_line);
+    let mut heads = ExcerptHeads::new();
+    let mut prev: Option<(u64, [u8; 32])> = None;
+    let mut pin_seen = false;
+    let mut n = 0u64;
+    loop {
+        let next = match r.next() {
+            Ok(next) => next,
+            Err(e) => {
+                o.unreadable(format!("anchor-chain.jsonl cannot be read ({})", kind(&e)));
+                return None;
+            }
+        };
+        if r.read > el.file {
+            o.unreadable(too_long);
+            return None;
+        }
+        n += 1;
+        match next {
+            Next::Eof => break,
+            Next::Line => {}
+            Next::Unterminated => {
+                o.unreadable(format!("anchor-chain.jsonl ends inside line {n}"));
+                return None;
+            }
+            Next::TooLong => {
+                o.unreadable(format!(
+                    "anchor-chain.jsonl line {n} is longer than {} bytes",
+                    el.line
+                ));
+                return None;
+            }
+        }
+        if n > el.rows {
+            o.unreadable(format!(
+                "anchor-chain.jsonl holds more than {} rows",
+                el.rows
+            ));
+            return None;
+        }
+        let row: ExcerptRow = match parse_excerpt_line(&r.buf, &el) {
+            Ok(row) => row,
+            Err(e) => {
+                o.unreadable(format!(
+                    "anchor-chain.jsonl line {n} is not an excerpt line ({e:?})"
+                ));
+                return None;
+            }
+        };
+        if let Err(e) = row.check(&el) {
+            o.chain_mismatch(format!("the excerpt row at seq {} fails ({e:?})", row.seq));
+            return None;
+        }
+        let want = prev.map_or(em.first_seq, |(s, _)| s.saturating_add(1));
+        if row.seq != want {
+            o.chain_mismatch(format!(
+                "the excerpt has seq {} where seq {want} belongs",
+                row.seq
+            ));
+            return None;
+        }
+        if prev.is_some_and(|(_, h)| !ct_eq(&row.prev_hash, &h)) {
+            o.chain_mismatch(format!(
+                "the excerpt row at seq {} does not link to the row before",
+                row.seq
+            ));
+            return None;
+        }
+        if let Some((ps, ph)) = c.head
+            && row.seq == ps
+        {
+            if !ct_eq(&row.hash, &ph) {
+                o.chain_mismatch(format!(
+                    "the pinned anchor head (seq {ps}) has another hash in the excerpt"
+                ));
+                return None;
+            }
+            pin_seen = true;
+        }
+        if let Some(e) = &row.leaf_entry {
+            let bound = c.head.is_none_or(|(ps, _)| row.seq <= ps);
+            if bound
+                && m.chain_ids.contains(&e.chain_id)
+                && (m.first_seq..=m.last_seq).contains(&e.head_seq)
+            {
+                match heads.get(&e.head_seq) {
+                    Some((ch, h)) if *ch != e.chain_id || !ct_eq(h, &e.record_hash) => {
+                        o.chain_mismatch(format!(
+                            "two excerpt rows name seq {} with different record hashes",
+                            e.head_seq
+                        ));
+                        return None;
+                    }
+                    _ => {
+                        heads.insert(e.head_seq, (e.chain_id.clone(), e.record_hash));
+                    }
+                }
+            }
+        }
+        prev = Some((row.seq, row.hash));
+    }
+    if !prev.is_some_and(|(s, h)| s == em.last_seq && ct_eq(&h, &last_hash)) {
+        o.chain_mismatch("the excerpt does not end at its manifest's last row");
+        return None;
+    }
+    if let Some((ps, _)) = c.head
+        && !pin_seen
+    {
+        o.chain_mismatch(format!(
+            "the pinned anchor head (seq {ps}) is not in the excerpt"
+        ));
+        return None;
+    }
+    o.chain_pinned = c.head.is_some();
+    Some(heads)
 }
 
 /// Names shown of the other entries of the export directory.
@@ -1603,11 +1950,13 @@ const MAX_OTHERS_SHOWN: usize = 8;
 /// The report line naming the entries of the export directory beside its three files (T8
 /// review M-5): a recipient must not take them for part of the verified export. Names are input,
 /// so only short plain-ASCII ones are printed (the first few in byte order); the rest are counted.
-fn other_entries(fs: &dyn FsRead, dir: &Path) -> Option<String> {
+fn other_entries(fs: &dyn FsRead, dir: &Path, excerpt_here: bool) -> Option<String> {
     let (mut count, mut shown) = (0usize, BTreeSet::new());
     let listed = fs.read_dir(dir, &mut |name| {
         let name = name.to_string_lossy();
-        if [EVENTS_FILE, PRUNE_LOG_FILE, MANIFEST_FILE].contains(&name.as_ref()) {
+        if [EVENTS_FILE, PRUNE_LOG_FILE, MANIFEST_FILE].contains(&name.as_ref())
+            || (excerpt_here && [EXCERPT_FILE, EXCERPT_MANIFEST_FILE].contains(&name.as_ref()))
+        {
             return true;
         }
         count += 1;
@@ -1801,6 +2150,7 @@ struct Pending {
 struct Walk<'a> {
     m: &'a Manifest,
     anchors: Option<&'a Anchors>,
+    excerpt: Option<&'a ExcerptHeads>,
     prune_rows: &'a [PruneLogRow],
     prev: Option<Prev>,
     rows: u64,
@@ -1810,15 +2160,24 @@ struct Walk<'a> {
     restores: Vec<Restore>,
     pending: Vec<Pending>,
     last_anchored: Option<u64>,
+    /// The highest row a leaf entry of the excerpt names with its record hash.
+    chain_last: Option<u64>,
     /// Fork candidates (by file) and the highest export row their lines name.
     shares: BTreeMap<usize, u64>,
 }
 
 impl<'a> Walk<'a> {
-    fn new(m: &'a Manifest, anchors: Option<&'a Anchors>, prune_rows: &'a [PruneLogRow]) -> Self {
+    fn new(
+        m: &'a Manifest,
+        anchors: Option<&'a Anchors>,
+        excerpt: Option<&'a ExcerptHeads>,
+        prune_rows: &'a [PruneLogRow],
+    ) -> Self {
         Walk {
             m,
             anchors,
+            excerpt,
+            chain_last: None,
             prune_rows,
             prev: None,
             rows: 0,
@@ -2087,6 +2446,18 @@ impl<'a> Walk<'a> {
                 self.boundary(a, seq - 1, &boundary_chain, o);
             }
             self.anchored(a, &l, seq, &hash, o);
+        }
+        // The anchor-chain excerpt (PD-259): a leaf entry naming this row must name its hash.
+        if let (Some(x), Some(hash)) = (self.excerpt, hash)
+            && let Some((chain, want)) = x.get(&seq)
+        {
+            if *chain == l.chain_id && ct_eq(want, &hash) {
+                self.chain_last = Some(seq);
+            } else {
+                o.chain_mismatch(format!(
+                    "the anchor chain names seq {seq} with another record hash"
+                ));
+            }
         }
 
         self.prev = Some(Prev {
