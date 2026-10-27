@@ -81,6 +81,34 @@ Each row: what M14 consumes, and what Task 1 does if it is wrong.
 | A-23 | M13 `/readyz` body has named checks and reports degraded fields without failing (PD-M13-13); `/metrics` exists with a label allow-list | T12 adds `scripts` field and metrics |
 | A-24 | M13 deactivation is the single function `users::deactivate(user_id, by)` (M13 T5) used by `admin users deactivate` and by the optional daily offboarding check (M13 PD-M13-14: the daily check runs only when a directory service bind is configured; otherwise login-time refusal + admin deactivate); PATs, API keys, sessions gone; the user's store stays for auditors until retention | T8 extends `users::deactivate` to revoke the user's OAuth grants (Δ-M14-4); T17 lets auditors read deactivated users |
 
+### Reconciliation (Task 1, 2026-10-27, against `4648252` = M12 + M11)
+
+M13 is **not merged**: its branch has T1–T4 only (docs, shutdown drain, chart, chart CI). Everything M14 consumes from M13 (migration path, schema v2, scheduler, admin socket, `users::deactivate`, `/metrics`, chart, GitLab jobs) does not exist yet. M14 builds interim seams that stay off M13's files and version numbers; each row names the merge action.
+
+| # | Found in the code (file:line) | Delta → task |
+|---|---|---|
+| A-2 | `crates/server` lib+bin, `crates/mcp-tools`; no `src/admin/` (M12 transitional `src/admin_offline.rs`) | admin commands of T4/T12 become functions; socket wiring at merge |
+| A-3 | `config.rs:83-105` `ATLAS_DUCK_*` keys, `ConfigError {code, key}` | M14 keys added in the same style (T6, T12, T18) |
+| A-4 | `errors.rs:11-195` `ApiError` const struct (`status, code, message, retry_after, reason`) | new web codes as consts; OAuth protocol errors get their own RFC-shaped type (PD-239), not `ApiError` (T6) |
+| A-5 | `web/extract.rs:14` `SessionUser(Session)` + `require_role`; `:61` `BearerUser(KeyCtx)` (API keys only); `UserCtx::from_authenticated` `runtime.rs:92`; guard `web/mod.rs:181` (`session_only_path` = `/api/cmd/*`, `/api/me/*`) | T8 widens `BearerUser`/`KeyCtx` with a credential tag; T17 adds `/api/auditor/*` to the bearer refusal |
+| A-6 | `store/schema.rs:4` `SCHEMA_VERSION = 1`, `sqlite.rs:76-88` refuses newer, **no migration path** | T3: M14 tables are one idempotent additive step applied at open, **no version bump** (v2 is M13's); at merge it becomes M13's v2 → v3 step |
+| A-7 | `runtime.rs:489` `Registry::runtime(&UserCtx)`, `evictable()` `:403` = SSE + MCP calls + queue; **no running-script pin**; `CoreDeps.scripts: None` `:301` | T12 adds the script pin and sets `scripts` |
+| A-8/A-9 | `mcp/handler.rs:65-84` `allowed()`, `script_run` always false, `tools_for(scopes)` over `catalog(ToolSet::Full)`; `SCOPE_MISSING = "scope_missing"` | T13 as planned |
+| A-10 | `handler.rs:367` `meta.approval_url` (not `details`, M12 L218) | T13 asserts `meta.approval_url` |
+| A-11 | `audit_kinds.rs:15,146-178` `LoginMethod::Oauth`, `grant_id`, `AuditorScope`/`UserReadAction` incl. `list_users`/`export` | confirmed (Δ-M14-1) |
+| A-12 | `anchor.rs:23-31` kinds `LOGIN_FAILED, ANCHOR_GENESIS, HEADS, RUNTIME_CLOSED, SERVER_START, SERVER_STOP, INSTANCE_ADDED, INSTANCE_REMOVED`; `AnchorWriter::{start, operational, record_closed, tick, shutdown, spawn}`, `anchor::verify`; no `tick_now`; v2 rows confirmed (Δ-M14-2). The writer is **not** in `AppInner` | T6 adds `anchor: Arc<AnchorWriter>` to `AppInner` |
+| A-13 | `store/mod.rs:34` `UserRecord` without deactivation columns | "active" = user row exists (`users::is_active`); M13's column check slots in at merge (T7, T8, T17) |
+| A-15 | `cmd.rs` `SERVER_COMMANDS` + names test | T16 as planned |
+| A-16/A-17 | `static_files::PAGES`, `vite.server.config.ts` fixed page list | T9/T16/T20 as planned |
+| A-18 | `crates/server/Dockerfile` (M13 T2 edits labels in its branch) | T14 edits the build/runtime stages only |
+| A-19 | `ci.yml:1857` `server`, `:1892` `server-image`; `--exclude atlas-duck-server` at `:126`, `:1230` | T2/T14/T23 as planned |
+| A-20/A-21 | no `chart/`, no `.gitlab-ci.yml` jobs on this base | **T15 and the GitLab half of T23 are deferred to after the M13 merge** |
+| A-22 | no admin socket, no scheduler | `oauth_purge` (T6) and `export_ttl` (T18) are pure functions + interval tasks in `app.rs`; `admin anchor head`/`admin sandbox probe` are functions, the socket commands come at merge; `GET /api/anchor/head` and the hidden `sandbox-probe --json` are built as planned |
+| A-23 | `health.rs` `/readyz` `{checks, directory}`; no `/metrics` | T12 adds `scripts` to `/readyz`; script metrics are counters without an endpoint until M13's `/metrics` |
+| A-24 | no `users::deactivate` | T8: `oauth::revoke_all_for_user(user_id, "deactivation")` (+ records); M13's `deactivate` calls it at merge |
+
+Further names T8 consumes: `mcp/session.rs` `McpSessions::{may_use, bind, forget}` bind a session to a **user** only and `handler.rs:406` falls back to `key.key_id` for the connection id; PD-243's credential binding changes all three.
+
 **Contract deltas** (status after the 2026-10-26 reconciliation): **Δ-M14-1** — *applied in M12 PD-216/T5*: `LOGIN.method` includes `"oauth"` (+ `grant_id?`); `AUDITOR_READ.action` is `"list_users"|"query"|"trail"|"payload"|"export"` plus `range?`, `request_id?`, `seq?`, `page?`, `job_id?`. **Δ-M14-2** — *applied in M12 PD-217/T10/T15*: anchor chain rows are v2 from the start; T4 Step 3 (migration) is dropped. **Δ-M14-3** — *split*: the "running script" eviction pin is applied in M12 PD-209; the `Registry` audit view (PD-257) is not a small interface addition (store open without a `Core`, idle close, adoption) and stays in M14 T17. **Δ-M14-4** — *stays in M14*: OAuth grants do not exist in M13, so T8 Step 4 extends M13's `users::deactivate`. **Δ-M14-5** — *applied in M12 T23* (`no_cross_user_audit_route_without_auditor_role`).
 
 ---

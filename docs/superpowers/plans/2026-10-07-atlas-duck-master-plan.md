@@ -846,7 +846,8 @@ Each milestone entry lists: scope (§14, with the placements this plan makes whe
 - **Scope (SM-10):** OAuth 2.1 authorization server for MCP (SM-3.3), scripts in server mode (SM-7), auditor UI and exports (SM-6.4), `verify-export` with anchor-chain excerpts (SM-6.3), end-to-end server test suite.
 - **Depends on:** M13.
 - **Exit criterion:** an MCP client completes the OAuth flow and runs a script; an auditor exports another user's chain and `verify-export` passes on it; the server e2e suite is green in CI.
-- **Status:** not started.
+- **Contract deltas (M14 plan):** Δ-M14-1 (`LOGIN.method = "oauth"`, `AUDITOR_READ` actions), Δ-M14-2 (anchor rows v2), the script pin of Δ-M14-3 and Δ-M14-5 (no cross-user audit route without `auditor`) were applied in the M12 plan; Δ-M14-1, Δ-M14-2 and Δ-M14-5 are confirmed in the M12 code, the script pin is not (M14 T12 adds it); Δ-M14-3's audit view (T17) and Δ-M14-4 (deactivation revokes OAuth grants, T8) are M14's.
+- **Status:** in progress on branch `m14-server-completion` (base: M12 + M11, M13 running in parallel; the M13 seams M14 needs are interim in M14 and listed in the M14 plan's "Reconciliation (Task 1)").
 ---
 
 ## Traceability
