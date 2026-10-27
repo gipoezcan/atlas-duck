@@ -1,0 +1,23 @@
+/* Server-mode pages (T20-T22): only what the desktop app.css has no rule for. */
+
+.server-header nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.server-header .server-user {
+  margin-left: auto;
+}
+
+.server-form {
+  display: grid;
+  gap: 0.5rem;
+  max-width: 24rem;
+}
+
+.server-form label {
+  display: grid;
+  gap: 0.25rem;
+}

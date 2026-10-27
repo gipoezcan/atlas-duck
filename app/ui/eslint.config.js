@@ -35,7 +35,7 @@ const WEB_STORAGE = ['localStorage', 'sessionStorage', 'indexedDB', 'BroadcastCh
 const WEB_STORAGE_MESSAGE = 'No web storage or cross-context channels in the credential page (spec §10.3).';
 
 export default [
-  { ignores: ['dist/**', 'node_modules/**'] },
+  { ignores: ['dist/**', 'dist-server/**', 'node_modules/**'] },
   {
     files: ['**/*.{js,mjs,cjs,jsx,ts,mts,cts,tsx}'],
     languageOptions: {

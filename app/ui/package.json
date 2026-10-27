@@ -8,6 +8,7 @@
   },
   "scripts": {
     "build": "tsc --noEmit && vite build",
+    "build:server": "tsc --noEmit && vite build --config vite.server.config.ts",
     "lint": "eslint . && node scripts/check-html-sinks.mjs src",
     "test": "vitest run",
     "test:scripts": "node --test scripts/check-html-sinks.test.mjs scripts/eslint-credential.test.mjs",

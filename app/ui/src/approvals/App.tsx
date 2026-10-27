@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { Header } from '../shared/Header';
 import {
@@ -70,7 +70,14 @@ const STATUS_EVENTS = ['status_banner', 'needs_attention_changed'] as const;
  * button or the next/prev chord). The window owns the keyboard (`useChords`) and the focus inert
  * periods (`useWindowInert`); a decision never moves the selection (no auto-advance).
  */
-export function App() {
+export interface AppProps {
+  /** Replaces the desktop header (server mode passes its own, PD-219). */
+  header?: ReactNode;
+  /** Opens this request once the queue holds it (the server's `?item=` deep link, SM-5.3). */
+  openId?: string | null;
+}
+
+export function App({ header, openId = null }: AppProps = {}) {
   const queue = useReloaded<QueueItem[]>(queueList, QUEUE_EVENTS);
   const recent = useReloaded<RecentItem[]>(recentList, RECENT_EVENTS);
   const status = useReloaded<StatusLine[]>(appStatus, STATUS_EVENTS);
@@ -102,6 +109,13 @@ export function App() {
     },
     [byId],
   );
+  // A deep link opens its item once, the first time the queue holds it.
+  const linked = useRef<string | null>(null);
+  useEffect(() => {
+    if (openId === null || linked.current === openId || !byId.has(openId)) return;
+    linked.current = openId;
+    onOpen(openId);
+  }, [openId, byId, onOpen]);
   const current = selected === null ? undefined : byId.get(selected.item.request_id);
   // Keep the last known row of a request that left the queue (a decided item stays selected).
   const shownItem = current ?? selected?.item;
@@ -147,7 +161,7 @@ export function App() {
 
   return (
     <WindowInertContext.Provider value={inert}>
-      <Header lines={status.value ?? []} />
+      {header ?? <Header lines={status.value ?? []} />}
       <main>
         <h1 ref={heading} tabIndex={-1}>
           {WINDOW_TITLES.approvals}
