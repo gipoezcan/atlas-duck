@@ -105,6 +105,33 @@ key material, PATs or audit contents.
   collect the PATs users then enter for it. Instance changes are recorded in the anchor chain
   (`INSTANCE_ADDED` / `INSTANCE_REMOVED`), and users see the base URL before storing a PAT.
 
+- **OAuth clients choose their own name.** Any MCP client can register (rate limited per IP,
+  capped in total); its name is its own claim, and the consent page says so. What protects the
+  user is the consent itself: the redirect host shown in bold, scopes the user can only drop, a
+  consent request bound to the browser session, PKCE S256, and an access token valid for one
+  resource. A user who consents to a malicious client gives it what the scopes allow until the
+  grant is revoked (**Connected apps**, the revocation endpoint, deactivation), and never the
+  right to approve anything ([oauth.md](oauth.md)).
+- **A stolen authorization code ends the grant.** Whoever presents a code first burns it; the
+  real client's redemption then counts as reuse and revokes the grant. That is a denial of
+  service by design (RFC 9700), traded for reuse detection.
+- **Scripts run in the server pod.** User scripts run in the sandbox worker inside the same
+  container, confined by seccomp with no-new-privileges, Landlock where the kernel has it and
+  resource limits, with no capability and no user namespace. The worker runs as the server's
+  UID; the confinement, not the UID, keeps a script from the server's files, its memory and
+  other users' workers. A kernel escape from the seccomp/Landlock sandbox would reach the server
+  process and so every user's data. Where the sandbox cannot start (`scripts: not_met`) no
+  script runs; there is no degraded mode on a server ([scripts.md](scripts.md)).
+- **Exports sit on the volume for a while.** An export job writes the exported chain under
+  `<data>/exports` and keeps it for `ATLAS_DUCK_EXPORT_TTL_HOURS` (default 24). Whoever can read
+  the volume can read those files in clear, as they could the stores with the master key.
+- **The anchor excerpt reveals a little about other users.** Rows of the excerpt that name the
+  exported chain carry every leaf hash of that anchoring: other users' leaf hashes and how many
+  users were anchored, never a user id, chain id or record (L248, [auditing.md](auditing.md)).
+- **Auditors read every chain.** Each auditor read is recorded before it returns data, in the
+  auditor's chain and in the anchor chain (`AUDITOR_READ`). An auditor's exports are recorded in
+  the target's chain (`EXPORT`).
+
 ## What the server never does
 
 - It never disables TLS verification. LDAPS and the instances are verified against the mounted
@@ -113,4 +140,5 @@ key material, PATs or audit contents.
   any `*MASTER_KEY` variable stops the server.
 - It never logs passwords, PATs, API keys, key material, session ids or payloads (SM-8.3).
 - It never lets an API key or OAuth token approve a request.
+- It never runs a script outside the sandbox: no `*ALLOW_DEGRADED*` setting is accepted.
 - It never opens the stores from a second process. The admin CLI talks to the running server.

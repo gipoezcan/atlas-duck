@@ -23,7 +23,7 @@ Admin commands run one at a time, and the scheduler's jobs take the same lock.
 | `instances add --alias A --product jira\|confluence --url U [--default] [--ca-org] [--proxy P]` | Adds an instance for everyone (SM-4.1). `--ca-org`: verify it against the organisation CA bundle |
 | `instances remove --alias A` | Removes it. Every user's PAT for it is deleted, each with a `CREDENTIAL_CHANGED` record in that user's chain |
 | `users list` | Username, display name, roles, last login, state (`active`, `deactivated`, `deleted`) |
-| `users deactivate <username>` | Offboarding ([offboarding.md](offboarding.md)): sessions end, API keys are revoked, PATs are deleted, `USER_DEACTIVATED` is anchored. Final and idempotent |
+| `users deactivate <username>` | Offboarding ([offboarding.md](offboarding.md)): sessions end, API keys and OAuth grants are revoked, PATs are deleted, each recorded in the user's chain, then `USER_DEACTIVATED` is anchored. Final and idempotent; a retry finishes what a failed run left |
 | `maintenance on\|off` | Maintenance: `/readyz` 503 and every request except the probes and `/metrics` answers 503 `server/maintenance` |
 | `backup <dir>` | A consistent snapshot of every store ([backup-restore.md](backup-restore.md)) |
 | `restore <bundle-dir>` | Restore a bundle; requires maintenance mode. The live data is first kept as the bundle `backups/pre-restore-<stamp>` |
@@ -32,13 +32,15 @@ Admin commands run one at a time, and the scheduler's jobs take the same lock.
 | `master-key status` | Loaded key ids and how many users each wraps; `rows_not_primary` must be 0 before a key Secret swap |
 | `restore --resume` | Finish a restore that a crash interrupted (`/readyz` reason `restore_interrupted`) |
 | `rotate-master-key --new-key-file <path>` | Re-wrap every data key ([master-key-rotation.md](master-key-rotation.md)) |
-| `retention run [--dry-run]` | Delete the chains of users deactivated more than `ATLAS_DUCK_RETENTION_DAYS` ago (default 365) |
+| `retention run [--dry-run]` | Delete the chains of users deactivated more than `ATLAS_DUCK_RETENTION_DAYS` ago (default 365), with their OAuth grants, tokens and export jobs |
 | `anchor verify` | Recompute the server anchor chain and check every user's anchored head against that user's own chain. Findings name the user and the sequence number. Exit 1 on any finding |
+| `anchor head` | `{seq, hash}` of the anchor chain's last row: a pin for `verify-export --anchor-chain-head` ([auditing.md](auditing.md)) |
+| `sandbox probe` | The script sandbox state (`met`, `not_met`, `probing`, `disabled`) and the probe's evidence ([scripts.md](scripts.md)) |
 
 ## Health
 
 - `/healthz`: `ok` while the process serves. Used by the liveness and startup probes.
-- `/readyz`: JSON `{ready, reasons, degraded, checks, directory, offboarding}`.
+- `/readyz`: JSON `{ready, reasons, degraded, checks, directory, offboarding, scripts}`.
   - 503 when `reasons` is not empty:
     - `store_unavailable`: the server store does not answer.
     - `master_key_missing`: the master key is not loaded.
@@ -54,6 +56,7 @@ Admin commands run one at a time, and the scheduler's jobs take the same lock.
   - `directory` is `ldap` or `stub`. `stub` in production is impossible: the server refuses to
     start that way.
   - `offboarding` is `directory`, `stub` or `manual`.
+  - `scripts` is `met`, `not_met`, `probing` or `disabled`; never a reason for 503.
 
 ## Metrics
 
@@ -71,6 +74,8 @@ carry a username, host or id.
 | `atlas_duck_test_directory_enabled` | 1 when logins use the test directory (must be 0 in production) |
 | `atlas_duck_master_key_info{key_id,role}` | The loaded key ids (`primary`, and `accepted` during a rotation) |
 | `atlas_duck_build_info{version}` | The server version |
+| `atlas_duck_scripts_floor{state}` | 1 for the sandbox state now |
+| `atlas_duck_script_runs_active{kind}` / `atlas_duck_script_runs_max{kind}` | Script runs holding a server-wide slot and the slots (`run`, `dry`); runs beyond the slots queue |
 
 ## Suggested alerts
 
@@ -82,6 +87,8 @@ carry a username, host or id.
   half done.
 - Repeated `directory_unreachable` degradation.
 - `5xx` share of `atlas_duck_requests_total` above the usual level.
+- `atlas_duck_scripts_floor{state="not_met"}` in production: no script runs.
+- `atlas_duck_script_runs_active == atlas_duck_script_runs_max` for long: scripts queue; raise the pools with the memory limit (`scripts.runsMax`, the PD-246 formula in the chart values).
 
 ## Scheduler
 
@@ -92,6 +99,10 @@ The scheduler runs two jobs daily at `ATLAS_DUCK_OFFBOARDING_AT` (UTC, default `
 
 A run missed while the pod was down executes once at the next start. A failed run is retried an
 hour later. The last runs are kept in `server.db` (`scheduler_state`).
+
+Besides the daily jobs the server runs three interval tasks (M14): `oauth_purge` (daily: unused
+and ended OAuth clients, expired codes and tokens), `export_ttl` (hourly and at start: expired
+export files and jobs) and the 60 s close of idle auditor store views.
 
 ## Logs
 
@@ -115,4 +126,12 @@ pod and starts a new one (Recreate). On SIGTERM the server:
 2. closes every user runtime (`APP_STOP`);
 3. anchors the final heads and appends `SERVER_STOP`.
 
-All of this fits in the 30 s grace period. Sessions survive the restart.
+All of this fits in the 30 s grace period. Sessions survive the restart. Running export jobs are
+cancelled before the runtimes close (start them again after the restart); OAuth grants and tokens
+survive.
+
+### Schema migrations
+
+`server.db` is migrated forward at start, one transaction per version (v1 to v2 M13, v2 to v3 the
+OAuth and export tables of M14). There is no down path: take `admin backup` before an upgrade
+that changes the schema, and roll back by restoring that bundle with the old image.

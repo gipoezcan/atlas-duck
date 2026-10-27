@@ -26,7 +26,9 @@ Give the pod at least
 
     server baseline + (SCRIPT_RUNS_MAX + SCRIPT_DRY_RUNS_MAX) × per-run address-space limit
 
-of memory. The chart values that apply this come with the Helm chart (milestone M13).
+of memory, with a per-run limit of 512 MiB. The chart applies it: `scripts.runsMax` and`n`scripts.dryRunsMax` (default 4 each, 1..=32) and a 5Gi memory limit; the review environment runs
+1 + 1 at 2Gi. `/metrics` shows the pools (`atlas_duck_script_runs_active`, `_max`) and the floor
+(`atlas_duck_scripts_floor`); `admin sandbox probe` prints the probe's evidence.
 
 ## The sandbox and `not_met`
 

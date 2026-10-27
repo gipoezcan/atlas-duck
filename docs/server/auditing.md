@@ -63,8 +63,8 @@ The server image has the same verifier: `atlas-duck-server verify-export …`.
   whole.
 
 Where to get a pin you trust, besides the job page: the server logs `anchor_head {seq, hash}` at
-every anchoring (the log store is the out-of-band witness), and `GET /api/anchor/head` answers the
-current head. Use the job's own head: the live head moves on after the export.
+every anchoring (the log store is the out-of-band witness), `GET /api/anchor/head` and the admin
+CLI's `anchor head` answer the current head. Use the job's own head: the live head moves on after the export.
 
 Exit codes: 0 verified against a supplied trust root, 20 consistent but no trust root covers all
 of it, 21 tampering or a fork, 22 usage or I/O error (also `--anchor-dir` together with

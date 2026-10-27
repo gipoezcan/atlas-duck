@@ -848,7 +848,7 @@ Each milestone entry lists: scope (§14, with the placements this plan makes whe
 - **Depends on:** M13.
 - **Exit criterion:** an MCP client completes the OAuth flow and runs a script; an auditor exports another user's chain and `verify-export` passes on it; the server e2e suite is green in CI.
 - **Contract deltas (M14 plan):** Δ-M14-1 (`LOGIN.method = "oauth"`, `AUDITOR_READ` actions), Δ-M14-2 (anchor rows v2), the script pin of Δ-M14-3 and Δ-M14-5 (no cross-user audit route without `auditor`) were applied in the M12 plan; Δ-M14-1, Δ-M14-2 and Δ-M14-5 are confirmed in the M12 code, the script pin is not (M14 T12 adds it); Δ-M14-3's audit view (T17) and Δ-M14-4 (deactivation revokes OAuth grants, T8) are M14's.
-- **Status:** done on branch `m14-server-completion` except the M13-dependent parts, CI evidence pending the push (base: M12 + M11; M13 ran in parallel). Open until the M13 merge: T15 (chart values for scripts), the GitLab half of T23 (`verify:review-e2e`, `verify:review-sandbox`), the interim seams listed in the M14 plan's "Reconciliation (Task 1)" (scheduler tasks, admin socket commands, `/metrics`, `users::deactivate` calling `oauth::revoke_all_for_user` before `USER_DEACTIVATED`, retention purging `oauth_*` rows) and the e2e cases that need them. Docs: `docs/server/oauth.md`, `scripts.md`, `auditing.md`.
+- **Status:** done on branch `m14-server-completion` with M13 merged in (schema v3 = M14's tables after M13's v2; deactivation revokes OAuth grants; retention purges OAuth state; chart script values; `verify:review-sandbox`, `verify:review-e2e`); CI and review-environment evidence pending the push. Docs: `docs/server/oauth.md`, `scripts.md`, `auditing.md`, threat model and runbook sections.
 ---
 
 ## Traceability
