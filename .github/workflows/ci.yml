@@ -1938,6 +1938,56 @@ jobs:
       - name: Smoke test
         run: bash ci/server-smoke.sh
 
+  # M14 T23 (PD-260): the black-box e2e suite against the hardened container. The image is
+  # rebuilt here (server-image keeps no artifact); no secrets, no push.
+  server-e2e:
+    name: server-e2e (black-box suite against the container)
+    needs: server-image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Syntax of the scripts
+        run: |
+          set -euo pipefail
+          bash -n ci/server-e2e.sh
+          bash -n ci/server-e2e-verify.sh
+          bash -n ci/server-test-master-key.sh
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustup show active-toolchain
+
+      - name: Build the image
+        run: docker build -f crates/server/Dockerfile -t atlas-duck-server:ci .
+
+      - name: Build the e2e suite and its parser tests
+        run: |
+          set -euo pipefail
+          cargo test -p atlas-duck-server-e2e --lib --locked
+          cargo test -p atlas-duck-server-e2e --test e2e --no-run --locked
+
+      - name: Throwaway master key
+        run: bash ci/server-test-master-key.sh
+
+      - name: E2E suite
+        run: timeout 1200 bash ci/server-e2e.sh
+
+      - name: Upload the summary and the container log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: server-e2e
+          path: ${{ runner.temp }}/server-e2e
+          if-no-files-found: warn
+          retention-days: 14
+
   ui:
     name: ui (Vite + React shell, spec §2.4, §6.4)
     runs-on: ubuntu-22.04
