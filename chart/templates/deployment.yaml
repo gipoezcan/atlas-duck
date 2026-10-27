@@ -20,8 +20,9 @@ spec:
         {{- if .Values.testDirectory.enabled }}
         checksum/test-directory: {{ .Values.testDirectory.usersJson | sha256sum }}
         {{- end }}
-        {{- with .Values.podAnnotations }}
-        {{- toYaml . | nindent 8 }}
+        {{- /* Annotation values are strings; quote them so an all-digit commit id stays one. */}}
+        {{- range $k, $v := .Values.podAnnotations }}
+        {{ $k }}: {{ $v | toString | quote }}
         {{- end }}
       labels:
         {{- include "atlas-duck.labels" . | nindent 8 }}
