@@ -7,7 +7,10 @@
 pub fn restrict_umask() -> Option<u32> {
     // SAFETY: umask(2) only swaps the process's creation mask and cannot fail.
     let previous = unsafe { libc::umask(0o077) };
-    Some(u32::from(previous))
+    // `mode_t` is u32 on Linux (no conversion) and u16 on macOS (widening).
+    #[cfg_attr(target_os = "linux", allow(clippy::useless_conversion))]
+    let previous = u32::from(previous);
+    Some(previous)
 }
 
 #[cfg(not(unix))]
