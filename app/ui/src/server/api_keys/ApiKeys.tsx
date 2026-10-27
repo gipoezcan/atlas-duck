@@ -113,7 +113,7 @@ function ShownOnce({ created, onDone }: { created: CreatedKey; onDone: () => voi
       <button type="button" onClick={onDone}>
         {KEY_TEXT.done}
       </button>
-      {copy !== null ? <p role="status">{copy}</p> : null}
+      {copy !== null ? <p role="status" className="notice notice-info">{copy}</p> : null}
     </section>
   );
 }
@@ -171,13 +171,13 @@ export function ApiKeys() {
   };
 
   return (
-    <main>
+    <main className="window window-api-keys">
       <h1>{KEY_TEXT.title}</h1>
       <p>{KEY_TEXT.intro}</p>
       {created !== null ? <ShownOnce created={created} onDone={() => setCreated(null)} /> : null}
-      {notice !== null ? <p role="alert">{notice}</p> : null}
-      {failed ? <p role="alert">{KEY_TEXT.load_failed}</p> : null}
-      {keys === null && !failed ? <p role="status">{KEY_TEXT.loading}</p> : null}
+      {notice !== null ? <p role="alert" className="notice notice-danger">{notice}</p> : null}
+      {failed ? <p role="alert" className="notice notice-danger">{KEY_TEXT.load_failed}</p> : null}
+      {keys === null && !failed ? <p role="status" className="notice notice-info">{KEY_TEXT.loading}</p> : null}
       {keys !== null && keys.length === 0 ? <p>{KEY_TEXT.none}</p> : null}
       {keys !== null && keys.length > 0 ? (
         <table>
@@ -232,8 +232,8 @@ export function ApiKeys() {
           {KEY_TEXT.expiry}
           <input inputMode="numeric" value={days} onChange={(e) => setDays(e.target.value)} />
         </label>
-        <button type="submit">{KEY_TEXT.create}</button>
-        {error !== null ? <p role="alert">{error}</p> : null}
+        <button type="submit" className="primary">{KEY_TEXT.create}</button>
+        {error !== null ? <p role="alert" className="notice notice-danger">{error}</p> : null}
       </form>
     </main>
   );

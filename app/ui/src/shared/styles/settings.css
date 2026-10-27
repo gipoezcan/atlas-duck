@@ -1,0 +1,42 @@
+/* The Settings window (M11 T7). Sections are cards (layout.css). */
+@media (min-width: 64rem) {
+  .window-settings {
+    max-width: 72rem;
+  }
+}
+
+/* The Guard wrapper (a <fieldset disabled>) must stay invisible. */
+.settings-guard { margin: 0; padding: 0; border: 0; min-width: 0; }
+
+/* Instances table: not in a section, so its scroll wrapper gets the card look. The 8 columns keep a
+   minimum width and scroll sideways in a narrow window instead of squeezing. */
+.window-settings > .table-scroll {
+  margin-bottom: var(--space-4);
+  overflow-x: auto;
+  background: var(--surface);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 0 0 1px var(--border);
+}
+.table-scroll > table.instances {
+  min-width: 56rem;
+  margin: 0;
+  font-size: var(--text-sm);
+}
+.instances caption {
+  caption-side: top;
+  text-align: start;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-bold);
+  padding: var(--space-3) var(--space-3) var(--space-2);
+}
+.instances td p { margin: var(--space-1) 0 0; }
+.instances tr.url-change td { background: var(--warning-subtle); }
+.expiry-warning { color: var(--warning); font-weight: var(--weight-bold); }
+.instance-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+
+/* Plain lists inside a section (orphan installs, removal checklist, file names). */
+.window-settings section ul:not(.consequences) { list-style: none; padding: 0; }
+.window-settings section ul:not(.consequences) > li { padding: var(--space-2) 0; border-bottom: 1px solid var(--border); }
+
+.restart-marker, .restart-waiting, .default-hint { color: var(--text-muted); font-size: var(--text-sm); }
+.window-settings section > button { margin: 0 var(--space-2) var(--space-2) 0; }

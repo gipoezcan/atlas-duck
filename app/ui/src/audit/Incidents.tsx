@@ -141,7 +141,7 @@ export function Incidents({ status, failed, onRetry, onChanged }: Props) {
               onChange={(e) => setNote(e.currentTarget.value)}
             />
             <p id={`${ids}-hint`}>{T.ack_hint}</p>
-            <button type="button" disabled={sending} onClick={() => send(seq)}>
+            <button type="button" className="primary" disabled={sending} onClick={() => send(seq)}>
               {T.ack_send}
             </button>{' '}
             <button type="button" disabled={sending} onClick={() => close(seq)}>

@@ -68,7 +68,7 @@ export function AnchorDir({ view, onChanged }: Props) {
       ) : health.anchor_dir_lines_pending > 0 ? (
         <p>{T.anchor_dir_pending(health.anchor_dir_lines_pending)}</p>
       ) : null}
-      <button type="button" disabled={action.pending} onClick={() => change(false)}>
+      <button type="button" className="primary" disabled={action.pending} onClick={() => change(false)}>
         {view.anchor_dir === null ? T.anchor_dir_set : T.anchor_dir_change}
       </button>
       {view.anchor_dir === null ? null : (

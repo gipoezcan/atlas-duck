@@ -105,7 +105,7 @@ export function ScriptLimitsForm({ view, onChanged, readOnly }: ScriptLimitsProp
           <p className="restart-waiting">{T.restart_waiting}</p>
         ) : null}
         <p>{T.script_limits_note}</p>
-        <button type="button" disabled={action.pending} onClick={submit}>
+        <button type="button" className="primary" disabled={action.pending} onClick={submit}>
           {T.apply}
         </button>
         {local === null ? null : <p role="alert">{local}</p>}

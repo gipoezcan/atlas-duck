@@ -152,7 +152,7 @@ export function ExportBackup({ job }: Props) {
           />
         </div>
       </div>
-      <button type="button" disabled={busy} onClick={startExport}>
+      <button type="button" className="primary" disabled={busy} onClick={startExport}>
         {T.export_start}
       </button>
       {exportActive ? (
@@ -176,7 +176,7 @@ export function ExportBackup({ job }: Props) {
 
       <h3>{T.backup}</h3>
       <p>{T.backup_note}</p>
-      <button type="button" disabled={busy} onClick={startBackup}>
+      <button type="button" className="primary" disabled={busy} onClick={startBackup}>
         {T.backup_start}
       </button>
       {backupActive ? (

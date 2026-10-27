@@ -92,14 +92,14 @@ function TokenForm({
         />
       </label>
       <div>
-        <button type="submit" disabled={busy}>
+        <button type="submit" className="primary" disabled={busy}>
           {CRED_TEXT.save}
         </button>{' '}
         <button type="button" onClick={onCancel}>
           {CRED_TEXT.cancel}
         </button>
       </div>
-      {error !== null ? <p role="alert">{error}</p> : null}
+      {error !== null ? <p role="alert" className="notice notice-danger">{error}</p> : null}
     </form>
   );
 }
@@ -131,12 +131,12 @@ export function Credentials() {
   };
 
   return (
-    <main>
+    <main className="window window-credentials">
       <h1>{CRED_TEXT.title}</h1>
       <p>{CRED_TEXT.intro}</p>
-      {notice !== null ? <p role="status">{notice}</p> : null}
-      {failed ? <p role="alert">{CRED_TEXT.load_failed}</p> : null}
-      {rows === null && !failed ? <p role="status">{CRED_TEXT.loading}</p> : null}
+      {notice !== null ? <p role="status" className="notice notice-info">{notice}</p> : null}
+      {failed ? <p role="alert" className="notice notice-danger">{CRED_TEXT.load_failed}</p> : null}
+      {rows === null && !failed ? <p role="status" className="notice notice-info">{CRED_TEXT.loading}</p> : null}
       {rows !== null && rows.length === 0 ? <p>{CRED_TEXT.none_configured}</p> : null}
       {rows !== null && rows.length > 0 ? (
         <table>

@@ -136,6 +136,15 @@ Coverage of the credential window by OS (M6 CI ruling, run 38859187604): the e2e
 4. Press each Cmd+Shift chord from the approvals window's help list (list, set M10 T36b: Cmd+Shift+Enter approve or release, Cmd+Shift+D deny, Cmd+Shift+Down next request, Cmd+Shift+Up previous request).
    - Expected: the chord performs the action listed, or does nothing if the window is not focused.
 
+## 7a. Visual design (M11)
+
+Look at every window once in the light appearance and once in the dark appearance (System Settings, Appearance): Setup, Settings, Approvals, Audit, Running scripts, Onboarding and the credential window.
+
+1. Expected: the system font (no serif), cards separated, labels above their fields, one button row per form, readable text in both appearances. Queue rows and audit rows are not clipped (badges and both lines fully visible).
+2. Press Tab through Settings and through Approvals. Expected: every control shows a visible focus ring in turn. A control with no visible focus is FAIL.
+3. System Settings, Accessibility, Display, turn on "Reduce motion". Expected: no transition or animation on buttons or hover.
+4. Expected: native controls (scrollbars, date pickers, checkboxes) follow the appearance.
+
 ## 8. Evidence table
 
 Fill one row per check, per architecture. Mark each item `PASS`, `FAIL` or `N/A` (with a reason).
@@ -175,6 +184,9 @@ Fill one row per check, per architecture. Mark each item `PASS`, `FAIL` or `N/A`
 |      |        |      |  | 6. Credential window private (V35) |  |  |
 |      |        |      |  | 7. Tray show, tray quit |  |  |
 |      |        |      |  | 7.4 Cmd+Shift chords |  |  |
+|      |        |      |  | 7a.1 Light and dark appearance, no clipped rows (M11) |  |  |
+|      |        |      |  | 7a.2 Focus ring visible on Tab (M11) |  |  |
+|      |        |      |  | 7a.3 Reduce motion honoured (M11) |  |  |
 
 Also record: mock Jira URL and alias (from 0.1), macOS version, hardware model, whether the account was reused.
 

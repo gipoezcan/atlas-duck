@@ -126,7 +126,7 @@ export function Queue({ items, onSelectionChange, onOpen, selectedId = null }: Q
     });
 
   if (items.length === 0) {
-    return <p className="empty">{QUEUE_TEXT.empty}</p>;
+    return <p className="empty empty-state">{QUEUE_TEXT.empty}</p>;
   }
 
   return (

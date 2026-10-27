@@ -1,0 +1,13 @@
+/* The Setup wizard (M11 T8). A narrow column; each step is a card in .window-body (layout.css). */
+.window-setup {
+  max-width: 44rem;
+}
+.window-setup .window-body > section > h2:first-child {
+  font-size: var(--text-xl);
+}
+.window-setup .window-body > section > button {
+  margin: 0 var(--space-2) var(--space-2) 0;
+}
+.window-setup .page-header > .notice {
+  margin-bottom: 0;
+}

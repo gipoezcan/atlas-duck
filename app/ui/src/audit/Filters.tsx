@@ -208,7 +208,7 @@ export function Filters({ onApply }: { onApply: (filter: AuditFilter) => void })
       </fieldset>
       {Object.keys(errors).length > 0 ? <p role="alert">{T.filter_errors}</p> : null}
       <div className="audit-actions">
-        <button type="submit">{T.apply}</button>
+        <button type="submit" className="primary">{T.apply}</button>
         <button type="button" onClick={clear}>
           {T.clear}
         </button>

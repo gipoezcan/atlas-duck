@@ -1,0 +1,53 @@
+/* The Audit window (M11 T9; the M10 T20 rules moved here). A list row is two
+   one-line rows (2rem each) plus the .windowed-row border: ROW_REM 4.25 in
+   EventList.tsx. The row contract applies (check-css.mjs): no padding, margin
+   or border on .audit-line / .audit-row. */
+@media (min-width: 64rem) {
+  .window-audit {
+    max-width: 80rem;
+  }
+}
+
+/* Filters. */
+.audit-fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(12rem, 1fr)); gap: var(--space-3) var(--space-4); }
+.audit-field { display: flex; flex-direction: column; gap: 0.2rem; }
+.audit-field > label { font-size: var(--text-sm); color: var(--text-muted); }
+.audit-field-error { font-size: 0.9em; font-weight: var(--weight-bold); color: var(--danger); }
+.audit-flags { display: flex; flex-wrap: wrap; gap: 0.25rem 1rem; margin: var(--space-3) 0; }
+.audit-flags > label { margin: 0; }
+.audit-actions, .audit-ack { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.audit-actions { margin: var(--space-3) 0; }
+/* The acknowledge form: the warning notice look. */
+.audit-ack {
+  flex-direction: column;
+  align-items: flex-start;
+  margin: var(--space-3) 0;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--warning-border);
+  border-radius: var(--radius-md);
+  background: var(--warning-subtle);
+}
+.audit-ack textarea { width: 100%; max-width: 40rem; min-height: 4rem; }
+
+/* List. */
+.audit-line { display: flex; flex-wrap: nowrap; align-items: center; gap: 0.5rem; height: 2rem; overflow: hidden; white-space: nowrap; }
+.audit-line > * { flex: none; }
+.audit-line > .agent-text, .audit-line > .target { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+/* Record. The card rule outranks layout.css's "no card for a section inside a card". */
+.window-audit .audit-record {
+  margin-top: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+.audit-record dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.2rem 1rem; }
+.audit-record dl > div { display: contents; }
+.audit-record dt { font-weight: var(--weight-medium); color: var(--text-muted); }
+.audit-record dd { margin: 0; overflow-wrap: anywhere; }
+.audit-record .agent-text-value { max-width: none; white-space: pre-wrap; overflow: visible; }
+.audit-payload iframe { display: block; width: 100%; height: 28rem; border: 1px solid var(--border); }
+.audit-credential-line { border-left: 3px solid var(--warning-border); padding-left: 0.5rem; }
+.audit-export-result code { overflow-wrap: anywhere; }

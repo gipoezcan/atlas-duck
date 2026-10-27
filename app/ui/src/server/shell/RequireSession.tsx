@@ -46,6 +46,6 @@ export function RequireSession({ children }: { children: ReactNode }) {
       live = false;
     };
   }, []);
-  if (session === null) return <p role="status">Loading…</p>;
+  if (session === null) return <p role="status" className="window muted">Loading…</p>;
   return <SessionContext.Provider value={session}>{children}</SessionContext.Provider>;
 }

@@ -98,7 +98,7 @@ export function Login({ next }: { next: string | null }) {
   };
 
   return (
-    <main>
+    <main className="window window-login">
       <h1>{LOGIN_TEXT.title}</h1>
       <form className="server-form" onSubmit={(e) => void submit(e)}>
         <label>
@@ -122,10 +122,10 @@ export function Login({ next }: { next: string | null }) {
             required
           />
         </label>
-        <button type="submit" disabled={busy}>
+        <button type="submit" className="primary" disabled={busy}>
           {LOGIN_TEXT.submit}
         </button>
-        {error !== null ? <p role="alert">{error}</p> : null}
+        {error !== null ? <p role="alert" className="notice notice-danger">{error}</p> : null}
       </form>
     </main>
   );

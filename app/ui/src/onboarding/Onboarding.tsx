@@ -7,7 +7,7 @@ import { OnboardingText } from './OnboardingText';
  */
 export function Onboarding() {
   return (
-    <main>
+    <main className="window window-onboarding">
       <h1>{WINDOW_TITLES.onboarding}</h1>
       <OnboardingText />
     </main>
