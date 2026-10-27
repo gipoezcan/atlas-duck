@@ -209,7 +209,8 @@ async fn run(config: Config) -> u8 {
         health: Arc::new(
             Health::new(store.clone(), directory, true)
                 .with_master(master.clone())
-                .with_offboarding(offboarding),
+                .with_offboarding(offboarding)
+                .with_registry(registry.clone()),
         ),
         api_keys,
         mcp_sessions: Arc::new(crate::mcp::McpSessions::new()),

@@ -883,8 +883,10 @@ async fn healthz_and_readyz() {
     );
 }
 
+/// PD-M13-13 (M13 T10, a deliberate change of M12's /readyz): an unreachable directory is a
+/// degraded field on a 200, never a 503.
 #[tokio::test]
-async fn readyz_is_503_when_the_stub_file_vanished() {
+async fn readyz_200_with_directory_degraded_when_unreachable() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("users.json");
     std::fs::write(&file, STUB).unwrap();
@@ -902,9 +904,12 @@ async fn readyz_is_503_when_the_stub_file_vanished() {
     std::fs::remove_file(&file).unwrap();
     let fresh = crate::health::Health::new(store, stub3, true);
     let res = fresh.readyz().await;
-    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(res.status(), StatusCode::OK);
     let body = json_body(res).await;
     assert_eq!(body["checks"]["directory"], false);
+    assert_eq!(body["degraded"], json!(["directory_unreachable"]));
+    assert_eq!(body["reasons"], json!([]));
+    assert_eq!(body["ready"], true);
 }
 
 // ---- T13: admin instances over HTTP --------------------------------------------------------
@@ -1782,7 +1787,10 @@ async fn maintenance_refuses_everything_but_the_probes() {
     h.registry.set_maintenance(true);
     let ready = get(&h, "/readyz").await;
     assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(json_body(ready).await, json!({"reasons": ["maintenance"]}));
+    assert_eq!(
+        json_body(ready).await,
+        json!({"ready": false, "reasons": ["maintenance"]})
+    );
     assert_eq!(get(&h, "/healthz").await.status(), StatusCode::OK);
     let (status, c) = code(h.get_session(&cookie).await).await;
     assert_eq!(
@@ -1800,4 +1808,213 @@ async fn maintenance_refuses_everything_but_the_probes() {
     );
     h.registry.set_maintenance(false);
     assert_eq!(h.get_session(&cookie).await.status(), StatusCode::OK);
+}
+
+// ---- M13 T10: health, readiness, metrics ------------------------------------------------------
+
+async fn ready_body(h: &crate::health::Health) -> (StatusCode, Value) {
+    let res = h.readyz().await;
+    let status = res.status();
+    (status, json_body(res).await)
+}
+
+#[tokio::test]
+async fn readyz_503_when_master_key_missing_stores_unopened_or_maintenance() {
+    let stub = Arc::new(StubDirectory::from_json(STUB).unwrap());
+    // The master key is not loaded.
+    let store: Arc<dyn ServerStore> = Arc::new(crate::store::memory::MemoryStore::new());
+    let (status, body) = ready_body(&crate::health::Health::new(store, stub.clone(), false)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body,
+        json!({"ready": false, "reasons": ["master_key_missing"], "degraded": [],
+               "checks": {"store": true, "master_key": false, "directory": true},
+               "directory": "stub"})
+    );
+    // The server store does not answer.
+    let dir = tempfile::tempdir().unwrap();
+    let sqlite = SqliteStore::open(&dir.path().join("server.db")).unwrap();
+    sqlite.raw().execute_batch("DROP TABLE instances;").unwrap();
+    let store: Arc<dyn ServerStore> = Arc::new(sqlite);
+    let (status, body) = ready_body(&crate::health::Health::new(store, stub, true)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["reasons"], json!(["store_unavailable"]));
+    // Maintenance (the web layer's reason).
+    let h = H::new();
+    h.registry.set_maintenance(true);
+    let res = get(&h, "/readyz").await;
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(json_body(res).await["reasons"], json!(["maintenance"]));
+}
+
+#[tokio::test]
+async fn healthz_200_without_dependencies() {
+    let h = H::new();
+    // Not ready (maintenance), but alive.
+    h.registry.set_maintenance(true);
+    let res = get(&h, "/healthz").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+    assert_eq!(&bytes[..], b"ok");
+    assert_eq!(crate::health::healthz().await, "ok");
+}
+
+#[tokio::test]
+async fn readyz_reports_directory_stub() {
+    let h = H::new();
+    let res = get(&h, "/readyz").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = json_body(res).await;
+    assert_eq!(body["directory"], "stub");
+    assert_eq!(body["ready"], true);
+}
+
+/// A Health over `h`'s store and registry the way `serve` builds it, with master key "k1".
+fn full_health(h: &H) -> crate::health::Health {
+    crate::health::Health::new(h.store.clone(), h.stub.clone(), true)
+        .with_master(Arc::new(MasterKey::for_tests("k1", [5; 32])))
+        .with_offboarding("stub")
+        .with_registry(h.registry.clone())
+}
+
+#[tokio::test]
+async fn metrics_include_requests_approvals_scheduler_offboarding_test_directory_and_key_id() {
+    let h = H::new();
+    h.session("alice", PW_CANARY).await;
+    h.store
+        .scheduler_put(
+            crate::scheduler::JOB_RETENTION,
+            &crate::store::JobState {
+                last_run_at: Some(T0),
+                last_success_at: Some(T0),
+            },
+        )
+        .unwrap();
+    let health = full_health(&h);
+    health.count(&Method::POST, StatusCode::OK);
+    health.count(&Method::GET, StatusCode::NOT_FOUND);
+    let text = health.metrics().await;
+    for line in [
+        "atlas_duck_requests_total{method=\"POST\",status=\"2xx\"} 1",
+        "atlas_duck_requests_total{method=\"GET\",status=\"4xx\"} 1",
+        "atlas_duck_approvals_pending 0",
+        &format!("atlas_duck_scheduler_last_success_seconds{{job=\"retention\"}} {T0}"),
+        "atlas_duck_offboarding_enabled 1",
+        "atlas_duck_test_directory_enabled 1",
+        "atlas_duck_master_key_info{key_id=\"k1\",role=\"primary\"} 1",
+        "# TYPE atlas_duck_requests_total counter",
+    ] {
+        assert!(text.lines().any(|l| l == line), "missing {line}:\n{text}");
+    }
+    // Manual offboarding reports 0.
+    let manual = crate::health::Health::new(h.store.clone(), h.stub.clone(), true)
+        .with_offboarding("manual");
+    assert!(
+        manual
+            .metrics()
+            .await
+            .contains("atlas_duck_offboarding_enabled 0")
+    );
+    // The router counts what it answers.
+    let res = get(&h, "/metrics").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        text.contains("atlas_duck_requests_total{method=\"POST\",status=\"2xx\"}"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn metrics_contain_no_usernames_hostnames_or_ids() {
+    let h = H::new();
+    h.session("alice", PW_CANARY).await;
+    h.session("bob", "pw-bob").await;
+    h.store
+        .instance_put(&crate::store::InstanceRecord {
+            alias: "work".into(),
+            product: "jira".into(),
+            base_url: "https://jira.internal.example.test".into(),
+            proxy: None,
+            ca_ref: None,
+            is_default: true,
+        })
+        .unwrap();
+    let health = full_health(&h);
+    for m in [Method::GET, Method::POST, Method::PATCH] {
+        health.count(&m, StatusCode::OK);
+    }
+    let text = health.metrics().await;
+    let allowed = [
+        "GET",
+        "POST",
+        "PUT",
+        "DELETE",
+        "HEAD",
+        "other",
+        "1xx",
+        "2xx",
+        "3xx",
+        "4xx",
+        "5xx",
+        "offboarding",
+        "retention",
+        "k1",
+        "primary",
+        "accepted",
+        env!("CARGO_PKG_VERSION"),
+    ];
+    for line in text.lines().filter(|l| !l.starts_with('#')) {
+        if let Some((_, rest)) = line.split_once('{') {
+            let labels = rest.split_once('}').unwrap().0;
+            for pair in labels.split(',') {
+                let value = pair.split_once('=').unwrap().1.trim_matches('"');
+                assert!(allowed.contains(&value), "label value {value:?} in {line}");
+            }
+        }
+    }
+    for leak in [
+        "alice",
+        "bob",
+        &user_id_for("alice"),
+        "jira.internal.example.test",
+        "work",
+    ] {
+        assert!(!text.contains(leak), "{leak} in\n{text}");
+    }
+}
+
+#[tokio::test]
+async fn metrics_not_served_to_requests_with_x_forwarded_for() {
+    let h = H::new();
+    for (name, value) in [
+        ("x-forwarded-for", "203.0.113.7"),
+        ("forwarded", "for=203.0.113.7"),
+    ] {
+        let req = Request::builder()
+            .uri("/metrics")
+            .header(name, value)
+            .body(Body::empty())
+            .unwrap();
+        let (status, code) = code(h.send(req).await).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (StatusCode::NOT_FOUND, "api/not_found"),
+            "{name}"
+        );
+    }
+    let res = get(&h, "/metrics").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(
+        res.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain; version=0.0.4")
+    );
 }
