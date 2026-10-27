@@ -314,6 +314,13 @@ impl ServerStore for SqliteStore {
             "DELETE FROM user_pats WHERE user_id = ?1",
             "DELETE FROM sessions WHERE user_id = ?1",
             "DELETE FROM api_keys WHERE user_id = ?1",
+            // M14: the user's OAuth state and export jobs (their files go with the TTL sweep).
+            "DELETE FROM oauth_access WHERE grant_id IN (SELECT grant_id FROM oauth_grants WHERE user_id = ?1)",
+            "DELETE FROM oauth_refresh WHERE grant_id IN (SELECT grant_id FROM oauth_grants WHERE user_id = ?1)",
+            "DELETE FROM oauth_codes WHERE grant_id IN (SELECT grant_id FROM oauth_grants WHERE user_id = ?1)",
+            "DELETE FROM oauth_consent_requests WHERE user_id = ?1",
+            "DELETE FROM oauth_grants WHERE user_id = ?1",
+            "DELETE FROM export_jobs WHERE target_user_id = ?1 OR requester_user_id = ?1",
         ] {
             tx.execute(sql, [user_id]).map_err(db)?;
         }

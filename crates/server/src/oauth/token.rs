@@ -101,19 +101,50 @@ pub async fn reuse_detected(c: &Ctx<'_>, grant_id: &str, reason: &'static str) {
     }
 }
 
-/// Δ-M14-4: deactivation revokes every grant of the user (M13's `users::deactivate` calls this
-/// at merge); one `OAUTH_GRANT_REVOKED {by: deactivation}` per grant.
+/// The grants of `user_id` not yet revoked: what a deactivation still owes (a retry derives it
+/// from the stored state, like the API keys).
+pub fn grants_owed(
+    store: &dyn ServerStore,
+    user_id: &str,
+) -> Result<Vec<GrantRecord>, crate::store::StoreError> {
+    Ok(store
+        .grant_list(user_id)?
+        .into_iter()
+        .filter(|g| g.revoked_at.is_none())
+        .collect())
+}
+
+/// Δ-M14-4: deactivation revokes every grant of the user (`admin::users::deactivate` calls this
+/// before the `USER_DEACTIVATED` anchor row). Audit before effect: each grant's
+/// `OAUTH_GRANT_REVOKED {by: deactivation}` is appended to the user's chain, then the grant is
+/// revoked; a failed append stops with the rest still owed (the deactivated flag already refuses
+/// their tokens), so a retry completes the records.
 pub async fn revoke_all_for_user(
     store: &dyn ServerStore,
     registry: &Registry,
     user_id: &str,
     now: i64,
-) -> Result<usize, crate::store::StoreError> {
-    let revoked = store.grant_revoke_all(user_id, GrantRevokedBy::Deactivation.as_str(), now)?;
-    for g in &revoked {
-        record_revoked(registry, g, GrantRevokedBy::Deactivation).await;
+) -> Result<usize, &'static str> {
+    let owed = grants_owed(store, user_id).map_err(|_| "store/unavailable")?;
+    if owed.is_empty() {
+        return Ok(0);
     }
-    Ok(revoked.len())
+    let rt = registry
+        .open_user(user_id)
+        .await
+        .map_err(|_| "admin/user_store_unavailable")?;
+    for g in &owed {
+        rt.append_server_record(
+            atlas_duck_audit::EventType::OAUTH_GRANT_REVOKED,
+            oauth_grant_revoked(&g.grant_id, &g.client_id, GrantRevokedBy::Deactivation),
+        )
+        .await
+        .map_err(|e| e.code)?;
+        store
+            .grant_revoke(&g.grant_id, GrantRevokedBy::Deactivation.as_str(), now)
+            .map_err(|_| "store/unavailable")?;
+    }
+    Ok(owed.len())
 }
 
 /// The token response (RFC 6749 §5.1).

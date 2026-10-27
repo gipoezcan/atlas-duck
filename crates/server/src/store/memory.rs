@@ -123,6 +123,19 @@ impl ServerStore for MemoryStore {
         g.pats.retain(|(u, _), _| u != user_id);
         g.sessions.retain(|_, s| s.user_id != user_id);
         g.keys.retain(|_, k| k.user_id != user_id);
+        let grants: Vec<String> = g
+            .grants
+            .values()
+            .filter(|x| x.user_id == user_id)
+            .map(|x| x.grant_id.clone())
+            .collect();
+        g.access.retain(|_, a| !grants.contains(&a.grant_id));
+        g.refresh.retain(|_, r| !grants.contains(&r.grant_id));
+        g.codes.retain(|_, c| !grants.contains(&c.grant_id));
+        g.consents.retain(|_, c| c.user_id != user_id);
+        g.grants.retain(|_, x| x.user_id != user_id);
+        g.export_jobs
+            .retain(|_, j| j.target_user_id != user_id && j.requester_user_id != user_id);
         if let Some(u) = g.users.get_mut(user_id) {
             u.data_key_wrapped.clear();
             g.states

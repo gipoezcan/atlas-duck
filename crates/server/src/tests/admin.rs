@@ -337,7 +337,8 @@ async fn deactivate_is_idempotent() {
     assert_eq!(
         second.data.unwrap(),
         json!({"username": "alice", "newly_deactivated": false, "sessions_ended": 0,
-               "api_keys_revoked": 0, "pats_deleted": 0, "anchor_seq": null})
+               "api_keys_revoked": 0, "pats_deleted": 0, "oauth_grants_revoked": 0,
+               "anchor_seq": null})
     );
     assert_eq!(t.env.store.anchor_all().unwrap().len(), rows);
     assert_eq!(
@@ -628,4 +629,104 @@ mod unix {
         assert!(sent.ok);
         serving.abort();
     }
+}
+
+fn grant(user_id: &str, id: &str) -> crate::store::GrantRecord {
+    crate::store::GrantRecord {
+        grant_id: id.to_owned(),
+        user_id: user_id.to_owned(),
+        client_id: "adc_e2e".to_owned(),
+        scopes: vec!["read".to_owned()],
+        resource: "https://duck.example.test/mcp".to_owned(),
+        created_at: 1_800_000_000,
+        expires_at: 1_900_000_000,
+        last_used_at: None,
+        revoked_at: None,
+        revoke_reason: None,
+    }
+}
+
+/// M14 Δ-M14-4: deactivation revokes every OAuth grant, each recorded in the user's chain before
+/// it is revoked and before the `USER_DEACTIVATED` anchor; a failed first attempt leaves the grants
+/// owed (refused at once, since the user is not active) and the retry completes them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deactivation_revokes_oauth_grants_and_a_retry_completes_them() {
+    let t = harness();
+    let a = t.env.user("alice");
+    t.env
+        .store
+        .oauth_client_insert(&crate::store::OAuthClientRecord {
+            client_id: "adc_e2e".into(),
+            name: "e2e".into(),
+            redirect_uris: vec!["http://127.0.0.1/cb".into()],
+            created_at: 1_800_000_000,
+            source_ip_hash: "00".repeat(32),
+        })
+        .unwrap();
+    for id in ["g1", "g2"] {
+        t.env.store.grant_insert(&grant(&a, id)).unwrap();
+    }
+    within(t.ctx.registry.quiesce()).await;
+    let first = call(
+        &t.ctx,
+        json!({"op": "users_deactivate", "username": "alice"}),
+    )
+    .await;
+    assert_eq!(first.error.as_deref(), Some("admin/user_store_unavailable"));
+    assert!(
+        !crate::users::is_active(t.env.store.as_ref(), &a),
+        "refused at once"
+    );
+    assert!(
+        t.env
+            .store
+            .grant_list(&a)
+            .unwrap()
+            .iter()
+            .all(|g| g.revoked_at.is_none()),
+        "not revoked before its record"
+    );
+    t.ctx.registry.resume();
+    let second = call(
+        &t.ctx,
+        json!({"op": "users_deactivate", "username": "alice"}),
+    )
+    .await;
+    assert!(second.ok, "{second:?}");
+    let report = second.data.unwrap();
+    assert_eq!(report["oauth_grants_revoked"], 2);
+    let grants = t.env.store.grant_list(&a).unwrap();
+    assert!(
+        grants
+            .iter()
+            .all(|g| g.revoke_reason.as_deref() == Some("deactivation"))
+    );
+    // Both records are in the chain, at or before the head the USER_DEACTIVATED row anchors.
+    let rt = within(t.ctx.registry.open_user(&a)).await.unwrap();
+    let page = rt
+        .audit_store()
+        .query(
+            &atlas_duck_audit::types::AuditFilter::default(),
+            atlas_duck_audit::types::AuditCursor::first(100),
+        )
+        .unwrap();
+    let revoked: Vec<u64> = page
+        .rows
+        .iter()
+        .filter(|r| r.event_type == atlas_duck_audit::EventType::OAUTH_GRANT_REVOKED)
+        .map(|r| r.seq)
+        .collect();
+    assert_eq!(revoked.len(), 2);
+    let last = t.env.store.anchor_last().unwrap().unwrap();
+    assert_eq!(last.kind, KIND_USER_DEACTIVATED);
+    let head = &t.env.store.anchor_heads_for(last.seq).unwrap()[0];
+    assert!(revoked.iter().all(|s| *s <= head.head_seq));
+    // A third call owes nothing.
+    let third = call(
+        &t.ctx,
+        json!({"op": "users_deactivate", "username": "alice"}),
+    )
+    .await;
+    assert_eq!(third.data.unwrap()["anchor_seq"], Value::Null);
+    within(t.ctx.registry.close_all()).await;
 }

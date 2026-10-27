@@ -356,8 +356,8 @@ pub trait ServerStore: Send + Sync {
     fn users_all(&self) -> StoreResult<Vec<(UserRecord, UserState)>>;
     fn user_state(&self, user_id: &str) -> StoreResult<Option<UserState>>;
     fn user_set_last_login(&self, user_id: &str, at: i64) -> StoreResult<()>;
-    /// Retention (M13 T8), one transaction: the user's keystore entries, PATs, sessions and API
-    /// keys go, the wrapped data key is wiped and `chain_deleted_at` set. The row stays.
+    /// Retention (M13 T8), one transaction: the user's keystore entries, PATs, sessions, API
+    /// keys, OAuth grants with their codes and tokens, consent requests and export jobs (M14) go, the wrapped data key is wiped and `chain_deleted_at` set. The row stays.
     fn user_purge(&self, user_id: &str, at: i64) -> StoreResult<()>;
     /// Marks the user deactivated unless it already is; answers whether this call did it.
     fn user_deactivate(

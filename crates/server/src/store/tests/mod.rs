@@ -1012,3 +1012,52 @@ fn a_failed_v3_step_leaves_the_database_at_v2() {
         .unwrap();
     assert_eq!(users, 1);
 }
+
+/// M13 merge: retention removes the user's OAuth state and export jobs with the rest.
+#[test]
+fn user_purge_removes_oauth_rows_and_export_jobs() {
+    for (name, s) in stores() {
+        with_users(s.as_ref());
+        for (g, u) in [("ga", A), ("gb", B)] {
+            s.grant_insert(&grant(g, u, "adc_x", 10, 10_000)).unwrap();
+        }
+        s.code_insert(&code(1, "ga", 500)).unwrap();
+        s.code_insert(&code(2, "gb", 500)).unwrap();
+        s.refresh_insert(&refresh(3, "ga", 10)).unwrap();
+        s.refresh_insert(&refresh(4, "gb", 10)).unwrap();
+        for (tag, g) in [(5u8, "ga"), (6, "gb")] {
+            s.access_insert(&AccessRecord {
+                hash: [tag; 32],
+                grant_id: g.into(),
+                scopes: vec!["read".into()],
+                expires_at: 900,
+            })
+            .unwrap();
+        }
+        s.consent_put(&consent(7, 1)).unwrap();
+        s.export_job_insert(&job("j1", B, A, "done", 900)).unwrap();
+        s.export_job_insert(&job("j2", B, B, "done", 900)).unwrap();
+        s.user_purge(A, 99).unwrap();
+        assert!(s.grant_list(A).unwrap().is_empty(), "{name}");
+        assert!(s.access_get(&[5; 32]).unwrap().is_none(), "{name}");
+        assert_eq!(s.refresh_grant(&[3; 32]).unwrap(), None, "{name}");
+        assert!(
+            s.consent_get(&[7; 32], &[1; 32]).unwrap().is_none(),
+            "{name}"
+        );
+        assert!(
+            matches!(s.code_redeem(&[1; 32], 20), Err(Redeem::Unknown)),
+            "{name}"
+        );
+        assert!(s.export_job_get("j1").unwrap().is_none(), "{name}");
+        // Bob's rows stay.
+        assert_eq!(s.grant_list(B).unwrap().len(), 1, "{name}");
+        assert!(s.access_get(&[6; 32]).unwrap().is_some(), "{name}");
+        assert_eq!(
+            s.refresh_grant(&[4; 32]).unwrap().as_deref(),
+            Some("gb"),
+            "{name}"
+        );
+        assert!(s.export_job_get("j2").unwrap().is_some(), "{name}");
+    }
+}

@@ -1494,3 +1494,40 @@ async fn grants_are_listed_and_revoked_per_user() {
         .await;
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oauth_paths_refuse_a_deactivated_user() {
+    let h = H::new();
+    let (client, alice, v) = h.tokens_for(&["read"]).await;
+    // A second client, so its consent does not replace the first grant.
+    let other = h.client_id().await;
+    let code = h.code_for(&alice, &other, &["read"]).await["code"].clone();
+    let uid = user_id_for("alice");
+    assert!(
+        h.store
+            .user_deactivate(&uid, T0, "admin", T0 + 86_400)
+            .unwrap()
+    );
+    // Bearer, refresh and code redemption all refuse (the grant itself is not revoked here).
+    assert_eq!(
+        h.mcp_init(&s(&v, "access_token"), None).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let (st, e) = h.refresh(&client, &s(&v, "refresh_token"), None).await;
+    assert_eq!(
+        (st, e["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+    );
+    let (st, e) = h.redeem(&other, &code).await;
+    assert_eq!(
+        (st, e["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+    );
+    assert!(
+        h.store
+            .grant_list(&uid)
+            .unwrap()
+            .iter()
+            .all(|g| g.revoked_at.is_none())
+    );
+}

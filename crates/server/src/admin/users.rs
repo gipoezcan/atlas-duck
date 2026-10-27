@@ -3,7 +3,8 @@
 //! with OAuth grant revocation (Δ-M14-4).
 //!
 //! Order: mark the user deactivated (no new login from here on), end every session, revoke every
-//! API key (cache evicted), delete every PAT, each with its record in the user's own chain, then
+//! API key (cache evicted), delete every PAT, revoke every OAuth grant (M14), each with its record
+//! in the user's own chain, then
 //! anchor the chain's final head as `USER_DEACTIVATED`. Deactivation is final: a user who shows up
 //! in the directory again stays refused. A second call finds nothing left and appends nothing.
 
@@ -42,6 +43,8 @@ pub struct DeactivationReport {
     pub sessions_ended: usize,
     pub api_keys_revoked: usize,
     pub pats_deleted: usize,
+    /// M14 Δ-M14-4: OAuth grants revoked.
+    pub oauth_grants_revoked: usize,
     /// Seq of the `USER_DEACTIVATED` anchor row, when one was appended.
     pub anchor_seq: Option<u64>,
 }
@@ -149,14 +152,17 @@ pub async fn deactivate(
         .filter(|k| k.revoked_at.is_none())
         .collect();
     let pats = store.pat_list(user_id).map_err(|_| "store/unavailable")?;
+    let grants =
+        crate::oauth::token::grants_owed(store, user_id).map_err(|_| "store/unavailable")?;
     let anchored = deactivation_anchored(store, user_id)?;
-    if keys.is_empty() && pats.is_empty() && anchored {
+    if keys.is_empty() && pats.is_empty() && grants.is_empty() && anchored {
         return Ok(DeactivationReport {
             username: user.username,
             newly_deactivated: newly,
             sessions_ended,
             api_keys_revoked: 0,
             pats_deleted: 0,
+            oauth_grants_revoked: 0,
             anchor_seq: None,
         });
     }
@@ -192,6 +198,9 @@ pub async fn deactivate(
             .pat_delete(user_id, &p.alias)
             .map_err(|_| "store/unavailable")?;
     }
+    // M14 Δ-M14-4: every OAuth grant, each recorded before it is revoked, before the anchor.
+    let grants_revoked =
+        crate::oauth::revoke_all_for_user(store, &ctx.registry, user_id, now).await?;
     let row = ctx
         .writer
         .user_deactivated(user_id, &rt.head())
@@ -202,7 +211,8 @@ pub async fn deactivate(
         by = by.as_str(),
         sessions = sessions_ended,
         api_keys = keys.len(),
-        pats = pats.len()
+        pats = pats.len(),
+        oauth_grants = grants_revoked
     );
     Ok(DeactivationReport {
         username: user.username,
@@ -210,6 +220,7 @@ pub async fn deactivate(
         sessions_ended,
         api_keys_revoked: keys.len(),
         pats_deleted: pats.len(),
+        oauth_grants_revoked: grants_revoked,
         anchor_seq: Some(row.seq),
     })
 }

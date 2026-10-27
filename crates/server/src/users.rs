@@ -31,11 +31,13 @@ pub fn user_id_for(username: &str) -> String {
     hex::encode(&digest[..16])
 }
 
-/// Is the user active (M14 seam for M13's deactivation)? Until M13's schema v2 merges this means
-/// "the user row exists"; at merge it also reads `deactivated_at` (T7 consent, T8 bearer, T8
-/// token endpoint, T17).
+/// Is the user active: the row exists, not deactivated and not purged by retention (M13 states;
+/// M14's OAuth consent, bearer and token endpoint refuse otherwise). A store error is not active.
 pub fn is_active(store: &dyn crate::store::ServerStore, user_id: &str) -> bool {
-    matches!(store.user(user_id), Ok(Some(_)))
+    matches!(
+        store.user_state(user_id),
+        Ok(Some(s)) if s.deactivated_at.is_none() && s.chain_deleted_at.is_none()
+    )
 }
 
 /// `<data>/users/<user_id>`.
