@@ -579,12 +579,20 @@ mod unix {
         assert!(socket::bind(&file).is_err());
     }
 
-    async fn exchange(path: &std::path::Path) -> Vec<u8> {
+    /// Sends one request line. A refused peer may see the server hang up before or during its
+    /// write (BrokenPipe, ConnectionReset): that is the refusal, answered with no bytes.
+    async fn exchange_line(path: &std::path::Path, line: &[u8]) -> Vec<u8> {
         let mut s = tokio::net::UnixStream::connect(path).await.unwrap();
-        s.write_all(b"{\"op\":\"users_list\"}\n").await.unwrap();
+        if s.write_all(line).await.is_err() {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         let _ = within(s.read_to_end(&mut out)).await;
         out
+    }
+
+    async fn exchange(path: &std::path::Path) -> Vec<u8> {
+        exchange_line(path, b"{\"op\":\"users_list\"}\n").await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -596,6 +604,13 @@ mod unix {
         // The server allows only another UID than this test's: the connection closes unanswered.
         let refusing = tokio::spawn(socket::serve(listener, uid.wrapping_add(1), t.ctx.clone()));
         assert!(exchange(&path).await.is_empty());
+        // A state-changing request from the refused peer changes nothing.
+        let out = exchange_line(&path, b"{\"op\":\"maintenance\",\"on\":true}\n").await;
+        assert!(out.is_empty());
+        assert!(
+            !t.ctx.registry.maintenance(),
+            "no command ran for the refused peer"
+        );
         refusing.abort();
         // The same peer is answered when its UID is the allowed one.
         let (listener, uid) = socket::bind(&path).unwrap();
