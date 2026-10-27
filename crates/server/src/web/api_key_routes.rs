@@ -40,27 +40,29 @@ pub async fn create(
     let bytes = body_bytes(req.into_body()).await?;
     let body: CreateBody = serde_json::from_slice(&bytes).map_err(|_| ApiError::BAD_REQUEST)?;
     let ctx = user.ctx();
-    let created = st
+    let prepared = st
         .api_keys
-        .create(&ctx, &body.name, &body.scopes, body.expires_in_days)?;
-    let v = &created.view;
+        .prepare(&ctx, &body.name, &body.scopes, body.expires_in_days)?;
+    let v = prepared.view();
     let scopes: Vec<&str> = v.scopes.iter().map(String::as_str).collect();
-    // Batch-3 review M3: a key whose API_KEY_CREATED did not commit is revoked again, so no
-    // active, unaudited key remains.
-    let appended = match st.registry.runtime(&ctx).await {
-        Ok(rt) => {
-            rt.append_server_record(
-                EventType::API_KEY_CREATED,
-                api_key_created(&v.id, &v.name, &v.prefix, &scopes, &rfc3339(v.expires_at)),
-            )
-            .await
+    // Final review I2: audit before effect. The key is stored only after `API_KEY_CREATED`
+    // committed; a failed append leaves no key at all.
+    let rt = st.registry.runtime(&ctx).await?;
+    rt.append_server_record(
+        EventType::API_KEY_CREATED,
+        api_key_created(&v.id, &v.name, &v.prefix, &scopes, &rfc3339(v.expires_at)),
+    )
+    .await?;
+    drop(rt);
+    let created = match st.api_keys.insert(prepared) {
+        Ok(c) => c,
+        Err(e) => {
+            // Final review I1: the record names a key that was never stored; say so.
+            tracing::error!(event = "api_key_insert_failed", key_id = %v.id);
+            return Err(e);
         }
-        Err(e) => Err(e),
     };
-    if let Err(e) = appended {
-        let _ = st.api_keys.revoke(&ctx, &v.id);
-        return Err(e);
-    }
+    let v = &created.view;
     let mut res = (
         StatusCode::CREATED,
         Json(json!({

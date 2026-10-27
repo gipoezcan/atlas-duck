@@ -132,17 +132,14 @@ pub fn validate(
     }
     let mut all = list.to_vec();
     all.push(candidate.clone());
-    let mut name = [0u8; 16];
-    getrandom::fill(&mut name).map_err(|_| ApiError::INTERNAL)?;
-    let path =
-        std::env::temp_dir().join(format!("atlas-duck-instances-{}.toml", hex::encode(name)));
-    std::fs::write(&path, config_toml(&all, None)).map_err(|_| ApiError::INTERNAL)?;
-    let parsed = atlas_duck_core::config::load_config(&path)
-        .ok()
-        .map(|cfg| atlas_duck_core::config::instances::instances(&cfg).is_ok());
-    let _ = std::fs::remove_file(&path);
-    match parsed {
-        Some(true) => Ok(()),
+    // Final review C1: parsed in memory (the image's root, /tmp included, is read-only). Only a
+    // config at this binary's head counts, and every instance must come back.
+    let cfg = atlas_duck_core::config::parse_config(config_toml(&all, None).as_bytes());
+    if !matches!(cfg, atlas_duck_core::config::ConfigState::Writable(_)) {
+        return Err(ApiError::INSTANCE_INVALID);
+    }
+    match atlas_duck_core::config::instances::instances(&cfg) {
+        Ok(parsed) if parsed.len() == all.len() => Ok(()),
         _ => Err(ApiError::INSTANCE_INVALID),
     }
 }

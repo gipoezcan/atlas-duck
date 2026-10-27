@@ -142,7 +142,7 @@ export function Running() {
 
   if (rows === null) {
     return (
-      <main>
+      <main className="window window-running">
         <h1>{WINDOW_TITLES.running_scripts}</h1>
         {failed ? (
           <p role="alert">
@@ -159,7 +159,7 @@ export function Running() {
   }
 
   return (
-    <main>
+    <main className="window window-running">
       <h1>{WINDOW_TITLES.running_scripts}</h1>
       {failed ? (
         <p role="alert">
@@ -175,7 +175,7 @@ export function Running() {
         </p>
       )}
       {rows.length === 0 ? (
-        <p>{T.empty}</p>
+        <p className="empty-state">{T.empty}</p>
       ) : (
         <table aria-label={T.list_label}>
           <thead>
@@ -213,6 +213,7 @@ export function Running() {
                 <td>
                   <button
                     type="button"
+                    className="danger"
                     aria-label={T.kill_label(r.request_id)}
                     disabled={killing !== null}
                     aria-busy={killing === r.request_id}

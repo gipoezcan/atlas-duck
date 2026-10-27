@@ -2018,3 +2018,31 @@ async fn metrics_not_served_to_requests_with_x_forwarded_for() {
             .starts_with("text/plain; version=0.0.4")
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_whose_audit_record_fails_is_never_stored() {
+    // Final review I1/I2: API_KEY_CREATED comes first; when it fails, no key exists to use.
+    let h = H::new();
+    let (cookie, csrf) = h.session("alice", PW_CANARY).await;
+    let uid = user_id_for("alice");
+    let rt = h
+        .registry
+        .runtime(&crate::runtime::UserCtx::from_authenticated(&uid))
+        .await
+        .unwrap();
+    rt.fail_next_append
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(rt);
+    let body = r#"{"name": "agent", "scopes": ["read"]}"#;
+    let res = admin_call(&h, Method::POST, "/api/me/api-keys", &cookie, &csrf, body).await;
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(code(res).await.1, "store/unavailable");
+    assert!(
+        h.store.api_key_list(&uid).unwrap().is_empty(),
+        "no key was stored"
+    );
+    // With the store back, the same request works and the key is listed.
+    let res = admin_call(&h, Method::POST, "/api/me/api-keys", &cookie, &csrf, body).await;
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(h.store.api_key_list(&uid).unwrap().len(), 1);
+}

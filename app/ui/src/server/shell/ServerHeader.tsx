@@ -53,7 +53,7 @@ export function ServerHeader() {
           {SHELL_TEXT.sign_out}
         </button>
       </nav>
-      {failed ? <p role="alert">{SHELL_TEXT.sign_out_failed}</p> : null}
+      {failed ? <p role="alert" className="notice notice-danger">{SHELL_TEXT.sign_out_failed}</p> : null}
     </header>
   );
 }

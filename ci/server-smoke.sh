@@ -68,7 +68,8 @@ user="$(docker inspect --format '{{.Config.User}}' "$NAME")"
 
 # The admin CLI reaches the running server over its socket (M13 T5, Δ-M13-2).
 set +e
-docker exec "$NAME" /app/atlas-duck-server admin instances list > "$WORK/admin.out" 2>&1
+docker exec "$NAME" /app/atlas-duck-server admin instances add --alias offline --product jira \
+  --url https://offline.example.test > "$WORK/admin.out" 2>&1
 code=$?
 set -e
 [[ "$code" == 0 ]] || fail "admin instances list exited $code: $(cat "$WORK/admin.out")"

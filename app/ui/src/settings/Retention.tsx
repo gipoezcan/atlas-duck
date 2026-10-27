@@ -75,7 +75,7 @@ export function Retention({ view, onChanged, readOnly }: RetentionProps) {
             onChange={(e) => setDays(e.target.value)}
           />
         </label>
-        <button type="button" disabled={retention.pending || days === null} onClick={applyDays}>
+        <button type="button" className="primary" disabled={retention.pending || days === null} onClick={applyDays}>
           {T.apply}
         </button>
         {local === null ? null : <p role="alert">{local}</p>}
@@ -122,6 +122,7 @@ export function Retention({ view, onChanged, readOnly }: RetentionProps) {
             </p>
             <button
               type="button"
+              className="danger"
               disabled={prune.pending}
               onClick={() =>
                 void prune.run(() => pruneBacklogNow()).then((r) => {

@@ -1,0 +1,108 @@
+/* Page, card, form and action-row layout (M11). Window roots carry
+   `window window-<name>`; a window's sections are cards. Text controls sit
+   below their label: the DOM nests control and text in one <label> (Settings)
+   or pairs a <label htmlFor> with a control inside .field (Audit, Edit form),
+   so the rules key on :has() instead of on a <form> ancestor. A window whose
+   sections sit in a wrapper div (the Setup wizard's panel) marks it
+   .window-body and gets the same card and notice rules. */
+.window {
+  max-width: var(--content-max);
+  margin: 0 auto;
+  padding: var(--space-5) var(--space-5) var(--space-7);
+}
+@media (max-width: 40rem) {
+  .window {
+    padding: var(--space-4);
+  }
+}
+.window > h1, .page-header {
+  margin-bottom: var(--space-4);
+}
+.page-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-4);
+}
+.page-header > h1 {
+  margin-bottom: 0;
+}
+
+/* Cards. */
+:is(.window, .window-body) > section, .card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4) var(--space-5);
+  margin: 0 0 var(--space-4);
+  box-shadow: var(--shadow-card);
+}
+:is(.window, .window-body) > section > h2:first-child, .card > h2:first-child {
+  margin-top: 0;
+  font-size: var(--text-lg);
+}
+:is(.window, .window-body) > section section {
+  background: none;
+  border: 0;
+  padding: 0;
+  box-shadow: none;
+}
+
+/* Forms: label text above the control. */
+.window label:has(> input:where(:not([type="checkbox"], [type="radio"], [type="button"], [type="submit"], [type="reset"], [type="file"])), > select, > textarea),
+.field {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+  margin: 0 0 var(--space-3);
+  max-width: var(--form-max);
+}
+.window label > input:where(:not([type="checkbox"], [type="radio"], [type="button"], [type="submit"], [type="reset"], [type="file"])),
+.window label > select,
+.window label > textarea,
+.field > input:where(:not([type="checkbox"], [type="radio"], [type="button"], [type="submit"], [type="reset"], [type="file"])),
+.field > select,
+.field > textarea {
+  width: 100%;
+}
+/* Checkbox and radio labels: control and text in one row, one label per line. */
+.window label:has(> input[type="checkbox"]), .window label:has(> input[type="radio"]) {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  margin: 0 0 var(--space-2);
+}
+/* A <label htmlFor> that wraps no control is a plain caption above its sibling control. */
+.window label:not(:has(input, select, textarea)) {
+  margin-bottom: var(--space-1);
+}
+.field-hint {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+.field-error {
+  font-size: var(--text-sm);
+  color: var(--danger);
+  font-weight: var(--weight-medium);
+}
+
+/* One action row per form or section: the shared look (later, more specific rules keep their own margins). */
+.actions, .edit-actions, .detail-actions, .batch-actions, .audit-actions, .redaction-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+}
+
+/* Utilities. */
+.stack > * + * {
+  margin-top: var(--space-3);
+}
+.muted {
+  color: var(--text-muted);
+}
+/* Text for screen readers only (the setup wizard's step announcement). */
+.visually-hidden { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }

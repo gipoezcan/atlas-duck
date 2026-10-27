@@ -100,7 +100,7 @@ export function Limits({ view, onChanged, readOnly }: LimitsProps) {
           ) : null}
         </div>
       ))}
-      <button type="button" disabled={action.pending} onClick={submit}>
+      <button type="button" className="primary" disabled={action.pending} onClick={submit}>
         {T.apply}
       </button>
       {local === null ? null : <p role="alert">{local}</p>}

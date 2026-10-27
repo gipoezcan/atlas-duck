@@ -11,6 +11,7 @@
 #     -e ATLAS_DUCK_TEST_DIRECTORY_FILE=/fixtures/test-directory.json \
 #     -e GROUP_USERS=cn=atlas-duck-users,ou=groups,dc=test \
 #     -e GROUP_ADMINS=cn=atlas-duck-admins,ou=groups,dc=test \
+#     -e GROUP_AUDITORS=cn=atlas-duck-auditors,ou=groups,dc=test \
 #     -v $PWD/data:/data -v $PWD/master-key:/run/secrets/master-key:ro \
 #     -v $PWD/crates/server/fixtures:/fixtures:ro atlas-duck-server:dev
 #
@@ -34,6 +35,9 @@ ENV CARGO_BUILD_JOBS=4
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
+# The one non-test include_str! input outside crates/ in the server's closure:
+# crates/preview/src/sanitize.rs embeds the preview stylesheet.
+COPY app/ui/public/preview.css app/ui/public/preview.css
 # A workspace member; copied only so the workspace resolves with --locked. The server's closure
 # links no Tauri, so no GTK/WebKit packages are needed.
 COPY app/src-tauri/ app/src-tauri/
@@ -46,8 +50,8 @@ ARG GIT_SHA=unknown
 LABEL org.opencontainers.image.title="atlas-duck-server" \
       org.opencontainers.image.source="https://gitlab.intern.gipmbh.de/gip/teams/g-dux/atlas-duck" \
       org.opencontainers.image.revision="${GIT_SHA}"
-# Writable at run time (read-only root, M13 A-9): ATLAS_DUCK_DATA_DIR, /tmp (instance config
-# files, instances.rs) and /run/atlas-duck (admin socket); the chart mounts all three.
+# Writable at run time (read-only root, M13 A-9): ATLAS_DUCK_DATA_DIR and
+# /run/atlas-duck (admin socket); /tmp only as an optional backup target. The chart mounts all three.
 COPY --from=build /src/target/release/atlas-duck-server /app/atlas-duck-server
 COPY --from=ui /src/app/ui/dist-server/ /app/web/
 USER 65532:65532

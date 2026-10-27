@@ -1,0 +1,149 @@
+/* The Approvals window (M11 T6): queue, detail, decision bar, deny dialog,
+   edit form, redaction panel, batch, recent. One column: App.tsx renders the
+   queue, the batch panel, the detail and the recent list as siblings in a row
+   with optional notices between them, so a two-column grid would need
+   restructuring the JSX (out of scope for M11).
+
+   Row contract (check-css.mjs): a queue row is QUEUE_ROW_REM (7.5rem) high =
+   2rem + 2rem + .queue-flags 3.5rem. No vertical padding, margin or border on
+   .windowed-row, .queue-line, .queue-flags, .audit-line; the selected row is
+   marked with an inset shadow, not a border. */
+@media (min-width: 64rem) {
+  .window-approvals,
+  .app-header nav,
+  .banner {
+    max-width: 80rem;
+  }
+}
+
+/* Queue. */
+.windowed-row { box-sizing: border-box; overflow: hidden; border-bottom: 1px solid var(--border); }
+/* An outer shadow, not a border: Windowed's height is its scroll viewport, a border would cut the last row. */
+.window-approvals > .windowed {
+  margin-bottom: var(--space-4);
+  box-shadow: 0 0 0 1px var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+}
+/* Lines 1 and 2 are one line each: shrinkable text is ellipsized, labels and badges are flex: none.
+   The flags line wraps. A row is QUEUE_ROW_REM (7.5rem) high, so the rem lines and the row scale together. */
+.queue-line { display: flex; flex-wrap: nowrap; align-items: center; gap: 0.5rem; height: 2rem; overflow: hidden; white-space: nowrap; }
+.queue-line > * { flex: none; }
+.queue-line > .agent-text, .queue-line > .target { flex: 0 1 auto; min-width: 0; }
+.queue-line > .target { overflow: hidden; text-overflow: ellipsis; }
+.queue-flags { flex-wrap: wrap; height: 3.5rem; row-gap: 0; align-content: center; }
+.queue-item { padding: 0 var(--space-3); }
+.queue-item:hover { background: var(--row-hover); }
+.queue-item[aria-current="true"] { background: var(--row-selected); box-shadow: inset 3px 0 0 var(--accent); }
+.queue-group {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  height: 100%;
+  padding: 0 var(--space-3);
+  font-weight: var(--weight-bold);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+.target { font-family: var(--font-mono); font-size: var(--text-sm); }
+
+/* Recent. */
+.recent ul { list-style: none; padding: 0; }
+.recent-item { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; padding: var(--space-2) 0; border-bottom: 1px solid var(--border); }
+
+/* Detail. */
+.detail {
+  padding: var(--space-4);
+  margin-bottom: var(--space-4);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+.detail-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: var(--space-2) 0; }
+.consequences { flex-basis: 100%; margin: 0; padding-left: 1.25rem; }
+.detail [role="tablist"] {
+  display: flex;
+  gap: var(--space-1);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: var(--space-3);
+}
+.detail [role="tab"] {
+  font: inherit;
+  cursor: pointer;
+  padding: 0 var(--space-3);
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  min-height: var(--control-height);
+  color: var(--text-muted);
+}
+.detail [role="tab"]:hover { color: var(--text); }
+/* The selected tab keeps a non-colour signal: weight and the underline bar. */
+.detail [role="tab"][aria-selected="true"] {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+  font-weight: var(--weight-bold);
+  text-decoration: none;
+}
+.detail-panel iframe { display: block; width: 100%; height: 28rem; border: 1px solid var(--border); }
+.raw-nav { display: flex; gap: 0.5rem; align-items: center; }
+.raw-text, .params-text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 28rem; overflow: auto; }
+.request-tab dt { font-weight: var(--weight-bold); }
+.request-tab dd { margin: 0 0 0.5rem 0; }
+.request-tab .agent-text-value { max-width: none; white-space: pre-wrap; overflow: visible; }
+
+/* Deny dialog. */
+.deny-dialog {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  margin: var(--space-3) 0;
+  padding: var(--space-3);
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+.deny-dialog input[type="text"] { flex: 1 1 20rem; min-width: 0; }
+.deny-keys { flex-basis: 100%; font-size: 0.9em; }
+.deny-offers { flex-basis: 100%; margin: 0; }
+.deny-offer-detail { margin-left: 1.5rem; }
+
+/* Edit form. */
+.edit-form fieldset { margin: var(--space-2) 0; border: 1px solid var(--border); border-radius: var(--radius-md); }
+.edit-form .field { display: flex; flex-direction: column; gap: 0.2rem; margin: 0.4rem 0; border: 0; padding: 0; }
+.edit-form .field input[type="text"], .edit-form .field textarea, .edit-form .field select { max-width: 100%; }
+.edit-form .json-input { font-family: var(--font-mono); min-height: 5rem; }
+.edit-form .read-only, .edit-form .field-hint, .edit-form .field-keys { font-size: 0.9em; }
+.edit-form .pick, .edit-form .as-json { display: flex; gap: 0.35rem; align-items: center; }
+.edit-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.keyboard-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 1rem;
+  list-style: none;
+  margin: 0 0 0.5rem 0;
+  padding: 0;
+  font-size: 0.85em;
+  color: var(--text-muted);
+}
+
+/* Redaction panel and tree. */
+.redaction-panel { display: flex; flex-direction: column; gap: 0.5rem; }
+.redaction-ops ul, .redaction-report ul { margin: 0.25rem 0; padding-left: 1.25rem; }
+.redaction-presets, .redaction-release, .redaction-actions, .mask-form { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.redaction-url { border: 1px solid var(--border); border-radius: var(--radius-md); }
+.tree-row { display: flex; align-items: center; gap: 0.35rem; height: 100%; white-space: nowrap; overflow: hidden; }
+.tree-toggle { flex: none; width: 1.75rem; }
+.tree-leaf { flex: none; width: 1.75rem; text-align: center; }
+.tree-select { display: flex; align-items: center; gap: 0.5rem; min-width: 0; flex: 0 1 auto; overflow: hidden; background: none; border: 0; padding: 0; text-align: left; font: inherit; color: inherit; }
+.tree-select[aria-pressed="true"] { outline: 2px solid var(--focus); outline-offset: -2px; background: var(--row-selected); }
+.tree-scalar, .tree-count { font-family: var(--font-mono); }
+.tree-value-full { max-height: 16rem; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-md); padding: 0.35rem; }
+.tree-value-full .agent-text-value { max-width: none; white-space: pre-wrap; overflow-wrap: anywhere; overflow: visible; }
+.unaddressable { margin: 0; }
+
+/* Batch (the card look comes from layout.css). */
+.batch-actions, .batch-session { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: var(--space-2) 0 0; }
+.batch-confirm ul, .batch-excluded ul, .batch-blocked ul { max-height: 12rem; overflow: auto; margin: 0.25rem 0; }

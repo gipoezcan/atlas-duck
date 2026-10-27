@@ -162,7 +162,7 @@ export function App({ header, openId = null }: AppProps = {}) {
   return (
     <WindowInertContext.Provider value={inert}>
       {header ?? <Header lines={status.value ?? []} />}
-      <main>
+      <main className="window window-approvals">
         <h1 ref={heading} tabIndex={-1}>
           {WINDOW_TITLES.approvals}
         </h1>

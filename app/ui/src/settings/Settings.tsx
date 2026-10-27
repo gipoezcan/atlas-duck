@@ -58,7 +58,7 @@ export function Settings() {
 
   if (data === null) {
     return (
-      <main>
+      <main className="window window-settings">
         <h1>{WINDOW_TITLES.settings}</h1>
         {failed ? (
           <p role="alert">
@@ -86,7 +86,7 @@ export function Settings() {
   const readOnly = banner !== null;
   return (
     <WindowBusyContext.Provider value={busy}>
-    <main>
+    <main className="window window-settings">
       <h1>{WINDOW_TITLES.settings}</h1>
       {failed ? (
         <p role="alert">

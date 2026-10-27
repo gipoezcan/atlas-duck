@@ -237,7 +237,7 @@ export function Removal({ onChanged }: { onChanged: () => void }) {
                 </p>
               ) : null}
               <p>{T.removal_finish_hint}</p>
-              <button type="button" disabled={action.pending || unanswered} onClick={doFinish}>
+              <button type="button" className="danger" disabled={action.pending || unanswered} onClick={doFinish}>
                 {T.removal_finish}
               </button>
             </>

@@ -112,9 +112,9 @@ function AdminInstances() {
   return (
     <>
       <p>{ADMIN_TEXT.intro}</p>
-      {notice !== null ? <p role="status">{notice}</p> : null}
-      {failed ? <p role="alert">{ADMIN_TEXT.load_failed}</p> : null}
-      {list === null && !failed ? <p role="status">{ADMIN_TEXT.loading}</p> : null}
+      {notice !== null ? <p role="status" className="notice notice-info">{notice}</p> : null}
+      {failed ? <p role="alert" className="notice notice-danger">{ADMIN_TEXT.load_failed}</p> : null}
+      {list === null && !failed ? <p role="status" className="notice notice-info">{ADMIN_TEXT.loading}</p> : null}
       {list !== null && list.length === 0 ? <p>{ADMIN_TEXT.none}</p> : null}
       {list !== null && list.length > 0 ? (
         <table>
@@ -176,8 +176,8 @@ function AdminInstances() {
           <input type="checkbox" checked={isDefault} onChange={(e) => setIsDefault(e.target.checked)} />{' '}
           {ADMIN_TEXT.is_default}
         </label>
-        <button type="submit">{ADMIN_TEXT.add}</button>
-        {error !== null ? <p role="alert">{error}</p> : null}
+        <button type="submit" className="primary">{ADMIN_TEXT.add}</button>
+        {error !== null ? <p role="alert" className="notice notice-danger">{error}</p> : null}
       </form>
     </>
   );
@@ -188,9 +188,9 @@ export function Instances() {
   const session = useSession();
   const admin = session?.roles.includes('admin') ?? false;
   return (
-    <main>
+    <main className="window window-admin">
       <h1>{ADMIN_TEXT.title}</h1>
-      {admin ? <AdminInstances /> : <p role="alert">{ADMIN_TEXT.admins_only}</p>}
+      {admin ? <AdminInstances /> : <p role="alert" className="notice notice-danger">{ADMIN_TEXT.admins_only}</p>}
     </main>
   );
 }

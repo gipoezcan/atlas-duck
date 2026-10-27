@@ -35,6 +35,7 @@ interface InstancesProps {
 export function Instances({ instances, onChanged, readOnly }: InstancesProps) {
   if (instances.length === 0) return <p>{T.no_instances}</p>;
   return (
+    <div className="table-scroll">
     <table className="instances">
       <caption>{T.instances}</caption>
       <thead>
@@ -55,6 +56,7 @@ export function Instances({ instances, onChanged, readOnly }: InstancesProps) {
         ))}
       </tbody>
     </table>
+    </div>
   );
 }
 

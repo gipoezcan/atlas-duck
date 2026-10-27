@@ -136,7 +136,7 @@ export function Audit() {
   };
 
   return (
-    <main className="audit">
+    <main className="audit window window-audit">
       <h1>{WINDOW_TITLES.audit}</h1>
       <Incidents status={status} failed={statusFailed} onRetry={readStatus} onChanged={readStatus} />
       <section aria-label={T.verification}>

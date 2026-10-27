@@ -824,7 +824,7 @@ Each milestone entry lists: scope (§14, with the placements this plan makes whe
 - **Scope:** the windows (Setup, Settings, Approvals, Audit, Credential, Onboarding, Running scripts) render with browser defaults: `app/ui/src/shared/app.css` holds only functional rules, no milestone planned a visual design. M11 adds a base theme (system font stack, light and dark palette, spacing scale, button/input/select styles, focus rings), form layout (labels above fields, grouped sections, one action row), and a layout pass per window.
 - **Constraints:** CSP (§6.4) forbids inline styles and external fonts: everything ships in the bundled CSS; no new runtime dependencies; class-name changes keep the existing tests and the windowed-row height contract (`QUEUE_ROW_REM`); accessibility (contrast, focus visibility, `prefers-reduced-motion`).
 - **Exit criterion:** every window reviewed in a screenshot on Windows and Linux (and the macOS GUI checklist), UI gates and e2e green.
-- **Status:** not started; detailed plan to be written.
+- **Status:** done (merged to master at 14007d5; CI run 40411277780 green; visual check on Windows (light) done). Open: Linux screenshot, dark-mode visual check, macOS GUI checklist item 7a (`docs/release/macos-gui-checklist.md`, "Visual design (M11)").
 
 ### M12 — Server mode core
 

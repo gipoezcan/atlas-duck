@@ -1,9 +1,10 @@
-/* Server-mode pages (T20-T22): only what the desktop app.css has no rule for. */
+/* Server-mode pages (T20-T22): layout only, on the M11 tokens; colours, type and controls come
+   from the shared app.css (tokens.css, controls.css, layout.css). */
 
 .server-header nav {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.75rem;
+  gap: var(--space-3);
   align-items: center;
 }
 
@@ -13,11 +14,11 @@
 
 .server-form {
   display: grid;
-  gap: 0.5rem;
+  gap: var(--space-2);
   max-width: 24rem;
 }
 
 .server-form label {
   display: grid;
-  gap: 0.25rem;
+  gap: var(--space-1);
 }

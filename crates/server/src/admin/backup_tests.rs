@@ -228,8 +228,10 @@ async fn backup_is_consistent_under_concurrent_writes() {
     // The bundle is self-consistent: a fresh server with the same key restores it, which checks
     // the hashes, the anchor chain and every user chain against the manifest.
     let fresh = sqlite_harness("k1", KEY_A);
+    let copied = fresh.backups().join("from-s");
+    copy_dir(Path::new(&bundle), &copied);
     fresh.maintenance(true).await;
-    let r = fresh.restore(&bundle).await;
+    let r = fresh.restore(&copied.display().to_string()).await;
     assert!(r.ok, "{r:?}");
     within(s.ctx.registry.close_all()).await;
     within(fresh.ctx.registry.close_all()).await;
@@ -452,8 +454,11 @@ async fn restore_refuses_backup_wrapped_by_unknown_master_key_version() {
     s.user("alice").await;
     let report = s.backup(&s.backups()).await;
     let bundle = report["bundle"].as_str().unwrap().to_owned();
-    // A server whose master key is another one (id k2).
+    // A server whose master key is another one (id k2), with the bundle copied to its backups.
     let other = sqlite_harness("k2", [0x33; 32]);
+    let copied = other.backups().join("from-k1");
+    copy_dir(Path::new(&bundle), &copied);
+    let bundle = copied.display().to_string();
     other.maintenance(true).await;
     assert_eq!(
         other.restore(&bundle).await.error.as_deref(),

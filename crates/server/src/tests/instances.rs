@@ -202,3 +202,48 @@ async fn a_re_added_alias_never_sees_a_leftover_pat() {
     assert!(env.store.pats_for_alias("wiki").unwrap().is_empty());
     within(reg.close_all()).await;
 }
+
+#[test]
+fn validation_is_in_memory() {
+    // Final review C1: the image's root and /tmp are read-only, so the check writes nothing.
+    // The parse itself: a valid list passes, a bad alias and a second default fail.
+    let rec = |alias: &str, default: bool| InstanceRecord {
+        alias: alias.into(),
+        product: "jira".into(),
+        base_url: "https://x.example.test".into(),
+        proxy: None,
+        ca_ref: None,
+        is_default: default,
+    };
+    assert_eq!(validate(&[rec("a", true)], &rec("b", false), false), Ok(()));
+    assert_eq!(
+        validate(&[], &rec("a b", false), false),
+        Err(ApiError::INSTANCE_INVALID)
+    );
+    assert_eq!(
+        validate(&[rec("a", true)], &rec("b", true), false),
+        Err(ApiError::INSTANCE_INVALID)
+    );
+    // No temp file anywhere in the server's non-test code.
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut stack = vec![src];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                if p.file_name().is_some_and(|n| n != "tests") {
+                    stack.push(p);
+                }
+            } else if p.extension().is_some_and(|x| x == "rs")
+                // Test modules beside their code (admin/tests.rs, admin/backup_tests.rs, ...).
+                && !p.file_name().is_some_and(|n| n.to_string_lossy().ends_with("tests.rs"))
+            {
+                let text = std::fs::read_to_string(&p).unwrap();
+                let code = text.split("#[cfg(test)]").next().unwrap_or("");
+                for needle in [["temp", "_dir("].concat(), ["temp", "file::"].concat()] {
+                    assert!(!code.contains(&needle), "{} uses {needle}", p.display());
+                }
+            }
+        }
+    }
+}

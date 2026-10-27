@@ -141,6 +141,44 @@ impl From<io::Error> for ConfigWriteError {
     }
 }
 
+/// Parses config text in memory: no file, no migration. Text at this binary's head is
+/// `Writable`; anything else is `Unreadable`. Server mode validates a candidate instance list
+/// with it on a read-only filesystem (M12 final review C1); desktop never calls it.
+pub fn parse_config(bytes: &[u8]) -> ConfigState {
+    match inspect(bytes) {
+        Inspected::Parsed {
+            doc,
+            schema_version: Some(version),
+            written_by,
+        } if version == CONFIG_SCHEMA_HEAD => ConfigState::Writable(Config {
+            schema_version: version,
+            written_by,
+            doc,
+        }),
+        Inspected::Parsed {
+            schema_version,
+            written_by,
+            ..
+        } => ConfigState::Unreadable {
+            info: ConfigReadOnly {
+                schema_version,
+                parsed: true,
+                written_by,
+            },
+        },
+        Inspected::Unparsable {
+            schema_version,
+            written_by,
+        } => ConfigState::Unreadable {
+            info: ConfigReadOnly {
+                schema_version,
+                parsed: false,
+                written_by,
+            },
+        },
+    }
+}
+
 /// Loads `path` with this binary's head and [`MIGRATIONS`].
 pub fn load_config(path: &Path) -> io::Result<ConfigState> {
     load_config_with(path, CONFIG_SCHEMA_HEAD, MIGRATIONS)

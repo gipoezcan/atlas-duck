@@ -1,0 +1,35 @@
+/* Running scripts and Onboarding (M11 T10). */
+@media (min-width: 64rem) {
+  .window-running {
+    max-width: 72rem;
+  }
+}
+.window-running table {
+  font-size: var(--text-sm);
+  background: var(--surface);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 0 0 1px var(--border);
+}
+.window-running td, .window-running th { font-variant-numeric: tabular-nums; }
+
+/* The generated onboarding text is copy-paste material for agents. In the wizard it sits inside a card already. */
+.window-onboarding .onboarding-section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4) var(--space-5);
+  margin: 0 0 var(--space-4);
+  box-shadow: var(--shadow-card);
+}
+.onboarding-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 32rem;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  background: var(--surface-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+}

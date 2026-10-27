@@ -126,7 +126,8 @@ pub fn unique_dir(base: &Path, name: &str) -> PathBuf {
 
 /// The roots a backup may be written to or restored from.
 pub fn allowed_roots(data: &Path) -> Vec<PathBuf> {
-    let mut roots = vec![data.join("backups"), std::env::temp_dir()];
+    // `/tmp` is the chart's emptyDir (never the system temp lookup: the server writes no temp files).
+    let mut roots = vec![data.join("backups"), PathBuf::from("/tmp")];
     roots.retain(|r| r.exists() || r.ends_with("backups"));
     roots
 }

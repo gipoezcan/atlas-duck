@@ -40,7 +40,7 @@ export function Recent({ items, onAcknowledge }: RecentProps) {
       ) : null}
       <h2>{RECENT_TEXT.heading}</h2>
       {rest.length === 0 ? (
-        <p className="empty">{RECENT_TEXT.empty}</p>
+        <p className="empty empty-state">{RECENT_TEXT.empty}</p>
       ) : (
         <ul>
           {rest.map((i) => (
