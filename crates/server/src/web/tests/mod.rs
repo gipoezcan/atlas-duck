@@ -28,6 +28,8 @@ use crate::store::ServerStore;
 use crate::store::sqlite::SqliteStore;
 use crate::users::user_id_for;
 
+/// M14 T16: the own-chain audit reads.
+mod audit;
 /// `/mcp` (T19) over the same harness.
 mod mcp;
 /// M14: OAuth discovery, registration, authorization, tokens.

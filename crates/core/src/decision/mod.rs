@@ -24,6 +24,7 @@
 //! attention"), the Rust-computed deny offers of a write preview (PD-70), the `internal` banner
 //! of a candidate that failed closed (M5 M-11), and path-free session ids (PD-86).
 
+pub mod audit_wire;
 mod batch;
 mod offers;
 mod recent;

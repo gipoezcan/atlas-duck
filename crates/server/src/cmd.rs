@@ -7,7 +7,12 @@
 
 use std::sync::Arc;
 
+use atlas_duck_audit::Store;
 use atlas_duck_core::decision::DecisionApi;
+use atlas_duck_core::decision::audit_wire::{
+    self, AuditPayloadArgs, AuditQueryArgs, AuditReadError, AuditStatusArgs, AuditTrailArgs,
+    Platform,
+};
 use atlas_duck_core::decision::wire::{
     AcknowledgeAttentionArgs, AppStatusArgs, DecideArgs, DenyBatchArgs, DenyCount, DenySessionArgs,
     PreviewFetchArgs, QueueDetail, QueueGetArgs, QueueListArgs, RawPageArgs, RawPageError,
@@ -34,6 +39,20 @@ pub const SERVER_COMMANDS: &[&str] = &[
     "redaction_preview",
     "preview_fetch",
     "raw_page",
+    // M14 T16 (PD-251, SM-6.4): the user's own chain, read-only (no native confirmation).
+    "audit_query",
+    "audit_trail",
+    "audit_payload",
+    "audit_status",
+];
+
+/// The audit reads of [`SERVER_COMMANDS`]: answered from the user's own store, never a
+/// `DecisionApi` call.
+pub const AUDIT_COMMANDS: &[&str] = &[
+    "audit_query",
+    "audit_trail",
+    "audit_payload",
+    "audit_status",
 ];
 
 /// The desktop `CommandError` wire shape for the kinds these commands answer.
@@ -47,7 +66,27 @@ pub enum CmdError {
     ReleaseBlocked,
     /// No such command here (404, `{"kind": "not_found", "code": "api/unknown_command"}`).
     UnknownCommand,
+    /// M14: the store is closed (`{"kind": "not_ready"}`, as on desktop).
+    NotReady,
+    /// M14: an audit read failed (`{"kind": "audit", "error": {"kind": "unreadable", "seq"}}` or
+    /// `{"kind": "failed"}`, the desktop's `AuditReadFailure`).
+    AuditUnreadable {
+        seq: u64,
+    },
+    AuditFailed,
     Internal,
+}
+
+impl From<AuditReadError> for CmdError {
+    fn from(e: AuditReadError) -> CmdError {
+        match e {
+            AuditReadError::InvalidArgument { field } => CmdError::InvalidArgument { field },
+            AuditReadError::NotFound => CmdError::NotFound,
+            AuditReadError::NotReady => CmdError::NotReady,
+            AuditReadError::Unreadable { seq } => CmdError::AuditUnreadable { seq },
+            AuditReadError::Failed => CmdError::AuditFailed,
+        }
+    }
 }
 
 impl CmdError {
@@ -56,7 +95,10 @@ impl CmdError {
             CmdError::InvalidArgument { .. } => StatusCode::BAD_REQUEST,
             CmdError::NotFound | CmdError::UnknownCommand => StatusCode::NOT_FOUND,
             CmdError::Decision(_) | CmdError::ReleaseBlocked => StatusCode::CONFLICT,
-            CmdError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+            CmdError::NotReady => StatusCode::SERVICE_UNAVAILABLE,
+            CmdError::AuditUnreadable { .. } | CmdError::AuditFailed | CmdError::Internal => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         }
     }
 
@@ -89,6 +131,18 @@ impl Serialize for CmdError {
             CmdError::UnknownCommand => {
                 m.serialize_entry("kind", "not_found")?;
                 m.serialize_entry("code", "api/unknown_command")?;
+            }
+            CmdError::NotReady => m.serialize_entry("kind", "not_ready")?,
+            CmdError::AuditUnreadable { seq } => {
+                m.serialize_entry("kind", "audit")?;
+                m.serialize_entry(
+                    "error",
+                    &serde_json::json!({"kind": "unreadable", "seq": seq}),
+                )?;
+            }
+            CmdError::AuditFailed => {
+                m.serialize_entry("kind", "audit")?;
+                m.serialize_entry("error", &serde_json::json!({"kind": "failed"}))?;
             }
             CmdError::Internal => m.serialize_entry("kind", "internal")?,
         }
@@ -194,6 +248,45 @@ pub fn dispatch(d: &dyn DecisionApi, cmd: &str, body: &Value) -> Result<Value, C
         }
         _ => Err(CmdError::UnknownCommand),
     }
+}
+
+/// One audit read of the user's own store (M14 T16), the desktop's DTOs (`core::decision::
+/// audit_wire`). The payload document is built for the web (`Platform::current()` of the server).
+pub fn dispatch_audit(store: &Store, cmd: &str, body: &Value) -> Result<Value, CmdError> {
+    match cmd {
+        "audit_query" => {
+            let a: AuditQueryArgs = args(body)?;
+            json(audit_wire::query(store, a)?)
+        }
+        "audit_trail" => {
+            let AuditTrailArgs { request_id } = args(body)?;
+            json(audit_wire::trail(store, request_id.as_str())?)
+        }
+        "audit_payload" => {
+            let AuditPayloadArgs { seq, page } = args(body)?;
+            json(audit_wire::payload(
+                store,
+                seq,
+                page.unwrap_or(0),
+                Platform::current(),
+            )?)
+        }
+        "audit_status" => {
+            let AuditStatusArgs {} = args(body)?;
+            json(audit_wire::status(store)?)
+        }
+        _ => Err(CmdError::UnknownCommand),
+    }
+}
+
+/// [`dispatch_audit`] on the blocking pool.
+pub async fn run_audit(store: Store, cmd: String, body: Value) -> Result<Value, CmdError> {
+    if !AUDIT_COMMANDS.contains(&cmd.as_str()) {
+        return Err(CmdError::UnknownCommand);
+    }
+    tokio::task::spawn_blocking(move || dispatch_audit(&store, &cmd, &body))
+        .await
+        .unwrap_or(Err(CmdError::Internal))
 }
 
 /// [`dispatch`] on the blocking pool.

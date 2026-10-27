@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
 
 import { on } from '../shared/ipc/events';
 import { auditStatus, verifyNow } from '../shared/ipc/invoke';
@@ -24,8 +24,16 @@ type Result = keyof typeof T.results | 'refused';
  * frame), the compliance export and the full backup. Rust does every check, dialog and write; the
  * page shows its answers as text. It listens to `audit_changed` (ids and counts only: the
  * incidents are read again) and `audit_job` (checked with `isAuditJobEvent` before use).
+ *
+ * M14 PD-251: `mode="server"` is the server's own-chain page: the records, their trail and
+ * payload only. The desktop-only parts (incidents and their acknowledgement, "Verify now", the
+ * export and backup dialogs) are not rendered and their events not listened to; `exportPanel`
+ * (the server's export job) takes the export's place.
  */
-export function Audit() {
+export type AuditMode = 'desktop' | 'server';
+
+export function Audit({ mode = 'desktop', exportPanel = null }: { mode?: AuditMode; exportPanel?: ReactNode } = {}) {
+  const desktop = mode === 'desktop';
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<Result | null>(null);
   const [status, setStatus] = useState<AuditStatus | null>(null);
@@ -73,6 +81,11 @@ export function Audit() {
 
   useEffect(() => {
     live.current = true;
+    if (!desktop) {
+      return () => {
+        live.current = false;
+      };
+    }
     const offJob = on<unknown>(
       'audit_job',
       (payload) => {
@@ -89,7 +102,7 @@ export function Audit() {
       live.current = false;
       for (const off of [offJob, offChanged]) void off.then((f) => f()).catch(() => undefined);
     };
-  }, [readStatus]);
+  }, [readStatus, desktop]);
 
   const verify = () => {
     if (inFlight.current) return;
@@ -138,27 +151,31 @@ export function Audit() {
   return (
     <main className="audit window window-audit">
       <h1>{WINDOW_TITLES.audit}</h1>
-      <Incidents status={status} failed={statusFailed} onRetry={readStatus} onChanged={readStatus} />
-      <section aria-label={T.verification}>
-        <h2>{T.verification}</h2>
-        <button type="button" disabled={running} onClick={verify}>
-          {running ? T.verifying : T.verify}
-        </button>
-        {/* The end-to-end flows read the result here: the window says "integrity incident" and "unverified" elsewhere. */}
-        <div data-testid="verification-result">
-          <Announce
-            said={
-              result === null
-                ? null
-                : {
-                    role: result === 'verified' ? 'status' : 'alert',
-                    body: result === 'refused' ? T.refused : T.results[result],
-                  }
-            }
-          />
-        </div>
-      </section>
-      <ExportBackup job={job} />
+      {desktop ? (
+        <Incidents status={status} failed={statusFailed} onRetry={readStatus} onChanged={readStatus} />
+      ) : null}
+      {desktop ? (
+        <section aria-label={T.verification}>
+          <h2>{T.verification}</h2>
+          <button type="button" disabled={running} onClick={verify}>
+            {running ? T.verifying : T.verify}
+          </button>
+          {/* The end-to-end flows read the result here: the window says "integrity incident" and "unverified" elsewhere. */}
+          <div data-testid="verification-result">
+            <Announce
+              said={
+                result === null
+                  ? null
+                  : {
+                      role: result === 'verified' ? 'status' : 'alert',
+                      body: result === 'refused' ? T.refused : T.results[result],
+                    }
+              }
+            />
+          </div>
+        </section>
+      ) : null}
+      {desktop ? <ExportBackup job={job} /> : exportPanel}
       <section aria-label={T.records} ref={records}>
         <h2 ref={recordsHeading} tabIndex={-1}>
           {T.records}

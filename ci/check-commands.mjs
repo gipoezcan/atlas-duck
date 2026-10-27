@@ -685,7 +685,11 @@ export function checkAclMutators(files) {
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 /** Files outside `commands/**` whose argument structs and DTOs the argument-struct rules cover. */
-export const WIRE_FILES = ["crates/core/src/decision/wire.rs"];
+export const WIRE_FILES = [
+  "crates/core/src/decision/wire.rs",
+  // M14 T16: the Audit window's read DTOs, shared with the server.
+  "crates/core/src/decision/audit_wire.rs",
+];
 
 function rustFiles(dir) {
   const out = [];

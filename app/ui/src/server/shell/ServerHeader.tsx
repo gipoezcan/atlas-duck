@@ -8,6 +8,7 @@ export const SHELL_TEXT = {
   credentials: 'Credentials',
   api_keys: 'API keys',
   connected_apps: 'Connected apps',
+  my_audit: 'My audit',
   admin: 'Admin',
   sign_out: 'Sign out',
   sign_out_failed: 'Signing out failed. Try again.',
@@ -44,6 +45,7 @@ export function ServerHeader() {
         <a href="/credentials">{SHELL_TEXT.credentials}</a>
         <a href="/api-keys">{SHELL_TEXT.api_keys}</a>
         <a href="/connected-apps">{SHELL_TEXT.connected_apps}</a>
+        <a href="/audit">{SHELL_TEXT.my_audit}</a>
         {admin ? <a href="/admin">{SHELL_TEXT.admin}</a> : null}
         <span className="server-user">{session?.user ?? ''}</span>
         <button

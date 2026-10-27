@@ -42,7 +42,13 @@ pub async fn command(
         Ok(rt) => rt,
         Err(e) => return e.into_response(),
     };
-    match cmd::run(rt.decisions(), name, body).await {
+    // M14 T16: the audit reads go to the user's own store (SM-6.4 first sentence).
+    let answer = if cmd::AUDIT_COMMANDS.contains(&name.as_str()) {
+        cmd::run_audit(rt.audit_handle(), name, body).await
+    } else {
+        cmd::run(rt.decisions(), name, body).await
+    };
+    match answer {
         Ok(v) => Json(v).into_response(),
         Err(e) => cmd_error(e),
     }

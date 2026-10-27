@@ -400,6 +400,11 @@ impl UserRuntime {
         (chain, seq, hash)
     }
 
+    /// M14 T16: a handle of the user's own audit store for the read-only audit commands.
+    pub fn audit_handle(&self) -> Store {
+        self.store.clone()
+    }
+
     /// The user's audit store (integration tests read and verify the chain).
     #[cfg(any(test, feature = "testing"))]
     pub fn audit_store(&self) -> &Store {

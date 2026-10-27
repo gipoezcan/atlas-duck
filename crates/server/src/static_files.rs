@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 pub const CSP: &str = "default-src 'self'; frame-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
 /// URL path → HTML file of the server build.
-pub const PAGES: [(&str, &str); 8] = [
+pub const PAGES: [(&str, &str); 9] = [
     ("/", "index.html"),
     ("/login", "login.html"),
     ("/approvals", "approvals.html"),
@@ -23,6 +23,8 @@ pub const PAGES: [(&str, &str); 8] = [
     // M14 T9.
     ("/oauth/consent", "oauth-consent.html"),
     ("/connected-apps", "connected-apps.html"),
+    // M14 T16.
+    ("/audit", "audit.html"),
 ];
 
 #[derive(Clone)]
