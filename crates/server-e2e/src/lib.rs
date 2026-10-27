@@ -6,15 +6,16 @@ use std::fmt;
 
 /// `usage` of the suite, printed (exit 2) when its environment is incomplete.
 pub const USAGE: &str = "usage: ATLAS_DUCK_E2E_BASE_URL=<url> ATLAS_DUCK_E2E_USERS_FILE=<file> \
-[ATLAS_DUCK_E2E_CA_FILE=<pem>] [ATLAS_DUCK_E2E_JIRA=mock|none] [ATLAS_DUCK_E2E_SCRIPTS=met|not_met] \
+[ATLAS_DUCK_E2E_CA_FILE=<pem>] [ATLAS_DUCK_E2E_JIRA=mock|none] [ATLAS_DUCK_E2E_MOCK_CA_DIR=<dir>] [ATLAS_DUCK_E2E_SCRIPTS=met|not_met] \
 [ATLAS_DUCK_E2E_ADMIN_EXEC=<command prefix>] [ATLAS_DUCK_E2E_VERIFY_EXEC=<command prefix>] \
 cargo test -p atlas-duck-server-e2e --test e2e";
 
 /// Which Jira the server under test can reach.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Jira {
-    /// A Jira mock the server reaches over HTTPS (its CA in the server's CA bundle).
-    Mock,
+    /// A Jira mock the server reaches over HTTPS; its test CA (made with
+    /// `ATLAS_DUCK_E2E_MAKE_CA=<dir>`) is in the server's CA bundle and in this directory.
+    Mock { ca_dir: String },
     /// None: the cases that need Jira are reported `skip`.
     None,
 }
@@ -53,7 +54,14 @@ pub fn parse_env(get: impl Fn(&str) -> Option<String>) -> Result<Env, String> {
     }
     let jira = match set("ATLAS_DUCK_E2E_JIRA").as_deref() {
         None | Some("none") => Jira::None,
-        Some("mock") => Jira::Mock,
+        Some("mock") => match set("ATLAS_DUCK_E2E_MOCK_CA_DIR") {
+            Some(ca_dir) => Jira::Mock { ca_dir },
+            None => {
+                return Err(format!(
+                    "ATLAS_DUCK_E2E_JIRA=mock needs ATLAS_DUCK_E2E_MOCK_CA_DIR\n{USAGE}"
+                ));
+            }
+        },
         Some(_) => return Err(format!("ATLAS_DUCK_E2E_JIRA must be mock or none\n{USAGE}")),
     };
     let scripts = set("ATLAS_DUCK_E2E_SCRIPTS").unwrap_or_else(|| "met".to_owned());
@@ -139,6 +147,7 @@ mod tests {
             ("ATLAS_DUCK_E2E_BASE_URL", "https://duck.example.test/"),
             ("ATLAS_DUCK_E2E_USERS_FILE", "u.json"),
             ("ATLAS_DUCK_E2E_JIRA", "mock"),
+            ("ATLAS_DUCK_E2E_MOCK_CA_DIR", "ca"),
             (
                 "ATLAS_DUCK_E2E_ADMIN_EXEC",
                 "docker exec c /app/atlas-duck-server admin",
@@ -150,7 +159,9 @@ mod tests {
                 base_url: "https://duck.example.test".into(),
                 users_file: "u.json".into(),
                 ca_file: None,
-                jira: Jira::Mock,
+                jira: Jira::Mock {
+                    ca_dir: "ca".into()
+                },
                 scripts: "met".into(),
                 admin_exec: Some("docker exec c /app/atlas-duck-server admin".into()),
                 verify_exec: None,
@@ -158,6 +169,7 @@ mod tests {
         );
         for bad in [
             ("ATLAS_DUCK_E2E_JIRA", "real"),
+            ("ATLAS_DUCK_E2E_JIRA", "mock"),
             ("ATLAS_DUCK_E2E_SCRIPTS", "maybe"),
         ] {
             let r = env(&[

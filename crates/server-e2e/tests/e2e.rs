@@ -9,6 +9,8 @@
 
 #[path = "e2e/client.rs"]
 mod client;
+#[path = "e2e/jira.rs"]
+mod jira;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -29,6 +31,8 @@ struct T {
     env: Env,
     s: Server,
     users: Users,
+    /// The HTTPS Jira mock (`ATLAS_DUCK_E2E_JIRA=mock`).
+    jira: Option<jira::Jira>,
 }
 
 impl T {
@@ -53,17 +57,25 @@ fn skip(why: &str) -> R<Outcome> {
     Ok(Outcome::Skip(why.to_owned()))
 }
 
-/// The Jira cases: the container job has no Jira the server can reach (it accepts HTTPS
-/// instances only), and the HTTPS mock mode is not built on this branch (M14 T23 Decision).
-fn jira_case(t: &T) -> R<Outcome> {
-    match t.env.jira {
-        Jira::None => skip("no Jira (ATLAS_DUCK_E2E_JIRA=none)"),
-        Jira::Mock => skip("the HTTPS Jira mock mode is not built yet (M14 T23 Decision)"),
-    }
+/// The Jira mock, or why the Jira cases skip (review environment: none, L258).
+fn jira_of(t: &T) -> Result<&jira::Jira, Outcome> {
+    t.jira
+        .as_ref()
+        .ok_or_else(|| Outcome::Skip("no Jira (ATLAS_DUCK_E2E_JIRA=none)".into()))
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> ExitCode {
+    // The CA step runs before the server starts (its CA bundle must exist then).
+    if let Some(dir) = std::env::var_os("ATLAS_DUCK_E2E_MAKE_CA") {
+        return match jira::make_ca(std::path::Path::new(&dir)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("cannot make the test CA: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
     let env = match parse_env(|k| std::env::var(k).ok()) {
         Ok(e) => e,
         Err(usage) => {
@@ -81,7 +93,22 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let t = T { env, s, users };
+    let jira = match &env.jira {
+        Jira::None => None,
+        Jira::Mock { ca_dir } => match jira::Jira::start(std::path::Path::new(ca_dir)).await {
+            Ok(j) => Some(j),
+            Err(e) => {
+                eprintln!("cannot start the Jira mock: {e}");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    let t = T {
+        env,
+        s,
+        users,
+        jira,
+    };
     let mut failed = false;
     for (name, case) in cases![
         health_and_ready,
@@ -235,18 +262,190 @@ async fn api_key_lifecycle(t: &T) -> R<Outcome> {
     Ok(Outcome::Ok)
 }
 
+/// The admin adds the HTTPS mock as `work` (the org CA bundle, idempotent); alice stores the test
+/// PAT, checked against the mock.
+async fn work_with_pat(t: &T, j: &jira::Jira) -> R<Browser> {
+    let s = &t.s;
+    let carol = s.login(&t.users.admin).await?;
+    let spec = json!({"alias": "work", "product": "jira", "base_url": j.base_url,
+                      "proxy": "direct", "ca_ref": "org", "is_default": true});
+    let (mut st, mut v) = s
+        .send(
+            Method::POST,
+            "/api/admin/instances",
+            Some(&carol),
+            Some(spec.clone()),
+        )
+        .await?;
+    if st == 409 {
+        // From an earlier case of this run or an earlier run against the same server: the mock's
+        // port may have changed, so the instance is replaced.
+        let (dst, dv) = s
+            .send(
+                Method::DELETE,
+                "/api/admin/instances/work",
+                Some(&carol),
+                None,
+            )
+            .await?;
+        ensure!(dst == 204, "admin remove {dst} {dv}");
+        (st, v) = s
+            .send(
+                Method::POST,
+                "/api/admin/instances",
+                Some(&carol),
+                Some(spec),
+            )
+            .await?;
+    }
+    ensure!(st == 201, "admin add {st} {v}");
+    let alice = s.login(t.alice()).await?;
+    let (st, v) = s
+        .send(
+            Method::PUT,
+            "/api/me/pats/work",
+            Some(&alice),
+            Some(json!({"pat": atlas_duck_atlassian::testing::TEST_PAT})),
+        )
+        .await?;
+    ensure!(st == 200, "PAT entry {st} {v}");
+    Ok(alice)
+}
+
+/// Releases or approves the queued request `id` in the browser.
+async fn decide(s: &Server, b: &Browser, id: &str, decision: &str) -> R<()> {
+    let (st, p) = s.cmd(b, "preview_fetch", json!({"request_id": id})).await?;
+    ensure!(st == 200, "preview {st} {p}");
+    let rev = p["preview"]["candidate_rev"].clone();
+    let (st, v) = s
+        .cmd(
+            b,
+            "decide",
+            json!({"request_id": id, "decision": decision, "candidate_rev": rev}),
+        )
+        .await?;
+    ensure!(st == 200, "decide {st} {v}");
+    Ok(())
+}
+
+/// The request ids in `b`'s queue now.
+async fn queue_ids(s: &Server, b: &Browser) -> R<Vec<String>> {
+    let (st, q) = s.cmd(b, "queue_list", json!({})).await?;
+    ensure!(st == 200, "queue_list {st} {q}");
+    Ok(q.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|r| r["request_id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// The first request queued for `b` that was not in `before`.
+async fn queued(s: &Server, b: &Browser, before: &[String]) -> R<String> {
+    for _ in 0..300 {
+        if let Some(id) = queue_ids(s, b)
+            .await?
+            .into_iter()
+            .find(|id| !before.contains(id))
+        {
+            return Ok(id);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err("nothing was queued".into())
+}
 async fn pat_entry(t: &T) -> R<Outcome> {
-    jira_case(t)
+    let j = match jira_of(t) {
+        Ok(j) => j,
+        Err(o) => return Ok(o),
+    };
+    // The PAT is checked against the mock (its identity call) when it is stored.
+    work_with_pat(t, j).await?;
+    Ok(Outcome::Ok)
 }
 
 async fn mcp_api_key_read(t: &T) -> R<Outcome> {
-    jira_case(t)
+    let j = match jira_of(t) {
+        Ok(j) => j,
+        Err(o) => return Ok(o),
+    };
+    let s = &t.s;
+    let alice = work_with_pat(t, j).await?;
+    let (_, key) = s.api_key(&alice, &["read"]).await?;
+    let agent = std::sync::Arc::new(s.mcp(&key).await?);
+    let before = queue_ids(s, &alice).await?;
+    let reading = {
+        let agent = agent.clone();
+        tokio::spawn(async move { call(&agent, "jira_issue_get", json!({"key": "ABC-1"})).await })
+    };
+    let id = queued(s, &alice, &before).await?;
+    decide(s, &alice, &id, "release").await?;
+    let env = reading.await.ctx("read task")??;
+    ensure!(env["status"] == "released", "read: {env}");
+    ensure!(
+        env["data"].to_string().contains("ABC-1"),
+        "read data: {env}"
+    );
+    Ok(Outcome::Ok)
 }
 
 async fn write_approval_flow(t: &T) -> R<Outcome> {
-    jira_case(t)
+    let j = match jira_of(t) {
+        Ok(j) => j,
+        Err(o) => return Ok(o),
+    };
+    let s = &t.s;
+    let alice = work_with_pat(t, j).await?;
+    let before = j.writes().await.len();
+    let (_, key) = s.api_key(&alice, &["read", "propose_write"]).await?;
+    let agent = std::sync::Arc::new(s.mcp(&key).await?);
+    let queued_before = queue_ids(s, &alice).await?;
+    let writing = {
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            call(
+                &agent,
+                "jira_comment_add",
+                json!({"key": "ABC-1", "body": "Seen on staging.", "body_format": "wiki",
+                       "reason": "e2e"}),
+            )
+            .await
+        })
+    };
+    let id = queued(s, &alice, &queued_before).await?;
+    let pending = call(&agent, "request_status", json!({"request_id": id})).await?;
+    ensure!(pending["status"] == "pending", "status: {pending}");
+    ensure!(
+        pending["meta"]["approval_url"] == format!("{}/approvals?item={id}", s.base).as_str(),
+        "approval_url: {pending}"
+    );
+    ensure!(
+        j.writes().await.len() == before,
+        "a write reached Jira before approval"
+    );
+    decide(s, &alice, &id, "approve").await?;
+    let env = writing.await.ctx("write task")??;
+    ensure!(env["status"] == "succeeded", "write: {env}");
+    let writes = j.writes().await;
+    ensure!(
+        writes.len() == before + 1,
+        "{} writes reached Jira",
+        writes.len() - before
+    );
+    let w = &writes[writes.len() - 1];
+    ensure!(
+        w.url.path() == "/rest/api/2/issue/ABC-1/comment",
+        "write path {}",
+        w.url.path()
+    );
+    ensure!(
+        w.headers.get("authorization").and_then(|v| v.to_str().ok())
+            == Some(format!("Bearer {}", atlas_duck_atlassian::testing::TEST_PAT).as_str()),
+        "the write did not carry alice's PAT"
+    );
+    Ok(Outcome::Ok)
 }
-
 async fn oauth_discovery_registration_consent_token_refresh_revoke(t: &T) -> R<Outcome> {
     let s = &t.s;
     let b = s.login(t.alice()).await?;
@@ -369,13 +568,38 @@ async fn script_run_via_oauth(t: &T) -> R<Outcome> {
     Ok(Outcome::Ok)
 }
 
-async fn script_slots_and_busy(_t: &T) -> R<Outcome> {
-    skip(
-        "no /metrics gauge and no busy answer on this branch (saturation queues, M14 T12 \
-         Decision); the server cap is tested in process (tests::scripts)",
-    )
+async fn script_slots_and_busy(t: &T) -> R<Outcome> {
+    // `/metrics` is never served through a proxy (M13): behind the review ingress it is 404.
+    let (st, _) = t.s.send(Method::GET, "/metrics", None, None).await?;
+    if st == 404 {
+        return skip("/metrics is not reachable here (behind a proxy)");
+    }
+    let text =
+        t.s.http
+            .get(t.s.url("/metrics"))
+            .send()
+            .await
+            .ctx("/metrics")?
+            .text()
+            .await
+            .ctx("/metrics body")?;
+    let floor = format!("atlas_duck_scripts_floor{{state=\"{}\"}} 1", t.env.scripts);
+    for want in [
+        floor.as_str(),
+        "atlas_duck_script_runs_active{kind=\"run\"} 0",
+        "atlas_duck_script_runs_active{kind=\"dry\"} 0",
+    ] {
+        ensure!(text.lines().any(|l| l == want), "/metrics lacks {want}");
+    }
+    ensure!(
+        text.lines()
+            .any(|l| l.starts_with("atlas_duck_script_runs_max{kind=\"run\"} ")),
+        "/metrics lacks the run pool size"
+    );
+    // Saturation queues instead of answering busy (M14 T12 Decision); the pools are idle again
+    // after the earlier script case.
+    Ok(Outcome::Ok)
 }
-
 /// The `event_type`s of `b`'s own chain (first page).
 async fn own_kinds(s: &Server, b: &Browser) -> R<Vec<String>> {
     let (st, v) = s.cmd(b, "audit_query", json!({"filter": {}})).await?;
@@ -592,11 +816,54 @@ async fn admin_has_no_audit_access(t: &T) -> R<Outcome> {
 }
 
 async fn deactivation_revokes_tokens(t: &T) -> R<Outcome> {
-    match &t.env.admin_exec {
-        None => skip("ATLAS_DUCK_E2E_ADMIN_EXEC is not set"),
-        Some(_) => skip(
-            "user deactivation is M13's admin command (not on this branch; M13 merge); the \
-             offline admin CLI also refuses while the server runs",
-        ),
-    }
+    let Some(prefix) = &t.env.admin_exec else {
+        return skip("ATLAS_DUCK_E2E_ADMIN_EXEC is not set (review: verify:review-ops-drill)");
+    };
+    // The last case: it deactivates the second plain user for good.
+    let s = &t.s;
+    let user = t.bob();
+    let b = s.login(user).await?;
+    let (c, tok) = OAuthClient::tokens_for(s, &b, &["read"]).await?;
+    let (_, key) = s.api_key(&b, &["read"]).await?;
+    let access = field(&tok, "access_token")?;
+    ensure!(s.mcp_status(&access).await? == 200, "token refused before");
+    let mut words = prefix.split_whitespace();
+    let program = words.next().ctx("ATLAS_DUCK_E2E_ADMIN_EXEC is empty")?;
+    let out = tokio::process::Command::new(program)
+        .args(words)
+        .args(["users", "deactivate", &user.name])
+        .output()
+        .await
+        .ctx("admin exec")?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    ensure!(out.status.success(), "users deactivate: {text}");
+    ensure!(
+        text.split_whitespace()
+            .collect::<String>()
+            .contains("\"oauth_grants_revoked\":1"),
+        "deactivation report: {text}"
+    );
+    ensure!(
+        s.mcp_status(&access).await? == 401,
+        "the OAuth token survived"
+    );
+    ensure!(s.mcp_status(&key).await? == 401, "the API key survived");
+    let (st, e) = c.refresh(s, &field(&tok, "refresh_token")?).await?;
+    ensure!(st == 400, "refresh after deactivation: {st} {e}");
+    let (st, _) = s.send(Method::GET, "/api/session", Some(&b), None).await?;
+    ensure!(st == 401, "the session survived: {st}");
+    let res = s
+        .http
+        .post(s.url("/api/login"))
+        .header("origin", &s.base)
+        .json(&json!({"username": user.name, "password": user.password}))
+        .send()
+        .await
+        .ctx("login")?;
+    ensure!(
+        res.status() == 403,
+        "a deactivated user signed in: {}",
+        res.status()
+    );
+    Ok(Outcome::Ok)
 }

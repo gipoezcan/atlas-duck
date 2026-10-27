@@ -3,9 +3,10 @@
 # the container with the PD-250 hardening flags (read-only root, no capability, no new
 # privileges, tmpfs data dir, uid 65532) on the host network, the test directory users and a
 # throwaway master key; waits for /readyz to leave `probing`; runs the e2e binary (crates/server-e2e)
-# with the image's own verify-export as ATLAS_DUCK_E2E_VERIFY_EXEC; then greps the container log
-# for the e2e canaries (the test passwords and full OAuth tokens). No Jira is reachable (the server
-# accepts HTTPS instances only), so the Jira cases report skip.
+# with the image's own verify-export as ATLAS_DUCK_E2E_VERIFY_EXEC and the admin CLI as
+# ATLAS_DUCK_E2E_ADMIN_EXEC; then greps the container log for the e2e canaries (the test passwords,
+# the test PAT and full OAuth tokens). Jira is the HTTPS mock the suite starts: a throwaway test CA
+# is made first (ATLAS_DUCK_E2E_MAKE_CA) and mounted as the server's CA bundle.
 #
 # Writes $OUT/e2e-summary.txt and $OUT/container.log. Exit 1 on any failed case or canary hit.
 set -euo pipefail
@@ -19,6 +20,11 @@ OUT="${OUT:-$RUNNER_TEMP/server-e2e}"
 NAME="atlas-duck-e2e"
 BASE="http://127.0.0.1:8080"
 mkdir -p "$OUT"
+
+# The suite's binary, built once; the test CA comes from it before the server starts.
+cargo test -p atlas-duck-server-e2e --test e2e --no-run --locked
+ATLAS_DUCK_E2E_MAKE_CA="$OUT/ca" cargo test -p atlas-duck-server-e2e --test e2e --locked
+chmod 0644 "$OUT/ca/ca.pem"
 
 cleanup() {
   docker logs "$NAME" > "$OUT/container.log" 2>&1 || true
@@ -34,6 +40,10 @@ fail() {
 docker run -d --name "$NAME" --network host --read-only --cap-drop ALL \
   --security-opt no-new-privileges \
   --tmpfs /data:uid=65532,gid=65532,mode=0700 \
+  --tmpfs /run/atlas-duck:uid=65532,gid=65532,mode=0700 \
+  --tmpfs /tmp:uid=65532,gid=65532,mode=1777 \
+  -v "$OUT/ca/ca.pem:/etc/atlas-duck/ca.pem:ro" \
+  -e ATLAS_DUCK_CA_BUNDLE_FILE=/etc/atlas-duck/ca.pem \
   -v "$KEY_FILE:/run/secrets/master-key:ro" \
   -v "$FIXTURES:/fixtures:ro" \
   -e ATLAS_DUCK_MODE=dev \
@@ -62,7 +72,9 @@ done
 set +e
 ATLAS_DUCK_E2E_BASE_URL="$BASE" \
   ATLAS_DUCK_E2E_USERS_FILE="$USERS_FILE" \
-  ATLAS_DUCK_E2E_JIRA=none \
+  ATLAS_DUCK_E2E_JIRA=mock \
+  ATLAS_DUCK_E2E_MOCK_CA_DIR="$OUT/ca" \
+  ATLAS_DUCK_E2E_ADMIN_EXEC="docker exec $NAME /app/atlas-duck-server admin" \
   ATLAS_DUCK_E2E_SCRIPTS=met \
   ATLAS_DUCK_E2E_VERIFY_EXEC="bash $ROOT/ci/server-e2e-verify.sh" \
   cargo test -p atlas-duck-server-e2e --test e2e --locked 2>&1 | tee "$OUT/e2e-output.txt"
@@ -85,6 +97,9 @@ while IFS= read -r pw; do
     fail "a test password is in the container log"
   fi
 done <<< "$passwords"
+if grep -qF 'test-pat-not-a-secret' "$OUT/container.log"; then
+  fail "the test PAT is in the container log"
+fi
 if grep -qE 'ado_(ac|at|rt)_[A-Za-z0-9_-]{43}' "$OUT/container.log"; then
   fail "an OAuth code or token is in the container log"
 fi
