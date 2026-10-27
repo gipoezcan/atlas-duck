@@ -1877,7 +1877,7 @@ jobs:
       - name: Build the sandbox worker (server image's bin)
         run: cargo build -p atlas-duck-sandbox-worker --bin atlas-duck-sandbox-worker --locked
 
-      - name: Server tests (unit, isolation, exit_flow, redaction, mcp_parity, oauth_flow, real worker)
+      - name: Server tests (unit, isolation, exit_flow, exit_flow_m14, redaction, mcp_parity, oauth_flow, real worker)
         timeout-minutes: 30
         env:
           ATLAS_DUCK_SANDBOX_BIN: ${{ github.workspace }}/target/debug/atlas-duck-sandbox-worker

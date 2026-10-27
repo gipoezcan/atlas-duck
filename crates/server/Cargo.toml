@@ -31,6 +31,10 @@ required-features = ["testing"]
 name = "oauth_flow"
 required-features = ["testing"]
 
+[[test]]
+name = "exit_flow_m14"
+required-features = ["testing"]
+
 [features]
 # In-memory store and test constructors for tests of code above the store, and core's test hooks
 # (plain-HTTP mock instances) for the in-process integration tests. Never a release build.

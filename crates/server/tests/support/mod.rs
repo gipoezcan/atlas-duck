@@ -99,6 +99,13 @@ pub async fn jira_mock() -> MockDc {
 
 impl TestServer {
     pub async fn start() -> TestServer {
+        Self::start_with_scripts(None).await
+    }
+
+    /// [`Self::start`] with server scripts (M14 T22: a fake runner, or the real worker on Linux).
+    pub async fn start_with_scripts(
+        scripts: Option<Arc<atlas_duck_server::scripts::ServerScripts>>,
+    ) -> TestServer {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
@@ -119,7 +126,7 @@ impl TestServer {
                 clock: clock.clone(),
                 allow_http: true,
                 sse_capacity: SSE_CAPACITY,
-                scripts: None,
+                scripts,
             },
             50,
         ));
@@ -546,4 +553,39 @@ pub async fn exit_flow(s: &TestServer, pat: &str) -> Flow {
         read_id,
         write_id,
     }
+}
+
+/// The members of a ustar archive `(name, data)`, read by hand (M14 T22): checks the magic and
+/// each header's checksum; names join ustar's `prefix` and `name`.
+pub fn untar(archive: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let field = |h: &[u8], a: usize, b: usize| {
+        let s = &h[a..b];
+        let end = s.iter().position(|c| *c == 0).unwrap_or(s.len());
+        String::from_utf8(s[..end].to_vec()).unwrap()
+    };
+    let num = |h: &[u8], a: usize, b: usize| u64::from_str_radix(field(h, a, b).trim(), 8).unwrap();
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at + 512 <= archive.len() {
+        let h = &archive[at..at + 512];
+        if h.iter().all(|b| *b == 0) {
+            break;
+        }
+        assert_eq!(&h[257..263], b"ustar\0");
+        let mut copy = h.to_vec();
+        copy[148..156].fill(b' ');
+        let sum: u64 = copy.iter().map(|b| u64::from(*b)).sum();
+        assert_eq!(num(h, 148, 155), sum, "header checksum");
+        let prefix = field(h, 345, 500);
+        let base = field(h, 0, 100);
+        let name = if prefix.is_empty() {
+            base
+        } else {
+            format!("{prefix}/{base}")
+        };
+        let size = num(h, 124, 136) as usize;
+        out.push((name, archive[at + 512..at + 512 + size].to_vec()));
+        at += 512 + size.div_ceil(512) * 512;
+    }
+    out
 }
