@@ -6,7 +6,7 @@ import { defineConfig } from 'vite';
 // `atlas-duck-server` serves from `ATLAS_DUCK_WEB_DIR`. No credential chunk rule: server mode has
 // no credential window. Everything is bundled locally: no CDN, no remote module loads.
 // `static_files::PAGES` in crates/server lists the same pages.
-const PAGES = ['index', 'login', 'approvals', 'credentials', 'api-keys'];
+const PAGES = ['index', 'login', 'approvals', 'credentials', 'api-keys', 'admin'];
 
 export default defineConfig({
   root: 'web',
