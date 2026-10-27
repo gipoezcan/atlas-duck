@@ -477,8 +477,8 @@ test("verifyRuns: a real-named run still reports a missing, an extra and a faile
 
 // Jobs added by later milestones: the M1 record is a frozen run and does not list them.
 // M10 Task 27: the ci_fixture build (bundle.yml) and the install-test-<pkg> jobs (install-probes.yml)
-// are not part of the M1 go/no-go record.
-const LATER_MILESTONE_JOBS = ["core-suite-fedora", "e2e", "ci-fixture", "install-test-"];
+// are not part of the M1 go/no-go record. M12 Task 25: the server and server-image jobs.
+const LATER_MILESTONE_JOBS = ["core-suite-fedora", "e2e", "ci-fixture", "install-test-", "server"];
 
 test("the workflows' job names begin with the ids REQUIRED_WORKFLOWS lists", () => {
   for (const [file, required] of Object.entries(REQUIRED_WORKFLOWS)) {

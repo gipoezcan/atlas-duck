@@ -1,0 +1,9 @@
+target/
+**/target/
+**/node_modules
+app/ui/dist
+app/ui/dist-server
+.git
+*.pem
+*.key
+.superpowers/

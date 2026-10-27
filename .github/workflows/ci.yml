@@ -1852,6 +1852,69 @@ jobs:
             grep -qE "\[[^]]*$f[^]]*\]" "$RUNNER_TEMP/tree-control.txt" || { echo "::error::positive control: $f not visible with --features scripted-approver"; exit 1; }
           done
 
+  # M12 T25: the server crate and its in-process suites (unit, isolation, exit flow, secret
+  # sweep, MCP parity). The desktop jobs exclude atlas-duck-server.
+  server:
+    name: server (atlas-duck-server, in-process suites)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustup show active-toolchain
+
+      - name: Clippy (server, mcp-tools)
+        run: cargo clippy -p atlas-duck-server -p atlas-duck-mcp-tools --all-targets --features atlas-duck-server/testing --locked -- -D warnings
+
+      - name: Server tests (unit, isolation, exit_flow, redaction, mcp_parity)
+        timeout-minutes: 30
+        run: cargo test -p atlas-duck-server --features testing --locked
+
+      - name: mcp-tools tests
+        run: cargo test -p atlas-duck-mcp-tools --locked
+
+      - name: The desktop app links no server crate
+        run: |
+          set -euo pipefail
+          if cargo tree -p atlas-duck-app -e normal --target all --locked --prefix none | grep -E '^(axum|axum-core|ldap3|lber|atlas-duck-server) '; then
+            echo "::error::a server-only crate is in the desktop app's tree"
+            exit 1
+          fi
+
+  # M12 T25: builds the container image and smoke-tests it. No secrets, no push (M13 pushes).
+  server-image:
+    name: server-image (container build + smoke)
+    needs: server
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Syntax of the scripts
+        run: |
+          set -euo pipefail
+          bash -n ci/server-smoke.sh
+          bash -n ci/server-test-master-key.sh
+
+      - name: Build the image
+        run: docker build -f crates/server/Dockerfile -t atlas-duck-server:ci .
+
+      - name: Throwaway master key
+        run: bash ci/server-test-master-key.sh
+
+      - name: Smoke test
+        run: bash ci/server-smoke.sh
+
   ui:
     name: ui (Vite + React shell, spec §2.4, §6.4)
     runs-on: ubuntu-22.04
@@ -1885,6 +1948,13 @@ jobs:
 
       - name: Credential bundle isolation (PD-71, 10.3)
         run: npm --prefix app/ui run check:bundle
+
+      # M12 T25: the server web build, and no HTTP transport in the desktop bundle (PD-218).
+      - name: Server web build
+        run: npm --prefix app/ui run build:server
+
+      - name: Desktop bundle has no HTTP transport
+        run: node ci/check-desktop-bundle-no-http.mjs app/ui/dist
 
       - name: CSP of the built pages
         run: node ci/check-csp.mjs --dist app/ui/dist
