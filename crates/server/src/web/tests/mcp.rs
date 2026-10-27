@@ -249,3 +249,20 @@ async fn another_users_key_cannot_use_a_session() {
     let res = h.send(mcp_post(list, Some(&ka), Some(&sid))).await;
     assert_ne!(res.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_sessions_and_oversized_bodies_are_refused() {
+    let h = H::new();
+    h.session("alice", PW_CANARY).await;
+    let k = key_for(&h, "alice", &["read"]);
+    let list = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#;
+    let res = h.send(mcp_post(list, Some(&k), Some("never-issued"))).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let mut big = mcp_post(INIT, Some(&k), None);
+    big.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        (crate::mcp::BODY_LIMIT + 1).to_string().parse().unwrap(),
+    );
+    let res = h.send(big).await;
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}

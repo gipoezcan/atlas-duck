@@ -45,13 +45,13 @@ impl McpSessions {
         g.order.push_back(session.to_owned());
     }
 
-    /// False when the session belongs to another user. An unknown id passes: rmcp answers it
-    /// (404) itself, and no session exists that this map does not name.
+    /// True only for a session this user created. Batch-4a review: an unknown id is refused here
+    /// too (404), not left to rmcp.
     pub fn may_use(&self, session: &str, user_id: &str) -> bool {
         self.lock()
             .owner
             .get(session)
-            .is_none_or(|owner| owner == user_id)
+            .is_some_and(|owner| owner == user_id)
     }
 
     pub fn forget(&self, session: &str) {
@@ -74,8 +74,8 @@ mod tests {
         s.bind("s1", "b");
         assert!(s.may_use("s1", "a"));
         assert!(!s.may_use("s1", "b"), "the first binding wins");
-        assert!(s.may_use("unknown", "b"));
+        assert!(!s.may_use("unknown", "b"), "unknown ids are refused");
         s.forget("s1");
-        assert!(s.may_use("s1", "b"));
+        assert!(!s.may_use("s1", "a"), "a forgotten session is unknown");
     }
 }

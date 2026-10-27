@@ -23,6 +23,9 @@ pub use handler::{ServerMcp, allowed, tools_for};
 pub use session::McpSessions;
 
 pub const MCP_PATH: &str = "/mcp";
+/// The largest `/mcp` body (batch-4a review). Larger than `/api`'s 64 KiB because a proposed
+/// page update or comment travels in the tool arguments; 413 above it, before any parsing.
+pub const BODY_LIMIT: usize = 4 * 1024 * 1024;
 /// The MCP session header (streamable HTTP).
 pub const SESSION_HEADER: &str = "mcp-session-id";
 /// PD-204: no `resource_metadata` before M14.
@@ -34,7 +37,9 @@ pub fn routes(state: &AppState) -> Router<AppState> {
     // Decision (T19): rmcp's Host allow-list guards local servers against DNS rebinding; every
     // `/mcp` request here carries a bearer key a rebinding page cannot have, and the public
     // host is the proxy's to check, so the list is off.
-    let config = StreamableHttpServerConfig::default().disable_allowed_hosts();
+    let config = StreamableHttpServerConfig::default()
+        .disable_allowed_hosts()
+        .with_max_request_body_bytes(BODY_LIMIT);
     let service = StreamableHttpService::new(
         move || Ok(mcp.clone()),
         std::sync::Arc::new(LocalSessionManager::default()),
@@ -56,6 +61,15 @@ fn unauthorized(e: ApiError) -> Response {
 
 /// Bearer → `KeyCtx` on the request; session ids bound to their creator.
 async fn guard(State(st): State<AppState>, req: Request, next: Next) -> Response {
+    if req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|n| n > BODY_LIMIT)
+    {
+        return ApiError::BODY_TOO_LARGE.into_response();
+    }
     let (mut parts, body) = req.into_parts();
     let key = match BearerUser::from_request_parts(&mut parts, &st).await {
         Ok(BearerUser(key)) => key,

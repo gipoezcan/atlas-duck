@@ -104,4 +104,21 @@ export default [
       ],
     },
   },
+  {
+    // M12: the server pages keep secrets (a new API key, a PAT being entered) in component state
+    // only; no web storage or cross-context channel (tests may inspect storage).
+    files: ['src/server/**'],
+    ignores: ['src/server/**/*.test.{ts,tsx}'],
+    rules: {
+      'no-restricted-globals': [
+        'error',
+        ...WEB_STORAGE.map((name) => ({ name, message: 'No web storage in the server pages (SM-3.2).' })),
+      ],
+      'no-restricted-properties': [
+        'error',
+        BLOB_URL_PROPERTY,
+        ...WEB_STORAGE.map((property) => ({ property, message: 'No web storage in the server pages (SM-3.2).' })),
+      ],
+    },
+  },
 ];

@@ -228,9 +228,6 @@ pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>, hops: u32) -> St
     }
 }
 
-/// The longest client address kept (an IPv6 address with zone fits).
-pub const MAX_IP_CHARS: usize = 64;
-
 /// The peer address axum's `into_make_service_with_connect_info` records, if any.
 pub fn peer(req_ext: &axum::http::Extensions) -> Option<SocketAddr> {
     req_ext.get::<ConnectInfo<SocketAddr>>().map(|c| c.0)
