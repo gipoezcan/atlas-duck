@@ -13,6 +13,7 @@ pub mod keyring;
 mod locality;
 mod pinned;
 mod resolve;
+mod umask;
 
 pub use appimage::{looks_absolute, runs_from_appimage, under_mount};
 pub use base_dirs::{BaseDirs, FirstRunDefaults, base_dirs, first_run_defaults};
@@ -47,6 +48,7 @@ pub use resolve::{
     DataDirResolution, LocalDataDir, REASON_DATA_DIR_MISSING, REASON_DATA_DIR_NOT_LOCAL,
     check_data_dir, check_data_dir_allowing_network, resolve_data_dir,
 };
+pub use umask::restrict_umask;
 
 /// Folder name used under every per-OS base folder.
 pub const APP_DIR_NAME: &str = "atlas-duck";

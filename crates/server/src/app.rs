@@ -117,6 +117,9 @@ fn fail(event: &'static str) -> u8 {
 
 /// Runs the server until shutdown; answers the process exit code.
 pub fn serve(config: Config) -> u8 {
+    // ADR 0004: the data volume's group is the process's own (gid 0 on NFS), so nothing the
+    // server creates is group or other accessible.
+    let _ = atlas_duck_ipc::paths::restrict_umask();
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

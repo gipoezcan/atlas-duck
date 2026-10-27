@@ -72,10 +72,8 @@
         }
       }
     },
-    "supplementalGroups": {
-      "type": "array",
-      "items": { "type": "integer", "minimum": 0 }
-    },
+    "gid": { "type": "integer", "minimum": 0 },
+    "fsGroup": { "type": "integer", "minimum": 0 },
     "persistence": {
       "type": "object",
       "properties": {

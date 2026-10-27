@@ -35,10 +35,12 @@ podLabels: {}
 
 # Pod hardening (SM-7.1, SM-9.4). The ids are the distroless `nonroot` user of the image (A-8).
 uid: 65532
-# Extra groups of the server process (ADR 0004). The team's NFS class does not apply fsGroup, and
-# a new volume's root stays owned by root. The review and production values therefore add group 0
-# here, the way dux-deployment-bot runs. The user id never becomes 0: the process stays non-root.
-supplementalGroups: []
+# The process's group and the pod's fsGroup. The team's NFS class does not apply fsGroup and its
+# server ignores supplementary groups, so a new volume's root (root:root 0770) is writable only
+# through the primary gid: review and production set both to 0, as dux-deployment-bot runs.
+# The uid never becomes 0 (chart policy); the server's umask 077 keeps its files private.
+gid: 65532
+fsGroup: 65532
 
 resources:
   requests:
