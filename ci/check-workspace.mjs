@@ -30,6 +30,8 @@ export const PKG = {
   cli: "atlas-duck-cli",
   mcpTools: "atlas-duck-mcp-tools",
   server: "atlas-duck-server",
+  scriptGlue: "atlas-duck-script-glue",
+  serverE2e: "atlas-duck-server-e2e",
 };
 
 // §2.2, read as workspace-internal normal/build edges (dev-dependencies ignored).
@@ -47,8 +49,27 @@ export const INTERNAL_RULES = [
   { pkg: PKG.sandboxWorker, allowed: [PKG.ipc] },
   // M12 PD-192/PD-193: the shared MCP tool layer and the server binary.
   { pkg: PKG.mcpTools, allowed: [PKG.ipc, PKG.registry] },
-  { pkg: PKG.server, allowed: [PKG.core, PKG.audit, PKG.atlassian, PKG.ipc, PKG.registry, PKG.mcpTools] },
+  {
+    pkg: PKG.server,
+    allowed: [
+      PKG.core,
+      PKG.audit,
+      PKG.atlassian,
+      PKG.ipc,
+      PKG.registry,
+      PKG.mcpTools,
+      PKG.scriptGlue,
+      PKG.sandboxHost,
+    ],
+  },
+  // M14 PD-247: the sandbox ScriptRunner shared by the app and the server.
+  { pkg: PKG.scriptGlue, allowed: [PKG.core, PKG.ipc, PKG.sandboxHost] },
+  // M14 PD-260: the e2e suite has dev-dependencies only.
+  { pkg: PKG.serverE2e, allowed: [] },
 ];
+
+// M14 PD-260: test-only packages; no workspace member has a normal or build edge to one.
+export const TEST_ONLY_PACKAGES = [PKG.serverE2e];
 
 // M12 (plan "Global Constraints"): crates only the server links. Checked per desktop package with
 // `cargo tree` (per-package feature resolution), which the unified `cargo metadata` resolve cannot
@@ -157,7 +178,15 @@ export const GLOBAL_ALLOCATOR_FILES = ["app/src-tauri/src/bin/atlas-duck-sandbox
 // library). `src/tests/` modules compile into the crate and are not exempt.
 const CRATE_TESTS_DIR = /^(?:crates\/[^/]+|app\/src-tauri)\/tests\//;
 
-export const LINT_PACKAGES = [PKG.core, PKG.atlassian, PKG.convert, PKG.mcpTools, PKG.server];
+export const LINT_PACKAGES = [
+  PKG.core,
+  PKG.atlassian,
+  PKG.convert,
+  PKG.mcpTools,
+  PKG.server,
+  PKG.scriptGlue,
+  PKG.serverE2e,
+];
 export const REQUIRED_DENY_LINTS = ["unwrap_used", "expect_used"];
 
 const isNormalOrBuild = (kind) => kind === null || kind === undefined || kind === "build";
@@ -268,6 +297,13 @@ export function checkGraph(metadata, trees = {}) {
     if (pkg.name === PKG.server) continue;
     if (pkg.dependencies.some((d) => d.name === PKG.server && isNormalOrBuild(d.kind))) {
       violations.push(`${pkg.name}: must not depend on ${PKG.server} (M12 PD-192)`);
+    }
+  }
+  for (const pkg of members) {
+    for (const t of TEST_ONLY_PACKAGES) {
+      if (pkg.name !== t && pkg.dependencies.some((d) => d.name === t && isNormalOrBuild(d.kind))) {
+        violations.push(`${pkg.name}: must not depend on test-only package ${t} (M14 PD-260)`);
+      }
     }
   }
 

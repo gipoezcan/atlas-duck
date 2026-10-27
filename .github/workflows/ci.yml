@@ -123,7 +123,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Test
-        run: cargo test --workspace --locked --exclude atlas-duck-server
+        run: cargo test --workspace --locked --exclude atlas-duck-server --exclude atlas-duck-server-e2e
         env:
           # T09: the only job allowed to write the WER registry values (no-op off Windows).
           ATLAS_DUCK_RUN_WER_TEST: "1"
@@ -1227,7 +1227,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Test x86_64-apple-darwin (test binaries run under Rosetta)
-        run: cargo test --workspace --locked --target x86_64-apple-darwin --exclude atlas-duck-server
+        run: cargo test --workspace --locked --target x86_64-apple-darwin --exclude atlas-duck-server --exclude atlas-duck-server-e2e
 
       - name: M3 suite x86_64-apple-darwin (atlassian + core, test-only features)
         run: cargo test -p atlas-duck-atlassian -p atlas-duck-core --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked --target x86_64-apple-darwin

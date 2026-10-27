@@ -1,0 +1,32 @@
+[package]
+name = "atlas-duck-server-e2e"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+# M14 PD-260: the black-box server suite. It runs against a base URL from the environment (the
+# container in GitHub CI, the review environment in GitLab CI) and is never part of
+# `cargo test --workspace` (excluded there); without its environment it prints usage and exits 2.
+autotests = false
+
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+harness = false
+
+[dev-dependencies]
+atlas-duck-atlassian = { path = "../atlassian", features = ["testing"] }
+atlas-duck-audit = { path = "../audit" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net"] }
+reqwest = { workspace = true, features = ["json"] }
+rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+url = { workspace = true }
+rcgen = { workspace = true }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

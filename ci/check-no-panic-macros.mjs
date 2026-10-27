@@ -35,6 +35,8 @@ export const PANIC_ROOTS = [
   "crates/convert/src",
   "crates/server/src",
   "crates/mcp-tools/src",
+  // M14 PD-247: the sandbox ScriptRunner shared by the app and the server.
+  "crates/script-glue/src",
 ];
 
 export const PANIC_PATTERNS = [

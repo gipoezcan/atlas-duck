@@ -392,6 +392,7 @@ dependencies = [
  "atlas-duck-registry",
  "atlas-duck-sandbox-host",
  "atlas-duck-sandbox-worker",
+ "atlas-duck-script-glue",
  "base64 0.22.1",
  "filetime",
  "libc",
@@ -626,6 +627,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlas-duck-script-glue"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "atlas-duck-core",
+ "atlas-duck-ipc",
+ "atlas-duck-sandbox-host",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "atlas-duck-server"
 version = "0.1.0"
 dependencies = [
@@ -638,6 +651,8 @@ dependencies = [
  "atlas-duck-ipc",
  "atlas-duck-mcp-tools",
  "atlas-duck-registry",
+ "atlas-duck-sandbox-host",
+ "atlas-duck-script-glue",
  "axum",
  "base64 0.22.1",
  "chrono",
@@ -667,6 +682,22 @@ dependencies = [
  "url",
  "wiremock",
  "zeroize",
+]
+
+[[package]]
+name = "atlas-duck-server-e2e"
+version = "0.1.0"
+dependencies = [
+ "atlas-duck-atlassian",
+ "atlas-duck-audit",
+ "base64 0.22.1",
+ "rcgen",
+ "reqwest",
+ "rmcp",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "url",
 ]
 
 [[package]]

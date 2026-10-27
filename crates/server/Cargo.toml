@@ -39,6 +39,9 @@ atlas-duck-atlassian = { path = "../atlassian" }
 atlas-duck-ipc = { path = "../ipc" }
 atlas-duck-registry = { path = "../registry" }
 atlas-duck-mcp-tools = { path = "../mcp-tools" }
+# M14 PD-247: scripts in server mode on the M8 sandbox.
+atlas-duck-script-glue = { path = "../script-glue" }
+atlas-duck-sandbox-host = { path = "../sandbox-host" }
 axum = { workspace = true }
 ldap3 = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }

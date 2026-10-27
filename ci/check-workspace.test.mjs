@@ -39,6 +39,8 @@ const MEMBERS = [
   "atlas-duck-cli",
   "atlas-duck-mcp-tools",
   "atlas-duck-server",
+  "atlas-duck-script-glue",
+  "atlas-duck-server-e2e",
 ];
 
 const memberId = (name) => `path+file:///ws/crates/${name}#${name}@0.1.0`;
@@ -73,7 +75,11 @@ function baseEdges() {
       "atlas-duck-ipc",
       "atlas-duck-registry",
       "atlas-duck-mcp-tools",
+      "atlas-duck-script-glue",
+      "atlas-duck-sandbox-host",
     ],
+    "atlas-duck-script-glue": ["atlas-duck-core", "atlas-duck-ipc", "atlas-duck-sandbox-host"],
+    "atlas-duck-server-e2e": [{ name: "atlas-duck-audit", kind: "dev" }],
   };
 }
 
@@ -170,6 +176,8 @@ const manifests = (over = {}) => ({
     "atlas-duck-convert": LINTS_OK,
     "atlas-duck-mcp-tools": LINTS_OK,
     "atlas-duck-server": LINTS_OK,
+    "atlas-duck-script-glue": LINTS_OK,
+    "atlas-duck-server-e2e": LINTS_OK,
   },
   ...over,
 });
@@ -457,8 +465,11 @@ test("sandbox-host may not link an HTTP client (fixture adds reqwest -> violatio
 test("sandbox-host with tauri in its closure is reported once, by the Tauri rule", () => {
   const e = baseEdges();
   e["atlas-duck-sandbox-host"].push("tauri");
+  // M14: the server and script-glue link sandbox-host, so its Tauri reaches them too.
   assert.deepEqual(graph(e), [
     "atlas-duck-sandbox-host: tauri in normal-dependency closure; nothing but app depends on Tauri (§2.2)",
+    "atlas-duck-server: tauri in normal-dependency closure; nothing but app depends on Tauri (§2.2)",
+    "atlas-duck-script-glue: tauri in normal-dependency closure; nothing but app depends on Tauri (§2.2)",
   ]);
 });
 
@@ -930,8 +941,8 @@ test("mcp-tools and server stay inside their allowed workspace edges", () => {
   e["atlas-duck-mcp-tools"] = [...e["atlas-duck-mcp-tools"], "atlas-duck-core"];
   assert.deepEqual(graph(e), ["atlas-duck-mcp-tools: must not depend on atlas-duck-core (§2.2)"]);
   const s = baseEdges();
-  s["atlas-duck-server"] = [...s["atlas-duck-server"], "atlas-duck-sandbox-host"];
-  assert.deepEqual(graph(s), ["atlas-duck-server: must not depend on atlas-duck-sandbox-host (§2.2)"]);
+  s["atlas-duck-server"] = [...s["atlas-duck-server"], "atlas-duck-cli"];
+  assert.deepEqual(graph(s), ["atlas-duck-server: must not depend on atlas-duck-cli (§2.2)"]);
 });
 
 test("a per-package tree overrides the unified closure for the banned-crate checks", () => {
@@ -944,6 +955,36 @@ test("a per-package tree overrides the unified closure for the banned-crate chec
   assert.deepEqual(checkGraph(md, { "atlas-duck-cli": ["atlas-duck-cli", "rmcp", "hyper"] }), [
     "atlas-duck-cli: banned crate hyper in normal-dependency closure (§2.1)",
   ]);
+});
+
+// ---------- M14 script-glue and server-e2e ----------
+
+test("script-glue stays inside core, ipc and sandbox-host", () => {
+  const e = baseEdges();
+  e["atlas-duck-script-glue"] = [...e["atlas-duck-script-glue"], "atlas-duck-audit"];
+  assert.deepEqual(graph(e), ["atlas-duck-script-glue: must not depend on atlas-duck-audit (§2.2)"]);
+});
+
+test("no member has a normal edge to the test-only e2e package", () => {
+  const e = baseEdges();
+  e["atlas-duck-server"] = [...e["atlas-duck-server"], { name: "atlas-duck-server-e2e", kind: "dev" }];
+  assert.deepEqual(graph(e), []);
+  e["atlas-duck-server"] = [...baseEdges()["atlas-duck-server"], "atlas-duck-server-e2e"];
+  assert.deepEqual(graph(e), [
+    "atlas-duck-server: must not depend on atlas-duck-server-e2e (§2.2)",
+    "atlas-duck-server: must not depend on test-only package atlas-duck-server-e2e (M14 PD-260)",
+  ]);
+});
+
+test("the e2e package has no normal workspace edge", () => {
+  const e = baseEdges();
+  e["atlas-duck-server-e2e"] = ["atlas-duck-audit"];
+  assert.deepEqual(graph(e), ["atlas-duck-server-e2e: must not depend on atlas-duck-audit (§2.2)"]);
+});
+
+test("script-glue and server-e2e are lint packages", () => {
+  assert.ok(LINT_PACKAGES.includes("atlas-duck-script-glue"));
+  assert.ok(LINT_PACKAGES.includes("atlas-duck-server-e2e"));
 });
 
 test("server and mcp-tools are lint packages", () => {

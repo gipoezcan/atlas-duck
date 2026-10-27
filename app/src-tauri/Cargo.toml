@@ -51,6 +51,8 @@ atlas-duck-core = { path = "../../crates/core" }
 atlas-duck-sandbox-worker = { path = "../../crates/sandbox-worker" }
 atlas-duck-ipc = { path = "../../crates/ipc" }
 atlas-duck-sandbox-host = { path = "../../crates/sandbox-host" }
+# M14 PD-247: the sandbox ScriptRunner, shared with the server.
+atlas-duck-script-glue = { path = "../../crates/script-glue" }
 atlas-duck-audit = { path = "../../crates/audit" }
 # M6 T10: `preview_fetch` renders the preview document (`preview::render`, PD-67); also the
 # `Preview` values `dto_fixtures` builds.

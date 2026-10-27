@@ -13,6 +13,8 @@ members = [
     "crates/cli",
     "crates/mcp-tools",
     "crates/server",
+    "crates/script-glue",
+    "crates/server-e2e",
     "app/src-tauri",
 ]
 
@@ -119,7 +121,7 @@ lru = "=0.18.5"
 rmcp = { version = "=3.5.0", default-features = false }
 # M12 server mode (plan PD-191): the server binary's HTTP framework, LDAPS client and the
 # constant-time compare of the test directory stub. Only atlas-duck-server depends on them.
-axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "matched-path", "original-uri"] }
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "query", "form", "tokio", "matched-path", "original-uri"] }
 # 0.12.1, not the plan's candidate 0.11.5: 0.11.5 links rustls 0.21 (a second rustls); 0.12.1
 # uses rustls 0.23 and its `tls-rustls-ring` feature keeps the ring provider (no aws-lc-rs).
 ldap3 = { version = "=0.12.1", default-features = false, features = ["tls-rustls-ring"] }

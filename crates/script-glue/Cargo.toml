@@ -1,0 +1,26 @@
+[package]
+name = "atlas-duck-script-glue"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# M14 PD-247: the Tauri-free `ScriptRunner` over the M8 sandbox host and the startup probe holder,
+# shared by the desktop app and the server.
+[lib]
+name = "atlas_duck_script_glue"
+path = "src/lib.rs"
+
+[dependencies]
+atlas-duck-core = { path = "../core" }
+atlas-duck-ipc = { path = "../ipc" }
+atlas-duck-sandbox-host = { path = "../sandbox-host" }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+serde_json = { workspace = true }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
