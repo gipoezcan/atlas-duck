@@ -33,6 +33,9 @@ ENV RUSTUP_TOOLCHAIN=1.95.0
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
+# The one non-test include_str! input outside crates/ in the server's closure:
+# crates/preview/src/sanitize.rs embeds the preview stylesheet.
+COPY app/ui/public/preview.css app/ui/public/preview.css
 # A workspace member; copied only so the workspace resolves with --locked. The server's closure
 # links no Tauri, so no GTK/WebKit packages are needed.
 COPY app/src-tauri/ app/src-tauri/
