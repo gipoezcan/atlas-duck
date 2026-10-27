@@ -100,6 +100,7 @@ impl LoginService {
     }
 
     fn failed(&self, username: &str, ip: &str, reason: &str) {
+        tracing::warn!(event = "login_failed", reason, source_ip = ip);
         let body = json!({"username": recorded_name(username), "source_ip": ip, "reason": reason});
         if append_operational(
             self.store.as_ref(),
@@ -188,6 +189,7 @@ impl LoginService {
         }
         self.limiter.release(&name, ip, now);
         self.limiter.record_success(&name);
+        tracing::info!(event = "login_succeeded", user_id = %record.user_id, source_ip = ip);
         let session = self.sessions.create(&record.user_id, roles.clone())?;
         let role_refs: Vec<&str> = roles.iter().map(String::as_str).collect();
         let payload = audit_kinds::login(&Login {

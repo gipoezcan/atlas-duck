@@ -19,7 +19,7 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, Method, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{MethodRouter, delete, get, post, put};
 
 use crate::csrf::{CSRF_HEADER, origin_ok, token_ok};
 use crate::errors::ApiError;
@@ -94,33 +94,51 @@ pub const ROUTES: &[(&str, &str, Access)] = &[
     ("DELETE", "/mcp", Access::Bearer),
 ];
 
+/// The handler of one [`ROUTES`] row; `None` for the bearer rows, which [`crate::mcp::routes`]
+/// serves. Batch-4b review I3: the router is built from the table, so a route exists exactly when
+/// its row does (`web::tests` pins that every non-bearer row has a handler).
+pub(crate) fn handler(method: &str, path: &str) -> Option<MethodRouter<AppState>> {
+    Some(match (method, path) {
+        ("GET", "/healthz") => get(health::healthz),
+        ("GET", "/readyz") => get(readyz),
+        ("GET", "/assets/{name}") => get(asset),
+        ("POST", "/api/login") => post(auth_routes::login),
+        ("POST", "/api/logout") => post(auth_routes::logout),
+        ("GET", "/api/session") => get(auth_routes::session),
+        ("GET", "/api/admin/instances") => get(admin_routes::list),
+        ("POST", "/api/admin/instances") => post(admin_routes::add),
+        ("DELETE", "/api/admin/instances/{alias}") => delete(admin_routes::remove),
+        ("POST", "/api/cmd/{command}") => post(cmd_routes::command),
+        ("GET", "/api/events") => get(cmd_routes::events),
+        ("GET", "/api/instances") => get(pat_routes::instances),
+        ("PUT", "/api/me/pats/{alias}") => put(pat_routes::put),
+        ("DELETE", "/api/me/pats/{alias}") => delete(pat_routes::delete),
+        ("GET", "/api/me/api-keys") => get(api_key_routes::list),
+        ("POST", "/api/me/api-keys") => post(api_key_routes::create),
+        ("DELETE", "/api/me/api-keys/{id}") => delete(api_key_routes::revoke),
+        _ => return None,
+    })
+}
+
 /// Every route group: health, static pages and assets, auth, commands and SSE, PATs, API keys,
-/// admin instances and `/mcp` (bearer only, its own guard). An unrouted path is 404.
+/// admin instances (all from [`ROUTES`]) and `/mcp` (bearer only, its own guard). An unrouted
+/// path is 404.
 pub fn router(state: AppState) -> Router {
-    let mut r = Router::new()
-        .route("/healthz", get(health::healthz))
-        .route("/readyz", get(readyz))
-        .route("/assets/{name}", get(asset))
-        .route("/api/login", post(auth_routes::login))
-        .route("/api/logout", post(auth_routes::logout))
-        .route("/api/session", get(auth_routes::session))
-        .route(
-            "/api/admin/instances",
-            get(admin_routes::list).post(admin_routes::add),
-        )
-        .route("/api/admin/instances/{alias}", delete(admin_routes::remove))
-        .route("/api/cmd/{command}", post(cmd_routes::command))
-        .route("/api/events", get(cmd_routes::events))
-        .route("/api/instances", get(pat_routes::instances))
-        .route(
-            "/api/me/pats/{alias}",
-            put(pat_routes::put).delete(pat_routes::delete),
-        )
-        .route(
-            "/api/me/api-keys",
-            get(api_key_routes::list).post(api_key_routes::create),
-        )
-        .route("/api/me/api-keys/{id}", delete(api_key_routes::revoke));
+    let mut by_path: std::collections::BTreeMap<&str, MethodRouter<AppState>> =
+        std::collections::BTreeMap::new();
+    for (method, path, _) in ROUTES {
+        if let Some(h) = handler(method, path) {
+            let merged = match by_path.remove(path) {
+                Some(m) => m.merge(h),
+                None => h,
+            };
+            by_path.insert(path, merged);
+        }
+    }
+    let mut r = Router::new();
+    for (path, m) in by_path {
+        r = r.route(path, m);
+    }
     for (path, _) in static_files::PAGES {
         r = r.route(path, get(page));
     }

@@ -13,6 +13,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use atlas_duck_server::api_keys;
 use base64::Engine;
 use futures::StreamExt as _;
 use support::*;
@@ -68,14 +69,64 @@ fn bytes_of(path: &Path) -> Vec<u8> {
     out
 }
 
-fn contains(hay: &[u8], needle: &str) -> bool {
-    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle.as_bytes())
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Everything the sweep reads: logs, answers, SSE frames, server.db and every user's audit.db.
+struct Sweep {
+    logs: Vec<u8>,
+    transcript: Vec<u8>,
+    sse: Vec<u8>,
+    server_db: Vec<u8>,
+    user_dbs: Vec<(String, Vec<u8>)>,
+}
+
+impl Sweep {
+    fn take(s: &TestServer, frames: &Mutex<Vec<u8>>) -> Sweep {
+        let data = s.dir.path().join("data");
+        let mut user_dbs = Vec::new();
+        for entry in std::fs::read_dir(data.join("users")).unwrap() {
+            let dir = entry.unwrap().path();
+            user_dbs.push((
+                dir.file_name().unwrap().to_string_lossy().into_owned(),
+                bytes_of(&dir.join("audit.db")),
+            ));
+        }
+        Sweep {
+            logs: logs().0.lock().unwrap().clone(),
+            transcript: s.transcript.lock().unwrap().join("\n").into_bytes(),
+            sse: frames.lock().unwrap().clone(),
+            server_db: bytes_of(&data.join("server").join("server.db")),
+            user_dbs,
+        }
+    }
+
+    /// Where `needle` occurs.
+    fn find(&self, needle: &[u8]) -> Vec<String> {
+        let mut at = Vec::new();
+        for (name, hay) in [
+            ("logs", &self.logs),
+            ("answers", &self.transcript),
+            ("sse", &self.sse),
+            ("server.db", &self.server_db),
+        ] {
+            if contains(hay, needle) {
+                at.push(name.to_owned());
+            }
+        }
+        for (user, hay) in &self.user_dbs {
+            if contains(hay, needle) {
+                at.push(format!("users/{user}/audit.db"));
+            }
+        }
+        at
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn no_secret_reaches_logs_answers_or_the_server_store() {
-    let logs = logs();
-    tracing::info!(event = "capture_started");
+async fn no_secret_reaches_logs_answers_or_the_stores() {
+    let _ = logs();
     let s = TestServer::start().await;
     // Alice's event stream records every frame of the run.
     let frames: Arc<Mutex<Vec<u8>>> = Arc::default();
@@ -96,39 +147,90 @@ async fn no_secret_reaches_logs_answers_or_the_server_store() {
     });
 
     let flow = exit_flow(&s, PAT_CANARY).await;
+    // Let the last frames arrive (bounded) before the stream goes.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     sse.abort();
 
-    let master_b64 = base64::engine::general_purpose::STANDARD.encode(MASTER_BYTES);
-    let master_b64url = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(MASTER_BYTES);
-    let canaries: Vec<(&str, String)> = vec![
-        ("password", ALICE.1.to_owned()),
-        ("pat", PAT_CANARY.to_owned()),
-        ("api_key", flow.key.clone()),
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let b64url = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    // `adk_<prefix>_<secret>`: the secret is everything after the known prefix (it may hold `_`).
+    let secret = flow
+        .key
+        .strip_prefix("adk_")
+        .and_then(|r| r.get(api_keys::PREFIX_LEN + 1..))
+        .unwrap()
+        .to_owned();
+    assert_eq!(secret.len(), api_keys::SECRET_B64_LEN);
+    let canaries: Vec<(&str, Vec<u8>)> = vec![
+        ("password", ALICE.1.as_bytes().to_vec()),
+        ("pat", PAT_CANARY.as_bytes().to_vec()),
+        ("api_key", flow.key.as_bytes().to_vec()),
+        ("api_key_secret", secret.into_bytes()),
+        ("master_key_raw", MASTER_BYTES.to_vec()),
+        ("master_key_hex", hex::encode(MASTER_BYTES).into_bytes()),
+        ("master_key_b64", b64.encode(MASTER_BYTES).into_bytes()),
         (
-            "api_key_secret",
-            flow.key.rsplit('_').next().unwrap().to_owned(),
+            "master_key_b64url",
+            b64url.encode(MASTER_BYTES).into_bytes(),
         ),
-        ("master_key_b64", master_b64),
-        ("master_key_b64url", master_b64url),
-        ("session_cookie", flow.alice.cookie.clone()),
-        ("session_cookie_probe", alice_probe.cookie.clone()),
+        ("session_cookie", flow.alice.cookie.as_bytes().to_vec()),
+        (
+            "session_cookie_probe",
+            alice_probe.cookie.as_bytes().to_vec(),
+        ),
     ];
 
-    let log_bytes = logs.0.lock().unwrap().clone();
-    assert!(contains(&log_bytes, "capture_started"), "the capture works");
-    let transcript = s.transcript.lock().unwrap().join("\n");
-    assert!(transcript.contains("ABC-1"), "the transcript holds the run");
-    let sse_bytes = frames.lock().unwrap().clone();
-    let db = bytes_of(&s.dir.path().join("data").join("server").join("server.db"));
-    assert!(!db.is_empty());
+    let sweep = Sweep::take(&s, &frames);
+    // Batch-4b review I5: the capture holds the server's own lines, the run's answers, frames and
+    // both kinds of store.
+    assert!(
+        contains(&sweep.logs, b"\"event\":\"login_succeeded\""),
+        "server log lines are captured"
+    );
+    assert!(
+        contains(&sweep.transcript, b"ABC-1"),
+        "the transcript holds the run"
+    );
+    assert!(
+        contains(&sweep.sse, b"event: queue_changed"),
+        "the stream holds the run"
+    );
+    assert!(!sweep.server_db.is_empty());
+    assert!(
+        sweep.user_dbs.iter().any(|(_, b)| !b.is_empty()),
+        "the users' stores are read"
+    );
     for (what, canary) in &canaries {
-        assert!(!contains(&log_bytes, canary), "{what} in the logs");
-        assert!(!transcript.contains(canary.as_str()), "{what} in an answer");
-        assert!(!contains(&sse_bytes, canary), "{what} in an SSE frame");
-        assert!(!contains(&db, canary), "{what} in server.db");
+        let at = sweep.find(canary);
+        assert!(at.is_empty(), "{what} found in {at:?}");
     }
-}
 
+    // Self-test: a known leak in a server log line, an answer, a frame and the server store is
+    // found in each, so the sweep above can fail.
+    const LEAK: &str = "leak-canary-0d9a7e";
+    tracing::warn!(target: "atlas_duck_server::login", event = "selftest", secret = LEAK);
+    s.record(&format!("{{\"leak\":\"{LEAK}\"}}"));
+    frames
+        .lock()
+        .unwrap()
+        .extend_from_slice(format!("data: {LEAK}\n\n").as_bytes());
+    s.store
+        .instance_put(&atlas_duck_server::store::InstanceRecord {
+            alias: "leak".into(),
+            product: "jira".into(),
+            base_url: format!("https://{LEAK}.example.test"),
+            proxy: None,
+            ca_ref: None,
+            is_default: false,
+        })
+        .unwrap();
+    let at = Sweep::take(&s, &frames).find(LEAK.as_bytes());
+    assert_eq!(
+        at,
+        ["logs", "answers", "sse", "server.db"],
+        "the sweep sees every channel"
+    );
+}
 /// Every `.rs` file under `dir`.
 fn rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap() {

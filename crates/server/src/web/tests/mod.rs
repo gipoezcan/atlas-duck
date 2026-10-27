@@ -1630,3 +1630,24 @@ async fn every_listed_route_is_routed() {
         }
     }
 }
+
+#[test]
+fn every_route_row_has_a_handler_and_bearer_rows_are_mcp() {
+    // Batch-4b review I3: the router is built from ROUTES, so this pins the table both ways.
+    for (method, path, access) in super::ROUTES {
+        match access {
+            super::Access::Bearer => {
+                assert_eq!(*path, crate::mcp::MCP_PATH, "{method} {path}");
+                assert!(super::handler(method, path).is_none());
+            }
+            _ => assert!(super::handler(method, path).is_some(), "{method} {path}"),
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (method, path, _) in super::ROUTES {
+        assert!(
+            seen.insert((*method, *path)),
+            "duplicate row {method} {path}"
+        );
+    }
+}

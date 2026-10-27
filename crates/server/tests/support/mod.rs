@@ -233,6 +233,18 @@ impl TestServer {
         self.send_rec(method, path, b, body, true).await
     }
 
+    /// [`Self::send`] with extra request headers (spoofing probes).
+    pub async fn send_with(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        b: Option<&Browser>,
+        body: Option<Value>,
+        extra: &[(&str, &str)],
+    ) -> (u16, Value) {
+        self.send_full(method, path, b, body, true, extra).await
+    }
+
     async fn send_rec(
         &self,
         method: reqwest::Method,
@@ -241,11 +253,26 @@ impl TestServer {
         body: Option<Value>,
         record: bool,
     ) -> (u16, Value) {
+        self.send_full(method, path, b, body, record, &[]).await
+    }
+
+    async fn send_full(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        b: Option<&Browser>,
+        body: Option<Value>,
+        record: bool,
+        extra: &[(&str, &str)],
+    ) -> (u16, Value) {
         let changing = method != reqwest::Method::GET;
         let mut req = self
             .http
             .request(method, self.url(path))
             .headers(self.headers(b, changing));
+        for (k, v) in extra {
+            req = req.header(*k, *v);
+        }
         if let Some(body) = body {
             req = req.json(&body);
         }
