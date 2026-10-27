@@ -77,35 +77,86 @@ fn tar_name(top: &str, rel: &Path) -> String {
         .join("/")
 }
 
-/// Writes the directory `root` as `top/...` into `w`, then the end-of-archive blocks.
+/// The exact byte length [`write_dir`] will produce for `root` (the stream's announced size).
+pub fn tar_size(root: &Path) -> std::io::Result<u64> {
+    let mut entries = Vec::new();
+    walk(root, Path::new(""), &mut entries)?;
+    let mut n = BLOCK as u64; // the top directory
+    for (rel, dir) in entries {
+        n += BLOCK as u64;
+        if !dir {
+            let size = std::fs::metadata(root.join(rel))?.len();
+            n += size.div_ceil(BLOCK as u64) * BLOCK as u64;
+        }
+    }
+    Ok(n + 2 * BLOCK as u64)
+}
+
+/// Writes the directory `root` as `top/...` into `w`, then the end-of-archive blocks. Answers
+/// the byte count and the SHA-256 of everything written (final review I1: the stream's trailer).
 pub async fn write_dir<W: AsyncWrite + Unpin>(
     w: &mut W,
     root: &Path,
     top: &str,
-) -> std::io::Result<()> {
+) -> std::io::Result<(u64, [u8; 32])> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let mut n = 0u64;
+    let mut put = |chunk: &[u8], h: &mut Sha256| {
+        h.update(chunk);
+        n += chunk.len() as u64;
+    };
     let mut entries = Vec::new();
     walk(root, Path::new(""), &mut entries)?;
-    w.write_all(&header(&format!("{top}/"), 0, true)?).await?;
+    let first = header(&format!("{top}/"), 0, true)?;
+    put(&first, &mut h);
+    w.write_all(&first).await?;
+    let mut buf = vec![0u8; 64 * 1024];
     for (rel, dir) in entries {
         let name = tar_name(top, &rel);
         if dir {
-            w.write_all(&header(&format!("{name}/"), 0, true)?).await?;
+            let hd = header(&format!("{name}/"), 0, true)?;
+            put(&hd, &mut h);
+            w.write_all(&hd).await?;
             continue;
         }
         let mut f = tokio::fs::File::open(root.join(&rel)).await?;
         let size = f.metadata().await?.len();
-        w.write_all(&header(&name, size, false)?).await?;
-        let copied = tokio::io::copy(&mut (&mut f).take(size), w).await?;
-        if copied != size {
-            return Err(std::io::Error::other("file changed while streaming"));
+        let hd = header(&name, size, false)?;
+        put(&hd, &mut h);
+        w.write_all(&hd).await?;
+        let mut left = size;
+        while left > 0 {
+            let want = buf.len().min(usize::try_from(left).unwrap_or(buf.len()));
+            let got = f.read(&mut buf[..want]).await?;
+            if got == 0 {
+                return Err(std::io::Error::other("file changed while streaming"));
+            }
+            put(&buf[..got], &mut h);
+            w.write_all(&buf[..got]).await?;
+            left -= got as u64;
         }
-        let pad = (BLOCK - (size as usize % BLOCK)) % BLOCK;
-        w.write_all(&vec![0u8; pad]).await?;
+        let pad = vec![0u8; (BLOCK - (size as usize % BLOCK)) % BLOCK];
+        put(&pad, &mut h);
+        w.write_all(&pad).await?;
     }
-    w.write_all(&[0u8; 2 * BLOCK]).await?;
-    w.flush().await
+    let end = [0u8; 2 * BLOCK];
+    put(&end, &mut h);
+    w.write_all(&end).await?;
+    w.flush().await?;
+    Ok((n, h.finalize().into()))
 }
 
+/// Final review M3: a stream that goes quiet this long is abandoned (its lock is released).
+pub const STREAM_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+async fn read_exact_t<R: AsyncRead + Unpin>(r: &mut R, buf: &mut [u8]) -> Result<(), &'static str> {
+    tokio::time::timeout(STREAM_IDLE, r.read_exact(buf))
+        .await
+        .map_err(|_| "restore/stream_idle")?
+        .map(drop)
+        .map_err(|_| "restore/stream_invalid")
+}
 fn field_str(b: &[u8]) -> String {
     let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
     String::from_utf8_lossy(&b[..end]).into_owned()
@@ -133,7 +184,7 @@ pub async fn read_into<R: AsyncRead + Unpin>(
     let mut total = 0u64;
     loop {
         let mut h = [0u8; BLOCK];
-        r.read_exact(&mut h).await.map_err(|_| bad)?;
+        read_exact_t(r, &mut h).await?;
         if h.iter().all(|&b| b == 0) {
             break;
         }
@@ -181,16 +232,26 @@ pub async fn read_into<R: AsyncRead + Unpin>(
                 let mut f = tokio::fs::File::create(&path)
                     .await
                     .map_err(|_| "restore/stage_failed")?;
-                let copied = tokio::io::copy(&mut (&mut *r).take(size), &mut f)
-                    .await
-                    .map_err(|_| bad)?;
-                if copied != size {
-                    return Err(bad);
+                let mut left = size;
+                let mut buf = vec![0u8; 64 * 1024];
+                while left > 0 {
+                    let want = buf.len().min(usize::try_from(left).unwrap_or(buf.len()));
+                    let got = tokio::time::timeout(STREAM_IDLE, r.read(&mut buf[..want]))
+                        .await
+                        .map_err(|_| "restore/stream_idle")?
+                        .map_err(|_| bad)?;
+                    if got == 0 {
+                        return Err(bad);
+                    }
+                    f.write_all(&buf[..got])
+                        .await
+                        .map_err(|_| "restore/stage_failed")?;
+                    left -= got as u64;
                 }
                 f.sync_all().await.map_err(|_| "restore/stage_failed")?;
                 let pad = (BLOCK - (size as usize % BLOCK)) % BLOCK;
                 let mut skip = vec![0u8; pad];
-                r.read_exact(&mut skip).await.map_err(|_| bad)?;
+                read_exact_t(r, &mut skip).await?;
             }
             // Links, devices and anything else are refused.
             _ => return Err(bad),

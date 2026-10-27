@@ -736,8 +736,31 @@ async fn backup_streams_as_tar_and_restore_reads_the_stream() {
     let nl = out.iter().position(|&b| b == b'\n').unwrap();
     let head: Response = serde_json::from_slice(&out[..nl]).unwrap();
     assert!(head.ok, "{head:?}");
-    let tar = out[nl + 1..].to_vec();
+    let tar_bytes = head.data.as_ref().unwrap()["tar_bytes"].as_u64().unwrap() as usize;
+    let rest = &out[nl + 1..];
+    let tar = rest[..tar_bytes].to_vec();
     assert_eq!(tar.len() % 512, 0);
+    // Final review I1: the client checks the trailer's length and hash.
+    let mut sink = Vec::new();
+    super::client::copy_verified(&mut &rest[..], &mut sink, tar_bytes as u64).unwrap();
+    assert_eq!(sink, tar);
+    let mut short = rest[..tar_bytes - 100].to_vec();
+    short.extend_from_slice(&rest[tar_bytes..]);
+    assert!(
+        super::client::copy_verified(&mut short.as_slice(), &mut Vec::new(), tar_bytes as u64)
+            .is_err()
+    );
+    let cut = &rest[..tar_bytes - 100];
+    assert_eq!(
+        super::client::copy_verified(&mut &cut[..], &mut Vec::new(), tar_bytes as u64),
+        Err("admin/stream_truncated")
+    );
+    let mut flipped = rest.to_vec();
+    flipped[600] ^= 1;
+    assert_eq!(
+        super::client::copy_verified(&mut flipped.as_slice(), &mut Vec::new(), tar_bytes as u64),
+        Err("admin/stream_mismatch")
+    );
     let left: Vec<_> = std::fs::read_dir(s.backups()).unwrap().collect();
     assert!(
         left.is_empty(),
@@ -807,4 +830,128 @@ async fn a_tar_stream_with_an_escaping_path_is_refused() {
         assert_eq!(r.unwrap_err(), "restore/stream_invalid", "{name}");
         assert!(!dir.path().join("evil").exists());
     }
+}
+
+/// Final review I1: a stream the client drops is not a completed backup: the bundle stays on the
+/// volume (the snapshot anchored as BACKUP_TAKEN still exists).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_backup_stream_keeps_the_bundle() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let s = sqlite_harness("k1", KEY_A);
+    s.user("alice").await;
+    let (client, server) = tokio::io::duplex(1024);
+    let ctx = s.ctx.clone();
+    let task = tokio::spawn(async move { serve_conn(&ctx, server).await });
+    let mut client = tokio::io::BufReader::new(client);
+    client
+        .get_mut()
+        .write_all(b"{\"op\":\"backup_stream\"}\n")
+        .await
+        .unwrap();
+    let mut head = String::new();
+    within(client.read_line(&mut head)).await.unwrap();
+    assert!(head.contains("\"tar_bytes\""), "{head}");
+    drop(client);
+    assert!(within(task).await.unwrap().is_err(), "the stream broke");
+    let kept: Vec<_> = std::fs::read_dir(s.backups()).unwrap().collect();
+    assert_eq!(kept.len(), 1, "the bundle stays for a later export");
+    within(s.ctx.registry.close_all()).await;
+}
+
+/// Final review I2: a bundle wrapped under a key the server has loaded but not as its primary
+/// (the old key mounted as the next one after a rotation) restores.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bundle_under_a_loaded_non_primary_key_restores() {
+    let s = sqlite_harness("k1", KEY_A);
+    s.user("alice").await;
+    let report = s.backup(&s.backups()).await;
+    let bundle = report["bundle"].as_str().unwrap().to_owned();
+    assert_eq!(manifest(&bundle).key_ids, ["k1"]);
+    let other = sqlite_harness("k2", [0x33; 32]);
+    other
+        .ctx
+        .registry
+        .deps()
+        .master
+        .accept(MasterKey::for_tests("k1", KEY_A))
+        .unwrap();
+    let copied = other.backups().join("old");
+    copy_dir(Path::new(&bundle), &copied);
+    other.maintenance(true).await;
+    let r = other.restore(&copied.display().to_string()).await;
+    assert!(r.ok, "{r:?}");
+    assert!(other.store().user_by_name("alice").unwrap().is_some());
+    within(s.ctx.registry.close_all()).await;
+    within(other.ctx.registry.close_all()).await;
+}
+
+/// Final review I3: kept bundles can be listed, exported as a stream and removed (anchored).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kept_bundles_list_export_and_remove() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let s = sqlite_harness("k1", KEY_A);
+    s.user("alice").await;
+    let report = s.backup(&s.backups()).await;
+    let name = PathBuf::from(report["bundle"].as_str().unwrap())
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    std::fs::create_dir_all(s.backups().join("upload-leftover")).unwrap();
+    let listed = s.call(Request::BackupsList(NoArgs {})).await.data.unwrap();
+    let rows = listed.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    let row = rows.iter().find(|r| r["name"] == name.as_str()).unwrap();
+    assert_eq!(row["complete"], true);
+    assert!(row["bytes"].as_u64().unwrap() > 0);
+    assert!(
+        rows.iter()
+            .any(|r| r["name"] == "upload-leftover" && r["complete"] == false)
+    );
+    // Export streams it with the same framing, and keeps it.
+    let (mut client, server) = tokio::io::duplex(1 << 16);
+    let ctx = s.ctx.clone();
+    let task = tokio::spawn(async move { serve_conn(&ctx, server).await });
+    client
+        .write_all(format!("{{\"op\":\"backups_export\",\"name\":\"{name}\"}}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    within(client.read_to_end(&mut out)).await.unwrap();
+    within(task).await.unwrap().unwrap();
+    let nl = out.iter().position(|&b| b == b'\n').unwrap();
+    let head: Response = serde_json::from_slice(&out[..nl]).unwrap();
+    let tar_bytes = head.data.unwrap()["tar_bytes"].as_u64().unwrap();
+    super::client::copy_verified(&mut &out[nl + 1..], &mut Vec::new(), tar_bytes).unwrap();
+    assert!(s.backups().join(&name).is_dir());
+    // Bad names never leave the backups directory.
+    for bad in ["..", "../server", "a/b", ""] {
+        let r = s
+            .call(Request::BackupsRemove(NameArg { name: bad.into() }))
+            .await;
+        assert_eq!(r.error.as_deref(), Some("backups/name_invalid"), "{bad:?}");
+    }
+    let r = s
+        .call(Request::BackupsRemove(NameArg { name: name.clone() }))
+        .await;
+    assert!(r.ok, "{r:?}");
+    assert!(!s.backups().join(&name).exists());
+    assert_eq!(
+        s.store().anchor_last().unwrap().unwrap().kind,
+        crate::anchor::KIND_BACKUP_REMOVED
+    );
+    within(s.ctx.registry.close_all()).await;
+}
+
+/// Final review M4: a stream larger than the configured bound is refused while it is read.
+#[tokio::test]
+async fn a_stream_above_the_bound_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tar = super::tarball::header("bundle/big", 4096, false)
+        .unwrap()
+        .to_vec();
+    tar.extend_from_slice(&[7u8; 4096]);
+    tar.extend_from_slice(&[0u8; 1024]);
+    let r = super::tarball::read_into(&mut tar.as_slice(), &dir.path().join("u"), 1024).await;
+    assert_eq!(r.unwrap_err(), "restore/stream_too_large");
 }

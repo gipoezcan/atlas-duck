@@ -77,7 +77,14 @@ async fn verify_staged(
     m: &Manifest,
 ) -> Result<Vec<UserHead>, &'static str> {
     let deps = ctx.registry.deps();
-    if m.master_key_id != deps.master.id() {
+    // Final review I2: any loaded key will do (the old key mounted as the next one, to restore a
+    // pre-rotation bundle); the per-row unwrap below is the real gate.
+    let ids = if m.key_ids.is_empty() {
+        std::slice::from_ref(&m.master_key_id)
+    } else {
+        m.key_ids.as_slice()
+    };
+    if !ids.iter().all(|id| deps.master.knows(id)) {
         return Err("restore/unknown_master_key");
     }
     let staged: Arc<dyn ServerStore> = match SqliteStore::open(&staging.join(SERVER_DB)) {

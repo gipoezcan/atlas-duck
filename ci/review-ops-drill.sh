@@ -11,8 +11,9 @@
 #  4. swap <release>-master-key to the new key, redeploy without nextSecret
 #  5. login still works, the API key still works, anchor verify passes, /metrics shows the new
 #     key id (port-forward: /metrics is never reachable through the ingress)
-#  6. post-rotation backup; maintenance on; restoring the pre-rotation bundle is refused
-#     (restore/unknown_master_key, expected); restoring the post-rotation bundle passes;
+#  4b. admin master-key status must report rows_not_primary 0 before the Secret swap
+#  6. post-rotation backup --stdout through kubectl exec; maintenance on; restoring the pre-rotation bundle is refused
+#     (restore/unknown_master_key, expected); restore --stdin of the post-rotation stream passes;
 #     anchor verify; maintenance off
 #  7. admin users deactivate alice -> her API key answers 401; admin retention run --dry-run
 #
@@ -118,7 +119,9 @@ if grep -q "$(tail -c 20 "$KEY_DIR/next" | tr -d '\n')" "$WORK/admin.out"; then
   fail "the rotation output contains key material"
 fi
 
-# 4. Swap the main Secret to the new key; drop the next one.
+# 4. The swap gate (master-key status), then swap the main Secret to the new key.
+admin master-key status || fail "master-key status: $(cat "$WORK/admin.out")"
+grep -q '"rows_not_primary":0' "$WORK/admin.out" || fail "rows still under the old key: $(cat "$WORK/admin.out")"
 step "swap ${MAIN_SECRET} to ${NEW_ID}"
 $K create secret generic "$MAIN_SECRET" --from-file=key="$KEY_DIR/next" --dry-run=client -o yaml \
   | $K apply -f - > /dev/null
@@ -155,10 +158,14 @@ if printf '%s\n' "$metrics" | grep -q 'role="accepted"'; then
 fi
 
 # 6. Backup/restore across the rotation.
-step "backup (post-rotation)"
-admin backup "$BACKUPS" || fail "admin backup: $(cat "$WORK/admin.out")"
-POST_BUNDLE="$(bundle_of)"
-[ -n "$POST_BUNDLE" ] || fail "no bundle path"
+step "backup (post-rotation) streamed through kubectl exec"
+set +e
+$K exec "deploy/${RELEASE_NAME}" -- /app/atlas-duck-server admin backup --stdout \
+  > "$WORK/post.tar" 2> "$WORK/post.err"
+rc=$?
+set -e
+[ "$rc" = 0 ] || fail "backup --stdout exited $rc: $(cat "$WORK/post.err")"
+[ -s "$WORK/post.tar" ] || fail "empty backup stream"
 admin maintenance on || fail "maintenance on"
 [ "$(status_of "$BASE/readyz")" = 503 ] || fail "/readyz not 503 in maintenance"
 step "restore of the pre-rotation bundle must be refused (old key)"
@@ -166,8 +173,13 @@ if admin restore "$PRE_BUNDLE"; then
   fail "the pre-rotation bundle was restored without its key"
 fi
 grep -q 'restore/unknown_master_key' "$WORK/admin.out" || fail "refused for another reason: $(cat "$WORK/admin.out")"
-step "restore of the post-rotation bundle"
-admin restore "$POST_BUNDLE" || fail "restore: $(cat "$WORK/admin.out")"
+step "restore of the post-rotation stream through kubectl exec -i"
+set +e
+$K exec -i "deploy/${RELEASE_NAME}" -- /app/atlas-duck-server admin restore --stdin \
+  < "$WORK/post.tar" > "$WORK/admin.out" 2>&1
+rc=$?
+set -e
+[ "$rc" = 0 ] || fail "restore --stdin exited $rc: $(cat "$WORK/admin.out")"
 admin anchor verify || fail "anchor verify after the restore: $(cat "$WORK/admin.out")"
 admin maintenance off || fail "maintenance off"
 csrf="$(login)"
@@ -182,6 +194,15 @@ st="$(status_of "$BASE/api/login" -H "Origin: $BASE" -H 'Content-Type: applicati
   -d '{"username":"alice","password":"alice-test-password"}')"
 [ "$st" = 403 ] || fail "a deactivated user's login answered $st"
 admin retention run --dry-run || fail "retention dry run: $(cat "$WORK/admin.out")"
+
+# Kept bundles: the pre-rotation one and the pre-restore copy are listed and removed.
+step "prune kept bundles"
+admin backups list || fail "backups list: $(cat "$WORK/admin.out")"
+for name in $(sed -n 's/.*"name":"\([^"]*\)".*/\1/p' "$WORK/admin.out"); do
+  admin backups remove "$name" || fail "backups remove $name: $(cat "$WORK/admin.out")"
+done
+# restore --resume needs a crash mid-swap and is covered by the server's own tests
+# (a_crash_mid_restore_keeps_maintenance_and_resume_finishes_it), not by this drill.
 KEY=""
 
 echo "ops drill: ok (rotated to ${NEW_ID}; pre-rotation restore refused; post-rotation restore passed)"

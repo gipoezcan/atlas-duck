@@ -246,15 +246,18 @@ async fn run(config: Config) -> u8 {
             recover = "admin restore --resume (finish) or admin restore <data>/backups/pre-restore-* (go back), then admin maintenance off"
         );
     }
-    let admin = Arc::new(AdminCtx::new(
-        store.clone(),
-        registry.clone(),
-        state.sessions.clone(),
-        state.api_keys.clone(),
-        writer.clone(),
-        clock.clone(),
-        config.retention_days,
-    ));
+    let admin = Arc::new(
+        AdminCtx::new(
+            store.clone(),
+            registry.clone(),
+            state.sessions.clone(),
+            state.api_keys.clone(),
+            writer.clone(),
+            clock.clone(),
+            config.retention_days,
+        )
+        .with_max_stream_bytes(config.max_restore_bytes),
+    );
     let scheduler = Arc::new(Scheduler::new(admin.clone(), lookup, config.offboarding_at));
     let scheduler_task = scheduler.spawn();
     let Some(admin_task) = start_admin_socket(&config, admin) else {

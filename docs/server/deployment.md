@@ -134,10 +134,25 @@ All server jobs live in `.gitlab-ci.yml`, in the stages `server-prepare` through
 ## Rollback
 
 `helm rollback atlas-duck <revision> -n team-dux --kube-context team-dux@gip` returns to an
-earlier chart and image, with downtime (Recreate). Schema migrations only go forward: once a
-newer build has migrated `server.db`, an older build refuses to start on it (`store/newer`). After
-such an upgrade, a rollback means restoring a backup taken before the upgrade
-([backup-restore.md](backup-restore.md)). Take one before every upgrade that changes the schema.
+earlier chart and image, with downtime (Recreate), as long as the database schema did not change.
+
+Schema migrations only go forward. Once a newer build has migrated `server.db`, an older build
+refuses to start on it (`store/newer`), never opens its admin socket, and the image has no shell
+to remove the file. The newer build's own restore would migrate an old bundle forward again. So
+before every upgrade that may change the schema, stream a backup **off the cluster**
+(`admin backup --stdout > pre-upgrade.tar`, [backup-restore.md](backup-restore.md)). The rollback
+is then:
+
+1. `kubectl $NS scale deploy/atlas-duck --replicas=0` (the PVC cannot be deleted while mounted).
+2. Remove the PVC: `kubectl $NS annotate pvc atlas-duck-data helm.sh/resource-policy-` (production
+   keeps it otherwise), then `kubectl $NS delete pvc atlas-duck-data`.
+3. Deploy the older chart and image (`helm rollback` or the old pipeline's `deploy:production`);
+   Helm creates an empty PVC and the old build starts on it.
+4. `admin maintenance on`, `admin restore --stdin < pre-upgrade.tar`, `admin anchor verify`,
+   `admin maintenance off`.
+
+Everything after the pre-upgrade backup is lost. The older build must itself have
+`restore --stdin` (M13 or later): a rollback to an M12 build is not possible this way.
 
 ## Review environments
 

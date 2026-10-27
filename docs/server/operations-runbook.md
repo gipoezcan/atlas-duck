@@ -28,6 +28,7 @@ Admin commands run one at a time, and the scheduler's jobs take the same lock.
 | `backup <dir>` | A consistent snapshot of every store ([backup-restore.md](backup-restore.md)) |
 | `restore <bundle-dir>` | Restore a bundle; requires maintenance mode. The live data is first kept as the bundle `backups/pre-restore-<stamp>` |
 | `backup --stdout` / `restore --stdin` | The same, as a tar stream through `kubectl exec` (`> bundle.tar` / `-i ... < bundle.tar`); the streamed backup is not kept on the volume |
+| `backups list` / `backups remove <name>` / `backups export <name> --stdout` | Bundles kept in `<data>/backups`: list with size and completeness, remove (anchored `BACKUP_REMOVED`), stream off the cluster |
 | `master-key status` | Loaded key ids and how many users each wraps; `rows_not_primary` must be 0 before a key Secret swap |
 | `restore --resume` | Finish a restore that a crash interrupted (`/readyz` reason `restore_interrupted`) |
 | `rotate-master-key --new-key-file <path>` | Re-wrap every data key ([master-key-rotation.md](master-key-rotation.md)) |
@@ -44,7 +45,9 @@ Admin commands run one at a time, and the scheduler's jobs take the same lock.
     - `master_key_mismatch`: some data key is wrapped under a key id that is not loaded, for
       example after a rotation that was not finished
       ([master-key-rotation.md](master-key-rotation.md)).
-    - `maintenance`.
+    - `maintenance`;
+    - `restore_interrupted` (with `maintenance`): a crash cut a restore; `admin restore
+      --resume`, or a restore of the pre-restore bundle.
   - `degraded: ["directory_unreachable"]` comes with a **200** (PD-M13-13). Logged-in users keep
     working, new logins fail with `auth/directory_unavailable`, and the probe result is cached
     for 30 s.

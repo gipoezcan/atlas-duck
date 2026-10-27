@@ -6,6 +6,7 @@
 
 pub mod anchor;
 pub mod backup;
+pub mod backups;
 pub mod client;
 pub mod instances;
 pub mod maintenance;
@@ -58,6 +59,8 @@ pub struct AdminCtx {
     pub writer: Arc<AnchorWriter>,
     pub clock: Arc<dyn Clock>,
     pub retention_days: u32,
+    /// Final review M4: the most file data a streamed restore accepts.
+    pub max_stream_bytes: u64,
     /// Admin operations run one at a time.
     ops: tokio::sync::Mutex<()>,
 }
@@ -80,12 +83,19 @@ impl AdminCtx {
             writer,
             clock,
             retention_days,
+            max_stream_bytes: stream::DEFAULT_MAX_STREAM_BYTES,
             ops: tokio::sync::Mutex::new(()),
         }
     }
 }
 
 impl AdminCtx {
+    /// Sets the streamed-restore bound (`ATLAS_DUCK_MAX_RESTORE_BYTES`).
+    pub fn with_max_stream_bytes(mut self, n: u64) -> AdminCtx {
+        self.max_stream_bytes = n;
+        self
+    }
+
     /// The admin operation lock: the scheduler's jobs take it too, so they never overlap a command.
     pub async fn lock_ops(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.ops.lock().await
@@ -148,6 +158,12 @@ pub struct DryRunArg {
     pub dry_run: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NameArg {
+    pub name: String,
+}
+
 /// One admin request (`{"op": "...", ...}`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -167,6 +183,10 @@ pub enum Request {
     BackupStream(NoArgs),
     /// `restore --stdin`: the request line, then the bundle as a tar stream.
     RestoreStream(NoArgs),
+    BackupsList(NoArgs),
+    BackupsRemove(NameArg),
+    /// `backups export <name> --stdout`: like `BackupStream` for a kept bundle.
+    BackupsExport(NameArg),
     RetentionRun(DryRunArg),
     AnchorVerify(NoArgs),
 }
@@ -188,6 +208,9 @@ impl Request {
             Request::MasterKeyStatus(_) => "master_key_status",
             Request::BackupStream(_) => "backup_stream",
             Request::RestoreStream(_) => "restore_stream",
+            Request::BackupsList(_) => "backups_list",
+            Request::BackupsRemove(_) => "backups_remove",
+            Request::BackupsExport(_) => "backups_export",
             Request::RetentionRun(_) => "retention_run",
             Request::AnchorVerify(_) => "anchor_verify",
         }
@@ -249,7 +272,11 @@ pub async fn handle(ctx: &AdminCtx, req: Request) -> Response {
         Request::RotateMasterKey(k) => rotate::run(ctx, &k.new_key_file).await,
         Request::MasterKeyStatus(_) => rotate::status(ctx),
         // Streams exist only on a connection (`serve_conn`).
-        Request::BackupStream(_) | Request::RestoreStream(_) => Err("admin/stream_only"),
+        Request::BackupStream(_) | Request::RestoreStream(_) | Request::BackupsExport(_) => {
+            Err("admin/stream_only")
+        }
+        Request::BackupsList(_) => backups::list(ctx),
+        Request::BackupsRemove(n) => backups::remove(ctx, &n.name),
         Request::RetentionRun(d) => retention::admin(ctx, d.dry_run).await,
         Request::AnchorVerify(_) => {
             let resp = anchor::admin(ctx);
@@ -302,6 +329,10 @@ where
             Ok(Request::BackupStream(_)) => {
                 let _one = ctx.ops.lock().await;
                 return stream::backup_out(ctx, &mut w).await;
+            }
+            Ok(Request::BackupsExport(n)) => {
+                let _one = ctx.ops.lock().await;
+                return stream::export_out(ctx, &n.name, &mut w).await;
             }
             Ok(Request::RestoreStream(_)) => {
                 let _one = ctx.ops.lock().await;

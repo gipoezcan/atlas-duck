@@ -72,6 +72,10 @@ pub struct Manifest {
     pub schema_version: u32,
     /// The master key the bundle's data keys are wrapped with (an id, never key material).
     pub master_key_id: String,
+    /// Final review I2: every key id the bundle's data keys are actually wrapped under (more than
+    /// one mid-rotation). Absent in older bundles: then `master_key_id`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_ids: Vec<String>,
     pub anchor_head: HeadRef,
     pub users: Vec<UserHeadRef>,
     pub files: Vec<FileRef>,
@@ -199,6 +203,21 @@ fn copy_user_dir(src: &Path, dst: &Path, rel: &Path, out: &mut Vec<String>) -> s
     Ok(())
 }
 
+/// The key ids the snapshot's data keys are wrapped under (tombstones carry none).
+fn snapshot_key_ids(db: &Path) -> rusqlite::Result<Vec<String>> {
+    let c = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut st = c.prepare("SELECT data_key_wrapped FROM users WHERE data_key_wrapped != ''")?;
+    let mut ids: Vec<String> = st
+        .query_map([], |r| r.get::<_, String>(0))?
+        .filter_map(Result::ok)
+        .filter_map(|w| crate::master_key::WrappedKey::from_json(&w).ok())
+        .map(|w| w.master_key_id)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
 /// The anchor-chain head and every user's latest anchored head, read from the snapshot itself.
 fn snapshot_heads(db: &Path) -> rusqlite::Result<(HeadRef, Vec<UserHeadRef>)> {
     let c = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -293,6 +312,7 @@ pub(crate) fn write_bundle(
         app_version: env!("CARGO_PKG_VERSION").to_owned(),
         schema_version: SCHEMA_VERSION,
         master_key_id,
+        key_ids: snapshot_key_ids(&bundle.join(SERVER_DB)).map_err(|_| "backup/write_failed")?,
         anchor_head,
         users: user_heads,
         files,

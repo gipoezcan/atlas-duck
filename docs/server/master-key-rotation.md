@@ -4,6 +4,22 @@ The master key wraps every user's data key (SM-6.2, ADR 0002). Rotating it re-wr
 key under a new master key. The users' stores and their audit chains stay as they are: their
 data keys do not change.
 
+**What rotation does not do (final review I5).** Rotation protects against someone who holds the
+old key but not yet the data. Anyone who once had the old key **and** `server.db` (the volume,
+a backup, a kept bundle) can unwrap every data key, and those keys stay valid for every PAT
+sealed now and later. After a suspected exposure of the key together with data, rotation alone
+is not enough:
+
+1. rotate the master key (below);
+2. tell every user to replace their Jira/Confluence PATs (revoke the old token at Atlassian, store
+   the new one on **Credentials**) and to revoke and recreate their API keys. Admins announce it
+   through the usual staff channel with the date of the suspected exposure; `admin users list`
+   gives the accounts to follow up;
+3. remove or re-take kept bundles (`admin backups list`/`remove`) and treat off-cluster copies
+   taken before the rotation as exposed.
+
+Re-sealing data with new data keys is not implemented (follow-up work).
+
 ## When
 
 - The key may have been exposed: a Secret read by someone who should not have, a lost medium,
@@ -51,7 +67,7 @@ A="kubectl $NS exec deploy/atlas-duck -- /app/atlas-duck-server admin"
    left under the old key, and `MASTER_KEY_ROTATED {old_key_id, new_key_id}` goes into the anchor
    chain. The output shows key ids and counts only, ending with `rows_not_primary: 0`. A restart
    while the next key is mounted and already in use keeps it as the primary.
-4. Check before the swap: ` master-key status` must show `rows_not_primary: 0`. If not, run
+4. Check before the swap: `$A master-key status` must show `rows_not_primary: 0`. If not, run
    step 3 again.
 5. Swap the production Secret to the new key, then remove the next one:
 
@@ -78,9 +94,17 @@ A="kubectl $NS exec deploy/atlas-duck -- /app/atlas-duck-server admin"
   old key (`already_rewrapped` counts the others).
 - **`/readyz` says `master_key_mismatch` after step 4.** The pod runs a key that does not open
   some data keys. Usually the Secret was not swapped, or the old key was mounted again after the
-  rotation finished. Mount the key whose id the users' data keys carry (the new one), or set
-  `masterKey.nextSecret` to it again.
+  rotation finished. Mount the key whose id the users' data keys carry (the new one, from the
+  offline medium) as `atlas-duck-master-key`. After step 5 the `-next` Secret is gone, and the old
+  key lives only in escrow.
 - **`rotate/concurrent_change`.** A row changed during the run. Run it again.
-- **A restore of a pre-rotation backup** needs the old key mounted as the master key. The restore
-  refuses a bundle whose data keys the loaded key cannot open (`restore/unknown_master_key`).
-  Restoring an old backup after a rotation means: mount the old key, restore, then rotate again.
+- **A restore of a pre-rotation backup** needs the old key loaded, not necessarily as the
+  primary. The restore accepts a bundle when every key id its manifest lists is loaded and every
+  data key opens (`restore/unknown_master_key` otherwise). The procedure:
+  1. Mount the old key from escrow as the next key: create a Secret (for example
+     `atlas-duck-master-key-old`, item `key`), set `masterKey.nextSecret` to it, and deploy. The new
+     key stays `atlas-duck-master-key`.
+  2. `admin maintenance on`, restore the bundle, `admin anchor verify`.
+  3. The restored rows are under the old key. To move them to the new key, rotate with the new key
+     as the next key: swap the two (old as `atlas-duck-master-key`, new as `masterKey.nextSecret`),
+     deploy, then run steps 3 to 7.

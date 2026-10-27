@@ -34,8 +34,15 @@ kubectl $NS exec deploy/atlas-duck -- /app/atlas-duck-server admin backup --stdo
 # the report ({"bundle": …, "manifest_sha256": …}) goes to stderr
 ```
 
+- The command exits 0 only when the whole stream arrived: the server ends it with a trailer
+  (length and SHA-256 of the tar) that the client checks; a short or damaged stream exits 1
+  (`admin/stream_truncated`, `admin/stream_mismatch`). Check the exit code in every backup job.
+- Verify a copy: `tar tf bundle.tar` lists `manifest.json` and the files, and
+  `tar xOf bundle.tar <bundle>/manifest.json | sha256sum` equals the reported `manifest_sha256`.
+  Do not repack the tar: the restore reads plain ustar entries only.
 - The server takes the snapshot into `<data>/backups`, sends it as a tar stream after its report,
-  and removes it from the volume. Keep the `.tar` in the agreed backup store, and record the
+  and removes it from the volume once the stream and its trailer went out (if the stream breaks,
+  the bundle stays: `admin backups export <name> --stdout` sends it again). Keep the `.tar` in the agreed backup store, and record the
   `manifest_sha256`; the anchor chain's `BACKUP_TAKEN` row carries the same value.
 - `admin backup /var/lib/atlas-duck/backups` keeps a bundle on the volume instead (for example
   before an upgrade). A copy on the same PVC does not survive the loss of the PVC.
@@ -44,6 +51,24 @@ kubectl $NS exec deploy/atlas-duck -- /app/atlas-duck-server admin backup --stdo
 - Schedule: daily, operator-run, until a CronJob-free schedule is agreed. A CronJob cannot mount
   the RWO volume (ADR 0003). Also take one before every upgrade that may change the schema
   ([deployment.md](deployment.md), "Rollback").
+
+### Kept bundles
+
+Bundles stay in `<data>/backups` when taken with `admin backup <dir>`, when a restore saves the
+live data (`pre-restore-<stamp>`), when a stream broke, or as an interrupted upload
+(`upload-<stamp>`). They use volume space and, for as long as they exist, keep chains that
+retention deleted later (SM-6.5). Prune them, with
+`A="kubectl $NS exec deploy/atlas-duck -- /app/atlas-duck-server admin"`:
+
+```sh
+$A backups list                                  # name, complete, created_at, bytes
+$A backups export <name> --stdout > <name>.tar   # copy off the cluster first
+$A backups remove <name>                         # recorded in the anchor chain (BACKUP_REMOVED)
+```
+
+Check `backups list` after every restore and weekly. `admin backup` also accepts `/tmp` as a
+target, but that is a 1 GiB emptyDir in the chart: a larger backup there gets the pod evicted. Do
+not use it in production.
 
 ### Copying files in and out
 
@@ -89,7 +114,9 @@ Every restore first writes the live data as a full bundle,
 5. `admin maintenance off`.
 
 A restore needs about **three times** the live data in free space: the staging copy, the
-pre-restore bundle, and the live data.
+pre-restore bundle, and the live data. A `restore --stdin` needs **four times** (the upload stays
+until the restore ends). The stream is refused above `ATLAS_DUCK_MAX_RESTORE_BYTES` (default
+8 GiB).
 
 ### A restore interrupted mid-swap
 

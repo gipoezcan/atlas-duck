@@ -80,6 +80,8 @@ pub struct Config {
     /// SM-6.5 retention period of a deactivated user's chain.
     pub retention_days: u32,
     pub service_bind: Option<ServiceBind>,
+    /// Final review M4: the most file data `admin restore --stdin` accepts.
+    pub max_restore_bytes: u64,
 }
 
 /// A refused configuration: a fixed code and the key it concerns. Never carries a value.
@@ -123,6 +125,9 @@ pub const ANCHOR_INTERVAL_SECS: &str = "ATLAS_DUCK_ANCHOR_INTERVAL_SECS";
 pub const RUST_LOG: &str = "RUST_LOG";
 pub const ADMIN_SOCKET: &str = "ATLAS_DUCK_ADMIN_SOCKET";
 pub const OFFBOARDING_AT: &str = "ATLAS_DUCK_OFFBOARDING_AT";
+pub const MAX_RESTORE_BYTES: &str = "ATLAS_DUCK_MAX_RESTORE_BYTES";
+/// 8 GiB: above the production volume's data, far below a filled disk.
+pub const DEFAULT_MAX_RESTORE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub const RETENTION_DAYS: &str = "ATLAS_DUCK_RETENTION_DAYS";
 pub const SERVICE_BIND_DN: &str = "ATLAS_DUCK_LDAP_SERVICE_BIND_DN";
 pub const SERVICE_BIND_PASSWORD_FILE: &str = "ATLAS_DUCK_LDAP_SERVICE_BIND_PASSWORD_FILE";
@@ -275,6 +280,7 @@ impl Config {
             rust_log: get(RUST_LOG).unwrap_or_else(|| "info".into()),
             offboarding_at,
             retention_days,
+            max_restore_bytes: positive(MAX_RESTORE_BYTES, DEFAULT_MAX_RESTORE_BYTES)?,
             service_bind,
             admin_socket: PathBuf::from(
                 get(ADMIN_SOCKET).unwrap_or_else(|| DEFAULT_ADMIN_SOCKET.into()),

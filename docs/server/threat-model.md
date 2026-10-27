@@ -49,7 +49,14 @@ Mitigations, none of which remove the risk:
   read the PVs.
 - Create the key out of band and keep it in two-person offline escrow
   ([deployment.md](deployment.md)). It never passes through CI.
-- Rotate on staff change, on suspected exposure, and yearly
+- Rotate on staff change and yearly. Rotation only re-wraps: it does not change data keys, so
+  after a suspected exposure of the key together with data (volume, backup or kept bundle) users
+  must also replace their PATs and API keys ([master-key-rotation.md](master-key-rotation.md));
+  re-sealing with new data keys is follow-up work.
+- Keep few bundles: every bundle on the volume or off-cluster (`admin backups list`) widens the
+  `PV backend + Secret` exposure to past data and to chains retention has since deleted. Prune
+  with `admin backups remove`.
+- Rotate on suspected exposure too, and yearly
   ([master-key-rotation.md](master-key-rotation.md)).
 - If the cluster's audit logging is available, alert on reads of `atlas-duck-master-key`.
 - Users should give PATs the least permissions their work needs, and rotate them.
@@ -59,6 +66,13 @@ mounted key file. That is the same risk as reading the Secret. The admin CLI its
 key material, PATs or audit contents.
 
 ## Further residual risks
+
+- **Review deploys share the namespace.** `deploy:review` runs `kubectl` with the `team-dux`
+  context from any branch whose server paths changed, in the namespace that holds
+  `atlas-duck-master-key`. If that context is available to pipelines of unprotected branches,
+  anyone who can push a branch can read the production key. Either restrict the cluster context
+  to protected refs (and give review environments a separate namespace), or accept this as part
+  of the ADR 0002 risk: whoever can run CI with the context can read Secrets.
 
 - **Plain HTTP between the ingress and the pod.** TLS ends at the ingress controller; inside the
   cluster the traffic is plain HTTP. The NetworkPolicy admits only the ingress and monitoring

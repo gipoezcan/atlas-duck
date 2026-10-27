@@ -35,6 +35,8 @@ pub const KIND_USER_DEACTIVATED: &str = "USER_DEACTIVATED";
 pub const KIND_MASTER_KEY_ROTATED: &str = "MASTER_KEY_ROTATED";
 pub const KIND_CHAIN_DELETED: &str = "CHAIN_DELETED";
 pub const KIND_BACKUP_TAKEN: &str = "BACKUP_TAKEN";
+/// Final review I3: an on-volume bundle removed by `admin backups remove`.
+pub const KIND_BACKUP_REMOVED: &str = "BACKUP_REMOVED";
 pub const KIND_RESTORED: &str = "RESTORED";
 pub const KIND_RETENTION_RUN: &str = "RETENTION_RUN";
 pub const KIND_MAINTENANCE: &str = "MAINTENANCE";

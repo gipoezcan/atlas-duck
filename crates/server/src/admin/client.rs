@@ -10,8 +10,8 @@ use std::io::Write;
 use serde_json::{Map, Value};
 
 use super::{
-    AliasArg, DirArg, DryRunArg, InstanceArgs, KeyFileArg, NoArgs, Request, Response, SwitchArg,
-    UsernameArg,
+    AliasArg, DirArg, DryRunArg, InstanceArgs, KeyFileArg, NameArg, NoArgs, Request, Response,
+    SwitchArg, UsernameArg,
 };
 use crate::cli::{EXIT_OK, EXIT_RUNTIME, EXIT_USAGE};
 use crate::config::{ADMIN_SOCKET, DEFAULT_ADMIN_SOCKET};
@@ -30,6 +30,7 @@ pub const USAGE: &str = "usage: atlas-duck-server admin <command>
   restore --resume      (finish a restore a crash interrupted)
   backup --stdout       (a bundle as a tar stream on stdout; report on stderr)
   restore --stdin       (a bundle tar stream from stdin; maintenance on first)
+  backups list | backups remove <name> | backups export <name> --stdout
   rotate-master-key --new-key-file <path>   (the mounted next key)
   master-key status
   retention run [--dry-run]
@@ -66,6 +67,17 @@ pub fn parse(args: &[String]) -> Option<Parsed> {
         ["backup", dir] if !dir.starts_with('-') => Some(Parsed::Run(Request::Backup(DirArg {
             dir: (*dir).to_owned(),
         }))),
+        ["backups", "list"] => Some(Parsed::Run(Request::BackupsList(NoArgs {}))),
+        ["backups", "remove", name] if !name.starts_with('-') => {
+            Some(Parsed::Run(Request::BackupsRemove(NameArg {
+                name: (*name).to_owned(),
+            })))
+        }
+        ["backups", "export", name, "--stdout"] if !name.starts_with('-') => {
+            Some(Parsed::Run(Request::BackupsExport(NameArg {
+                name: (*name).to_owned(),
+            })))
+        }
         ["backup", "--stdout"] => Some(Parsed::Run(Request::BackupStream(NoArgs {}))),
         ["restore", "--stdin"] => Some(Parsed::Run(Request::RestoreStream(NoArgs {}))),
         ["restore", "--resume"] => Some(Parsed::Run(Request::RestoreResume(NoArgs {}))),
@@ -169,7 +181,10 @@ pub fn run(args: &[String]) -> u8 {
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| DEFAULT_ADMIN_SOCKET.to_owned());
-    if matches!(req, Request::BackupStream(_) | Request::RestoreStream(_)) {
+    if matches!(
+        req,
+        Request::BackupStream(_) | Request::RestoreStream(_) | Request::BackupsExport(_)
+    ) {
         return send_stream(std::path::Path::new(&path), &req);
     }
     match send(std::path::Path::new(&path), &req) {
@@ -226,9 +241,16 @@ pub fn send_stream(path: &std::path::Path, req: &Request) -> u8 {
         return EXIT_UNREACHABLE;
     }
     if matches!(req, Request::RestoreStream(_)) {
-        if std::io::copy(&mut std::io::stdin().lock(), &mut s).is_err()
-            || s.shutdown(Shutdown::Write).is_err()
-        {
+        // Final review M2: a server that refuses early closes the socket while stdin is still
+        // being copied; its answer line is still there to read.
+        let sent = std::io::copy(&mut std::io::stdin().lock(), &mut s).is_ok();
+        let _ = s.shutdown(Shutdown::Write);
+        if !sent {
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            if let Ok(resp) = serde_json::from_slice::<Response>(&buf) {
+                return finish(&resp);
+            }
             error_line("admin/stream_failed");
             return EXIT_RUNTIME;
         }
@@ -261,16 +283,61 @@ pub fn send_stream(path: &std::path::Path, req: &Request) -> u8 {
     if let Some(d) = &resp.data {
         print_data(&mut std::io::stderr(), d);
     }
+    let tar_bytes = resp
+        .data
+        .as_ref()
+        .and_then(|d| d["tar_bytes"].as_u64())
+        .unwrap_or(0);
     let mut out = std::io::stdout().lock();
-    if std::io::copy(&mut r, &mut out).is_err() || out.flush().is_err() {
-        error_line("admin/stream_failed");
-        return EXIT_RUNTIME;
+    match copy_verified(&mut r, &mut out, tar_bytes) {
+        Ok(()) => EXIT_OK,
+        Err(code) => {
+            error_line(code);
+            EXIT_RUNTIME
+        }
     }
-    EXIT_OK
 }
 
 #[cfg(not(unix))]
 pub fn send_stream(_path: &std::path::Path, _req: &Request) -> u8 {
     error_line("admin/unsupported_platform");
     EXIT_UNREACHABLE
+}
+
+/// Final review I1: copies exactly `tar_bytes` of a streamed bundle to `out`, then checks the
+/// server's trailer (length and SHA-256). A short stream or a mismatch is an error, so a
+/// truncated `backup --stdout` never exits 0.
+pub fn copy_verified<R: std::io::BufRead, W: Write>(
+    r: &mut R,
+    out: &mut W,
+    tar_bytes: u64,
+) -> Result<(), &'static str> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let mut left = tar_bytes;
+    let mut buf = vec![0u8; 64 * 1024];
+    while left > 0 {
+        let want = buf.len().min(usize::try_from(left).unwrap_or(buf.len()));
+        let got = r
+            .read(&mut buf[..want])
+            .map_err(|_| "admin/stream_truncated")?;
+        if got == 0 {
+            return Err("admin/stream_truncated");
+        }
+        h.update(&buf[..got]);
+        out.write_all(&buf[..got])
+            .map_err(|_| "admin/stream_failed")?;
+        left -= got as u64;
+    }
+    out.flush().map_err(|_| "admin/stream_failed")?;
+    let mut line = Vec::new();
+    r.read_until(b'\n', &mut line)
+        .map_err(|_| "admin/stream_truncated")?;
+    let trailer: Value = serde_json::from_slice(&line).map_err(|_| "admin/stream_truncated")?;
+    let sha = hex::encode(h.finalize());
+    if trailer["tar_bytes"].as_u64() != Some(tar_bytes) || trailer["sha256"].as_str() != Some(&sha)
+    {
+        return Err("admin/stream_mismatch");
+    }
+    Ok(())
 }

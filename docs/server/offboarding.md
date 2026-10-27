@@ -94,3 +94,7 @@ deactivates them.
 - `admin retention run --dry-run` lists what is due without deleting anything.
 
 An auditor who needs a chain longer than the period must export it before `retention_until`.
+
+Backups are not touched by retention: a bundle taken before a chain was deleted still contains
+it. Keep off-cluster backups only as long as the backup policy needs them, and remove kept
+bundles on the volume with `admin backups remove` ([backup-restore.md](backup-restore.md)).
