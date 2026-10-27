@@ -280,7 +280,7 @@ server:image:
     KUBERNETES_CPU_REQUEST: "2000m"
     KUBERNETES_CPU_LIMIT: "4000m"
     KUBERNETES_MEMORY_REQUEST: "6Gi"
-    KUBERNETES_MEMORY_LIMIT: "12Gi"
+    KUBERNETES_MEMORY_LIMIT: "8Gi"
   script:
     - mkdir -p /kaniko/.docker
     # The registry login lands in the job's own filesystem only (as dux-deploy), never in a log.
