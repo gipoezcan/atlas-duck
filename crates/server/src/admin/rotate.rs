@@ -40,7 +40,11 @@ pub fn run_with(
     }
     let users = ctx.store.users_all().map_err(|_| "store/unavailable")?;
     let (mut rewrapped, mut already) = (0usize, 0usize);
-    for (u, _) in &users {
+    for (u, s) in &users {
+        // A retention tombstone has no data key left to re-wrap (T8).
+        if s.chain_deleted_at.is_some() || u.data_key_wrapped.is_empty() {
+            continue;
+        }
         let w =
             WrappedKey::from_json(&u.data_key_wrapped).map_err(|_| "rotate/data_key_invalid")?;
         if w.master_key_id == new_id {

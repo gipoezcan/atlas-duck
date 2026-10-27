@@ -85,7 +85,11 @@ async fn verify_staged(
         return Err("restore/anchor_chain_invalid");
     }
     let users = staged.users_all().map_err(|_| "restore/store_invalid")?;
-    for (u, _) in &users {
+    // Retention tombstones (T8) carry no data key and no store: nothing to check or open.
+    let live = |u: &crate::store::UserRecord, s: &crate::store::UserState| {
+        s.chain_deleted_at.is_none() && !u.data_key_wrapped.is_empty()
+    };
+    for (u, _) in users.iter().filter(|(u, s)| live(u, s)) {
         let w =
             WrappedKey::from_json(&u.data_key_wrapped).map_err(|_| "restore/data_key_invalid")?;
         match deps.master.unwrap(&u.user_id, &w) {
@@ -104,7 +108,7 @@ async fn verify_staged(
         sse_capacity: deps.sse_capacity,
     };
     let mut heads = Vec::new();
-    for (u, _) in &users {
+    for (u, _) in users.iter().filter(|(u, s)| live(u, s)) {
         let want = m.users.iter().find(|h| h.user_id == u.user_id);
         let dir = crate::users::user_dir(staging, &u.user_id);
         if want.is_none() && !dir.exists() {

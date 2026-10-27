@@ -573,3 +573,24 @@ async fn restore_keeps_previous_data_as_dated_dir_until_admin_prunes() {
     assert_eq!(kept, 2);
     within(s.ctx.registry.close_all()).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backup_and_restore_after_retention_keep_the_tombstone() {
+    let s = sqlite_harness("k1", KEY_A);
+    let a = s.user("alice").await;
+    s.user("carol").await;
+    // Alice was deactivated long ago and retention deleted her chain.
+    s.store().user_deactivate(&a, 0, "admin", 0).unwrap();
+    let r = crate::admin::retention::run(&s.ctx, false).await.unwrap();
+    assert_eq!(r.deleted, 1);
+    let report = s.backup(&s.backups()).await;
+    let bundle = report["bundle"].as_str().unwrap().to_owned();
+    s.maintenance(true).await;
+    let r = s.restore(&bundle).await;
+    assert!(r.ok, "{r:?}");
+    let st = s.store().user_state(&a).unwrap().unwrap();
+    assert!(st.chain_deleted_at.is_some() && st.deactivated_at.is_some());
+    assert_eq!(s.store().user(&a).unwrap().unwrap().data_key_wrapped, "");
+    verify(s.store()).unwrap();
+    within(s.ctx.registry.close_all()).await;
+}

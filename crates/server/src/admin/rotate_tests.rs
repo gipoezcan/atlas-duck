@@ -285,3 +285,20 @@ async fn rotate_output_contains_no_key_bytes() {
         "{shown}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotate_skips_users_whose_chain_retention_deleted() {
+    let env = Env::new();
+    let a = env.user("alice");
+    let b = env.user("bob");
+    let ctx = ctx_with(&env, Arc::new(MasterKey::for_tests("k1", OLD)));
+    // Alice was deactivated long ago and retention deleted her chain: a tombstone row remains.
+    env.store.user_deactivate(&a, 0, "admin", 0).unwrap();
+    let r = crate::admin::retention::run(&ctx, false).await.unwrap();
+    assert_eq!(r.deleted, 1);
+    let out = run_with(&ctx, MasterKey::for_tests("k2", NEW), None).unwrap();
+    assert_eq!(out["rewrapped"], 1);
+    assert_eq!(env.store.user(&a).unwrap().unwrap().data_key_wrapped, "");
+    let w = env.store.user(&b).unwrap().unwrap().data_key_wrapped;
+    assert_eq!(WrappedKey::from_json(&w).unwrap().master_key_id, "k2");
+}
