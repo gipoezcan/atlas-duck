@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atlas_duck_audit::lock::InstanceLock;
-use atlas_duck_ipc::paths::{DataDirResolution, check_data_dir};
+use atlas_duck_ipc::paths::DataDirResolution;
 use serde_json::json;
 
 use crate::admin::AdminCtx;
@@ -83,22 +83,25 @@ async fn run(config: Config) -> u8 {
     if std::fs::create_dir_all(&server_dir).is_err() {
         return fail("server_dir_unusable");
     }
-    let Ok(DataDirResolution::Local(local)) = check_data_dir(&server_dir) else {
+    let Ok(DataDirResolution::Local(local)) =
+        crate::config::check_dir(&server_dir, config.sqlite_journal)
+    else {
         return fail("server_dir_unusable");
     };
     // ADR 0003: one process per data volume.
     let Ok(_lock) = InstanceLock::acquire(&local, LOCK_HOST) else {
         return fail("server_running");
     };
-    let store: Arc<dyn ServerStore> = match SqliteStore::open(&server_dir.join("server.db")) {
-        Ok(s) => Arc::new(s),
-        Err(StoreError::Migration { from, to }) => {
-            // M13 Δ-M13-3: the file stays at `from`; an older build can still open it.
-            tracing::error!(event = "store/migration_failed", from, to);
-            return EXIT_RUNTIME;
-        }
-        Err(_) => return fail("server_store_unavailable"),
-    };
+    let store: Arc<dyn ServerStore> =
+        match SqliteStore::open_with(&server_dir.join("server.db"), config.sqlite_journal) {
+            Ok(s) => Arc::new(s),
+            Err(StoreError::Migration { from, to }) => {
+                // M13 Δ-M13-3: the file stays at `from`; an older build can still open it.
+                tracing::error!(event = "store/migration_failed", from, to);
+                return EXIT_RUNTIME;
+            }
+            Err(_) => return fail("server_store_unavailable"),
+        };
     // Batch-2 review I1: a rotation under way (the next key already wraps rows) keeps the next key
     // as the primary across restarts, so no new data key goes under the key about to retire.
     if let Some(id) = &next_id {
@@ -175,6 +178,7 @@ async fn run(config: Config) -> u8 {
             clock: clock.clone(),
             allow_http: false,
             sse_capacity: crate::runtime::SSE_CAPACITY,
+            journal: config.sqlite_journal,
         },
         config.max_open_users,
     ));

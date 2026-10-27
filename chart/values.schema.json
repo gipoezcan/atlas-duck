@@ -79,6 +79,7 @@
         "storageClassName": { "type": "string" },
         "size": { "type": "string" },
         "keep": { "type": "boolean" },
+        "sqliteJournal": { "type": "string", "enum": ["delete", "wal"] },
         "backups": {
           "type": "object",
           "properties": {

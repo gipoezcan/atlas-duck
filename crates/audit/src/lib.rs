@@ -58,10 +58,10 @@ pub mod recovery;
 mod recovery;
 pub mod request_set;
 pub mod requests;
+mod restore;
 /// The server anchor chain's pure hash functions (M12 PD-217), shared by the server and
 /// `verify-export`.
 pub mod server_anchor;
-mod restore;
 // Read-write connections, DDL and the migration runner (I-4: the writer thread is the only
 // read-write user of `audit.db`); production builds re-export only the names below.
 #[cfg(any(test, feature = "testing"))]
@@ -106,7 +106,7 @@ pub use recovery::MIN_PASSPHRASE_CHARS;
 pub use request_set::{RequestRecord, request_set_hash};
 pub use requests::{ReconcileReport, ReconciledWrite, ScriptFailedFlags, is_terminal};
 pub use restore::{RestoreReport, finish_restore, live_store_blocks_restore, restore_from_source};
-pub use schema::{DB_FILE, SCHEMA_HEAD};
+pub use schema::{DB_FILE, JournalMode, SCHEMA_HEAD};
 pub use settings::{
     FilePolicy, InstancePolicy, KEY_ALLOW_DEGRADED_SCRIPTS, RETENTION_DEFAULT, RETENTION_MIN,
     SETTING_UNCHANGED, SettingChange, Settings, is_policy_key,

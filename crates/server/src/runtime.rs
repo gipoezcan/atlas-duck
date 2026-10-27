@@ -26,7 +26,7 @@ use atlas_duck_core::decision::DecisionApi;
 use atlas_duck_core::http_factory::HttpFactory;
 use atlas_duck_core::proxy::SystemProxySource;
 use atlas_duck_core::{Confirm, Core, CoreDeps, NativeConfirmer, ShutdownReason, UiEvent, UiSink};
-use atlas_duck_ipc::paths::{DataDirResolution, check_data_dir};
+use atlas_duck_ipc::paths::DataDirResolution;
 use atlas_duck_ipc::proto::RequestHandler;
 use secrecy::SecretString;
 use serde_json::{Map, Value};
@@ -112,6 +112,8 @@ pub struct RuntimeDeps {
     pub allow_http: bool,
     /// Per-user SSE broadcast capacity ([`SSE_CAPACITY`]; tests use a small one).
     pub sse_capacity: usize,
+    /// ADR 0004: the journal mode of every user store (`ATLAS_DUCK_SQLITE_JOURNAL`).
+    pub journal: atlas_duck_audit::JournalMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,7 +231,7 @@ impl UserRuntime {
         let st = |e: String| RuntimeError::Store(e);
         let dir = user_dir(&deps.data_dir, user_id);
         std::fs::create_dir_all(&dir).map_err(|e| st(e.to_string()))?;
-        let data = match check_data_dir(&dir) {
+        let data = match crate::config::check_dir(&dir, deps.journal) {
             Ok(DataDirResolution::Local(d)) => d,
             _ => return Err(st("user dir is not a local directory".into())),
         };
@@ -242,6 +244,7 @@ impl UserRuntime {
         let open_cfg = || {
             let mut c = OpenConfig::new(Arc::new(SystemClock::new()), keys.clone());
             c.pinned_install_id = Some(user_id.to_owned());
+            c.journal = deps.journal;
             c
         };
         let exists = dir

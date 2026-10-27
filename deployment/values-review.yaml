@@ -12,10 +12,11 @@ ingress:
       issuerKind: ClusterIssuer
 
 persistence:
-  # ADR 0004: node-local ReadWriteOnce (no RWO block class exists; never NFS for SQLite).
-  storageClassName: local-path
+  # ADR 0004: the team's NFS class, ReadWriteOnce, SQLite in rollback-journal mode.
+  storageClassName: team-dux-storage
   size: 1Gi
   keep: false
+  sqliteJournal: delete
 
 testDirectory:
   enabled: true

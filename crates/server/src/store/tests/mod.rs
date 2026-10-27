@@ -540,6 +540,48 @@ fn failed_migration_leaves_v1() {
     assert_eq!(n, 1);
 }
 
+/// ADR 0004: on the NFS data volume `server.db` runs the rollback journal, `synchronous=FULL`
+/// and an exclusive lock that keeps every other connection out; a WAL file is switched over.
+#[test]
+fn sqlite_delete_mode_is_full_and_exclusive() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.db");
+    drop(SqliteStore::open(&path).unwrap()); // a WAL file from before
+    let s = SqliteStore::open_with(&path, atlas_duck_audit::JournalMode::Delete).unwrap();
+    s.upsert_user(&user(A, "alice")).unwrap();
+    {
+        let c = s.raw();
+        let q = |p: &str| -> String {
+            c.query_row(&format!("PRAGMA {p}"), [], |r| {
+                r.get::<_, rusqlite::types::Value>(0)
+            })
+            .map(|v| match v {
+                rusqlite::types::Value::Text(t) => t,
+                rusqlite::types::Value::Integer(i) => i.to_string(),
+                other => format!("{other:?}"),
+            })
+            .unwrap()
+        };
+        assert_eq!(q("journal_mode"), "delete");
+        assert_eq!(q("synchronous"), "2");
+        assert_eq!(q("locking_mode"), "exclusive");
+    }
+    assert!(!dir.path().join("server.db-wal").exists());
+    let other = rusqlite::Connection::open(&path).unwrap();
+    other.busy_timeout(std::time::Duration::ZERO).unwrap();
+    assert!(
+        other
+            .query_row("SELECT COUNT(*) FROM users", [], |r| r.get::<_, i64>(0))
+            .is_err(),
+        "a second connection is locked out"
+    );
+    drop(other);
+    drop(s);
+    // Closed: the lock is gone, and the file reopens in the same mode.
+    let s = SqliteStore::open_with(&path, atlas_duck_audit::JournalMode::Delete).unwrap();
+    assert_eq!(s.users_all().unwrap().len(), 1);
+}
+
 #[test]
 fn sqlite_file_uses_wal_and_foreign_keys() {
     let dir = tempfile::tempdir().unwrap();

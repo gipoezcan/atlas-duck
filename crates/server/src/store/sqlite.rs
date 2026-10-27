@@ -1,11 +1,13 @@
-//! The SQLite `ServerStore` (`<data>/server/server.db`): WAL, foreign keys, a 5 s busy timeout,
-//! schema v1 (PD-217 triggers make the anchor tables append-only). One connection behind a
-//! mutex: the server is a single process (ADR 0003) and every call is short.
+//! The SQLite `ServerStore` (`<data>/server/server.db`): WAL, or the rollback journal with an
+//! exclusive lock on a network volume (ADR 0004), foreign keys, a 5 s busy timeout, schema v1
+//! (PD-217 triggers make the anchor tables append-only). One connection behind a mutex: the
+//! server is a single process (ADR 0003) and every call is short.
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
+use atlas_duck_audit::JournalMode;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use super::schema::{SCHEMA_VERSION, V1};
@@ -58,7 +60,34 @@ fn to_i64(v: u64) -> StoreResult<i64> {
 impl SqliteStore {
     /// Opens (creating when absent) the database at `path`; refuses a newer schema.
     pub fn open(path: &Path) -> StoreResult<SqliteStore> {
-        Self::init(Connection::open(path).map_err(db)?)
+        Self::open_with(path, JournalMode::Wal)
+    }
+
+    /// [`SqliteStore::open`] in `journal` mode. `Delete` (ADR 0004, a data volume on NFS) also
+    /// sets `synchronous=FULL` and `locking_mode=EXCLUSIVE`: this connection is the only one
+    /// to the file (every reader goes through the store's mutex, backups through
+    /// `snapshot_to`), so the lock only keeps any other process out.
+    pub fn open_with(path: &Path, journal: JournalMode) -> StoreResult<SqliteStore> {
+        let conn = Connection::open(path).map_err(db)?;
+        conn.busy_timeout(Duration::from_millis(5000)).map_err(db)?;
+        // Before the first read: the lock mode takes effect on the next lock taken.
+        if journal == JournalMode::Delete {
+            conn.execute_batch("PRAGMA locking_mode=EXCLUSIVE; PRAGMA synchronous=FULL;")
+                .map_err(db)?;
+        }
+        let want = match journal {
+            JournalMode::Wal => "wal",
+            JournalMode::Delete => "delete",
+        };
+        let got: String = conn
+            .query_row(&format!("PRAGMA journal_mode={want}"), [], |r| r.get(0))
+            .map_err(db)?;
+        if !got.eq_ignore_ascii_case(want) {
+            return Err(StoreError::Db(format!(
+                "journal_mode {want} refused, got {got}"
+            )));
+        }
+        Self::init(conn)
     }
 
     /// An in-memory database (tests of code above the store).
@@ -68,10 +97,6 @@ impl SqliteStore {
 
     fn init(conn: Connection) -> StoreResult<SqliteStore> {
         conn.busy_timeout(Duration::from_millis(5000)).map_err(db)?;
-        // An in-memory database answers "memory"; a file one "wal".
-        let _: String = conn
-            .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
-            .map_err(db)?;
         conn.execute_batch("PRAGMA foreign_keys=ON;").map_err(db)?;
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))

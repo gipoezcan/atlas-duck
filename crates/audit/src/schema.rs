@@ -137,6 +137,39 @@ pub(crate) fn set_written_by(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// The rollback mode of a store's file. `Wal` everywhere except a server whose data volume is a
+/// network filesystem, which shares no memory map between hosts and needs the rollback journal
+/// (M13, ADR 0004).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JournalMode {
+    #[default]
+    Wal,
+    Delete,
+}
+
+impl JournalMode {
+    fn pragma(self) -> &'static str {
+        match self {
+            JournalMode::Wal => "wal",
+            JournalMode::Delete => "delete",
+        }
+    }
+}
+
+/// Puts the file in `mode` on a read-write connection and reads it back; an error unless SQLite
+/// took it (switching away from WAL needs the only connection to the file).
+pub fn apply_journal_mode(conn: &Connection, mode: JournalMode) -> rusqlite::Result<()> {
+    let got: String =
+        conn.pragma_update_and_check(None, "journal_mode", mode.pragma(), |r| r.get(0))?;
+    if !got.eq_ignore_ascii_case(mode.pragma()) {
+        return Err(other_err(format!(
+            "journal_mode {} refused, got {got}",
+            mode.pragma()
+        )));
+    }
+    Ok(())
+}
+
 /// Per-connection pragmas, read-write and read-only alike. Never sets `journal_mode` (it is a
 /// property of the file and a write on a read-only open).
 pub fn apply_connection_pragmas(conn: &Connection) -> rusqlite::Result<()> {
@@ -372,7 +405,11 @@ pub(crate) fn versions_from(conn: &Connection) -> Result<StoreVersions, OpenErro
 pub(crate) fn open_peek(path: &Path) -> Result<Connection, OpenError> {
     let mut wal = path.as_os_str().to_owned();
     wal.push("-wal");
-    if Path::new(&wal).exists() {
+    let mut journal = path.as_os_str().to_owned();
+    journal.push("-journal");
+    // A rollback journal left by a crash (journal mode DELETE) must not be read past either: a
+    // normal read-only connection refuses a hot journal instead of reading torn pages.
+    if Path::new(&wal).exists() || Path::new(&journal).exists() {
         Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,

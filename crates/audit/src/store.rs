@@ -63,6 +63,9 @@ pub struct OpenConfig {
     pub min_free_bytes: u64,
     /// `None` = the OS probe (`GetDiskFreeSpaceExW` / `statvfs`).
     pub free_space: Option<Arc<dyn FreeSpaceProbe>>,
+    /// The file's journal mode, applied when the writer opens it (default WAL; server mode on a
+    /// network volume: `Delete`).
+    pub journal: schema::JournalMode,
     /// Empty unless feature `testing`.
     pub hooks: Hooks,
 }
@@ -76,6 +79,7 @@ impl OpenConfig {
             anchor_dir: None,
             min_free_bytes: DEFAULT_MIN_FREE_BYTES,
             free_space: None,
+            journal: schema::JournalMode::Wal,
             hooks: Hooks::default(),
         }
     }
@@ -326,6 +330,7 @@ impl Store {
             shared: shared.clone(),
             hooks: cfg.hooks.clone(),
             genesis_hash: anchors.genesis_hash,
+            journal: cfg.journal,
         };
         let (tx, thread) = writer::spawn(move || init(parts))?;
         let h = lock(&shared.head).clone();

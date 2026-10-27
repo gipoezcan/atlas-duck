@@ -10,8 +10,10 @@ Kubernetes Secret) and ADR 0003 (SQLite, one replica).
 - One pod (`replicas: 1`, `strategy: Recreate`) running `atlas-duck-server serve`, with a hardened
   security context: non-root user 65532, read-only root filesystem, all capabilities dropped,
   seccomp `RuntimeDefault`, and no service-account token.
-- A `ReadWriteOnce` PVC at `/var/lib/atlas-duck` on `local-path` (node-local; ADR 0004), holding
-  `server/server.db` and one store per user. Production marks it `helm.sh/resource-policy: keep`.
+- A `ReadWriteOnce` PVC at `/var/lib/atlas-duck` on `team-dux-storage` (NFS; ADR 0004), holding
+  `server/server.db` and one store per user, all in SQLite's rollback-journal mode
+  (`ATLAS_DUCK_SQLITE_JOURNAL=delete`, never WAL on NFS). Production marks it
+  `helm.sh/resource-policy: keep`.
 - A second PVC on `team-dux-storage` (NFS) at `/var/lib/atlas-duck-backups` for the scheduler's
   daily backup bundles (newest 14 kept).
 - Secrets created outside the chart, mounted read-only as files:
@@ -33,7 +35,7 @@ stored in `server.db`.
 
 | # | Question | Answer |
 |---|---|---|
-| Q1 | Storage | Live data on `local-path` (no RWO block class exists, NFS is out for SQLite), daily backups on `team-dux-storage` (ADR 0004) |
+| Q1 | Storage | Live data and daily backups on `team-dux-storage` (NFS; `local-path` is not provisioned and no RWO block class exists), SQLite in rollback-journal mode (ADR 0004) |
 | Q2 | Hosts | `atlas-duck.dux.intern.gipmbh.de`; reviews `<slug>.atlas-duck.dux.intern.gipmbh.de` (`REVIEW_DOMAIN`) |
 | Q3 | TLS | cert-manager per host: `atlas-duck-tls`, reviews `atlas-duck-<slug>-tls` |
 | Q4 | Directory | `ldaps://sro-ad-4.intern.gipmbh.de:636`, `@gipmbh.de`, `DC=intern,DC=gipmbh,DC=de`; users and admins `CN=G-DUX,OU=Teams,OU=Gruppen,DC=intern,DC=gipmbh,DC=de`; no auditors group |

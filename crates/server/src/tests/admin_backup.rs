@@ -46,8 +46,13 @@ fn sqlite_harness_with(key_id: &str, key: [u8; 32], backup_dir: Option<PathBuf>,
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir_all(data.join("server")).unwrap();
-    let store: Arc<dyn ServerStore> =
-        Arc::new(SqliteStore::open(&data.join("server").join("server.db")).unwrap());
+    let store: Arc<dyn ServerStore> = Arc::new(
+        SqliteStore::open_with(
+            &data.join("server").join("server.db"),
+            atlas_duck_audit::JournalMode::Delete,
+        )
+        .unwrap(),
+    );
     store
         .instance_put(&InstanceRecord {
             alias: "work".into(),
@@ -68,6 +73,7 @@ fn sqlite_harness_with(key_id: &str, key: [u8; 32], backup_dir: Option<PathBuf>,
             clock: clock.clone(),
             allow_http: true,
             sse_capacity: crate::runtime::SSE_CAPACITY,
+            journal: atlas_duck_audit::JournalMode::Delete,
         },
         10,
     ));

@@ -45,7 +45,7 @@ pub use pinned::{
 };
 pub use resolve::{
     DataDirResolution, LocalDataDir, REASON_DATA_DIR_MISSING, REASON_DATA_DIR_NOT_LOCAL,
-    check_data_dir, resolve_data_dir,
+    check_data_dir, check_data_dir_allowing_network, resolve_data_dir,
 };
 
 /// Folder name used under every per-OS base folder.

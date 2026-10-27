@@ -140,6 +140,7 @@ impl H {
                 clock: clock.clone(),
                 allow_http: true,
                 sse_capacity: crate::runtime::SSE_CAPACITY,
+                journal: atlas_duck_audit::JournalMode::Delete,
             },
             10,
         ));

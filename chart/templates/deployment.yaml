@@ -92,6 +92,9 @@ spec:
               value: /etc/atlas-duck/ca/ca.pem
             - name: ATLAS_DUCK_ADMIN_SOCKET
               value: /run/atlas-duck/admin.sock
+            # ADR 0004: the rollback journal on the NFS data volume.
+            - name: ATLAS_DUCK_SQLITE_JOURNAL
+              value: {{ .Values.persistence.sqliteJournal | default "delete" | quote }}
             {{- if .Values.persistence.backups.enabled }}
             - name: ATLAS_DUCK_BACKUP_DIR
               value: /var/lib/atlas-duck-backups/bundles

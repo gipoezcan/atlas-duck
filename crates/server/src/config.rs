@@ -7,10 +7,13 @@
 
 use std::fmt;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use atlas_duck_ipc::paths::{DataDirResolution, LocalDataDir, check_data_dir};
+use atlas_duck_audit::JournalMode;
+use atlas_duck_ipc::paths::{
+    DataDirResolution, LocalDataDir, check_data_dir, check_data_dir_allowing_network,
+};
 use url::Url;
 
 /// The one production switch of every server-mode plan.
@@ -85,6 +88,9 @@ pub struct Config {
     /// ADR 0004: the daily scheduled backup target (a second volume) and how many bundles stay.
     pub backup_dir: Option<PathBuf>,
     pub backup_keep: u32,
+    /// ADR 0004: the journal mode of `server.db` and every user store. `Delete` (the default)
+    /// for a data volume on NFS, which shares no WAL index between hosts.
+    pub sqlite_journal: JournalMode,
 }
 
 /// A refused configuration: a fixed code and the key it concerns. Never carries a value.
@@ -132,6 +138,7 @@ pub const MAX_RESTORE_BYTES: &str = "ATLAS_DUCK_MAX_RESTORE_BYTES";
 pub const BACKUP_DIR: &str = "ATLAS_DUCK_BACKUP_DIR";
 pub const BACKUP_KEEP: &str = "ATLAS_DUCK_BACKUP_KEEP";
 pub const DEFAULT_BACKUP_KEEP: u32 = 14;
+pub const SQLITE_JOURNAL: &str = "ATLAS_DUCK_SQLITE_JOURNAL";
 /// 8 GiB: above the production volume's data, far below a filled disk.
 pub const DEFAULT_MAX_RESTORE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub const RETENTION_DAYS: &str = "ATLAS_DUCK_RETENTION_DAYS";
@@ -146,6 +153,15 @@ pub const DEFAULT_ADMIN_SOCKET: &str = "/run/atlas-duck/admin.sock";
 
 /// SM-6.3 "at least every 15 minutes".
 pub const MAX_ANCHOR_INTERVAL_SECS: u64 = 900;
+
+/// The locality check of every server data directory (ADR 0004): a network filesystem is accepted
+/// only with the rollback journal; with WAL the directory must be local, as on the desktop.
+pub fn check_dir(path: &Path, journal: JournalMode) -> std::io::Result<DataDirResolution> {
+    match journal {
+        JournalMode::Delete => check_data_dir_allowing_network(path),
+        JournalMode::Wal => check_data_dir(path),
+    }
+}
 
 fn err(code: &'static str, key: &'static str) -> ConfigError {
     ConfigError { code, key }
@@ -179,7 +195,12 @@ impl Config {
             None => SocketAddr::from(([0, 0, 0, 0], 8080)),
             Some(v) => v.parse().map_err(|_| err("config/invalid_value", LISTEN))?,
         };
-        let data_dir = match check_data_dir(&PathBuf::from(required(DATA_DIR)?)) {
+        let sqlite_journal = match get(SQLITE_JOURNAL).as_deref() {
+            None | Some("delete") => JournalMode::Delete,
+            Some("wal") => JournalMode::Wal,
+            Some(_) => return Err(err("config/invalid_value", SQLITE_JOURNAL)),
+        };
+        let data_dir = match check_dir(&PathBuf::from(required(DATA_DIR)?), sqlite_journal) {
             Ok(DataDirResolution::Local(d)) => d,
             _ => return Err(err("config/data_dir_invalid", DATA_DIR)),
         };
@@ -292,6 +313,7 @@ impl Config {
                 BACKUP_KEEP,
                 positive(BACKUP_KEEP, u64::from(DEFAULT_BACKUP_KEEP))?,
             )?,
+            sqlite_journal,
             service_bind,
             admin_socket: PathBuf::from(
                 get(ADMIN_SOCKET).unwrap_or_else(|| DEFAULT_ADMIN_SOCKET.into()),
@@ -414,6 +436,7 @@ mod tests {
         assert_eq!(c.offboarding_at, (2, 0));
         assert_eq!(c.retention_days, 365);
         assert_eq!(c.service_bind, None);
+        assert_eq!(c.sqlite_journal, JournalMode::Delete);
         assert_eq!(c.groups.auditors, None);
         assert_eq!(c.public_origin(), "https://duck.example.test");
         assert!(c.cookie_secure());
@@ -596,6 +619,21 @@ mod tests {
             assert_eq!(
                 code(Env::ok().set(RETENTION_DAYS, bad)),
                 ("config/invalid_value", RETENTION_DAYS),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_journal_is_delete_unless_wal_is_asked_for() {
+        let c = Env::ok().set(SQLITE_JOURNAL, "wal").load().unwrap();
+        assert_eq!(c.sqlite_journal, JournalMode::Wal);
+        let c = Env::ok().set(SQLITE_JOURNAL, "delete").load().unwrap();
+        assert_eq!(c.sqlite_journal, JournalMode::Delete);
+        for bad in ["WAL", "truncate", "memory", "off"] {
+            assert_eq!(
+                code(Env::ok().set(SQLITE_JOURNAL, bad)),
+                ("config/invalid_value", SQLITE_JOURNAL),
                 "{bad}"
             );
         }
