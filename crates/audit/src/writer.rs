@@ -911,7 +911,10 @@ impl Writer {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             &parts.hooks,
         )?;
-        schema::apply_journal_mode(&conn, parts.journal).map_err(sql_open)?;
+        // WAL (the desktop) is already set by create_v1: nothing to do, as before M13.
+        if parts.journal != schema::JournalMode::Wal {
+            schema::apply_journal_mode(&conn, parts.journal).map_err(sql_open)?;
+        }
         let head = Head {
             seq: 0,
             hash: ZERO_HASH,
@@ -932,8 +935,11 @@ impl Writer {
             &parts.hooks,
         )?;
         schema::gate_open_connection_up_to(&conn, parts.hooks.schema_head())?;
-        // After the gate, so a newer store's file is left as it is.
-        schema::apply_journal_mode(&conn, parts.journal).map_err(sql_open)?;
+        // After the gate, so a newer store's file is left as it is. A WAL store (the desktop) is
+        // not touched at all, as before M13.
+        if parts.journal != schema::JournalMode::Wal {
+            schema::apply_journal_mode(&conn, parts.journal).map_err(sql_open)?;
+        }
         let row: Option<HeadRow> = conn
             .query_row(
                 "SELECT seq, record_hash, chain_id, epoch, ts_utc, flags, event_type FROM events \

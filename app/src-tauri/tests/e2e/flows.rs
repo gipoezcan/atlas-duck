@@ -900,8 +900,14 @@ async fn ui06(rig: &Rig) -> Result<()> {
     );
     ensure!(parse_envelope(&stdout).is_some(), "{stdout}");
 
-    // Verify now, in the Audit window.
+    // Verify now, in the Audit window, once its first audit_status answered (as s09 does): CI runs
+    // 40539121689 and 40543353030 clicked straight after the window opened and the click left
+    // neither "Verifying" nor a result.
     rig.open_window("Audit", "Audit").await?;
+    wait_text(wd, "the incident count (audit_status)", WAIT, |t| {
+        t.contains("No open integrity incidents.")
+    })
+    .await?;
     let verify = wd
         .wait_find_xpath("//button[normalize-space()='Verify now']", WAIT)
         .await?;
