@@ -4,6 +4,8 @@ The cluster offers no ReadWriteOnce block storage class, and `local-path` is not
 
 ## Consequences
 
+The NFS driver does not apply `fsGroup`, so a new volume's root belongs to root. The server stays uid 65532 but gets supplemental group 0 (chart `supplementalGroups`, as dux-deployment-bot runs) to create its directories there. Whatever it creates is its own and closed to others: `server/` is 0700. A refused data directory is logged with the check, the path, the error kind and the root's `uid:gid mode`.
+
 SQLite on NFS is safe only with exactly one writing host. That depends on the single replica, `Recreate`, the instance lock in the data directory and the exclusive lock on `server.db`. It still relies on the NFS server's locks and fsync behaving correctly. That includes the instance lock, a `flock`, which the Linux NFS client maps to NFS byte-range locks. Nobody has verified this on this cluster's NFS server yet. A stale lock or lost write on the NFS side could corrupt a store, and the anchor chain and `admin anchor verify` detect that afterwards rather than preventing it. The rollback journal is slower than WAL, and readers wait while a write commits. That is acceptable at this load.
 
 The backup claim is on the same NFS server as the data, so it protects against a damaged or deleted claim, not against losing that server. Streaming a bundle off the cluster (`admin backup --stdout`) covers that case (docs/server/backup-restore.md). The backup claim holds wrapped data keys and every chain of the last 14 days. That widens the exposure of ADR 0002 to anyone who can read that share. Retention-deleted chains disappear from it within 14 days.

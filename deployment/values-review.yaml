@@ -11,6 +11,10 @@ ingress:
       issuer: letsencrypt
       issuerKind: ClusterIssuer
 
+# ADR 0004: the NFS volume's root is root-owned (fsGroup is not applied); group 0 lets the
+# non-root server create its directories there, as dux-deployment-bot does.
+supplementalGroups: [0]
+
 persistence:
   # ADR 0004: the team's NFS class, ReadWriteOnce, SQLite in rollback-journal mode.
   storageClassName: team-dux-storage

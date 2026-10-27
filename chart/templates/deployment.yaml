@@ -46,6 +46,10 @@ spec:
         runAsGroup: {{ .Values.uid }}
         fsGroup: {{ .Values.uid }}
         fsGroupChangePolicy: OnRootMismatch
+        {{- with .Values.supplementalGroups }}
+        supplementalGroups:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -200,8 +204,9 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 1Mi
-        # Kubelet adds group read for fsGroup (0400 becomes 0440, group 65532); the server warns on
-        # group bits but runs (M12 master_key.rs).
+        # Kubelet adds group read for fsGroup whatever defaultMode says (0400 becomes 0440, group
+        # 65532, the process's own group); the server accepts exactly that and warns on any other
+        # group or other bit (master_key.rs loose_mode).
         - name: master-key
           secret:
             secretName: {{ .Values.masterKey.existingSecret }}

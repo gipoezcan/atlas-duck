@@ -131,17 +131,35 @@ impl WrappedKey {
     }
 }
 
-/// Configuration table: a key file mode looser than 0600/0400 (any group or other bit; Secret
-/// mounts are 0440 unless M13's chart sets `defaultMode`) is a warning, never a stop.
+/// Whether a key file's mode lets anyone but this process read it: any other bit, any group
+/// bit but read, or group read for a group other than the process's own. A Secret mounted with
+/// `fsGroup` is 0440 in the process's own group whatever `defaultMode` says (kubelet adds the
+/// group read), and that is not loose.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn loose_mode(mode: u32, file_gid: u32, own_gid: Option<u32>) -> bool {
+    mode & 0o037 != 0 || (mode & 0o040 != 0 && own_gid != Some(file_gid))
+}
+
+/// The effective gid of this process (Linux `/proc/self/status`; `None` elsewhere or unreadable).
+#[cfg(unix)]
+fn own_gid() -> Option<u32> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("Gid:"))?;
+    line.split_whitespace().nth(2)?.parse().ok()
+}
+
+/// Configuration table: a key file mode looser than 0600/0400 (see [`loose_mode`]) is a warning,
+/// never a stop.
 #[cfg(unix)]
 fn warn_if_loose_mode(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     if let Ok(meta) = std::fs::metadata(path)
-        && meta.permissions().mode() & 0o077 != 0
+        && loose_mode(meta.permissions().mode(), meta.gid(), own_gid())
     {
         tracing::warn!(
             event = "master_key_file_mode",
-            mode = format!("{:o}", meta.permissions().mode() & 0o777)
+            mode = format!("{:o}", meta.permissions().mode() & 0o777),
+            gid = meta.gid()
         );
     }
 }
@@ -361,6 +379,20 @@ mod tests {
     use super::*;
 
     const KEY_A: [u8; 32] = [7; 32];
+
+    #[test]
+    fn group_read_in_the_own_group_is_not_loose() {
+        // The fsGroup Secret mount: 0440 in the process's group.
+        assert!(!loose_mode(0o100440, 65532, Some(65532)));
+        assert!(!loose_mode(0o100400, 0, Some(65532)));
+        assert!(!loose_mode(0o100600, 0, None));
+        // Another group, an unknown own group, group write or any other bit: loose.
+        assert!(loose_mode(0o100440, 0, Some(65532)));
+        assert!(loose_mode(0o100440, 65532, None));
+        assert!(loose_mode(0o100460, 65532, Some(65532)));
+        assert!(loose_mode(0o100404, 65532, Some(65532)));
+        assert!(loose_mode(0o100444, 65532, Some(65532)));
+    }
 
     fn file_text(id: &str, bytes: &[u8]) -> String {
         format!("{PREFIX} {id} {}", STANDARD.encode(bytes))

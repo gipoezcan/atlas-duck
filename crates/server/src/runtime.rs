@@ -233,7 +233,8 @@ impl UserRuntime {
         std::fs::create_dir_all(&dir).map_err(|e| st(e.to_string()))?;
         let data = match crate::config::check_dir(&dir, deps.journal) {
             Ok(DataDirResolution::Local(d)) => d,
-            _ => return Err(st("user dir is not a local directory".into())),
+            Ok(other) => return Err(st(format!("user dir refused: {other:?}"))),
+            Err(e) => return Err(st(format!("user dir check failed: {:?}", e.kind()))),
         };
         let lock = InstanceLock::acquire(&data, LOCK_HOST).map_err(|e| st(format!("{e:?}")))?;
         let keys = Arc::new(ServerKeyStore::new(
