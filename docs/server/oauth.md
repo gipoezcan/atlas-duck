@@ -22,9 +22,6 @@ discovers the server, registers itself and sends the user through a consent page
 6. The client redeems the code at `POST /oauth/token` and calls `/mcp` with
    `Authorization: Bearer ado_at_…`.
 
-Claude Code, for example: `claude mcp add --transport http atlas-duck https://duck.example/mcp`,
-then `/mcp` in a session to authenticate.
-
 ## Endpoints
 
 | Method and path | Auth | Purpose |

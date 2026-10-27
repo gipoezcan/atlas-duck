@@ -254,3 +254,16 @@ test("a tampered excerpt is caught", () => {
   assert.ok(edit(1, (l) => (l.prev_hash = "00".repeat(32))).some((m) => /lines\[1\]: prev_hash does not link/.test(m)));
   assert.ok(edit(1, (l) => (l.extra = 1)).some((m) => /unknown key extra/.test(m)));
 });
+
+test("a shifted ts_utc/kind split keeps the hash but is refused (batch-1 review I1)", () => {
+  const doc = loadExcerpt();
+  const i = doc.lines.findIndex((t) => JSON.parse(t).kind.length > 2);
+  const l = JSON.parse(doc.lines[i]);
+  // The row hash frames neither field: moving two bytes from kind into ts_utc keeps it.
+  l.ts_utc += l.kind.slice(0, 2);
+  l.kind = l.kind.slice(2);
+  doc.lines[i] = canonicalize(l);
+  const out = checkServerExcerptVectors(doc);
+  assert.ok(!out.some((m) => /hash differs/.test(m)), out.join("\n"));
+  assert.ok(out.some((m) => new RegExp(`lines\\[${i}\\]: ts_utc is not YYYY-MM-DDTHH:MM:SS.mmmZ`).test(m)), out.join("\n"));
+});

@@ -429,6 +429,12 @@ export function checkServerExcerptVectors(doc) {
       if (canonicalize(l) !== text) out.push(`excerpt lines[${i}]: not JCS`);
       for (const k of Object.keys(l)) if (!EXCERPT_KEYS.has(k)) out.push(`excerpt lines[${i}]: unknown key ${k}`);
       if (l.v !== 2) out.push(`excerpt lines[${i}]: v must be 2`);
+      // The row hash frames neither ts_utc nor kind; the fixed shapes make the split unique
+      // (server_anchor::parse_excerpt_line, batch-1 review I1).
+      if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(l.ts_utc)) {
+        out.push(`excerpt lines[${i}]: ts_utc is not YYYY-MM-DDTHH:MM:SS.mmmZ`);
+      }
+      if (!/^[A-Z_]+$/.test(l.kind)) out.push(`excerpt lines[${i}]: kind is not [A-Z_]+`);
       if (prev !== null && l.prev_hash !== prev) out.push(`excerpt lines[${i}]: prev_hash does not link`);
       const h = anchorRowHashFromBodyHash(l.seq, l.ts_utc, l.kind, l.body_sha256, l.prev_hash).toString("hex");
       if (h !== l.hash) out.push(`excerpt lines[${i}]: hash differs`);
