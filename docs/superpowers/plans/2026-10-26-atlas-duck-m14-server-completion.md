@@ -109,6 +109,13 @@ M13 is **not merged**: its branch has T1–T4 only (docs, shutdown drain, chart,
 
 Further names T8 consumes: `mcp/session.rs` `McpSessions::{may_use, bind, forget}` bind a session to a **user** only and `handler.rs:406` falls back to `key.key_id` for the connection id; PD-243's credential binding changes all three.
 
+**Deviations recorded during execution** (ledger Decision lines carry the detail):
+
+- T11 (PD-247): no `GlueDiag` trait and no `WorkerLocation`. The glue's event-name constants moved to `atlas_duck_script_glue::diag` (the app's `diag::fields` re-exports them; its allowlist is unchanged), and `ScriptGlue::with_port(HostBridge::default(), Some(worker), inputs)` already takes a fixed worker path. The Tauri thread start of the probe stays in the app.
+- T12 (PD-246): the server-wide cap is a core seam, `ScriptRunner::shared_slots()` (default `None`), taken in core's `slot()` right after the user's own slot in the same request-bound wait. Saturation **queues** like the per-user slots (`queued`, cancellable); there is no bounded wait and no `busy` answer, so `ATLAS_DUCK_SCRIPT_WAIT_SECS` and `atlas_duck_script_busy_total` are not built. A third run of one user queues (core's `slot()`); it is not refused.
+- T12: the running-script eviction pin (Δ-M14-3) was not in M12; `evictable()` now also requires `core.running_scripts()` to be empty.
+- T6: an absent `token_endpoint_auth_method` is read as `none`; the registration anchor row carries the hashed source IP. T4: excerpt lines are bounded at 8 MiB (a full `HEADS` line carries its body).
+
 **Contract deltas** (status after the 2026-10-26 reconciliation): **Δ-M14-1** — *applied in M12 PD-216/T5*: `LOGIN.method` includes `"oauth"` (+ `grant_id?`); `AUDITOR_READ.action` is `"list_users"|"query"|"trail"|"payload"|"export"` plus `range?`, `request_id?`, `seq?`, `page?`, `job_id?`. **Δ-M14-2** — *applied in M12 PD-217/T10/T15*: anchor chain rows are v2 from the start; T4 Step 3 (migration) is dropped. **Δ-M14-3** — *split*: the "running script" eviction pin is applied in M12 PD-209; the `Registry` audit view (PD-257) is not a small interface addition (store open without a `Core`, idle close, adoption) and stays in M14 T17. **Δ-M14-4** — *stays in M14*: OAuth grants do not exist in M13, so T8 Step 4 extends M13's `users::deactivate`. **Δ-M14-5** — *applied in M12 T23* (`no_cross_user_audit_route_without_auditor_role`).
 
 ---
