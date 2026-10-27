@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
 use super::{
-    AnchorHasher, AnchorHead, AnchorRow, ApiKeyRecord, InstanceRecord, PatRecord, Sealed,
+    AnchorHasher, AnchorHead, AnchorRow, ApiKeyRecord, InstanceRecord, JobState, PatRecord, Sealed,
     ServerStore, SessionRecord, StoreError, StoreResult, UserRecord, UserState,
 };
 
@@ -13,6 +13,7 @@ use super::{
 struct Inner {
     users: BTreeMap<String, UserRecord>,
     states: BTreeMap<String, UserState>,
+    jobs: BTreeMap<String, JobState>,
     keystore: BTreeMap<(String, String), Sealed>,
     pats: BTreeMap<(String, String), PatRecord>,
     sessions: BTreeMap<[u8; 32], SessionRecord>,
@@ -372,6 +373,15 @@ impl ServerStore for MemoryStore {
 
     fn anchor_all(&self) -> StoreResult<Vec<AnchorRow>> {
         Ok(self.lock().anchors.clone())
+    }
+
+    fn scheduler_get(&self, job: &str) -> StoreResult<JobState> {
+        Ok(self.lock().jobs.get(job).copied().unwrap_or_default())
+    }
+
+    fn scheduler_put(&self, job: &str, s: &JobState) -> StoreResult<()> {
+        self.lock().jobs.insert(job.to_owned(), *s);
+        Ok(())
     }
 
     fn anchor_latest_heads(&self) -> StoreResult<Vec<AnchorHead>> {

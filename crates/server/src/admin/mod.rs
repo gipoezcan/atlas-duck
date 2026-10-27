@@ -80,6 +80,13 @@ impl AdminCtx {
     }
 }
 
+impl AdminCtx {
+    /// The admin operation lock: the scheduler's jobs take it too, so they never overlap a command.
+    pub async fn lock_ops(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.ops.lock().await
+    }
+}
+
 /// No arguments; any field is refused.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

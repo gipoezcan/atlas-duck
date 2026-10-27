@@ -29,6 +29,7 @@ pub mod master_key;
 pub mod mcp;
 pub mod ratelimit;
 pub mod runtime;
+pub mod scheduler;
 pub mod session;
 pub mod sse;
 pub mod static_files;

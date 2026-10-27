@@ -23,6 +23,8 @@ pub struct Health {
     master_key_loaded: bool,
     /// M13 T7: the loaded keys, checked against the key ids the users' data keys carry.
     master: Option<Arc<MasterKey>>,
+    /// M13 T9: `manual`, `directory` or `stub` (how offboarding happens).
+    offboarding: Option<&'static str>,
     probe: Mutex<Option<(Instant, bool)>>,
 }
 
@@ -37,8 +39,15 @@ impl Health {
             directory,
             master_key_loaded,
             master: None,
+            offboarding: None,
             probe: Mutex::new(None),
         }
+    }
+
+    /// Reports how offboarding happens (a field, never a reason for 503).
+    pub fn with_offboarding(mut self, mode: &'static str) -> Health {
+        self.offboarding = Some(mode);
+        self
     }
 
     /// Also checks that every user's data key is wrapped under a loaded master key.
@@ -81,6 +90,9 @@ impl Health {
             "checks": {"store": store, "master_key": master_key, "directory": directory},
             "directory": self.directory.kind(),
         });
+        if let Some(mode) = self.offboarding {
+            body["offboarding"] = json!(mode);
+        }
         if let Some(r) = key_reason {
             body["reasons"] = json!([r]);
         }

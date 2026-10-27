@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use super::schema::{SCHEMA_VERSION, V1};
 use super::{
-    AnchorHasher, AnchorHead, AnchorRow, ApiKeyRecord, InstanceRecord, PatRecord, Sealed,
+    AnchorHasher, AnchorHead, AnchorRow, ApiKeyRecord, InstanceRecord, JobState, PatRecord, Sealed,
     ServerStore, SessionRecord, StoreError, StoreResult, UserRecord, UserState,
 };
 
@@ -737,6 +737,36 @@ impl ServerStore for SqliteStore {
             ))
             .map_err(db)?;
         collect(st.query_map([], anchor_row).map_err(db)?)
+    }
+
+    fn scheduler_get(&self, job: &str) -> StoreResult<JobState> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT last_run_at, last_success_at FROM scheduler_state WHERE job = ?1",
+                [job],
+                |r| {
+                    Ok(JobState {
+                        last_run_at: r.get(0)?,
+                        last_success_at: r.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db)?
+            .unwrap_or_default())
+    }
+
+    fn scheduler_put(&self, job: &str, s: &JobState) -> StoreResult<()> {
+        self.conn()
+            .execute(
+                "INSERT INTO scheduler_state (job, last_run_at, last_success_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(job) DO UPDATE SET last_run_at = excluded.last_run_at,
+                     last_success_at = excluded.last_success_at",
+                params![job, s.last_run_at, s.last_success_at],
+            )
+            .map_err(db)?;
+        Ok(())
     }
 
     fn anchor_latest_heads(&self) -> StoreResult<Vec<AnchorHead>> {

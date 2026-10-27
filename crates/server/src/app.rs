@@ -11,13 +11,14 @@ use atlas_duck_audit::lock::InstanceLock;
 use atlas_duck_ipc::paths::{DataDirResolution, check_data_dir};
 use serde_json::json;
 
-use crate::admin::{AdminCtx, DEFAULT_RETENTION_DAYS};
+use crate::admin::AdminCtx;
 use crate::anchor::AnchorWriter;
 use crate::cli::{EXIT_CONFIG, EXIT_OK, EXIT_RUNTIME, config_error_fields};
 use crate::clock::{Clock, SystemClock};
 use crate::config::{Config, ConfigError, DirectoryConfig};
 use crate::directory::Directory;
-use crate::directory::ldap::LdapDirectory;
+use crate::directory::account::AccountLookup;
+use crate::directory::ldap::{LdapDirectory, LdapServiceLookup};
 use crate::directory::stub::StubDirectory;
 use crate::directory::tls::client_config;
 use crate::health::Health;
@@ -25,6 +26,7 @@ use crate::login::LoginService;
 use crate::master_key::MasterKey;
 use crate::ratelimit::LoginLimiter;
 use crate::runtime::{Registry, RegistrySink, RuntimeDeps};
+use crate::scheduler::Scheduler;
 use crate::session::SessionTable;
 use crate::static_files::WebDir;
 use crate::store::sqlite::SqliteStore;
@@ -93,27 +95,62 @@ async fn run(config: Config) -> u8 {
         }
         Err(_) => return fail("server_store_unavailable"),
     };
-    let directory: Arc<dyn Directory> = match &config.directory {
-        DirectoryConfig::Ldap {
-            url,
-            upn_suffix,
-            base_dn,
-        } => match client_config(config.ca_bundle_file.as_deref()) {
-            Ok(tls) => Arc::new(LdapDirectory::new(
-                url.clone(),
-                upn_suffix.clone(),
-                base_dn.clone(),
-                tls,
-            )),
-            Err(_) => return fail("ca_bundle_unusable"),
-        },
-        DirectoryConfig::Stub { file } => match StubDirectory::from_file(file) {
-            Ok(d) => {
-                tracing::warn!(event = "test_directory_active", users = d.user_count());
-                Arc::new(d)
+    // The login directory, and the offboarding check's account lookup (M13 T9, PD-M13-14): the
+    // LDAP service bind when configured, the test directory's file, else none (manual).
+    let (directory, lookup): (Arc<dyn Directory>, Option<Arc<dyn AccountLookup>>) =
+        match &config.directory {
+            DirectoryConfig::Ldap {
+                url,
+                upn_suffix,
+                base_dn,
+            } => {
+                let Ok(tls) = client_config(config.ca_bundle_file.as_deref()) else {
+                    return fail("ca_bundle_unusable");
+                };
+                let lookup: Option<Arc<dyn AccountLookup>> = match &config.service_bind {
+                    None => None,
+                    Some(bind) => {
+                        let Some(password) = read_secret_file(&bind.password_file) else {
+                            crate::log::stderr_line(
+                                "error",
+                                config_error_fields(&ConfigError {
+                                    code: "config/service_bind_password_unreadable",
+                                    key: crate::config::SERVICE_BIND_PASSWORD_FILE,
+                                }),
+                            );
+                            return EXIT_CONFIG;
+                        };
+                        Some(Arc::new(LdapServiceLookup::new(
+                            url.clone(),
+                            upn_suffix.clone(),
+                            base_dn.clone(),
+                            tls.clone(),
+                            bind.dn.clone(),
+                            password,
+                        )))
+                    }
+                };
+                let dir = Arc::new(LdapDirectory::new(
+                    url.clone(),
+                    upn_suffix.clone(),
+                    base_dn.clone(),
+                    tls,
+                ));
+                (dir, lookup)
             }
-            Err(_) => return fail("test_directory_unusable"),
-        },
+            DirectoryConfig::Stub { file } => match StubDirectory::from_file(file) {
+                Ok(d) => {
+                    tracing::warn!(event = "test_directory_active", users = d.user_count());
+                    let d = Arc::new(d);
+                    (d.clone(), Some(d))
+                }
+                Err(_) => return fail("test_directory_unusable"),
+            },
+        };
+    let offboarding = match (&lookup, &config.directory) {
+        (None, _) => "manual",
+        (Some(_), DirectoryConfig::Stub { .. }) => "stub",
+        (Some(_), DirectoryConfig::Ldap { .. }) => "directory",
     };
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let registry = Arc::new(Registry::new(
@@ -169,7 +206,11 @@ async fn run(config: Config) -> u8 {
         login,
         registry: registry.clone(),
         web: WebDir(config.web_dir.clone()),
-        health: Arc::new(Health::new(store.clone(), directory, true).with_master(master.clone())),
+        health: Arc::new(
+            Health::new(store.clone(), directory, true)
+                .with_master(master.clone())
+                .with_offboarding(offboarding),
+        ),
         api_keys,
         mcp_sessions: Arc::new(crate::mcp::McpSessions::new()),
     }));
@@ -190,8 +231,10 @@ async fn run(config: Config) -> u8 {
         state.api_keys.clone(),
         writer.clone(),
         clock.clone(),
-        DEFAULT_RETENTION_DAYS,
+        config.retention_days,
     ));
+    let scheduler = Arc::new(Scheduler::new(admin.clone(), lookup, config.offboarding_at));
+    let scheduler_task = scheduler.spawn();
     let Some(admin_task) = start_admin_socket(&config, admin) else {
         return fail("admin_socket_unusable");
     };
@@ -203,6 +246,7 @@ async fn run(config: Config) -> u8 {
     sweeper.abort();
     anchor_timer.abort();
     admin_task.abort();
+    scheduler_task.abort();
     let _ = std::fs::remove_file(&config.admin_socket);
     match served {
         Ok(()) => {
@@ -211,6 +255,17 @@ async fn run(config: Config) -> u8 {
         }
         Err(_) => fail("serve_failed"),
     }
+}
+
+/// A secret file's content without its trailing newline (the service-bind password, M13 T9).
+/// Never logged; `None` when unreadable or empty.
+pub fn read_secret_file(path: &std::path::Path) -> Option<secrecy::SecretString> {
+    let text = zeroize::Zeroizing::new(std::fs::read_to_string(path).ok()?);
+    let line = text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .unwrap_or(&text);
+    (!line.is_empty()).then(|| secrecy::SecretString::from(line.to_owned()))
 }
 
 /// Binds the admin socket (M13 PD-M13-1) and serves it; `None` when it cannot be bound (the

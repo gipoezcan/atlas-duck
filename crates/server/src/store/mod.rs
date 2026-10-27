@@ -55,6 +55,13 @@ pub struct UserState {
     pub chain_deleted_at: Option<i64>,
 }
 
+/// A scheduler job's last run and last successful run (M13 T9, `scheduler_state`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JobState {
+    pub last_run_at: Option<i64>,
+    pub last_success_at: Option<i64>,
+}
+
 /// A stored PAT (PD-211), sealed with the user's data key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatRecord {
@@ -255,6 +262,10 @@ pub trait ServerStore: Send + Sync {
     fn anchor_all(&self) -> StoreResult<Vec<AnchorRow>>;
     /// The most recently anchored head of every user (backup manifests).
     fn anchor_latest_heads(&self) -> StoreResult<Vec<AnchorHead>>;
+
+    // ---- scheduler (M13 T9) ----
+    fn scheduler_get(&self, job: &str) -> StoreResult<JobState>;
+    fn scheduler_put(&self, job: &str, state: &JobState) -> StoreResult<()>;
 
     // ---- backup and restore (M13 T6) ----
     /// A consistent copy of the whole store into the new file `path`.
