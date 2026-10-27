@@ -75,7 +75,13 @@ matrix (chart/ci-fail/*.yaml, `# expect:`) can match it.
 {{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.ingressNamespaceSelectors) }}
 {{- fail "atlas-duck: networkPolicy.ingressNamespaceSelectors is required when networkPolicy.enabled (Q2)" }}
 {{- end }}
+{{- if contains "CHANGE-ME" (toYaml .Values) }}
+{{- fail "atlas-duck: a CHANGE-ME placeholder is left in the values (an open question, see deployment/README.md)" }}
+{{- end }}
 {{- range .Values.extraEnv }}
+{{- if regexMatch "^(ATLAS_DUCK_|LDAP_|GROUP_)" .name }}
+{{- fail (printf "atlas-duck: extraEnv %s is managed by the chart" .name) }}
+{{- end }}
 {{- if and (regexMatch "(?i)(KEY|TOKEN|PASSWORD|SECRET)" .name) (not (hasSuffix "_FILE" .name)) }}
 {{- fail (printf "atlas-duck: extraEnv %s looks like a secret; mount a file instead (SM-9.1)" .name) }}
 {{- end }}

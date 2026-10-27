@@ -96,6 +96,26 @@ pub async fn deactivate_by_name(ctx: &AdminCtx, username: &str) -> Result<Value,
     serde_json::to_value(report).map_err(|_| "admin/internal")
 }
 
+/// Whether a `USER_DEACTIVATED` row already anchors this user's final head.
+fn deactivation_anchored(
+    store: &dyn crate::store::ServerStore,
+    user_id: &str,
+) -> Result<bool, &'static str> {
+    let rows = store.anchor_all().map_err(|_| "store/unavailable")?;
+    for r in rows
+        .iter()
+        .filter(|r| r.kind == crate::anchor::KIND_USER_DEACTIVATED)
+    {
+        let heads = store
+            .anchor_heads_for(r.seq)
+            .map_err(|_| "store/unavailable")?;
+        if heads.iter().any(|h| h.user_id == user_id) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Deactivates `user_id` (SM-6.5). Idempotent.
 pub async fn deactivate(
     ctx: &AdminCtx,
@@ -119,20 +139,22 @@ pub async fn deactivate(
         .delete_for_user(user_id)
         .map_err(|_| "store/unavailable")?;
 
-    // API keys: revoked in the store and evicted from the cache, then recorded.
-    let keys = store
-        .api_keys_revoke_all(user_id, now)
-        .map_err(|_| "store/unavailable")?;
-    for k in &keys {
-        ctx.api_keys.invalidate(&k.id);
-    }
+    // Batch-1 review I-2: every record goes into the chain before its effect, and what is still
+    // owed is derived from the stored state, so a retry after any failure completes the audit.
+    // Meanwhile the keys are already dead: the deactivated flag refuses them (api_keys.rs).
+    let keys: Vec<_> = store
+        .api_key_list(user_id)
+        .map_err(|_| "store/unavailable")?
+        .into_iter()
+        .filter(|k| k.revoked_at.is_none())
+        .collect();
     let pats = store.pat_list(user_id).map_err(|_| "store/unavailable")?;
-    let anything = newly || sessions_ended > 0 || !keys.is_empty() || !pats.is_empty();
-    if !anything {
+    let anchored = deactivation_anchored(store, user_id)?;
+    if keys.is_empty() && pats.is_empty() && anchored {
         return Ok(DeactivationReport {
             username: user.username,
-            newly_deactivated: false,
-            sessions_ended: 0,
+            newly_deactivated: newly,
+            sessions_ended,
             api_keys_revoked: 0,
             pats_deleted: 0,
             anchor_seq: None,
@@ -151,6 +173,10 @@ pub async fn deactivate(
         )
         .await
         .map_err(|e| e.code)?;
+        store
+            .api_key_revoke(user_id, &k.id, now)
+            .map_err(|_| "store/unavailable")?;
+        ctx.api_keys.invalidate(&k.id);
     }
     // PATs: the record goes into the chain before the PAT goes (as instance removal).
     for p in &pats {

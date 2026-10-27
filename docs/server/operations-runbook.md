@@ -26,7 +26,8 @@ Admin commands run one at a time, and the scheduler's jobs take the same lock.
 | `users deactivate <username>` | Offboarding ([offboarding.md](offboarding.md)): sessions end, API keys are revoked, PATs are deleted, `USER_DEACTIVATED` is anchored. Final and idempotent |
 | `maintenance on\|off` | Maintenance: `/readyz` 503 and every request except the probes and `/metrics` answers 503 `server/maintenance` |
 | `backup <dir>` | A consistent snapshot of every store ([backup-restore.md](backup-restore.md)) |
-| `restore <bundle-dir>` | Restore a bundle; requires maintenance mode |
+| `restore <bundle-dir>` | Restore a bundle; requires maintenance mode. The live data is first kept as the bundle `backups/pre-restore-<stamp>` |
+| `restore --resume` | Finish a restore that a crash interrupted (`/readyz` reason `restore_interrupted`) |
 | `rotate-master-key --new-key-file <path>` | Re-wrap every data key ([master-key-rotation.md](master-key-rotation.md)) |
 | `retention run [--dry-run]` | Delete the chains of users deactivated more than `ATLAS_DUCK_RETENTION_DAYS` ago (default 365) |
 | `anchor verify` | Recompute the server anchor chain and check every user's anchored head against that user's own chain. Findings name the user and the sequence number. Exit 1 on any finding |

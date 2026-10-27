@@ -398,8 +398,18 @@ impl ApiKeys {
         cache.retain(|_, c| c.key_id != id);
     }
 
-    /// The bearer's key, verified (PD-213, PD-214).
+    /// The bearer's key, verified (PD-213, PD-214). A deactivated user's keys are refused at once,
+    /// even before their revocation is recorded (M13 batch-1 review I-2, M-3).
     pub fn authenticate(&self, key: &str) -> Result<KeyCtx, AuthFail> {
+        let ctx = self.authenticate_key(key)?;
+        match self.store.user_state(ctx.user.user_id()) {
+            Ok(Some(s)) if s.deactivated_at.is_some() => Err(AuthFail::Invalid),
+            Ok(_) => Ok(ctx),
+            Err(_) => Err(AuthFail::Store),
+        }
+    }
+
+    fn authenticate_key(&self, key: &str) -> Result<KeyCtx, AuthFail> {
         let now = self.clock.now();
         let fp: [u8; 32] = Sha256::digest(key.as_bytes()).into();
         if let Some(c) = self.cache().get(&fp)

@@ -5,11 +5,18 @@
 //! copied file is checked against the manifest's SHA-256, the master key id must be the loaded
 //! one and every wrapped data key must open with it, the staged anchor chain must verify and end
 //! at the manifest's head, and every staged user chain must open, pass a full verification and
-//! reach its manifest head. Then the swap: the runtimes are quiesced, the live `server.db` is
-//! copied and `<data>/users` moved to `<data>/pre-restore-<stamp>/` (kept until an admin deletes
-//! it), the staged users move in and the live database takes the staged content through SQLite's
-//! backup API in one step. Sessions and the API-key cache are reloaded, and `RESTORED` goes into
-//! the (restored) anchor chain.
+//! reach its manifest head. Then the swap, with the runtimes quiesced:
+//! 1. the live data is written as a full bundle `<data>/backups/pre-restore-<stamp>/` (manifest,
+//!    hashes), so going back is an ordinary `admin restore` of it (batch-1 review I-1);
+//! 2. the journal `<data>/restore-in-progress` (staging, replaced and pre-restore paths) is
+//!    written and fsync'd;
+//! 3. `<data>/users` moves aside, the staged users move in, and the live database takes the
+//!    staged content through SQLite's backup API in one step;
+//! 4. sessions and the API-key cache reload, `RESTORED` is anchored, the journal goes.
+//!
+//! A crash between 2 and 4 leaves the journal. The next start then keeps the server in
+//! maintenance (`/readyz` reason `restore_interrupted`) and logs how to recover: `admin restore
+//! --resume` finishes the verified swap, or `admin restore <pre-restore bundle>` goes back.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,9 +26,10 @@ use serde_json::{Value, json};
 use super::AdminCtx;
 use super::backup::{
     FORMAT, MANIFEST, MAX_MANIFEST_BYTES, Manifest, SERVER_DB, USERS_DIR, allowed_dir, safe_rel,
-    sha256_file, stamp, unique_dir,
+    sha256_file, stamp, sync_dir, sync_file, unique_dir, write_bundle,
 };
 use crate::anchor::{KIND_RESTORED, verify};
+use crate::clock::rfc3339;
 use crate::master_key::{KeyError, WrappedKey};
 use crate::runtime::{RuntimeDeps, UserHead, UserRuntime};
 use crate::store::ServerStore;
@@ -50,6 +58,7 @@ fn stage_files(bundle: &Path, staging: &Path, m: &Manifest) -> Result<(), &'stat
             std::fs::create_dir_all(parent).map_err(|_| "restore/stage_failed")?;
         }
         std::fs::copy(&src, &dst).map_err(|_| "restore/hash_mismatch")?;
+        sync_file(&dst).map_err(|_| "restore/stage_failed")?;
         let got = sha256_file(&dst).map_err(|_| "restore/stage_failed")?;
         if hex::encode(got) != f.sha256 {
             return Err("restore/hash_mismatch");
@@ -132,41 +141,117 @@ async fn verify_staged(
     Ok(heads)
 }
 
-/// The live swap; on a failure before the database step, the users directory is put back.
-async fn swap(ctx: &AdminCtx, staging: &Path, data: &Path, pre: &Path) -> Result<(), &'static str> {
-    std::fs::create_dir_all(pre).map_err(|_| "restore/swap_failed")?;
-    ctx.store
-        .snapshot_to(&pre.join(SERVER_DB))
-        .map_err(|_| "restore/swap_failed")?;
-    let live_users = data.join(USERS_DIR);
-    let staged_users = staging.join(USERS_DIR);
-    let had_users = live_users.exists();
-    if had_users {
-        std::fs::rename(&live_users, pre.join(USERS_DIR)).map_err(|_| "restore/swap_failed")?;
-    }
-    let moved = if staged_users.exists() {
-        std::fs::rename(&staged_users, &live_users)
-    } else {
-        std::fs::create_dir_all(&live_users)
-    };
-    let undo = || {
-        let _ = std::fs::remove_dir_all(&live_users);
-        if had_users {
-            let _ = std::fs::rename(pre.join(USERS_DIR), &live_users);
-        }
-    };
-    if moved.is_err() {
-        undo();
-        return Err("restore/swap_failed");
-    }
-    if ctx.store.restore_from(&staging.join(SERVER_DB)).is_err() {
-        undo();
-        return Err("restore/swap_failed");
-    }
+/// The journal of a swap in progress (batch-1 review I-1).
+pub const JOURNAL: &str = "restore-in-progress";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Journal {
+    staging: PathBuf,
+    replaced: PathBuf,
+    pre: PathBuf,
+    manifest_sha256: String,
+    backup_anchor_seq: u64,
+}
+
+/// Whether a restore was interrupted in `data` (startup and `/readyz` ask).
+pub fn interrupted(data: &Path) -> bool {
+    data.join(JOURNAL).exists()
+}
+
+fn read_journal(data: &Path) -> Option<Journal> {
+    serde_json::from_slice(&std::fs::read(data.join(JOURNAL)).ok()?).ok()
+}
+
+fn write_journal(data: &Path, j: &Journal) -> Result<(), &'static str> {
+    let p = data.join(JOURNAL);
+    let bytes = serde_json::to_vec(j).map_err(|_| "admin/internal")?;
+    std::fs::write(&p, bytes).map_err(|_| "restore/swap_failed")?;
+    sync_file(&p).map_err(|_| "restore/swap_failed")?;
+    sync_dir(data);
     Ok(())
 }
 
+/// Where a test stops a swap as a crash would (no cleanup at all).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CrashAt {
+    Never,
+    AfterUsersMoved,
+}
+
+/// Moves the staged users in (the live ones aside) and gives the live database the staged
+/// content. Idempotent, so `--resume` can run it again after a crash.
+fn swap_files(
+    ctx: &AdminCtx,
+    data: &Path,
+    j: &Journal,
+    crash: CrashAt,
+) -> Result<(), &'static str> {
+    let live = data.join(USERS_DIR);
+    let staged = j.staging.join(USERS_DIR);
+    if staged.exists() {
+        if live.exists() && !j.replaced.exists() {
+            std::fs::rename(&live, &j.replaced).map_err(|_| "restore/swap_failed")?;
+        } else if live.exists() {
+            std::fs::remove_dir_all(&live).map_err(|_| "restore/swap_failed")?;
+        }
+        std::fs::rename(&staged, &live).map_err(|_| "restore/swap_failed")?;
+    } else if !live.exists() {
+        std::fs::create_dir_all(&live).map_err(|_| "restore/swap_failed")?;
+    }
+    sync_dir(data);
+    if crash == CrashAt::AfterUsersMoved {
+        return Err("restore/interrupted");
+    }
+    ctx.store
+        .restore_from(&j.staging.join(SERVER_DB))
+        .map_err(|_| "restore/swap_failed")
+}
+
+/// After the swap: caches, anchors, cleanup of the journal and its directories.
+fn finish(
+    ctx: &AdminCtx,
+    data: &Path,
+    j: &Journal,
+    verify_heads: &[UserHead],
+) -> Result<Value, &'static str> {
+    if ctx.sessions.reload().is_err() {
+        tracing::error!(event = "sessions_reload_failed");
+    }
+    ctx.api_keys.invalidate_all();
+    ctx.writer.forget_anchored();
+    let row = ctx
+        .writer
+        .record_heads(verify_heads)
+        .and_then(|_| {
+            ctx.writer.operational(
+                KIND_RESTORED,
+                &json!({"bundle_manifest_sha256": j.manifest_sha256,
+                        "backup_anchor_seq": j.backup_anchor_seq,
+                        "previous": j.pre.file_name().map(|n| n.to_string_lossy().into_owned())}),
+            )
+        })
+        .map_err(|_| "anchor/append_failed")?;
+    let _ = std::fs::remove_file(data.join(JOURNAL));
+    sync_dir(data);
+    let _ = std::fs::remove_dir_all(&j.replaced);
+    let _ = std::fs::remove_dir_all(&j.staging);
+    tracing::info!(event = "restored", users = verify_heads.len());
+    Ok(
+        json!({"restored": true, "users": verify_heads.len(), "anchor_seq": row.seq,
+              "previous": j.pre.display().to_string()}),
+    )
+}
+
 pub async fn run(ctx: &AdminCtx, dir: &str) -> Result<Value, &'static str> {
+    run_inner(ctx, dir, CrashAt::Never).await
+}
+
+pub(crate) async fn run_inner(
+    ctx: &AdminCtx,
+    dir: &str,
+    crash: CrashAt,
+) -> Result<Value, &'static str> {
     if !ctx.registry.maintenance() {
         return Err("admin/maintenance_required");
     }
@@ -175,6 +260,8 @@ pub async fn run(ctx: &AdminCtx, dir: &str) -> Result<Value, &'static str> {
     let manifest = read_manifest(&bundle)?;
     let manifest_sha256 =
         hex::encode(sha256_file(&bundle.join(MANIFEST)).map_err(|_| "restore/manifest_missing")?);
+    // A restore after an interrupted one (going back to its pre-restore bundle) cleans that one up.
+    let earlier = read_journal(&data);
     let now = ctx.clock.now();
     let staging = unique_dir(&data, &format!("restore-staging-{}", stamp(now)));
     let staged = {
@@ -199,38 +286,80 @@ pub async fn run(ctx: &AdminCtx, dir: &str) -> Result<Value, &'static str> {
     if ctx.writer.record_heads(&closed).is_err() {
         tracing::error!(event = "anchor_append_failed", kind = "RUNTIME_CLOSED");
     }
-    let pre: PathBuf = unique_dir(&data, &format!("pre-restore-{}", stamp(now)));
-    let swapped = swap(ctx, &staging, &data, &pre).await;
-    if swapped.is_ok() {
-        if ctx.sessions.reload().is_err() {
-            tracing::error!(event = "sessions_reload_failed");
-        }
-        ctx.api_keys.invalidate_all();
-        ctx.writer.forget_anchored();
+    let backups = data.join("backups");
+    let pre = unique_dir(&backups, &format!("pre-restore-{}", stamp(now)));
+    let written = {
+        let (store, d, p, id) = (
+            ctx.store.clone(),
+            data.clone(),
+            pre.clone(),
+            ctx.registry.deps().master.id(),
+        );
+        tokio::task::spawn_blocking(move || write_bundle(&store, &d, &p, rfc3339(now), id))
+            .await
+            .unwrap_or(Err("admin/internal"))
+    };
+    if let Err(code) = written {
+        let _ = std::fs::remove_dir_all(&pre);
+        let _ = std::fs::remove_dir_all(&staging);
+        ctx.registry.resume();
+        return Err(code);
     }
-    let _ = std::fs::remove_dir_all(&staging);
-    let outcome = match swapped {
+    let journal = Journal {
+        replaced: unique_dir(&data, &format!("users-replaced-{}", stamp(now))),
+        staging: staging.clone(),
+        pre,
+        manifest_sha256,
+        backup_anchor_seq: manifest.anchor_head.seq,
+    };
+    let outcome = match write_journal(&data, &journal) {
         Err(code) => Err(code),
-        Ok(()) => {
-            // The verification's own records (APP_START, VERIFY, APP_STOP) are anchored first.
-            let rows = ctx
-                .writer
-                .record_heads(&verify_heads)
-                .and_then(|_| {
-                    ctx.writer.operational(
-                        KIND_RESTORED,
-                        &json!({"bundle_manifest_sha256": manifest_sha256,
-                                "backup_anchor_seq": manifest.anchor_head.seq,
-                                "previous": pre.file_name().map(|n| n.to_string_lossy().into_owned())}),
-                    )
-                })
-                .map_err(|_| "anchor/append_failed");
-            rows.map(|row| {
-                tracing::info!(event = "restored", users = verify_heads.len());
-                json!({"restored": true, "users": verify_heads.len(), "anchor_seq": row.seq,
-                       "previous": pre.display().to_string()})
-            })
-        }
+        Ok(()) => match swap_files(ctx, &data, &journal, crash) {
+            Err("restore/interrupted") => return Err("restore/interrupted"),
+            Err(code) => {
+                // Not a crash: put the live users back and drop the journal.
+                let live = data.join(USERS_DIR);
+                if journal.replaced.exists() {
+                    let _ = std::fs::remove_dir_all(&live);
+                    let _ = std::fs::rename(&journal.replaced, &live);
+                }
+                let _ = std::fs::remove_file(data.join(JOURNAL));
+                Err(code)
+            }
+            Ok(()) => finish(ctx, &data, &journal, &verify_heads),
+        },
+    };
+    if outcome.is_err() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    if outcome.is_ok()
+        && let Some(e) = earlier
+    {
+        let _ = std::fs::remove_dir_all(&e.replaced);
+        let _ = std::fs::remove_dir_all(&e.staging);
+    }
+    ctx.registry.resume();
+    outcome
+}
+
+/// `admin restore --resume`: finishes a swap a crash interrupted. The staged copy was fully
+/// verified before the journal was written, so finishing it is safe.
+pub async fn resume(ctx: &AdminCtx) -> Result<Value, &'static str> {
+    if !ctx.registry.maintenance() {
+        return Err("admin/maintenance_required");
+    }
+    let data = ctx.registry.deps().data_dir.clone();
+    let journal = read_journal(&data).ok_or("restore/nothing_to_resume")?;
+    if !journal.staging.join(SERVER_DB).is_file() {
+        return Err("restore/staging_missing");
+    }
+    let closed = ctx.registry.quiesce().await;
+    if ctx.writer.record_heads(&closed).is_err() {
+        tracing::error!(event = "anchor_append_failed", kind = "RUNTIME_CLOSED");
+    }
+    let outcome = match swap_files(ctx, &data, &journal, CrashAt::Never) {
+        Ok(()) => finish(ctx, &data, &journal, &[]),
+        Err(code) => Err(code),
     };
     ctx.registry.resume();
     outcome

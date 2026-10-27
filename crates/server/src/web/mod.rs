@@ -157,9 +157,13 @@ pub fn router(state: AppState) -> Router {
 
 async fn readyz(State(st): State<AppState>) -> Response {
     if st.registry.maintenance() {
+        let mut reasons = vec!["maintenance"];
+        if crate::admin::restore::interrupted(&st.registry.deps().data_dir) {
+            reasons.push("restore_interrupted");
+        }
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({"ready": false, "reasons": ["maintenance"]})),
+            axum::Json(serde_json::json!({"ready": false, "reasons": reasons})),
         )
             .into_response();
     }

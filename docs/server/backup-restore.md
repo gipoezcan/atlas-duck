@@ -59,15 +59,14 @@ ephemeral containers, in which case the backup copy-out needs another route (an 
 
 ## Restoring
 
-A restore cannot be undone by another restore: the copy it keeps of the replaced data is not a
-bundle. So **take a backup immediately before every restore.**
+Every restore first writes the live data as a full bundle,
+`<data>/backups/pre-restore-<stamp>/`, with a manifest. Going back is therefore an ordinary
+`admin restore` of that bundle. Still copy it off the cluster afterwards, like any backup.
 
-1. `admin backup /var/lib/atlas-duck/backups`, then copy it off the cluster.
-2. `admin maintenance on`. Users get 503 `server/maintenance`; the probes and `/metrics` still
+1. `admin maintenance on`. Users get 503 `server/maintenance`; the probes and `/metrics` still
    answer.
-3. Copy the bundle in through the debug container (see "Copying files in and out"):
-   `kubectl $NS cp -c ops ./atlas-duck-server-backup-… "$POD:/proc/1/root/var/lib/atlas-duck/backups/"`.
-4. `admin restore /var/lib/atlas-duck/backups/atlas-duck-server-backup-…`. Before anything live
+2. Copy the bundle in (see "Copying files in and out").
+3. `admin restore /var/lib/atlas-duck/backups/atlas-duck-server-backup-…`. Before anything live
    changes, the server:
    - copies the bundle to `<data>/restore-staging-<stamp>/` and checks every file's SHA-256;
    - requires the loaded master key to be the one in the manifest **and** to open every wrapped
@@ -75,42 +74,43 @@ bundle. So **take a backup immediately before every restore.**
    - verifies the staged anchor chain (`restore/anchor_chain_invalid`);
    - opens and fully verifies every staged user chain, which must reach its manifest head
      (`restore/chain_invalid`). This verification appends `APP_START`, `VERIFY` and `APP_STOP`
-     to the restored chains.
+     to the restored chains;
+   - migrates an older bundle's `server.db` on the staged copy (after the hash checks).
 
    Any failure leaves the live data untouched and removes the staging copy.
-5. The swap:
+4. The swap:
    - the runtimes close;
-   - the live `server.db` is copied and `<data>/users` moved to `<data>/pre-restore-<stamp>/`;
+   - the live data is written as the pre-restore bundle;
+   - the journal `<data>/restore-in-progress` is written and flushed to disk;
    - the staged users move in;
    - the live database takes the staged content in one step (SQLite backup API);
    - sessions and the API-key cache reload;
-   - `RESTORED` goes into the restored anchor chain.
+   - `RESTORED` goes into the restored anchor chain, and the journal goes.
 
    Sessions and API keys created after the backup are gone.
-6. `admin anchor verify`. It must exit 0.
-7. `admin maintenance off`.
+5. `admin anchor verify`. It must exit 0.
+6. `admin maintenance off`.
 
-### After a restore
-
-`<data>/pre-restore-<stamp>/` keeps the replaced data until an admin deletes it:
-
-```sh
-kubectl $NS exec "$POD" -c ops -- rm -rf /proc/1/root/var/lib/atlas-duck/pre-restore-<stamp>
-```
-
-The image has no `rm` of its own; the debug container `ops` does. Check free space before each restore: it needs about **three times** the live data
-(staging, the pre-restore copy and the live data).
+A restore needs about **three times** the live data in free space: the staging copy, the
+pre-restore bundle, and the live data.
 
 ### A restore interrupted mid-swap
 
-`server.db` changes in one step, but moving the users directory is two renames. If the pod dies
-between them, `<data>/users` is missing or incomplete, and `<data>/pre-restore-<stamp>/users`
-holds the previous one. Recovery:
+If the pod dies during the swap, the journal is still there at the next start. The server then:
 
-1. Keep the pod in maintenance after the restart (`admin maintenance on`).
-2. Restore the bundle taken in step 1 again.
+- stays in maintenance;
+- answers `/readyz` with `restore_interrupted`;
+- logs `store/restore_interrupted`;
+- refuses `admin maintenance off`.
 
-If you cannot restore, move `pre-restore-<stamp>/users` back from a debug container.
+To recover, either:
+
+- `admin restore --resume` finishes the swap. The staged copy was fully verified before the
+  journal was written. Or:
+- `admin restore /var/lib/atlas-duck/backups/pre-restore-<stamp>` goes back to the data as it
+  was before.
+
+Then run `admin anchor verify` and `admin maintenance off`.
 
 ## Drill
 

@@ -40,6 +40,7 @@ expect_fail "RWX volume" 's/- ReadWriteOnce/- ReadWriteMany/'
 expect_fail "a Secret" 's/^kind: PersistentVolumeClaim$/kind: Secret/'
 expect_fail "hostPath" 's/^            secretName: atlas-duck-master-key$/          hostPath: {path: \/x}/'
 expect_fail "privileged" 's/privileged: false/privileged: true/'
+expect_fail "a placeholder" 's/storageClassName: "ci-rwo"/storageClassName: "CHANGE-ME"/'
 expect_fail "literal secret env" 's/name: ATLAS_DUCK_MASTER_KEY_FILE/name: ATLAS_DUCK_API_TOKEN/'
 
 echo "self-test: $n refusals as expected"

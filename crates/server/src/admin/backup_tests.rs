@@ -551,16 +551,21 @@ async fn restore_keeps_previous_data_as_dated_dir_until_admin_prunes() {
             .to_string_lossy()
             .starts_with("pre-restore-20270115T")
     );
-    assert_eq!(previous.parent().unwrap(), s.data);
-    // The pre-restore copy holds what was live: carol's row and carol's store.
-    let old = SqliteStore::open(&previous.join("server.db")).unwrap();
-    assert!(old.user_by_name("carol").unwrap().is_some());
+    // Batch-1 review I-1: the copy of what was live is a full bundle in <data>/backups, so going
+    // back is an ordinary restore of it.
+    assert_eq!(previous.parent().unwrap(), s.backups());
+    assert!(previous.join(MANIFEST).is_file());
     assert!(crate::users::user_dir(&previous, &c).is_dir());
-    // A second restore keeps both previous copies.
-    let r = s.restore(&bundle).await;
+    assert!(!super::restore::interrupted(&s.data));
+    let r = s.restore(&previous.display().to_string()).await;
     assert!(r.ok, "{r:?}");
+    assert!(
+        s.store().user_by_name("carol").unwrap().is_some(),
+        "carol is back"
+    );
+    // Restores keep every previous copy until an admin deletes it.
     assert!(previous.exists());
-    let kept = std::fs::read_dir(&s.data)
+    let kept = std::fs::read_dir(s.backups())
         .unwrap()
         .filter(|e| {
             e.as_ref()
@@ -592,5 +597,115 @@ async fn backup_and_restore_after_retention_keep_the_tombstone() {
     assert!(st.chain_deleted_at.is_some() && st.deactivated_at.is_some());
     assert_eq!(s.store().user(&a).unwrap().unwrap().data_key_wrapped, "");
     verify(s.store()).unwrap();
+    within(s.ctx.registry.close_all()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crash_mid_restore_keeps_maintenance_and_resume_finishes_it() {
+    let s = sqlite_harness("k1", KEY_A);
+    let a = s.user("alice").await;
+    let report = s.backup(&s.backups()).await;
+    let bundle = report["bundle"].as_str().unwrap().to_owned();
+    s.user("carol").await;
+    s.maintenance(true).await;
+    let r = within(super::restore::run_inner(
+        &s.ctx,
+        &bundle,
+        super::restore::CrashAt::AfterUsersMoved,
+    ))
+    .await;
+    assert_eq!(r.unwrap_err(), "restore/interrupted");
+    // The journal is on disk; maintenance cannot be switched off until it is resolved.
+    assert!(super::restore::interrupted(&s.data));
+    let off = s.call(Request::Maintenance(SwitchArg { on: false })).await;
+    assert_eq!(off.error.as_deref(), Some("restore/interrupted"));
+    let r = s.call(Request::RestoreResume(NoArgs {})).await;
+    assert!(r.ok, "{r:?}");
+    assert!(!super::restore::interrupted(&s.data));
+    assert!(s.store().user_by_name("carol").unwrap().is_none());
+    assert_eq!(
+        s.store().anchor_last().unwrap().unwrap().kind,
+        KIND_RESTORED
+    );
+    verify(s.store()).unwrap();
+    s.maintenance(false).await;
+    s.activity(&a).await;
+    within(s.ctx.registry.close_all()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crash_mid_restore_can_go_back_to_the_pre_restore_bundle() {
+    let s = sqlite_harness("k1", KEY_A);
+    s.user("alice").await;
+    let report = s.backup(&s.backups()).await;
+    let bundle = report["bundle"].as_str().unwrap().to_owned();
+    s.user("carol").await;
+    s.maintenance(true).await;
+    let r = within(super::restore::run_inner(
+        &s.ctx,
+        &bundle,
+        super::restore::CrashAt::AfterUsersMoved,
+    ))
+    .await;
+    assert_eq!(r.unwrap_err(), "restore/interrupted");
+    s.ctx.registry.resume();
+    let pre = std::fs::read_dir(s.backups())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("pre-restore-")
+        })
+        .unwrap();
+    let r = s.restore(&pre.display().to_string()).await;
+    assert!(r.ok, "{r:?}");
+    assert!(!super::restore::interrupted(&s.data));
+    assert!(
+        s.store().user_by_name("carol").unwrap().is_some(),
+        "back to before"
+    );
+    let leftovers: Vec<String> = std::fs::read_dir(&s.data)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("restore-staging") || n.starts_with("users-replaced"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+    s.maintenance(false).await;
+    within(s.ctx.registry.close_all()).await;
+}
+
+/// Batch-1 review M-5: a bundle from a v1 server is migrated on its staged copy (after the hash
+/// checks), and the live v2 database then takes the migrated content.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_upgrades_a_v1_bundle() {
+    let s = sqlite_harness("k1", KEY_A);
+    s.user("alice").await;
+    let report = s.backup(&s.backups()).await;
+    let bundle = report["bundle"].as_str().unwrap().to_owned();
+    {
+        let c = rusqlite::Connection::open(Path::new(&bundle).join("server.db")).unwrap();
+        c.execute_batch(
+            "ALTER TABLE users DROP COLUMN deactivated_at;
+             ALTER TABLE users DROP COLUMN deactivated_by;
+             ALTER TABLE users DROP COLUMN last_login_at;
+             ALTER TABLE users DROP COLUMN retention_until;
+             ALTER TABLE users DROP COLUMN chain_deleted_at;
+             DROP TABLE scheduler_state;
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    }
+    rehash(&bundle, "server.db");
+    s.maintenance(true).await;
+    let r = s.restore(&bundle).await;
+    assert!(r.ok, "{r:?}");
+    assert!(s.store().user_by_name("alice").unwrap().is_some());
+    assert!(
+        s.store().scheduler_get("retention").is_ok(),
+        "v2 tables exist"
+    );
+    s.maintenance(false).await;
     within(s.ctx.registry.close_all()).await;
 }

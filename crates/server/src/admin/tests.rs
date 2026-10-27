@@ -353,6 +353,126 @@ async fn deactivate_is_idempotent() {
     within(t.ctx.registry.close_all()).await;
 }
 
+/// Batch-1 review I-2: a deactivation whose first attempt fails part-way (the user's store
+/// cannot open) leaves the keys dead but owes the records; the retry writes them all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deactivation_records_survive_a_failed_first_attempt() {
+    let t = harness();
+    let a = t.env.user("alice");
+    let key = t
+        .ctx
+        .api_keys
+        .create(
+            &UserCtx::from_authenticated(&a),
+            "agent",
+            &["read".to_owned()],
+            None,
+        )
+        .unwrap();
+    t.env.store.pat_put(&pat(&a, "work")).unwrap();
+    // No runtime can open: the first attempt fails before any record.
+    within(t.ctx.registry.quiesce()).await;
+    let first = call(
+        &t.ctx,
+        json!({"op": "users_deactivate", "username": "alice"}),
+    )
+    .await;
+    assert_eq!(first.error.as_deref(), Some("admin/user_store_unavailable"));
+    assert!(
+        t.ctx
+            .api_keys
+            .authenticate(key.key.expose_secret())
+            .is_err(),
+        "dead at once"
+    );
+    assert!(
+        t.env.store.api_key_list(&a).unwrap()[0]
+            .revoked_at
+            .is_none(),
+        "not revoked before its record"
+    );
+    t.ctx.registry.resume();
+    let rt = within(t.ctx.registry.open_user(&a)).await.unwrap();
+    let before = rt.head().1;
+    let second = call(
+        &t.ctx,
+        json!({"op": "users_deactivate", "username": "alice"}),
+    )
+    .await;
+    assert!(second.ok, "{second:?}");
+    let report = second.data.unwrap();
+    assert_eq!(report["newly_deactivated"], false);
+    assert_eq!(
+        (
+            report["api_keys_revoked"].clone(),
+            report["pats_deleted"].clone()
+        ),
+        (json!(1), json!(1))
+    );
+    assert!(report["anchor_seq"].is_u64());
+    assert_eq!(
+        rt.head().1,
+        before + 2,
+        "API_KEY_REVOKED and CREDENTIAL_CHANGED"
+    );
+    assert!(
+        t.env.store.api_key_list(&a).unwrap()[0]
+            .revoked_at
+            .is_some()
+    );
+    // Everything owed is done: a third call appends nothing.
+    let rows = t.env.store.anchor_all().unwrap().len();
+    let third = call(
+        &t.ctx,
+        json!({"op": "users_deactivate", "username": "alice"}),
+    )
+    .await;
+    assert_eq!(third.data.unwrap()["anchor_seq"], Value::Null);
+    assert_eq!(t.env.store.anchor_all().unwrap().len(), rows);
+    within(t.ctx.registry.close_all()).await;
+}
+
+/// Batch-1 review M-3: a session created by a login that raced the deactivation dies at its
+/// first use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_of_a_deactivated_user_dies_at_first_use() {
+    let t = harness();
+    let a = t.env.user("alice");
+    let b = t.env.user("bob");
+    let late = t.ctx.sessions.create(&a, vec!["user".into()]).unwrap();
+    let other = t.ctx.sessions.create(&b, vec!["user".into()]).unwrap();
+    t.env.store.user_deactivate(&a, 1, "admin", 2).unwrap();
+    assert_eq!(
+        t.ctx
+            .sessions
+            .lookup(late.cookie_id.expose_secret())
+            .unwrap_err(),
+        ApiError::NO_SESSION
+    );
+    assert!(
+        t.env
+            .store
+            .sessions_all()
+            .unwrap()
+            .iter()
+            .all(|s| s.user_id != a)
+    );
+    assert!(
+        t.ctx
+            .sessions
+            .lookup(other.cookie_id.expose_secret())
+            .is_ok()
+    );
+}
+/// Batch-1 review M-2: a peer that never sends its request line is dropped after the timeout.
+#[tokio::test(start_paused = true)]
+async fn an_idle_admin_connection_times_out() {
+    let t = harness();
+    let (_client, server) = tokio::io::duplex(1024);
+    let r = tokio::time::timeout(READ_TIMEOUT * 2, serve_conn(&t.ctx, server)).await;
+    let err = r.expect("serve_conn returned").unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+}
 #[test]
 fn cli_argument_table() {
     let a = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
@@ -445,6 +565,11 @@ mod unix {
         let (_listener, uid) = socket::bind(&path).unwrap();
         let meta = std::fs::metadata(&path).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(dir_mode & 0o777, 0o700, "the socket's directory is closed");
         assert_eq!(uid, meta.uid());
         // A stale socket is replaced; a regular file at the path is refused.
         drop(_listener);

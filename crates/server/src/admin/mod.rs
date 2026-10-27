@@ -41,6 +41,9 @@ use crate::store::ServerStore;
 /// A request line is at most this long (`admin/request_too_large`).
 pub const MAX_LINE: usize = 64 * 1024;
 
+/// How long a connection may take to send its request line.
+pub const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// SM-6.5 default retention period of a deactivated user's chain.
 pub const DEFAULT_RETENTION_DAYS: u32 = 365;
 
@@ -155,6 +158,7 @@ pub enum Request {
     Maintenance(SwitchArg),
     Backup(DirArg),
     Restore(DirArg),
+    RestoreResume(NoArgs),
     RotateMasterKey(KeyFileArg),
     RetentionRun(DryRunArg),
     AnchorVerify(NoArgs),
@@ -172,6 +176,7 @@ impl Request {
             Request::Maintenance(_) => "maintenance",
             Request::Backup(_) => "backup",
             Request::Restore(_) => "restore",
+            Request::RestoreResume(_) => "restore_resume",
             Request::RotateMasterKey(_) => "rotate_master_key",
             Request::RetentionRun(_) => "retention_run",
             Request::AnchorVerify(_) => "anchor_verify",
@@ -230,6 +235,7 @@ pub async fn handle(ctx: &AdminCtx, req: Request) -> Response {
         Request::Maintenance(m) => maintenance::set(ctx, m.on),
         Request::Backup(d) => backup::run(ctx, &d.dir).await,
         Request::Restore(d) => restore::run(ctx, &d.dir).await,
+        Request::RestoreResume(_) => restore::resume(ctx).await,
         Request::RotateMasterKey(k) => rotate::run(ctx, &k.new_key_file).await,
         Request::RetentionRun(d) => retention::admin(ctx, d.dry_run).await,
         Request::AnchorVerify(_) => {
@@ -266,10 +272,15 @@ where
 {
     let (r, mut w) = tokio::io::split(stream);
     let mut line = Vec::new();
-    BufReader::new(r)
-        .take(MAX_LINE as u64 + 1)
-        .read_until(b'\n', &mut line)
-        .await?;
+    // Batch-1 review M-2: an idle peer cannot hold a task forever.
+    tokio::time::timeout(
+        READ_TIMEOUT,
+        BufReader::new(r)
+            .take(MAX_LINE as u64 + 1)
+            .read_until(b'\n', &mut line),
+    )
+    .await
+    .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
     let resp = if line.len() > MAX_LINE {
         Response::err("admin/request_too_large")
     } else {

@@ -27,6 +27,10 @@ pub fn bind(path: &Path) -> io::Result<(UnixListener, u32)> {
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        // Batch-1 review M-2: no window with umask permissions. The directory is closed to
+        // everyone else first (best effort: an emptyDir may belong to root), then the socket
+        // itself is narrowed to 0600.
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;

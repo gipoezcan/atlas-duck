@@ -225,6 +225,14 @@ async fn run(config: Config) -> u8 {
         return fail("anchor_append_failed");
     }
     let anchor_timer = writer.spawn(config.anchor_interval);
+    // Batch-1 review I-1: a restore interrupted by a crash keeps the server in maintenance.
+    if crate::admin::restore::interrupted(config.data_dir.path()) {
+        registry.set_maintenance(true);
+        tracing::error!(
+            event = "store/restore_interrupted",
+            recover = "admin restore --resume (finish) or admin restore <data>/backups/pre-restore-* (go back), then admin maintenance off"
+        );
+    }
     let admin = Arc::new(AdminCtx::new(
         store.clone(),
         registry.clone(),

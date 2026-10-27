@@ -1,0 +1,4 @@
+# expect: atlas-duck: extraEnv ATLAS_DUCK_MODE is managed by the chart
+extraEnv:
+  - name: ATLAS_DUCK_MODE
+    value: dev

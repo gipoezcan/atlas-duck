@@ -72,6 +72,10 @@ for f in "$@"; do
     finding "$f" "an access mode other than ReadWriteOnce is rendered"
   fi
 
+  if grep -q 'CHANGE-ME' "$f"; then
+    finding "$f" "a CHANGE-ME placeholder is rendered"
+  fi
+
   if grep -Eq '^kind: Secret$' "$f"; then
     finding "$f" "a Secret is rendered (Secrets are created out of band, PD-M13-5)"
   fi

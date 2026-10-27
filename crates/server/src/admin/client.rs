@@ -27,6 +27,7 @@ pub const USAGE: &str = "usage: atlas-duck-server admin <command>
   maintenance on|off
   backup <dir>          (under <data>/backups or the temp directory)
   restore <bundle-dir>  (maintenance on first)
+  restore --resume      (finish a restore a crash interrupted)
   rotate-master-key --new-key-file <path>
   retention run [--dry-run]
   anchor verify
@@ -62,6 +63,7 @@ pub fn parse(args: &[String]) -> Option<Parsed> {
         ["backup", dir] if !dir.starts_with('-') => Some(Parsed::Run(Request::Backup(DirArg {
             dir: (*dir).to_owned(),
         }))),
+        ["restore", "--resume"] => Some(Parsed::Run(Request::RestoreResume(NoArgs {}))),
         ["restore", dir] if !dir.starts_with('-') => Some(Parsed::Run(Request::Restore(DirArg {
             dir: (*dir).to_owned(),
         }))),

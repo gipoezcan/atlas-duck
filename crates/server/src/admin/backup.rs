@@ -231,8 +231,25 @@ fn snapshot_heads(db: &Path) -> rusqlite::Result<(HeadRef, Vec<UserHeadRef>)> {
     ))
 }
 
+/// Flushes a written file to disk (batch-1 review M-1).
+pub fn sync_file(path: &Path) -> std::io::Result<()> {
+    // Opened for writing: Windows flushes only handles with write access.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .sync_all()
+}
+
+/// Flushes a directory's entries (renames, new files) to disk. Best effort: some platforms
+/// cannot open a directory for syncing.
+pub fn sync_dir(path: &Path) {
+    if let Ok(d) = std::fs::File::open(path) {
+        let _ = d.sync_all();
+    }
+}
+
 /// Everything after the quiesce: the files, then the manifest. Blocking.
-fn write_bundle(
+pub(crate) fn write_bundle(
     store: &Arc<dyn ServerStore>,
     data: &Path,
     bundle: &Path,
@@ -257,6 +274,10 @@ fn write_bundle(
     let mut files = Vec::new();
     for rel in &written {
         let p = bundle.join(rel);
+        sync_file(&p).map_err(io)?;
+        if let Some(parent) = p.parent() {
+            sync_dir(parent);
+        }
         files.push(FileRef {
             path: rel.clone(),
             size: std::fs::metadata(&p).map_err(io)?.len(),
@@ -280,6 +301,7 @@ fn write_bundle(
     let mut f = std::fs::File::create_new(bundle.join(MANIFEST)).map_err(io)?;
     std::io::Write::write_all(&mut f, &bytes).map_err(io)?;
     f.sync_all().map_err(io)?;
+    sync_dir(bundle);
     written.push(MANIFEST.to_owned());
     Ok((manifest, written))
 }

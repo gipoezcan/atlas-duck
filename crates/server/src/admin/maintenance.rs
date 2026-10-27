@@ -8,6 +8,10 @@ use super::AdminCtx;
 use crate::anchor::KIND_MAINTENANCE;
 
 pub fn set(ctx: &AdminCtx, on: bool) -> Result<Value, &'static str> {
+    // An interrupted restore keeps the server in maintenance until it is finished or undone.
+    if !on && super::restore::interrupted(&ctx.registry.deps().data_dir) {
+        return Err("restore/interrupted");
+    }
     let was = ctx.registry.maintenance();
     if was != on {
         ctx.writer

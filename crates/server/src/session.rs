@@ -149,6 +149,18 @@ impl SessionTable {
             let _ = self.store.session_delete(&key);
             return Err(ApiError::SESSION_EXPIRED);
         }
+        // Batch-1 review M-3: a session a login created while the user was being deactivated dies
+        // at its first use.
+        let user_id = live.record.user_id.clone();
+        if matches!(self.store.user_state(&user_id), Ok(Some(s)) if s.deactivated_at.is_some()) {
+            map.remove(&key);
+            drop(map);
+            let _ = self.store.session_delete(&key);
+            return Err(ApiError::NO_SESSION);
+        }
+        let Some(live) = map.get_mut(&key) else {
+            return Err(ApiError::NO_SESSION);
+        };
         live.record.last_seen = now;
         live.record.idle_expiry = now
             .saturating_add(self.idle)
