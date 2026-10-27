@@ -237,29 +237,24 @@ pub struct StoreOnly {
 /// How long a reopen waits for a user lock that this very process still holds.
 const OWN_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 const OWN_LOCK_STEP: std::time::Duration = std::time::Duration::from_millis(20);
+/// The error text of [`UserRuntime::open_store`] for a lock held by this process.
+const OWN_LOCK_HELD: &str = "user lock held by this process";
 
 /// The user's `instance.lock`. On Unix the lock is an `flock` on an open file description: a
 /// child this process forks (a script worker, the sandbox probe, any `Command`) shares the
 /// descriptor from `fork` until its `exec` closes it (`O_CLOEXEC`). A runtime closed and
 /// reopened at that moment finds the lock still held, by its own pid (CI run 40517478906:
-/// eviction then reopen). Held by this pid, the lock is released within moments, so the open
-/// retries for at most [`OWN_LOCK_WAIT`]; held by another process it fails at once, as before.
-fn acquire_own_lock(
-    data: &atlas_duck_ipc::paths::LocalDataDir,
-) -> Result<InstanceLock, atlas_duck_audit::lock::LockError> {
-    let deadline = std::time::Instant::now() + OWN_LOCK_WAIT;
-    loop {
-        match InstanceLock::acquire(data, LOCK_HOST) {
-            Err(atlas_duck_audit::lock::LockError::Held(Some(h)))
-                if h.pid == std::process::id() && std::time::Instant::now() < deadline =>
-            {
-                std::thread::sleep(OWN_LOCK_STEP);
-            }
-            other => return other,
+/// eviction then reopen). That case is reported as [`OWN_LOCK_HELD`]; held by another process
+/// the error is as before.
+fn acquire_lock(data: &atlas_duck_ipc::paths::LocalDataDir) -> Result<InstanceLock, String> {
+    match InstanceLock::acquire(data, LOCK_HOST) {
+        Ok(l) => Ok(l),
+        Err(atlas_duck_audit::lock::LockError::Held(Some(h))) if h.pid == std::process::id() => {
+            Err(OWN_LOCK_HELD.to_owned())
         }
+        Err(e) => Err(format!("{e:?}")),
     }
 }
-
 impl UserRuntime {
     /// The user's store under its instance lock. `create`: create it when it does not exist yet
     /// (a login); otherwise a missing store is `UnknownUser` (an auditor never creates one).
@@ -282,7 +277,7 @@ impl UserRuntime {
             Ok(DataDirResolution::Local(d)) => d,
             _ => return Err(st("user dir is not a local directory".into())),
         };
-        let lock = acquire_own_lock(&data).map_err(|e| st(format!("{e:?}")))?;
+        let lock = acquire_lock(&data).map_err(st)?;
         let keys = Arc::new(ServerKeyStore::new(
             deps.store.clone(),
             user_id,
@@ -317,9 +312,29 @@ impl UserRuntime {
         Ok(StoreOnly { lock, store })
     }
 
+    /// [`Self::open_store`], waiting (without blocking a worker) up to [`OWN_LOCK_WAIT`] while
+    /// the user's lock is still held by this process.
+    pub async fn open_store_waiting(
+        user_id: &str,
+        deps: &RuntimeDeps,
+        create: bool,
+    ) -> Result<StoreOnly, RuntimeError> {
+        let deadline = tokio::time::Instant::now() + OWN_LOCK_WAIT;
+        loop {
+            match Self::open_store(user_id, deps, create) {
+                Err(RuntimeError::Store(m))
+                    if m == OWN_LOCK_HELD && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(OWN_LOCK_STEP).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// Opens (creating on first use) the user's store and starts its core.
     pub async fn open(user_id: &str, deps: &RuntimeDeps) -> Result<UserRuntime, RuntimeError> {
-        let opened = Self::open_store(user_id, deps, true)?;
+        let opened = Self::open_store_waiting(user_id, deps, true).await?;
         Self::open_with(user_id, deps, opened).await
     }
 
@@ -732,14 +747,14 @@ impl Registry {
             return Ok(rt.audit_handle());
         }
         let now = self.deps.clock.now();
-        let mut views = self.views();
-        if let Some((v, at)) = views.get_mut(user_id) {
+        if let Some((v, at)) = self.views().get_mut(user_id) {
             *at = now;
             return Ok(v.store.clone());
         }
-        let opened = UserRuntime::open_store(user_id, &self.deps, false)?;
+        // Views are only made under the registry lock, which this call still holds.
+        let opened = UserRuntime::open_store_waiting(user_id, &self.deps, false).await?;
         let store = opened.store.clone();
-        views.insert(user_id.to_owned(), (opened, now));
+        self.views().insert(user_id.to_owned(), (opened, now));
         drop(open);
         Ok(store)
     }

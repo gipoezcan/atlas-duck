@@ -457,10 +457,17 @@ async fn ldap_probe_handshakes_without_binding() {
 
 #[tokio::test]
 async fn ldap_closed_port_is_unavailable_within_11s() {
+    // The fake server first, then a port that refuses: a port freed before the fake started
+    // could be the one it binds (the flake of CI run 40517478906's rerun). A listener that
+    // closes every connection at once keeps the port this test's own: no other test can bind it.
+    let any = FakeLdap::start(Mode::Entry { uac: 512 }).await;
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    let any = FakeLdap::start(Mode::Entry { uac: 512 }).await;
+    let closer = tokio::spawn(async move {
+        while let Ok((sock, _)) = listener.accept().await {
+            drop(sock);
+        }
+    });
     let d = LdapDirectory::new(
         url::Url::parse(&format!("ldaps://localhost:{port}")).unwrap(),
         "@example.test".into(),
@@ -477,6 +484,7 @@ async fn ldap_closed_port_is_unavailable_within_11s() {
         "{:?}",
         started.elapsed()
     );
+    closer.abort();
 }
 
 /// Review M3: a missing or unreadable `userAccountControl` is a disabled account (fail closed).
