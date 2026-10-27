@@ -28,7 +28,9 @@ case "$RELEASE_NAME" in
   atlas-duck-*) ;;
   *) echo "ops drill: refusing release '$RELEASE_NAME' (review releases only)" >&2; exit 1 ;;
 esac
-CA="${CA_BUNDLE:-deployment/ca/org-ca.pem}"
+# Ingress TLS: Let's Encrypt via cert-manager, verified against the system bundle (or
+# INGRESS_CA_BUNDLE); deployment/ca/org-ca.pem is the AD root for LDAPS only.
+INGRESS_CA="${INGRESS_CA_BUNDLE:-}"
 BASE="${REVIEW_URL%/}"
 CHART="${APP_NAME}-${PROJECT_VERSION}.tgz"
 K="kubectl --context ${KUBE_CONTEXT} -n ${KUBE_NAMESPACE}"
@@ -52,7 +54,13 @@ fail() {
   echo "ops drill: FAILED: $*" >&2
   exit 1
 }
-c() { curl --silent --show-error --max-time 30 --cacert "$CA" "$@"; }
+c() {
+  if [ -n "$INGRESS_CA" ]; then
+    curl --silent --show-error --max-time 30 --cacert "$INGRESS_CA" "$@"
+  else
+    curl --silent --show-error --max-time 30 "$@"
+  fi
+}
 status_of() { # url [curl args...] -> status; body in $WORK/body
   url="$1"
   shift

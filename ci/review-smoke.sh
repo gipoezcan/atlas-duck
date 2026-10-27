@@ -1,7 +1,7 @@
 #!/bin/sh
 # Review-environment smoke test (M13 plan T14; master-plan exit criterion, SM-2, SM-3.2, SM-8.2).
 # Runs in the `verify:review-smoke` job against the release `deploy:review` just applied, through
-# the ingress with TLS verified against the organisation CA bundle (never -k, SM-9.2):
+# the ingress with TLS verified against the system CA bundle (Let's Encrypt; never -k, SM-9.2):
 #   rollout done; /healthz 200; /readyz 200 with the test directory reported; /metrics not
 #   reachable through the ingress; an instance via the admin socket (kubectl exec); login as a
 #   test user (CSRF); an API key (scope read); MCP initialize + tools/list with it; the key
@@ -13,7 +13,10 @@ set -eu
 set +x
 
 : "${REVIEW_URL:?}" "${RELEASE_NAME:?}" "${KUBE_CONTEXT:?}" "${KUBE_NAMESPACE:?}"
-CA="${CA_BUNDLE:-deployment/ca/org-ca.pem}"
+# The ingress certificate comes from cert-manager's ClusterIssuer letsencrypt (Let's Encrypt,
+# chain to ISRG Root X1), so TLS is verified against the image's system bundle. INGRESS_CA_BUNDLE
+# overrides it. deployment/ca/org-ca.pem is the AD root for LDAPS only, not for the ingress.
+INGRESS_CA="${INGRESS_CA_BUNDLE:-}"
 BASE="${REVIEW_URL%/}"
 K="kubectl --context ${KUBE_CONTEXT} -n ${KUBE_NAMESPACE}"
 WORK="$(mktemp -d)"
@@ -26,7 +29,11 @@ fail() {
 command -v curl > /dev/null || fail "no curl in this image"
 
 c() { # curl with the CA bundle, bounded, quiet
-  curl --silent --show-error --max-time 15 --cacert "$CA" "$@"
+  if [ -n "$INGRESS_CA" ]; then
+    curl --silent --show-error --max-time 15 --cacert "$INGRESS_CA" "$@"
+  else
+    curl --silent --show-error --max-time 15 "$@"
+  fi
 }
 status_of() { # url [curl args...] -> HTTP status, body in $WORK/body
   url="$1"

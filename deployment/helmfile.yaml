@@ -30,6 +30,10 @@ releases:
   - name: {{ requiredEnv "RELEASE_NAME" }}
     namespace: team-dux
     chart: ./chart # Do not change the path, it is set up by the pipeline
+    # The cluster's /openapi/v2 answers 503 (an aggregated API is down); Helm's client-side
+    # schema check would fail on it. The server validates every object on apply, and the job's
+    # server-side dry run checks them first.
+    disableOpenAPIValidation: true
     values:
       - {{ .Values.valuesFile }}
     set:

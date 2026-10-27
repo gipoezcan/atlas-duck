@@ -415,7 +415,10 @@ deploy:review:
       ARGS="${ARGS} --set podAnnotations.commit-sha=${CI_COMMIT_SHORT_SHA}"
       # Server-side schema validation before anything changes (PD-M13-10).
       helmfile -e review -f build/helmfile.yaml template ${ARGS} > rendered-review.yaml
-      $K apply --dry-run=server -f rendered-review.yaml > /dev/null
+      # Server-side apply: the cluster's /openapi/v2 answers 503 (an aggregated API is down),
+      # which client-side apply needs; server-side apply validates on the server via v3.
+      $K apply --server-side --field-manager=atlas-duck-ci --dry-run=server --validate=strict \
+        -f rendered-review.yaml > /dev/null
       helmfile -e review -f build/helmfile.yaml apply ${ARGS}
       echo "REVIEW_URL=https://${HOST}" > review.env
       echo "RELEASE_NAME=${RELEASE_NAME}" >> review.env
@@ -501,13 +504,17 @@ deploy:production:
       ARGS="${ARGS} --set image.digest=$(cat image.digest)"
       ARGS="${ARGS} --set podAnnotations.commit-sha=${CI_COMMIT_SHORT_SHA}"
       helmfile -e production -f build/helmfile.yaml template ${ARGS} > rendered-production.yaml
-      $K apply --dry-run=server -f rendered-production.yaml > /dev/null
+      # Server-side apply: the cluster's /openapi/v2 answers 503 (an aggregated API is down),
+      # which client-side apply needs; server-side apply validates on the server via v3.
+      $K apply --server-side --field-manager=atlas-duck-ci --dry-run=server --validate=strict \
+        -f rendered-production.yaml > /dev/null
       helmfile -e production -f build/helmfile.yaml apply ${ARGS}
   environment:
     name: production
     deployment_tier: production
 # T14 (master-plan exit criterion): the review environment answers through the ingress with TLS
-# verified against the org CA, signs in a test user, serves MCP to an API key and refuses it once
+# verified against the system bundle (the ingress certificate is Let's Encrypt via cert-manager;
+# deployment/ca/org-ca.pem is the AD root for LDAPS only), signs in a test user, serves MCP to an API key and refuses it once
 # revoked, and passes `helm test`.
 verify:review-smoke:
   stage: server-verify
