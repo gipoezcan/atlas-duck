@@ -299,6 +299,21 @@ pub trait ScriptRunner: Send + Sync {
         run: RunSpec,
         calls: Arc<dyn HostCalls>,
     ) -> Result<Arc<dyn RunHandle>, RunnerError>;
+    /// M14 PD-246 (additive): pools a runner shared by many cores (the server: one core per user)
+    /// bounds all of them with, on top of each core's own §9.4 slots. A run takes the shared
+    /// permit right after its own slot, in the same wait (it queues the same way, `queued`
+    /// included, and stops waiting when its request ends) and holds both to its end. `None` (the
+    /// default, the desktop): no shared bound.
+    fn shared_slots(&self) -> Option<SharedSlots> {
+        None
+    }
+}
+
+/// M14 PD-246: process-wide pools of real runs and of dry runs plus compile checks.
+#[derive(Debug, Clone)]
+pub struct SharedSlots {
+    pub runs: Arc<Semaphore>,
+    pub dry: Arc<Semaphore>,
 }
 
 /// C.7: what the worker's `host.call`s and `atlas.log` go through.
@@ -3045,7 +3060,40 @@ async fn run(engine: Arc<Engine>, entry: Arc<RequestEntry>) {
 /// A slot of `sem`, or `None` once the request is terminal (cancel, expiry) meanwhile. An end
 /// wins over a free permit (`biased`): a request cancelled during `check_available` gets no
 /// compile worker (T12 review M-3).
+/// A run's slot: its own core's permit and, under a runner with [`SharedSlots`], the shared one.
+/// Dropping it gives both back.
+struct SlotPermit {
+    _own: OwnedSemaphorePermit,
+    _shared: Option<OwnedSemaphorePermit>,
+}
+
+/// The core's own pool first, then (M14 PD-246) the runner's shared pool; `queued` is true when
+/// either was not free at once. The wait ends with `None` when the request ends meanwhile.
 async fn slot(
+    sem: &Arc<Semaphore>,
+    shared: Option<&Arc<Semaphore>>,
+    entry: &RequestEntry,
+    immediately: bool,
+) -> Option<(SlotPermit, bool)> {
+    let (own, mut queued) = slot_of(sem, entry, immediately).await?;
+    let shared = match shared {
+        None => None,
+        Some(s) => {
+            let (p, q) = slot_of(s, entry, immediately).await?;
+            queued |= q;
+            Some(p)
+        }
+    };
+    Some((
+        SlotPermit {
+            _own: own,
+            _shared: shared,
+        },
+        queued,
+    ))
+}
+
+async fn slot_of(
     sem: &Arc<Semaphore>,
     entry: &RequestEntry,
     immediately: bool,
@@ -3172,7 +3220,15 @@ async fn run_real(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, runner: &dyn 
         return;
     }
     // 2. The submit-time compile check, in the dry pool (never a real slot, §9.1 step 2).
-    let Some((dry_permit, _)) = slot(&engine.dry_slots, entry, false).await else {
+    let pools = runner.shared_slots();
+    let Some((dry_permit, _)) = slot(
+        &engine.dry_slots,
+        pools.as_ref().map(|p| &p.dry),
+        entry,
+        false,
+    )
+    .await
+    else {
         return;
     };
     let compiled = runner
@@ -3223,7 +3279,14 @@ async fn run_real(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, runner: &dyn 
     //    here, when the slot is acquired (PD-141), with the confinement the run is admitted under
     //    (`confinement` is this slot-time admission); the spawn below reads it again and may only
     //    narrow it.
-    let Some((permit, queued)) = slot(&engine.script_slots, entry, true).await else {
+    let Some((permit, queued)) = slot(
+        &engine.script_slots,
+        pools.as_ref().map(|p| &p.runs),
+        entry,
+        true,
+    )
+    .await
+    else {
         return;
     };
     let policy = engine.script_policy();
@@ -3765,7 +3828,15 @@ async fn run_dry(
         return;
     }
     // The dry pool: a dry run never waits on a real slot (§9.4, §9.5).
-    let Some((permit, _)) = slot(&engine.dry_slots, entry, false).await else {
+    let pools = runner.shared_slots();
+    let Some((permit, _)) = slot(
+        &engine.dry_slots,
+        pools.as_ref().map(|p| &p.dry),
+        entry,
+        false,
+    )
+    .await
+    else {
         return;
     };
     // The kill handle exists from the step that enters `DryRunning`: a cancel during the compile

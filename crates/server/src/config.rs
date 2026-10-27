@@ -65,6 +65,8 @@ pub struct Config {
     pub rust_log: String,
     /// M14 PD-233..PD-245.
     pub oauth: crate::oauth::OAuthConfig,
+    /// M14 PD-246..PD-249.
+    pub scripts: crate::scripts::ScriptsConfig,
 }
 
 /// A refused configuration: a fixed code and the key it concerns. Never carries a value.
@@ -111,6 +113,10 @@ pub const OAUTH_REFRESH_IDLE_DAYS: &str = "ATLAS_DUCK_OAUTH_REFRESH_IDLE_DAYS";
 pub const OAUTH_GRANT_MAX_DAYS: &str = "ATLAS_DUCK_OAUTH_GRANT_MAX_DAYS";
 pub const OAUTH_REGISTER_PER_IP_HOUR: &str = "ATLAS_DUCK_OAUTH_REGISTER_PER_IP_HOUR";
 pub const OAUTH_MAX_CLIENTS: &str = "ATLAS_DUCK_OAUTH_MAX_CLIENTS";
+pub const SCRIPTS: &str = "ATLAS_DUCK_SCRIPTS";
+pub const SANDBOX_BIN: &str = "ATLAS_DUCK_SANDBOX_BIN";
+pub const SCRIPT_RUNS_MAX: &str = "ATLAS_DUCK_SCRIPT_RUNS_MAX";
+pub const SCRIPT_DRY_RUNS_MAX: &str = "ATLAS_DUCK_SCRIPT_DRY_RUNS_MAX";
 
 /// SM-6.3 "at least every 15 minutes".
 pub const MAX_ANCHOR_INTERVAL_SECS: u64 = 900;
@@ -133,6 +139,13 @@ impl Config {
             .any(|n| n.to_ascii_uppercase().ends_with("MASTER_KEY"))
         {
             return Err(err("config/master_key_in_env", MASTER_KEY_FILE));
+        }
+        // PD-248: no degraded scripts in server mode; a key that asks for them is refused.
+        if vars()
+            .iter()
+            .any(|n| n.to_ascii_uppercase().contains("ALLOW_DEGRADED"))
+        {
+            return Err(err("config/degraded_scripts_refused", SCRIPTS));
         }
         let required = |k: &'static str| get(k).ok_or(err("config/missing_key", k));
 
@@ -207,6 +220,7 @@ impl Config {
         };
         let anchor = positive(ANCHOR_INTERVAL_SECS, MAX_ANCHOR_INTERVAL_SECS)?;
         let oauth = oauth_config(&get, &num)?;
+        let scripts = scripts_config(&get, &num)?;
         if anchor > MAX_ANCHOR_INTERVAL_SECS {
             return Err(err("config/anchor_interval_too_long", ANCHOR_INTERVAL_SECS));
         }
@@ -230,6 +244,7 @@ impl Config {
             anchor_interval: Duration::from_secs(anchor),
             rust_log: get(RUST_LOG).unwrap_or_else(|| "info".into()),
             oauth,
+            scripts,
         })
     }
 
@@ -275,6 +290,40 @@ fn oauth_config(
             .unwrap_or(100),
         max_clients: u64::try_from(ranged(OAUTH_MAX_CLIENTS, 1000, 10, 100_000, bad)?)
             .unwrap_or(100_000),
+    })
+}
+
+/// The M14 script keys: `ATLAS_DUCK_SCRIPTS` `enabled|disabled`, an absolute
+/// `ATLAS_DUCK_SANDBOX_BIN` (its file is checked at serve start), the two server-wide pools
+/// 1..=32 (`config/script_limits_out_of_range`).
+fn scripts_config(
+    get: &dyn Fn(&str) -> Option<String>,
+    num: &dyn Fn(&'static str, u64) -> Result<u64, ConfigError>,
+) -> Result<crate::scripts::ScriptsConfig, ConfigError> {
+    let enabled = match get(SCRIPTS).as_deref() {
+        None | Some("enabled") => true,
+        Some("disabled") => false,
+        Some(_) => return Err(err("config/invalid_value", SCRIPTS)),
+    };
+    let sandbox_bin = PathBuf::from(
+        get(SANDBOX_BIN).unwrap_or_else(|| crate::scripts::ScriptsConfig::DEFAULT_BIN.into()),
+    );
+    if !sandbox_bin.has_root() {
+        return Err(err("config/sandbox_bin_invalid", SANDBOX_BIN));
+    }
+    let pool = |k: &'static str| -> Result<usize, ConfigError> {
+        let v = num(k, 4)?;
+        if (1..=32).contains(&v) {
+            usize::try_from(v).map_err(|_| err("config/script_limits_out_of_range", k))
+        } else {
+            Err(err("config/script_limits_out_of_range", k))
+        }
+    };
+    Ok(crate::scripts::ScriptsConfig {
+        enabled,
+        sandbox_bin,
+        runs_max: pool(SCRIPT_RUNS_MAX)?,
+        dry_runs_max: pool(SCRIPT_DRY_RUNS_MAX)?,
     })
 }
 
@@ -525,6 +574,46 @@ mod tests {
             (OAUTH_MAX_CLIENTS, "x", "config/invalid_value"),
         ] {
             assert_eq!(code(Env::ok().set(k, v)), (want, k), "{k}={v}");
+        }
+    }
+
+    #[test]
+    fn script_keys_defaults_ranges_and_the_degraded_refusal() {
+        let c = Env::ok().load().unwrap();
+        assert_eq!(c.scripts, crate::scripts::ScriptsConfig::defaults());
+        assert_eq!(
+            c.scripts.sandbox_bin,
+            PathBuf::from("/app/atlas-duck-sandbox")
+        );
+        let c = Env::ok()
+            .set(SCRIPTS, "disabled")
+            .set(SANDBOX_BIN, "/opt/worker")
+            .set(SCRIPT_RUNS_MAX, "32")
+            .set(SCRIPT_DRY_RUNS_MAX, "1")
+            .load()
+            .unwrap();
+        assert!(!c.scripts.enabled);
+        assert_eq!(c.scripts.sandbox_bin, PathBuf::from("/opt/worker"));
+        assert_eq!((c.scripts.runs_max, c.scripts.dry_runs_max), (32, 1));
+        for (k, v, want) in [
+            (SCRIPTS, "on", "config/invalid_value"),
+            (SANDBOX_BIN, "relative/worker", "config/sandbox_bin_invalid"),
+            (SCRIPT_RUNS_MAX, "0", "config/script_limits_out_of_range"),
+            (SCRIPT_RUNS_MAX, "33", "config/script_limits_out_of_range"),
+            (
+                SCRIPT_DRY_RUNS_MAX,
+                "40",
+                "config/script_limits_out_of_range",
+            ),
+            (
+                "ATLAS_DUCK_ALLOW_DEGRADED_SCRIPTS",
+                "1",
+                "config/degraded_scripts_refused",
+            ),
+            ("my_allow_degraded", "x", "config/degraded_scripts_refused"),
+        ] {
+            let got = code(Env::ok().set(k, v));
+            assert_eq!(got.0, want, "{k}={v}");
         }
     }
 

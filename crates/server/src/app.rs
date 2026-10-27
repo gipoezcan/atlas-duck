@@ -93,6 +93,27 @@ async fn run(config: Config) -> u8 {
         },
     };
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    // M14 PD-246..PD-249: the worker must exist before listening; the probe runs in the
+    // background (readiness does not wait for it).
+    let scripts = if config.scripts.enabled {
+        if !crate::scripts::sandbox_bin_ok(&config.scripts.sandbox_bin) {
+            crate::log::stderr_line(
+                "error",
+                config_error_fields(&crate::config::ConfigError {
+                    code: "config/sandbox_bin_invalid",
+                    key: crate::config::SANDBOX_BIN,
+                }),
+            );
+            return EXIT_CONFIG;
+        }
+        Some(Arc::new(crate::scripts::ServerScripts::start(
+            config.scripts.clone(),
+            &data,
+        )))
+    } else {
+        tracing::warn!(event = "scripts_disabled");
+        None
+    };
     let registry = Arc::new(Registry::new(
         RuntimeDeps {
             data_dir: data,
@@ -102,6 +123,7 @@ async fn run(config: Config) -> u8 {
             clock: clock.clone(),
             allow_http: false,
             sse_capacity: crate::runtime::SSE_CAPACITY,
+            scripts: scripts.clone(),
         },
         config.max_open_users,
     ));
@@ -155,7 +177,7 @@ async fn run(config: Config) -> u8 {
         login,
         registry: registry.clone(),
         web: WebDir(config.web_dir.clone()),
-        health: Arc::new(Health::new(store.clone(), directory, true)),
+        health: Arc::new(Health::new(store.clone(), directory, true).with_scripts(scripts.clone())),
         api_keys,
         mcp_sessions: Arc::new(crate::mcp::McpSessions::new()),
         clock: clock.clone(),

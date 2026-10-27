@@ -143,6 +143,7 @@ pub async fn execute(cmd: AdminCmd, config: &Config, master: Arc<MasterKey>) -> 
             clock: Arc::new(SystemClock),
             allow_http: false,
             sse_capacity: crate::runtime::SSE_CAPACITY,
+            scripts: None,
         },
         config.max_open_users,
     );

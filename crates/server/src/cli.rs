@@ -25,6 +25,8 @@ pub enum Command {
     Version,
     /// The hidden transitional dmin (PD-212).
     Admin,
+    /// M14 T12 (hidden): probe the sandbox worker once, print the report as JSON.
+    SandboxProbe,
     Usage,
 }
 
@@ -33,6 +35,9 @@ pub fn parse(args: &[String]) -> Command {
         [cmd] if cmd == "serve" => Command::Serve,
         [cmd] if cmd == "version" || cmd == "--version" => Command::Version,
         [cmd, ..] if cmd == "admin" => Command::Admin,
+        [cmd] | [cmd, _] if cmd == "sandbox-probe" && args.get(1).is_none_or(|a| a == "--json") => {
+            Command::SandboxProbe
+        }
         _ => Command::Usage,
     }
 }
@@ -64,7 +69,38 @@ pub fn main() -> ExitCode {
         }
         Command::Serve => serve(),
         Command::Admin => crate::admin_offline::run(&args[1..]),
+        Command::SandboxProbe => sandbox_probe(),
     })
+}
+
+/// `atlas-duck-server sandbox-probe --json` (T12 Step 4, T14's container proof): one probe of
+/// `ATLAS_DUCK_SANDBOX_BIN` (default `/app/atlas-duck-sandbox`) with `ATLAS_DUCK_DATA_DIR` (else
+/// the temp dir) as the profile a worker must not read; prints the report, exits 0 when the floor
+/// is met and 1 otherwise. Needs no other configuration and opens no store.
+fn sandbox_probe() -> u8 {
+    let bin = std::env::var_os(crate::config::SANDBOX_BIN)
+        .filter(|v| !v.is_empty())
+        .map_or_else(
+            || std::path::PathBuf::from(crate::scripts::ScriptsConfig::DEFAULT_BIN),
+            std::path::PathBuf::from,
+        );
+    let profile = std::env::var_os(crate::config::DATA_DIR)
+        .filter(|v| !v.is_empty())
+        .map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+    let report = atlas_duck_script_glue::probe::run_probe_for(&bin, std::process::id(), &profile);
+    let _ = writeln!(
+        std::io::stdout(),
+        "{}",
+        crate::scripts::report_json(&report)
+    );
+    if matches!(
+        report.floor,
+        atlas_duck_sandbox_host::probe::FloorVerdict::Met
+    ) {
+        EXIT_OK
+    } else {
+        EXIT_RUNTIME
+    }
 }
 
 fn serve() -> u8 {
@@ -103,6 +139,12 @@ mod tests {
             parse(&args(&["admin", "instances", "list"])),
             Command::Admin
         );
+        assert_eq!(
+            parse(&args(&["sandbox-probe", "--json"])),
+            Command::SandboxProbe
+        );
+        assert_eq!(parse(&args(&["sandbox-probe"])), Command::SandboxProbe);
+        assert_eq!(parse(&args(&["sandbox-probe", "x"])), Command::Usage);
     }
 
     #[test]

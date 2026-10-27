@@ -160,6 +160,7 @@ impl H {
                 clock: clock.clone(),
                 allow_http: true,
                 sse_capacity: crate::runtime::SSE_CAPACITY,
+                scripts: None,
             },
             10,
         ));

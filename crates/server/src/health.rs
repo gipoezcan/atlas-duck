@@ -21,6 +21,8 @@ pub struct Health {
     directory: Arc<dyn Directory>,
     master_key_loaded: bool,
     probe: Mutex<Option<(Instant, bool)>>,
+    /// M14 PD-248: the script state; reported, never a reason for 503.
+    scripts: Option<Arc<crate::scripts::ServerScripts>>,
 }
 
 impl Health {
@@ -34,7 +36,19 @@ impl Health {
             directory,
             master_key_loaded,
             probe: Mutex::new(None),
+            scripts: None,
         }
+    }
+
+    /// The script state `/readyz` reports (`disabled` without one).
+    pub fn with_scripts(mut self, scripts: Option<Arc<crate::scripts::ServerScripts>>) -> Health {
+        self.scripts = scripts;
+        self
+    }
+
+    /// `met`, `not_met`, `probing` or `disabled` (PD-248).
+    pub fn scripts_state(&self) -> &'static str {
+        self.scripts.as_ref().map_or("disabled", |s| s.state())
     }
 
     async fn directory_ok(&self) -> bool {
@@ -56,6 +70,7 @@ impl Health {
         let body = json!({
             "checks": {"store": store, "master_key": self.master_key_loaded, "directory": directory},
             "directory": self.directory.kind(),
+            "scripts": self.scripts_state(),
         });
         let status = if ok {
             StatusCode::OK

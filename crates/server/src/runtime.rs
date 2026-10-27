@@ -112,6 +112,9 @@ pub struct RuntimeDeps {
     pub allow_http: bool,
     /// Per-user SSE broadcast capacity ([`SSE_CAPACITY`]; tests use a small one).
     pub sse_capacity: usize,
+    /// M14 PD-246: the process-wide script state; `None` (`ATLAS_DUCK_SCRIPTS=disabled`) answers
+    /// every script `sandbox_unavailable`.
+    pub scripts: Option<Arc<crate::scripts::ServerScripts>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +223,7 @@ pub struct UserRuntime {
     pub fail_next_append: std::sync::atomic::AtomicBool,
     mcp_calls: AtomicUsize,
     last_used: AtomicU64,
+    script_instances: atlas_duck_script_glue::InstanceSource,
     _lock: InstanceLock,
 }
 
@@ -287,6 +291,12 @@ impl UserRuntime {
         let (events, _) = broadcast::channel(deps.sse_capacity.max(1));
         let mut extra = Map::new();
         extra.insert("mode".into(), Value::from("server"));
+        // M14: this core's glue reads this core's instances once it runs ([`Registry`] binds).
+        let script_instances = atlas_duck_script_glue::InstanceSource::default();
+        let scripts = deps
+            .scripts
+            .as_ref()
+            .map(|s| s.runner(script_instances.clone()));
         let core_deps = CoreDeps {
             audit: store.clone(),
             clock: Arc::new(SystemClock::new()),
@@ -298,7 +308,7 @@ impl UserRuntime {
             http,
             app_start_extra: extra,
             pats_deleted: Vec::new(),
-            scripts: None,
+            scripts,
         };
         let core = start_core(core_deps, &store, deps.allow_http)
             .await
@@ -314,8 +324,20 @@ impl UserRuntime {
             fail_next_append: std::sync::atomic::AtomicBool::new(false),
             mcp_calls: AtomicUsize::new(0),
             last_used: AtomicU64::new(0),
+            script_instances,
             _lock: lock,
         })
+    }
+
+    /// Lets this core's script glue read its instances (`atlas.instances()`); a weak reference,
+    /// as the glue is the core's own.
+    fn bind_script_instances(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        self.script_instances.set(move || {
+            weak.upgrade()
+                .map(|rt| rt.core.script_instances())
+                .unwrap_or_default()
+        });
     }
 
     pub fn user_id(&self) -> &str {
@@ -404,6 +426,8 @@ impl UserRuntime {
         self.sse_streams.load(Ordering::SeqCst) == 0
             && self.mcp_calls.load(Ordering::SeqCst) == 0
             && self.decisions().queue_list().is_empty()
+            // M14 PD-249 (Δ-M14-3): a running script pins its runtime (closing would kill it).
+            && self.core.running_scripts().is_empty()
     }
 
     /// An SSE pin unless the user already has [`MAX_SSE_STREAMS`] open (batch-3 review M5).
@@ -541,6 +565,7 @@ impl Registry {
             }
         }
         let rt = Arc::new(UserRuntime::open(user_id, &self.deps).await?);
+        rt.bind_script_instances();
         rt.last_used.store(t, Ordering::SeqCst);
         open.insert(user_id.to_owned(), rt.clone());
         Ok(rt)

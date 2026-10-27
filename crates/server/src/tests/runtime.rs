@@ -19,6 +19,8 @@ pub(crate) struct Env {
     pub dir: tempfile::TempDir,
     pub store: Arc<dyn ServerStore>,
     pub master: Arc<MasterKey>,
+    /// M14: the script state the registry's runtimes get (`None`: scripts off).
+    pub scripts: Option<Arc<crate::scripts::ServerScripts>>,
 }
 
 impl Env {
@@ -38,6 +40,7 @@ impl Env {
             dir: tempfile::tempdir().unwrap(),
             store,
             master: Arc::new(MasterKey::for_tests("k1", [4; 32])),
+            scripts: None,
         }
     }
 
@@ -63,6 +66,7 @@ impl Env {
             clock: ManualClock::at(1_800_000_000),
             allow_http: true,
             sse_capacity: crate::runtime::SSE_CAPACITY,
+            scripts: self.scripts.clone(),
         }
     }
 }

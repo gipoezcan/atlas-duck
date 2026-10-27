@@ -436,6 +436,17 @@ pub fn run_startup_probe(
     run_startup_probe_with(install_dir, app_pid, profile, None)
 }
 
+/// The probe of the worker at `worker` itself (M14 PD-249, the server: `ATLAS_DUCK_SANDBOX_BIN`
+/// names the binary, not an install dir). No ACE step: the server image is Linux. Blocking, like
+/// [`run_startup_probe`].
+pub fn run_probe_for(worker: &Path, app_pid: u32, profile: &Path) -> ProbeReport {
+    run_with_platform_spawner(&ProbeConfig::new(
+        worker.to_path_buf(),
+        app_pid,
+        profile.to_path_buf(),
+    ))
+}
+
 /// `run_startup_probe` with the Windows `WRITE_DAC` answer forced:
 /// `Some(false)` makes the ACE step behave as in a per-machine install,
 /// `None` probes the real file handle. Ignored off Windows.

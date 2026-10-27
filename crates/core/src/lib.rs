@@ -97,7 +97,7 @@ pub use decision::{
 pub use edit::Edits;
 pub use engine::script::{
     CompileError, CompileFailure, ConfinementMode, HostCalls, KillReason, RunConfinement, RunEnd,
-    RunHandle, RunPolicy, RunSpec, RunnerError, ScriptRunner, UnavailableReason,
+    RunHandle, RunPolicy, RunSpec, RunnerError, ScriptRunner, SharedSlots, UnavailableReason,
 };
 pub use gate::{
     AttentionKind, GateHandler, GateState, MSG_FIRST_RUN, UiEvent, UiSink, gate_handler,

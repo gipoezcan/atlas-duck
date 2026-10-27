@@ -30,6 +30,7 @@ pub mod mcp;
 pub mod oauth;
 pub mod ratelimit;
 pub mod runtime;
+pub mod scripts;
 pub mod session;
 pub mod sse;
 pub mod static_files;
