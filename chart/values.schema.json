@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "mode": { "type": "string" },
+    "publicUrl": { "type": "string" },
+    "trustedProxyHops": { "type": "integer", "minimum": 0 },
+    "maxOpenUsers": { "type": "integer", "minimum": 1 },
+    "replicaCount": { "type": "integer" },
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": { "type": "string" },
+        "tag": { "type": "string" },
+        "digest": { "type": "string" },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "imagePullSecrets": { "type": "array" },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "serviceAccount": {
+      "type": "object",
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": { "type": "string" },
+        "annotations": { "type": "object" }
+      }
+    },
+    "podAnnotations": { "type": "object" },
+    "podLabels": { "type": "object" },
+    "uid": { "type": "integer", "minimum": 1 },
+    "resources": {
+      "type": "object",
+      "required": ["requests", "limits"],
+      "properties": {
+        "requests": { "type": "object", "required": ["cpu", "memory"] },
+        "limits": { "type": "object", "required": ["cpu", "memory"] }
+      }
+    },
+    "startupProbe": {
+      "type": "object",
+      "properties": {
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "failureThreshold": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "service": {
+      "type": "object",
+      "properties": { "port": { "type": "integer" } }
+    },
+    "ingress": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "className": { "type": "string" },
+        "host": { "type": "string" },
+        "annotations": { "type": "object" },
+        "tls": {
+          "type": "object",
+          "properties": { "secretName": { "type": "string" } }
+        }
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "properties": {
+        "accessMode": { "type": "string" },
+        "storageClassName": { "type": "string" },
+        "size": { "type": "string" },
+        "keep": { "type": "boolean" }
+      }
+    },
+    "masterKey": {
+      "type": "object",
+      "properties": {
+        "existingSecret": { "type": "string" },
+        "nextSecret": { "type": "string" }
+      }
+    },
+    "caBundle": {
+      "type": "object",
+      "properties": { "pem": { "type": "string" } }
+    },
+    "directory": {
+      "type": "object",
+      "properties": {
+        "ldap": {
+          "type": "object",
+          "properties": {
+            "url": { "type": "string" },
+            "upnSuffix": { "type": "string" },
+            "baseDn": { "type": "string" }
+          }
+        },
+        "serviceBind": {
+          "type": "object",
+          "properties": {
+            "dn": { "type": "string" },
+            "existingSecret": { "type": "string" }
+          }
+        }
+      }
+    },
+    "groups": {
+      "type": "object",
+      "properties": {
+        "users": { "type": "string" },
+        "auditors": { "type": "string" },
+        "admins": { "type": "string" }
+      }
+    },
+    "testDirectory": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "usersJson": { "type": "string" }
+      }
+    },
+    "extraEnv": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "value"],
+        "properties": {
+          "name": { "type": "string" },
+          "value": { "type": "string" }
+        }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "ingressNamespaceSelectors": { "type": "array", "items": { "type": "object" } },
+        "extraEgressPorts": { "type": "array", "items": { "type": "integer" } }
+      }
+    },
+    "tests": {
+      "type": "object",
+      "properties": { "image": { "type": "string" } }
+    },
+    "nodeSelector": { "type": "object" },
+    "tolerations": { "type": "array" },
+    "affinity": { "type": "object" }
+  }
+}

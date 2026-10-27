@@ -1,0 +1,11 @@
+atlas-duck-server {{ .Chart.AppVersion }} ({{ .Values.mode }}) is deploying as {{ include "atlas-duck.fullname" . }}.
+
+URL: {{ .Values.publicUrl }}
+{{- if .Values.testDirectory.enabled }}
+Login uses the TEST DIRECTORY (review only, never real accounts).
+{{- end }}
+
+Admin CLI (docs/server/operations-runbook.md):
+  kubectl exec -n {{ .Release.Namespace }} deploy/{{ include "atlas-duck.fullname" . }} -- /app/atlas-duck-server admin --help
+
+One replica with Recreate: every upgrade has a short downtime (ADR 0003).

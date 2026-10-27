@@ -1,0 +1,227 @@
+{{- include "atlas-duck.validate" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "atlas-duck.fullname" . }}
+  labels:
+    {{- include "atlas-duck.labels" . | nindent 4 }}
+spec:
+  # ADR 0003: one process per data volume. Not a value; no HPA, no PDB (PD-M13-4).
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "atlas-duck.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/ca-bundle: {{ .Values.caBundle.pem | sha256sum }}
+        {{- if .Values.testDirectory.enabled }}
+        checksum/test-directory: {{ .Values.testDirectory.usersJson | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "atlas-duck.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "atlas-duck.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # SIGTERM: drain at most 10 s, close runtimes, SERVER_STOP (A-13, test
+      # shutdown_completes_within_25s).
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: {{ .Values.uid }}
+        runAsGroup: {{ .Values.uid }}
+        fsGroup: {{ .Values.uid }}
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: server
+          image: {{ include "atlas-duck.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve"]
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: {{ .Values.uid }}
+            runAsGroup: {{ .Values.uid }}
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            privileged: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            # Non-secret configuration and file paths only (SM-9.1, A-4).
+            - name: ATLAS_DUCK_MODE
+              value: {{ .Values.mode | quote }}
+            - name: ATLAS_DUCK_PUBLIC_URL
+              value: {{ required "atlas-duck: publicUrl is required" .Values.publicUrl | quote }}
+            - name: ATLAS_DUCK_TRUSTED_PROXY_HOPS
+              value: {{ .Values.trustedProxyHops | quote }}
+            - name: ATLAS_DUCK_MAX_OPEN_USERS
+              value: {{ .Values.maxOpenUsers | quote }}
+            - name: ATLAS_DUCK_DATA_DIR
+              value: /var/lib/atlas-duck
+            - name: ATLAS_DUCK_MASTER_KEY_FILE
+              value: /run/secrets/atlas-duck/master-key/key
+            - name: ATLAS_DUCK_CA_BUNDLE_FILE
+              value: /etc/atlas-duck/ca/ca.pem
+            - name: ATLAS_DUCK_ADMIN_SOCKET
+              value: /run/atlas-duck/admin.sock
+            {{- if .Values.testDirectory.enabled }}
+            - name: ATLAS_DUCK_TEST_DIRECTORY_FILE
+              value: /etc/atlas-duck/testdir/users.json
+            {{- else }}
+            - name: LDAP_URL
+              value: {{ required "atlas-duck: directory.ldap.url is required" .Values.directory.ldap.url | quote }}
+            - name: LDAP_UPN_SUFFIX
+              value: {{ required "atlas-duck: directory.ldap.upnSuffix is required" .Values.directory.ldap.upnSuffix | quote }}
+            - name: LDAP_BASE_DN
+              value: {{ required "atlas-duck: directory.ldap.baseDn is required" .Values.directory.ldap.baseDn | quote }}
+            {{- end }}
+            {{- if .Values.directory.serviceBind.existingSecret }}
+            - name: ATLAS_DUCK_LDAP_SERVICE_BIND_DN
+              value: {{ .Values.directory.serviceBind.dn | quote }}
+            - name: ATLAS_DUCK_LDAP_SERVICE_BIND_PASSWORD_FILE
+              value: /run/secrets/atlas-duck/ldap-bind/password
+            {{- end }}
+            - name: GROUP_USERS
+              value: {{ required "atlas-duck: groups.users is required" .Values.groups.users | quote }}
+            {{- with .Values.groups.auditors }}
+            - name: GROUP_AUDITORS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.groups.admins }}
+            - name: GROUP_ADMINS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- range .Values.extraEnv }}
+            - name: {{ .name }}
+              value: {{ .value | quote }}
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: {{ .Values.startupProbe.periodSeconds }}
+            failureThreshold: {{ .Values.startupProbe.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/atlas-duck
+            - name: tmp
+              mountPath: /tmp
+            - name: run
+              mountPath: /run/atlas-duck
+            - name: master-key
+              mountPath: /run/secrets/atlas-duck/master-key
+              readOnly: true
+            {{- if .Values.masterKey.nextSecret }}
+            - name: master-key-next
+              mountPath: /run/secrets/atlas-duck/master-key-next
+              readOnly: true
+            {{- end }}
+            - name: ca-bundle
+              mountPath: /etc/atlas-duck/ca
+              readOnly: true
+            {{- if .Values.testDirectory.enabled }}
+            - name: test-directory
+              mountPath: /etc/atlas-duck/testdir
+              readOnly: true
+            {{- end }}
+            {{- if .Values.directory.serviceBind.existingSecret }}
+            - name: ldap-bind
+              mountPath: /run/secrets/atlas-duck/ldap-bind
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "atlas-duck.fullname" . }}-data
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: run
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        # Kubelet adds group read for fsGroup (0400 becomes 0440, group 65532); the server warns on
+        # group bits but runs (M12 master_key.rs).
+        - name: master-key
+          secret:
+            secretName: {{ .Values.masterKey.existingSecret }}
+            defaultMode: 0400
+            items:
+              - key: key
+                path: key
+        {{- if .Values.masterKey.nextSecret }}
+        - name: master-key-next
+          secret:
+            secretName: {{ .Values.masterKey.nextSecret }}
+            defaultMode: 0400
+            items:
+              - key: key
+                path: key
+        {{- end }}
+        - name: ca-bundle
+          configMap:
+            name: {{ include "atlas-duck.fullname" . }}-ca-bundle
+            defaultMode: 0444
+        {{- if .Values.testDirectory.enabled }}
+        - name: test-directory
+          configMap:
+            name: {{ include "atlas-duck.fullname" . }}-test-directory
+            defaultMode: 0444
+        {{- end }}
+        {{- if .Values.directory.serviceBind.existingSecret }}
+        - name: ldap-bind
+          secret:
+            secretName: {{ .Values.directory.serviceBind.existingSecret }}
+            defaultMode: 0400
+            items:
+              - key: password
+                path: password
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
