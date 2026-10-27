@@ -1728,6 +1728,16 @@ fn server_kinds_verify_clean() {
             json!({"action": "trail", "request_id": "req_0123456789abcdefghij",
                    "target_user_id": "0123456789abcdef0123456789abcdef"}),
         ),
+        // M14 PD-244.
+        (
+            EventType::OAUTH_GRANT_CREATED,
+            json!({"client_id": "adc_x", "client_name": "<b>app</b>", "expires_at": "2027-01-24T09:00:00.000Z",
+                   "grant_id": "grt_1", "redirect_host": "127.0.0.1", "scopes": ["read"]}),
+        ),
+        (
+            EventType::OAUTH_GRANT_REVOKED,
+            json!({"by": "user", "client_id": "adc_x", "grant_id": "grt_1"}),
+        ),
     ] {
         store
             .append(ev(t, None, payload))

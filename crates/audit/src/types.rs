@@ -83,6 +83,9 @@ event_types!(
     API_KEY_CREATED,
     API_KEY_REVOKED,
     AUDITOR_READ,
+    // OAuth grants (M14 PD-244), appended after M12's four.
+    OAUTH_GRANT_CREATED,
+    OAUTH_GRANT_REVOKED,
 );
 
 /// The `flags` column (F.2): a u64 bitset. Bits above `INTEGRITY_INCIDENT` are never valid.

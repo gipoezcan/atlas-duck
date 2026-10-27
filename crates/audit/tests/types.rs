@@ -2,7 +2,7 @@ use atlas_duck_audit::error::AuditError;
 use atlas_duck_audit::keystore::KeyStoreError;
 use atlas_duck_audit::types::{DecisionColumn, EventFlags, EventType, UtcInstant};
 
-const C3_NAMES: [&str; 53] = [
+const C3_NAMES: [&str; 55] = [
     "REQUEST_RECEIVED",
     "REQUEST_REJECTED",
     "REQUEST_FAILED",
@@ -57,11 +57,14 @@ const C3_NAMES: [&str; 53] = [
     "API_KEY_CREATED",
     "API_KEY_REVOKED",
     "AUDITOR_READ",
+    // M14 PD-244, appended.
+    "OAUTH_GRANT_CREATED",
+    "OAUTH_GRANT_REVOKED",
 ];
 
 #[test]
 fn event_type_names_round_trip() {
-    assert_eq!(EventType::ALL.len(), 53);
+    assert_eq!(EventType::ALL.len(), 55);
     for t in EventType::ALL {
         assert_eq!(EventType::parse(t.as_str()), Some(t));
     }
@@ -88,7 +91,25 @@ fn new_server_kinds_round_trip() {
             "{name} must follow every desktop kind"
         );
     }
-    assert_eq!(&EventType::ALL[49..], server.map(|(t, _)| t).as_slice());
+    assert_eq!(&EventType::ALL[49..53], server.map(|(t, _)| t).as_slice());
+}
+
+/// M14 PD-244: the OAuth grant kinds follow M12's four.
+#[test]
+fn oauth_kinds_round_trip() {
+    let oauth = [
+        (EventType::OAUTH_GRANT_CREATED, "OAUTH_GRANT_CREATED"),
+        (EventType::OAUTH_GRANT_REVOKED, "OAUTH_GRANT_REVOKED"),
+    ];
+    for (t, name) in oauth {
+        assert_eq!(t.as_str(), name);
+        assert_eq!(EventType::parse(name), Some(t));
+        assert!(
+            t > EventType::AUDITOR_READ,
+            "{name} must follow M12's kinds"
+        );
+    }
+    assert_eq!(&EventType::ALL[53..], oauth.map(|(t, _)| t).as_slice());
 }
 
 #[test]

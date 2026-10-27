@@ -194,6 +194,64 @@ pub fn auditor_read(r: &AuditorRead<'_>) -> Map<String, Value> {
     m
 }
 
+/// `OAUTH_GRANT_CREATED {grant_id, client_id, client_name, redirect_host, scopes, expires_at}`
+/// (M14 PD-244). `client_name` is the registered name as given (validated printable, at most 64
+/// characters); the audit UI renders it as text.
+pub fn oauth_grant_created(
+    grant_id: &str,
+    client_id: &str,
+    client_name: &str,
+    redirect_host: &str,
+    scopes: &[&str],
+    expires_at: &str,
+) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("grant_id".into(), grant_id.into());
+    m.insert("client_id".into(), client_id.into());
+    m.insert("client_name".into(), client_name.into());
+    m.insert("redirect_host".into(), redirect_host.into());
+    m.insert("scopes".into(), strings(scopes));
+    m.insert("expires_at".into(), expires_at.into());
+    m
+}
+
+/// Who ended an OAuth grant (PD-244).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantRevokedBy {
+    User,
+    RevocationEndpoint,
+    ReuseDetected,
+    Replaced,
+    Deactivation,
+    ExpiredPurge,
+}
+
+impl GrantRevokedBy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GrantRevokedBy::User => "user",
+            GrantRevokedBy::RevocationEndpoint => "revocation_endpoint",
+            GrantRevokedBy::ReuseDetected => "reuse_detected",
+            GrantRevokedBy::Replaced => "replaced",
+            GrantRevokedBy::Deactivation => "deactivation",
+            GrantRevokedBy::ExpiredPurge => "expired_purge",
+        }
+    }
+}
+
+/// `OAUTH_GRANT_REVOKED {grant_id, client_id, by}`.
+pub fn oauth_grant_revoked(
+    grant_id: &str,
+    client_id: &str,
+    by: GrantRevokedBy,
+) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("grant_id".into(), grant_id.into());
+    m.insert("client_id".into(), client_id.into());
+    m.insert("by".into(), by.as_str().into());
+    m
+}
+
 fn put_str(m: &mut Map<String, Value>, key: &str, v: Option<&str>) {
     if let Some(v) = v {
         m.insert(key.into(), v.into());
@@ -215,6 +273,48 @@ mod tests {
         let mut k: Vec<&str> = m.keys().map(String::as_str).collect();
         k.sort_unstable();
         k
+    }
+
+    #[test]
+    fn oauth_grant_created_key_set() {
+        let m = oauth_grant_created(
+            "grt_1",
+            "adc_1",
+            "<img src=x>",
+            "127.0.0.1",
+            &["read", "scripts"],
+            "2027-01-24T09:00:00.000Z",
+        );
+        assert_eq!(
+            keys(&m),
+            [
+                "client_id",
+                "client_name",
+                "expires_at",
+                "grant_id",
+                "redirect_host",
+                "scopes"
+            ]
+        );
+        // The name is stored as given.
+        assert_eq!(m["client_name"], "<img src=x>");
+        assert_eq!(m["scopes"], json!(["read", "scripts"]));
+    }
+
+    #[test]
+    fn oauth_grant_revoked_every_by() {
+        for (by, s) in [
+            (GrantRevokedBy::User, "user"),
+            (GrantRevokedBy::RevocationEndpoint, "revocation_endpoint"),
+            (GrantRevokedBy::ReuseDetected, "reuse_detected"),
+            (GrantRevokedBy::Replaced, "replaced"),
+            (GrantRevokedBy::Deactivation, "deactivation"),
+            (GrantRevokedBy::ExpiredPurge, "expired_purge"),
+        ] {
+            let m = oauth_grant_revoked("grt_1", "adc_1", by);
+            assert_eq!(keys(&m), ["by", "client_id", "grant_id"]);
+            assert_eq!(m["by"], s);
+        }
     }
 
     const LOGIN_KEYS: [&str; 9] = [

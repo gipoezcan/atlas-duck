@@ -54,7 +54,7 @@ test("the committed vectors pass", () => {
   assert.equal(res.status, 0, res.stdout + res.stderr);
   assert.match(
     res.stderr,
-    /^check-audit-vectors: ok \(5 rows, 4 request sets, 3 prune rows, 5 jcs, 3 dek wraps, 7 query tags, recovery layout; 4 server-kind rows; server anchor vectors\)$/m,
+    /^check-audit-vectors: ok \(5 rows, 4 request sets, 3 prune rows, 5 jcs, 3 dek wraps, 7 query tags, recovery layout; 6 server-kind rows; server anchor vectors\)$/m,
   );
   assert.deepEqual(checkVectors(load()), []);
 });

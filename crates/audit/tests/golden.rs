@@ -896,6 +896,24 @@ fn server_row_specs() -> Vec<Spec> {
             json!({"action": "trail", "request_id": "req_0123456789abcdefghij",
                    "target_user_id": "0123456789abcdef0123456789abcdef"}),
         ),
+        // M14 PD-244.
+        on(
+            "oauth_grant_created",
+            45,
+            "2026-10-26T09:04:00.000Z",
+            "OAUTH_GRANT_CREATED",
+            json!({"client_id": "adc_0123456789abcdefghijkl", "client_name": "Claude Code",
+                   "expires_at": "2027-01-24T09:04:00.000Z", "grant_id": "grt_0123456789abcdef",
+                   "redirect_host": "127.0.0.1", "scopes": ["read", "scripts"]}),
+        ),
+        on(
+            "oauth_grant_revoked",
+            46,
+            "2026-10-26T09:05:00.000Z",
+            "OAUTH_GRANT_REVOKED",
+            json!({"by": "reuse_detected", "client_id": "adc_0123456789abcdefghijkl",
+                   "grant_id": "grt_0123456789abcdef"}),
+        ),
     ]
 }
 
@@ -961,7 +979,9 @@ fn server_kinds_vectors_match() {
             "LOGIN",
             "API_KEY_CREATED",
             "API_KEY_REVOKED",
-            "AUDITOR_READ"
+            "AUDITOR_READ",
+            "OAUTH_GRANT_CREATED",
+            "OAUTH_GRANT_REVOKED"
         ]
     );
 }

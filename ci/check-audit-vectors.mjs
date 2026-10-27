@@ -340,7 +340,15 @@ function checkRows(rows, out, notes) {
 // M12 PD-216: the server-mode kinds, one row each, in a file of their own (format_v1.json is
 // frozen; the kinds change no format, only the event_type text of an ordinary record).
 export const DEFAULT_SERVER_VECTORS = join(REPO_ROOT, "crates", "audit", "tests", "vectors", "server_kinds_v1.json");
-export const SERVER_KINDS = ["LOGIN", "API_KEY_CREATED", "API_KEY_REVOKED", "AUDITOR_READ"];
+export const SERVER_KINDS = [
+  "LOGIN",
+  "API_KEY_CREATED",
+  "API_KEY_REVOKED",
+  "AUDITOR_READ",
+  // M14 PD-244.
+  "OAUTH_GRANT_CREATED",
+  "OAUTH_GRANT_REVOKED",
+];
 
 /** The server-kind vectors: rows only, exactly one per server kind in SERVER_KINDS order. */
 export function checkServerKindVectors(doc, notes = new Set()) {
