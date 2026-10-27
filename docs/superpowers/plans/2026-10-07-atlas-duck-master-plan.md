@@ -832,7 +832,7 @@ Each milestone entry lists: scope (§14, with the placements this plan makes whe
 - **Scope (SM-10):** UI transport abstraction (the React pages run against Tauri IPC or HTTP), `crates/server` (axum), domain login over LDAPS with rate limits (SM-2.1/2.2), roles from directory groups (SM-2.3), cookie sessions with CSRF (SM-2.4), per-user stores with data keys wrapped by the master key (SM-6.1/6.2), admin-defined instances and user PAT entry (SM-4), web approvals with SSE and browser notifications and `approval_url` (SM-5), remote MCP over streamable HTTP with API keys (SM-3.1/3.2/3.4), new audit kinds and the server anchor chain (SM-6.3), container image runnable locally against a test directory.
 - **Depends on:** M9 (MCP front end), M10, M11 (shared restyled UI).
 - **Exit criterion:** the container runs locally; an MCP client with an API key reads Jira through a user's PAT, proposes a write, the user approves it in the browser, and the write lands; desktop mode CI stays green; per-user isolation tests (user A cannot reach B's data, approvals, keys) pass.
-- **Status:** not started.
+- **Status:** implemented on branch `m12-server-core` (plan `2026-10-26-atlas-duck-m12-server-core.md`, Tasks 1–26); the in-process exit flow and isolation suites pass locally; done once the `server` and `server-image` CI jobs and the desktop jobs are green on the PR and the branch is merged.
 
 ### M13 — Server mode deployment and operations
 
