@@ -168,6 +168,20 @@ async fn run(config: Config) -> u8 {
         config.oauth,
         &config.public_origin(),
     ));
+    // M14 PD-254: export jobs under <data>/exports; the TTL sweep runs now and hourly.
+    let exports = Arc::new(crate::export_job::ExportJobs::new(
+        store.clone(),
+        registry.clone(),
+        writer.clone(),
+        clock.clone(),
+        config.data_dir.path(),
+        &config.public_origin(),
+        config.exports,
+    ));
+    let swept = exports.sweep(true);
+    if swept > 0 {
+        tracing::info!(event = "export_ttl", removed = swept);
+    }
     let state = AppState(Arc::new(AppInner {
         public_origin: config.public_origin(),
         cookie_secure: config.cookie_secure(),
@@ -183,6 +197,7 @@ async fn run(config: Config) -> u8 {
         clock: clock.clone(),
         anchor: writer.clone(),
         oauth,
+        exports: exports.clone(),
     }));
     let started = json!({"version": env!("CARGO_PKG_VERSION"), "mode": format!("{:?}", config.mode).to_lowercase()});
     if writer.start(&started).is_err() {
@@ -209,6 +224,16 @@ async fn run(config: Config) -> u8 {
             views_registry.close_idle_views().await;
         }
     });
+    // M14 PD-254: the hourly `export_ttl` job (M13's scheduler takes it over at merge).
+    let ttl_exports = exports.clone();
+    let export_ttl = tokio::spawn(async move {
+        let mut t = tokio::time::interval(std::time::Duration::from_secs(3600));
+        loop {
+            t.tick().await;
+            let e = ttl_exports.clone();
+            let _ = tokio::task::spawn_blocking(move || e.sweep(false)).await;
+        }
+    });
     let Ok(listener) = tokio::net::TcpListener::bind(config.listen).await else {
         return fail("listen_failed");
     };
@@ -223,6 +248,9 @@ async fn run(config: Config) -> u8 {
     anchor_timer.abort();
     oauth_purge.abort();
     idle_views.abort();
+    export_ttl.abort();
+    // PD-254: running exports are cancelled and awaited before the stores close.
+    exports.shutdown().await;
     // Final heads (RUNTIME_CLOSED per runtime, after its APP_STOP) and SERVER_STOP.
     if writer.shutdown().await.is_err() {
         tracing::error!(event = "anchor_append_failed", kind = "SERVER_STOP");

@@ -294,6 +294,10 @@ fn anchor_append_links_rows_and_heads() {
             .unwrap();
         assert_eq!(s.anchor_all().unwrap().len(), 3, "{name}");
         assert_eq!(s.anchor_last().unwrap().unwrap().seq, 3, "{name}");
+        let seqs = |v: Vec<crate::store::AnchorRow>| v.iter().map(|r| r.seq).collect::<Vec<_>>();
+        assert_eq!(seqs(s.anchor_range(2, 3).unwrap()), [2, 3], "{name}");
+        assert_eq!(seqs(s.anchor_range(3, 9).unwrap()), [3], "{name}");
+        assert!(s.anchor_range(4, 9).unwrap().is_empty(), "{name}");
         assert_eq!(s.anchor_heads_for(2).unwrap(), heads.to_vec(), "{name}");
         assert_eq!(
             s.anchor_heads_for_chain("ca", 8).unwrap(),
@@ -464,6 +468,8 @@ fn job(id: &str, requester: &str, target: &str, state: &str, expires_at: i64) ->
         manifest_sha256: None,
         size: None,
         file_name: None,
+        anchor_seq: None,
+        anchor_hash: None,
     }
 }
 
@@ -740,6 +746,8 @@ fn export_jobs_round_trip() {
             manifest_sha256: Some("ab".repeat(32)),
             size: Some(4096),
             file_name: Some("x.tar".into()),
+            anchor_seq: Some(7),
+            anchor_hash: Some("ab".repeat(32)),
             ..job("j1", A, B, "running", 200)
         };
         s.export_job_update(&done).unwrap();

@@ -88,7 +88,9 @@ use crate::error::AuditError;
 use crate::open::sync_dir;
 use crate::schema;
 use crate::store::Store;
-use crate::types::{EventType, ExportControl, ExportReceipt, RustChosenPath, TimeRange};
+use crate::types::{
+    EventType, ExportControl, ExportReceipt, RustChosenPath, SeqBoundRange, TimeRange,
+};
 use crate::verify::{DecryptError, Deks};
 use crate::verify_export::{MAX_JSON_DEPTH, depth_ok};
 use crate::writer::{PreparedEvent, ts_text};
@@ -231,13 +233,24 @@ fn seq_of(v: Option<i64>) -> Result<Option<u64>, AuditError> {
     .transpose()
 }
 
+/// Where an export range ends: the last record at or before a time, or exactly a seq (M14).
+#[derive(Clone, Copy)]
+enum End<'a> {
+    Time(&'a str),
+    Seq(u64),
+}
+
+/// `through_seq` names a seq beyond the head.
+pub const EXPORT_BEYOND_HEAD: &str = "the export range ends beyond the head";
+
 /// Resolves the range on one snapshot: the first record with `ts_utc >= from` to the last with
 /// `ts_utc <= to` (PD-160; `ts_utc` is not monotonic, so rows outside the times may lie in
-/// between and are exported), then the last anchored row of that interval.
+/// between and are exported), or to exactly the seq of [`End::Seq`] (never beyond the head),
+/// then the last anchored row of that interval.
 fn resolve_range(
     conn: &Connection,
     from: &str,
-    to: &str,
+    end: End<'_>,
     parts: &Parts,
 ) -> Result<Plan, AuditError> {
     let tx = conn.unchecked_transaction().map_err(sql)?;
@@ -248,13 +261,24 @@ fn resolve_range(
             |r| r.get(0),
         )
         .map_err(sql)?;
-    let last: Option<i64> = tx
-        .query_row(
-            "SELECT max(seq) FROM events WHERE ts_utc <= ?1",
-            [to],
-            |r| r.get(0),
-        )
-        .map_err(sql)?;
+    let last: Option<i64> = match end {
+        End::Time(to) => tx
+            .query_row(
+                "SELECT max(seq) FROM events WHERE ts_utc <= ?1",
+                [to],
+                |r| r.get(0),
+            )
+            .map_err(sql)?,
+        End::Seq(s) => {
+            let head: Option<i64> = tx
+                .query_row("SELECT max(seq) FROM events", [], |r| r.get(0))
+                .map_err(sql)?;
+            if seq_of(head)?.is_none_or(|h| s > h) {
+                return Err(AuditError::Invalid(EXPORT_BEYOND_HEAD));
+            }
+            Some(seq_param(s)?)
+        }
+    };
     let (Some(first_seq), Some(last_seq)) = (seq_of(first)?, seq_of(last)?) else {
         return Err(AuditError::Invalid(EXPORT_NO_RECORDS));
     };
@@ -814,6 +838,35 @@ impl Store {
         out: RustChosenPath,
         ctl: &ExportControl<'_>,
     ) -> Result<ExportReceipt, AuditError> {
+        self.export_range(
+            range.from_utc,
+            End::Time(&range.to_utc.to_rfc3339_ms()),
+            out,
+            ctl,
+        )
+    }
+
+    /// [`Store::export`] of the records from the first with `ts_utc >= from_utc` to exactly
+    /// `range.last_seq` (M14 PD-254: the head the server export job anchored first, so the
+    /// excerpt names the last exported row). `Invalid` ([`EXPORT_BEYOND_HEAD`]) when
+    /// `last_seq` is beyond the head. The manifest's `requested_range.to_utc` is the latest
+    /// instant (no time bound).
+    pub fn export_through(
+        &self,
+        range: SeqBoundRange,
+        out: RustChosenPath,
+        ctl: &ExportControl<'_>,
+    ) -> Result<ExportReceipt, AuditError> {
+        self.export_range(range.from_utc, End::Seq(range.last_seq), out, ctl)
+    }
+
+    fn export_range(
+        &self,
+        from_utc: crate::clock::UtcInstant,
+        end: End<'_>,
+        out: RustChosenPath,
+        ctl: &ExportControl<'_>,
+    ) -> Result<ExportReceipt, AuditError> {
         let parts = self.export_parts()?;
         let out = out.path();
         if !out.is_absolute() {
@@ -826,15 +879,18 @@ impl Store {
                 "the export location is not a directory",
             ));
         }
-        let from = range.from_utc.to_rfc3339_ms();
-        let to = range.to_utc.to_rfc3339_ms();
+        let from = from_utc.to_rfc3339_ms();
+        let to = match end {
+            End::Time(to) => to.to_owned(),
+            End::Seq(_) => TimeRange::all().to_utc.to_rfc3339_ms(),
+        };
         if from > to {
             return Err(AuditError::Invalid(
                 "the export range ends before it starts",
             ));
         }
         let conn = schema::open_ro(&parts.db_path).map_err(|e| AuditError::Io(e.to_string()))?;
-        let plan = resolve_range(&conn, &from, &to, &parts)?;
+        let plan = resolve_range(&conn, &from, end, &parts)?;
         let exported_at = ts_text(parts.now)?;
         let name = format!(
             "atlas-duck-export-{}-{}-{}-{}",

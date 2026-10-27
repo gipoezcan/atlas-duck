@@ -112,7 +112,7 @@ impl TestServer {
         let master = Arc::new(MasterKey::for_tests("k1", MASTER_BYTES));
         let registry = Arc::new(Registry::new(
             RuntimeDeps {
-                data_dir: data,
+                data_dir: data.clone(),
                 store: store.clone(),
                 master: master.clone(),
                 org_ca: None,
@@ -164,6 +164,15 @@ impl TestServer {
             clock: clock.clone(),
             anchor: anchor.clone(),
             oauth: Arc::new(OAuth::new(OAuthConfig::DEFAULT, &base)),
+            exports: Arc::new(atlas_duck_server::export_job::ExportJobs::new(
+                store.clone(),
+                registry.clone(),
+                anchor.clone(),
+                clock.clone(),
+                &data,
+                &base,
+                atlas_duck_server::export_job::ExportConfig::DEFAULT,
+            )),
         }));
         anchor
             .start(&json!({"version": "test", "mode": "test"}))

@@ -292,6 +292,16 @@ impl ServerStore for MemoryStore {
         Ok(self.lock().anchors.clone())
     }
 
+    fn anchor_range(&self, first: u64, last: u64) -> StoreResult<Vec<AnchorRow>> {
+        Ok(self
+            .lock()
+            .anchors
+            .iter()
+            .filter(|r| (first..=last).contains(&r.seq))
+            .cloned()
+            .collect())
+    }
+
     fn anchor_last(&self) -> StoreResult<Option<AnchorRow>> {
         Ok(self.lock().anchors.last().cloned())
     }
@@ -601,6 +611,8 @@ impl ServerStore for MemoryStore {
             x.manifest_sha256 = j.manifest_sha256.clone();
             x.size = j.size;
             x.file_name = j.file_name.clone();
+            x.anchor_seq = j.anchor_seq;
+            x.anchor_hash = j.anchor_hash.clone();
         }
         Ok(())
     }

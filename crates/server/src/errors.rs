@@ -192,6 +192,29 @@ impl ApiError {
         "audit/read_not_recorded",
         "The read could not be recorded; nothing was read. Try again later.",
     );
+    /// M14 PD-254: the server-wide cap, or a running job of this requester for this target.
+    pub const EXPORT_BUSY: ApiError = e(
+        StatusCode::CONFLICT,
+        "audit/export_busy",
+        "An export is already running; try again when it has finished.",
+    );
+    /// No job with this id for this requester (another user's job included).
+    pub const EXPORT_UNKNOWN: ApiError = e(
+        StatusCode::NOT_FOUND,
+        "audit/export_unknown",
+        "No such export.",
+    );
+    /// The job expired or its archive was downloaded and removed.
+    pub const EXPORT_EXPIRED: ApiError = e(
+        StatusCode::GONE,
+        "audit/export_expired",
+        "This export is no longer available; start a new one.",
+    );
+    pub const EXPORT_FAILED: ApiError = e(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "audit/export_failed",
+        "The export failed; start a new one.",
+    );
     pub const INTERNAL: ApiError = e(
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal",
@@ -299,6 +322,10 @@ mod tests {
             (ApiError::OAUTH_GRANT_UNKNOWN, 404),
             (ApiError::AUDIT_USER_UNKNOWN, 404),
             (ApiError::AUDIT_READ_NOT_RECORDED, 503),
+            (ApiError::EXPORT_BUSY, 409),
+            (ApiError::EXPORT_UNKNOWN, 404),
+            (ApiError::EXPORT_EXPIRED, 410),
+            (ApiError::EXPORT_FAILED, 500),
             (ApiError::INTERNAL, 500),
         ] {
             assert_eq!(err.status.as_u16(), status, "{}", err.code);

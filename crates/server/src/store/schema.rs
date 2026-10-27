@@ -158,7 +158,9 @@ CREATE TABLE export_jobs (
     expires_at INTEGER NOT NULL,
     manifest_sha256 TEXT,
     size INTEGER,
-    file_name TEXT
+    file_name TEXT,
+    anchor_seq INTEGER,
+    anchor_hash TEXT
 );
 CREATE INDEX export_jobs_requester ON export_jobs(requester_user_id);
 "#;

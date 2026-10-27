@@ -27,6 +27,8 @@
 //    on the Ok path (rule 1's test at the call). It is matched as `.name(`, `.name` or
 //    `Store::name` / `Self::name`, in any crate; a function of the same name elsewhere is not a
 //    call of it unless reached that way.
+// 6. `RustChosenPath::from_server_export_dir(` (M14 PD-255) only in the function listed in
+//    `SERVER_EXPORT_DIR_SITES` (the server export job's own directory, never a request's path).
 //
 // Exempt: `crates/audit/src/testing.rs`, `crates/core/src/testing/**` (not `cfg(test)`), the
 // crate-root `tests/` directories (`crates/*/tests`, `app/src-tauri/tests`, which the scan visits),
@@ -57,6 +59,16 @@ import { removeCfgTest, stripNonCode } from "./check-no-panic-macros.mjs";
  */
 export const SERVER_ADMIN_PROOFS = [
   { file: "crates/server/src/runtime.rs", name: "apply_instance_settings" },
+];
+
+/**
+ * Server mode (M14 PD-255, ledger L249): an export job writes into its own directory under the data
+ * volume, computed from the data directory and a random job id, never from a request. The one
+ * function that turns that path into `RustChosenPath` is listed here; `from_server_export_dir(`
+ * anywhere else is a violation (rule 6).
+ */
+export const SERVER_EXPORT_DIR_SITES = [
+  { file: "crates/server/src/export_job.rs", name: "export_dir_path" },
 ];
 
 /**
@@ -175,6 +187,7 @@ const CONFIRMED_LITERAL =
 const IMPL_CONFIRMED = /\bimpl\b[^{};]*\bConfirmed\s*\{/g;
 const SELF_LITERAL = /(?<!->\s*)\bSelf\s*\{/g;
 const FROM_NATIVE_DIALOG = /\bRustChosenPath\s*::\s*from_native_dialog\s*\(/g;
+const FROM_SERVER_EXPORT_DIR = /\bRustChosenPath\s*::\s*from_server_export_dir\s*\(/g;
 const ALIASED = /\b(Confirmed|RustChosenPath)\s+as\s+\w+/g;
 const TYPE_ALIAS = /\btype\s+\w+(?:\s*<[^>]*>)?\s*=\s*[^;]*?\b(Confirmed|RustChosenPath)\b/g;
 
@@ -375,6 +388,12 @@ export function scanDialogProofs(files, helpers = PROOF_HELPERS, guarded = GUARD
       const f = enclosing(file.fns, m.index);
       if (f && pathProvedAt(file.code, f, m)) return;
       add(file, m.index, "RustChosenPath::from_native_dialog outside a function that opens a folder or file dialog");
+    });
+    // 6: the server export directory (PD-255) only in its listed function.
+    each(FROM_SERVER_EXPORT_DIR, file.code, (m) => {
+      const f = enclosing(file.fns, m.index);
+      if (f && SERVER_EXPORT_DIR_SITES.some((s) => s.file === file.path && s.name === f.name)) return;
+      add(file, m.index, "RustChosenPath::from_server_export_dir outside the server export job's listed function");
     });
     each(ALIASED, file.code, (m) => add(file, m.index, `${m[1]} imported under another name hides its construction sites from this check`));
     each(TYPE_ALIAS, file.code, (m) => add(file, m.index, `${m[1]} aliased with \`type\` hides its construction sites from this check`));

@@ -307,6 +307,20 @@ impl TimeRange {
             to_utc: UtcInstant(i64::MAX),
         }
     }
+
+    /// M14 PD-254: from the first record with `ts_utc >= from_utc` to exactly `last_seq` (the
+    /// head a server export job anchored just before), for [`crate::Store::export_through`].
+    pub fn through_seq(from_utc: UtcInstant, last_seq: u64) -> SeqBoundRange {
+        SeqBoundRange { from_utc, last_seq }
+    }
+}
+
+/// An export range that ends at a seq, not a time (M14 PD-254): `last_seq` must not be beyond
+/// the head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeqBoundRange {
+    pub from_utc: UtcInstant,
+    pub last_seq: u64,
 }
 
 /// What a compliance export wrote (C.3, Δ-M10-1).
@@ -481,6 +495,13 @@ pub struct RustChosenPath(PathBuf);
 
 impl RustChosenPath {
     pub fn from_native_dialog(p: PathBuf) -> Self {
+        RustChosenPath(p)
+    }
+
+    /// M14 PD-255 (L249): the server export job's own directory, computed by the server from its
+    /// data directory and a random job id, never from a request. `ci/check-dialog-proofs.mjs`
+    /// allows exactly one call site (`crates/server/src/export_job.rs`).
+    pub fn from_server_export_dir(p: PathBuf) -> Self {
         RustChosenPath(p)
     }
 

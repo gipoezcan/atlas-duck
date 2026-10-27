@@ -32,6 +32,8 @@ use crate::users::user_id_for;
 mod audit;
 /// M14 T17: auditor reads.
 mod auditor;
+// M14 T18: export jobs, excerpt, tar download, TTL.
+mod export;
 /// `/mcp` (T19) over the same harness.
 mod mcp;
 /// M14: OAuth discovery, registration, authorization, tokens.
@@ -193,6 +195,11 @@ impl H {
             },
             10,
         ));
+        let anchor = Arc::new(crate::anchor::AnchorWriter::new(
+            store.clone(),
+            registry.clone(),
+            clock.clone(),
+        ));
         let state = AppState(Arc::new(AppInner {
             public_origin: ORIGIN.into(),
             cookie_secure: true,
@@ -217,12 +224,17 @@ impl H {
             ),
             mcp_sessions: Arc::new(crate::mcp::McpSessions::new()),
             clock: clock.clone(),
-            anchor: Arc::new(crate::anchor::AnchorWriter::new(
+            anchor: anchor.clone(),
+            oauth: Arc::new(crate::oauth::OAuth::new(oauth, ORIGIN)),
+            exports: Arc::new(crate::export_job::ExportJobs::new(
                 store.clone(),
                 registry.clone(),
+                anchor.clone(),
                 clock.clone(),
+                &dir.path().join("data"),
+                ORIGIN,
+                crate::export_job::ExportConfig::DEFAULT,
             )),
-            oauth: Arc::new(crate::oauth::OAuth::new(oauth, ORIGIN)),
         }));
         H {
             router: router(state.clone()),

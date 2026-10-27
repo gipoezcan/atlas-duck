@@ -328,12 +328,15 @@ fn concrete(path: &str) -> String {
         .replace("{id}", "key_00000000000000000000000000000000")
         .replace("{user_id}", &user_id_for(BOB.0))
         .replace("{req}", "consentrequestprobe")
+        .replace("{job}", &"0".repeat(32))
 }
 
 /// A well-formed body for a state-changing row (so a refusal is the guard's, not the parser's).
 fn body_for(method: &str, path: &str) -> Option<Value> {
     match (method, path) {
         ("POST", "/api/cmd/{command}") => Some(json!({})),
+        ("POST", "/api/me/audit/exports") => Some(json!({})),
+        ("POST", "/api/auditor/users/{user_id}/exports") => Some(json!({})),
         ("PUT", "/api/me/pats/{alias}") => Some(json!({"pat": "x"})),
         ("POST", "/api/me/api-keys") => Some(json!({"name": "probe", "scopes": ["read"]})),
         ("POST", "/api/admin/instances") => Some(json!({"alias": "probe", "product": "jira",
@@ -401,6 +404,7 @@ async fn every_route_enforces_its_access_class() {
         if path.starts_with("/api/cmd/")
             || path.starts_with("/api/me/")
             || path.starts_with("/api/auditor/")
+            || path.starts_with("/api/anchor/")
         {
             let auth = format!("Bearer {key}");
             let (status, v) = s

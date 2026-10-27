@@ -641,6 +641,19 @@ impl ServerStore for SqliteStore {
         collect(st.query_map([], anchor_row).map_err(db)?)
     }
 
+    fn anchor_range(&self, first: u64, last: u64) -> StoreResult<Vec<AnchorRow>> {
+        let c = self.conn();
+        let mut st = c
+            .prepare(&format!(
+                "SELECT {ANCHOR_COLS} FROM anchor_chain WHERE seq BETWEEN ?1 AND ?2 ORDER BY seq"
+            ))
+            .map_err(db)?;
+        collect(
+            st.query_map(params![to_i64(first)?, to_i64(last)?], anchor_row)
+                .map_err(db)?,
+        )
+    }
+
     fn anchor_last(&self) -> StoreResult<Option<AnchorRow>> {
         self.conn()
             .query_row(
@@ -1097,7 +1110,7 @@ impl ServerStore for SqliteStore {
         self.conn()
             .execute(
                 &format!(
-                    "INSERT INTO export_jobs ({JOB_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+                    "INSERT INTO export_jobs ({JOB_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
                 ),
                 params![
                     j.job_id,
@@ -1108,7 +1121,9 @@ impl ServerStore for SqliteStore {
                     j.expires_at,
                     j.manifest_sha256,
                     j.size.map(to_i64).transpose()?,
-                    j.file_name
+                    j.file_name,
+                    j.anchor_seq.map(to_i64).transpose()?,
+                    j.anchor_hash
                 ],
             )
             .map_err(db)?;
@@ -1130,14 +1145,16 @@ impl ServerStore for SqliteStore {
         self.conn()
             .execute(
                 "UPDATE export_jobs SET state = ?2, expires_at = ?3, manifest_sha256 = ?4,
-                 size = ?5, file_name = ?6 WHERE job_id = ?1",
+                 size = ?5, file_name = ?6, anchor_seq = ?7, anchor_hash = ?8 WHERE job_id = ?1",
                 params![
                     j.job_id,
                     j.state,
                     j.expires_at,
                     j.manifest_sha256,
                     j.size.map(to_i64).transpose()?,
-                    j.file_name
+                    j.file_name,
+                    j.anchor_seq.map(to_i64).transpose()?,
+                    j.anchor_hash
                 ],
             )
             .map_err(db)?;
@@ -1275,7 +1292,7 @@ fn insert_refresh(c: &Connection, r: &RefreshRecord) -> StoreResult<()> {
 }
 
 const JOB_COLS: &str = "job_id, requester_user_id, target_user_id, state, created_at, expires_at, \
-     manifest_sha256, size, file_name";
+     manifest_sha256, size, file_name, anchor_seq, anchor_hash";
 
 fn job_row(r: &Row<'_>) -> rusqlite::Result<ExportJobRecord> {
     Ok(ExportJobRecord {
@@ -1288,5 +1305,7 @@ fn job_row(r: &Row<'_>) -> rusqlite::Result<ExportJobRecord> {
         manifest_sha256: r.get(6)?,
         size: r.get::<_, Option<i64>>(7)?.map(to_u64),
         file_name: r.get(8)?,
+        anchor_seq: r.get::<_, Option<i64>>(9)?.map(to_u64),
+        anchor_hash: r.get(10)?,
     })
 }

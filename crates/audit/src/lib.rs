@@ -119,7 +119,7 @@ pub use types::{
     Actor, AuditCursor, AuditFilter, AuditPage, AuditTrail, Committed, Confirmed, DecisionColumn,
     DeliverySummary, EventFlags, EventHeader, EventType, ExportControl, ExportReceipt,
     ExportVerdict, MAX_AUDIT_PAGE_ROWS, MissingAnchor, NewEvent, PAYLOAD_PAGE_BYTES, PayloadPage,
-    QueryKind, RustChosenPath, TimeRange, UtcInstant,
+    QueryKind, RustChosenPath, SeqBoundRange, TimeRange, UtcInstant,
 };
 pub use verify::{FindingKind, VerifyFinding, VerifyOutcome};
 pub use verify_export::{AnchorChain, verify_export, verify_export_full};

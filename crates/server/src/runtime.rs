@@ -556,6 +556,27 @@ pub struct Registry {
     closed: Mutex<Vec<UserHead>>,
     /// M14 PD-257: stores opened for auditors without a runtime, with their last use.
     views: Mutex<HashMap<String, (StoreOnly, i64)>>,
+    /// M14 PD-254: users whose store an export job is using; their view is never closed idle
+    /// and their runtime never evicted while a pin is held.
+    view_pins: Mutex<HashMap<String, usize>>,
+}
+
+/// Holds a user's store open for an export job ([`Registry::pin_view`]); released on drop.
+pub struct ViewPin {
+    registry: Arc<Registry>,
+    user_id: String,
+}
+
+impl Drop for ViewPin {
+    fn drop(&mut self) {
+        let mut pins = self.registry.pins();
+        if let Some(n) = pins.get_mut(&self.user_id) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                pins.remove(&self.user_id);
+            }
+        }
+    }
 }
 
 /// PD-257: an audit view nobody used for this long is closed.
@@ -570,6 +591,25 @@ impl Registry {
             tick: AtomicU64::new(0),
             closed: Mutex::new(Vec::new()),
             views: Mutex::new(HashMap::new()),
+            view_pins: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn pins(&self) -> std::sync::MutexGuard<'_, HashMap<String, usize>> {
+        self.view_pins.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn pinned(&self, user_id: &str) -> bool {
+        self.pins().contains_key(user_id)
+    }
+
+    /// M14 PD-254: keeps `user_id`'s audit view (or runtime) open while the pin lives: the idle
+    /// sweep and runtime eviction skip it, so an export never loses its store mid-run.
+    pub fn pin_view(self: &Arc<Self>, user_id: &str) -> ViewPin {
+        *self.pins().entry(user_id.to_owned()).or_insert(0) += 1;
+        ViewPin {
+            registry: self.clone(),
+            user_id: user_id.to_owned(),
         }
     }
 
@@ -608,7 +648,7 @@ impl Registry {
             let mut views = self.views();
             let keys: Vec<String> = views
                 .iter()
-                .filter(|(_, (_, at))| now - at >= VIEW_IDLE_SECS)
+                .filter(|(k, (_, at))| now - at >= VIEW_IDLE_SECS && !self.pinned(k))
                 .map(|(k, _)| k.clone())
                 .collect();
             keys.iter()
@@ -652,7 +692,7 @@ impl Registry {
                 .values()
                 // Batch-3 review I3: a runtime a request still holds (any `Arc` besides this
                 // map's, a pin included) is in use and never closed under it.
-                .filter(|r| Arc::strong_count(r) == 1 && r.evictable())
+                .filter(|r| Arc::strong_count(r) == 1 && r.evictable() && !self.pinned(&r.user_id))
                 .min_by_key(|r| r.last_used.load(Ordering::SeqCst))
                 .map(|r| r.user_id.clone());
             match victim.and_then(|v| open.remove(&v)) {

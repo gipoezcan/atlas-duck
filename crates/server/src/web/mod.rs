@@ -5,6 +5,7 @@ pub mod admin_routes;
 pub mod api_key_routes;
 pub mod auth_routes;
 pub mod cmd_routes;
+pub mod export_routes;
 pub mod extract;
 pub mod grant_routes;
 pub mod oauth_routes;
@@ -52,6 +53,8 @@ pub struct AppInner {
     /// M14: operational anchor rows from handlers (registration, reuse, auditor reads, exports).
     pub anchor: Arc<crate::anchor::AnchorWriter>,
     pub oauth: Arc<crate::oauth::OAuth>,
+    /// M14 PD-254: export jobs.
+    pub exports: Arc<crate::export_job::ExportJobs>,
 }
 
 #[derive(Clone)]
@@ -136,6 +139,30 @@ pub const ROUTES: &[(&str, &str, Access)] = &[
         "/api/auditor/users/{user_id}/{command}",
         Access::Auditor,
     ),
+    // M14 T18: export jobs (own and auditor) and the anchor head.
+    ("POST", "/api/me/audit/exports", Access::Session),
+    ("GET", "/api/me/audit/exports/{job}", Access::Session),
+    (
+        "GET",
+        "/api/me/audit/exports/{job}/download",
+        Access::Session,
+    ),
+    (
+        "POST",
+        "/api/auditor/users/{user_id}/exports",
+        Access::Auditor,
+    ),
+    (
+        "GET",
+        "/api/auditor/users/{user_id}/exports/{job}",
+        Access::Auditor,
+    ),
+    (
+        "GET",
+        "/api/auditor/users/{user_id}/exports/{job}/download",
+        Access::Auditor,
+    ),
+    ("GET", "/api/anchor/head", Access::Session),
 ];
 
 /// The handler of one [`ROUTES`] row; `None` for the bearer rows, which [`crate::mcp::routes`]
@@ -177,6 +204,15 @@ pub(crate) fn handler(method: &str, path: &str) -> Option<MethodRouter<AppState>
         ("DELETE", "/api/me/oauth/grants/{id}") => delete(grant_routes::revoke),
         ("GET", "/api/auditor/users") => get(crate::auditor::list_users),
         ("POST", "/api/auditor/users/{user_id}/{command}") => post(crate::auditor::read),
+        ("POST", "/api/me/audit/exports") => post(export_routes::start_own),
+        ("GET", "/api/me/audit/exports/{job}") => get(export_routes::status_own),
+        ("GET", "/api/me/audit/exports/{job}/download") => get(export_routes::download_own),
+        ("POST", "/api/auditor/users/{user_id}/exports") => post(export_routes::start_auditor),
+        ("GET", "/api/auditor/users/{user_id}/exports/{job}") => get(export_routes::status_auditor),
+        ("GET", "/api/auditor/users/{user_id}/exports/{job}/download") => {
+            get(export_routes::download_auditor)
+        }
+        ("GET", "/api/anchor/head") => get(export_routes::anchor_head),
         _ => return None,
     })
 }
@@ -234,6 +270,8 @@ fn session_only_path(path: &str) -> bool {
         || path.starts_with("/api/oauth/")
         // M14 PD-257: auditor reads take a session only.
         || path.starts_with("/api/auditor/")
+        // M14 PD-259: the anchor head pins exports; a session reads it.
+        || path.starts_with("/api/anchor/")
 }
 
 fn header_str(h: &HeaderMap, name: impl header::AsHeaderName) -> Option<&str> {

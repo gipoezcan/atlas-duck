@@ -67,6 +67,8 @@ pub struct Config {
     pub oauth: crate::oauth::OAuthConfig,
     /// M14 PD-246..PD-249.
     pub scripts: crate::scripts::ScriptsConfig,
+    /// M14 PD-254: export job lifetime and the server-wide cap.
+    pub exports: crate::export_job::ExportConfig,
 }
 
 /// A refused configuration: a fixed code and the key it concerns. Never carries a value.
@@ -117,6 +119,8 @@ pub const SCRIPTS: &str = "ATLAS_DUCK_SCRIPTS";
 pub const SANDBOX_BIN: &str = "ATLAS_DUCK_SANDBOX_BIN";
 pub const SCRIPT_RUNS_MAX: &str = "ATLAS_DUCK_SCRIPT_RUNS_MAX";
 pub const SCRIPT_DRY_RUNS_MAX: &str = "ATLAS_DUCK_SCRIPT_DRY_RUNS_MAX";
+pub const EXPORT_TTL_HOURS: &str = "ATLAS_DUCK_EXPORT_TTL_HOURS";
+pub const EXPORT_MAX_CONCURRENT: &str = "ATLAS_DUCK_EXPORT_MAX_CONCURRENT";
 
 /// SM-6.3 "at least every 15 minutes".
 pub const MAX_ANCHOR_INTERVAL_SECS: u64 = 900;
@@ -221,6 +225,15 @@ impl Config {
         let anchor = positive(ANCHOR_INTERVAL_SECS, MAX_ANCHOR_INTERVAL_SECS)?;
         let oauth = oauth_config(&get, &num)?;
         let scripts = scripts_config(&get, &num)?;
+        let in_range = |k: &'static str, default: u64, lo: u64, hi: u64| match num(k, default)? {
+            v if (lo..=hi).contains(&v) => Ok(v),
+            _ => Err(err("config/invalid_value", k)),
+        };
+        let exports = crate::export_job::ExportConfig {
+            ttl_secs: i64::try_from(in_range(EXPORT_TTL_HOURS, 24, 1, 168)? * 3600)
+                .unwrap_or(i64::MAX),
+            max_concurrent: usize::try_from(in_range(EXPORT_MAX_CONCURRENT, 2, 1, 8)?).unwrap_or(1),
+        };
         if anchor > MAX_ANCHOR_INTERVAL_SECS {
             return Err(err("config/anchor_interval_too_long", ANCHOR_INTERVAL_SECS));
         }
@@ -245,6 +258,7 @@ impl Config {
             rust_log: get(RUST_LOG).unwrap_or_else(|| "info".into()),
             oauth,
             scripts,
+            exports,
         })
     }
 
@@ -595,6 +609,34 @@ mod tests {
         assert!(!c.scripts.enabled);
         assert_eq!(c.scripts.sandbox_bin, PathBuf::from("/opt/worker"));
         assert_eq!((c.scripts.runs_max, c.scripts.dry_runs_max), (32, 1));
+        // M14 PD-254: the export keys.
+        let d = Env::ok().load().unwrap();
+        assert_eq!((d.exports.ttl_secs, d.exports.max_concurrent), (86_400, 2));
+        let e = Env::ok()
+            .set(EXPORT_TTL_HOURS, "168")
+            .set(EXPORT_MAX_CONCURRENT, "8")
+            .load()
+            .unwrap();
+        assert_eq!(
+            (e.exports.ttl_secs, e.exports.max_concurrent),
+            (168 * 3600, 8)
+        );
+        for (k, v) in [
+            (EXPORT_TTL_HOURS, "0"),
+            (EXPORT_TTL_HOURS, "169"),
+            (EXPORT_MAX_CONCURRENT, "0"),
+            (EXPORT_MAX_CONCURRENT, "9"),
+            (EXPORT_MAX_CONCURRENT, "x"),
+        ] {
+            assert_eq!(
+                Env::ok().set(k, v).load().unwrap_err(),
+                ConfigError {
+                    code: "config/invalid_value",
+                    key: k
+                },
+                "{k}={v}"
+            );
+        }
         for (k, v, want) in [
             (SCRIPTS, "on", "config/invalid_value"),
             (SANDBOX_BIN, "relative/worker", "config/sandbox_bin_invalid"),

@@ -9,6 +9,7 @@ import {
   GUARDED_CALLS,
   PROOF_HELPERS,
   SERVER_ADMIN_PROOFS,
+  SERVER_EXPORT_DIR_SITES,
   collectFiles,
   isExempt,
   scanDialogProofs,
@@ -614,4 +615,24 @@ test("server_admin_proof_site_only", () => {
   assert.match(other[0], /Confirmed built outside a dialog function/);
   const otherFile = scanDialogProofs([{ path: "crates/server/src/web/mod.rs", src: body(site.name) }]);
   assert.equal(otherFile.length, 1);
+});
+test("m14_server_export_dir_only_in_its_listed_function", () => {
+  const JOB = "crates/server/src/export_job.rs";
+  const site = [
+    "fn export_dir_path(root: &Path, job_id: &str) -> RustChosenPath {",
+    "    RustChosenPath::from_server_export_dir(root.join(job_id))",
+    "}",
+  ].join("\n");
+  assert.deepEqual(SERVER_EXPORT_DIR_SITES, [{ file: JOB, name: "export_dir_path" }]);
+  assert.deepEqual(scanDialogProofs([{ path: JOB, src: site }]), []);
+  // Another function of the same file, or the same function name elsewhere, is flagged.
+  const other = site.replace("fn export_dir_path", "fn from_request");
+  const want = (p, line) =>
+    `${p}:${line}: RustChosenPath::from_server_export_dir outside the server export job's listed function`;
+  assert.deepEqual(scanDialogProofs([{ path: JOB, src: other }]), [want(JOB, 2)]);
+  const ROUTES = "crates/server/src/web/export_routes.rs";
+  assert.deepEqual(scanDialogProofs([{ path: ROUTES, src: site }]), [want(ROUTES, 2)]);
+  // A call outside any function is flagged too.
+  const loose = "static P: () = { RustChosenPath::from_server_export_dir(p); };";
+  assert.equal(scanDialogProofs([{ path: JOB, src: loose }]).length, 1);
 });

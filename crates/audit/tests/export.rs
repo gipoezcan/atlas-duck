@@ -1394,3 +1394,79 @@ fn export_on_a_closed_store_is_closed() {
     );
     assert!(entries(out.path()).is_empty());
 }
+
+// ---------------------------------------------------------------------------------------
+// M14 T18: TimeRange::through_seq (PD-254)
+
+fn export_through(
+    store: &Store,
+    out: &Path,
+    range: atlas_duck_audit::SeqBoundRange,
+) -> Result<ExportReceipt, AuditError> {
+    let cancel = AtomicBool::new(false);
+    let progress = |_: u64, _: u64| {};
+    store.export_through(
+        range,
+        chosen(out),
+        &ExportControl {
+            progress: &progress,
+            cancel: &cancel,
+        },
+    )
+}
+
+#[test]
+fn through_seq_ends_exactly_at_the_seq() {
+    let (store, f) = new_store(fake_clock(START), MemKeyring::new());
+    store.append_batch(mixed(6)).expect("append");
+    let head = store.head().0;
+    let all = TimeRange::all();
+    // Ends at seq 4 although later rows are inside every time bound.
+    let out = tempfile::tempdir().expect("out");
+    let r = export_through(&store, out.path(), TimeRange::through_seq(all.from_utc, 4))
+        .expect("export");
+    assert_eq!((r.first_seq, r.last_seq, r.rows), (1, 4, 4));
+    let dir = out.path().join(&r.dir_name);
+    assert_eq!(lines(&dir).len(), 4);
+    let m: Value = serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap())
+        .expect("manifest");
+    assert_eq!(m["head"]["seq"], 4);
+    assert_eq!(m["requested_range"]["to_utc"], all.to_utc.to_rfc3339_ms());
+    // Through the head: everything; the EXPORT row of the first export is beyond it.
+    let out = tempfile::tempdir().expect("out");
+    let r = export_through(
+        &store,
+        out.path(),
+        TimeRange::through_seq(all.from_utc, head),
+    )
+    .expect("export");
+    assert_eq!(r.last_seq, head);
+    assert_eq!(count(&f, EventType::EXPORT), 2);
+}
+
+#[test]
+fn through_seq_beyond_the_head_or_before_the_range_is_refused() {
+    let (store, f) = new_store(fake_clock(START), MemKeyring::new());
+    store.append_batch(mixed(3)).expect("append");
+    let head = store.head().0;
+    let all = TimeRange::all();
+    let out = tempfile::tempdir().expect("out");
+    match export_through(
+        &store,
+        out.path(),
+        TimeRange::through_seq(all.from_utc, head + 1),
+    ) {
+        Err(AuditError::Invalid(why)) => {
+            assert_eq!(why, atlas_duck_audit::export::EXPORT_BEYOND_HEAD)
+        }
+        other => panic!("{other:?}"),
+    }
+    // A from-time after every record: no records.
+    let late = atlas_duck_audit::UtcInstant(i64::MAX);
+    assert!(matches!(
+        export_through(&store, out.path(), TimeRange::through_seq(late, head)),
+        Err(AuditError::Invalid(_))
+    ));
+    assert!(entries(out.path()).is_empty());
+    assert_eq!(count(&f, EventType::EXPORT), 0);
+}

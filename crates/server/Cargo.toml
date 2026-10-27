@@ -49,7 +49,7 @@ atlas-duck-sandbox-host = { path = "../sandbox-host" }
 axum = { workspace = true }
 ldap3 = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal", "fs"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal", "fs", "io-util"] }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-platform-verifier = { workspace = true }

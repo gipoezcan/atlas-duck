@@ -276,6 +276,9 @@ pub struct ExportJobRecord {
     pub manifest_sha256: Option<String>,
     pub size: Option<u64>,
     pub file_name: Option<String>,
+    /// The `HEADS` row the job forced (PD-254 s1): the export's `--anchor-chain-head` pin.
+    pub anchor_seq: Option<u64>,
+    pub anchor_hash: Option<String>,
 }
 
 /// PD-240: a client without a grant this long after registration is purged.
@@ -375,6 +378,8 @@ pub trait ServerStore: Send + Sync {
         hash: AnchorHasher<'_>,
     ) -> StoreResult<AnchorRow>;
     fn anchor_all(&self) -> StoreResult<Vec<AnchorRow>>;
+    /// M14 PD-253: the rows `first..=last` in seq order (an excerpt span, read in batches).
+    fn anchor_range(&self, first: u64, last: u64) -> StoreResult<Vec<AnchorRow>>;
     fn anchor_last(&self) -> StoreResult<Option<AnchorRow>>;
     fn anchor_heads_for(&self, anchor_seq: u64) -> StoreResult<Vec<AnchorHead>>;
     /// `(anchor_seq, head)` of every head of `chain_id` with `head_seq <= upto_seq`, in order.
