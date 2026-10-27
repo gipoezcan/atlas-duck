@@ -183,6 +183,15 @@ impl ApiError {
         "oauth/grant_unknown",
         "No such connected app.",
     );
+    /// M14 PD-257: no user with a store has this id.
+    pub const AUDIT_USER_UNKNOWN: ApiError =
+        e(StatusCode::NOT_FOUND, "audit/user_unknown", "No such user.");
+    /// M14 PD-258: the auditor's read could not be recorded, so nothing was read.
+    pub const AUDIT_READ_NOT_RECORDED: ApiError = e(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "audit/read_not_recorded",
+        "The read could not be recorded; nothing was read. Try again later.",
+    );
     pub const INTERNAL: ApiError = e(
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal",
@@ -288,6 +297,8 @@ mod tests {
             (ApiError::OAUTH_REQUEST_UNKNOWN, 404),
             (ApiError::OAUTH_REQUEST_EXPIRED, 410),
             (ApiError::OAUTH_GRANT_UNKNOWN, 404),
+            (ApiError::AUDIT_USER_UNKNOWN, 404),
+            (ApiError::AUDIT_READ_NOT_RECORDED, 503),
             (ApiError::INTERNAL, 500),
         ] {
             assert_eq!(err.status.as_u16(), status, "{}", err.code);

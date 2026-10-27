@@ -74,6 +74,9 @@ pub enum Access {
     Admin,
     /// A bearer API key; the answer is the key owner's own data only.
     Bearer,
+    /// M14 PD-257: a session with role `auditor`; the answer may be any user's audit data, and
+    /// every such read is recorded (PD-258).
+    Auditor,
 }
 
 /// Every route [`router`] serves, `(method, path, access)`; `web::tests` pins that each is
@@ -126,6 +129,13 @@ pub const ROUTES: &[(&str, &str, Access)] = &[
     // M14 T9: connected apps.
     ("GET", "/api/me/oauth/grants", Access::Session),
     ("DELETE", "/api/me/oauth/grants/{id}", Access::Session),
+    // M14 T17: auditor reads (role checked by the guard before any handler).
+    ("GET", "/api/auditor/users", Access::Auditor),
+    (
+        "POST",
+        "/api/auditor/users/{user_id}/{command}",
+        Access::Auditor,
+    ),
 ];
 
 /// The handler of one [`ROUTES`] row; `None` for the bearer rows, which [`crate::mcp::routes`]
@@ -165,6 +175,8 @@ pub(crate) fn handler(method: &str, path: &str) -> Option<MethodRouter<AppState>
         ("POST", "/oauth/revoke") => post(oauth_routes::revoke_endpoint),
         ("GET", "/api/me/oauth/grants") => get(grant_routes::list),
         ("DELETE", "/api/me/oauth/grants/{id}") => delete(grant_routes::revoke),
+        ("GET", "/api/auditor/users") => get(crate::auditor::list_users),
+        ("POST", "/api/auditor/users/{user_id}/{command}") => post(crate::auditor::read),
         _ => return None,
     })
 }
@@ -220,6 +232,8 @@ fn session_only_path(path: &str) -> bool {
         || path == "/api/me"
         // M14: consent is the user's decision, never an agent's (SM-3.4).
         || path.starts_with("/api/oauth/")
+        // M14 PD-257: auditor reads take a session only.
+        || path.starts_with("/api/auditor/")
 }
 
 fn header_str(h: &HeaderMap, name: impl header::AsHeaderName) -> Option<&str> {
@@ -265,6 +279,27 @@ async fn api_guard(State(st): State<AppState>, mut req: Request, next: Next) -> 
             }
             req.extensions_mut().insert(session);
         }
+    }
+    // M14 PD-257: the auditor role, checked before any auditor handler or path extraction.
+    if path.starts_with("/api/auditor/") {
+        let session = match req.extensions().get::<crate::session::Session>().cloned() {
+            Some(s) => s,
+            None => {
+                let Some(cookie) = header_str(req.headers(), header::COOKIE)
+                    .and_then(|h| cookie_value(h, st.cookie_secure))
+                else {
+                    return ApiError::NO_SESSION.into_response();
+                };
+                match st.sessions.lookup(cookie) {
+                    Ok(s) => s,
+                    Err(e) => return e.into_response(),
+                }
+            }
+        };
+        if !session.roles.iter().any(|r| r == crate::auditor::ROLE) {
+            return ApiError::ROLE_REQUIRED.into_response();
+        }
+        req.extensions_mut().insert(session);
     }
     next.run(req).await
 }

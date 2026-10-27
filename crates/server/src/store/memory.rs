@@ -77,6 +77,12 @@ impl ServerStore for MemoryStore {
             .cloned())
     }
 
+    fn user_list(&self) -> StoreResult<Vec<UserRecord>> {
+        let mut v: Vec<UserRecord> = self.lock().users.values().cloned().collect();
+        v.sort_by(|a, b| a.username.cmp(&b.username));
+        Ok(v)
+    }
+
     fn ks_get(&self, user_id: &str, entry: &str) -> StoreResult<Option<Sealed>> {
         Ok(self
             .lock()

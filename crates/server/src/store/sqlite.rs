@@ -273,6 +273,14 @@ impl ServerStore for SqliteStore {
             .map_err(db)
     }
 
+    fn user_list(&self) -> StoreResult<Vec<UserRecord>> {
+        let c = self.conn();
+        let mut st = c
+            .prepare(&format!("SELECT {USER_COLS} FROM users ORDER BY username"))
+            .map_err(db)?;
+        collect(st.query_map([], user_row).map_err(db)?)
+    }
+
     fn ks_get(&self, user_id: &str, entry: &str) -> StoreResult<Option<Sealed>> {
         self.conn()
             .query_row(

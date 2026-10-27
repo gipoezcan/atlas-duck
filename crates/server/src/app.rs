@@ -200,6 +200,15 @@ async fn run(config: Config) -> u8 {
             let _ = tokio::task::spawn_blocking(move || crate::oauth::purge(s.as_ref(), now)).await;
         }
     });
+    // M14 PD-257: auditors' store views close after 5 minutes idle.
+    let views_registry = registry.clone();
+    let idle_views = tokio::spawn(async move {
+        let mut t = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            t.tick().await;
+            views_registry.close_idle_views().await;
+        }
+    });
     let Ok(listener) = tokio::net::TcpListener::bind(config.listen).await else {
         return fail("listen_failed");
     };
@@ -213,6 +222,7 @@ async fn run(config: Config) -> u8 {
     sweeper.abort();
     anchor_timer.abort();
     oauth_purge.abort();
+    idle_views.abort();
     // Final heads (RUNTIME_CLOSED per runtime, after its APP_STOP) and SERVER_STOP.
     if writer.shutdown().await.is_err() {
         tracing::error!(event = "anchor_append_failed", kind = "SERVER_STOP");

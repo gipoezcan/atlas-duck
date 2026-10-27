@@ -326,6 +326,8 @@ fn concrete(path: &str) -> String {
         .replace("{alias}", "work")
         .replace("{command}", "queue_list")
         .replace("{id}", "key_00000000000000000000000000000000")
+        .replace("{user_id}", &user_id_for(BOB.0))
+        .replace("{req}", "consentrequestprobe")
 }
 
 /// A well-formed body for a state-changing row (so a refusal is the guard's, not the parser's).
@@ -353,6 +355,7 @@ async fn every_route_enforces_its_access_class() {
     // answers 401 to a cookie, and the approval commands refuse a bearer even with a cookie.
     let s = TestServer::start().await;
     let alice = s.login(ALICE).await;
+    let carol = s.login(CAROL).await;
     let (_, key) = s.api_key(&alice, &["read", "propose_write"]).await;
     for (method, path, access) in ROUTES {
         let url = concrete(path);
@@ -378,9 +381,27 @@ async fn every_route_enforces_its_access_class() {
                 let (status, _) = s.send(m.clone(), &url, Some(&alice), body.clone()).await;
                 assert_eq!(status, 401, "{method} {path} with a cookie only");
             }
+            // M14 PD-257: without a session 401; a plain user and an admin get 403.
+            Access::Auditor => {
+                let anon = Browser {
+                    cookie: "none".into(),
+                    csrf: "none".into(),
+                };
+                let (status, v) = s.send(m.clone(), &url, Some(&anon), body.clone()).await;
+                assert_eq!(status, 401, "{method} {path} without a session: {v}");
+                for who in [&alice, &carol] {
+                    let (status, v) = s.send(m.clone(), &url, Some(who), body.clone()).await;
+                    assert_eq!(status, 403, "{method} {path} as a non-auditor: {v}");
+                    assert_eq!(v["error"]["code"], "auth/role_required", "{method} {path}");
+                }
+            }
         }
-        // Session-only rows under /api/cmd and /api/me refuse a bearer before anything else.
-        if path.starts_with("/api/cmd/") || path.starts_with("/api/me/") {
+        // Session-only rows under /api/cmd, /api/me and /api/auditor refuse a bearer before
+        // anything else.
+        if path.starts_with("/api/cmd/")
+            || path.starts_with("/api/me/")
+            || path.starts_with("/api/auditor/")
+        {
             let auth = format!("Bearer {key}");
             let (status, v) = s
                 .send_with(
@@ -541,14 +562,26 @@ async fn admin_has_no_user_data() {
 }
 #[test]
 fn no_cross_user_audit_route_without_auditor_role() {
-    // Δ-M14-5: no route returns another user's audit data unless it requires role `auditor`;
-    // M12 has no auditor route at all.
+    // Δ-M14-5: no route returns another user's audit data unless it requires role `auditor`.
+    // M14: the auditor routes are exactly the `/api/auditor/` rows and all need the role; every
+    // other audit or chain route is the session user's own (`/api/me/...`).
+    let mut auditor_rows = 0;
     for (_, path, access) in ROUTES {
+        if path.starts_with("/api/auditor/") {
+            assert_eq!(*access, Access::Auditor, "{path}");
+            auditor_rows += 1;
+        } else if path.contains("audit") || path.contains("chain") {
+            assert!(
+                path.starts_with("/api/me/") && *access == Access::Session,
+                "{path} ({access:?}) needs the auditor role or must be the user's own"
+            );
+        }
         assert!(
-            !path.contains("audit") && !path.contains("chain"),
-            "{path} ({access:?}) needs the auditor role"
+            *access != Access::Auditor || path.starts_with("/api/auditor/"),
+            "{path}: an auditor route outside /api/auditor/"
         );
     }
+    assert!(auditor_rows >= 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

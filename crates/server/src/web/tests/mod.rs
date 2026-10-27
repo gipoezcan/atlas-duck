@@ -30,6 +30,8 @@ use crate::users::user_id_for;
 
 /// M14 T16: the own-chain audit reads.
 mod audit;
+/// M14 T17: auditor reads.
+mod auditor;
 /// `/mcp` (T19) over the same harness.
 mod mcp;
 /// M14: OAuth discovery, registration, authorization, tokens.
@@ -44,6 +46,7 @@ const STUB: &str = r#"{"users": [
   {"username": "alice", "password": "pw-canary-7f3a9c", "groups": ["CN=Users,DC=t"]},
   {"username": "bob", "password": "pw-bob", "groups": ["cn=users,dc=t", "cn=admins,dc=t"]},
   {"username": "audrey", "password": "pw-audrey", "groups": ["cn=auditors,dc=t"]},
+  {"username": "vera", "password": "pw-vera", "groups": ["cn=users,dc=t", "cn=auditors,dc=t"]},
   {"username": "ursula", "password": "pw-ursula", "groups": ["cn=other,dc=t"]},
   {"username": "dora", "password": "pw-dora", "groups": ["cn=users,dc=t"], "disabled": true}
 ]}"#;

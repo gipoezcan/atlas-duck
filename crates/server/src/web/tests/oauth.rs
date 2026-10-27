@@ -889,7 +889,7 @@ impl H {
         (client, alice, v)
     }
 
-    fn chain_kinds(
+    pub(super) fn chain_kinds(
         &self,
         rt: &crate::runtime::UserRuntime,
     ) -> Vec<(atlas_duck_audit::EventType, Value)> {

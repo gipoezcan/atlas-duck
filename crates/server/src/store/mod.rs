@@ -316,6 +316,8 @@ pub trait ServerStore: Send + Sync {
     fn upsert_user(&self, user: &UserRecord) -> StoreResult<()>;
     fn user(&self, user_id: &str) -> StoreResult<Option<UserRecord>>;
     fn user_by_name(&self, username: &str) -> StoreResult<Option<UserRecord>>;
+    /// M14 PD-257: every user, by username (the auditor's list; no secret column is shown).
+    fn user_list(&self) -> StoreResult<Vec<UserRecord>>;
 
     // ---- per-user keystore entries (PD-210) ----
     fn ks_get(&self, user_id: &str, entry: &str) -> StoreResult<Option<Sealed>>;

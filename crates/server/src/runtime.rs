@@ -227,11 +227,30 @@ pub struct UserRuntime {
     _lock: InstanceLock,
 }
 
+/// A user's store opened without a core (M14 PD-257: an auditor's read of a user whose runtime
+/// is closed), held under the user's instance lock; a runtime that opens later adopts both.
+pub struct StoreOnly {
+    pub lock: InstanceLock,
+    pub store: Store,
+}
+
 impl UserRuntime {
-    /// Opens (creating on first use) the user's store and starts its core.
-    pub async fn open(user_id: &str, deps: &RuntimeDeps) -> Result<UserRuntime, RuntimeError> {
+    /// The user's store under its instance lock. `create`: create it when it does not exist yet
+    /// (a login); otherwise a missing store is `UnknownUser` (an auditor never creates one).
+    pub fn open_store(
+        user_id: &str,
+        deps: &RuntimeDeps,
+        create: bool,
+    ) -> Result<StoreOnly, RuntimeError> {
         let st = |e: String| RuntimeError::Store(e);
         let dir = user_dir(&deps.data_dir, user_id);
+        let exists = dir
+            .join(atlas_duck_audit::DB_FILE)
+            .try_exists()
+            .unwrap_or(false);
+        if !exists && !create {
+            return Err(RuntimeError::UnknownUser);
+        }
         std::fs::create_dir_all(&dir).map_err(|e| st(e.to_string()))?;
         let data = match check_data_dir(&dir) {
             Ok(DataDirResolution::Local(d)) => d,
@@ -248,10 +267,6 @@ impl UserRuntime {
             c.pinned_install_id = Some(user_id.to_owned());
             c
         };
-        let exists = dir
-            .join(atlas_duck_audit::DB_FILE)
-            .try_exists()
-            .unwrap_or(false);
         let store = if exists {
             match atlas_duck_audit::open(&data, &lock, open_cfg()) {
                 Ok(StartupOutcome::Ready { store, .. }) => store,
@@ -273,6 +288,24 @@ impl UserRuntime {
             atlas_duck_audit::create_new_store(&data, &lock, open_cfg(), input)
                 .map_err(|e| st(e.to_string()))?
         };
+        Ok(StoreOnly { lock, store })
+    }
+
+    /// Opens (creating on first use) the user's store and starts its core.
+    pub async fn open(user_id: &str, deps: &RuntimeDeps) -> Result<UserRuntime, RuntimeError> {
+        let opened = Self::open_store(user_id, deps, true)?;
+        Self::open_with(user_id, deps, opened).await
+    }
+
+    /// Starts the core over a store already open (fresh, or adopted from an audit view).
+    pub async fn open_with(
+        user_id: &str,
+        deps: &RuntimeDeps,
+        opened: StoreOnly,
+    ) -> Result<UserRuntime, RuntimeError> {
+        let st = |e: String| RuntimeError::Store(e);
+        let StoreOnly { lock, store } = opened;
+        let dir = user_dir(&deps.data_dir, user_id);
         apply_instance_settings(&store, deps)?;
         let config_path = dir.join(CONFIG_FILE);
         write_config(&config_path, deps)?;
@@ -521,7 +554,12 @@ pub struct Registry {
     open: tokio::sync::Mutex<HashMap<String, Arc<UserRuntime>>>,
     tick: AtomicU64,
     closed: Mutex<Vec<UserHead>>,
+    /// M14 PD-257: stores opened for auditors without a runtime, with their last use.
+    views: Mutex<HashMap<String, (StoreOnly, i64)>>,
 }
+
+/// PD-257: an audit view nobody used for this long is closed.
+pub const VIEW_IDLE_SECS: i64 = 300;
 
 impl Registry {
     pub fn new(deps: RuntimeDeps, max_open: usize) -> Registry {
@@ -531,7 +569,64 @@ impl Registry {
             open: tokio::sync::Mutex::new(HashMap::new()),
             tick: AtomicU64::new(0),
             closed: Mutex::new(Vec::new()),
+            views: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn views(&self) -> std::sync::MutexGuard<'_, HashMap<String, (StoreOnly, i64)>> {
+        self.views.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// M14 PD-257 (Δ-M14-3): `user_id`'s audit store for an auditor. The open runtime's store
+    /// when there is one; else the store opened without a core (so an audit read appends no
+    /// `APP_START` and no agent-facing runtime exists), held under the user's instance lock and
+    /// closed after [`VIEW_IDLE_SECS`] idle. A runtime opening meanwhile adopts it. A user who has
+    /// no store is `UnknownUser` (an auditor never creates one).
+    pub async fn audit_view(&self, user_id: &str) -> Result<Store, RuntimeError> {
+        // Under the registry lock: no runtime of this user opens while the view is made.
+        let open = self.open.lock().await;
+        if let Some(rt) = open.get(user_id) {
+            return Ok(rt.audit_handle());
+        }
+        let now = self.deps.clock.now();
+        let mut views = self.views();
+        if let Some((v, at)) = views.get_mut(user_id) {
+            *at = now;
+            return Ok(v.store.clone());
+        }
+        let opened = UserRuntime::open_store(user_id, &self.deps, false)?;
+        let store = opened.store.clone();
+        views.insert(user_id.to_owned(), (opened, now));
+        drop(open);
+        Ok(store)
+    }
+
+    /// Closes every audit view idle for [`VIEW_IDLE_SECS`] (the periodic task; tests call it).
+    pub async fn close_idle_views(&self) -> usize {
+        let now = self.deps.clock.now();
+        let idle: Vec<StoreOnly> = {
+            let mut views = self.views();
+            let keys: Vec<String> = views
+                .iter()
+                .filter(|(_, (_, at))| now - at >= VIEW_IDLE_SECS)
+                .map(|(k, _)| k.clone())
+                .collect();
+            keys.iter()
+                .filter_map(|k| views.remove(k).map(|(v, _)| v))
+                .collect()
+        };
+        let n = idle.len();
+        for v in idle {
+            let store = v.store.clone();
+            let _ = tokio::task::spawn_blocking(move || store.shutdown()).await;
+            drop(v);
+        }
+        n
+    }
+
+    /// Whether `user_id` has an open audit view (tests).
+    pub fn has_audit_view(&self, user_id: &str) -> bool {
+        self.views().contains_key(user_id)
     }
 
     pub fn deps(&self) -> &RuntimeDeps {
@@ -569,7 +664,12 @@ impl Registry {
                 None => tracing::warn!(event = "runtime_cap_exceeded", open = open.len()),
             }
         }
-        let rt = Arc::new(UserRuntime::open(user_id, &self.deps).await?);
+        // PD-257: a store an auditor's view holds is adopted, never opened twice.
+        let adopted = self.views().remove(user_id).map(|(v, _)| v);
+        let rt = Arc::new(match adopted {
+            Some(v) => UserRuntime::open_with(user_id, &self.deps, v).await?,
+            None => UserRuntime::open(user_id, &self.deps).await?,
+        });
         rt.bind_script_instances();
         rt.last_used.store(t, Ordering::SeqCst);
         open.insert(user_id.to_owned(), rt.clone());
@@ -605,6 +705,13 @@ impl Registry {
         for rt in all {
             rt.close().await;
             heads.push((rt.user_id.clone(), rt.head()));
+        }
+        // M14: audit views close too (no core, so no APP_STOP; an export's record is anchored by
+        // the export itself).
+        let views: Vec<StoreOnly> = self.views().drain().map(|(_, (v, _))| v).collect();
+        for v in views {
+            let store = v.store.clone();
+            let _ = tokio::task::spawn_blocking(move || store.shutdown()).await;
         }
         heads
     }
