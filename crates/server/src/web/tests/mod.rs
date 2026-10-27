@@ -1979,6 +1979,25 @@ async fn metrics_include_requests_approvals_scheduler_offboarding_test_directory
     ] {
         assert!(text.lines().any(|l| l == line), "missing {line}:\n{text}");
     }
+    // Without scripts: the floor is disabled and no pool is listed.
+    assert!(
+        text.lines()
+            .any(|l| l == "atlas_duck_scripts_floor{state=\"disabled\"} 1")
+    );
+    // M14: with scripts, the pools and the probe state (no probe ran: probing).
+    let scripts = Arc::new(crate::scripts::ServerScripts::new(
+        crate::scripts::ScriptsConfig::defaults(),
+    ));
+    let text = full_health(&h).with_scripts(Some(scripts)).metrics().await;
+    for line in [
+        "atlas_duck_scripts_floor{state=\"probing\"} 1",
+        "atlas_duck_script_runs_active{kind=\"run\"} 0",
+        "atlas_duck_script_runs_active{kind=\"dry\"} 0",
+        "atlas_duck_script_runs_max{kind=\"run\"} 4",
+        "atlas_duck_script_runs_max{kind=\"dry\"} 4",
+    ] {
+        assert!(text.lines().any(|l| l == line), "missing {line}:\n{text}");
+    }
     // Manual offboarding reports 0.
     let manual = crate::health::Health::new(h.store.clone(), h.stub.clone(), true)
         .with_offboarding("manual");
@@ -2042,6 +2061,13 @@ async fn metrics_contain_no_usernames_hostnames_or_ids() {
         "primary",
         "accepted",
         env!("CARGO_PKG_VERSION"),
+        // M14: the script floor states and pool kinds.
+        "met",
+        "not_met",
+        "probing",
+        "disabled",
+        "run",
+        "dry",
     ];
     for line in text.lines().filter(|l| !l.starts_with('#')) {
         if let Some((_, rest)) = line.split_once('{') {

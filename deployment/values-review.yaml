@@ -29,10 +29,15 @@ networkPolicy:
   ingressNamespaceSelectors:
     - kubernetes.io/metadata.name: CHANGE-ME
 
+# M14 PD-246: one run and one dry run at a time; memory 1Gi + (1 + 1) x 512Mi.
+scripts:
+  runsMax: 1
+  dryRunsMax: 1
+
 resources:
   requests:
     cpu: 100m
     memory: 256Mi
   limits:
     cpu: "1"
-    memory: 1Gi
+    memory: 2Gi

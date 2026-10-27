@@ -303,6 +303,44 @@ impl Health {
             "gauge",
             &keys,
         );
+        // M14 PD-246/PD-248: the script pools and the sandbox floor (batch-2 review m5: a
+        // saturated pool shows as active == max; runs beyond it queue).
+        let (scripts, pools) = match &self.scripts {
+            Some(s) => (
+                s.state(),
+                vec![
+                    ("run", s.runs_active(), s.cfg.runs_max),
+                    ("dry", s.dry_active(), s.cfg.dry_runs_max),
+                ],
+            ),
+            None => ("disabled", Vec::new()),
+        };
+        gauge(
+            "atlas_duck_scripts_floor",
+            "1 for the sandbox state now: met, not_met, probing or disabled.",
+            "gauge",
+            &[(format!("{{state=\"{scripts}\"}}"), "1".into())],
+        );
+        let active: Vec<(String, String)> = pools
+            .iter()
+            .map(|(k, n, _)| (format!("{{kind=\"{k}\"}}"), n.to_string()))
+            .collect();
+        gauge(
+            "atlas_duck_script_runs_active",
+            "Script runs holding a server-wide slot, by kind (run, dry).",
+            "gauge",
+            &active,
+        );
+        let max: Vec<(String, String)> = pools
+            .iter()
+            .map(|(k, _, m)| (format!("{{kind=\"{k}\"}}"), m.to_string()))
+            .collect();
+        gauge(
+            "atlas_duck_script_runs_max",
+            "Server-wide script slots, by kind (run, dry).",
+            "gauge",
+            &max,
+        );
         gauge(
             "atlas_duck_build_info",
             "The server version.",

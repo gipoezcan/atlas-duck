@@ -7,6 +7,15 @@
     "publicUrl": { "type": "string" },
     "trustedProxyHops": { "type": "integer", "minimum": 0 },
     "maxOpenUsers": { "type": "integer", "minimum": 1 },
+    "scripts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "runsMax": { "type": "integer" },
+        "dryRunsMax": { "type": "integer" }
+      }
+    },
     "replicaCount": { "type": "integer" },
     "image": {
       "type": "object",

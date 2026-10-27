@@ -52,10 +52,11 @@ networkPolicy:
   ingressNamespaceSelectors:
     - kubernetes.io/metadata.name: CHANGE-ME
 
+# M14 PD-246: the chart's script pools (4 + 4); memory 1Gi + (4 + 4) x 512Mi = 5Gi.
 resources:
   requests:
     cpu: 250m
-    memory: 512Mi
+    memory: 1Gi
   limits:
     cpu: "2"
-    memory: 2Gi
+    memory: 5Gi

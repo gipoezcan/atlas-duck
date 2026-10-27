@@ -118,6 +118,15 @@ spec:
             - name: GROUP_ADMINS
               value: {{ . | quote }}
             {{- end }}
+            # M14 PD-246..PD-249: scripts in the pod; the worker is the image's.
+            - name: ATLAS_DUCK_SCRIPTS
+              value: {{ ternary "enabled" "disabled" .Values.scripts.enabled | quote }}
+            - name: ATLAS_DUCK_SANDBOX_BIN
+              value: /app/atlas-duck-sandbox
+            - name: ATLAS_DUCK_SCRIPT_RUNS_MAX
+              value: {{ .Values.scripts.runsMax | quote }}
+            - name: ATLAS_DUCK_SCRIPT_DRY_RUNS_MAX
+              value: {{ .Values.scripts.dryRunsMax | quote }}
             {{- range .Values.extraEnv }}
             - name: {{ .name }}
               value: {{ .value | quote }}

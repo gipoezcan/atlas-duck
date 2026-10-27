@@ -730,3 +730,29 @@ async fn deactivation_revokes_oauth_grants_and_a_retry_completes_them() {
     assert_eq!(third.data.unwrap()["anchor_seq"], Value::Null);
     within(t.ctx.registry.close_all()).await;
 }
+
+/// M14: `anchor head` answers the chain's last row; `sandbox probe` the script state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anchor_head_and_sandbox_probe() {
+    let t = harness();
+    let r = call(&t.ctx, json!({"op": "anchor_head"})).await;
+    assert!(r.ok, "{r:?}");
+    let last = t.env.store.anchor_last().unwrap().unwrap();
+    assert_eq!(
+        r.data.unwrap(),
+        json!({"seq": last.seq, "hash": hex::encode(last.hash)})
+    );
+    let r = call(&t.ctx, json!({"op": "sandbox_probe"})).await;
+    assert_eq!(
+        r.data.unwrap(),
+        json!({"state": "disabled", "report": null})
+    );
+    assert_eq!(
+        parse(&["anchor".into(), "head".into()]),
+        Some(Parsed::Run(Request::AnchorHead(NoArgs {})))
+    );
+    assert_eq!(
+        parse(&["sandbox".into(), "probe".into()]),
+        Some(Parsed::Run(Request::SandboxProbe(NoArgs {})))
+    );
+}

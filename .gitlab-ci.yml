@@ -539,3 +539,49 @@ verify:review-ops-drill:
   allow_failure: true
   script:
     - sh ci/review-ops-drill.sh
+# M14 T15 (PD-250): the sandbox floor in the review pod under RuntimeDefault; keep the evidence line.
+verify:review-sandbox:
+  stage: server-verify
+  image:
+    name: ghcr.io/helmfile/helmfile:v0.169.1
+    entrypoint: [""]
+  needs: [deploy:review]
+  variables: *server-vars
+  rules: *review-rules
+  script:
+    - sh -n ci/review-sandbox.sh
+    - sh ci/review-sandbox.sh
+
+# M14 T23 (PD-260): the e2e binary, built in this pipeline (never a downloaded tool).
+server:e2e-build:
+  stage: server-build
+  needs: []
+  variables: *server-vars
+  rules: *review-rules
+  script:
+    - rustup toolchain install
+    - cargo test -p atlas-duck-server-e2e --lib --locked
+    - |
+      set -eu
+      bin="$(cargo test -p atlas-duck-server-e2e --test e2e --no-run --locked 2>&1 \
+        | sed -n 's/.*Executable .*(\(.*\)).*/\1/p' | tail -n 1)"
+      [ -x "$bin" ] || { echo "no e2e test binary built"; exit 1; }
+      mkdir -p e2e-bin && cp "$bin" e2e-bin/e2e
+  artifacts:
+    paths: [e2e-bin/e2e]
+    expire_in: 1 day
+
+# M14 T23: the black-box suite against the review environment (Jira none, L258).
+verify:review-e2e:
+  stage: server-verify
+  needs: [deploy:review, verify:review-smoke, server:e2e-build]
+  variables: *server-vars
+  rules: *review-rules
+  timeout: 20m
+  script:
+    - sh -n ci/review-e2e.sh
+    - sh ci/review-e2e.sh
+  artifacts:
+    when: always
+    paths: [e2e-summary.txt, e2e-output.txt]
+    expire_in: 2 weeks

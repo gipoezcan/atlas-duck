@@ -36,13 +36,25 @@ podLabels: {}
 # Pod hardening (SM-7.1, SM-9.4). The ids are the distroless `nonroot` user of the image (A-8).
 uid: 65532
 
+# Memory (M14 PD-246): server baseline 1Gi + (scripts.runsMax + scripts.dryRunsMax) x 512Mi, the
+# per-run process limit (crates/ipc/src/sandbox/limits.rs process_mb). With the defaults below:
+# 1Gi + (4 + 4) x 512Mi = 5Gi. Lower the pools before lowering the limit.
 resources:
   requests:
     cpu: 250m
-    memory: 512Mi
+    memory: 1Gi
   limits:
     cpu: "2"
-    memory: 2Gi
+    memory: 5Gi
+
+# Scripts in the pod (M14 PD-246..PD-250): the sandbox needs no capability (RuntimeDefault
+# seccomp, no privilege escalation); a pod where it cannot start reports scripts: not_met.
+scripts:
+  # ATLAS_DUCK_SCRIPTS: false is the operator's kill switch.
+  enabled: true
+  # ATLAS_DUCK_SCRIPT_RUNS_MAX / _DRY_RUNS_MAX, 1..32 each, across all users.
+  runsMax: 4
+  dryRunsMax: 4
 
 # Generous: the server opens and verifies its stores before it listens.
 startupProbe:

@@ -193,6 +193,10 @@ pub enum Request {
     BackupsExport(NameArg),
     RetentionRun(DryRunArg),
     AnchorVerify(NoArgs),
+    /// M14 PD-259: the anchor chain's last row, the pin for `verify-export --anchor-chain-head`.
+    AnchorHead(NoArgs),
+    /// M14 PD-250: the server's sandbox probe report.
+    SandboxProbe(NoArgs),
 }
 
 impl Request {
@@ -217,6 +221,8 @@ impl Request {
             Request::BackupsExport(_) => "backups_export",
             Request::RetentionRun(_) => "retention_run",
             Request::AnchorVerify(_) => "anchor_verify",
+            Request::AnchorHead(_) => "anchor_head",
+            Request::SandboxProbe(_) => "sandbox_probe",
         }
     }
 }
@@ -282,6 +288,12 @@ pub async fn handle(ctx: &AdminCtx, req: Request) -> Response {
         Request::BackupsList(_) => backups::list(ctx),
         Request::BackupsRemove(n) => backups::remove(ctx, &n.name),
         Request::RetentionRun(d) => retention::admin(ctx, d.dry_run).await,
+        Request::AnchorHead(_) => match crate::anchor::head(ctx.store.as_ref()) {
+            Ok(Some((seq, hash))) => Ok(serde_json::json!({"seq": seq, "hash": hex::encode(hash)})),
+            Ok(None) => Ok(Value::Null),
+            Err(_) => Err("store/unavailable"),
+        },
+        Request::SandboxProbe(_) => Ok(sandbox_probe(ctx).await),
         Request::AnchorVerify(_) => {
             let resp = anchor::admin(ctx);
             tracing::info!(
@@ -358,4 +370,18 @@ pub(crate) async fn write_line<W: AsyncWrite + Unpin>(
     let mut out = serde_json::to_vec(resp).map_err(std::io::Error::other)?;
     out.push(b'\n');
     w.write_all(&out).await
+}
+
+/// `admin sandbox probe` (M14 PD-250): `state` (`met`, `not_met`, `probing`, `disabled`) and
+/// the probe's evidence once it answered (waits at most 60 s for a probe still running).
+async fn sandbox_probe(ctx: &AdminCtx) -> Value {
+    let Some(s) = ctx.registry.deps().scripts.clone() else {
+        return serde_json::json!({"state": "disabled", "report": null});
+    };
+    let report = s
+        .probe
+        .wait(std::time::Duration::from_secs(60))
+        .await
+        .map(crate::scripts::report_json);
+    serde_json::json!({"state": s.state(), "report": report})
 }

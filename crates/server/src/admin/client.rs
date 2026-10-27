@@ -35,6 +35,8 @@ pub const USAGE: &str = "usage: atlas-duck-server admin <command>
   master-key status
   retention run [--dry-run]
   anchor verify
+  anchor head           (the pin for verify-export --anchor-chain-head)
+  sandbox probe
 ";
 
 /// What argv asks for.
@@ -97,6 +99,8 @@ pub fn parse(args: &[String]) -> Option<Parsed> {
         }))),
         ["master-key", "status"] => Some(Parsed::Run(Request::MasterKeyStatus(NoArgs {}))),
         ["anchor", "verify"] => Some(Parsed::Run(Request::AnchorVerify(NoArgs {}))),
+        ["anchor", "head"] => Some(Parsed::Run(Request::AnchorHead(NoArgs {}))),
+        ["sandbox", "probe"] => Some(Parsed::Run(Request::SandboxProbe(NoArgs {}))),
         _ => None,
     }
 }

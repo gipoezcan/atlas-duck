@@ -78,6 +78,12 @@ matrix (chart/ci-fail/*.yaml, `# expect:`) can match it.
 {{- if contains "CHANGE-ME" (toYaml .Values) }}
 {{- fail "atlas-duck: a CHANGE-ME placeholder is left in the values (an open question, see deployment/README.md)" }}
 {{- end }}
+{{- range list "runsMax" "dryRunsMax" }}
+{{- $v := int (index $.Values.scripts .) }}
+{{- if or (lt $v 1) (gt $v 32) }}
+{{- fail (printf "atlas-duck: scripts.%s must be 1..32 (M14 PD-246)" .) }}
+{{- end }}
+{{- end }}
 {{- range .Values.extraEnv }}
 {{- if regexMatch "^(ATLAS_DUCK_|LDAP_|GROUP_)" .name }}
 {{- fail (printf "atlas-duck: extraEnv %s is managed by the chart" .name) }}

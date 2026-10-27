@@ -1,0 +1,4 @@
+# expect: atlas-duck: extraEnv ATLAS_DUCK_ALLOW_DEGRADED_SCRIPTS is managed by the chart
+extraEnv:
+  - name: ATLAS_DUCK_ALLOW_DEGRADED_SCRIPTS
+    value: "1"
