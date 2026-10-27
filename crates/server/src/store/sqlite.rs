@@ -115,7 +115,8 @@ fn user_row(r: &Row<'_>) -> rusqlite::Result<UserRecord> {
 }
 
 const USER_COLS: &str = "user_id, username, display_name, roles, data_key_wrapped, created_at";
-const STATE_COLS: &str = "deactivated_at, deactivated_by, last_login_at, retention_until";
+const STATE_COLS: &str =
+    "deactivated_at, deactivated_by, last_login_at, retention_until, chain_deleted_at";
 
 fn state_row(r: &Row<'_>, at: usize) -> rusqlite::Result<UserState> {
     Ok(UserState {
@@ -123,6 +124,7 @@ fn state_row(r: &Row<'_>, at: usize) -> rusqlite::Result<UserState> {
         deactivated_by: r.get(at + 1)?,
         last_login_at: r.get(at + 2)?,
         retention_until: r.get(at + 3)?,
+        chain_deleted_at: r.get(at + 4)?,
     })
 }
 
@@ -292,6 +294,25 @@ impl ServerStore for SqliteStore {
             )
             .map_err(db)?;
         Ok(())
+    }
+
+    fn user_purge(&self, user_id: &str, at: i64) -> StoreResult<()> {
+        let mut c = self.conn();
+        let tx = c.transaction().map_err(db)?;
+        for sql in [
+            "DELETE FROM user_keystore WHERE user_id = ?1",
+            "DELETE FROM user_pats WHERE user_id = ?1",
+            "DELETE FROM sessions WHERE user_id = ?1",
+            "DELETE FROM api_keys WHERE user_id = ?1",
+        ] {
+            tx.execute(sql, [user_id]).map_err(db)?;
+        }
+        tx.execute(
+            "UPDATE users SET data_key_wrapped = '', chain_deleted_at = ?2 WHERE user_id = ?1",
+            params![user_id, at],
+        )
+        .map_err(db)?;
+        tx.commit().map_err(db)
     }
 
     fn user_deactivate(

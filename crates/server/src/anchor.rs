@@ -166,6 +166,11 @@ impl AnchorWriter {
         self.closed_rows(closed)
     }
 
+    /// Retention (M13 T8): a deleted chain is never re-anchored.
+    pub fn forget_user(&self, user_id: &str) {
+        self.anchored().remove(user_id);
+    }
+
     /// After a restore (M13 T6): what was anchored before belongs to the replaced stores.
     pub fn forget_anchored(&self) {
         self.anchored().clear();

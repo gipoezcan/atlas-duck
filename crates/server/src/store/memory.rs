@@ -100,6 +100,22 @@ impl ServerStore for MemoryStore {
         Ok(())
     }
 
+    fn user_purge(&self, user_id: &str, at: i64) -> StoreResult<()> {
+        let mut g = self.lock();
+        g.keystore.retain(|(u, _), _| u != user_id);
+        g.pats.retain(|(u, _), _| u != user_id);
+        g.sessions.retain(|_, s| s.user_id != user_id);
+        g.keys.retain(|_, k| k.user_id != user_id);
+        if let Some(u) = g.users.get_mut(user_id) {
+            u.data_key_wrapped.clear();
+            g.states
+                .entry(user_id.to_owned())
+                .or_default()
+                .chain_deleted_at = Some(at);
+        }
+        Ok(())
+    }
+
     fn user_deactivate(
         &self,
         user_id: &str,

@@ -405,6 +405,7 @@ fn user_state_deactivation_sessions_and_key_revocation() {
             deactivated_by: Some("admin".into()),
             last_login_at: Some(50),
             retention_until: Some(70),
+            chain_deleted_at: None,
         };
         assert_eq!(s.user_state(A).unwrap(), Some(want.clone()), "{name}");
         // The login's upsert never clears the lifecycle columns.

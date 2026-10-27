@@ -535,6 +535,13 @@ impl Registry {
         heads
     }
 
+    /// Closes one user's runtime if it is open (retention, M13 T8); answers its last head.
+    pub async fn close_user(&self, user_id: &str) -> Option<Head> {
+        let rt = self.open.lock().await.remove(user_id)?;
+        rt.close().await;
+        Some(rt.head())
+    }
+
     pub fn resume(&self) {
         self.quiesced.store(false, Ordering::SeqCst);
     }

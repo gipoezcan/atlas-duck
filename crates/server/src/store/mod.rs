@@ -51,6 +51,8 @@ pub struct UserState {
     pub last_login_at: Option<i64>,
     /// When retention may delete the user's chain (deactivation time + the retention period).
     pub retention_until: Option<i64>,
+    /// When retention deleted the user's chain (M13 T8); the row stays so the user stays refused.
+    pub chain_deleted_at: Option<i64>,
 }
 
 /// A stored PAT (PD-211), sealed with the user's data key.
@@ -179,6 +181,9 @@ pub trait ServerStore: Send + Sync {
     fn users_all(&self) -> StoreResult<Vec<(UserRecord, UserState)>>;
     fn user_state(&self, user_id: &str) -> StoreResult<Option<UserState>>;
     fn user_set_last_login(&self, user_id: &str, at: i64) -> StoreResult<()>;
+    /// Retention (M13 T8), one transaction: the user's keystore entries, PATs, sessions and API
+    /// keys go, the wrapped data key is wiped and `chain_deleted_at` set. The row stays.
+    fn user_purge(&self, user_id: &str, at: i64) -> StoreResult<()>;
     /// Marks the user deactivated unless it already is; answers whether this call did it.
     fn user_deactivate(
         &self,

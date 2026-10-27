@@ -53,7 +53,7 @@ pub struct UserView {
     pub display_name: Option<String>,
     pub roles: Vec<String>,
     pub last_login_at: Option<String>,
-    /// `active` or `deactivated`.
+    /// `active`, `deactivated` or `deleted` (retention removed the chain).
     pub state: &'static str,
     pub deactivated_at: Option<String>,
     pub deactivated_by: Option<String>,
@@ -68,7 +68,9 @@ pub fn list(ctx: &AdminCtx) -> Result<Value, &'static str> {
             display_name: u.display_name,
             roles: u.roles,
             last_login_at: s.last_login_at.map(rfc3339),
-            state: if s.deactivated_at.is_some() {
+            state: if s.chain_deleted_at.is_some() {
+                "deleted"
+            } else if s.deactivated_at.is_some() {
                 "deactivated"
             } else {
                 "active"

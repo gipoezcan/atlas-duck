@@ -10,7 +10,8 @@ use std::io::Write;
 use serde_json::{Map, Value};
 
 use super::{
-    AliasArg, DirArg, InstanceArgs, KeyFileArg, NoArgs, Request, Response, SwitchArg, UsernameArg,
+    AliasArg, DirArg, DryRunArg, InstanceArgs, KeyFileArg, NoArgs, Request, Response, SwitchArg,
+    UsernameArg,
 };
 use crate::cli::{EXIT_OK, EXIT_RUNTIME, EXIT_USAGE};
 use crate::config::{ADMIN_SOCKET, DEFAULT_ADMIN_SOCKET};
@@ -27,6 +28,8 @@ pub const USAGE: &str = "usage: atlas-duck-server admin <command>
   backup <dir>          (under <data>/backups or the temp directory)
   restore <bundle-dir>  (maintenance on first)
   rotate-master-key --new-key-file <path>
+  retention run [--dry-run]
+  anchor verify
 ";
 
 /// What argv asks for.
@@ -67,6 +70,13 @@ pub fn parse(args: &[String]) -> Option<Parsed> {
                 new_key_file: (*path).to_owned(),
             })))
         }
+        ["retention", "run"] => Some(Parsed::Run(Request::RetentionRun(DryRunArg {
+            dry_run: false,
+        }))),
+        ["retention", "run", "--dry-run"] => Some(Parsed::Run(Request::RetentionRun(DryRunArg {
+            dry_run: true,
+        }))),
+        ["anchor", "verify"] => Some(Parsed::Run(Request::AnchorVerify(NoArgs {}))),
         _ => None,
     }
 }
@@ -126,6 +136,9 @@ pub fn finish(resp: &Response) -> u8 {
         }
         EXIT_OK
     } else {
+        if let Some(d) = &resp.data {
+            print_data(&mut std::io::stdout(), d);
+        }
         error_line(resp.error.as_deref().unwrap_or("admin/failed"));
         EXIT_RUNTIME
     }
