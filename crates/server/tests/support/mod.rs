@@ -119,6 +119,7 @@ impl TestServer {
                 clock: clock.clone(),
                 allow_http: true,
                 sse_capacity: SSE_CAPACITY,
+                scripts: None,
             },
             50,
         ));
