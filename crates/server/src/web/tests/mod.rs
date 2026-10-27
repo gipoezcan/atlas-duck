@@ -1651,3 +1651,95 @@ fn every_route_row_has_a_handler_and_bearer_rows_are_mcp() {
         );
     }
 }
+
+/// M13 T2 (A-13): SIGTERM with an open runtime and an open SSE stream still finishes inside
+/// the chart's 30 s grace period: connections drain at most `DRAIN`, then the runtimes close and
+/// `SERVER_STOP` is appended.
+#[tokio::test(start_paused = true)]
+async fn shutdown_completes_within_25s() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let h = H::new();
+    let (cookie, _) = h.session("alice", PW_CANARY).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let writer = Arc::new(crate::anchor::AnchorWriter::new(
+        h.store.clone(),
+        h.registry.clone(),
+        h.clock.clone(),
+    ));
+    writer.start(&json!({})).unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let state = h.state.clone();
+    let w = writer.clone();
+    let server = tokio::spawn(async move {
+        crate::app::serve_until(
+            listener,
+            state,
+            &w,
+            async move {
+                let _ = stop_rx.await;
+            },
+            crate::app::DRAIN,
+        )
+        .await
+    });
+
+    let mut sse = tokio::net::TcpStream::connect(addr).await.unwrap();
+    sse.write_all(
+        format!(
+            "GET /api/events HTTP/1.1\r\nHost: duck.example.test\r\nCookie: __Host-atlas_duck_session={cookie}\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut head = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !contains(&head, b"\r\n\r\n") {
+        let n = tokio::time::timeout(LIMIT, sse.read(&mut buf))
+            .await
+            .expect("no SSE answer")
+            .unwrap();
+        assert!(n > 0, "SSE connection closed early");
+        head.extend_from_slice(&buf[..n]);
+    }
+    assert!(
+        head.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&head)
+    );
+    assert_eq!(
+        h.registry.open_runtimes().await.len(),
+        1,
+        "the stream pins a runtime"
+    );
+
+    let started = tokio::time::Instant::now();
+    stop_tx.send(()).unwrap();
+    let served = tokio::time::timeout(Duration::from_secs(25), server)
+        .await
+        .expect("shutdown took longer than 25 s")
+        .unwrap();
+    assert!(served.is_ok());
+    assert!(started.elapsed() <= Duration::from_secs(25));
+    assert!(h.registry.open_runtimes().await.is_empty());
+    let kinds: Vec<String> = h
+        .store
+        .anchor_all()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.kind)
+        .collect();
+    assert_eq!(
+        kinds.last().map(String::as_str),
+        Some(crate::anchor::KIND_SERVER_STOP)
+    );
+    assert!(
+        kinds
+            .iter()
+            .any(|k| k == crate::anchor::KIND_RUNTIME_CLOSED),
+        "{kinds:?}"
+    );
+    drop(sse);
+}

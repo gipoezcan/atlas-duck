@@ -39,6 +39,13 @@ RUN cargo build --release --locked -p atlas-duck-server \
  && strip target/release/atlas-duck-server
 
 FROM gcr.io/distroless/cc-debian12:nonroot
+# M13 T2: the commit only (CI passes $CI_COMMIT_SHA, never a secret; SM-9.1).
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.title="atlas-duck-server" \
+      org.opencontainers.image.source="https://gitlab.intern.gipmbh.de/gip/teams/g-dux/atlas-duck" \
+      org.opencontainers.image.revision="${GIT_SHA}"
+# Writable at run time (read-only root, M13 A-9): ATLAS_DUCK_DATA_DIR, /tmp (instance config
+# files, instances.rs) and /run/atlas-duck (admin socket); the chart mounts all three.
 COPY --from=build /src/target/release/atlas-duck-server /app/atlas-duck-server
 COPY --from=ui /src/app/ui/dist-server/ /app/web/
 USER 65532:65532

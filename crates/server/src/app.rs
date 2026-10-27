@@ -2,8 +2,10 @@
 //! directory → registry → anchor rows → listen; on SIGTERM / Ctrl-C stop accepting, close every
 //! runtime (`APP_STOP` in each chain), append `SERVER_STOP`, exit 0.
 
+use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use atlas_duck_audit::lock::InstanceLock;
 use atlas_duck_ipc::paths::{DataDirResolution, check_data_dir};
@@ -164,18 +166,9 @@ async fn run(config: Config) -> u8 {
         return fail("listen_failed");
     };
     tracing::info!(event = "listening", addr = %config.listen);
-    let served = axum::serve(
-        listener,
-        router(state).into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await;
+    let served = serve_until(listener, state, &writer, shutdown_signal(), DRAIN).await;
     sweeper.abort();
     anchor_timer.abort();
-    // Final heads (RUNTIME_CLOSED per runtime, after its APP_STOP) and SERVER_STOP.
-    if writer.shutdown().await.is_err() {
-        tracing::error!(event = "anchor_append_failed", kind = "SERVER_STOP");
-    }
     match served {
         Ok(()) => {
             tracing::info!(event = "stopped");
@@ -183,6 +176,50 @@ async fn run(config: Config) -> u8 {
         }
         Err(_) => fail("serve_failed"),
     }
+}
+
+/// How long open connections may drain after the shutdown signal. SSE streams never end on their
+/// own, so the wait is bounded: drain plus closing the runtimes stays inside the chart's 30 s
+/// `terminationGracePeriodSeconds` (M13 A-13).
+pub const DRAIN: Duration = Duration::from_secs(10);
+
+/// Serves `state` on `listener` until `signal`, lets connections drain for at most `drain`, then
+/// closes every runtime and appends the final heads and `SERVER_STOP`.
+pub async fn serve_until(
+    listener: tokio::net::TcpListener,
+    state: AppState,
+    writer: &AnchorWriter,
+    signal: impl Future<Output = ()> + Send + 'static,
+    drain: Duration,
+) -> std::io::Result<()> {
+    let (fired_tx, fired_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve = axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        signal.await;
+        let _ = fired_tx.send(());
+    });
+    let drained = async move {
+        if fired_rx.await.is_ok() {
+            tokio::time::sleep(drain).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    let served = tokio::select! {
+        r = serve.into_future() => r,
+        () = drained => {
+            tracing::warn!(event = "shutdown_drain_elapsed");
+            Ok(())
+        }
+    };
+    // Final heads (RUNTIME_CLOSED per runtime, after its APP_STOP) and SERVER_STOP.
+    if writer.shutdown().await.is_err() {
+        tracing::error!(event = "anchor_append_failed", kind = "SERVER_STOP");
+    }
+    served
 }
 
 async fn shutdown_signal() {
