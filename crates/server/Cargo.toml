@@ -15,8 +15,9 @@ name = "atlas-duck-server"
 path = "src/main.rs"
 
 [features]
-# In-memory store and test constructors for tests of code above the store. Never a release build.
-testing = []
+# In-memory store and test constructors for tests of code above the store, and core's test hooks
+# (plain-HTTP mock instances) for the in-process integration tests. Never a release build.
+testing = ["atlas-duck-core/testing", "atlas-duck-atlassian/testing"]
 
 [dependencies]
 atlas-duck-core = { path = "../core" }

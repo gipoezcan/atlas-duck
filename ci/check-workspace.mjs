@@ -77,6 +77,8 @@ export const TEST_FEATURE_FORWARDERS = [
   "atlas-duck-app/scripted-approver",
   "atlas-duck-core/testing",
   "atlas-duck-atlassian/testing",
+  // M12 T23: the integration tests run user runtimes against plain-HTTP mocks (core's hooks).
+  "atlas-duck-server/testing",
 ];
 
 // The registry stays a plain data crate: its normal dependencies are these and nothing else.

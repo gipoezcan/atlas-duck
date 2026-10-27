@@ -450,7 +450,7 @@ fn write_config(path: &Path, deps: &RuntimeDeps) -> Result<(), RuntimeError> {
         .map_err(|e| RuntimeError::Store(e.to_string()))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 async fn start_core(deps: CoreDeps, store: &Store, allow_http: bool) -> Result<Core, String> {
     use atlas_duck_core::audit_port::AuditPort;
     let port: Arc<dyn AuditPort> = Arc::new(store.clone());
@@ -464,7 +464,7 @@ async fn start_core(deps: CoreDeps, store: &Store, allow_http: bool) -> Result<C
         .map_err(|e| e.to_string())
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "testing")))]
 async fn start_core(deps: CoreDeps, _store: &Store, _allow_http: bool) -> Result<Core, String> {
     Core::start(deps).await.map_err(|e| e.to_string())
 }

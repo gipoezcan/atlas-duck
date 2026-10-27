@@ -1595,3 +1595,38 @@ async fn api_keys_over_http_create_once_list_revoke_and_record() {
         (StatusCode::BAD_REQUEST, "api_key/scope_invalid")
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_listed_route_is_routed() {
+    // T23: the isolation suite walks `ROUTES`; each entry must be a route the router serves
+    // with that method (not the 404 fallback, not 405).
+    let h = H::new();
+    for (method, path, _) in super::ROUTES {
+        let concrete = path
+            .replace("{name}", "x.js")
+            .replace("{alias}", "work")
+            .replace("{command}", "queue_list")
+            .replace("{id}", "key_x");
+        let req = Request::builder()
+            .method(*method)
+            .uri(&concrete)
+            .header(header::HOST, "duck.example.test")
+            .body(Body::empty())
+            .unwrap();
+        let res = h.send(req).await;
+        assert_ne!(
+            res.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {path}"
+        );
+        if res.status() == StatusCode::NOT_FOUND {
+            let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains("api/not_found"),
+                "{method} {path} fell through to the fallback"
+            );
+        }
+    }
+}

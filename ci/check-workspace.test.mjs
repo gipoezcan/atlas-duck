@@ -759,6 +759,7 @@ test("the forwarder list and the M4 test-only features", () => {
     "atlas-duck-app/scripted-approver",
     "atlas-duck-core/testing",
     "atlas-duck-atlassian/testing",
+    "atlas-duck-server/testing",
   ]);
 });
 

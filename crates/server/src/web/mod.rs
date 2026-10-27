@@ -57,6 +57,43 @@ impl std::ops::Deref for AppState {
     }
 }
 
+/// Who may call a route (the isolation suite's route-table scan, T23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    Public,
+    /// A session; the answer is the session user's own data only.
+    Session,
+    /// A session with role `admin`; the answer carries no user data (SM-2.5).
+    Admin,
+    /// A bearer API key; the answer is the key owner's own data only.
+    Bearer,
+}
+
+/// Every route [`router`] serves, `(method, path, access)`; `web::tests` pins that each is
+/// routed, and the isolation suite walks it. Static pages are [`static_files::PAGES`].
+pub const ROUTES: &[(&str, &str, Access)] = &[
+    ("GET", "/healthz", Access::Public),
+    ("GET", "/readyz", Access::Public),
+    ("GET", "/assets/{name}", Access::Public),
+    ("POST", "/api/login", Access::Public),
+    ("POST", "/api/logout", Access::Session),
+    ("GET", "/api/session", Access::Session),
+    ("GET", "/api/admin/instances", Access::Admin),
+    ("POST", "/api/admin/instances", Access::Admin),
+    ("DELETE", "/api/admin/instances/{alias}", Access::Admin),
+    ("POST", "/api/cmd/{command}", Access::Session),
+    ("GET", "/api/events", Access::Session),
+    ("GET", "/api/instances", Access::Session),
+    ("PUT", "/api/me/pats/{alias}", Access::Session),
+    ("DELETE", "/api/me/pats/{alias}", Access::Session),
+    ("GET", "/api/me/api-keys", Access::Session),
+    ("POST", "/api/me/api-keys", Access::Session),
+    ("DELETE", "/api/me/api-keys/{id}", Access::Session),
+    ("POST", "/mcp", Access::Bearer),
+    ("GET", "/mcp", Access::Bearer),
+    ("DELETE", "/mcp", Access::Bearer),
+];
+
 /// Every route group: health, static pages and assets, auth, commands and SSE, PATs, API keys,
 /// admin instances and `/mcp` (bearer only, its own guard). An unrouted path is 404.
 pub fn router(state: AppState) -> Router {
