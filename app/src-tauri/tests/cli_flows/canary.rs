@@ -54,6 +54,8 @@ use crate::harness::{
 const INSTANCES: [&str; 3] = ["jira-a", "jira-b", "jira-c"];
 /// Every wait of the sweep is bounded by this.
 const WAIT: Duration = Duration::from_secs(60);
+/// `ERROR_SHARING_VIOLATION`: a file another process holds open without read sharing.
+const SHARING_VIOLATION: i32 = 32;
 const MYSELF: &str = "/rest/api/2/myself";
 
 /// The §10.2 allowlist (shared with the spec): the audit sources whose bytes may reach the agent
@@ -131,19 +133,49 @@ fn files_below(dir: &Path) -> Vec<PathBuf> {
 /// Reads each listed file. A file that disappeared between the listing and the read (Windows:
 /// WebView2 helper processes outlive the app for a moment and remove their own lock and temp
 /// files under `<data>/webview`) is skipped and named on stdout; it holds nothing to sweep any
-/// more. Any other error names the file.
-fn capture_files(out: &mut Vec<Captured>, what: &str, files: &[PathBuf]) -> Result<()> {
+/// more. A file still open without read sharing by such a helper (Windows sharing violation,
+/// os error 32, e.g. a `.tmp` under `EBWebView/Default`) is retried until the helper lets go or
+/// removes it, within `WAIT`; it is never skipped unread. Any other error names the file.
+async fn capture_files(out: &mut Vec<Captured>, what: &str, files: &[PathBuf]) -> Result<()> {
     for f in files {
-        let bytes = match fs::read(f) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                println!(
-                    "canary sweep: {what} {} vanished before it was read",
-                    f.display()
-                );
-                continue;
+        let start = Instant::now();
+        let mut busy = 0u32;
+        let bytes = loop {
+            match fs::read(f) {
+                Ok(b) => break Some(b),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break None,
+                Err(e)
+                    if cfg!(windows)
+                        && e.raw_os_error() == Some(SHARING_VIOLATION)
+                        && start.elapsed() < WAIT =>
+                {
+                    busy += 1;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => {
+                    let msg = format!(
+                        "{what} {}: {e} (after {busy} sharing-violation retries over {:?})",
+                        f.display(),
+                        start.elapsed()
+                    );
+                    eprintln!("canary sweep: {msg}");
+                    return Err(msg.into());
+                }
             }
-            Err(e) => return Err(format!("{what} {}: {e}", f.display()).into()),
+        };
+        if busy > 0 {
+            println!(
+                "canary sweep: {what} {} was held by another process for {:?} ({busy} retries)",
+                f.display(),
+                start.elapsed()
+            );
+        }
+        let Some(bytes) = bytes else {
+            println!(
+                "canary sweep: {what} {} vanished before it was read",
+                f.display()
+            );
+            continue;
         };
         out.push(Captured {
             name: format!("{what} {}", f.display()),
@@ -582,17 +614,19 @@ async fn s16_canary_sweep_process_channels() -> Result<()> {
         "the test build wrote no stderr file: {}",
         world.diagnostics()
     );
-    capture_files(&mut cap, "app stderr", &[stderr_file])?;
+    capture_files(&mut cap, "app stderr", &[stderr_file]).await?;
     capture_files(
         &mut cap,
         "diagnostic log",
         &files_below(&world.data_dir().join(LOG_DIR_NAME)),
-    )?;
+    )
+    .await?;
     capture_files(
         &mut cap,
         "webview",
         &files_below(&world.data_dir().join(WEBVIEW_DIR_NAME)),
-    )?;
+    )
+    .await?;
     let records = world
         .audit_records()
         .map_err(|e| format!("audit_records: {e}"))?;
