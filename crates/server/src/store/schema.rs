@@ -85,3 +85,79 @@ CREATE TRIGGER anchor_heads_no_update BEFORE UPDATE ON anchor_heads
 CREATE TRIGGER anchor_heads_no_delete BEFORE DELETE ON anchor_heads
     BEGIN SELECT RAISE(ABORT, 'anchor_heads is append-only'); END;
 "#;
+
+/// The tables M14 adds (OAuth, export jobs; plan T3). Applied at open, in one transaction, when
+/// `oauth_clients` is absent. Decision (M14 T1): no `user_version` bump here, because schema v2 is
+/// M13's; when M13's migration path merges, this becomes its v2 → v3 step.
+pub const M14_TABLES: &str = r#"
+CREATE TABLE oauth_clients (
+    client_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    redirect_uris TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    source_ip_hash TEXT NOT NULL
+);
+CREATE TABLE oauth_consent_requests (
+    id_hash BLOB PRIMARY KEY,
+    session_hash BLOB NOT NULL,
+    user_id TEXT NOT NULL,
+    client_id TEXT NOT NULL,
+    redirect_uri TEXT NOT NULL,
+    scopes TEXT NOT NULL,
+    code_challenge TEXT NOT NULL,
+    state TEXT NOT NULL,
+    resource TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+CREATE TABLE oauth_grants (
+    grant_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    client_id TEXT NOT NULL,
+    scopes TEXT NOT NULL,
+    resource TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    last_used_at INTEGER,
+    revoked_at INTEGER,
+    revoke_reason TEXT
+);
+CREATE INDEX oauth_grants_user ON oauth_grants(user_id);
+CREATE INDEX oauth_grants_client ON oauth_grants(client_id);
+CREATE TABLE oauth_codes (
+    hash BLOB PRIMARY KEY,
+    grant_id TEXT NOT NULL,
+    client_id TEXT NOT NULL,
+    redirect_uri TEXT NOT NULL,
+    code_challenge TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    redeemed_at INTEGER
+);
+CREATE INDEX oauth_codes_grant ON oauth_codes(grant_id);
+CREATE TABLE oauth_access (
+    hash BLOB PRIMARY KEY,
+    grant_id TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+CREATE INDEX oauth_access_grant ON oauth_access(grant_id);
+CREATE TABLE oauth_refresh (
+    hash BLOB PRIMARY KEY,
+    grant_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    last_used_at INTEGER NOT NULL,
+    rotated_at INTEGER
+);
+CREATE INDEX oauth_refresh_grant ON oauth_refresh(grant_id);
+CREATE TABLE export_jobs (
+    job_id TEXT PRIMARY KEY,
+    requester_user_id TEXT NOT NULL,
+    target_user_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    manifest_sha256 TEXT,
+    size INTEGER,
+    file_name TEXT
+);
+CREATE INDEX export_jobs_requester ON export_jobs(requester_user_id);
+"#;

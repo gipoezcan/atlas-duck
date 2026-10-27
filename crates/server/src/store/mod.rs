@@ -120,6 +120,167 @@ pub struct AnchorHead {
     pub record_hash: [u8; 32],
 }
 
+/// A dynamically registered OAuth public client (M14 PD-240).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthClientRecord {
+    pub client_id: String,
+    pub name: String,
+    pub redirect_uris: Vec<String>,
+    pub created_at: i64,
+    /// Hex SHA-256 of the registering client IP (never the IP itself).
+    pub source_ip_hash: String,
+}
+
+/// A pending authorization request awaiting consent (PD-241): bound to the hash of the session
+/// that made it; its id is stored hashed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConsentRequestRecord {
+    pub id_hash: [u8; 32],
+    pub session_hash: [u8; 32],
+    pub user_id: String,
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub scopes: Vec<String>,
+    pub code_challenge: String,
+    pub state: String,
+    pub resource: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+impl fmt::Debug for ConsentRequestRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConsentRequestRecord")
+            .field("user_id", &self.user_id)
+            .field("client_id", &self.client_id)
+            .field("scopes", &self.scopes)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// An OAuth grant (PD-236): the family of every token issued under one consent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantRecord {
+    pub grant_id: String,
+    pub user_id: String,
+    pub client_id: String,
+    pub scopes: Vec<String>,
+    pub resource: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub last_used_at: Option<i64>,
+    pub revoked_at: Option<i64>,
+    pub revoke_reason: Option<String>,
+}
+
+impl GrantRecord {
+    /// Neither revoked nor past its absolute expiry at `now`.
+    pub fn live(&self, now: i64) -> bool {
+        self.revoked_at.is_none() && now < self.expires_at
+    }
+}
+
+/// An authorization code, stored by hash (PD-235); single use.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CodeRecord {
+    pub hash: [u8; 32],
+    pub grant_id: String,
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub code_challenge: String,
+    pub expires_at: i64,
+    pub redeemed_at: Option<i64>,
+}
+
+impl fmt::Debug for CodeRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CodeRecord")
+            .field("grant_id", &self.grant_id)
+            .field("expires_at", &self.expires_at)
+            .field("redeemed_at", &self.redeemed_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// An access token, stored by hash.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AccessRecord {
+    pub hash: [u8; 32],
+    pub grant_id: String,
+    pub expires_at: i64,
+}
+
+impl fmt::Debug for AccessRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AccessRecord")
+            .field("grant_id", &self.grant_id)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A refresh token, stored by hash; `rotated_at` once it was exchanged (PD-236).
+#[derive(Clone, PartialEq, Eq)]
+pub struct RefreshRecord {
+    pub hash: [u8; 32],
+    pub grant_id: String,
+    pub created_at: i64,
+    pub last_used_at: i64,
+    pub rotated_at: Option<i64>,
+}
+
+impl fmt::Debug for RefreshRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RefreshRecord")
+            .field("grant_id", &self.grant_id)
+            .field("rotated_at", &self.rotated_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a code was not redeemed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Redeem {
+    Unknown,
+    /// Past its expiry; the code is burned.
+    Expired,
+    /// Redeemed before: the grant it belongs to (reuse detection, PD-236).
+    Reused(String),
+    Store(StoreError),
+}
+
+/// Why a refresh token was not rotated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rotate {
+    Unknown,
+    /// Idle too long, or its grant is revoked or past its absolute expiry.
+    Expired,
+    /// Rotated before: the grant it belongs to (reuse detection, PD-236).
+    Reused(String),
+    Store(StoreError),
+}
+
+/// A server-side export job (PD-254).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportJobRecord {
+    pub job_id: String,
+    pub requester_user_id: String,
+    pub target_user_id: String,
+    /// `running`, `done`, `failed`, `downloaded`.
+    pub state: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub manifest_sha256: Option<String>,
+    pub size: Option<u64>,
+    pub file_name: Option<String>,
+}
+
+/// PD-240: a client without a grant this long after registration is purged.
+pub const CLIENT_UNUSED_SECS: i64 = 24 * 3600;
+/// PD-240: a client whose last grant ended this long ago is purged.
+pub const CLIENT_ENDED_SECS: i64 = 30 * 24 * 3600;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreError {
     /// The database file has a newer schema (`store/newer`).
@@ -218,4 +379,75 @@ pub trait ServerStore: Send + Sync {
         chain_id: &str,
         upto_seq: u64,
     ) -> StoreResult<Vec<(u64, AnchorHead)>>;
+
+    // ---- OAuth clients (M14 PD-240) ----
+    /// `Duplicate` when the id exists.
+    fn oauth_client_insert(&self, c: &OAuthClientRecord) -> StoreResult<()>;
+    fn oauth_client_get(&self, client_id: &str) -> StoreResult<Option<OAuthClientRecord>>;
+    fn oauth_client_count(&self) -> StoreResult<u64>;
+    /// Removes stale clients ([`CLIENT_UNUSED_SECS`], [`CLIENT_ENDED_SECS`]) with their ended
+    /// grants and those grants' tokens, expired consent requests, codes and access tokens, and
+    /// refresh tokens of ended grants; answers how many clients went.
+    fn oauth_purge(&self, now: i64) -> StoreResult<u64>;
+
+    // ---- consent requests (PD-241) ----
+    fn consent_put(&self, r: &ConsentRequestRecord) -> StoreResult<()>;
+    /// The request if it exists and was made by this session (it stays).
+    fn consent_get(
+        &self,
+        id_hash: &[u8; 32],
+        session_hash: &[u8; 32],
+    ) -> StoreResult<Option<ConsentRequestRecord>>;
+    /// Removes and answers the request if it was made by this session; another session's
+    /// attempt leaves it in place.
+    fn consent_take(
+        &self,
+        id_hash: &[u8; 32],
+        session_hash: &[u8; 32],
+    ) -> StoreResult<Option<ConsentRequestRecord>>;
+
+    // ---- grants (PD-236) ----
+    fn grant_insert(&self, g: &GrantRecord) -> StoreResult<()>;
+    fn grant_get(&self, grant_id: &str) -> StoreResult<Option<GrantRecord>>;
+    /// The user's grants, newest first.
+    fn grant_list(&self, user_id: &str) -> StoreResult<Vec<GrantRecord>>;
+    /// Marks the grant revoked; false when it already was (or does not exist).
+    fn grant_revoke(&self, grant_id: &str, reason: &str, at: i64) -> StoreResult<bool>;
+    /// Revokes every unrevoked grant of the user; answers the grants it revoked.
+    fn grant_revoke_all(
+        &self,
+        user_id: &str,
+        reason: &str,
+        at: i64,
+    ) -> StoreResult<Vec<GrantRecord>>;
+    fn grant_touch(&self, grant_id: &str, at: i64) -> StoreResult<()>;
+
+    // ---- codes and tokens (PD-235) ----
+    fn code_insert(&self, c: &CodeRecord) -> StoreResult<()>;
+    /// Check-and-set in one transaction: the code and its grant, the code marked redeemed.
+    fn code_redeem(&self, hash: &[u8; 32], now: i64) -> Result<(CodeRecord, GrantRecord), Redeem>;
+    fn access_insert(&self, a: &AccessRecord) -> StoreResult<()>;
+    fn access_get(&self, hash: &[u8; 32]) -> StoreResult<Option<AccessRecord>>;
+    fn refresh_insert(&self, r: &RefreshRecord) -> StoreResult<()>;
+    /// Check-and-set in one transaction: marks `hash` rotated and inserts `new` in the same
+    /// grant; refuses a token idle `idle_secs` or longer, or whose grant is not live.
+    fn refresh_rotate(
+        &self,
+        hash: &[u8; 32],
+        new: &RefreshRecord,
+        now: i64,
+        idle_secs: i64,
+    ) -> Result<GrantRecord, Rotate>;
+    /// The grant a refresh token belongs to (revocation endpoint).
+    fn refresh_grant(&self, hash: &[u8; 32]) -> StoreResult<Option<String>>;
+
+    // ---- export jobs (PD-254) ----
+    fn export_job_insert(&self, j: &ExportJobRecord) -> StoreResult<()>;
+    fn export_job_get(&self, job_id: &str) -> StoreResult<Option<ExportJobRecord>>;
+    fn export_job_update(&self, j: &ExportJobRecord) -> StoreResult<()>;
+    /// Jobs in state `running`, server-wide.
+    fn export_jobs_running(&self) -> StoreResult<Vec<ExportJobRecord>>;
+    /// Jobs whose expiry is at or before `now`.
+    fn export_jobs_expired(&self, now: i64) -> StoreResult<Vec<ExportJobRecord>>;
+    fn export_job_delete(&self, job_id: &str) -> StoreResult<bool>;
 }

@@ -8,14 +8,37 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use super::schema::{SCHEMA_VERSION, V1};
+use super::schema::{M14_TABLES, SCHEMA_VERSION, V1};
 use super::{
-    AnchorHasher, AnchorHead, AnchorRow, ApiKeyRecord, InstanceRecord, PatRecord, Sealed,
+    AccessRecord, AnchorHasher, AnchorHead, AnchorRow, ApiKeyRecord, CLIENT_ENDED_SECS,
+    CLIENT_UNUSED_SECS, CodeRecord, ConsentRequestRecord, ExportJobRecord, GrantRecord,
+    InstanceRecord, OAuthClientRecord, PatRecord, Redeem, RefreshRecord, Rotate, Sealed,
     ServerStore, SessionRecord, StoreError, StoreResult, UserRecord,
 };
 
 pub struct SqliteStore {
     conn: Mutex<Connection>,
+}
+
+/// Applies an additive table set in one transaction when its first table (`oauth_clients`) is
+/// absent; a failure leaves the database as it was (M14 T3; becomes M13's v2 → v3 step).
+pub(crate) fn add_tables(conn: &Connection, sql: &str) -> StoreResult<()> {
+    let present: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'oauth_clients'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(db)?;
+    if present > 0 {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction().map_err(db)?;
+    tx.execute_batch(sql).map_err(|e| {
+        tracing::error!(event = "store_migration_failed", step = "m14_tables");
+        db(e)
+    })?;
+    tx.commit().map_err(db)
 }
 
 fn db(e: rusqlite::Error) -> StoreError {
@@ -86,6 +109,7 @@ impl SqliteStore {
                 .map_err(db)?;
             tx.commit().map_err(db)?;
         }
+        add_tables(&conn, M14_TABLES)?;
         Ok(SqliteStore {
             conn: Mutex::new(conn),
         })
@@ -649,4 +673,611 @@ impl ServerStore for SqliteStore {
                 .map_err(db)?,
         )
     }
+
+    fn oauth_client_insert(&self, c: &OAuthClientRecord) -> StoreResult<()> {
+        self.conn()
+            .execute(
+                &format!("INSERT INTO oauth_clients ({CLIENT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5)"),
+                params![
+                    c.client_id,
+                    c.name,
+                    json_list(&c.redirect_uris),
+                    c.created_at,
+                    c.source_ip_hash
+                ],
+            )
+            .map_err(db)?;
+        Ok(())
+    }
+
+    fn oauth_client_get(&self, client_id: &str) -> StoreResult<Option<OAuthClientRecord>> {
+        self.conn()
+            .query_row(
+                &format!("SELECT {CLIENT_COLS} FROM oauth_clients WHERE client_id = ?1"),
+                [client_id],
+                client_row,
+            )
+            .optional()
+            .map_err(db)
+    }
+
+    fn oauth_client_count(&self) -> StoreResult<u64> {
+        let n: i64 = self
+            .conn()
+            .query_row("SELECT COUNT(*) FROM oauth_clients", [], |r| r.get(0))
+            .map_err(db)?;
+        Ok(to_u64(n))
+    }
+
+    fn oauth_purge(&self, now: i64) -> StoreResult<u64> {
+        let mut c = self.conn();
+        let tx = c.transaction().map_err(db)?;
+        // A grant has ended when it is revoked or past its expiry; its end is the earlier.
+        let ended_end = "MIN(COALESCE(revoked_at, expires_at), expires_at)";
+        let stale: Vec<String> = {
+            let mut st = tx
+                .prepare(&format!(
+                    "SELECT client_id FROM oauth_clients c WHERE
+                       (NOT EXISTS (SELECT 1 FROM oauth_grants g WHERE g.client_id = c.client_id)
+                        AND c.created_at <= ?1)
+                    OR (EXISTS (SELECT 1 FROM oauth_grants g WHERE g.client_id = c.client_id)
+                        AND NOT EXISTS (SELECT 1 FROM oauth_grants g WHERE g.client_id = c.client_id
+                                        AND g.revoked_at IS NULL AND g.expires_at > ?3)
+                        AND (SELECT MAX({ended_end}) FROM oauth_grants g
+                             WHERE g.client_id = c.client_id) <= ?2)"
+                ))
+                .map_err(db)?;
+            collect(
+                st.query_map(
+                    params![now - CLIENT_UNUSED_SECS, now - CLIENT_ENDED_SECS, now],
+                    |r| r.get(0),
+                )
+                .map_err(db)?,
+            )?
+        };
+        for id in &stale {
+            for table in ["oauth_codes", "oauth_access", "oauth_refresh"] {
+                tx.execute(
+                    &format!(
+                        "DELETE FROM {table} WHERE grant_id IN
+                         (SELECT grant_id FROM oauth_grants WHERE client_id = ?1)"
+                    ),
+                    [id],
+                )
+                .map_err(db)?;
+            }
+            tx.execute("DELETE FROM oauth_grants WHERE client_id = ?1", [id])
+                .map_err(db)?;
+            tx.execute(
+                "DELETE FROM oauth_consent_requests WHERE client_id = ?1",
+                [id],
+            )
+            .map_err(db)?;
+            tx.execute("DELETE FROM oauth_clients WHERE client_id = ?1", [id])
+                .map_err(db)?;
+        }
+        tx.execute(
+            "DELETE FROM oauth_consent_requests WHERE expires_at <= ?1",
+            [now],
+        )
+        .map_err(db)?;
+        tx.execute("DELETE FROM oauth_codes WHERE expires_at <= ?1", [now])
+            .map_err(db)?;
+        tx.execute("DELETE FROM oauth_access WHERE expires_at <= ?1", [now])
+            .map_err(db)?;
+        tx.execute(
+            "DELETE FROM oauth_refresh WHERE grant_id IN (SELECT grant_id FROM oauth_grants
+             WHERE revoked_at IS NOT NULL OR expires_at <= ?1)",
+            [now],
+        )
+        .map_err(db)?;
+        tx.commit().map_err(db)?;
+        Ok(stale.len() as u64)
+    }
+
+    fn consent_put(&self, r: &ConsentRequestRecord) -> StoreResult<()> {
+        self.conn()
+            .execute(
+                &format!(
+                    "INSERT INTO oauth_consent_requests ({CONSENT_COLS})
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+                ),
+                params![
+                    r.id_hash.as_slice(),
+                    r.session_hash.as_slice(),
+                    r.user_id,
+                    r.client_id,
+                    r.redirect_uri,
+                    json_list(&r.scopes),
+                    r.code_challenge,
+                    r.state,
+                    r.resource,
+                    r.created_at,
+                    r.expires_at
+                ],
+            )
+            .map_err(db)?;
+        Ok(())
+    }
+
+    fn consent_get(
+        &self,
+        id_hash: &[u8; 32],
+        session_hash: &[u8; 32],
+    ) -> StoreResult<Option<ConsentRequestRecord>> {
+        self.conn()
+            .query_row(
+                &format!(
+                    "SELECT {CONSENT_COLS} FROM oauth_consent_requests
+                     WHERE id_hash = ?1 AND session_hash = ?2"
+                ),
+                [id_hash.as_slice(), session_hash.as_slice()],
+                consent_row,
+            )
+            .optional()
+            .map_err(db)
+    }
+
+    fn consent_take(
+        &self,
+        id_hash: &[u8; 32],
+        session_hash: &[u8; 32],
+    ) -> StoreResult<Option<ConsentRequestRecord>> {
+        let mut c = self.conn();
+        let tx = c.transaction().map_err(db)?;
+        let found = tx
+            .query_row(
+                &format!(
+                    "SELECT {CONSENT_COLS} FROM oauth_consent_requests
+                     WHERE id_hash = ?1 AND session_hash = ?2"
+                ),
+                [id_hash.as_slice(), session_hash.as_slice()],
+                consent_row,
+            )
+            .optional()
+            .map_err(db)?;
+        if found.is_some() {
+            tx.execute(
+                "DELETE FROM oauth_consent_requests WHERE id_hash = ?1",
+                [id_hash.as_slice()],
+            )
+            .map_err(db)?;
+        }
+        tx.commit().map_err(db)?;
+        Ok(found)
+    }
+
+    fn grant_insert(&self, g: &GrantRecord) -> StoreResult<()> {
+        self.conn()
+            .execute(
+                &format!(
+                    "INSERT INTO oauth_grants ({GRANT_COLS})
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+                ),
+                params![
+                    g.grant_id,
+                    g.user_id,
+                    g.client_id,
+                    json_list(&g.scopes),
+                    g.resource,
+                    g.created_at,
+                    g.expires_at,
+                    g.last_used_at,
+                    g.revoked_at,
+                    g.revoke_reason
+                ],
+            )
+            .map_err(db)?;
+        Ok(())
+    }
+
+    fn grant_get(&self, grant_id: &str) -> StoreResult<Option<GrantRecord>> {
+        grant_by_id(&self.conn(), grant_id)
+    }
+
+    fn grant_list(&self, user_id: &str) -> StoreResult<Vec<GrantRecord>> {
+        let c = self.conn();
+        let mut st = c
+            .prepare(&format!(
+                "SELECT {GRANT_COLS} FROM oauth_grants WHERE user_id = ?1
+                 ORDER BY created_at DESC, grant_id"
+            ))
+            .map_err(db)?;
+        collect(st.query_map([user_id], grant_row).map_err(db)?)
+    }
+
+    fn grant_revoke(&self, grant_id: &str, reason: &str, at: i64) -> StoreResult<bool> {
+        let n = self
+            .conn()
+            .execute(
+                "UPDATE oauth_grants SET revoked_at = ?3, revoke_reason = ?2
+                 WHERE grant_id = ?1 AND revoked_at IS NULL",
+                params![grant_id, reason, at],
+            )
+            .map_err(db)?;
+        Ok(n > 0)
+    }
+
+    fn grant_revoke_all(
+        &self,
+        user_id: &str,
+        reason: &str,
+        at: i64,
+    ) -> StoreResult<Vec<GrantRecord>> {
+        let mut c = self.conn();
+        let tx = c.transaction().map_err(db)?;
+        let live: Vec<GrantRecord> = {
+            let mut st = tx
+                .prepare(&format!(
+                    "SELECT {GRANT_COLS} FROM oauth_grants WHERE user_id = ?1 AND revoked_at IS NULL
+                     ORDER BY created_at, grant_id"
+                ))
+                .map_err(db)?;
+            collect(st.query_map([user_id], grant_row).map_err(db)?)?
+        };
+        tx.execute(
+            "UPDATE oauth_grants SET revoked_at = ?3, revoke_reason = ?2
+             WHERE user_id = ?1 AND revoked_at IS NULL",
+            params![user_id, reason, at],
+        )
+        .map_err(db)?;
+        tx.commit().map_err(db)?;
+        Ok(live
+            .into_iter()
+            .map(|mut g| {
+                g.revoked_at = Some(at);
+                g.revoke_reason = Some(reason.to_owned());
+                g
+            })
+            .collect())
+    }
+
+    fn grant_touch(&self, grant_id: &str, at: i64) -> StoreResult<()> {
+        self.conn()
+            .execute(
+                "UPDATE oauth_grants SET last_used_at = ?2 WHERE grant_id = ?1",
+                params![grant_id, at],
+            )
+            .map_err(db)?;
+        Ok(())
+    }
+
+    fn code_insert(&self, c: &CodeRecord) -> StoreResult<()> {
+        self.conn()
+            .execute(
+                &format!(
+                    "INSERT INTO oauth_codes ({CODE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                ),
+                params![
+                    c.hash.as_slice(),
+                    c.grant_id,
+                    c.client_id,
+                    c.redirect_uri,
+                    c.code_challenge,
+                    c.expires_at,
+                    c.redeemed_at
+                ],
+            )
+            .map_err(db)?;
+        Ok(())
+    }
+
+    fn code_redeem(&self, hash: &[u8; 32], now: i64) -> Result<(CodeRecord, GrantRecord), Redeem> {
+        let st = |e: rusqlite::Error| Redeem::Store(db(e));
+        let mut c = self.conn();
+        let tx = c.transaction().map_err(st)?;
+        let Some(code) = tx
+            .query_row(
+                &format!("SELECT {CODE_COLS} FROM oauth_codes WHERE hash = ?1"),
+                [hash.as_slice()],
+                code_row,
+            )
+            .optional()
+            .map_err(st)?
+        else {
+            return Err(Redeem::Unknown);
+        };
+        if code.redeemed_at.is_some() {
+            return Err(Redeem::Reused(code.grant_id));
+        }
+        // Expired or not, the code is used up now.
+        tx.execute(
+            "UPDATE oauth_codes SET redeemed_at = ?2 WHERE hash = ?1",
+            params![hash.as_slice(), now],
+        )
+        .map_err(st)?;
+        let grant = grant_by_id(&tx, &code.grant_id).map_err(Redeem::Store)?;
+        tx.commit().map_err(st)?;
+        if now >= code.expires_at {
+            return Err(Redeem::Expired);
+        }
+        let grant = grant.ok_or(Redeem::Unknown)?;
+        Ok((
+            CodeRecord {
+                redeemed_at: Some(now),
+                ..code
+            },
+            grant,
+        ))
+    }
+
+    fn access_insert(&self, a: &AccessRecord) -> StoreResult<()> {
+        self.conn()
+            .execute(
+                "INSERT INTO oauth_access (hash, grant_id, expires_at) VALUES (?1, ?2, ?3)",
+                params![a.hash.as_slice(), a.grant_id, a.expires_at],
+            )
+            .map_err(db)?;
+        Ok(())
+    }
+
+    fn access_get(&self, hash: &[u8; 32]) -> StoreResult<Option<AccessRecord>> {
+        self.conn()
+            .query_row(
+                "SELECT hash, grant_id, expires_at FROM oauth_access WHERE hash = ?1",
+                [hash.as_slice()],
+                |r| {
+                    Ok(AccessRecord {
+                        hash: hash32(r.get(0)?)?,
+                        grant_id: r.get(1)?,
+                        expires_at: r.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db)
+    }
+
+    fn refresh_insert(&self, r: &RefreshRecord) -> StoreResult<()> {
+        insert_refresh(&self.conn(), r)
+    }
+
+    fn refresh_rotate(
+        &self,
+        hash: &[u8; 32],
+        new: &RefreshRecord,
+        now: i64,
+        idle_secs: i64,
+    ) -> Result<GrantRecord, Rotate> {
+        let st = |e: rusqlite::Error| Rotate::Store(db(e));
+        let mut c = self.conn();
+        let tx = c.transaction().map_err(st)?;
+        let Some(old) = tx
+            .query_row(
+                &format!("SELECT {REFRESH_COLS} FROM oauth_refresh WHERE hash = ?1"),
+                [hash.as_slice()],
+                refresh_row,
+            )
+            .optional()
+            .map_err(st)?
+        else {
+            return Err(Rotate::Unknown);
+        };
+        if old.rotated_at.is_some() {
+            return Err(Rotate::Reused(old.grant_id));
+        }
+        let grant = grant_by_id(&tx, &old.grant_id)
+            .map_err(Rotate::Store)?
+            .ok_or(Rotate::Unknown)?;
+        if !grant.live(now) || now - old.last_used_at >= idle_secs || new.grant_id != grant.grant_id
+        {
+            return Err(Rotate::Expired);
+        }
+        tx.execute(
+            "UPDATE oauth_refresh SET rotated_at = ?2 WHERE hash = ?1",
+            params![hash.as_slice(), now],
+        )
+        .map_err(st)?;
+        insert_refresh(&tx, new).map_err(Rotate::Store)?;
+        tx.commit().map_err(st)?;
+        Ok(grant)
+    }
+
+    fn refresh_grant(&self, hash: &[u8; 32]) -> StoreResult<Option<String>> {
+        self.conn()
+            .query_row(
+                "SELECT grant_id FROM oauth_refresh WHERE hash = ?1",
+                [hash.as_slice()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db)
+    }
+
+    fn export_job_insert(&self, j: &ExportJobRecord) -> StoreResult<()> {
+        self.conn()
+            .execute(
+                &format!(
+                    "INSERT INTO export_jobs ({JOB_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+                ),
+                params![
+                    j.job_id,
+                    j.requester_user_id,
+                    j.target_user_id,
+                    j.state,
+                    j.created_at,
+                    j.expires_at,
+                    j.manifest_sha256,
+                    j.size.map(to_i64).transpose()?,
+                    j.file_name
+                ],
+            )
+            .map_err(db)?;
+        Ok(())
+    }
+
+    fn export_job_get(&self, job_id: &str) -> StoreResult<Option<ExportJobRecord>> {
+        self.conn()
+            .query_row(
+                &format!("SELECT {JOB_COLS} FROM export_jobs WHERE job_id = ?1"),
+                [job_id],
+                job_row,
+            )
+            .optional()
+            .map_err(db)
+    }
+
+    fn export_job_update(&self, j: &ExportJobRecord) -> StoreResult<()> {
+        self.conn()
+            .execute(
+                "UPDATE export_jobs SET state = ?2, expires_at = ?3, manifest_sha256 = ?4,
+                 size = ?5, file_name = ?6 WHERE job_id = ?1",
+                params![
+                    j.job_id,
+                    j.state,
+                    j.expires_at,
+                    j.manifest_sha256,
+                    j.size.map(to_i64).transpose()?,
+                    j.file_name
+                ],
+            )
+            .map_err(db)?;
+        Ok(())
+    }
+
+    fn export_jobs_running(&self) -> StoreResult<Vec<ExportJobRecord>> {
+        let c = self.conn();
+        let mut st = c
+            .prepare(&format!(
+                "SELECT {JOB_COLS} FROM export_jobs WHERE state = 'running' ORDER BY created_at"
+            ))
+            .map_err(db)?;
+        collect(st.query_map([], job_row).map_err(db)?)
+    }
+
+    fn export_jobs_expired(&self, now: i64) -> StoreResult<Vec<ExportJobRecord>> {
+        let c = self.conn();
+        let mut st = c
+            .prepare(&format!(
+                "SELECT {JOB_COLS} FROM export_jobs WHERE expires_at <= ?1 ORDER BY created_at"
+            ))
+            .map_err(db)?;
+        collect(st.query_map([now], job_row).map_err(db)?)
+    }
+
+    fn export_job_delete(&self, job_id: &str) -> StoreResult<bool> {
+        let n = self
+            .conn()
+            .execute("DELETE FROM export_jobs WHERE job_id = ?1", [job_id])
+            .map_err(db)?;
+        Ok(n > 0)
+    }
+}
+
+const CLIENT_COLS: &str = "client_id, name, redirect_uris, created_at, source_ip_hash";
+
+fn client_row(r: &Row<'_>) -> rusqlite::Result<OAuthClientRecord> {
+    Ok(OAuthClientRecord {
+        client_id: r.get(0)?,
+        name: r.get(1)?,
+        redirect_uris: parse_list(&r.get::<_, String>(2)?),
+        created_at: r.get(3)?,
+        source_ip_hash: r.get(4)?,
+    })
+}
+
+const CONSENT_COLS: &str = "id_hash, session_hash, user_id, client_id, redirect_uri, scopes, \
+     code_challenge, state, resource, created_at, expires_at";
+
+fn consent_row(r: &Row<'_>) -> rusqlite::Result<ConsentRequestRecord> {
+    Ok(ConsentRequestRecord {
+        id_hash: hash32(r.get(0)?)?,
+        session_hash: hash32(r.get(1)?)?,
+        user_id: r.get(2)?,
+        client_id: r.get(3)?,
+        redirect_uri: r.get(4)?,
+        scopes: parse_list(&r.get::<_, String>(5)?),
+        code_challenge: r.get(6)?,
+        state: r.get(7)?,
+        resource: r.get(8)?,
+        created_at: r.get(9)?,
+        expires_at: r.get(10)?,
+    })
+}
+
+const GRANT_COLS: &str = "grant_id, user_id, client_id, scopes, resource, created_at, expires_at, \
+     last_used_at, revoked_at, revoke_reason";
+
+fn grant_row(r: &Row<'_>) -> rusqlite::Result<GrantRecord> {
+    Ok(GrantRecord {
+        grant_id: r.get(0)?,
+        user_id: r.get(1)?,
+        client_id: r.get(2)?,
+        scopes: parse_list(&r.get::<_, String>(3)?),
+        resource: r.get(4)?,
+        created_at: r.get(5)?,
+        expires_at: r.get(6)?,
+        last_used_at: r.get(7)?,
+        revoked_at: r.get(8)?,
+        revoke_reason: r.get(9)?,
+    })
+}
+
+fn grant_by_id(c: &Connection, grant_id: &str) -> StoreResult<Option<GrantRecord>> {
+    c.query_row(
+        &format!("SELECT {GRANT_COLS} FROM oauth_grants WHERE grant_id = ?1"),
+        [grant_id],
+        grant_row,
+    )
+    .optional()
+    .map_err(db)
+}
+
+const CODE_COLS: &str =
+    "hash, grant_id, client_id, redirect_uri, code_challenge, expires_at, redeemed_at";
+
+fn code_row(r: &Row<'_>) -> rusqlite::Result<CodeRecord> {
+    Ok(CodeRecord {
+        hash: hash32(r.get(0)?)?,
+        grant_id: r.get(1)?,
+        client_id: r.get(2)?,
+        redirect_uri: r.get(3)?,
+        code_challenge: r.get(4)?,
+        expires_at: r.get(5)?,
+        redeemed_at: r.get(6)?,
+    })
+}
+
+const REFRESH_COLS: &str = "hash, grant_id, created_at, last_used_at, rotated_at";
+
+fn refresh_row(r: &Row<'_>) -> rusqlite::Result<RefreshRecord> {
+    Ok(RefreshRecord {
+        hash: hash32(r.get(0)?)?,
+        grant_id: r.get(1)?,
+        created_at: r.get(2)?,
+        last_used_at: r.get(3)?,
+        rotated_at: r.get(4)?,
+    })
+}
+
+fn insert_refresh(c: &Connection, r: &RefreshRecord) -> StoreResult<()> {
+    c.execute(
+        &format!("INSERT INTO oauth_refresh ({REFRESH_COLS}) VALUES (?1, ?2, ?3, ?4, ?5)"),
+        params![
+            r.hash.as_slice(),
+            r.grant_id,
+            r.created_at,
+            r.last_used_at,
+            r.rotated_at
+        ],
+    )
+    .map_err(db)?;
+    Ok(())
+}
+
+const JOB_COLS: &str = "job_id, requester_user_id, target_user_id, state, created_at, expires_at, \
+     manifest_sha256, size, file_name";
+
+fn job_row(r: &Row<'_>) -> rusqlite::Result<ExportJobRecord> {
+    Ok(ExportJobRecord {
+        job_id: r.get(0)?,
+        requester_user_id: r.get(1)?,
+        target_user_id: r.get(2)?,
+        state: r.get(3)?,
+        created_at: r.get(4)?,
+        expires_at: r.get(5)?,
+        manifest_sha256: r.get(6)?,
+        size: r.get::<_, Option<i64>>(7)?.map(to_u64),
+        file_name: r.get(8)?,
+    })
 }
