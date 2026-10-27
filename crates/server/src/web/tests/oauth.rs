@@ -1128,6 +1128,23 @@ async fn refresh_rotates_and_a_reused_refresh_token_revokes_the_grant() {
     assert_eq!(v2["scope"], "read");
     let rt2 = s(&v2, "refresh_token");
     assert_ne!(rt1, rt2);
+    // Final review m2: a refresh without `resource` gets the grant's resource.
+    let (st, v3) = h
+        .post_form(
+            "/oauth/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &rt2),
+                ("client_id", &client),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v3}");
+    assert_eq!(
+        h.mcp_init(&s(&v3, "access_token"), None).await.status(),
+        StatusCode::OK
+    );
+    let rt2 = s(&v3, "refresh_token");
     // The old access token stays valid until its expiry; the new one works.
     assert_eq!(
         h.mcp_init(&s(&v, "access_token"), None).await.status(),

@@ -224,6 +224,8 @@ pub enum GrantRevokedBy {
     Replaced,
     Deactivation,
     ExpiredPurge,
+    /// A restore brought back grants that may have been revoked after the backup.
+    Restore,
 }
 
 impl GrantRevokedBy {
@@ -235,6 +237,7 @@ impl GrantRevokedBy {
             GrantRevokedBy::Replaced => "replaced",
             GrantRevokedBy::Deactivation => "deactivation",
             GrantRevokedBy::ExpiredPurge => "expired_purge",
+            GrantRevokedBy::Restore => "restore",
         }
     }
 }
@@ -310,6 +313,7 @@ mod tests {
             (GrantRevokedBy::Replaced, "replaced"),
             (GrantRevokedBy::Deactivation, "deactivation"),
             (GrantRevokedBy::ExpiredPurge, "expired_purge"),
+            (GrantRevokedBy::Restore, "restore"),
         ] {
             let m = oauth_grant_revoked("grt_1", "adc_1", by);
             assert_eq!(keys(&m), ["by", "client_id", "grant_id"]);

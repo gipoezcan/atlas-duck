@@ -275,6 +275,45 @@ async fn an_auditor_export_is_recorded_and_only_the_auditor_can_poll_it() {
         let res = h.get_raw(&vera, &format!("{base}/{bad}")).await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND, "{bad}");
     }
+    // Final review m1: the download is an auditor read too, recorded before the bytes.
+    let res = h.get_raw(&vera, &format!("{base}/{id}/download")).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let reads: Vec<Value> = h
+        .kinds_of_user("vera")
+        .await
+        .into_iter()
+        .filter(|(k, _)| *k == atlas_duck_audit::EventType::AUDITOR_READ)
+        .map(|(_, p)| p)
+        .collect();
+    assert_eq!(reads.len(), 2, "{reads:?}");
+    assert_eq!(reads[1]["action"], "export");
+    assert_eq!(reads[1]["job_id"], id.as_str());
+    // Final review m1: without the auditor role (a session after it was withdrawn) the job is
+    // out of reach by every route.
+    use secrecy::ExposeSecret;
+    let plain = h
+        .state
+        .0
+        .sessions
+        .create(&user_id_for("vera"), vec!["user".into()])
+        .unwrap();
+    let plain = (
+        plain.cookie_id.expose_secret().to_owned(),
+        plain.session.csrf_token.expose_secret().to_owned(),
+    );
+    for path in [
+        format!("/api/me/audit/exports/{id}"),
+        format!("/api/me/audit/exports/{id}/download"),
+        format!("{base}/{id}"),
+        format!("{base}/{id}/download"),
+    ] {
+        let res = h.get_raw(&plain, &path).await;
+        assert!(
+            matches!(res.status(), StatusCode::FORBIDDEN | StatusCode::NOT_FOUND),
+            "{path}: {}",
+            res.status()
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

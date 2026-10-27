@@ -107,7 +107,11 @@ Every restore first writes the live data as a full bundle,
    - the staged users move in;
    - the live database takes the staged content in one step (SQLite backup API);
    - sessions and the API-key cache reload;
-   - `RESTORED` goes into the restored anchor chain, and the journal goes.
+   - `RESTORED` goes into the restored anchor chain, and the journal goes;
+   - every OAuth grant still live is revoked, with `OAUTH_GRANT_REVOKED {by: restore}` in its
+     user's chain (the report's `oauth_grants_revoked`). A grant revoked after the backup (by its
+     user, the revocation endpoint or reuse detection) would otherwise be live again; MCP clients
+     authorize once more.
 
    Sessions and API keys created after the backup are gone.
 4. `admin anchor verify`. It must exit 0.
@@ -167,6 +171,7 @@ The data volume lives on one node. If the node is gone (or the volume is lost):
    `admin restore /var/lib/atlas-duck-backups/bundles/<newest bundle>`, `admin anchor verify`,
    `admin maintenance off`.
 
-Anything after the bundle's time is lost (at most a day): sessions, API keys created later and
+Anything after the bundle's time is lost (at most a day): sessions, API keys created later, every
+OAuth connection (revoked by the restore) and
 audit records written later. The anchor chain shows where the restored history ends
 (`RESTORED`). A bundle copied off the cluster restores the same way with `restore --stdin`.

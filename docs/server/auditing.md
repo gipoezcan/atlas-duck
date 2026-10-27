@@ -19,7 +19,8 @@ state and chain head, and the same audit view for any of them. The routes are
 without the auditor role they answer 403 `auth/role_required`, and an unknown user 404
 `audit/user_unknown`. Admins have no audit route.
 
-Every auditor request that returns data is recorded first, as `AUDITOR_READ` in the auditor's
+Every auditor request that returns data is recorded first (an export's start and each of its
+downloads too), as `AUDITOR_READ` in the auditor's
 own chain and in the server's anchor chain, with the action (`list_users`, `query`, `trail`,
 `payload`, `export`) and the target user. If the record cannot be written the request fails with
 503 `audit/read_not_recorded` and returns nothing. Reading a chain does not start the target's
@@ -36,7 +37,8 @@ Users export their own chain, auditors any user's chain:
 | download | `GET …/exports/{job}/download` | `GET …/exports/{job}/download` |
 
 The job first anchors the target's current head in the anchor chain (a `HEADS` row), then exports
-through that head. Only the requester sees the job. The download is an uncompressed tar,
+through that head. Only the requester sees the job, and an auditor's job of another user's chain only
+while they still hold the auditor role. The download is an uncompressed tar,
 `atlas-duck-export-<user>-<from>-<to>.tar`, with `manifest.json`, `events.jsonl`,
 `prune_log.jsonl`, `anchor-chain.jsonl`, `anchor-chain.manifest.json` and `README.txt`. Its
 `X-Atlas-Duck-Manifest-Sha256` header and the job page carry the manifest's SHA-256.

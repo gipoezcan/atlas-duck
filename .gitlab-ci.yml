@@ -579,7 +579,8 @@ server:e2e-build:
 
 # M14 T23: the black-box suite against the review environment (Jira none, L258) at
 # https://<slug>.atlas-duck.dux.intern.gipmbh.de (REVIEW_URL from deploy:review), TLS verified against
-# deployment/ca/org-ca.pem (the issuer of the cert-manager certificate).
+# the system trust store (the ingress certificate is cert-manager's letsencrypt; org-ca.pem is the
+# LDAPS root and not used here).
 verify:review-e2e:
   stage: server-verify
   needs: [deploy:review, verify:review-smoke, server:e2e-build]

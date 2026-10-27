@@ -75,6 +75,9 @@ An OAuth token never approves anything: `/api/cmd/*`, `/api/me/*` and the consen
 | Authorization code | 60 s, single use | fixed |
 | Access token `ado_at_…` | 900 s | `ATLAS_DUCK_OAUTH_ACCESS_TTL_SECS` (60..=3600) |
 | Refresh token `ado_rt_…` | until 14 days unused | `ATLAS_DUCK_OAUTH_REFRESH_IDLE_DAYS` (1..=30) |
+
+A refresh request may leave out `resource` (RFC 8707); the grant's resource applies. A `resource`
+that is given must be `<public>/mcp`.
 | Grant | 90 days at most | `ATLAS_DUCK_OAUTH_GRANT_MAX_DAYS` (1..=90) |
 
 Tokens are 32 random bytes; the server stores only their SHA-256. Every refresh issues a new
@@ -96,6 +99,8 @@ once per grant per minute.
   unknown tokens and other clients' tokens answer 200 and change nothing.
 - Re-consent for the same client revokes the older grant (`by: "replaced"`).
 - Deactivating a user revokes all of their grants (`by: "deactivation"`).
+- A restore from backup revokes every grant (`by: "restore"`): a grant revoked after the backup
+  must not come back with it. Clients authorize again ([backup-restore.md](backup-restore.md)).
 
 Revocation takes effect on the next request: `/mcp` reads the grant on every call.
 

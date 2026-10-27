@@ -4,7 +4,9 @@
 //!   `GET /api/me/audit/exports/{job}/download`: the session user's own chain.
 //! - `POST /api/auditor/users/{user_id}/exports`, `GET …/exports/{job}`,
 //!   `GET …/exports/{job}/download`: an auditor's export of `user_id`'s chain; the
-//!   `AUDITOR_READ {action: export, range, job_id}` is recorded before the job starts (PD-258).
+//!   `AUDITOR_READ {action: export, range, job_id}` is recorded before the job starts (PD-258),
+//!   and `AUDITOR_READ {action: export, job_id}` again before each download. Polling and
+//!   downloading another user's export need the auditor role still held.
 //! - `GET /api/anchor/head`: `{seq, hash}` of the anchor chain's last row (any role).
 //!
 //! Only the requester polls or downloads a job; anyone else's job id is 404
@@ -121,6 +123,10 @@ fn job_of(
     let (job, progress) = st.exports.get(&user.0.user_id, job_id)?;
     if target.is_some_and(|t| t != job.target_user_id) {
         return Err(ApiError::EXPORT_UNKNOWN);
+    }
+    // Final review m1: another user's export stays the auditor's only while they are one.
+    if job.target_user_id != user.0.user_id {
+        user.require_role(crate::auditor::ROLE)?;
     }
     Ok((job, progress))
 }
@@ -277,6 +283,25 @@ pub async fn download_auditor(
     Path((target, job_id)): Path<(String, String)>,
 ) -> Response {
     if let Err(e) = user.require_role(crate::auditor::ROLE) {
+        return e.into_response();
+    }
+    if let Err(e) = job_of(&st, &user, &job_id, Some(&target)) {
+        return e.into_response();
+    }
+    // Final review m1: the download of another user's chain is an auditor read too, recorded
+    // before any byte goes out (PD-258).
+    let read = AuditorRead {
+        scope: AuditorScope::User {
+            target_user_id: &target,
+            action: UserReadAction::Export,
+        },
+        range: None,
+        request_id: None,
+        seq: None,
+        page: None,
+        job_id: Some(&job_id),
+    };
+    if let Err(e) = crate::auditor::record(&st, &user, &read).await {
         return e.into_response();
     }
     download(&st, &user, &job_id, Some(&target))

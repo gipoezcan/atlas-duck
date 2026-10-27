@@ -340,13 +340,14 @@ pub(crate) async fn run_inner(
     if outcome.is_err() {
         let _ = std::fs::remove_dir_all(&staging);
     }
+    ctx.registry.resume();
+    let outcome = revoke_oauth(ctx, outcome).await;
     if outcome.is_ok()
         && let Some(e) = earlier
     {
         let _ = std::fs::remove_dir_all(&e.replaced);
         let _ = std::fs::remove_dir_all(&e.staging);
     }
-    ctx.registry.resume();
     outcome
 }
 
@@ -370,5 +371,22 @@ pub async fn resume(ctx: &AdminCtx) -> Result<Value, &'static str> {
         Err(code) => Err(code),
     };
     ctx.registry.resume();
-    outcome
+    revoke_oauth(ctx, outcome).await
+}
+
+/// Final review I2: after a completed restore every live OAuth grant is revoked (`by: restore`,
+/// recorded per user); the report says how many.
+async fn revoke_oauth(
+    ctx: &AdminCtx,
+    outcome: Result<Value, &'static str>,
+) -> Result<Value, &'static str> {
+    let mut v = outcome?;
+    let n = crate::oauth::token::revoke_all_after_restore(
+        ctx.store.as_ref(),
+        &ctx.registry,
+        ctx.clock.now(),
+    )
+    .await;
+    v["oauth_grants_revoked"] = Value::from(n);
+    Ok(v)
 }

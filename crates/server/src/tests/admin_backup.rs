@@ -1026,3 +1026,63 @@ async fn scheduled_backups_keep_the_newest_n_and_restore() {
     within(s.ctx.registry.close_all()).await;
     within(fresh.ctx.registry.close_all()).await;
 }
+
+/// Final review I2: a restore must not bring back a grant revoked after the backup; every grant
+/// live after a restore is revoked (`by: restore`), recorded in its owner's chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_revokes_every_oauth_grant() {
+    let s = sqlite_harness("k1", KEY_A);
+    let a = s.user("alice").await;
+    s.store()
+        .oauth_client_insert(&crate::store::OAuthClientRecord {
+            client_id: "adc_r".into(),
+            name: "r".into(),
+            redirect_uris: vec!["http://127.0.0.1/cb".into()],
+            created_at: 1,
+            source_ip_hash: "00".repeat(32),
+        })
+        .unwrap();
+    s.store()
+        .grant_insert(&crate::store::GrantRecord {
+            grant_id: "grt_r".into(),
+            user_id: a.clone(),
+            client_id: "adc_r".into(),
+            scopes: vec!["read".into()],
+            resource: "https://duck.example.test/mcp".into(),
+            created_at: 1,
+            expires_at: i64::MAX,
+            last_used_at: None,
+            revoked_at: None,
+            revoke_reason: None,
+        })
+        .unwrap();
+    let report = s.backup(&s.backups()).await;
+    let bundle = report["bundle"].as_str().unwrap().to_owned();
+    // After the backup the user revokes the grant (a stolen refresh token, say).
+    assert!(s.store().grant_revoke("grt_r", "user", 5).unwrap());
+    s.clock.advance(10);
+    s.maintenance(true).await;
+    let r = s.restore(&bundle).await;
+    assert!(r.ok, "{r:?}");
+    assert_eq!(r.data.unwrap()["oauth_grants_revoked"], 1);
+    let g = s.store().grant_get("grt_r").unwrap().unwrap();
+    assert!(g.revoked_at.is_some(), "the restore brought the grant back");
+    assert_eq!(g.revoke_reason.as_deref(), Some("restore"));
+    let rt = within(s.ctx.registry.open_user(&a)).await.unwrap();
+    let page = rt
+        .audit_store()
+        .query(
+            &atlas_duck_audit::types::AuditFilter::default(),
+            atlas_duck_audit::types::AuditCursor::first(100),
+        )
+        .unwrap();
+    let rec = page
+        .rows
+        .iter()
+        .find(|r| r.event_type == EventType::OAUTH_GRANT_REVOKED)
+        .expect("an OAUTH_GRANT_REVOKED record");
+    let payload = rt.audit_store().payload_view(rec.seq, 0).unwrap();
+    assert!(String::from_utf8_lossy(&payload.bytes).contains("\"restore\""));
+    s.maintenance(false).await;
+    within(s.ctx.registry.close_all()).await;
+}

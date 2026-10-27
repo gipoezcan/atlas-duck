@@ -236,11 +236,12 @@ async fn auditor_exports_another_users_chain_and_verify_passes() {
         let mut pin_hash = [0u8; 32];
         hex::decode_to_slice(done["anchor_head"]["hash"].as_str().unwrap(), &mut pin_hash).unwrap();
         let pin = (done["anchor_head"]["seq"].as_u64().unwrap(), pin_hash);
-        // In this quiet server nothing was anchored since the job: the live head is the pin.
+        // Only the download's own AUDITOR_READ row was anchored since the job: the live head
+        // moved one row past the pin.
         let (_, head) = s
             .send(Method::GET, "/api/anchor/head", Some(&dave), None)
             .await;
-        assert_eq!(head["seq"], pin.0);
+        assert_eq!(head["seq"], pin.0 + 1);
         // Untar into a temp dir.
         let out = tempfile::tempdir().unwrap();
         let mut dir = None;

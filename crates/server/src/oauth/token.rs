@@ -147,6 +147,57 @@ pub async fn revoke_all_for_user(
     Ok(owed.len())
 }
 
+/// Final review I2: a restore brings back `server.db` as it was at the backup, so a grant revoked
+/// after it (by its user, the revocation endpoint or reuse detection) would be live again. Every
+/// grant still live after a restore is revoked (`OAUTH_GRANT_REVOKED {by: restore}` in its
+/// owner's chain, then the grant); clients authorize again. Fail-safe: a grant whose record cannot
+/// be written is revoked anyway, with an error logged. Answers how many were revoked.
+pub async fn revoke_all_after_restore(
+    store: &dyn ServerStore,
+    registry: &Registry,
+    now: i64,
+) -> usize {
+    let users = match store.users_all() {
+        Ok(u) => u,
+        Err(_) => {
+            tracing::error!(event = "restore_oauth_revoke_failed", step = "users");
+            return 0;
+        }
+    };
+    let mut n = 0;
+    for (u, _) in users {
+        let Ok(owed) = grants_owed(store, &u.user_id) else {
+            tracing::error!(event = "restore_oauth_revoke_failed", step = "grants");
+            continue;
+        };
+        if owed.is_empty() {
+            continue;
+        }
+        let rt = registry.open_user(&u.user_id).await.ok();
+        for g in &owed {
+            let recorded = match &rt {
+                Some(rt) => rt
+                    .append_server_record(
+                        atlas_duck_audit::EventType::OAUTH_GRANT_REVOKED,
+                        oauth_grant_revoked(&g.grant_id, &g.client_id, GrantRevokedBy::Restore),
+                    )
+                    .await
+                    .is_ok(),
+                None => false,
+            };
+            if !recorded {
+                tracing::error!(event = "audit_append_failed", kind = "OAUTH_GRANT_REVOKED");
+            }
+            if matches!(
+                store.grant_revoke(&g.grant_id, GrantRevokedBy::Restore.as_str(), now),
+                Ok(true)
+            ) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
 /// The token response (RFC 6749 §5.1).
 fn tokens(c: &Ctx<'_>, grant: &GrantRecord, scopes: &[String]) -> Result<Value, OAuthError> {
     let access = new_token(ACCESS_PREFIX).ok_or(OAuthError::SERVER_ERROR)?;
@@ -236,9 +287,12 @@ async fn authorization_code(c: &Ctx<'_>, p: &Params) -> Result<Value, OAuthError
 
 async fn refresh_token(c: &Ctx<'_>, p: &Params) -> Result<Value, OAuthError> {
     let token = required(p, "refresh_token")?;
-    let resource = required(p, "resource")?;
     let client_id = client_known(c, p)?;
-    if !resource_ok(c.o, resource) {
+    // Final review m2: RFC 8707 makes `resource` optional on a refresh; absent, the grant's own
+    // resource applies (there is one); present, it must be that resource.
+    if let Some(resource) = p.get("resource").filter(|r| !r.is_empty())
+        && !resource_ok(c.o, resource)
+    {
         return Err(OAuthError::INVALID_TARGET);
     }
     if !token_shape_ok(token, REFRESH_PREFIX) {
