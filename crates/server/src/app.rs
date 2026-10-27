@@ -127,6 +127,7 @@ async fn run(config: Config) -> u8 {
         },
         config.max_open_users,
     ));
+    let ip_key = master.derive(crate::oauth::IP_KEY_LABEL);
     let sessions = match SessionTable::new(
         store.clone(),
         clock.clone(),
@@ -167,6 +168,7 @@ async fn run(config: Config) -> u8 {
     let oauth = Arc::new(crate::oauth::OAuth::new(
         config.oauth,
         &config.public_origin(),
+        ip_key,
     ));
     // M14 PD-254: export jobs under <data>/exports; the TTL sweep runs now and hourly.
     let exports = Arc::new(crate::export_job::ExportJobs::new(

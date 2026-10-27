@@ -137,7 +137,8 @@ fn directory_kind(st: &AppState) -> crate::audit_kinds::DirectoryKind {
 }
 
 /// The OAuth branch of [`BearerUser`]: the grant check (no cache), and for a refused token of a
-/// known grant `LOGIN {method: oauth, outcome: refused, reason, grant_id}` in its owner's chain.
+/// known grant `LOGIN {method: oauth, outcome: refused, reason, grant_id}` in its owner's chain,
+/// at most once per grant per [`crate::oauth::REFUSAL_RECORD_EVERY`].
 async fn oauth_bearer(parts: &Parts, st: &AppState, token: &str) -> Result<BearerUser, ApiError> {
     let now = st.clock.now();
     match crate::oauth::bearer::authenticate(&st.oauth, st.store.as_ref(), token, now) {
@@ -147,6 +148,10 @@ async fn oauth_bearer(parts: &Parts, st: &AppState, token: &str) -> Result<Beare
             grant_id,
             reason,
         }) => {
+            // Once per grant and window: a token holder cannot flood the owner's chain.
+            if !st.oauth.refusal_due(&grant_id, now) {
+                return Err(ApiError::API_KEY_INVALID);
+            }
             let ip = super::client_ip(
                 &parts.headers,
                 super::peer(&parts.extensions),

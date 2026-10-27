@@ -78,6 +78,18 @@ impl fmt::Display for KeyError {
 
 impl std::error::Error for KeyError {}
 
+/// HMAC-SHA256 under a 32-byte key.
+pub fn hmac_sha256(key: &[u8; 32], msg: &[u8]) -> [u8; 32] {
+    use hmac::{Hmac, KeyInit, Mac};
+    // HMAC zero-pads a short key (RFC 2104): the block-size constructor has no error arm.
+    let mut k = hmac::digest::Key::<Hmac<sha2::Sha256>>::default();
+    k[..key.len()].copy_from_slice(key);
+    let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new(&k);
+    zeroize::Zeroize::zeroize(&mut k[..]);
+    mac.update(msg);
+    mac.finalize().into_bytes().into()
+}
+
 /// AES-256-GCM with a random 96-bit nonce.
 pub fn seal(key: &SecretKey, aad: &[u8], msg: &[u8]) -> Result<Sealed, KeyError> {
     let mut nonce = [0u8; 12];
@@ -216,6 +228,11 @@ impl MasterKey {
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// A purpose key: `HMAC-SHA256(master, label)`. A new master key gives new purpose keys.
+    pub fn derive(&self, label: &str) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(hmac_sha256(&self.key.0, label.as_bytes()))
     }
 
     /// Wraps `dk` for `user_id` (PD-208).

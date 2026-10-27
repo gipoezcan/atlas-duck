@@ -1356,8 +1356,10 @@ impl Outcome {
             return "anchor chain: not checked".into();
         };
         if !self.chain_pinned {
-            return "anchor chain: internally consistent; no head pinned (give --anchor-chain-head)"
-                .into();
+            // A self-consistent excerpt can be fabricated whole; only a pin anchors it.
+            return format!(
+                "anchor chain: unanchored; no head pinned, rows {first}..{last} are not checked against the anchor chain (give --anchor-chain-head)"
+            );
         }
         let tail = if self.manifest == Root::Match {
             "covered by the manifest SHA-256 only"

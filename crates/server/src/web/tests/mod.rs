@@ -225,7 +225,11 @@ impl H {
             mcp_sessions: Arc::new(crate::mcp::McpSessions::new()),
             clock: clock.clone(),
             anchor: anchor.clone(),
-            oauth: Arc::new(crate::oauth::OAuth::new(oauth, ORIGIN)),
+            oauth: Arc::new(crate::oauth::OAuth::new(
+                oauth,
+                ORIGIN,
+                MasterKey::for_tests("k1", [5; 32]).derive(crate::oauth::IP_KEY_LABEL),
+            )),
             exports: Arc::new(crate::export_job::ExportJobs::new(
                 store.clone(),
                 registry.clone(),

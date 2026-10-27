@@ -662,6 +662,7 @@ dependencies = [
  "futures",
  "getrandom 0.4.3",
  "hex",
+ "hmac",
  "ldap3",
  "proptest",
  "rcgen",

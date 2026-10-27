@@ -138,9 +138,23 @@ async fn registration_of_a_loopback_and_an_https_client() {
     assert_eq!(rec.name, "Claude Code");
     assert_eq!(rec.redirect_uris, ["http://127.0.0.1:33418/callback"]);
     // The IP is kept hashed only, in the store and in the anchor row.
+    assert_eq!(rec.source_ip_hash, h.state.0.oauth.ip_hash("192.0.2.1"));
+    // Keyed (batch-1 review M1): not the plain SHA-256 an enumeration of addresses would find,
+    // and the HMAC under the master key's derived purpose key.
+    use sha2::Digest;
+    assert_ne!(
+        rec.source_ip_hash,
+        hex::encode(sha2::Sha256::digest(b"192.0.2.1"))
+    );
+    let key = MasterKey::for_tests("k1", [5; 32]).derive(crate::oauth::IP_KEY_LABEL);
     assert_eq!(
         rec.source_ip_hash,
-        crate::oauth::register::ip_hash("192.0.2.1")
+        hex::encode(crate::master_key::hmac_sha256(&key, b"192.0.2.1"))
+    );
+    let other = MasterKey::for_tests("k2", [6; 32]).derive(crate::oauth::IP_KEY_LABEL);
+    assert_ne!(
+        rec.source_ip_hash,
+        hex::encode(crate::master_key::hmac_sha256(&other, b"192.0.2.1"))
     );
     let row = h.store.anchor_last().unwrap().unwrap();
     assert_eq!(row.kind, "OAUTH_CLIENT_REGISTERED");
@@ -1177,6 +1191,65 @@ async fn an_expired_access_token_is_401_and_recorded() {
                 && p.to_string().contains("\"expired\"")),
         "{chain:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_token_endpoint_refuses_a_user_who_is_not_active() {
+    let h = H::new();
+    let (client, alice, v) = h.tokens_for(&["read"]).await;
+    let code = h.code_for(&alice, &client, &["read"]).await["code"].clone();
+    // The user is gone (M13 deactivation reads the same seam, users::is_active).
+    let c = rusqlite::Connection::open(h.dir.path().join("server.db")).unwrap();
+    // The grant rows stay (only the user row goes), as after M13's deactivation.
+    c.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+    c.execute(
+        "DELETE FROM users WHERE user_id = ?1",
+        [user_id_for("alice")],
+    )
+    .unwrap();
+    let (st, e) = h.refresh(&client, &s(&v, "refresh_token"), None).await;
+    assert_eq!(
+        (st, e["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("invalid_grant")),
+        "{e}"
+    );
+    let (st, e) = h.redeem(&client, &code).await;
+    assert_eq!(
+        (st, e["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("invalid_grant")),
+        "{e}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_token_records_are_deduplicated_per_grant() {
+    let h = H::new();
+    let (_, _, v) = h.tokens_for(&["read"]).await;
+    let access = s(&v, "access_token");
+    h.clock.advance(900);
+    let refusals = |chain: &[(atlas_duck_audit::EventType, serde_json::Value)]| {
+        chain
+            .iter()
+            .filter(|(k, p)| {
+                *k == atlas_duck_audit::EventType::LOGIN && p.to_string().contains("\"refused\"")
+            })
+            .count()
+    };
+    // A burst of requests with the expired token: every one is 401, one record.
+    for _ in 0..5 {
+        assert_eq!(
+            h.mcp_init(&access, None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(refusals(&h.alice_chain().await), 1);
+    // Inside the window still none; after it, one more.
+    h.clock.advance(crate::oauth::REFUSAL_RECORD_EVERY - 1);
+    h.mcp_init(&access, None).await;
+    assert_eq!(refusals(&h.alice_chain().await), 1);
+    h.clock.advance(1);
+    h.mcp_init(&access, None).await;
+    assert_eq!(refusals(&h.alice_chain().await), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

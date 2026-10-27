@@ -5,10 +5,9 @@
 //! other unknown field is ignored (RFC 7591 §2).
 
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 
 use super::error::OAuthError;
-use super::redirect::{MAX_URIS, host_of, validate_registered};
+use super::redirect::{MAX_URIS, host_of, registered_form};
 use super::{CLIENT_PREFIX, OAuth, random_b64};
 use crate::anchor::AnchorWriter;
 use crate::store::{OAuthClientRecord, ServerStore, StoreError};
@@ -66,16 +65,18 @@ pub fn validate(body: &Map<String, Value>) -> Result<Accepted, OAuthError> {
     if REFUSED.iter().any(|k| body.contains_key(*k)) {
         return Err(meta);
     }
-    let uris = body
+    let raw_uris = body
         .get("redirect_uris")
         .and_then(strings)
         .ok_or(OAuthError::INVALID_REDIRECT_URI)?;
-    if uris.is_empty()
-        || uris.len() > MAX_URIS
-        || uris.iter().any(|u| validate_registered(u).is_none())
-    {
+    if raw_uris.is_empty() || raw_uris.len() > MAX_URIS {
         return Err(OAuthError::INVALID_REDIRECT_URI);
     }
+    let uris = raw_uris
+        .iter()
+        .map(|u| registered_form(u))
+        .collect::<Option<Vec<String>>>()
+        .ok_or(OAuthError::INVALID_REDIRECT_URI)?;
     let client_name = body
         .get("client_name")
         .and_then(Value::as_str)
@@ -119,11 +120,6 @@ pub fn validate(body: &Map<String, Value>) -> Result<Accepted, OAuthError> {
     })
 }
 
-/// Hex SHA-256 of the client IP: what the store and the anchor row keep of it.
-pub fn ip_hash(ip: &str) -> String {
-    hex::encode(Sha256::digest(ip.as_bytes()))
-}
-
 /// Registers a client: rate limit per IP, the client cap (purge, then refuse), the store row, the
 /// anchor row. Answers the RFC 7591 response body.
 pub fn register(
@@ -160,7 +156,7 @@ pub fn register(
         name: accepted.client_name.clone(),
         redirect_uris: accepted.redirect_uris.clone(),
         created_at: now,
-        source_ip_hash: ip_hash(ip),
+        source_ip_hash: o.ip_hash(ip),
     };
     store.oauth_client_insert(&rec).map_err(store_err)?;
     let mut hosts: Vec<String> = accepted.redirect_uris.iter().map(|u| host_of(u)).collect();

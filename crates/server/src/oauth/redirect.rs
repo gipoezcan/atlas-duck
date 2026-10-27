@@ -38,6 +38,18 @@ pub fn validate_registered(raw: &str) -> Option<Url> {
     }
 }
 
+/// The form a registered URI is stored in (batch-1 review M4): a loopback URI in its normal
+/// form, which [`matches`] compares against, so stored == compared; any other URI as given
+/// (it matches by exact string). `None` when it may not be registered.
+pub fn registered_form(raw: &str) -> Option<String> {
+    let u = validate_registered(raw)?;
+    Some(if is_loopback(&u) {
+        u.as_str().to_owned()
+    } else {
+        raw.to_owned()
+    })
+}
+
 /// Does the presented redirect URI match the registered one? Exact string match, except that a
 /// loopback `http` URI may differ in its port. The presented URI must be in its normal form, so
 /// `/cb/../evil`-style spellings never match by normalisation.
@@ -70,6 +82,7 @@ pub fn host_of(uri: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -140,6 +153,29 @@ mod tests {
         for (reg, pre, want) in cases {
             assert_eq!(matches(reg, pre), want, "{reg} vs {pre}");
         }
+    }
+
+    #[test]
+    fn loopback_uris_are_stored_normalised() {
+        // A non-normal loopback spelling is stored normal, so it matches its normal forms and
+        // the stored string is what matching compares.
+        let stored = registered_form("http://localhost:1/a/../cb").unwrap();
+        assert_eq!(stored, "http://localhost:1/cb");
+        assert!(matches(&stored, "http://localhost:7/cb"));
+        assert_eq!(
+            registered_form("http://127.0.0.1:80/cb").unwrap(),
+            "http://127.0.0.1/cb"
+        );
+        assert_eq!(
+            registered_form("HTTP://[::1]:5/cb").unwrap(),
+            "http://[::1]:5/cb"
+        );
+        // https URIs stay as given (exact match).
+        assert_eq!(
+            registered_form("https://a.example:443/cb").unwrap(),
+            "https://a.example:443/cb"
+        );
+        assert!(registered_form("http://example.com/cb").is_none());
     }
 
     #[test]

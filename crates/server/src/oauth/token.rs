@@ -192,6 +192,7 @@ async fn authorization_code(c: &Ctx<'_>, p: &Params) -> Result<Value, OAuthError
         || code_rec.redirect_uri != redirect_uri
         || !verifier_matches(verifier, &code_rec.code_challenge)
         || !grant.live(c.now)
+        || !crate::users::is_active(c.store, &grant.user_id)
     {
         return Err(OAuthError::INVALID_GRANT);
     }
@@ -223,7 +224,9 @@ async fn refresh_token(c: &Ctx<'_>, p: &Params) -> Result<Value, OAuthError> {
         .grant_get(&grant_id)
         .map_err(store_err)?
         .ok_or(OAuthError::INVALID_GRANT)?;
-    if grant.client_id != client_id {
+    // A user who is no longer active gets no tokens (batch-2 review m3), checked before the
+    // token is spent.
+    if grant.client_id != client_id || !crate::users::is_active(c.store, &grant.user_id) {
         return Err(OAuthError::INVALID_GRANT);
     }
     // A narrower scope only (checked before the token is spent).

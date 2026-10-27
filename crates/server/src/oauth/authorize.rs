@@ -182,7 +182,11 @@ mod tests {
 
     #[test]
     fn resource_normalisation() {
-        let o = OAuth::new(OAuthConfig::DEFAULT, "https://duck.example.test");
+        let o = OAuth::new(
+            OAuthConfig::DEFAULT,
+            "https://duck.example.test",
+            zeroize::Zeroizing::new([0; 32]),
+        );
         for ok in [
             "https://duck.example.test/mcp",
             "https://DUCK.example.test/mcp",

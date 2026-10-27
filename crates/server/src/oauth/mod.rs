@@ -18,7 +18,16 @@ pub mod token;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use secrecy::SecretString;
+/// The hook M13's user deactivation calls (Δ-M14-4): revokes all of a user's OAuth grants, one
+/// `OAUTH_GRANT_REVOKED {by: deactivation}` record each. At the M13 merge `users::deactivate`
+/// must call it before it appends the `USER_DEACTIVATED` anchor row.
+pub use token::revoke_all_for_user;
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::store::ServerStore;
 use ratelimit::WindowLimiter;
@@ -73,18 +82,58 @@ pub struct OAuth {
     pub resource: String,
     pub register_limiter: WindowLimiter,
     pub token_limiter: WindowLimiter,
+    /// The key of [`OAuth::ip_hash`] (batch-1 review M1), derived from the master key.
+    ip_key: Zeroizing<[u8; 32]>,
+    /// Per grant: when its last refused-token `LOGIN` record was written (batch-2 review m1).
+    refusals: Mutex<HashMap<String, i64>>,
 }
 
+/// A refused token of one grant is recorded in its owner's chain at most once per this window.
+pub const REFUSAL_RECORD_EVERY: i64 = 60;
+/// Above this many remembered grants, expired windows are dropped.
+const REFUSALS_PRUNE_AT: usize = 4096;
+
+/// The master-key label of the source-IP hash key.
+pub const IP_KEY_LABEL: &str = "atlas-duck/oauth/source-ip/v1";
+
 impl OAuth {
-    pub fn new(cfg: OAuthConfig, public_origin: &str) -> OAuth {
+    pub fn new(cfg: OAuthConfig, public_origin: &str, ip_key: Zeroizing<[u8; 32]>) -> OAuth {
         let issuer = public_origin.trim_end_matches('/').to_owned();
         OAuth {
             resource: format!("{issuer}{}", crate::mcp::MCP_PATH),
             issuer,
+            ip_key,
+            refusals: Mutex::new(HashMap::new()),
             register_limiter: WindowLimiter::new(cfg.register_per_ip_hour, REGISTER_WINDOW_SECS),
             token_limiter: WindowLimiter::new(TOKEN_PER_IP_MINUTE, 60),
             cfg,
         }
+    }
+
+    /// Hex HMAC-SHA256 of a client IP under the server-held key: what the store and the anchor
+    /// row keep of it. Unlike a plain SHA-256 it cannot be reversed by enumerating addresses.
+    pub fn ip_hash(&self, ip: &str) -> String {
+        hex::encode(crate::master_key::hmac_sha256(&self.ip_key, ip.as_bytes()))
+    }
+
+    /// Whether a refused token of `grant_id` is recorded now: once per grant per
+    /// [`REFUSAL_RECORD_EVERY`], so a holder of a revoked or expired token cannot grow the
+    /// owner's chain (or keep the owner's runtime open) at the request rate.
+    pub fn refusal_due(&self, grant_id: &str, now: i64) -> bool {
+        let Ok(mut seen) = self.refusals.lock() else {
+            return false;
+        };
+        if seen
+            .get(grant_id)
+            .is_some_and(|&t| now - t < REFUSAL_RECORD_EVERY)
+        {
+            return false;
+        }
+        if seen.len() >= REFUSALS_PRUNE_AT {
+            seen.retain(|_, t| now - *t < REFUSAL_RECORD_EVERY);
+        }
+        seen.insert(grant_id.to_owned(), now);
+        true
     }
 
     /// The protected-resource metadata URL a 401 names (RFC 9728 §5.1).

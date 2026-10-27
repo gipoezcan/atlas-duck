@@ -53,7 +53,11 @@ fn client_names() {
 
 #[test]
 fn resource_and_metadata_url() {
-    let o = OAuth::new(OAuthConfig::DEFAULT, "https://duck.example.test/");
+    let o = OAuth::new(
+        OAuthConfig::DEFAULT,
+        "https://duck.example.test/",
+        zeroize::Zeroizing::new([0; 32]),
+    );
     assert_eq!(o.issuer, "https://duck.example.test");
     assert_eq!(o.resource, "https://duck.example.test/mcp");
     assert_eq!(

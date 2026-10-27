@@ -373,10 +373,18 @@ fn without_a_pin_the_excerpt_is_consistency_only() {
     let v = ex.verify(None, None);
     expect(&v, 20, "no pin, no manifest");
     assert_eq!(last_line(&v), NO_ROOT);
-    assert!(chain_line(&v).contains("no head pinned"), "{v:#?}");
+    let unanchored = |v: &ExportVerdict| {
+        let l = chain_line(v);
+        assert!(
+            l.starts_with("anchor chain: unanchored; no head pinned") && !l.contains("ok"),
+            "{v:#?}"
+        );
+    };
+    unanchored(&v);
     let v = ex.verify(None, Some(ex.hash));
     expect(&v, 0, "manifest only");
     assert_eq!(last_line(&v), MANIFEST_OK);
+    unanchored(&v);
 }
 
 #[test]

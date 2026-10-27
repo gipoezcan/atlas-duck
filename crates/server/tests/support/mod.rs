@@ -163,7 +163,11 @@ impl TestServer {
             mcp_sessions: Arc::new(McpSessions::new()),
             clock: clock.clone(),
             anchor: anchor.clone(),
-            oauth: Arc::new(OAuth::new(OAuthConfig::DEFAULT, &base)),
+            oauth: Arc::new(OAuth::new(
+                OAuthConfig::DEFAULT,
+                &base,
+                zeroize::Zeroizing::new([9; 32]),
+            )),
             exports: Arc::new(atlas_duck_server::export_job::ExportJobs::new(
                 store.clone(),
                 registry.clone(),

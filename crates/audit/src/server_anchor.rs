@@ -241,6 +241,21 @@ pub fn body_leaves(body: &[u8], limits: &ExcerptLimits) -> Result<Vec<[u8; 32]>,
     Ok(vec![hex32(&l.leaf).ok_or(ExcerptError::Shape)?])
 }
 
+/// Exactly `YYYY-MM-DDTHH:MM:SS.mmmZ` (24 bytes, digits where the shape has digits).
+fn ts_utc_ok(s: &str) -> bool {
+    const SHAPE: &[u8; 24] = b"dddd-dd-ddTdd:dd:dd.dddZ";
+    s.len() == SHAPE.len()
+        && s.bytes().zip(SHAPE.iter()).all(|(b, &p)| match p {
+            b'd' => b.is_ascii_digit(),
+            _ => b == p,
+        })
+}
+
+/// `[A-Z_]+`.
+fn kind_ok(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+}
+
 /// Parses one line (without its newline). Bounded: a line longer than `limits.line` is refused
 /// before it is parsed, and the typed shape admits no nesting beyond the leaf entry.
 pub fn parse_excerpt_line(line: &[u8], limits: &ExcerptLimits) -> Result<ExcerptRow, ExcerptError> {
@@ -256,6 +271,11 @@ pub fn parse_excerpt_line(line: &[u8], limits: &ExcerptLimits) -> Result<Excerpt
     })?;
     if raw.v != EXCERPT_LINE_VERSION {
         return Err(ExcerptError::UnknownVersion);
+    }
+    // The row hash frames neither `ts_utc` nor `kind`, so only the fixed timestamp shape and an
+    // upper-case kind keep their split unambiguous (`...000Z`+`HEADS` vs `...000ZHE`+`ADS`).
+    if !ts_utc_ok(&raw.ts_utc) || !kind_ok(&raw.kind) {
+        return Err(ExcerptError::Shape);
     }
     let h = |s: &str| hex32(s).ok_or(ExcerptError::Shape);
     let leaf_entry = match raw.leaf_entry {
@@ -472,6 +492,38 @@ mod tests {
     }
 
     #[test]
+    fn shifted_ts_kind_split_is_refused() {
+        let (_, opaque, _) = heads_lines();
+        let l = ExcerptLimits::DEFAULT;
+        let s = String::from_utf8(opaque).unwrap();
+        // Same hash input bytes, another split: the row hash would still verify.
+        let shifted = s
+            .replace("\"kind\":\"HEADS\"", "\"kind\":\"ADS\"")
+            .replace("000Z\"", "000ZHE\"");
+        assert_ne!(shifted, s);
+        assert_eq!(
+            parse_excerpt_line(shifted.as_bytes(), &l).err(),
+            Some(ExcerptError::Shape)
+        );
+        for bad_ts in [
+            "2026-10-27T10:00:00Z",
+            "2026-10-27 10:00:00.000Z",
+            "2026-1a-27T10:00:00.000Z",
+        ] {
+            let t = s.replace("2026-10-27T10:00:00.000Z", bad_ts);
+            assert_eq!(
+                parse_excerpt_line(t.as_bytes(), &l).err(),
+                Some(ExcerptError::Shape)
+            );
+        }
+        let lower = s.replace("\"kind\":\"HEADS\"", "\"kind\":\"heads\"");
+        assert_eq!(
+            parse_excerpt_line(lower.as_bytes(), &l).err(),
+            Some(ExcerptError::Shape)
+        );
+    }
+
+    #[test]
     fn contradictions_are_found() {
         let (full, _, _) = heads_lines();
         let l = ExcerptLimits::DEFAULT;
@@ -558,11 +610,17 @@ mod tests {
     fn single_leaf_body_and_manifest() {
         let leaf = leaf_hash("u1", "c1", 3, &[0x22; 32]);
         let body = leaf_body_jcs(&leaf);
-        let hash = row_hash(2, "t", "RUNTIME_CLOSED", &body, &GENESIS_PREV);
+        let hash = row_hash(
+            2,
+            "2026-10-27T10:00:00.000Z",
+            "RUNTIME_CLOSED",
+            &body,
+            &GENESIS_PREV,
+        );
         let e = entry(3, 0);
         let line = excerpt_line_jcs(
             2,
-            "t",
+            "2026-10-27T10:00:00.000Z",
             "RUNTIME_CLOSED",
             &body,
             &GENESIS_PREV,
