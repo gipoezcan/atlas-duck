@@ -268,3 +268,32 @@ fn sse_sink_maps_with_the_desktop_table() {
     assert_eq!(e.name, "needs_attention_changed");
     assert_eq!(e.data, serde_json::json!({"count": 2}));
 }
+
+/// CI run 40517478906: a user lock still held by this process (a forked child shares the
+/// `flock` until its `exec`) is waited for, briefly, instead of failing the reopen.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reopen_waits_for_a_lock_this_process_still_holds() {
+    let env = Env::new();
+    let uid = env.user("alice");
+    let reg = Registry::new(env.deps(), 10);
+    let rt = within(reg.open_user(&uid)).await.unwrap();
+    drop(rt);
+    within(reg.close_all()).await;
+    // Stand-in for the forked child: this process takes the lock again and lets go shortly.
+    let dir = crate::users::user_dir(env.dir.path(), &uid);
+    let data = match atlas_duck_ipc::paths::check_data_dir(&dir) {
+        Ok(atlas_duck_ipc::paths::DataDirResolution::Local(d)) => d,
+        _ => panic!("user dir not local"),
+    };
+    let held = atlas_duck_audit::lock::InstanceLock::acquire(&data, "atlas-duck-server").unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(held);
+    });
+    let reg = Registry::new(env.deps(), 10);
+    let rt = within(reg.open_user(&uid)).await.unwrap();
+    release.join().unwrap();
+    drop(rt);
+    within(reg.close_all()).await;
+}

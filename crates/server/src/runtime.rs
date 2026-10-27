@@ -234,6 +234,32 @@ pub struct StoreOnly {
     pub store: Store,
 }
 
+/// How long a reopen waits for a user lock that this very process still holds.
+const OWN_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+const OWN_LOCK_STEP: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The user's `instance.lock`. On Unix the lock is an `flock` on an open file description: a
+/// child this process forks (a script worker, the sandbox probe, any `Command`) shares the
+/// descriptor from `fork` until its `exec` closes it (`O_CLOEXEC`). A runtime closed and
+/// reopened at that moment finds the lock still held, by its own pid (CI run 40517478906:
+/// eviction then reopen). Held by this pid, the lock is released within moments, so the open
+/// retries for at most [`OWN_LOCK_WAIT`]; held by another process it fails at once, as before.
+fn acquire_own_lock(
+    data: &atlas_duck_ipc::paths::LocalDataDir,
+) -> Result<InstanceLock, atlas_duck_audit::lock::LockError> {
+    let deadline = std::time::Instant::now() + OWN_LOCK_WAIT;
+    loop {
+        match InstanceLock::acquire(data, LOCK_HOST) {
+            Err(atlas_duck_audit::lock::LockError::Held(Some(h)))
+                if h.pid == std::process::id() && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(OWN_LOCK_STEP);
+            }
+            other => return other,
+        }
+    }
+}
+
 impl UserRuntime {
     /// The user's store under its instance lock. `create`: create it when it does not exist yet
     /// (a login); otherwise a missing store is `UnknownUser` (an auditor never creates one).
@@ -256,7 +282,7 @@ impl UserRuntime {
             Ok(DataDirResolution::Local(d)) => d,
             _ => return Err(st("user dir is not a local directory".into())),
         };
-        let lock = InstanceLock::acquire(&data, LOCK_HOST).map_err(|e| st(format!("{e:?}")))?;
+        let lock = acquire_own_lock(&data).map_err(|e| st(format!("{e:?}")))?;
         let keys = Arc::new(ServerKeyStore::new(
             deps.store.clone(),
             user_id,
