@@ -149,6 +149,13 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn readyz(State(st): State<AppState>) -> Response {
+    if st.registry.maintenance() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"reasons": ["maintenance"]})),
+        )
+            .into_response();
+    }
     st.health.readyz().await
 }
 
@@ -180,6 +187,10 @@ fn header_str(h: &HeaderMap, name: impl header::AsHeaderName) -> Option<&str> {
 /// session and its CSRF token. The checked session rides on the request for the extractor.
 async fn api_guard(State(st): State<AppState>, mut req: Request, next: Next) -> Response {
     let path = req.uri().path().to_owned();
+    // M13 T6: in maintenance only the probes answer (the admin CLI uses its socket).
+    if st.registry.maintenance() && path != "/healthz" && path != "/readyz" {
+        return ApiError::MAINTENANCE.into_response();
+    }
     if !path.starts_with("/api/") {
         return next.run(req).await;
     }

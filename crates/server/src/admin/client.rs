@@ -9,7 +9,7 @@ use std::io::Write;
 
 use serde_json::{Map, Value};
 
-use super::{AliasArg, InstanceArgs, NoArgs, Request, Response, UsernameArg};
+use super::{AliasArg, DirArg, InstanceArgs, NoArgs, Request, Response, SwitchArg, UsernameArg};
 use crate::cli::{EXIT_OK, EXIT_RUNTIME, EXIT_USAGE};
 use crate::config::{ADMIN_SOCKET, DEFAULT_ADMIN_SOCKET};
 
@@ -21,6 +21,9 @@ pub const USAGE: &str = "usage: atlas-duck-server admin <command>
   instances remove --alias A
   users list
   users deactivate <username>
+  maintenance on|off
+  backup <dir>          (under <data>/backups or the temp directory)
+  restore <bundle-dir>  (maintenance on first)
 ";
 
 /// What argv asks for.
@@ -48,6 +51,14 @@ pub fn parse(args: &[String]) -> Option<Parsed> {
                 username: (*name).to_owned(),
             })))
         }
+        ["maintenance", "on"] => Some(Parsed::Run(Request::Maintenance(SwitchArg { on: true }))),
+        ["maintenance", "off"] => Some(Parsed::Run(Request::Maintenance(SwitchArg { on: false }))),
+        ["backup", dir] if !dir.starts_with('-') => Some(Parsed::Run(Request::Backup(DirArg {
+            dir: (*dir).to_owned(),
+        }))),
+        ["restore", dir] if !dir.starts_with('-') => Some(Parsed::Run(Request::Restore(DirArg {
+            dir: (*dir).to_owned(),
+        }))),
         _ => None,
     }
 }

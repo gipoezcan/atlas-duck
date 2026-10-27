@@ -384,6 +384,13 @@ impl ApiKeys {
             .map(KeyView::from))
     }
 
+    /// After a restore (M13 T6): nothing cached survives.
+    pub fn invalidate_all(&self) {
+        let mut cache = self.cache();
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        cache.clear();
+    }
+
     /// Evicts every cache entry of key `id`.
     pub fn invalidate(&self, id: &str) {
         let mut cache = self.cache();

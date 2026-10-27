@@ -4,12 +4,17 @@
 //! fields refused. The socket lives in [`socket`] (Unix only); the request handling here is
 //! platform-independent and tested over in-memory streams.
 
+pub mod backup;
 pub mod client;
 pub mod instances;
+pub mod maintenance;
+pub mod restore;
 #[cfg(unix)]
 pub mod socket;
 pub mod users;
 
+#[cfg(test)]
+mod backup_tests;
 #[cfg(test)]
 mod tests;
 
@@ -99,6 +104,18 @@ pub struct UsernameArg {
     pub username: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwitchArg {
+    pub on: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirArg {
+    pub dir: String,
+}
+
 /// One admin request (`{"op": "...", ...}`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -108,6 +125,9 @@ pub enum Request {
     InstancesRemove(AliasArg),
     UsersList(NoArgs),
     UsersDeactivate(UsernameArg),
+    Maintenance(SwitchArg),
+    Backup(DirArg),
+    Restore(DirArg),
 }
 
 impl Request {
@@ -119,6 +139,9 @@ impl Request {
             Request::InstancesRemove(_) => "instances_remove",
             Request::UsersList(_) => "users_list",
             Request::UsersDeactivate(_) => "users_deactivate",
+            Request::Maintenance(_) => "maintenance",
+            Request::Backup(_) => "backup",
+            Request::Restore(_) => "restore",
         }
     }
 }
@@ -162,6 +185,9 @@ pub async fn handle(ctx: &AdminCtx, req: Request) -> Response {
         Request::InstancesRemove(a) => instances::remove(ctx, &a.alias).await,
         Request::UsersList(_) => users::list(ctx),
         Request::UsersDeactivate(u) => users::deactivate_by_name(ctx, &u.username).await,
+        Request::Maintenance(m) => maintenance::set(ctx, m.on),
+        Request::Backup(d) => backup::run(ctx, &d.dir).await,
+        Request::Restore(d) => restore::run(ctx, &d.dir).await,
     };
     match out {
         Ok(v) => {

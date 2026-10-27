@@ -161,6 +161,12 @@ impl ApiError {
         "store/unavailable",
         "The store is not available.",
     );
+    /// M13 T6: the server is in maintenance (backup restore); only the probes answer.
+    pub const MAINTENANCE: ApiError = e(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "server/maintenance",
+        "The server is in maintenance.",
+    );
     pub const INTERNAL: ApiError = e(
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal",
@@ -262,6 +268,7 @@ mod tests {
             (ApiError::API_KEY_NAME_INVALID, 400),
             (ApiError::API_KEY_SCOPE_INVALID, 400),
             (ApiError::STORE_UNAVAILABLE, 503),
+            (ApiError::MAINTENANCE, 503),
             (ApiError::INTERNAL, 500),
         ] {
             assert_eq!(err.status.as_u16(), status, "{}", err.code);

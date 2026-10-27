@@ -172,6 +172,22 @@ impl SessionTable {
         Ok(())
     }
 
+    /// After a restore (M13 T6): the memory map becomes the restored store's sessions.
+    pub fn reload(&self) -> Result<(), StoreError> {
+        let mut fresh = HashMap::new();
+        for record in self.store.sessions_all()? {
+            fresh.insert(
+                record.id_hash,
+                Live {
+                    stored_last_seen: record.last_seen,
+                    record,
+                },
+            );
+        }
+        *self.lock() = fresh;
+        Ok(())
+    }
+
     /// Deactivation (M13 T5): every session of the user ends now, in memory and in the store;
     /// answers how many were live in memory.
     pub fn delete_for_user(&self, user_id: &str) -> Result<usize, StoreError> {

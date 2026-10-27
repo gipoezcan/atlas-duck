@@ -707,6 +707,35 @@ impl ServerStore for SqliteStore {
         collect(st.query_map([], anchor_row).map_err(db)?)
     }
 
+    fn anchor_latest_heads(&self) -> StoreResult<Vec<AnchorHead>> {
+        let c = self.conn();
+        let mut st = c
+            .prepare(
+                "SELECT anchor_seq, user_id, chain_id, head_seq, record_hash FROM anchor_heads
+                 WHERE rowid IN (SELECT MAX(rowid) FROM anchor_heads GROUP BY user_id)
+                 ORDER BY user_id",
+            )
+            .map_err(db)?;
+        let rows = collect(st.query_map([], head_row).map_err(db)?)?;
+        Ok(rows.into_iter().map(|(_, h)| h).collect())
+    }
+
+    fn snapshot_to(&self, path: &Path) -> StoreResult<()> {
+        self.conn()
+            .backup(rusqlite::MAIN_DB, path, None)
+            .map_err(db)
+    }
+
+    fn restore_from(&self, path: &Path) -> StoreResult<()> {
+        self.conn()
+            .restore(
+                rusqlite::MAIN_DB,
+                path,
+                None::<fn(rusqlite::backup::Progress)>,
+            )
+            .map_err(db)
+    }
+
     fn anchor_last(&self) -> StoreResult<Option<AnchorRow>> {
         self.conn()
             .query_row(

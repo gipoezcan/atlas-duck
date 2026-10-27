@@ -349,6 +349,22 @@ impl ServerStore for MemoryStore {
         Ok(self.lock().anchors.clone())
     }
 
+    fn anchor_latest_heads(&self) -> StoreResult<Vec<AnchorHead>> {
+        let mut latest: BTreeMap<String, AnchorHead> = BTreeMap::new();
+        for (_, h) in &self.lock().heads {
+            latest.insert(h.user_id.clone(), h.clone());
+        }
+        Ok(latest.into_values().collect())
+    }
+
+    fn snapshot_to(&self, _path: &std::path::Path) -> StoreResult<()> {
+        Err(StoreError::Db("the memory store has no file".into()))
+    }
+
+    fn restore_from(&self, _path: &std::path::Path) -> StoreResult<()> {
+        Err(StoreError::Db("the memory store has no file".into()))
+    }
+
     fn anchor_last(&self) -> StoreResult<Option<AnchorRow>> {
         Ok(self.lock().anchors.last().cloned())
     }

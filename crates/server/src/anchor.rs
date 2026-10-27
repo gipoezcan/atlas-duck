@@ -161,6 +161,16 @@ impl AnchorWriter {
         Ok(row)
     }
 
+    /// `RUNTIME_CLOSED` rows for runtimes closed outside the registry's eviction (a quiesce).
+    pub fn record_heads(&self, closed: &[(String, Head)]) -> Result<usize, StoreError> {
+        self.closed_rows(closed)
+    }
+
+    /// After a restore (M13 T6): what was anchored before belongs to the replaced stores.
+    pub fn forget_anchored(&self) {
+        self.anchored().clear();
+    }
+
     /// `USER_DEACTIVATED` with the user's final head (SM-6.3 "on each user's deactivation").
     pub fn user_deactivated(&self, user_id: &str, head: &Head) -> Result<AnchorRow, StoreError> {
         self.leaf_row(KIND_USER_DEACTIVATED, user_id, head)

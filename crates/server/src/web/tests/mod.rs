@@ -1773,3 +1773,31 @@ async fn deactivated_user_login_refused_not_permitted() {
     // Bob is not affected.
     assert_eq!(h.login("bob", "pw-bob").await.status(), StatusCode::OK);
 }
+
+/// M13 T6: in maintenance only the probes answer; `/readyz` says why it is not ready.
+#[tokio::test]
+async fn maintenance_refuses_everything_but_the_probes() {
+    let h = H::new();
+    let (cookie, _) = h.session("alice", PW_CANARY).await;
+    h.registry.set_maintenance(true);
+    let ready = get(&h, "/readyz").await;
+    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(json_body(ready).await, json!({"reasons": ["maintenance"]}));
+    assert_eq!(get(&h, "/healthz").await.status(), StatusCode::OK);
+    let (status, c) = code(h.get_session(&cookie).await).await;
+    assert_eq!(
+        (status, c.as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, "server/maintenance")
+    );
+    let (status, c) = code(h.login("bob", "pw-bob").await).await;
+    assert_eq!(
+        (status, c.as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, "server/maintenance")
+    );
+    assert_eq!(
+        get(&h, "/login").await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    h.registry.set_maintenance(false);
+    assert_eq!(h.get_session(&cookie).await.status(), StatusCode::OK);
+}

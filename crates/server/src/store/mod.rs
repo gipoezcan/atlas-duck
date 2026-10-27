@@ -244,6 +244,14 @@ pub trait ServerStore: Send + Sync {
         hash: AnchorHasher<'_>,
     ) -> StoreResult<AnchorRow>;
     fn anchor_all(&self) -> StoreResult<Vec<AnchorRow>>;
+    /// The most recently anchored head of every user (backup manifests).
+    fn anchor_latest_heads(&self) -> StoreResult<Vec<AnchorHead>>;
+
+    // ---- backup and restore (M13 T6) ----
+    /// A consistent copy of the whole store into the new file `path`.
+    fn snapshot_to(&self, path: &std::path::Path) -> StoreResult<()>;
+    /// Replaces the whole store's content with the file at `path`, atomically.
+    fn restore_from(&self, path: &std::path::Path) -> StoreResult<()>;
     fn anchor_last(&self) -> StoreResult<Option<AnchorRow>>;
     fn anchor_heads_for(&self, anchor_seq: u64) -> StoreResult<Vec<AnchorHead>>;
     /// `(anchor_seq, head)` of every head of `chain_id` with `head_seq <= upto_seq`, in order.

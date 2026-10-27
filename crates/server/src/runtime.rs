@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use atlas_duck_audit::lock::InstanceLock;
@@ -369,8 +369,18 @@ impl UserRuntime {
         (chain, seq, hash)
     }
 
-    /// The user's audit store (integration tests read and verify the chain).
-    #[cfg(any(test, feature = "testing"))]
+    /// M13 T6 (restore): a full verification of the user's chain, which appends its `VERIFY`
+    /// record; `true` when it completed without an incident.
+    pub async fn full_verify(&self) -> bool {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.try_full_verify())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .is_some_and(|o| !o.findings.iter().any(|f| f.kind.is_incident()))
+    }
+
+    /// The user's audit store (integration tests read and verify the chain).    #[cfg(any(test, feature = "testing"))]
     pub fn audit_store(&self) -> &Store {
         &self.store
     }
@@ -483,6 +493,10 @@ pub struct Registry {
     open: tokio::sync::Mutex<HashMap<String, Arc<UserRuntime>>>,
     tick: AtomicU64,
     closed: Mutex<Vec<UserHead>>,
+    /// M13 T6: no runtime opens while a backup or restore holds the stores still.
+    quiesced: AtomicBool,
+    /// M13 T6: `admin maintenance on`: every request but the probes is refused.
+    maintenance: AtomicBool,
 }
 
 impl Registry {
@@ -493,7 +507,36 @@ impl Registry {
             open: tokio::sync::Mutex::new(HashMap::new()),
             tick: AtomicU64::new(0),
             closed: Mutex::new(Vec::new()),
+            quiesced: AtomicBool::new(false),
+            maintenance: AtomicBool::new(false),
         }
+    }
+
+    pub fn maintenance(&self) -> bool {
+        self.maintenance.load(Ordering::SeqCst)
+    }
+
+    pub fn set_maintenance(&self, on: bool) {
+        self.maintenance.store(on, Ordering::SeqCst);
+    }
+
+    /// Closes every runtime and keeps new ones from opening until [`Registry::resume`]; answers
+    /// the closed runtimes' last heads (the caller anchors them).
+    pub async fn quiesce(&self) -> Vec<UserHead> {
+        let mut open = self.open.lock().await;
+        self.quiesced.store(true, Ordering::SeqCst);
+        let all: Vec<Arc<UserRuntime>> = open.drain().map(|(_, r)| r).collect();
+        drop(open);
+        let mut heads = Vec::new();
+        for rt in all {
+            rt.close().await;
+            heads.push((rt.user_id.clone(), rt.head()));
+        }
+        heads
+    }
+
+    pub fn resume(&self) {
+        self.quiesced.store(false, Ordering::SeqCst);
     }
 
     pub fn deps(&self) -> &RuntimeDeps {
@@ -509,6 +552,9 @@ impl Registry {
     /// requests never open one store twice.
     pub(crate) async fn open_user(&self, user_id: &str) -> Result<Arc<UserRuntime>, RuntimeError> {
         let mut open = self.open.lock().await;
+        if self.quiesced.load(Ordering::SeqCst) {
+            return Err(RuntimeError::Store("quiesced".into()));
+        }
         let t = self.tick.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(rt) = open.get(user_id) {
             rt.last_used.store(t, Ordering::SeqCst);
