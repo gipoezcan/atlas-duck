@@ -429,7 +429,7 @@ deploy:review:
       echo "== helmfile template"
       helmfile -e review -f build/helmfile.yaml template --skip-deps ${ARGS} > rendered-review.yaml
       echo "== server-side dry run"
-      $K apply --server-side --field-manager=atlas-duck-ci --dry-run=server --validate=false \
+      $K apply --server-side --field-manager=atlas-duck-ci --dry-run=server --force-conflicts --validate=false \
         -f rendered-review.yaml > /dev/null
       echo "== helmfile apply"
       helmfile -e review -f build/helmfile.yaml apply --skip-deps ${ARGS}
@@ -526,7 +526,7 @@ deploy:production:
       echo "== helmfile template"
       helmfile -e production -f build/helmfile.yaml template --skip-deps ${ARGS} > rendered-production.yaml
       echo "== server-side dry run"
-      $K apply --server-side --field-manager=atlas-duck-ci --dry-run=server --validate=false \
+      $K apply --server-side --field-manager=atlas-duck-ci --dry-run=server --force-conflicts --validate=false \
         -f rendered-production.yaml > /dev/null
       echo "== helmfile apply"
       helmfile -e production -f build/helmfile.yaml apply --skip-deps ${ARGS}
