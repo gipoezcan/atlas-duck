@@ -1870,11 +1870,17 @@ jobs:
           rustup toolchain install
           rustup show active-toolchain
 
-      - name: Clippy (server, mcp-tools)
-        run: cargo clippy -p atlas-duck-server -p atlas-duck-mcp-tools --all-targets --features atlas-duck-server/testing --locked -- -D warnings
+      - name: Clippy (server, mcp-tools, script-glue)
+        run: cargo clippy -p atlas-duck-server -p atlas-duck-mcp-tools -p atlas-duck-script-glue --all-targets --features atlas-duck-server/testing --locked -- -D warnings
 
-      - name: Server tests (unit, isolation, exit_flow, redaction, mcp_parity)
+      # M14 T12: the real-worker test of the server's script runner needs the built worker.
+      - name: Build the sandbox worker (server image's bin)
+        run: cargo build -p atlas-duck-sandbox-worker --bin atlas-duck-sandbox-worker --locked
+
+      - name: Server tests (unit, isolation, exit_flow, redaction, mcp_parity, oauth_flow, real worker)
         timeout-minutes: 30
+        env:
+          ATLAS_DUCK_SANDBOX_BIN: ${{ github.workspace }}/target/debug/atlas-duck-sandbox-worker
         run: cargo test -p atlas-duck-server --features testing --locked
 
       - name: mcp-tools tests
@@ -1893,7 +1899,7 @@ jobs:
     name: server-image (container build + smoke)
     needs: server
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1905,9 +1911,26 @@ jobs:
           set -euo pipefail
           bash -n ci/server-smoke.sh
           bash -n ci/server-test-master-key.sh
+          bash -n ci/server-sandbox-container.sh
 
       - name: Build the image
         run: docker build -f crates/server/Dockerfile -t atlas-duck-server:ci .
+
+      # M14 T14 (PD-250): the M8 confined corpus on the runtime image's base.
+      - name: Build the confined-scripts image
+        run: docker build -f crates/server/Dockerfile --target confined -t atlas-duck-confined:ci .
+
+      - name: Sandbox in the hardened container (default seccomp profile)
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          bash ci/server-sandbox-container.sh 2>&1 | tee "$RUNNER_TEMP/sandbox-container.log"
+          {
+            echo "### M14 container sandbox proof"
+            echo '```'
+            grep -E '^evidence:|^V11 |^V02 |server sandbox container' "$RUNNER_TEMP/sandbox-container.log" | cut -c1-400
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Throwaway master key
         run: bash ci/server-test-master-key.sh

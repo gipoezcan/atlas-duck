@@ -36,11 +36,28 @@ COPY crates/ crates/
 # A workspace member; copied only so the workspace resolves with --locked. The server's closure
 # links no Tauri, so no GTK/WebKit packages are needed.
 COPY app/src-tauri/ app/src-tauri/
-RUN cargo build --release --locked -p atlas-duck-server \
- && strip target/release/atlas-duck-server
+# M14 T14 (PD-250): the sandbox worker beside the server (the desktop's `atlas-duck-sandbox` bin is
+# a Tauri-package target; `atlas-duck-sandbox-worker` is the same thin main without Tauri).
+RUN cargo build --release --locked -p atlas-duck-server -p atlas-duck-sandbox-worker \
+      --bin atlas-duck-server --bin atlas-duck-sandbox-worker \
+ && strip target/release/atlas-duck-server target/release/atlas-duck-sandbox-worker
+
+# M14 T14: the M8 `confined_scripts` corpus as a test binary on the runtime image's base, for
+# `ci/server-sandbox-container.sh` only (`docker build --target confined`; never pushed).
+FROM build AS confined-build
+RUN cargo test --locked -p atlas-duck-sandbox-worker --test confined_scripts --no-run \
+ && exe="$(find target/debug/deps -maxdepth 1 -type f -name 'confined_scripts-*' -perm -u+x ! -name '*.d' | head -n 1)" \
+ && test -n "$exe" && cp "$exe" /confined_scripts
+
+FROM gcr.io/distroless/cc-debian12:nonroot AS confined
+COPY --from=confined-build --chmod=0555 /confined_scripts /app/confined_scripts
+USER 65532:65532
+ENTRYPOINT ["/app/confined_scripts"]
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /src/target/release/atlas-duck-server /app/atlas-duck-server
+# Owned by root, read-only and executable for the server user (PD-250: no capability, no setcap).
+COPY --from=build --chmod=0555 /src/target/release/atlas-duck-sandbox-worker /app/atlas-duck-sandbox
 COPY --from=ui /src/app/ui/dist-server/ /app/web/
 USER 65532:65532
 EXPOSE 8080

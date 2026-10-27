@@ -32,6 +32,12 @@ landlock = { workspace = true }
 seccompiler = { workspace = true }
 syscalls = { workspace = true }
 
+# M14 T14: the server image's worker (the desktop's `atlas-duck-sandbox` bin is a Tauri-package
+# target). Same thin main.
+[[bin]]
+name = "atlas-duck-sandbox-worker"
+path = "src/bin/atlas-duck-sandbox-worker.rs"
+
 [[test]]
 name = "confined_workload"
 harness = false

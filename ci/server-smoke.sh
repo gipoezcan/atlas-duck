@@ -3,7 +3,8 @@
 # the image runs as uid 65532 with a read-only root, serves the pages with the CSP, signs in a
 # test-directory user, creates an API key, answers MCP `initialize` + `tools/list` with it,
 # refuses the offline admin CLI while serving, and refuses the test directory in production
-# (exit 78). The Jira write flow itself is crates/server/tests/exit_flow.rs (in process).
+# (exit 78). M14 T14: a key with `scripts` runs a script dry run in the container's sandbox.
+# The Jira write flow itself is crates/server/tests/exit_flow.rs (in process).
 set -euo pipefail
 
 if [[ "${SMOKE_INNER:-}" != 1 ]]; then
@@ -115,6 +116,27 @@ grep -q 'jira_issue_get' "$WORK/tools.body" || fail "tools/list lacks jira_issue
 if grep -q 'jira_issue_edit' "$WORK/tools.body"; then fail "a read key lists a write tool"; fi
 status="$("${CURL[@]}" -o /dev/null -w '%{http_code}' -X POST "$BASE/mcp")"
 [[ "$status" == 401 ]] || fail "/mcp without a key answered $status"
+
+# M14 T14: a key with `scripts` runs a dry run in the container's sandbox (no host call).
+skey="$("${CURL[@]}" -b "$JAR" -H "Origin: $BASE" -H "X-CSRF-Token: $alice_csrf" \
+  -H 'Content-Type: application/json' -d '{"name":"smoke-scripts","scopes":["read","scripts"]}' \
+  "$BASE/api/me/api-keys" | sed -n 's/.*"key":"\(adk_[^"]*\)".*/\1/p')"
+[[ -n "$skey" ]] || fail "no scripts key created"
+"${CURL[@]}" -D "$WORK/sinit.headers" -o /dev/null -H "Authorization: Bearer $skey" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d "$init" "$BASE/mcp"
+ssid="$(sed -n 's/^[Mm]cp-[Ss]ession-[Ii]d: *\([^[:space:]]*\).*/\1/p' "$WORK/sinit.headers" | tr -d '\r')"
+[[ -n "$ssid" ]] || fail "no MCP session id for the scripts key"
+"${CURL[@]}" -o /dev/null -H "Authorization: Bearer $skey" -H "Mcp-Session-Id: $ssid" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' "$BASE/mcp"
+call='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"script_run","arguments":{"source":"return 1 + 1;","dry_run":"sparse"}}}'
+curl --silent --show-error --max-time 70 -H "Authorization: Bearer $skey" -H "Mcp-Session-Id: $ssid" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d "$call" "$BASE/mcp" > "$WORK/script.body"
+# The structured envelope arrives inside the JSON-RPC result (SSE data line or plain JSON).
+grep -Eq '"status": ?"succeeded"|\\"status\\": ?\\"succeeded\\"' "$WORK/script.body" \
+  || fail "the script dry run did not succeed: $(head -c 2000 "$WORK/script.body")"
 
 # The approvals page carries the CSP.
 "${CURL[@]}" -D "$WORK/page.headers" -o /dev/null "$BASE/approvals"

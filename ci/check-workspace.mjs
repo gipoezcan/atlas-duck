@@ -172,7 +172,11 @@ export const WORKER_EXTERNAL_ALLOW = [
 export const BANNED_IN_SANDBOX_HOST = BANNED_IN_CLI_AND_WORKER;
 
 // PD-134 (plan review B-2): `#[global_allocator]` lives only in the sandbox binary and in tests.
-export const GLOBAL_ALLOCATOR_FILES = ["app/src-tauri/src/bin/atlas-duck-sandbox.rs"];
+export const GLOBAL_ALLOCATOR_FILES = [
+  "app/src-tauri/src/bin/atlas-duck-sandbox.rs",
+  // M14 T14: the server image's worker bin (same thin main).
+  "crates/sandbox-worker/src/bin/atlas-duck-sandbox-worker.rs",
+];
 
 // A `tests/` directory directly under a crate root (an integration-test target, never part of the
 // library). `src/tests/` modules compile into the crate and are not exempt.
