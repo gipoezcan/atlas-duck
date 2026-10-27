@@ -27,7 +27,7 @@ use tokio::sync::Mutex;
 use crate::directory::Directory;
 use crate::master_key::{MasterKey, WrappedKey};
 use crate::runtime::Registry;
-use crate::scheduler::{JOB_OFFBOARDING, JOB_RETENTION};
+use crate::scheduler::{JOB_BACKUP, JOB_OFFBOARDING, JOB_RETENTION};
 use crate::store::ServerStore;
 
 pub const PROBE_CACHE: Duration = Duration::from_secs(30);
@@ -238,7 +238,7 @@ impl Health {
             &[(String::new(), open.to_string())],
         );
         let mut last = Vec::new();
-        for job in [JOB_OFFBOARDING, JOB_RETENTION] {
+        for job in [JOB_OFFBOARDING, JOB_RETENTION, JOB_BACKUP] {
             if let Some(at) = self
                 .store
                 .scheduler_get(job)

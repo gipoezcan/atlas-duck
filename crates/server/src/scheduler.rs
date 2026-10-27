@@ -26,6 +26,8 @@ use crate::store::JobState;
 
 pub const JOB_OFFBOARDING: &str = "offboarding";
 pub const JOB_RETENTION: &str = "retention";
+/// ADR 0004: the daily backup to the backup volume (only with `ATLAS_DUCK_BACKUP_DIR`).
+pub const JOB_BACKUP: &str = "backup";
 /// A failed run is retried this long after it started.
 pub const RETRY_SECS: i64 = 3600;
 /// How often the loop looks for due jobs.
@@ -84,7 +86,11 @@ impl Scheduler {
             return Vec::new();
         };
         let mut out = Vec::new();
-        for job in [JOB_OFFBOARDING, JOB_RETENTION] {
+        let mut jobs = vec![JOB_OFFBOARDING, JOB_RETENTION];
+        if self.ctx.backup_dir.is_some() {
+            jobs.push(JOB_BACKUP);
+        }
+        for job in jobs {
             let now = self.ctx.clock.now();
             let Ok(state) = self.ctx.store.scheduler_get(job) else {
                 tracing::error!(event = "scheduler_state_unavailable", job);
@@ -97,6 +103,7 @@ impl Scheduler {
             let run = async {
                 match job {
                     JOB_OFFBOARDING => self.offboarding().await,
+                    JOB_BACKUP => self.backup().await,
                     _ => self.retention().await,
                 }
             };
@@ -201,6 +208,17 @@ impl Scheduler {
         }
         errors == 0
     }
+    async fn backup(&self) -> bool {
+        let _ops = self.ctx.lock_ops().await;
+        match crate::admin::backups::scheduled(&self.ctx).await {
+            Ok(_) => true,
+            Err(code) => {
+                tracing::error!(event = "scheduled_backup_failed", code);
+                false
+            }
+        }
+    }
+
     async fn retention(&self) -> bool {
         let _ops = self.ctx.lock_ops().await;
         crate::admin::retention::run(&self.ctx, false)

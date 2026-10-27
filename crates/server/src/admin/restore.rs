@@ -263,7 +263,7 @@ pub(crate) async fn run_inner(
         return Err("admin/maintenance_required");
     }
     let data = ctx.registry.deps().data_dir.clone();
-    let bundle = allowed_dir(&data, dir)?;
+    let bundle = allowed_dir(&data, ctx.backup_dir.as_deref(), dir)?;
     let manifest = read_manifest(&bundle)?;
     let manifest_sha256 =
         hex::encode(sha256_file(&bundle.join(MANIFEST)).map_err(|_| "restore/manifest_missing")?);
