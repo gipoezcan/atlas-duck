@@ -38,8 +38,10 @@ The `data` directory must be writable by uid 65532 (the image's user). Open
 
 Then: as `carol-admin`, add an instance on **Admin**; as `alice`, store a personal access token on
 **Credentials** and create a key on **API keys**; point an MCP client at
-`http://localhost:8080/mcp` with `Authorization: Bearer <key>`. Requests the agent proposes appear
-on **Approvals**; the agent never approves anything.
+`http://localhost:8080/mcp` with `Authorization: Bearer <key>`, or let an OAuth-capable MCP client
+connect without a key ([oauth.md](oauth.md)). Requests the agent proposes appear on **Approvals**;
+the agent never approves anything. `dave-auditor` sees every user's chain on **Auditor**
+([auditing.md](auditing.md)).
 
 While the server runs, the transitional admin CLI refuses (`admin/server_running`); with the server
 stopped, `docker run ... atlas-duck-server:dev admin instances list|add|remove` manages instances
@@ -83,13 +85,32 @@ case. A user in none of them cannot sign in (`auth/not_permitted`).
 | `ATLAS_DUCK_SESSION_ABSOLUTE_SECS` | no | `28800` | session lifetime |
 | `ATLAS_DUCK_SESSION_IDLE_SECS` | no | `1800` | idle timeout |
 | `ATLAS_DUCK_ANCHOR_INTERVAL_SECS` | no | `900` (maximum) | server anchor chain interval |
+| `ATLAS_DUCK_OAUTH` | no | `enabled` | `enabled` or `disabled` (API keys only) ([oauth.md](oauth.md)) |
+| `ATLAS_DUCK_OAUTH_ACCESS_TTL_SECS` | no | `900` | access token lifetime, 60..=3600 |
+| `ATLAS_DUCK_OAUTH_REFRESH_IDLE_DAYS` | no | `14` | a refresh token unused this long dies, 1..=30 |
+| `ATLAS_DUCK_OAUTH_GRANT_MAX_DAYS` | no | `90` | grant lifetime, 1..=90 |
+| `ATLAS_DUCK_OAUTH_REGISTER_PER_IP_HOUR` | no | `10` | client registrations per client IP and hour, 1..=100 |
+| `ATLAS_DUCK_OAUTH_MAX_CLIENTS` | no | `1000` | registered clients, 10..=100000 |
+| `ATLAS_DUCK_SCRIPTS` | no | `enabled` | `enabled` or `disabled` ([scripts.md](scripts.md)) |
+| `ATLAS_DUCK_SANDBOX_BIN` | no | `/app/atlas-duck-sandbox` | absolute path of the sandbox worker; the file must exist |
+| `ATLAS_DUCK_SCRIPT_RUNS_MAX` | no | `4` | real script runs across all users, 1..=32 |
+| `ATLAS_DUCK_SCRIPT_DRY_RUNS_MAX` | no | `4` | dry runs and compile checks across all users, 1..=32 |
+| `ATLAS_DUCK_EXPORT_TTL_HOURS` | no | `24` | how long export files stay on the volume, 1..=168 ([auditing.md](auditing.md)) |
+| `ATLAS_DUCK_EXPORT_MAX_CONCURRENT` | no | `2` | export jobs at once, 1..=8 |
 | `RUST_LOG` | no | `info` | log filter (JSON lines on stdout) |
 
 A configuration error prints one JSON line (`{"level":"error","event":"config_error","code":...,"key":...}`)
 on stderr and exits 78. Codes: `config/missing_key`, `config/invalid_mode`, `config/invalid_value`,
 `config/public_url_invalid`, `config/data_dir_invalid`, `config/master_key_in_env`,
 `config/master_key_unreadable`, `config/master_key_invalid`, `config/ldap_url_not_ldaps`,
-`config/test_directory_in_production`, `config/anchor_interval_too_long`.
+`config/test_directory_in_production`, `config/anchor_interval_too_long`, and since M14
+`config/oauth_ttl_out_of_range`, `config/degraded_scripts_refused` (any `*ALLOW_DEGRADED*`
+variable), `config/sandbox_bin_invalid`, `config/script_limits_out_of_range`. Out-of-range
+registration and export limits are `config/invalid_value`.
+
+Running the server outside the image (for example `cargo run -p atlas-duck-server -- serve` on a
+development machine) needs `ATLAS_DUCK_SANDBOX_BIN` to name an existing file; where the sandbox
+cannot start, `/readyz` reports `scripts: not_met` and scripts answer `sandbox_unavailable`.
 
 ## Exit codes
 
@@ -122,6 +143,12 @@ Every `/api` error is `{"error": {"code": "<area>/<name>", "message": "<fixed te
 | `pat/check_failed`, `pat/instance_unreachable` | 422, 502 | the token check against the instance |
 | `api_key/name_invalid`, `api_key/scope_invalid`, `api_key/expiry_out_of_range`, `api_key/limit_reached` | 400, 400, 400, 409 | API key creation |
 | `store/unavailable`, `internal` | 503, 500 | server faults |
+| `oauth/request_unknown`, `oauth/request_expired`, `oauth/grant_unknown`, `oauth/disabled` | 404, 410, 404, 404 | consent and connected apps (M14) |
+| `audit/user_unknown`, `audit/read_not_recorded` | 404, 503 | auditor reads (M14) |
+| `audit/export_busy`, `audit/export_unknown`, `audit/export_expired`, `audit/export_failed` | 409, 404, 410, 500 | export jobs (M14) |
+
+The OAuth protocol endpoints (`/oauth/token`, `/oauth/revoke`, `/oauth/register`) answer in the
+RFC error formats instead ([oauth.md](oauth.md)).
 
 An MCP tool outside the key's scopes answers a tool-result envelope with `error.code =
 "scope_missing"`; a pending request's envelope carries `meta.approval_url`.
