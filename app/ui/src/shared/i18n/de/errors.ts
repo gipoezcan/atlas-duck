@@ -31,7 +31,7 @@ export const errors: Dict['errors'] = {
     cancelled: 'Die Anfrage wurde abgebrochen.',
     abandoned: 'Die Anfrage wurde verworfen.',
     unknown_request: 'Diese Anfrage gibt es nicht.',
-    protocol_error: 'Die App und das Kommandozeilenwerkzeug konnten die Nachricht nicht abstimmen.',
+    protocol_error: 'Die App und das Kommandozeilenwerkzeug haben sich nicht verstanden: Die Nachricht hatte ein unerwartetes Format.',
   },
   cmd: {
     invalid_argument: 'Die Anfrage enthält einen ungültigen Wert.',
