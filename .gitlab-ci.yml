@@ -428,9 +428,10 @@ deploy:review:
       helmfile version || true
       echo "== helmfile template"
       helmfile -e review -f build/helmfile.yaml template --skip-deps ${ARGS} > rendered-review.yaml
-      echo "== server-side dry run"
+      echo "== server-side dry run (without helm hooks: a test Pod left by helm test is immutable)"
+      sh ci/drop-helm-hooks.sh rendered-review.yaml > rendered-review-objects.yaml
       $K apply --server-side --field-manager=atlas-duck-ci --dry-run=server --force-conflicts --validate=false \
-        -f rendered-review.yaml > /dev/null
+        -f rendered-review-objects.yaml > /dev/null
       echo "== helmfile apply"
       helmfile -e review -f build/helmfile.yaml apply --skip-deps ${ARGS}
       echo "REVIEW_URL=https://${HOST}" > review.env
@@ -525,9 +526,10 @@ deploy:production:
       helmfile version || true
       echo "== helmfile template"
       helmfile -e production -f build/helmfile.yaml template --skip-deps ${ARGS} > rendered-production.yaml
-      echo "== server-side dry run"
+      echo "== server-side dry run (without helm hooks: a test Pod left by helm test is immutable)"
+      sh ci/drop-helm-hooks.sh rendered-production.yaml > rendered-production-objects.yaml
       $K apply --server-side --field-manager=atlas-duck-ci --dry-run=server --force-conflicts --validate=false \
-        -f rendered-production.yaml > /dev/null
+        -f rendered-production-objects.yaml > /dev/null
       echo "== helmfile apply"
       helmfile -e production -f build/helmfile.yaml apply --skip-deps ${ARGS}
   environment:
