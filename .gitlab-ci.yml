@@ -45,6 +45,9 @@ ui:
     # died mid-run (pipeline 43004). Two forks stay well inside.
     KUBERNETES_MEMORY_REQUEST: "6Gi"
     KUBERNETES_MEMORY_LIMIT: "8Gi"
+    # node's default heap ran out in approvals/injection.test.tsx on every GitLab run; the forks
+    # inherit this, and two of them at 3 GiB still fit the 8Gi limit.
+    NODE_OPTIONS: "--max-old-space-size=3072"
   script:
     - cd app/ui
     - npm ci --ignore-scripts
@@ -487,6 +490,8 @@ stop:review:
 deploy:production:
   <<: *deploy-base
   variables: *server-vars
+  # Automatic deploys must not skip the UI tests and checks.
+  needs: [server:version, server:image, server:publish-harbor, server:chart-package, ui, node:ci-checks, chart:test]
   rules:
     - if: $CI_COMMIT_BRANCH == "master"
       when: on_success
