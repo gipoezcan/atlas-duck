@@ -599,11 +599,21 @@ server:e2e-build:
   script:
     - rustup toolchain install
     - cargo test -p atlas-duck-server-e2e --lib --locked
+    # The `[[test]] e2e` target's executable from cargo's JSON messages: the human "Executable"
+    # line is coloured here (CARGO_TERM_COLOR=always), which broke a text match (pipeline 43122).
     - |
       set -eu
-      bin="$(cargo test -p atlas-duck-server-e2e --test e2e --no-run --locked 2>&1 \
-        | sed -n 's/.*Executable .*(\(.*\)).*/\1/p' | tail -n 1)"
-      [ -x "$bin" ] || { echo "no e2e test binary built"; exit 1; }
+      CARGO_TERM_COLOR=never cargo test -p atlas-duck-server-e2e --test e2e --no-run --locked \
+        --message-format=json > e2e-build.json
+      bin="$(grep '"reason":"compiler-artifact"' e2e-build.json \
+        | grep '"kind":\["test"\]' | grep '"name":"e2e"' \
+        | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)"
+      if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+        echo "server:e2e-build: no executable for the e2e test target in cargo's JSON output:"
+        grep '"name":"e2e"' e2e-build.json | cut -c1-400 || true
+        exit 1
+      fi
+      echo "e2e test binary: $bin"
       mkdir -p e2e-bin && cp "$bin" e2e-bin/e2e
   artifacts:
     paths: [e2e-bin/e2e]
