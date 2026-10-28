@@ -8,7 +8,11 @@ metadata:
   name: {{ include "atlas-duck.fullname" . }}
   labels:
     {{- include "atlas-duck.labels" . | nindent 4 }}
-  {{- with .Values.ingress.annotations }}
+  {{- $annotations := deepCopy (.Values.ingress.annotations | default dict) }}
+  {{- if .Values.ingress.useClusterIp }}
+  {{- $_ := set $annotations "nginx.org/use-cluster-ip" "true" }}
+  {{- end }}
+  {{- with $annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}

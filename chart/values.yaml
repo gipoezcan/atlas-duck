@@ -74,6 +74,10 @@ ingress:
     nginx.org/proxy-read-timeout: "3600s"
     nginx.org/proxy-send-timeout: "3600s"
     nginx.org/client-max-body-size: "1m"
+  # nginx.org/use-cluster-ip: the controller proxies to the Service's ClusterIP instead of the pod
+  # endpoints it caches; after a Recreate rollout some controller replicas kept the old pod's
+  # endpoints and answered 502 for hours (docs/server/deployment.md, "Known cluster issues").
+  useClusterIp: true
   tls:
     # The TLS Secret's name (PD-M13-6). Required. The chart never renders a Secret; with
     # certManager.issuer set it renders a cert-manager Certificate that fills this Secret.

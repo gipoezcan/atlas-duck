@@ -44,17 +44,3 @@ resources:
   limits:
     cpu: "1"
     memory: 1Gi
-
-# Known cluster issue (2026-10-28): pods on node k3s-gip-pair1-2 are unreachable from other nodes
-# (ingress 502, helm test "connection refused", while a port-forward to the pod works). Keep the
-# server off that node until the cluster admins fix cross-node traffic to it (admin ticket:
-# TICKET-TBD; docs/server/deployment.md "Known cluster issues"). Remove this block then.
-affinity:
-  nodeAffinity:
-    requiredDuringSchedulingIgnoredDuringExecution:
-      nodeSelectorTerms:
-        - matchExpressions:
-            - key: kubernetes.io/hostname
-              operator: NotIn
-              values:
-                - k3s-gip-pair1-2

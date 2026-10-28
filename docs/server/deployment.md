@@ -176,12 +176,15 @@ review environment.
 
 ## Known cluster issues
 
-- **Node `k3s-gip-pair1-2` (2026-10-28):** a pod scheduled there is unreachable from other
-  nodes. The ingress answers 502, and a `helm test` pod elsewhere gets "connection refused",
-  while a port-forward to the pod works and `/readyz` is ready. Once it took a long, unknown
-  delay before the pod became reachable. Until the cluster admins fix cross-node traffic to that
-  node (admin ticket: TICKET-TBD), the review and production values keep the server and its test
-  pod off it with a required node affinity (`kubernetes.io/hostname NotIn [k3s-gip-pair1-2]`).
-  The data volume is NFS, so the pod may run on any other node. Remove the affinity once the
-  ticket is closed. The review smoke retries `/healthz` through the ingress for up to 3 minutes
-  and logs each try.
+- **Stale ingress endpoints after a rollout (2026-10-27/28):** after a `Recreate` rollout the
+  ingress kept answering 502 for many requests while the new pod was ready: a port-forward
+  worked, `/readyz` was ready, and some requests through the ingress got 200. The likely cause is
+  that some nginx.org ingress-controller replicas keep the old pod's endpoints, and once it took
+  hours to heal. The node the pod ran on made no difference. Mitigation: the chart sets
+  `nginx.org/use-cluster-ip: "true"` (value `ingress.useClusterIp`, default true), so the
+  controller proxies to the Service's ClusterIP and kube-proxy picks the current pod. The
+  annotation needs a recent NGINX Ingress Controller; an older one ignores it. The review smoke
+  needs three 200s in a row from `/healthz` through the ingress, within 3 minutes, before it goes
+  on, and logs each try. If 502s persist with the annotation in place, report it to the cluster
+  admins with the controller replica list. The chart's `nodeSelector`, `affinity` and
+  `tolerations` values stay available for scheduling rules.

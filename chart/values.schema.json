@@ -61,6 +61,7 @@
         "className": { "type": "string" },
         "host": { "type": "string" },
         "annotations": { "type": "object" },
+        "useClusterIp": { "type": "boolean" },
         "tls": {
           "type": "object",
           "properties": {
