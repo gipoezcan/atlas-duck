@@ -40,6 +40,7 @@ import type {
   RunningScriptView,
   SettingChange,
   SettingsGet,
+  UiLang,
   SettingsView,
   StatusLine,
   VerifyNow,
@@ -81,6 +82,7 @@ import {
   isRetestOutcome,
   isRunningScriptView,
   isSettingsGet,
+  isUiLang,
   isSettingsView,
   isStatusLine,
   isVerifyNow,
@@ -212,6 +214,11 @@ export function previewFetch(
 
 export function settingsGet(): Promise<SettingsGet> {
   return call('settings_get', {}, isSettingsGet);
+}
+
+/** M15 T3 (PD-294): the UI language; answered without a serving core (every React window). */
+export function uiLangGet(): Promise<UiLang> {
+  return call('ui_lang_get', {}, isUiLang);
 }
 
 export function settingsApply(changes: SettingChange[]): Promise<SettingsView> {

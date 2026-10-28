@@ -15,6 +15,7 @@ pub mod credential;
 pub mod csp;
 pub mod diag;
 pub mod early_argv;
+pub mod i18n;
 pub mod os_hooks;
 pub mod recovery_tier;
 pub mod removal;
@@ -30,6 +31,7 @@ pub mod status;
 pub mod testing;
 pub mod tray;
 pub mod tray_host;
+pub mod ui_lang;
 pub mod ui_sink;
 pub mod windows;
 pub mod wizard;
@@ -225,8 +227,18 @@ pub fn run_gui(background: bool) -> ! {
             let tray_host = tray_host::check_tray_host();
             tray_host::log_tray_host(tray_host);
 
+            // M15 T3 (PD-294): the language preference lives in the local data dir of `Ready`;
+            // every other state uses `auto` (the OS locale).
+            let ui_lang_dir = match &state {
+                StartupState::Ready { data, .. } => Some(data.path().to_path_buf()),
+                _ => None,
+            };
             if let Some(summary) = state.summary() {
-                app.manage(AppState::new(summary, tray_host).with_startup_text(tray_status));
+                app.manage(
+                    AppState::new(summary, tray_host)
+                        .with_startup_text(tray_status)
+                        .with_ui_lang_dir(ui_lang_dir),
+                );
             }
             // M6 T6: the window registry. In `Ready` the cold start opens its window once
             // `serve::start` finished (§2.5); in every other state nothing waits.

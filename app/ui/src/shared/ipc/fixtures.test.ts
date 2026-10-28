@@ -482,6 +482,14 @@ describe('fixtures validate against their TS types', () => {
     expect(isSettingsGet({ ...full, cli_dir_on_path: 'yes' })).toBe(false);
     expect(isSettingsGet({ ...full, cli_dir_on_path: 1 })).toBe(false);
     expect(isSettingsGet({ ...full, cli_dir_on_path: undefined })).toBe(false);
+    // M15 T3: `ui_lang` is exactly `{pref, lang}`; every preference and both languages are in the
+    // fixtures, anything else is refused.
+    expect(new Set(settingsGet.map((g) => g.ui_lang.pref))).toEqual(new Set(['auto', 'en', 'de']));
+    expect(new Set(settingsGet.map((g) => g.ui_lang.lang))).toEqual(new Set(['en', 'de']));
+    expect(isSettingsGet({ ...full, ui_lang: undefined })).toBe(false);
+    expect(isSettingsGet({ ...full, ui_lang: { pref: 'fr', lang: 'en' } })).toBe(false);
+    expect(isSettingsGet({ ...full, ui_lang: { pref: 'auto', lang: 'auto' } })).toBe(false);
+    expect(isSettingsGet({ ...full, ui_lang: { pref: 'de', lang: 'de', extra: 1 } })).toBe(false);
     expect(isSettingsGet({ ...full, settings: { ...full?.settings, attention_mode: 'loud' } })).toBe(false);
     expect(isSettingsGet({ ...full, settings: { ...full?.settings, config_read_only: { kind: 'x', text: '' } } })).toBe(false);
     // `conn` is written only for a tls, proxy or network failure.

@@ -54,6 +54,21 @@ pub fn emit_settings_changed<R: Runtime>(app: &AppHandle<R>) {
     EventOut::emit(app, EVENT_SETTINGS_CHANGED, Value::Null);
 }
 
+/// The event every React window re-reads `ui_lang_get` on (M15 T3, PD-294): the language
+/// preference changed. App-owned, not a core event; `{lang, pref}` (two fixed words).
+pub const EVENT_LANG_CHANGED: &str = "lang_changed";
+
+/// The payload of `lang_changed`: exactly `{lang, pref}`.
+pub fn lang_changed_payload(ui: crate::state::UiLang) -> Value {
+    json!({ "lang": ui.lang, "pref": ui.pref })
+}
+
+/// Tells every window that the UI language changed. Recorded like every payload a webview can
+/// receive (S-16).
+pub fn emit_lang_changed<R: Runtime>(app: &AppHandle<R>, ui: crate::state::UiLang) {
+    EventOut::emit(app, EVENT_LANG_CHANGED, lang_changed_payload(ui));
+}
+
 /// The event the setup page re-reads `wizard_state` on (Δ1, M6 T23): a step ended, the serving
 /// state changed, a request was refused (the header's count), the credential window went. App-owned,
 /// not a core event; no payload.
@@ -244,6 +259,21 @@ mod tests {
         assert_eq!(
             got,
             vec![("status_banner".to_owned(), json!({ "line_ids": [] }))]
+        );
+    }
+
+    /// M15 T3: `lang_changed` carries two fixed words and nothing else.
+    #[test]
+    fn lang_changed_payload_is_lang_and_pref() {
+        use crate::i18n::{Lang, LangPref};
+        use crate::state::UiLang;
+        let ui = UiLang {
+            pref: LangPref::Auto,
+            lang: Lang::De,
+        };
+        assert_eq!(
+            lang_changed_payload(ui),
+            json!({ "lang": "de", "pref": "auto" })
         );
     }
 

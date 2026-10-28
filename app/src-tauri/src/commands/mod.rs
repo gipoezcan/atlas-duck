@@ -103,6 +103,7 @@ pub fn register<R: Runtime>(builder: Builder<R>) -> Builder<R> {
         settings::retest_token,
         settings::settings_apply,
         settings::settings_get,
+        settings::ui_lang_get,
         setup::wizard_anchor_dir,
         setup::wizard_anchor_dir_clear,
         setup::wizard_begin,

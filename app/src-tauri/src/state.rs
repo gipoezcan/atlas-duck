@@ -1,7 +1,8 @@
 //! App-wide state managed by Tauri (`app.manage`). Later milestones read it and add fields.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 
 use atlas_duck_audit::lock::InstanceLock;
 use atlas_duck_core::StoreHealthView;
@@ -10,6 +11,7 @@ use atlas_duck_ipc::server::ShutdownSignal;
 use atlas_duck_sandbox_host::probe::{FloorVerdict, ProbeReport};
 use tauri::async_runtime::JoinHandle;
 
+use crate::i18n::{self, Lang, LangPref};
 use crate::sandbox_probe::{ProbeHolder, canonical_worker};
 use crate::script_glue::{InstanceSource, ScriptInputs, StatusPing};
 use crate::serve::{ServeState, ShutdownOutcome};
@@ -78,6 +80,28 @@ pub struct AppState {
     /// Rebuilds the tray menu and tooltip; registered by `setup` once the tray exists (the status
     /// code is generic over the runtime, the tray is not).
     tray_refresh: OnceLock<TrayRefresh>,
+    /// M15 T3 (PD-294): the folder of the `ui-lang` file (the pinned local data dir; `None`
+    /// outside `Ready`, where nothing can be stored and the preference is `auto`).
+    ui_lang_dir: Option<PathBuf>,
+    /// The language preference and the language it resolved to.
+    lang: RwLock<UiLang>,
+}
+
+/// The desktop language preference and its resolved language (`lang_changed`'s payload).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct UiLang {
+    pub pref: LangPref,
+    pub lang: Lang,
+}
+
+impl UiLang {
+    /// `pref` resolved against the OS locale ([`i18n::os_locale`]).
+    pub fn of(pref: LangPref) -> UiLang {
+        UiLang {
+            pref,
+            lang: i18n::resolve(pref, i18n::os_locale().as_deref()),
+        }
+    }
 }
 
 /// What [`AppState::set_tray_refresh`] holds.
@@ -101,7 +125,35 @@ impl AppState {
             tray_hint_shown: AtomicBool::new(false),
             health: Mutex::new(None),
             tray_refresh: OnceLock::new(),
+            ui_lang_dir: None,
+            lang: RwLock::new(UiLang::of(LangPref::Auto)),
         }
+    }
+
+    /// M15 T3: the `ui-lang` folder; the stored preference is read from it now.
+    pub fn with_ui_lang_dir(mut self, dir: Option<PathBuf>) -> AppState {
+        let pref = dir.as_deref().map(crate::ui_lang::load).unwrap_or_default();
+        self.lang = RwLock::new(UiLang::of(pref));
+        self.ui_lang_dir = dir;
+        self
+    }
+
+    pub fn ui_lang_dir(&self) -> Option<&Path> {
+        self.ui_lang_dir.as_deref()
+    }
+
+    /// The language preference and the language it resolved to.
+    pub fn ui_lang(&self) -> UiLang {
+        *self.lang.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The language of the Rust-rendered texts (T10).
+    pub fn lang(&self) -> Lang {
+        self.ui_lang().lang
+    }
+
+    pub fn set_ui_lang(&self, ui: UiLang) {
+        *self.lang.write().unwrap_or_else(PoisonError::into_inner) = ui;
     }
 
     /// Registers the tray rebuild ([`AppState::refresh_tray`]); the first registration wins.

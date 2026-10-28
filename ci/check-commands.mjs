@@ -48,6 +48,7 @@ export const WINDOW_COMMANDS = {
     "open_window",
     "quit",
     "app_status",
+    "ui_lang_get",
   ],
   settings: [
     "settings_get",
@@ -83,6 +84,8 @@ export const WINDOW_COMMANDS = {
     "re_anchor",
     "orphan_installs",
     "forget_install",
+    // M15 T3 (PD-294): the UI language, read by every React window (not the credential page, PD-71).
+    "ui_lang_get",
   ],
   // M6: `verify_now` (P8); M10 T12 (Δ-M10-3, L201): the queries, the payload view, the incident
   // acknowledgement and the export/backup triggers (`backup_trigger` also in settings, T13).
@@ -96,9 +99,10 @@ export const WINDOW_COMMANDS = {
     "export_trigger",
     "export_cancel",
     "backup_trigger",
+    "ui_lang_get",
   ],
-  running_scripts: ["running_list", "running_kill"],
-  onboarding: ["onboarding_text"],
+  running_scripts: ["running_list", "running_kill", "ui_lang_get"],
+  onboarding: ["onboarding_text", "ui_lang_get"],
   credential: [
     "submit_secret",
     "credential_context",
@@ -130,14 +134,15 @@ export const WINDOW_COMMANDS = {
     "cli_install",
     "onboarding_text",
     "quit",
+    "ui_lang_get",
   ],
 };
 
 /**
  * The windows that listen to events (C.10 + Δ1 events): they, and only they, get both. The Audit
- * window since M10 T12 (Δ-M10-3: `audit_job` progress, `audit_changed`).
+ * window since M10 T12 (Δ-M10-3: `audit_job` progress, `audit_changed`); Onboarding since M15 T3 (`lang_changed`).
  */
-export const LISTENING_WINDOWS = ["approvals", "settings", "audit", "running_scripts", "credential", "setup"];
+export const LISTENING_WINDOWS = ["approvals", "settings", "audit", "running_scripts", "credential", "setup", "onboarding"];
 
 /** The only non-app permissions a capability file may hold, and the IPC command each grants. */
 export const EVENT_PERMISSIONS = {

@@ -8,6 +8,7 @@ import { AnchorDir } from './AnchorDir';
 import { InstanceForm } from './InstanceForm';
 import { Cli } from './Cli';
 import { Instances } from './Instances';
+import { Language } from './Language';
 import { Limits } from './Limits';
 import { OldInstalls, Recovery } from './Recovery';
 import { Removal } from './Removal';
@@ -81,6 +82,7 @@ export function Settings() {
     cli_installed: cliInstalled,
     cli_removable: cliRemovable,
     cli_dir_on_path: cliDirOnPath,
+    ui_lang: uiLang,
   } = data;
   const banner = settings.config_read_only;
   const readOnly = banner !== null;
@@ -104,6 +106,8 @@ export function Settings() {
       {/* A read-only config disables the controls that write config.toml (each section wraps them
           in a Guard). Re-test, Add/Replace token and the prune button stay on: core refuses
           ConfigReadOnly only for config-writing operations. */}
+      {/* M15 T3: app-side, not in config.toml, so a read-only config does not disable it. */}
+      <Language uiLang={uiLang} onChanged={reload} />
       <Instances instances={instances} onChanged={reload} readOnly={readOnly} />
       <InstanceForm onAdded={reload} readOnly={readOnly} />
       <Limits view={settings} onChanged={reload} readOnly={readOnly} />

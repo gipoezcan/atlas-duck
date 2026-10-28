@@ -31,6 +31,7 @@
     "allow-retest-token",
     "allow-settings-apply",
     "allow-settings-get",
+    "allow-ui-lang-get",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

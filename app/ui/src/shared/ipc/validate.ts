@@ -61,6 +61,7 @@ import type {
   RetestOutcome,
   RunningScriptView,
   SettingsGet,
+  UiLang,
   SettingsView,
   StatusLine,
   VerifyNow,
@@ -383,6 +384,10 @@ const isConfinement = (v: unknown): v is Confinement =>
     degraded_allowed: isBool,
   });
 
+/** M15 T3: exactly `{pref, lang}`, each a closed word. */
+export const isUiLang = (v: unknown): v is UiLang =>
+  closed(v, { pref: oneOf('auto', 'en', 'de'), lang: oneOf('en', 'de') });
+
 export const isSettingsGet = (v: unknown): v is SettingsGet =>
   fields(v, {
     settings: isSettingsView,
@@ -391,6 +396,7 @@ export const isSettingsGet = (v: unknown): v is SettingsGet =>
     cli_installed: isBool,
     cli_removable: isBool,
     cli_dir_on_path: (b): b is boolean | null => b === null || isBool(b),
+    ui_lang: isUiLang,
   });
 
 export const isRetestOutcome = (v: unknown): v is RetestOutcome => {

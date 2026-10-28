@@ -12,6 +12,7 @@
     "allow-export-cancel",
     "allow-export-trigger",
     "allow-verify-now",
+    "allow-ui-lang-get",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

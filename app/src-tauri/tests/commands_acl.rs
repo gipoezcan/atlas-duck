@@ -1902,7 +1902,7 @@ fn shell_commands_granted_to_their_windows_only() -> TestResult {
         .map(|label| window(&app, label).map(|w| (label, w)))
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
-    let table: [(&str, Value, &[&str]); 4] = [
+    let table: [(&str, Value, &[&str]); 5] = [
         ("verify_now", json!({}), &["audit"]),
         ("running_list", json!({}), &["running_scripts"]),
         (
@@ -1911,6 +1911,19 @@ fn shell_commands_granted_to_their_windows_only() -> TestResult {
             &["running_scripts"],
         ),
         ("onboarding_text", json!({}), &["onboarding", "setup"]),
+        // M15 T3 (PD-294): every React window, without a serving core.
+        (
+            "ui_lang_get",
+            json!({}),
+            &[
+                "approvals",
+                "settings",
+                "audit",
+                "running_scripts",
+                "onboarding",
+                "setup",
+            ],
+        ),
     ];
     for (cmd, body, granted) in &table {
         assert!(COMMANDS.contains(cmd), "{cmd} is not in COMMANDS");
@@ -1918,6 +1931,12 @@ fn shell_commands_granted_to_their_windows_only() -> TestResult {
             let r = invoke(w, cmd, body.clone());
             if !granted.contains(label) {
                 assert!(acl_refused(&r), "{label}: {cmd} {r:?}");
+            } else if *cmd == "ui_lang_get" {
+                // No AppState here: uto, resolved against this machine's locale.
+                let v = r.as_ref().map_err(|e| format!("{label}: {e:?}"))?;
+                assert_eq!(v["pref"], "auto", "{label}");
+                assert!(v["lang"] == "en" || v["lang"] == "de", "{label}: {v}");
+                assert_eq!(v.as_object().map(|o| o.len()), Some(2), "{label}: {v}");
             } else if *cmd == "onboarding_text" {
                 let sections = r
                     .as_ref()
@@ -2153,12 +2172,15 @@ mod settings_commands {
     use atlas_duck_app_lib::commands::settings::{
         CliState, ConfinementDto, InstanceAcceptUrlChangeArgs, InstanceAddArgs,
         InstanceChangeUrlArgs, InstanceConfirmConfigArgs, RetestOutcome, RetestTokenArgs,
-        SettingChanges, cli_install_dto, cli_state_of, cli_uninstall_dto, conclude_instance_call,
-        instance_accept_url_change_dto, instance_add_dto, instance_change_url_dto,
-        instance_confirm_config_dto, instance_set_proxy_dto, pat_open_error, prune_backlog_now_dto,
-        retest_token_dto, settings_apply_dto, settings_get_dto,
+        SettingChanges, apply_ui_lang, cli_install_dto, cli_state_of, cli_uninstall_dto,
+        conclude_instance_call, instance_accept_url_change_dto, instance_add_dto,
+        instance_change_url_dto, instance_confirm_config_dto, instance_set_proxy_dto,
+        pat_open_error, prune_backlog_now_dto, retest_token_dto, settings_apply_dto,
+        settings_get_dto,
     };
     use atlas_duck_app_lib::credential::{PatOpenError, open_for_pat};
+    use atlas_duck_app_lib::i18n::{Lang, LangPref};
+    use atlas_duck_app_lib::state::UiLang;
     use atlas_duck_atlassian::testing::{
         MockDc, TEST_USER, TEST_USER_KEY, XAuser, generate_ca_pem,
     };
@@ -2211,6 +2233,110 @@ mod settings_commands {
 
     fn no_ca() -> Result<Vec<u8>, CommandError> {
         Err(CommandError::Internal)
+    }
+
+    /// Core's settings admin, with every call recorded by name.
+    struct Recording {
+        inner: std::sync::Arc<dyn atlas_duck_core::SettingsAdmin>,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl Recording {
+        fn note(&self, name: &'static str) {
+            if let Ok(mut c) = self.calls.lock() {
+                c.push(name);
+            }
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().map(|c| c.clone()).unwrap_or_default()
+        }
+    }
+
+    impl atlas_duck_core::SettingsAdmin for Recording {
+        fn view(&self) -> atlas_duck_core::SettingsView {
+            self.note("view");
+            self.inner.view()
+        }
+        fn apply(
+            &self,
+            changes: Vec<atlas_duck_core::SettingChangeReq>,
+        ) -> Result<atlas_duck_core::SettingsView, SettingsError> {
+            self.note("apply");
+            self.inner.apply(changes)
+        }
+        fn prune_backlog_now(&self) -> Result<atlas_duck_core::PruneReport, SettingsError> {
+            self.note("prune_backlog_now");
+            self.inner.prune_backlog_now()
+        }
+        fn verify_now(&self) -> atlas_duck_core::VerifyNow {
+            self.note("verify_now");
+            self.inner.verify_now()
+        }
+        fn record_app_change(
+            &self,
+            key: &str,
+            old: Value,
+            new: Value,
+        ) -> Result<(), SettingsError> {
+            self.note("record_app_change");
+            self.inner.record_app_change(key, old, new)
+        }
+    }
+
+    /// M15 T3 (PD-294): the language change is the app's. Alone, core is only read (no `apply`, no
+    /// `record_app_change`, no audit record, config.toml untouched); with core changes, core gets
+    /// exactly those. The preference lands in the `ui-lang` file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn apply_ui_lang_does_not_touch_core() -> TestResult {
+        let h = rig(vec![]).await?;
+        let rec = std::sync::Arc::new(Recording {
+            inner: h.core().settings(),
+            calls: std::sync::Mutex::default(),
+        });
+        let before_file = std::fs::read_to_string(h.config_path())?;
+        let events = h.event_count().await?;
+
+        let c = changes(json!([{"key": "ui_lang", "value": "de"}]))?;
+        assert_eq!((c.core.len(), c.ui_lang), (0, Some(LangPref::De)));
+        let dir = tempfile::tempdir()?;
+        let ui = apply_ui_lang(Some(dir.path()), LangPref::De)?;
+        assert_eq!(
+            ui,
+            UiLang {
+                pref: LangPref::De,
+                lang: Lang::De
+            }
+        );
+        assert_eq!(std::fs::read_to_string(dir.path().join("ui-lang"))?, "de");
+        let r = rec.clone();
+        let view = blocking(move || settings_apply_dto(&*r, c)).await??;
+        assert_eq!(view, h.core().settings().view());
+        assert_eq!(rec.calls(), vec!["view"]);
+        assert_eq!(
+            h.event_count().await?,
+            events,
+            "no audit record of any type"
+        );
+        assert_eq!(std::fs::read_to_string(h.config_path())?, before_file);
+
+        // Together with a core change, core sees only its own.
+        let c = changes(json!([
+            {"key": "ui_lang", "value": "en"},
+            {"key": "jira_comments_cap", "value": 40},
+        ]))?;
+        assert_eq!(c.ui_lang, Some(LangPref::En));
+        let r = rec.clone();
+        let view = blocking(move || settings_apply_dto(&*r, c)).await??;
+        assert_eq!(view.limits.jira_comments_cap, 40);
+        assert_eq!(rec.calls(), vec!["view", "apply"]);
+
+        // No folder (a state that stores nothing): refused, nothing written.
+        assert_eq!(
+            apply_ui_lang(None, LangPref::De),
+            Err(CommandError::Internal)
+        );
+        Ok(())
     }
 
     /// I-31 through the commands: a new instance, a URL change, a limit raise and the backlog prune
@@ -2881,6 +3007,7 @@ mod settings_commands {
                 &*i,
                 ConfinementDto::pending(),
                 cli_state(false, true, None),
+                UiLang::of(LangPref::Auto),
             )
         })
         .await?;
@@ -2919,6 +3046,7 @@ mod settings_commands {
                 &*i,
                 ConfinementDto::pending(),
                 cli_state(true, false, Some(false)),
+                UiLang::of(LangPref::Auto),
             )
         })
         .await?;
@@ -3047,7 +3175,13 @@ mod settings_commands {
             let confinement = ConfinementDto::of_probe(state.probe_report(), allowed);
             let (s, i) = (h.core().settings(), h.instances());
             let got = blocking(move || {
-                settings_get_dto(&*s, &*i, confinement, cli_state(false, true, None))
+                settings_get_dto(
+                    &*s,
+                    &*i,
+                    confinement,
+                    cli_state(false, true, None),
+                    UiLang::of(LangPref::Auto),
+                )
             })
             .await?;
             // The core started and answers while the probe says the memory read got through.
@@ -5113,6 +5247,8 @@ const S09_GRANTS: [(&str, &[&str]); 7] = [
             "open_window",
             "quit",
             "app_status",
+            // M15 T3 (PD-294): the UI language, in every React window.
+            "ui_lang_get",
         ],
     ),
     (
@@ -5150,6 +5286,7 @@ const S09_GRANTS: [(&str, &[&str]); 7] = [
             "re_anchor",
             "orphan_installs",
             "forget_install",
+            "ui_lang_get",
         ],
     ),
     (
@@ -5166,10 +5303,14 @@ const S09_GRANTS: [(&str, &[&str]); 7] = [
             "export_trigger",
             "export_cancel",
             "backup_trigger",
+            "ui_lang_get",
         ],
     ),
-    ("running_scripts", &["running_list", "running_kill"]),
-    ("onboarding", &["onboarding_text"]),
+    (
+        "running_scripts",
+        &["running_list", "running_kill", "ui_lang_get"],
+    ),
+    ("onboarding", &["onboarding_text", "ui_lang_get"]),
     (
         "credential",
         &[
@@ -5205,6 +5346,7 @@ const S09_GRANTS: [(&str, &[&str]); 7] = [
             "cli_install",
             "onboarding_text",
             "quit",
+            "ui_lang_get",
         ],
     ),
 ];
@@ -5309,26 +5451,28 @@ fn s09_command_outside_grant_rejected_every_window() -> TestResult {
     assert_eq!(refusals, 8 * COMMANDS.len() - grants);
 
     // The event commands follow the same authority: the windows that listen hold both, the others
-    // neither. The Audit window listens since M10 T12 (`audit_job` progress, `audit_changed`).
+    // neither. The Audit window listens since M10 T12 (`audit_job` progress, `audit_changed`), the
+    // Onboarding window since M15 T3 (`lang_changed`).
     let listen = json!({"event": "queue_changed", "target": {"kind": "Any"}, "handler": 0});
-    let audit = s09_window(&app, "audit")?;
-    let r = invoke(&audit, "plugin:event|listen", listen.clone());
-    assert!(
-        !r.as_ref()
-            .err()
-            .is_some_and(|e| e.as_str().is_some_and(|s| s.contains("not allowed"))),
-        "audit: plugin:event|listen {r:?}"
-    );
-    for label in ["onboarding", "unknown"] {
+    for label in ["audit", "onboarding"] {
         let w = s09_window(&app, label)?;
         let r = invoke(&w, "plugin:event|listen", listen.clone());
         assert!(
-            r.as_ref()
+            !r.as_ref()
                 .err()
                 .is_some_and(|e| e.as_str().is_some_and(|s| s.contains("not allowed"))),
             "{label}: plugin:event|listen {r:?}"
         );
     }
+    // A window without a capability file holds neither.
+    let w = s09_window(&app, "unknown")?;
+    let r = invoke(&w, "plugin:event|listen", listen);
+    assert!(
+        r.as_ref()
+            .err()
+            .is_some_and(|e| e.as_str().is_some_and(|s| s.contains("not allowed"))),
+        "unknown: plugin:event|listen {r:?}"
+    );
     Ok(())
 }
 
@@ -5344,6 +5488,7 @@ fn s09_running_scripts_grants_unchanged() -> TestResult {
         [
             "allow-running-kill",
             "allow-running-list",
+            "allow-ui-lang-get",
             "core:event:allow-listen",
             "core:event:allow-unlisten",
         ]
@@ -6022,6 +6167,7 @@ fn s09_cases() -> Vec<S09Case> {
             ),
         ),
         case("settings_get", "settings", json!({}), whole(), pad()),
+        case("ui_lang_get", "settings", json!({}), whole(), pad()),
         case(
             "submit_secret",
             "credential",

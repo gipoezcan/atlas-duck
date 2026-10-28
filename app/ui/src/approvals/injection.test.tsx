@@ -67,6 +67,8 @@ const DISCRIMINANTS = new Set([
   // page sends back with "Forget"; a `free` run keeps it valid so the list, the buttons and the
   // `forgotten` answer are reached. The per-path pass poisons it, and `all` poisons it with everything.
   'install_id',
+  // M15 T3: the UI language preference and the language it resolves to (closed words).
+  'pref', 'lang',
 ]);
 
 /** The one discriminator path a `free` run poisons as well (the per-path prototype pass), or null. */

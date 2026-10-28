@@ -35,12 +35,14 @@ use atlas_duck_app_lib::commands::{
     ReAnchorFailure, RestoreFailure,
 };
 use atlas_duck_app_lib::credential::{PatTarget, Purpose};
+use atlas_duck_app_lib::i18n::{Lang, LangPref};
 use atlas_duck_app_lib::recovery_tier::{
     AnchorDirDto, ForgottenDto, OrphanInstallDto, ReAnchoredDto,
 };
 use atlas_duck_app_lib::removal::{
     BackupAnswer, Choice, FinishAnswer, ItemDto, RemovalDto, RemovalError,
 };
+use atlas_duck_app_lib::state::UiLang;
 use atlas_duck_app_lib::ui_sink::audit_job_payload;
 use atlas_duck_app_lib::wizard::{
     MSG_NEEDS_SECRET_SERVICE, MSG_PIN_WRITE_FAILED, MSG_PREVIOUS_CHAIN_FOUND, WizardError,
@@ -1467,6 +1469,11 @@ fn settings_gets() -> Vec<SettingsGet> {
             cli_installed: true,
             cli_removable: true,
             cli_dir_on_path: Some(true),
+            // M15 T3: every preference and both languages are in the fixtures.
+            ui_lang: UiLang {
+                pref: LangPref::Auto,
+                lang: Lang::De,
+            },
         },
         SettingsGet {
             settings: views.next().unwrap_or_else(|| unreachable!()),
@@ -1475,6 +1482,10 @@ fn settings_gets() -> Vec<SettingsGet> {
             cli_installed: false,
             cli_removable: true,
             cli_dir_on_path: Some(false),
+            ui_lang: UiLang {
+                pref: LangPref::Auto,
+                lang: Lang::En,
+            },
         },
         // deb/rpm: the CLI is in `/usr/bin` and nothing can be removed.
         SettingsGet {
@@ -1484,6 +1495,10 @@ fn settings_gets() -> Vec<SettingsGet> {
             cli_installed: true,
             cli_removable: false,
             cli_dir_on_path: None,
+            ui_lang: UiLang {
+                pref: LangPref::De,
+                lang: Lang::De,
+            },
         },
         // The degraded state: the setting on (the first view) and an unmet floor.
         SettingsGet {
@@ -1494,6 +1509,10 @@ fn settings_gets() -> Vec<SettingsGet> {
             cli_removable: true,
             // Installed to ~/.local/bin, which this process's PATH does not have.
             cli_dir_on_path: Some(false),
+            ui_lang: UiLang {
+                pref: LangPref::En,
+                lang: Lang::En,
+            },
         },
     ]
 }

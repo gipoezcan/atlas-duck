@@ -65,6 +65,7 @@ pub const COMMANDS: &[&str] = &[
     "settings_apply",
     "settings_get",
     "submit_secret",
+    "ui_lang_get",
     "verify_now",
     "wizard_anchor_dir",
     "wizard_anchor_dir_clear",

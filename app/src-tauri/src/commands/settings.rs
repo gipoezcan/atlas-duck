@@ -44,6 +44,7 @@ use crate::cli_install::{
     self, APP_CHANGE_KEY, Artifact, Inputs, InstallError, Kind, Layout, PlatformOps, SystemOps,
 };
 use crate::credential::{self, PatOpenError};
+use crate::i18n::LangPref;
 use crate::recovery_tier;
 use crate::removal::{
     self, BackupAnswer, Choice, FinishAnswer, PluginAutostart, RemovalDto, RemovalError,
@@ -52,8 +53,8 @@ use crate::removal::{
 use crate::restore_flow;
 use crate::sandbox_probe::{floor_label, mode_label, probe_id_name, scripts_state};
 use crate::serve::{JobRefused, RestoreCancel, StoreCall};
-use crate::state::{AppState, ServeSlot};
-use crate::ui_sink::{emit_settings_changed, emit_status_changed};
+use crate::state::{AppState, ServeSlot, UiLang};
+use crate::ui_sink::{emit_lang_changed, emit_settings_changed, emit_status_changed};
 use crate::windows::{Show, WindowError};
 
 /// §7.1 (verbatim): the fixed hint beside an `http://` base URL. Core refuses the URL
@@ -195,9 +196,18 @@ impl<'de> Deserialize<'de> for PatPurposeDto {
 /// `changes`: one to [`MAX_CHANGES`] `{key, value}` settings in `SettingChangeReq`'s own closed
 /// form. Ranges are core's to check (`SettingsError::Invalid {key}`, before anything happens),
 /// except the eight script limits (M8 Δ6, PD-139): each is bounded here too, before core is called,
-/// and a refused one is `InvalidArgument` naming the limit.
+/// and a refused one is `InvalidArgument` naming the limit. M15 T3 (PD-294): one `{key: "ui_lang",
+/// value: "auto"|"en"|"de"}` is the app's own language preference, peeled off here and never
+/// handed to core (it is not a core setting and not audited).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SettingChanges(pub Vec<SettingChangeReq>);
+pub struct SettingChanges {
+    /// Core's changes, in request order (may be empty when only `ui_lang` changes).
+    pub core: Vec<SettingChangeReq>,
+    pub ui_lang: Option<LangPref>,
+}
+
+/// The `key` of the app-side language change.
+pub const KEY_UI_LANG: &str = "ui_lang";
 
 /// The name of the first limit of `req` outside its PD-139 bound (core's own table). A limit is
 /// found by the wire key `ScriptLimitsReq` serializes, which skips the unchanged ones.
@@ -238,10 +248,26 @@ impl<'de> Deserialize<'de> for SettingChanges {
                 return Err(refuse(key));
             }
         }
-        let changes = items
-            .into_iter()
-            .map(|v| SettingChangeReq::deserialize(v).map_err(|_| bad()))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut ui_lang = None;
+        let mut changes = Vec::with_capacity(items.len());
+        for item in items {
+            if item.get("key").and_then(Value::as_str) == Some(KEY_UI_LANG) {
+                let Value::Object(fields) = &item else {
+                    return Err(bad());
+                };
+                let pref = fields
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .and_then(LangPref::parse)
+                    .filter(|_| fields.len() == 2)
+                    .ok_or_else(|| refuse::<D::Error>(KEY_UI_LANG))?;
+                if ui_lang.replace(pref).is_some() {
+                    return Err(bad());
+                }
+            } else {
+                changes.push(SettingChangeReq::deserialize(item).map_err(|_| bad())?);
+            }
+        }
         for change in &changes {
             if let SettingChangeReq::ScriptLimits(req) = change
                 && let Some(key) = script_limit_out_of_bounds(req)
@@ -249,7 +275,10 @@ impl<'de> Deserialize<'de> for SettingChanges {
                 return Err(refuse(key));
             }
         }
-        Ok(SettingChanges(changes))
+        Ok(SettingChanges {
+            core: changes,
+            ui_lang,
+        })
     }
 }
 
@@ -259,6 +288,11 @@ impl<'de> Deserialize<'de> for SettingChanges {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SettingsGetArgs {}
+
+/// `ui_lang_get {}` (read-only, every React window).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiLangGetArgs {}
 
 /// `settings_apply {changes}`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -479,6 +513,8 @@ pub struct SettingsGet {
     /// CLI is in `/usr/bin`) and when this machine has no stable install layout. Settings words
     /// its status line by it.
     pub cli_dir_on_path: Option<bool>,
+    /// M15 T3 (PD-294): the language preference and the language it resolves to (app-side).
+    pub ui_lang: UiLang,
 }
 
 /// `retest_token`'s answer: "Connected as <user>" or a fixed failure class (§10.3); the instance
@@ -568,6 +604,7 @@ pub fn settings_get_dto(
     instances: &dyn InstanceAdmin,
     confinement: ConfinementDto,
     cli: CliState,
+    ui_lang: UiLang,
 ) -> SettingsGet {
     SettingsGet {
         settings: settings.view(),
@@ -576,6 +613,7 @@ pub fn settings_get_dto(
         cli_installed: cli.installed,
         cli_removable: cli.removable,
         cli_dir_on_path: cli.dir_on_path,
+        ui_lang,
     }
 }
 
@@ -674,12 +712,24 @@ pub fn cli_uninstall_dto(
 }
 
 /// `settings_apply`: core confirms each security-weakening change natively, in request order (a
-/// `Cancel` applies none), writes the audit records first and the file last.
+/// `Cancel` applies none), writes the audit records first and the file last. The language change
+/// is not core's ([`apply_ui_lang`] ran before): with nothing else, core is only read.
 pub fn settings_apply_dto(
     settings: &dyn SettingsAdmin,
     changes: SettingChanges,
 ) -> Result<SettingsView, CommandError> {
-    Ok(settings.apply(changes.0)?)
+    if changes.core.is_empty() {
+        return Ok(settings.view());
+    }
+    Ok(settings.apply(changes.core)?)
+}
+
+/// M15 T3 (PD-294): stores `pref` in `dir`'s `ui-lang` file and answers the new language. No
+/// folder (a state that stores nothing) or a failed write is `Internal`.
+pub fn apply_ui_lang(dir: Option<&Path>, pref: LangPref) -> Result<UiLang, CommandError> {
+    let dir = dir.ok_or(CommandError::Internal)?;
+    crate::ui_lang::store(dir, pref).map_err(|_| CommandError::Internal)?;
+    Ok(UiLang::of(pref))
 }
 
 /// Runs `apply` and says whether "allow scripts with degraded confinement" (as `read` reports it)
@@ -887,6 +937,7 @@ pub async fn settings_get<R: Runtime>(
     let report = app
         .try_state::<AppState>()
         .and_then(|s| s.probe_report().cloned());
+    let ui_lang = current_ui_lang(&app);
     let response = match core(&app) {
         Ok(core) => {
             let (settings, instances) = (core.settings(), core.instances());
@@ -897,7 +948,7 @@ pub async fn settings_get<R: Runtime>(
                 // Δ8: the setting is core's run policy as the glue reads it at each call.
                 let confinement =
                     ConfinementDto::of_probe(report.as_ref(), core.script_policy().allow_degraded);
-                let got = settings_get_dto(&*settings, &*instances, confinement, cli);
+                let got = settings_get_dto(&*settings, &*instances, confinement, cli, ui_lang);
                 // T36b: the view's health is the freshest read there is; the tray follows it.
                 crate::status::note_health(&noted, Some(got.settings.health.clone()));
                 Ok(got)
@@ -918,6 +969,23 @@ pub async fn settings_apply<R: Runtime>(
 ) -> Result<SettingsView, CommandError> {
     let Args(SettingsApplyArgs { changes }) = args;
     let mut flipped = false;
+    // M15 T3 (PD-294): the language is the app's, stored before core is asked (and whether core
+    // serves or not); the windows switch on `lang_changed`.
+    if let Some(pref) = changes.ui_lang {
+        let state = app.try_state::<AppState>();
+        let dir = state
+            .as_ref()
+            .and_then(|s| s.ui_lang_dir().map(Path::to_path_buf));
+        match blocking(move || apply_ui_lang(dir.as_deref(), pref)).await {
+            Ok(ui) => {
+                if let Some(state) = state {
+                    state.set_ui_lang(ui);
+                }
+                emit_lang_changed(&app, ui);
+            }
+            Err(e) => return conclude_settings_apply(&app, Err(e), false),
+        }
+    }
     let response = match core(&app) {
         Ok(core) => {
             let settings = core.settings();
@@ -940,6 +1008,25 @@ pub async fn settings_apply<R: Runtime>(
         Err(e) => Err(e),
     };
     conclude_settings_apply(&app, response, flipped)
+}
+
+/// The language preference of this process: `auto` (the OS locale) without an `AppState`.
+fn current_ui_lang<R: Runtime>(app: &AppHandle<R>) -> UiLang {
+    app.try_state::<AppState>()
+        .map(|s| s.ui_lang())
+        .unwrap_or_else(|| UiLang::of(LangPref::Auto))
+}
+
+/// `ui_lang_get {}` (M15 T3, PD-294): the language preference and the language every window
+/// renders in. Needs no serving core: the setup wizard and the windows of a locked app read it too.
+#[tauri::command]
+pub async fn ui_lang_get<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<UiLangGetArgs>,
+) -> Result<UiLang, CommandError> {
+    let Args(UiLangGetArgs {}) = args;
+    let response = Ok(current_ui_lang(&app));
+    finish(&app, response)
 }
 
 /// The end of `settings_apply`: logs a failure by kind, tells the windows that settings changed
@@ -2114,6 +2201,7 @@ mod tests {
         );
         for (name, body) in [
             ("settings_get", field::<SettingsGetArgs>(json!({"x": 1}))),
+            ("ui_lang_get", field::<UiLangGetArgs>(json!({"x": 1}))),
             (
                 "prune",
                 field::<PruneBacklogNowArgs>(json!({"force": true})),
@@ -2161,9 +2249,12 @@ mod tests {
             {"key": "legal_hold", "value": true},
         ]}))
         .unwrap_or_else(|e| panic!("{e:?}"));
-        assert_eq!(ok.changes.0.len(), 4);
-        assert_eq!(ok.changes.0[0], SettingChangeReq::JiraCommentsCap(50));
-        assert_eq!(ok.changes.0[1], SettingChangeReq::MaxPendingBytesMb(None));
+        assert_eq!(ok.changes.core.len(), 4);
+        assert_eq!(ok.changes.core[0], SettingChangeReq::JiraCommentsCap(50));
+        assert_eq!(
+            ok.changes.core[1],
+            SettingChangeReq::MaxPendingBytesMb(None)
+        );
         let seven: Vec<Value> = (0..MAX_CHANGES)
             .map(|_| json!({"key": "legal_hold", "value": false}))
             .collect();
@@ -2198,6 +2289,62 @@ mod tests {
                 json!({"changes": [{"key": "legal_hold", "value": true}], "force": true})
             ),
             Some(FIELD_PAYLOAD)
+        );
+    }
+
+    /// M15 T3 (PD-294): `ui_lang` is peeled off for the app; core gets the rest in order. A bad
+    /// value names `ui_lang`; a second one is a malformed `changes`.
+    #[test]
+    fn ui_lang_change_is_the_apps_own() {
+        let both = parse::<SettingsApplyArgs>(&json!({"changes": [
+            {"key": "legal_hold", "value": true},
+            {"key": "ui_lang", "value": "de"},
+            {"key": "jira_comments_cap", "value": 50},
+        ]}))
+        .unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(both.changes.ui_lang, Some(LangPref::De));
+        assert_eq!(
+            both.changes.core,
+            vec![
+                SettingChangeReq::LegalHold(true),
+                SettingChangeReq::JiraCommentsCap(50)
+            ]
+        );
+        for word in ["auto", "en", "de"] {
+            let only = parse::<SettingsApplyArgs>(
+                &json!({"changes": [{"key": "ui_lang", "value": word}]}),
+            )
+            .unwrap_or_else(|e| panic!("{e:?}"));
+            assert!(only.changes.core.is_empty());
+            assert_eq!(only.changes.ui_lang.map(LangPref::as_str), Some(word));
+        }
+        for bad in [
+            json!([{"key": "ui_lang", "value": "fr"}]),
+            json!([{"key": "ui_lang", "value": "DE"}]),
+            json!([{"key": "ui_lang", "value": null}]),
+            json!([{"key": "ui_lang", "value": 1}]),
+            json!([{"key": "ui_lang"}]),
+            json!([{"key": "ui_lang", "value": "de", "extra": 1}]),
+        ] {
+            assert_eq!(
+                field::<SettingsApplyArgs>(json!({ "changes": bad.clone() })),
+                Some(KEY_UI_LANG),
+                "{bad}"
+            );
+        }
+        let twice = json!([{"key": "ui_lang", "value": "de"}, {"key": "ui_lang", "value": "en"}]);
+        assert_eq!(
+            field::<SettingsApplyArgs>(json!({ "changes": twice })),
+            Some("changes")
+        );
+        // The bound counts the language change too.
+        let mut eight: Vec<Value> = (0..MAX_CHANGES)
+            .map(|_| json!({"key": "legal_hold", "value": false}))
+            .collect();
+        eight.push(json!({"key": "ui_lang", "value": "de"}));
+        assert_eq!(
+            field::<SettingsApplyArgs>(json!({ "changes": eight })),
+            Some("changes")
         );
     }
 

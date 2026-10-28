@@ -91,6 +91,10 @@
         "candidate_cache_mb"
       ],
       "retention_days": 365
+    },
+    "ui_lang": {
+      "lang": "de",
+      "pref": "auto"
     }
   },
   {
@@ -164,6 +168,10 @@
       },
       "restart_pending": [],
       "retention_days": 100
+    },
+    "ui_lang": {
+      "lang": "en",
+      "pref": "auto"
     }
   },
   {
@@ -219,6 +227,10 @@
       },
       "restart_pending": [],
       "retention_days": 100
+    },
+    "ui_lang": {
+      "lang": "de",
+      "pref": "de"
     }
   },
   {
@@ -281,6 +293,10 @@
         "candidate_cache_mb"
       ],
       "retention_days": 365
+    },
+    "ui_lang": {
+      "lang": "en",
+      "pref": "en"
     }
   }
 ]

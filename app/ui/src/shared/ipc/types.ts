@@ -3,6 +3,8 @@
 // these types and the validators honest against them. Later tasks widen them
 // when the Rust DTOs change.
 
+import type { Lang, LangPref } from '../i18n';
+
 export interface CandidateRev {
   counter: number;
   candidate_hash: string;
@@ -382,6 +384,14 @@ export interface SettingsGet {
    * tell where it is installed.
    */
   cli_dir_on_path: boolean | null;
+  /** M15 T3: the desktop language preference and the language it resolves to (app-side). */
+  ui_lang: UiLang;
+}
+
+/** `ui_lang_get`'s answer and `lang_changed`'s payload (M15 T3, PD-294). */
+export interface UiLang {
+  pref: LangPref;
+  lang: Lang;
 }
 
 /** One `settings_apply` change, in core's closed `{key, value}` form (`SettingChangeReq`). */
@@ -395,7 +405,9 @@ export type SettingChange =
   | { key: 'legal_hold'; value: boolean }
   /** The keys to change only; the others stay (Rust confirms a raise natively). */
   | { key: 'script_limits'; value: Partial<ScriptLimits> }
-  | { key: 'allow_degraded_scripts'; value: boolean };
+  | { key: 'allow_degraded_scripts'; value: boolean }
+  /** M15 T3 (PD-294): the app's own language preference; Rust never hands it to core. */
+  | { key: 'ui_lang'; value: LangPref };
 
 /** `instance_add`: no CA bytes or path ever (`use_custom_ca` makes Rust open its own file dialog). */
 export interface InstanceAddArgs {
