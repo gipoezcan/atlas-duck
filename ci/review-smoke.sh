@@ -44,6 +44,20 @@ status_of() { # url [curl args...] -> HTTP status, body in $WORK/body
 echo "review smoke: waiting for ${RELEASE_NAME}"
 $K rollout status "deploy/${RELEASE_NAME}" --timeout=600s
 
+# A rolled-out pod can still be unreachable through the ingress for a while (502; a known cluster
+# issue, docs/server/deployment.md): /healthz is retried for up to 3 minutes, each try logged.
+reachable=0
+for i in $(seq 1 36); do
+  st="$(status_of "$BASE/healthz" || true)"
+  echo "review smoke: /healthz through the ingress, try $i: ${st:-no answer}"
+  if [ "$st" = 200 ]; then
+    reachable=1
+    break
+  fi
+  sleep 5
+done
+[ "$reachable" = 1 ] || fail "/healthz not reachable through the ingress within 3 minutes"
+
 ready=0
 for _ in $(seq 1 60); do
   if [ "$(status_of "$BASE/readyz" || true)" = 200 ]; then

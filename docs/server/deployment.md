@@ -173,3 +173,15 @@ A review environment has:
 Those passwords are fixed test values, not secrets. Production refuses the test directory
 twice: a chart guard, then the server itself (exit 78). No real account or data belongs in a
 review environment.
+
+## Known cluster issues
+
+- **Node `k3s-gip-pair1-2` (2026-10-28):** a pod scheduled there is unreachable from other
+  nodes. The ingress answers 502, and a `helm test` pod elsewhere gets "connection refused",
+  while a port-forward to the pod works and `/readyz` is ready. Once it took a long, unknown
+  delay before the pod became reachable. Until the cluster admins fix cross-node traffic to that
+  node (admin ticket: TICKET-TBD), the review and production values keep the server and its test
+  pod off it with a required node affinity (`kubernetes.io/hostname NotIn [k3s-gip-pair1-2]`).
+  The data volume is NFS, so the pod may run on any other node. Remove the affinity once the
+  ticket is closed. The review smoke retries `/healthz` through the ingress for up to 3 minutes
+  and logs each try.

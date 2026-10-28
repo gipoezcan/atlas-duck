@@ -11,6 +11,19 @@ metadata:
 spec:
   restartPolicy: Never
   automountServiceAccountToken: false
+  {{- /* The server's scheduling rules (e.g. a node to avoid) apply to its test pod too. */}}
+  {{- with .Values.nodeSelector }}
+  nodeSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.affinity }}
+  affinity:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.tolerations }}
+  tolerations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   securityContext:
     runAsNonRoot: true
     runAsUser: {{ .Values.uid }}
