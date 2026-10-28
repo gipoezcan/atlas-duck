@@ -850,6 +850,15 @@ Each milestone entry lists: scope (§14, with the placements this plan makes whe
 - **Contract deltas (M14 plan):** Δ-M14-1 (`LOGIN.method = "oauth"`, `AUDITOR_READ` actions), Δ-M14-2 (anchor rows v2), the script pin of Δ-M14-3 and Δ-M14-5 (no cross-user audit route without `auditor`) were applied in the M12 plan; Δ-M14-1, Δ-M14-2 and Δ-M14-5 are confirmed in the M12 code, the script pin is not (M14 T12 adds it); Δ-M14-3's audit view (T17) and Δ-M14-4 (deactivation revokes OAuth grants, T8) are M14's.
 - **Status:** done 2026-10-28 (plan `2026-10-26-atlas-duck-m14-server-completion.md`; ledger `.superpowers/sdd/2026-10-26-atlas-duck-m14-server-completion/`; final review fixes in `f2dba31`). Evidence: GitHub CI run 40647193822 green (incl. `server-e2e` against the container); GitLab review pipeline 43124 green incl. `verify:review-e2e` (11 ok, 5 skip, 0 fail), `verify:review-sandbox` (floor `met` under RuntimeDefault) and the operations drill; production as M13 (pipeline 43147, scripts `met`). Docs: `docs/server/oauth.md`, `scripts.md`, `auditing.md`, threat model and runbook sections.
 
+### M15 — User documentation
+
+- **Scope (user request 2026-10-28):** detailed end-user documentation, written once and shipped in both modes. Desktop: the docs are bundled with the app and open offline from the app (no network fetch). Server: the docs are deployed with the server image, served under the app's own origin, and reachable from their own entry in the web UI's menu. Content: getting started per mode (install, or sign in), instances and tokens, connecting an MCP agent (desktop launcher; server API keys and OAuth), approvals, scripts, audit and export/verify, settings, admin and auditor pages (server), troubleshooting and the error-code reference. Operator docs in `docs/server/` stay where they are; M15 is for users.
+- **Constraints:** CSP (§6.4 desktop, the server's CSP) allows no external fonts, scripts or styles: the docs are static, built at build time and ship with the bundled CSS; no new runtime dependencies; the server serves them without a login (no user data) or behind it, to be decided in the plan; screenshots reflect the M11 design; docs cannot drift silently from the UI's texts and error codes (a check in CI, e.g. every error code in the reference exists in the code and vice versa).
+- **Questions for the detailed plan:** the source format and generator (Markdown rendered to static HTML at build time, without adding a runtime dependency); how desktop opens them (a Tauri window on the bundled files, or the system browser on a local file); public or login-only on the server; versioning (the docs match the running build); language (English only, or German too).
+- **Depends on:** M14.
+- **Exit criterion:** the desktop bundles (Windows, macOS, Linux) open the docs offline from the app; the production server serves them from the menu entry; the docs check is green in CI; every UI page links to its docs section.
+- **Status:** not started; the detailed plan comes first.
+
 **Open after M13/M14** (operational, no code task):
 
 - `GROUP_AUDITORS` is not set in production: there are no auditors yet.
