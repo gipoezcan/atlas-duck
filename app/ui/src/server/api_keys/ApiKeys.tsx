@@ -25,7 +25,7 @@ export const KEY_TEXT = {
   scope_label: {
     read: 'read: read data and wait for your decisions',
     propose_write: 'propose_write: propose changes for your approval',
-    scripts: 'scripts: run scripts (not available yet)',
+    scripts: 'scripts: run read-only scripts in the sandbox; you approve each final result',
   },
   expiry: 'Expires in (days, 1–90)',
   create: 'Create key',
