@@ -712,16 +712,36 @@ pub fn cli_uninstall_dto(
 }
 
 /// `settings_apply`: core confirms each security-weakening change natively, in request order (a
-/// `Cancel` applies none), writes the audit records first and the file last. The language change
-/// is not core's ([`apply_ui_lang`] ran before): with nothing else, core is only read.
+/// `Cancel` applies none), writes the audit records first and the file last. M15 T3 (PD-294,
+/// review I-2): the language change is the app's and comes last, only after core committed, so a
+/// refused or cancelled request changes no language either. A language-only request never asks
+/// core to apply: it needs no serving core (`settings` is `None` then and the answer has no view).
+/// A failed language write after core committed is `Internal` (the windows re-read on
+/// `settings_changed` and see core's part).
 pub fn settings_apply_dto(
-    settings: &dyn SettingsAdmin,
+    settings: Option<&dyn SettingsAdmin>,
+    ui_lang_dir: Option<&Path>,
     changes: SettingChanges,
-) -> Result<SettingsView, CommandError> {
-    if changes.core.is_empty() {
-        return Ok(settings.view());
-    }
-    Ok(settings.apply(changes.core)?)
+) -> Result<SettingsApplied, CommandError> {
+    let view = if changes.core.is_empty() {
+        settings.map(|s| s.view())
+    } else {
+        let settings = settings.ok_or(CommandError::NotReady)?;
+        Some(settings.apply(changes.core)?)
+    };
+    let ui_lang = changes
+        .ui_lang
+        .map(|pref| apply_ui_lang(ui_lang_dir, pref))
+        .transpose()?;
+    Ok(SettingsApplied { view, ui_lang })
+}
+
+/// What [`settings_apply_dto`] did: core's view (`None` for a language-only request without a
+/// serving core) and the new language, when the request set one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsApplied {
+    pub view: Option<SettingsView>,
+    pub ui_lang: Option<UiLang>,
 }
 
 /// M15 T3 (PD-294): stores `pref` in `dir`'s `ui-lang` file and answers the new language. No
@@ -966,47 +986,46 @@ pub async fn settings_get<R: Runtime>(
 pub async fn settings_apply<R: Runtime>(
     app: AppHandle<R>,
     args: Args<SettingsApplyArgs>,
-) -> Result<SettingsView, CommandError> {
+) -> Result<Option<SettingsView>, CommandError> {
     let Args(SettingsApplyArgs { changes }) = args;
     let mut flipped = false;
-    // M15 T3 (PD-294): the language is the app's, stored before core is asked (and whether core
-    // serves or not); the windows switch on `lang_changed`.
-    if let Some(pref) = changes.ui_lang {
-        let state = app.try_state::<AppState>();
-        let dir = state
-            .as_ref()
-            .and_then(|s| s.ui_lang_dir().map(Path::to_path_buf));
-        match blocking(move || apply_ui_lang(dir.as_deref(), pref)).await {
-            Ok(ui) => {
-                if let Some(state) = state {
-                    state.set_ui_lang(ui);
-                }
-                emit_lang_changed(&app, ui);
-            }
-            Err(e) => return conclude_settings_apply(&app, Err(e), false),
-        }
-    }
-    let response = match core(&app) {
-        Ok(core) => {
-            let settings = core.settings();
-            blocking(move || {
-                // The header's `scripts_degraded` line follows this setting (T21 review I-2).
-                Ok(apply_noting_degraded(
-                    || settings.view().allow_degraded_scripts,
-                    || settings_apply_dto(&*settings, changes),
-                ))
-            })
-            .await
-            // If the blocking task itself fails (a join error) after core committed a flip, `flipped`
-            // stays false and no `status_banner` follows: accepted (T23 review m-5), the header
-            // re-reads `app_status` on its next refresh and `settings_changed` is still emitted.
-            .and_then(|(applied, flip)| {
-                flipped = flip;
-                applied
-            })
-        }
-        Err(e) => Err(e),
+    let state = app.try_state::<AppState>();
+    let dir = state
+        .as_ref()
+        .and_then(|s| s.ui_lang_dir().map(Path::to_path_buf));
+    // M15 T3 (PD-294, review I-2): a language-only request needs no serving core; any other one
+    // fails as before without one.
+    let settings = match core(&app) {
+        Ok(core) => Some(core.settings()),
+        Err(_) if changes.core.is_empty() => None,
+        Err(e) => return conclude_settings_apply(&app, Err(e), false),
     };
+    let response = blocking(move || {
+        let apply = || settings_apply_dto(settings.as_deref(), dir.as_deref(), changes);
+        Ok(match &settings {
+            // The header's `scripts_degraded` line follows this setting (T21 review I-2).
+            Some(s) => apply_noting_degraded(|| s.view().allow_degraded_scripts, apply),
+            None => (apply(), false),
+        })
+    })
+    .await
+    // If the blocking task itself fails (a join error) after core committed a flip, `flipped`
+    // stays false and no `status_banner` follows: accepted (T23 review m-5), the header
+    // re-reads `app_status` on its next refresh and `settings_changed` is still emitted.
+    .and_then(|(applied, flip)| {
+        flipped = flip;
+        applied
+    });
+    // The language switched only once everything else was applied.
+    let response = response.map(|applied| {
+        if let Some(ui) = applied.ui_lang {
+            if let Some(state) = &state {
+                state.set_ui_lang(ui);
+            }
+            emit_lang_changed(&app, ui);
+        }
+        applied.view
+    });
     conclude_settings_apply(&app, response, flipped)
 }
 
@@ -1033,11 +1052,11 @@ pub async fn ui_lang_get<R: Runtime>(
 /// (whatever core answered: it can commit and then fail) and, when "allow scripts with degraded
 /// confinement" flipped, that the status changed (`status_banner`, T21 review I-2: the header's
 /// `scripts_degraded` line follows that setting), then answers.
-pub fn conclude_settings_apply<R: Runtime>(
+pub fn conclude_settings_apply<R: Runtime, T: Serialize>(
     app: &AppHandle<R>,
-    response: Result<SettingsView, CommandError>,
+    response: Result<T, CommandError>,
     flipped: bool,
-) -> Result<SettingsView, CommandError> {
+) -> Result<T, CommandError> {
     note_failure(&response);
     emit_settings_changed(app);
     if flipped {

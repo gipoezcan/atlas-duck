@@ -221,8 +221,9 @@ export function uiLangGet(): Promise<UiLang> {
   return call('ui_lang_get', {}, isUiLang);
 }
 
-export function settingsApply(changes: SettingChange[]): Promise<SettingsView> {
-  return call('settings_apply', { changes }, isSettingsView);
+/** `null` only for a language-only change while no core serves (M15 T3: no view to answer). */
+export function settingsApply(changes: SettingChange[]): Promise<SettingsView | null> {
+  return call('settings_apply', { changes }, (v): v is SettingsView | null => v === null || isSettingsView(v));
 }
 
 export function instanceAdd(args: InstanceAddArgs): Promise<InstanceView> {

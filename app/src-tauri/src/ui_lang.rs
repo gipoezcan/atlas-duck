@@ -31,8 +31,11 @@ pub fn load(dir: &Path) -> LangPref {
         .unwrap_or_default()
 }
 
-/// Writes `pref` atomically: a new temp file next to it, flushed, renamed over the old one.
+/// Writes `pref` atomically: a new temp file next to it, flushed, renamed over the old one, and
+/// (Unix, best effort) the rename itself flushed, as `ipc::paths`'s atomic writes do. A temp file
+/// a crashed earlier write left behind is removed first.
 pub fn store(dir: &Path, pref: LangPref) -> io::Result<()> {
+    sweep_temps(dir);
     let tmp = dir.join(format!(
         ".{FILE_NAME}.{}.{}.tmp",
         std::process::id(),
@@ -50,8 +53,35 @@ pub fn store(dir: &Path, pref: LangPref) -> io::Result<()> {
     })();
     if written.is_err() {
         let _ = fs::remove_file(&tmp);
+        return written;
     }
-    written
+    #[cfg(unix)]
+    if let Ok(d) = fs::File::open(dir) {
+        // Best effort: persist the rename itself.
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
+/// Removes the `.ui-lang.*.tmp` regular files in `dir` (symlinks are not followed). Best effort:
+/// the language is a preference, a temp file that stays is harmless.
+fn sweep_temps(dir: &Path) {
+    let prefix = format!(".{FILE_NAME}.");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with(&prefix)
+            && name.ends_with(".tmp")
+            && fs::symlink_metadata(entry.path()).is_ok_and(|m| m.is_file())
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -104,6 +134,24 @@ mod tests {
         assert_eq!(names, vec![std::ffi::OsString::from(FILE_NAME)]);
         // Trailing whitespace (a hand edit) is accepted.
         fs::write(dir.path().join(FILE_NAME), "en\n")?;
+        assert_eq!(load(dir.path()), LangPref::En);
+        Ok(())
+    }
+
+    /// Review m-6: a temp file a crashed write left behind is gone after the next write; other
+    /// files are kept.
+    #[test]
+    fn store_sweeps_stale_temp_files() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join(".ui-lang.999.3.tmp"), "de")?;
+        fs::write(dir.path().join("audit.db"), "x")?;
+        fs::write(dir.path().join(".endpoint.1.1.tmp"), "x")?;
+        store(dir.path(), LangPref::En)?;
+        let mut names: Vec<_> = fs::read_dir(dir.path())?
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .collect();
+        names.sort();
+        assert_eq!(names, [".endpoint.1.1.tmp", "audit.db", FILE_NAME]);
         assert_eq!(load(dir.path()), LangPref::En);
         Ok(())
     }

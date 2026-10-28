@@ -1932,10 +1932,12 @@ fn shell_commands_granted_to_their_windows_only() -> TestResult {
             if !granted.contains(label) {
                 assert!(acl_refused(&r), "{label}: {cmd} {r:?}");
             } else if *cmd == "ui_lang_get" {
-                // No AppState here: uto, resolved against this machine's locale.
+                // No AppState here: `auto`, resolved against this machine's locale.
                 let v = r.as_ref().map_err(|e| format!("{label}: {e:?}"))?;
                 assert_eq!(v["pref"], "auto", "{label}");
-                assert!(v["lang"] == "en" || v["lang"] == "de", "{label}: {v}");
+                let want =
+                    atlas_duck_app_lib::state::UiLang::of(atlas_duck_app_lib::i18n::LangPref::Auto);
+                assert_eq!(v["lang"], serde_json::to_value(want.lang)?, "{label}: {v}");
                 assert_eq!(v.as_object().map(|o| o.len()), Some(2), "{label}: {v}");
             } else if *cmd == "onboarding_text" {
                 let sections = r
@@ -2284,6 +2286,18 @@ mod settings_commands {
         }
     }
 
+    /// `settings_apply_dto` over a serving core, for the requests that carry core changes.
+    fn core_apply(
+        s: &dyn atlas_duck_core::SettingsAdmin,
+        c: SettingChanges,
+    ) -> Result<atlas_duck_core::SettingsView, CommandError> {
+        settings_apply_dto(Some(s), None, c).and_then(|a| a.view.ok_or(CommandError::Internal))
+    }
+
+    fn ui(pref: LangPref, lang: Lang) -> UiLang {
+        UiLang { pref, lang }
+    }
+
     /// M15 T3 (PD-294): the language change is the app's. Alone, core is only read (no `apply`, no
     /// `record_app_change`, no audit record, config.toml untouched); with core changes, core gets
     /// exactly those. The preference lands in the `ui-lang` file.
@@ -2296,22 +2310,16 @@ mod settings_commands {
         });
         let before_file = std::fs::read_to_string(h.config_path())?;
         let events = h.event_count().await?;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().to_path_buf();
 
         let c = changes(json!([{"key": "ui_lang", "value": "de"}]))?;
         assert_eq!((c.core.len(), c.ui_lang), (0, Some(LangPref::De)));
-        let dir = tempfile::tempdir()?;
-        let ui = apply_ui_lang(Some(dir.path()), LangPref::De)?;
-        assert_eq!(
-            ui,
-            UiLang {
-                pref: LangPref::De,
-                lang: Lang::De
-            }
-        );
-        assert_eq!(std::fs::read_to_string(dir.path().join("ui-lang"))?, "de");
-        let r = rec.clone();
-        let view = blocking(move || settings_apply_dto(&*r, c)).await??;
-        assert_eq!(view, h.core().settings().view());
+        let (r, d) = (rec.clone(), path.clone());
+        let applied = blocking(move || settings_apply_dto(Some(&*r), Some(&d), c)).await??;
+        assert_eq!(applied.view, Some(h.core().settings().view()));
+        assert_eq!(applied.ui_lang, Some(ui(LangPref::De, Lang::De)));
+        assert_eq!(std::fs::read_to_string(path.join("ui-lang"))?, "de");
         assert_eq!(rec.calls(), vec!["view"]);
         assert_eq!(
             h.event_count().await?,
@@ -2320,18 +2328,19 @@ mod settings_commands {
         );
         assert_eq!(std::fs::read_to_string(h.config_path())?, before_file);
 
-        // Together with a core change, core sees only its own.
+        // Together with a core change, core sees only its own, and the language follows.
         let c = changes(json!([
             {"key": "ui_lang", "value": "en"},
             {"key": "jira_comments_cap", "value": 40},
         ]))?;
-        assert_eq!(c.ui_lang, Some(LangPref::En));
-        let r = rec.clone();
-        let view = blocking(move || settings_apply_dto(&*r, c)).await??;
-        assert_eq!(view.limits.jira_comments_cap, 40);
+        let (r, d) = (rec.clone(), path.clone());
+        let applied = blocking(move || settings_apply_dto(Some(&*r), Some(&d), c)).await??;
+        assert_eq!(applied.view.map(|v| v.limits.jira_comments_cap), Some(40));
+        assert_eq!(applied.ui_lang, Some(ui(LangPref::En, Lang::En)));
+        assert_eq!(std::fs::read_to_string(path.join("ui-lang"))?, "en");
         assert_eq!(rec.calls(), vec!["view", "apply"]);
 
-        // No folder (a state that stores nothing): refused, nothing written.
+        // No folder (a state that stores nothing): refused.
         assert_eq!(
             apply_ui_lang(None, LangPref::De),
             Err(CommandError::Internal)
@@ -2339,6 +2348,63 @@ mod settings_commands {
         Ok(())
     }
 
+    /// Review I-2: core runs first. A refused or cancelled core part leaves the language as it was
+    /// (no file write, no new language in the answer).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_core_refusal_leaves_the_language_unchanged() -> TestResult {
+        let h = rig(vec![Confirm::Cancel]).await?;
+        let s = h.core().settings();
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().to_path_buf();
+        atlas_duck_app_lib::ui_lang::store(&path, LangPref::En)?;
+
+        // A raise needs core's native confirmation: Cancel.
+        let c = changes(json!([
+            {"key": "ui_lang", "value": "de"},
+            {"key": "jira_comments_cap", "value": 500},
+        ]))?;
+        let (s2, d) = (s.clone(), path.clone());
+        let res = blocking(move || settings_apply_dto(Some(&*s2), Some(&d), c)).await?;
+        assert_eq!(
+            res.err(),
+            Some(CommandError::Settings(SettingsError::Cancelled))
+        );
+        assert_eq!(std::fs::read_to_string(path.join("ui-lang"))?, "en");
+
+        // Core refuses a value (`Invalid`): the same.
+        let c = changes(json!([
+            {"key": "ui_lang", "value": "de"},
+            {"key": "retention_days", "value": 0},
+        ]))?;
+        let (s2, d) = (s.clone(), path.clone());
+        let res = blocking(move || settings_apply_dto(Some(&*s2), Some(&d), c)).await?;
+        assert!(matches!(res, Err(CommandError::Settings(_))), "{res:?}");
+        assert_eq!(std::fs::read_to_string(path.join("ui-lang"))?, "en");
+        Ok(())
+    }
+
+    /// Review I-2: a language-only request needs no serving core: it is stored and answered without
+    /// a view. A request with core changes and no core is `not_ready`, and the language stays.
+    #[test]
+    fn language_only_apply_succeeds_without_a_serving_core() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let c = changes(json!([{"key": "ui_lang", "value": "de"}]))?;
+        let applied = settings_apply_dto(None, Some(dir.path()), c)?;
+        assert_eq!(applied.view, None);
+        assert_eq!(applied.ui_lang, Some(ui(LangPref::De, Lang::De)));
+        assert_eq!(std::fs::read_to_string(dir.path().join("ui-lang"))?, "de");
+
+        let c = changes(json!([
+            {"key": "ui_lang", "value": "en"},
+            {"key": "legal_hold", "value": true},
+        ]))?;
+        assert_eq!(
+            settings_apply_dto(None, Some(dir.path()), c),
+            Err(CommandError::NotReady)
+        );
+        assert_eq!(std::fs::read_to_string(dir.path().join("ui-lang"))?, "de");
+        Ok(())
+    }
     /// I-31 through the commands: a new instance, a URL change, a limit raise and the backlog prune
     /// each need the native confirmation core draws itself; a `Cancel` is `Cancelled` with nothing
     /// logged or written, an `Ok` applies and logs.
@@ -2412,7 +2478,7 @@ mod settings_commands {
             s.clone(),
             changes(json!([{"key": "jira_comments_cap", "value": 500}]))?,
         );
-        let res = blocking(move || settings_apply_dto(&*s2, c)).await?;
+        let res = blocking(move || core_apply(&*s2, c)).await?;
         assert_eq!(
             res.err(),
             Some(CommandError::Settings(SettingsError::Cancelled))
@@ -2423,7 +2489,7 @@ mod settings_commands {
             s.clone(),
             changes(json!([{"key": "jira_comments_cap", "value": 500}]))?,
         );
-        let view = blocking(move || settings_apply_dto(&*s2, c)).await??;
+        let view = blocking(move || core_apply(&*s2, c)).await??;
         assert_eq!(view.limits.jira_comments_cap, 500);
         assert_eq!(config_records(&h).await?, records + 1);
 
@@ -2675,7 +2741,7 @@ mod settings_commands {
         );
         let s = h.core().settings();
         let c = changes(json!([{"key": "retention_days", "value": 400}]))?;
-        let res = blocking(move || settings_apply_dto(&*s, c)).await?;
+        let res = blocking(move || core_apply(&*s, c)).await?;
         assert_eq!(
             res.err(),
             Some(CommandError::Settings(SettingsError::ShuttingDown))
@@ -2908,13 +2974,15 @@ mod settings_commands {
             names(&cap)?[1..],
             [settings_changed.clone(), status_banner.clone()]
         );
-        let err = Err(CommandError::Settings(SettingsError::ConfigWrite));
+        let err: Result<atlas_duck_core::SettingsView, CommandError> =
+            Err(CommandError::Settings(SettingsError::ConfigWrite));
         assert_eq!(
             conclude_settings_apply(app.handle(), err.clone(), true),
             err
         );
         assert_eq!(names(&cap)?[3..], [settings_changed.clone(), status_banner]);
-        let err = Err(CommandError::Settings(SettingsError::Cancelled));
+        let err: Result<atlas_duck_core::SettingsView, CommandError> =
+            Err(CommandError::Settings(SettingsError::Cancelled));
         assert_eq!(
             conclude_settings_apply(app.handle(), err.clone(), false),
             err
@@ -5451,28 +5519,26 @@ fn s09_command_outside_grant_rejected_every_window() -> TestResult {
     assert_eq!(refusals, 8 * COMMANDS.len() - grants);
 
     // The event commands follow the same authority: the windows that listen hold both, the others
-    // neither. The Audit window listens since M10 T12 (`audit_job` progress, `audit_changed`), the
-    // Onboarding window since M15 T3 (`lang_changed`).
+    // neither. The Audit window listens since M10 T12 (`audit_job` progress, `audit_changed`).
     let listen = json!({"event": "queue_changed", "target": {"kind": "Any"}, "handler": 0});
-    for label in ["audit", "onboarding"] {
+    let audit = s09_window(&app, "audit")?;
+    let r = invoke(&audit, "plugin:event|listen", listen.clone());
+    assert!(
+        !r.as_ref()
+            .err()
+            .is_some_and(|e| e.as_str().is_some_and(|s| s.contains("not allowed"))),
+        "audit: plugin:event|listen {r:?}"
+    );
+    for label in ["onboarding", "unknown"] {
         let w = s09_window(&app, label)?;
         let r = invoke(&w, "plugin:event|listen", listen.clone());
         assert!(
-            !r.as_ref()
+            r.as_ref()
                 .err()
                 .is_some_and(|e| e.as_str().is_some_and(|s| s.contains("not allowed"))),
             "{label}: plugin:event|listen {r:?}"
         );
     }
-    // A window without a capability file holds neither.
-    let w = s09_window(&app, "unknown")?;
-    let r = invoke(&w, "plugin:event|listen", listen);
-    assert!(
-        r.as_ref()
-            .err()
-            .is_some_and(|e| e.as_str().is_some_and(|s| s.contains("not allowed"))),
-        "unknown: plugin:event|listen {r:?}"
-    );
     Ok(())
 }
 

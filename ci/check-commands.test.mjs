@@ -225,11 +225,9 @@ test("non_app_permissions_fail", () => {
 });
 
 test("event_permissions_only_for_listening_windows", () => {
-  // M15 T3: the Onboarding window listens too (`lang_changed`), so every window does now; the
-  // check's "listens to no event" branch is kept for a later window that does not.
   const caps = capsFor(COMMANDS);
-  caps.onboarding.permissions = caps.onboarding.permissions.filter((p) => p !== "core:event:allow-listen");
-  assertFails(errorsOf(surface({ caps })), /onboarding\.json: a listening window needs exactly/);
+  caps.onboarding.permissions.push("core:event:allow-listen");
+  assertFails(errorsOf(surface({ caps })), /onboarding\.json: this window listens to no event/);
   // M10 T12: the Audit window listens (`audit_job`, `audit_changed`), so it needs both.
   const caps3 = capsFor(COMMANDS);
   caps3.audit.permissions = caps3.audit.permissions.filter((p) => p !== "core:event:allow-listen");

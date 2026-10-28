@@ -67,8 +67,9 @@ pub fn resolve(pref: LangPref, locale: Option<&str>) -> Lang {
 }
 
 /// The user's OS locale tag: `LC_ALL`, `LC_MESSAGES`, `LANG` (the first non-empty) on Linux and
-/// the BSDs, `GetUserDefaultLocaleName` on Windows, the first preferred language on macOS. `None`
-/// when the OS names none.
+/// the BSDs, the user's display language on Windows (`GetUserDefaultUILanguage`, named by
+/// `LCIDToLocaleName`: an English Windows with German regional formats is English), the first
+/// preferred language on macOS. `None` when the OS names none.
 pub fn os_locale() -> Option<String> {
     os_locale_impl().filter(|tag| !tag.trim().is_empty())
 }
@@ -85,11 +86,15 @@ fn os_locale_impl() -> Option<String> {
 
 #[cfg(windows)]
 fn os_locale_impl() -> Option<String> {
-    use windows_sys::Win32::Globalization::GetUserDefaultLocaleName;
+    use windows_sys::Win32::Globalization::{GetUserDefaultUILanguage, LCIDToLocaleName};
+    // SAFETY: no arguments; answers the user's UI language id.
+    let langid = unsafe { GetUserDefaultUILanguage() };
+    // MAKELCID(langid, SORT_DEFAULT): the sort id is 0.
+    let lcid = u32::from(langid);
     // LOCALE_NAME_MAX_LENGTH, with the NUL.
     let mut buf = [0u16; 85];
-    // SAFETY: `buf` is writable for its length, which is what the call is told.
-    let len = unsafe { GetUserDefaultLocaleName(buf.as_mut_ptr(), buf.len() as i32) };
+    // SAFETY: `buf` is writable for its length, which is what the call is told; no flags.
+    let len = unsafe { LCIDToLocaleName(lcid, buf.as_mut_ptr(), buf.len() as i32, 0) };
     // The answer counts the NUL; 0 is a failure.
     let chars = usize::try_from(len).ok()?.checked_sub(1)?;
     String::from_utf16(buf.get(..chars)?).ok()
@@ -147,6 +152,19 @@ mod tests {
         let lang = env(&[("LANG", "en_GB.UTF-8")]);
         assert_eq!(posix_locale(&lang).as_deref(), Some("en_GB.UTF-8"));
         assert_eq!(posix_locale(&env(&[])), None);
+        // Review m-4: the C locale wins over LANG and reads as English, through read and resolve.
+        for c in ["C", "POSIX", "C.UTF-8"] {
+            let pairs: &'static [(&'static str, &'static str)] = match c {
+                "C" => &[("LC_ALL", "C"), ("LANG", "de_DE.UTF-8")],
+                "POSIX" => &[("LC_MESSAGES", "POSIX"), ("LANG", "de_DE.UTF-8")],
+                _ => &[("LANG", "C.UTF-8")],
+            };
+            let tag = posix_locale(&env(pairs));
+            assert_eq!(tag.as_deref(), Some(c));
+            assert_eq!(resolve(LangPref::Auto, tag.as_deref()), Lang::En, "{c}");
+        }
+        let de = posix_locale(&env(&[("LC_ALL", ""), ("LANG", "de_AT.UTF-8")]));
+        assert_eq!(resolve(LangPref::Auto, de.as_deref()), Lang::De);
     }
 
     #[test]

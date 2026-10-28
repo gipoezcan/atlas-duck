@@ -140,9 +140,9 @@ export const WINDOW_COMMANDS = {
 
 /**
  * The windows that listen to events (C.10 + Δ1 events): they, and only they, get both. The Audit
- * window since M10 T12 (Δ-M10-3: `audit_job` progress, `audit_changed`); Onboarding since M15 T3 (`lang_changed`).
+ * window since M10 T12 (Δ-M10-3: `audit_job` progress, `audit_changed`).
  */
-export const LISTENING_WINDOWS = ["approvals", "settings", "audit", "running_scripts", "credential", "setup", "onboarding"];
+export const LISTENING_WINDOWS = ["approvals", "settings", "audit", "running_scripts", "credential", "setup"];
 
 /** The only non-app permissions a capability file may hold, and the IPC command each grants. */
 export const EVENT_PERMISSIONS = {

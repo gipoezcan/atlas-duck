@@ -1,11 +1,9 @@
 {
   "identifier": "onboarding",
-  "description": "the Onboarding window (Δ1): read-only onboarding text; the UI language and its lang_changed event (M15 T3)",
+  "description": "the Onboarding window (Δ1): read-only onboarding text; the UI language, read on focus (M15 T3, no event grant)",
   "windows": ["onboarding"],
   "permissions": [
     "allow-onboarding-text",
-    "allow-ui-lang-get",
-    "core:event:allow-listen",
-    "core:event:allow-unlisten"
+    "allow-ui-lang-get"
   ]
 }
