@@ -108,16 +108,16 @@ All server jobs live in `.gitlab-ci.yml`, in the stages `server-prepare` through
   master key Secret on first deploy, validates the rendered manifests with a server-side dry run,
   then applies them. The environment stops itself after 3 days.
 - `stop:review` uninstalls the release and deletes the review PVC and the review key Secrets.
-- `deploy:production` runs only on master, is triggered manually, and blocks the pipeline until
-  someone decides. It is triggered only after the product owner's explicit go-ahead.
+- `deploy:production` runs only on master and starts automatically on every master pipeline
+  once the earlier stages pass (product owner's decision, 2026-10-28).
 
 ## GitLab settings (once, before the first production deploy)
 
 - Protect `master` (Settings > Repository > Protected branches). `deploy:production` refuses to
   run from an unprotected ref.
 - Protect the `production` environment and require an approval from the product owner (Settings >
-  CI/CD > Protected environments). Without it, anyone who can run pipelines on master can trigger
-  the manual job.
+  CI/CD > Protected environments). With an approval rule, each automatic deploy waits for that
+  approval; without one, every push to master reaches production.
 - `deploy:review` reaches the cluster from any branch whose server paths changed (PD-M13-12).
   Review environments hold test data only.
 

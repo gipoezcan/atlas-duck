@@ -482,14 +482,14 @@ stop:review:
       when: manual
   allow_failure: true
 
-# PD-M13-11: master only, manual, and the pipeline stays blocked until someone decides. The
-# lead triggers it only after the user's explicit go-ahead.
+# Every master pipeline deploys production automatically once the earlier stages pass
+# (user decision 2026-10-28, replacing PD-M13-11's manual gate).
 deploy:production:
   <<: *deploy-base
   variables: *server-vars
   rules:
     - if: $CI_COMMIT_BRANCH == "master"
-      when: manual
+      when: on_success
   allow_failure: false
   script:
     - *no-placeholders
