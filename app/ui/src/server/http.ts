@@ -1,3 +1,5 @@
+import { formatDateTime } from '../shared/i18n/format';
+import type { Lang } from '../shared/i18n';
 import { csrf } from '../shared/ipc/transport-http';
 import { loginUrl, nav } from './shell/RequireSession';
 
@@ -258,6 +260,6 @@ export function isGrantView(v: unknown): v is GrantView {
 }
 
 /** A Unix time in seconds as a short UTC date and time. */
-export function when(secs: number): string {
-  return new Date(secs * 1000).toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
+export function when(secs: number, lang: Lang = 'en'): string {
+  return formatDateTime(lang, secs);
 }
