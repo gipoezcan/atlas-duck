@@ -135,5 +135,6 @@ survive.
 ### Schema migrations
 
 `server.db` is migrated forward at start, one transaction per version (v1 to v2 M13, v2 to v3 the
-OAuth and export tables of M14). There is no down path: take `admin backup` before an upgrade
+OAuth and export tables of M14, v3 to v4 the users' language preference `users.lang_pref` of M15,
+default `auto`). There is no down path: take `admin backup` before an upgrade
 that changes the schema, and roll back by restoring that bundle with the old image.

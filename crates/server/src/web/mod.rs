@@ -10,6 +10,7 @@ pub mod extract;
 pub mod grant_routes;
 pub mod oauth_routes;
 pub mod pat_routes;
+pub mod pref_routes;
 
 #[cfg(test)]
 mod tests;
@@ -102,6 +103,8 @@ pub const ROUTES: &[(&str, &str, Access)] = &[
     ("GET", "/api/me/api-keys", Access::Session),
     ("POST", "/api/me/api-keys", Access::Session),
     ("DELETE", "/api/me/api-keys/{id}", Access::Session),
+    // M15 T4 (PD-295): the user's own display preferences (not audited).
+    ("PUT", "/api/me/preferences", Access::Session),
     ("POST", "/mcp", Access::Bearer),
     ("GET", "/mcp", Access::Bearer),
     ("DELETE", "/mcp", Access::Bearer),
@@ -187,6 +190,7 @@ pub(crate) fn handler(method: &str, path: &str) -> Option<MethodRouter<AppState>
         ("GET", "/api/me/api-keys") => get(api_key_routes::list),
         ("POST", "/api/me/api-keys") => post(api_key_routes::create),
         ("DELETE", "/api/me/api-keys/{id}") => delete(api_key_routes::revoke),
+        ("PUT", "/api/me/preferences") => put(pref_routes::put),
         ("GET", "/.well-known/oauth-protected-resource")
         | ("GET", "/.well-known/oauth-protected-resource/mcp") => {
             get(oauth_routes::protected_resource)

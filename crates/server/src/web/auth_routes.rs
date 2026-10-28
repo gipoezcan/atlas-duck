@@ -89,12 +89,18 @@ pub async fn session(
         .user(&s.user_id)
         .map_err(|_| ApiError::STORE_UNAVAILABLE)?
         .ok_or(ApiError::NO_SESSION)?;
+    // M15 T4 (PD-295): the page resolves `auto` against the browser's language.
+    let lang_pref = st
+        .store
+        .user_lang_pref(&s.user_id)
+        .map_err(|_| ApiError::STORE_UNAVAILABLE)?;
     let mut res = Json(json!({
         "user": user.username,
         "roles": s.roles,
         "csrf_token": s.csrf_token.expose_secret(),
         "expires_at": rfc3339(s.absolute_expiry),
         "idle_expires_at": rfc3339(s.idle_expiry),
+        "lang_pref": lang_pref.as_str(),
     }))
     .into_response();
     res.headers_mut()

@@ -321,6 +321,58 @@ async fn b_cannot_read_a_pat_state_or_use_a_pat() {
     );
 }
 
+/// M15 T4 (PD-295): one user's language preference never reaches another user's session, and a
+/// body or header naming another user changes only the caller's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn other_user_pref_untouched() {
+    let s = TestServer::start().await;
+    let a = s.login(ALICE).await;
+    let b = s.login(BOB).await;
+    let (status, v) = s
+        .send(
+            Method::PUT,
+            "/api/me/preferences",
+            Some(&a),
+            Some(json!({"lang_pref": "de"})),
+        )
+        .await;
+    assert_eq!(status, 204, "{v}");
+    let (_, sa) = s.send(Method::GET, "/api/session", Some(&a), None).await;
+    let (_, sb) = s.send(Method::GET, "/api/session", Some(&b), None).await;
+    assert_eq!(
+        (sa["lang_pref"].clone(), sb["lang_pref"].clone()),
+        (json!("de"), json!("auto"))
+    );
+    // Bob's request with every spoofing header naming alice sets bob's own.
+    let a_uid = user_id_for(ALICE.0);
+    let (status, _) = s
+        .send_with(
+            Method::PUT,
+            &format!("/api/me/preferences?user_id={a_uid}"),
+            Some(&b),
+            Some(json!({"lang_pref": "en"})),
+            &[("x-user", ALICE.0), ("x-user-id", &a_uid)],
+        )
+        .await;
+    assert_eq!(status, 204);
+    let (_, sa) = s.send(Method::GET, "/api/session", Some(&a), None).await;
+    let (_, sb) = s.send(Method::GET, "/api/session", Some(&b), None).await;
+    assert_eq!(
+        (sa["lang_pref"].clone(), sb["lang_pref"].clone()),
+        (json!("de"), json!("en"))
+    );
+    // A body naming a user is refused, not obeyed.
+    let (status, _) = s
+        .send(
+            Method::PUT,
+            "/api/me/preferences",
+            Some(&b),
+            Some(json!({"lang_pref": "de", "user_id": a_uid})),
+        )
+        .await;
+    assert_eq!(status, 400);
+}
+
 /// A concrete path for a ROUTES pattern.
 fn concrete(path: &str) -> String {
     path.replace("{name}", "x.js")
@@ -339,6 +391,7 @@ fn body_for(method: &str, path: &str) -> Option<Value> {
         ("POST", "/api/me/audit/exports") => Some(json!({})),
         ("POST", "/api/auditor/users/{user_id}/exports") => Some(json!({})),
         ("PUT", "/api/me/pats/{alias}") => Some(json!({"pat": "x"})),
+        ("PUT", "/api/me/preferences") => Some(json!({"lang_pref": "de"})),
         ("POST", "/api/me/api-keys") => Some(json!({"name": "probe", "scopes": ["read"]})),
         ("POST", "/api/admin/instances") => Some(json!({"alias": "probe", "product": "jira",
             "base_url": "https://probe.example.test"})),

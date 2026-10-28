@@ -1,3 +1,4 @@
+import { LANG_PREFS, type LangPref } from '../i18n';
 import type { Transport } from './transport';
 
 /**
@@ -12,6 +13,8 @@ export interface SessionInfo {
   roles: string[];
   csrf_token: string;
   expires_at: string;
+  /** M15 T4 (PD-295): the user's language preference; an older server sends none (`auto`). */
+  lang_pref?: LangPref;
 }
 
 let session: SessionInfo | null = null;
@@ -28,7 +31,8 @@ function isSessionInfo(v: unknown): v is SessionInfo {
     Array.isArray(v.roles) &&
     v.roles.every((r) => typeof r === 'string') &&
     typeof v.csrf_token === 'string' &&
-    typeof v.expires_at === 'string'
+    typeof v.expires_at === 'string' &&
+    (v.lang_pref === undefined || LANG_PREFS.some((p) => p === v.lang_pref))
   );
 }
 

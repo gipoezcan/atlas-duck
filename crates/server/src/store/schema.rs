@@ -3,7 +3,7 @@
 //! every file reaches the current version by the same path.
 
 /// `PRAGMA user_version` of this build.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// v1 → v2 (M13 T5): user lifecycle columns and the scheduler's last runs (T9).
 pub const V1_TO_V2: &str = r#"
@@ -28,9 +28,15 @@ pub fn up_from(from: u32) -> Option<&'static str> {
     match from {
         1 => Some(V1_TO_V2),
         2 => Some(M14_TABLES),
+        3 => Some(V3_TO_V4),
         _ => None,
     }
 }
+
+/// v3 → v4 (M15 T4, PD-295): the user's UI language preference; existing users get `auto`.
+pub const V3_TO_V4: &str = r#"
+ALTER TABLE users ADD COLUMN lang_pref TEXT NOT NULL DEFAULT 'auto';
+"#;
 
 pub const V1: &str = r#"
 CREATE TABLE users (

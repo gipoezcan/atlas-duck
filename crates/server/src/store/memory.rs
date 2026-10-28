@@ -7,8 +7,8 @@ use std::sync::{Mutex, MutexGuard};
 use super::{
     AccessRecord, AnchorHasher, AnchorHead, AnchorRow, ApiKeyRecord, CLIENT_ENDED_SECS,
     CLIENT_UNUSED_SECS, CodeRecord, ConsentRequestRecord, ExportJobRecord, GrantRecord,
-    InstanceRecord, JobState, OAuthClientRecord, PatRecord, Redeem, RefreshRecord, Rotate, Sealed,
-    ServerStore, SessionRecord, StoreError, StoreResult, UserRecord, UserState,
+    InstanceRecord, JobState, LangPref, OAuthClientRecord, PatRecord, Redeem, RefreshRecord,
+    Rotate, Sealed, ServerStore, SessionRecord, StoreError, StoreResult, UserRecord, UserState,
 };
 
 #[derive(Default)]
@@ -31,6 +31,8 @@ struct Inner {
     access: BTreeMap<[u8; 32], AccessRecord>,
     refresh: BTreeMap<[u8; 32], RefreshRecord>,
     export_jobs: BTreeMap<String, ExportJobRecord>,
+    /// M15 T4: `users.lang_pref`; absent is `auto`.
+    lang_prefs: BTreeMap<String, LangPref>,
 }
 
 #[derive(Default)]
@@ -104,6 +106,23 @@ impl ServerStore for MemoryStore {
         Ok(g.users
             .contains_key(user_id)
             .then(|| g.states.get(user_id).cloned().unwrap_or_default()))
+    }
+
+    fn user_lang_pref(&self, user_id: &str) -> StoreResult<LangPref> {
+        Ok(self
+            .lock()
+            .lang_prefs
+            .get(user_id)
+            .copied()
+            .unwrap_or_default())
+    }
+
+    fn set_user_lang_pref(&self, user_id: &str, pref: LangPref) -> StoreResult<()> {
+        let mut g = self.lock();
+        if g.users.contains_key(user_id) {
+            g.lang_prefs.insert(user_id.to_owned(), pref);
+        }
+        Ok(())
     }
 
     fn user_set_last_login(&self, user_id: &str, at: i64) -> StoreResult<()> {

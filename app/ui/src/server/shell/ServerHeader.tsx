@@ -1,7 +1,10 @@
 import { useState } from 'react';
 
+import { LANG_PREFS, type LangPref } from '../../shared/i18n';
+import { useText } from '../../shared/i18n/context';
 import { csrf } from '../../shared/ipc/transport-http';
 import { nav, useSession } from './RequireSession';
+import { saveLangPref, useServerLangPref } from './ServerLangRoot';
 
 export const SHELL_TEXT = {
   approvals: 'Approvals',
@@ -38,6 +41,21 @@ export async function signOut(): Promise<boolean> {
 export function ServerHeader() {
   const session = useSession();
   const [failed, setFailed] = useState(false);
+  const [langFailed, setLangFailed] = useState(false);
+  const t = useText();
+  const langPref = useServerLangPref();
+  const label: Record<LangPref, string> = {
+    auto: t.common.lang_auto,
+    en: t.common.lang_en,
+    de: t.common.lang_de,
+  };
+  // M15 T4 (PD-295): stored first, then switched in place (no reload).
+  const chooseLang = (value: LangPref) => {
+    void saveLangPref(value).then((ok) => {
+      setLangFailed(!ok);
+      if (ok) langPref?.setPref(value);
+    });
+  };
   const admin = session?.roles.includes('admin') ?? false;
   const auditor = session?.roles.includes('auditor') ?? false;
   return (
@@ -50,6 +68,24 @@ export function ServerHeader() {
         <a href="/audit">{SHELL_TEXT.my_audit}</a>
         {auditor ? <a href="/auditor">{SHELL_TEXT.auditor}</a> : null}
         {admin ? <a href="/admin">{SHELL_TEXT.admin}</a> : null}
+        {langPref === null ? null : (
+          <label>
+            {t.common.language}{' '}
+            <select
+              value={langPref.pref}
+              onChange={(e) => {
+                const value = LANG_PREFS.find((p) => p === e.target.value);
+                if (value !== undefined) chooseLang(value);
+              }}
+            >
+              {LANG_PREFS.map((p) => (
+                <option key={p} value={p}>
+                  {label[p]}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
         <span className="server-user">{session?.user ?? ''}</span>
         <button
           type="button"
@@ -61,6 +97,7 @@ export function ServerHeader() {
         </button>
       </nav>
       {failed ? <p role="alert" className="notice notice-danger">{SHELL_TEXT.sign_out_failed}</p> : null}
+      {langFailed ? <p role="alert" className="notice notice-danger">{t.common.lang_save_failed}</p> : null}
     </header>
   );
 }

@@ -38,6 +38,8 @@ mod export;
 mod mcp;
 /// M14: OAuth discovery, registration, authorization, tokens.
 mod oauth;
+/// M15 T4: `PUT /api/me/preferences` and `lang_pref` in `/api/session`.
+mod prefs;
 
 const ORIGIN: &str = "https://duck.example.test";
 const T0: i64 = 1_800_000_000;
