@@ -76,7 +76,9 @@ rust:test:
     # Same for the keyring dir: the container's home is an overlayfs too (§8.6 locality).
     - mkdir -p "$CI_PROJECT_DIR/.xdg" && export XDG_DATA_HOME="$CI_PROJECT_DIR/.xdg"
     - cargo clippy --workspace --all-targets --locked -- -D warnings
-    - cargo test --workspace --locked
+    # The real-worker sandbox test needs ATLAS_DUCK_SANDBOX_BIN and the built worker; GitHub's
+    # `server` job runs it (and verify:review-sandbox checks the floor in the cluster).
+    - cargo test --workspace --locked -- --skip the_real_worker_meets_the_floor_and_runs_a_script
     # cli_flows run on GitHub only (every OS leg, ci.yml): the app's data-dir locality check fails
     # closed on this runner's container volume ("the test data dir is not a local data dir"), so
     # none of the spawning flows can start an app here. ci/cli-flows-linux.sh itself is verified up
