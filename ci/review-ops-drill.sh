@@ -146,7 +146,8 @@ NEXT_DATA=""
 
 # 1. Seed.
 step "seed: $USER_NAME signs in and creates a read API key"
-csrf="$(login)"[ -n "$csrf" ] || fail "no CSRF token"
+csrf="$(login)"
+[ -n "$csrf" ] || fail "no CSRF token"
 st="$(status_of "$BASE/api/me/api-keys" -b "$WORK/jar" -H "Origin: $BASE" -H "X-CSRF-Token: $csrf" \
   -H 'Content-Type: application/json' -d '{"name":"ops-drill","scopes":["read"]}')"
 [ "$st" = 201 ] || fail "API key creation answered $st"
