@@ -12,7 +12,8 @@
     "lint": "eslint . && node scripts/check-html-sinks.mjs src && node scripts/check-css.mjs src",
     "test": "vitest run",
     "test:scripts": "node --test scripts/check-html-sinks.test.mjs scripts/eslint-credential.test.mjs scripts/check-css.test.mjs",
-    "check:bundle": "node ../../ci/check-credential-bundle.mjs dist"
+    "check:bundle": "node ../../ci/check-credential-bundle.mjs dist",
+    "check:i18n": "node ../../ci/check-i18n.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "2.12.0",

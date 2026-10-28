@@ -118,7 +118,7 @@ describe('dictionary', () => {
   // the expect-error directive itself would fail the typecheck.
   it('a German dictionary missing a key is a compile error', () => {
     // @ts-expect-error the key "cancel" is missing
-    const broken: Dict = { common: { ...de.common, cancel: undefined } };
+    const broken: Dict = { ...de, common: { ...de.common, cancel: undefined } };
     void broken;
   });
 

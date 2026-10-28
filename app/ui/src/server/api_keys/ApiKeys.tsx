@@ -1,5 +1,8 @@
 import { type FormEvent, useCallback, useEffect, useState } from 'react';
 
+import { en } from '../../shared/i18n/dict';
+import { serverErrorText } from '../../shared/i18n/errors';
+import type { Dict } from '../../shared/i18n';
 import {
   api,
   arrayOf,
@@ -62,21 +65,11 @@ export function validateKey(name: string, scopes: readonly Scope[], days: string
   return null;
 }
 
-export function createError(code: string | null): string {
-  switch (code) {
-    case 'api_key/name_invalid':
-      return KEY_TEXT.errors.name;
-    case 'api_key/scope_invalid':
-      return KEY_TEXT.errors.scopes;
-    case 'api_key/expiry_out_of_range':
-      return KEY_TEXT.errors.expiry;
-    case 'api_key/limit_reached':
-      return KEY_TEXT.errors.limit;
-    default:
-      return KEY_TEXT.errors.failed;
-  }
+/** The text for a failed create: the server's code text, the page's own sentence for anything else. */
+export function createError(code: string | null, t: Dict = en): string {
+  if (code !== null && Object.hasOwn(t.errors.server, code)) return serverErrorText(t, code);
+  return KEY_TEXT.errors.failed;
 }
-
 /** Browser pieces (replaced in tests). */
 export const browser = {
   confirm: (text: string): boolean => window.confirm(text),
