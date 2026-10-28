@@ -72,6 +72,14 @@ _Avoid_: anchor directory (desktop mode only), global log
 The single server-mode secret that encrypts each user's own data key; held outside the image and outside CI variables.
 _Avoid_: password, secret (too broad)
 
+**User guide**:
+The end-user documentation for users, admins and auditors, in English and German, shipped with the desktop app and served by the server; opened from the "Help" entry.
+_Avoid_: docs, documentation (too broad: the operations docs are separate), manual
+
+**Operations docs**:
+The documentation for the people who deploy and run the server; kept in the repository, never shipped to users.
+_Avoid_: admin docs (an **Admin** is a user role, not an operator)
+
 ## Relationships
 
 - An **Organisation** runs at most one **Server mode** deployment; **Desktop mode** and **Server mode** are built from the same codebase.

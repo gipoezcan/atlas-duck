@@ -850,14 +850,24 @@ Each milestone entry lists: scope (§14, with the placements this plan makes whe
 - **Contract deltas (M14 plan):** Δ-M14-1 (`LOGIN.method = "oauth"`, `AUDITOR_READ` actions), Δ-M14-2 (anchor rows v2), the script pin of Δ-M14-3 and Δ-M14-5 (no cross-user audit route without `auditor`) were applied in the M12 plan; Δ-M14-1, Δ-M14-2 and Δ-M14-5 are confirmed in the M12 code, the script pin is not (M14 T12 adds it); Δ-M14-3's audit view (T17) and Δ-M14-4 (deactivation revokes OAuth grants, T8) are M14's.
 - **Status:** done 2026-10-28 (plan `2026-10-26-atlas-duck-m14-server-completion.md`; ledger `.superpowers/sdd/2026-10-26-atlas-duck-m14-server-completion/`; final review fixes in `f2dba31`). Evidence: GitHub CI run 40647193822 green (incl. `server-e2e` against the container); GitLab review pipeline 43124 green incl. `verify:review-e2e` (11 ok, 5 skip, 0 fail), `verify:review-sandbox` (floor `met` under RuntimeDefault) and the operations drill; production as M13 (pipeline 43147, scripts `met`). Docs: `docs/server/oauth.md`, `scripts.md`, `auditing.md`, threat model and runbook sections.
 
-### M15 — User documentation
+### M15 — German UI
 
-- **Scope (user request 2026-10-28):** detailed end-user documentation, written once and shipped in both modes. Desktop: the docs are bundled with the app and open offline from the app (no network fetch). Server: the docs are deployed with the server image, served under the app's own origin, and reachable from their own entry in the web UI's menu. Content: getting started per mode (install, or sign in), instances and tokens, connecting an MCP agent (desktop launcher; server API keys and OAuth), approvals, scripts, audit and export/verify, settings, admin and auditor pages (server), troubleshooting and the error-code reference. Operator docs in `docs/server/` stay where they are; M15 is for users.
-- **Constraints:** CSP (§6.4 desktop, the server's CSP) allows no external fonts, scripts or styles: the docs are static, built at build time and ship with the bundled CSS; no new runtime dependencies; the server serves them without a login (no user data) or behind it, to be decided in the plan; screenshots reflect the M11 design; docs cannot drift silently from the UI's texts and error codes (a check in CI, e.g. every error code in the reference exists in the code and vice versa).
-- **Questions for the detailed plan:** the source format and generator (Markdown rendered to static HTML at build time, without adding a runtime dependency); how desktop opens them (a Tauri window on the bundled files, or the system browser on a local file); public or login-only on the server; versioning (the docs match the running build); language (English only, or German too).
+- **Decided (design interview 2026-10-28):** the whole UI ships in English and German. Translated: every desktop window and server web page, the error messages the UI shows (the UI maps error codes to texts; core and server keep sending codes), browser and desktop notifications, the desktop app's native dialogs. Stays English: CLI output, everything agents see over MCP, audit records, logs, metrics, operations docs.
+- **Language choice:** automatic by default (browser language on the server, OS language on the desktop; anything not German falls back to English); each user can override it with "Deutsch" / "English" / "Automatic" (server: stored per user; desktop: an app setting).
+- **Mechanism:** an own typed dictionary (English and German side by side), no new runtime dependency; the compiler and CI check that every key has both languages. Dates and numbers formatted per language with `Intl`; exported audit files keep ISO dates.
+- **Tests:** existing UI tests keep running in English; new tests check German completeness and run key flows in German.
 - **Depends on:** M14.
-- **Exit criterion:** the desktop bundles (Windows, macOS, Linux) open the docs offline from the app; the production server serves them from the menu entry; the docs check is green in CI; every UI page links to its docs section.
-- **Status:** not started; the detailed plan comes first.
+- **Exit criterion:** every window and web page renders fully in German when chosen; the language setting works in both modes; completeness check and German flow tests green in CI (GitHub and GitLab); deployed to production.
+- **Status:** not started.
+
+### M16 — User guide
+
+- **Decided (design interview 2026-10-28):** the **User guide** (CONTEXT.md) for users, admins and auditors; the **Operations docs** in `docs/server/` stay in the repository. Written once as Markdown, built at build time by an own generator (pulldown-cmark, already a dependency) into two sets of static HTML, desktop and server, each with only its mode's pages, in English and German, styled with the app's bundled CSS within the CSP.
+- **Delivery:** server: public under `/docs/<lang>/…` (no user data), linked from the login page and a "Help" menu entry. Desktop: bundled, opened offline in its own help window from "Help"; "?" links next to UI sections open the matching anchor. Language follows the M15 choice, with a switch on every page.
+- **Consistency:** CI requires every page in both languages with the same section anchors; the error-code reference matches the code both ways; every UI page links to its section. Search: a build-time index plus a few KB of own JavaScript (no library), else a table of contents and index page. Screenshots generated in CI in both languages if it fits the milestone. The German text has no human review (user decision).
+- **Depends on:** M15.
+- **Exit criterion:** the desktop bundles (Windows, macOS, Linux) open the guide offline; production serves it from the menu entry; the docs checks are green in CI; every UI page links to its section.
+- **Status:** not started.
 
 **Open after M13/M14** (operational, no code task):
 
