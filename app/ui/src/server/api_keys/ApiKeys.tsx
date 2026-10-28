@@ -1,8 +1,8 @@
 import { type FormEvent, useCallback, useEffect, useState } from 'react';
 
+import type { Dict } from '../../shared/i18n';
 import { en } from '../../shared/i18n/dict';
 import { serverErrorText } from '../../shared/i18n/errors';
-import type { Dict } from '../../shared/i18n';
 import {
   api,
   arrayOf,
@@ -70,6 +70,7 @@ export function createError(code: string | null, t: Dict = en): string {
   if (code !== null && Object.hasOwn(t.errors.server, code)) return serverErrorText(t, code);
   return KEY_TEXT.errors.failed;
 }
+
 /** Browser pieces (replaced in tests). */
 export const browser = {
   confirm: (text: string): boolean => window.confirm(text),
