@@ -78,12 +78,28 @@ describe('formatting', () => {
 
   it('format_bytes_per_language', () => {
     expect(formatBytes('en', 512)).toBe('512 B');
-    expect(formatBytes('en', 1536)).toBe('1.5 KB');
-    expect(formatBytes('de', 1536)).toBe('1,5 KB');
-    expect(formatBytes('de', 5 * 1024 * 1024)).toBe('5 MB');
+    expect(formatBytes('en', 1536)).toBe('1.5 KiB');
+    expect(formatBytes('de', 1536)).toBe('1,5 KiB');
+    expect(formatBytes('de', 5 * 1024 * 1024)).toBe('5 MiB');
+  });
+
+  it('format_bytes_picks_the_unit_after_rounding', () => {
+    for (const lang of ['en', 'de'] as const) {
+      expect(formatBytes(lang, 1048575), lang).toBe('1 MiB');
+      expect(formatBytes(lang, 1048575 - 1024), lang).toBe(lang === 'en' ? '1,023 KiB' : '1.023 KiB');
+      expect(formatBytes(lang, 1024 ** 3 - 1), lang).toBe('1 GiB');
+      expect(formatBytes(lang, 1024 ** 4 - 1), lang).toBe('1 TiB');
+    }
+  });
+
+  it('format_bytes_gib_and_tib', () => {
+    expect(formatBytes('en', 3 * 1024 ** 3)).toBe('3 GiB');
+    expect(formatBytes('de', 1.5 * 1024 ** 3)).toBe('1,5 GiB');
+    expect(formatBytes('en', 1024 ** 4)).toBe('1 TiB');
+    expect(formatBytes('de', 2048 * 1024 ** 4)).toBe('2.048 TiB');
+    expect(formatBytes('en', 2048 * 1024 ** 4)).toBe('2,048 TiB');
   });
 });
-
 describe('dictionary', () => {
   it('de has exactly the keys of en, with the same kinds of leaves', () => {
     const walk = (a: unknown, b: unknown, path: string) => {
@@ -98,10 +114,12 @@ describe('dictionary', () => {
     walk(en, de, 'dict');
   });
 
+  // Checked by tsc (the gate), not by vitest: if the line below stopped being a type error,
+  // the expect-error directive itself would fail the typecheck.
   it('a German dictionary missing a key is a compile error', () => {
     // @ts-expect-error the key "cancel" is missing
     const broken: Dict = { common: { ...de.common, cancel: undefined } };
-    expect(broken).toBeTruthy();
+    void broken;
   });
 
   it('plurals_follow_german_forms', () => {

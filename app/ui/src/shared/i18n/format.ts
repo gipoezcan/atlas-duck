@@ -26,15 +26,20 @@ export function formatNumber(lang: Lang, n: number): string {
   return new Intl.NumberFormat(LOCALE[lang]).format(n);
 }
 
-/** A byte count with a 1024-based B/KB/MB/GB unit and at most one decimal. */
+/**
+ * A byte count with a 1024-based unit (B, KiB, MiB, GiB, TiB) and at most one
+ * decimal. The unit is chosen after rounding: 1048575 B is "1 MiB", never
+ * "1,024 KiB".
+ */
 export function formatBytes(lang: Lang, n: number): string {
-  const units = ['B', 'KB', 'MB', 'GB'];
-  let value = n;
+  const format = new Intl.NumberFormat(LOCALE[lang], { maximumFractionDigits: 1 });
+  if (n < 1024) return `${format.format(n)} B`;
+  const units = ['KiB', 'MiB', 'GiB', 'TiB'];
+  let value = n / 1024;
   let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
+  while (Math.round(value * 10) >= 10240 && unit < units.length - 1) {
     value /= 1024;
     unit += 1;
   }
-  const text = new Intl.NumberFormat(LOCALE[lang], { maximumFractionDigits: unit === 0 ? 0 : 1 }).format(value);
-  return `${text} ${units[unit]}`;
+  return `${format.format(value)} ${units[unit]}`;
 }
