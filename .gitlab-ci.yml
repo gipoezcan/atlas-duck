@@ -490,8 +490,17 @@ stop:review:
 deploy:production:
   <<: *deploy-base
   variables: *server-vars
-  # Automatic deploys must not skip the UI tests and checks.
-  needs: [server:version, server:image, server:publish-harbor, server:chart-package, ui, node:ci-checks, chart:test]
+  # Automatic deploys must not skip the UI tests and checks. chart:test runs only when the chart
+  # changes, so it is optional (a required need on an absent job rejects the whole pipeline).
+  needs:
+    - server:version
+    - server:image
+    - server:publish-harbor
+    - server:chart-package
+    - ui
+    - node:ci-checks
+    - job: chart:test
+      optional: true
   rules:
     - if: $CI_COMMIT_BRANCH == "master"
       when: on_success
