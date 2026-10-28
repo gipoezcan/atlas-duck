@@ -840,7 +840,7 @@ Each milestone entry lists: scope (§14, with the placements this plan makes whe
 - **Depends on:** M12.
 - **Exit criterion:** a review environment deploys from a branch pipeline and passes the smoke test; master key rotation and backup/restore pass on it; the production deploy is gated behind the user's go-ahead (a deploy to the shared cluster is outward-facing).
 - **Contract deltas (M13 plan, Task 1):** Δ-M13-1 new operational server anchor-chain kinds `MASTER_KEY_ROTATED`, `USER_DEACTIVATED` (body `{"leaf"}` with an `anchor_heads` entry, PD-217 v2), `CHAIN_DELETED`, `BACKUP_TAKEN`, `RESTORED`, `RETENTION_RUN`, `MAINTENANCE`; Δ-M13-2 the admin CLI talks to the running server over a Unix socket and replaces M12's hidden offline `admin instances` (PD-212); Δ-M13-3 `server.db` schema v2 with an up-migration path (M14 numbers its migration v3).
-- **Status:** implemented on branch `m13-server-deploy-ops` (plan `2026-10-26-atlas-duck-m13-server-deploy-ops.md`, Tasks 1–16; ledger `.superpowers/sdd/2026-10-26-atlas-duck-m13-server-deploy-ops/progress.md`). Server tests pass locally (Windows); the Unix-socket tests, `chart:test`, `server:guards`, the image, publish and deploy jobs, `verify:review-smoke` and `verify:review-ops-drill` run only in GitLab CI and have not run yet: the first push to GitLab deploys a review environment (outward-facing, needs the user's go-ahead), and the deploy jobs refuse to run until Q1–Q4 (storage class, hosts, TLS secrets, directory values and the organisation CA bundle) are filled in. Exit evidence (Task 17) and the gated production deploy (Q5, user go-ahead) are pending.
+- **Status:** done 2026-10-28 (plan `2026-10-26-atlas-duck-m13-server-deploy-ops.md`, Tasks 1–16; ledger `.superpowers/sdd/2026-10-26-atlas-duck-m13-server-deploy-ops/`). Evidence: GitHub CI run 40645788615 green; GitLab review pipeline 43119 green including the operations drill (key rotation, backup/restore, deactivation); production deployed from master `10b0932` by GitLab pipeline 43147 (`deploy:production` job 347796, release `atlas-duck`): https://atlas-duck.dux.intern.gipmbh.de answers `/healthz` 200 (three in a row), `/readyz` ready (directory `ldap`, master key, store, scripts `met`, offboarding `manual`), `/metrics` 404 publicly, `/` serves the web UI; the first scheduled offboarding, retention and backup runs succeeded. Review environments for M13 and M14 are torn down. Open items: see "Open after M13/M14" below.
 
 ### M14 — Server mode completion
 
@@ -848,7 +848,16 @@ Each milestone entry lists: scope (§14, with the placements this plan makes whe
 - **Depends on:** M13.
 - **Exit criterion:** an MCP client completes the OAuth flow and runs a script; an auditor exports another user's chain and `verify-export` passes on it; the server e2e suite is green in CI.
 - **Contract deltas (M14 plan):** Δ-M14-1 (`LOGIN.method = "oauth"`, `AUDITOR_READ` actions), Δ-M14-2 (anchor rows v2), the script pin of Δ-M14-3 and Δ-M14-5 (no cross-user audit route without `auditor`) were applied in the M12 plan; Δ-M14-1, Δ-M14-2 and Δ-M14-5 are confirmed in the M12 code, the script pin is not (M14 T12 adds it); Δ-M14-3's audit view (T17) and Δ-M14-4 (deactivation revokes OAuth grants, T8) are M14's.
-- **Status:** done on branch `m14-server-completion` with M13 merged in (schema v3 = M14's tables after M13's v2; deactivation revokes OAuth grants; retention purges OAuth state; chart script values; `verify:review-sandbox`, `verify:review-e2e`); CI and review-environment evidence pending the push. Docs: `docs/server/oauth.md`, `scripts.md`, `auditing.md`, threat model and runbook sections.
+- **Status:** done 2026-10-28 (plan `2026-10-26-atlas-duck-m14-server-completion.md`; ledger `.superpowers/sdd/2026-10-26-atlas-duck-m14-server-completion/`; final review fixes in `f2dba31`). Evidence: GitHub CI run 40647193822 green (incl. `server-e2e` against the container); GitLab review pipeline 43124 green incl. `verify:review-e2e` (11 ok, 5 skip, 0 fail), `verify:review-sandbox` (floor `met` under RuntimeDefault) and the operations drill; production as M13 (pipeline 43147, scripts `met`). Docs: `docs/server/oauth.md`, `scripts.md`, `auditing.md`, threat model and runbook sections.
+
+**Open after M13/M14** (operational, no code task):
+
+- `GROUP_AUDITORS` is not set in production: there are no auditors yet.
+- The admin group is all of G-DUX; narrow it to the people who operate the server.
+- Offboarding is `manual` until a read-only directory bind account exists (`directory.serviceBind`); until then `users deactivate` is an operator step.
+- The data volume is on NFS (ADR 0004, rollback journal); ask the cluster admins for local-path or block storage and move to it.
+- The master key's escrow copy has to move offline.
+- M11 manual checks still open: Linux screenshot, dark-mode visual check, macOS GUI checklist item 7a.
 ---
 
 ## Traceability
