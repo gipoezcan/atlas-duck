@@ -40,11 +40,16 @@ variables:
 ui:
   stage: ui
   image: node:22
+  variables:
+    # The runner caps the job at 8Gi; vitest's default (one fork per core) outgrew it and a worker
+    # died mid-run (pipeline 43004). Two forks stay well inside.
+    KUBERNETES_MEMORY_REQUEST: "6Gi"
+    KUBERNETES_MEMORY_LIMIT: "8Gi"
   script:
     - cd app/ui
     - npm ci --ignore-scripts
     - npm run lint
-    - npm test
+    - npm test -- --pool=forks --maxWorkers=2
     - npm run test:scripts
     - npm run build
     - npm run check:bundle
@@ -172,6 +177,8 @@ chart:test:
   vars: &server-vars
     APP_NAME: atlas-duck-server
     KUBE_CONTEXT: team-dux@gip
+    # The g-dux group's file variable KUBECONFIG_DUX holds the team-dux@gip context.
+    KUBECONFIG: ${KUBECONFIG_DUX}
     KUBE_NAMESPACE: team-dux
     # Review hosts are <slug>.<REVIEW_DOMAIN>; each gets its own cert-manager certificate in the
     # Secret <release>-tls (no wildcard exists).
@@ -412,9 +419,21 @@ deploy:review:
       ARGS="${ARGS} --set masterKey.existingSecret=${KEY_SECRET}"
       ARGS="${ARGS} --set podAnnotations.commit-sha=${CI_COMMIT_SHORT_SHA}"
       # Server-side schema validation before anything changes (PD-M13-10).
-      helmfile -e review -f build/helmfile.yaml template ${ARGS} > rendered-review.yaml
-      $K apply --dry-run=server -f rendered-review.yaml > /dev/null
-      helmfile -e review -f build/helmfile.yaml apply ${ARGS}
+      # The cluster's /openapi/v2 answers 503 (an aggregated API is down; /openapi/v3 works):
+      # nothing here may fetch it. Client-side validation is off everywhere; the server-side
+      # dry run and the apply itself still get every schema and admission error from the server.
+      echo "== tool versions"
+      kubectl version --client || true
+      helm version || true
+      helmfile version || true
+      echo "== helmfile template"
+      helmfile -e review -f build/helmfile.yaml template --skip-deps ${ARGS} > rendered-review.yaml
+      echo "== server-side dry run (without helm hooks: a test Pod left by helm test is immutable)"
+      sh ci/drop-helm-hooks.sh rendered-review.yaml > rendered-review-objects.yaml
+      $K apply --server-side --field-manager=atlas-duck-ci --dry-run=server --force-conflicts --validate=false \
+        -f rendered-review-objects.yaml > /dev/null
+      echo "== helmfile apply"
+      helmfile -e review -f build/helmfile.yaml apply --skip-deps ${ARGS}
       echo "REVIEW_URL=https://${HOST}" > review.env
       echo "RELEASE_NAME=${RELEASE_NAME}" >> review.env
   artifacts:
@@ -498,14 +517,27 @@ deploy:production:
       ARGS="--set image.repository=${HARBOR_HOST}/${ARTIFACTORY_REPO_KEY}/${APP_NAME}"
       ARGS="${ARGS} --set image.digest=$(cat image.digest)"
       ARGS="${ARGS} --set podAnnotations.commit-sha=${CI_COMMIT_SHORT_SHA}"
-      helmfile -e production -f build/helmfile.yaml template ${ARGS} > rendered-production.yaml
-      $K apply --dry-run=server -f rendered-production.yaml > /dev/null
-      helmfile -e production -f build/helmfile.yaml apply ${ARGS}
+      # The cluster's /openapi/v2 answers 503 (an aggregated API is down; /openapi/v3 works):
+      # nothing here may fetch it. Client-side validation is off everywhere; the server-side
+      # dry run and the apply itself still get every schema and admission error from the server.
+      echo "== tool versions"
+      kubectl version --client || true
+      helm version || true
+      helmfile version || true
+      echo "== helmfile template"
+      helmfile -e production -f build/helmfile.yaml template --skip-deps ${ARGS} > rendered-production.yaml
+      echo "== server-side dry run (without helm hooks: a test Pod left by helm test is immutable)"
+      sh ci/drop-helm-hooks.sh rendered-production.yaml > rendered-production-objects.yaml
+      $K apply --server-side --field-manager=atlas-duck-ci --dry-run=server --force-conflicts --validate=false \
+        -f rendered-production-objects.yaml > /dev/null
+      echo "== helmfile apply"
+      helmfile -e production -f build/helmfile.yaml apply --skip-deps ${ARGS}
   environment:
     name: production
     deployment_tier: production
 # T14 (master-plan exit criterion): the review environment answers through the ingress with TLS
-# verified against the org CA, signs in a test user, serves MCP to an API key and refuses it once
+# verified against the system bundle (the ingress certificate is Let's Encrypt via cert-manager;
+# deployment/ca/org-ca.pem is the AD root for LDAPS only), signs in a test user, serves MCP to an API key and refuses it once
 # revoked, and passes `helm test`.
 verify:review-smoke:
   stage: server-verify
@@ -579,8 +611,8 @@ server:e2e-build:
 
 # M14 T23: the black-box suite against the review environment (Jira none, L258) at
 # https://<slug>.atlas-duck.dux.intern.gipmbh.de (REVIEW_URL from deploy:review), TLS verified against
-# the system trust store (the ingress certificate is cert-manager's letsencrypt; org-ca.pem is the
-# LDAPS root and not used here).
+# the system trust store (the ingress certificate is cert-manager's letsencrypt; INGRESS_CA_BUNDLE
+# overrides it; org-ca.pem is the LDAPS root and not used here); it waits for the ingress as the smoke.
 verify:review-e2e:
   stage: server-verify
   needs: [deploy:review, verify:review-smoke, server:e2e-build]

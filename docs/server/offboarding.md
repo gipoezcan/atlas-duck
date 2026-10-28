@@ -72,7 +72,9 @@ looks up every active user by UPN, and deactivates those whose account is disabl
 Rotating the bind password:
 
 1. The directory team sets a new password.
-2. Replace the Secret (`--dry-run=client -o yaml | kubectl apply -f -`).
+2. Replace the Secret: `kubectl create secret ... --dry-run=client -o yaml | kubectl apply --server-side
+   --force-conflicts --field-manager=atlas-duck-ops --validate=false -f -`. It runs server-side because
+   this cluster answers `/openapi/v2` with 503 (see [master-key-rotation.md](master-key-rotation.md)).
 3. Run `kubectl rollout restart deploy/atlas-duck`. The password is read at start.
 
 Review environments use the test directory's file as the lookup (`offboarding: "stub"`): mark a

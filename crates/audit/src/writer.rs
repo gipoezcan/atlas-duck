@@ -399,6 +399,8 @@ pub(crate) struct WriterParts {
     /// `GENESIS`'s `record_hash` from the first-retained anchor, for a store whose `GENESIS`
     /// is already pruned (a retained `GENESIS` row wins).
     pub(crate) genesis_hash: Option<[u8; 32]>,
+    /// The journal mode every read-write open puts the file in (`OpenConfig::journal`).
+    pub(crate) journal: schema::JournalMode,
 }
 
 pub(crate) type AppendReply = SyncSender<Result<Vec<Committed>, AuditError>>;
@@ -496,6 +498,7 @@ pub(crate) struct WriterState {
     /// `GENESIS`'s `record_hash` (the first-retained anchor names it); `None`: unknown, and
     /// prune fails closed.
     pub(crate) genesis_hash: Option<[u8; 32]>,
+    pub(crate) journal: schema::JournalMode,
     /// The settings view (see `settings.rs`), the writer's copy of `Shared::settings`.
     pub(crate) settings: Settings,
     /// The view was rebuilt from every settings row; `false`: a row was unreadable, and no
@@ -539,6 +542,7 @@ impl WriterState {
             shared: parts.shared,
             hooks: parts.hooks,
             genesis_hash: parts.genesis_hash,
+            journal: parts.journal,
             settings: Settings::default(),
             settings_trusted: true,
             config_reconciled: false,
@@ -557,6 +561,7 @@ impl WriterState {
             shared: self.shared,
             hooks: self.hooks,
             genesis_hash: self.genesis_hash,
+            journal: self.journal,
         }
     }
 }
@@ -906,6 +911,10 @@ impl Writer {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             &parts.hooks,
         )?;
+        // WAL (the desktop) is already set by create_v1: nothing to do, as before M13.
+        if parts.journal != schema::JournalMode::Wal {
+            schema::apply_journal_mode(&conn, parts.journal).map_err(sql_open)?;
+        }
         let head = Head {
             seq: 0,
             hash: ZERO_HASH,
@@ -926,6 +935,11 @@ impl Writer {
             &parts.hooks,
         )?;
         schema::gate_open_connection_up_to(&conn, parts.hooks.schema_head())?;
+        // After the gate, so a newer store's file is left as it is. A WAL store (the desktop) is
+        // not touched at all, as before M13.
+        if parts.journal != schema::JournalMode::Wal {
+            schema::apply_journal_mode(&conn, parts.journal).map_err(sql_open)?;
+        }
         let row: Option<HeadRow> = conn
             .query_row(
                 "SELECT seq, record_hash, chain_id, epoch, ts_utc, flags, event_type FROM events \
@@ -1160,8 +1174,8 @@ impl Writer {
 
     /// The staging copy after its restore transaction (§8.10's credential rule applied to a
     /// restore): vacuumed with `secure_delete` on (no freed page of a dropped `vault` table
-    /// survives), page size and incremental auto-vacuum as F.10 requires, back in WAL mode,
-    /// then checkpointed, closed and fsynced with no `-wal` left (`close_for_rename`).
+    /// survives), page size and incremental auto-vacuum as F.10 requires, back in the store's
+    /// journal mode (WAL unless `OpenConfig::journal` says otherwise), then checkpointed, closed and fsynced with no `-wal` left (`close_for_rename`).
     pub(crate) fn finish_staging(self, path: &Path) -> Result<(), AuditError> {
         self.conn
             .execute_batch(
@@ -1169,15 +1183,8 @@ impl Writer {
                  PRAGMA auto_vacuum = INCREMENTAL; VACUUM;",
             )
             .map_err(sql)?;
-        let mode: String = self
-            .conn
-            .pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))
-            .map_err(sql)?;
-        if !mode.eq_ignore_ascii_case("wal") {
-            return Err(AuditError::AppendFailed(format!(
-                "journal_mode WAL refused, got {mode}"
-            )));
-        }
+        schema::apply_journal_mode(&self.conn, self.st.journal)
+            .map_err(|e| AuditError::AppendFailed(e.to_string()))?;
         self.close_for_rename(path)
             .map(|_| ())
             .map_err(|e| AuditError::Io(e.to_string()))
@@ -1296,6 +1303,7 @@ impl Writer {
             shared,
             hooks: self.st.hooks.clone(),
             genesis_hash,
+            journal: self.st.journal,
         };
         *self = Writer::open(path, parts)?;
         Ok(())

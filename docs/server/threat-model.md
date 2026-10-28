@@ -92,9 +92,15 @@ key material, PATs or audit contents.
 - **Review environments use a test directory and a test key.** That is fine only because they
   never hold real data. Never sign in there with a real account and never store a real PAT
   there. Production refuses the test directory twice (chart guard, then server exit 78).
-- **Daily backups on NFS (ADR 0004).** The backups volume on `team-dux-storage` holds the
-  wrapped keys and every chain of the last 14 days: whoever can read that share and the master
-  key Secret can read every PAT of that period.
+- **Live data and daily backups on NFS (ADR 0004).** Both claims on `team-dux-storage` hold the
+  wrapped keys and the chains (the backups those of the last 14 days): whoever can read that share
+  and the master key Secret can read every PAT. SQLite on NFS relies on the NFS server's locking
+  and fsync; the single replica, the rollback journal and the exclusive lock on `server.db` keep
+  one writer, and a corruption on the NFS side is detected by `admin anchor verify`, not prevented.
+- **The server runs with gid 0 (ADR 0004).** It is the only group that may write the NFS volume's
+  root. The uid stays 65532 with no capabilities, and the chart policy refuses uid 0. The process
+  umask is 077, so nothing the server creates can be read through gid 0. Other files in the
+  container that are writable by group root are on the read-only root filesystem.
 - **Backups contain the wrapped keys.** A bundle is useless without the master key whose id is
   in its manifest. Store bundles off-cluster and apart from the key escrow
   ([backup-restore.md](backup-restore.md)).

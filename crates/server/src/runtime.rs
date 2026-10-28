@@ -26,7 +26,7 @@ use atlas_duck_core::decision::DecisionApi;
 use atlas_duck_core::http_factory::HttpFactory;
 use atlas_duck_core::proxy::SystemProxySource;
 use atlas_duck_core::{Confirm, Core, CoreDeps, NativeConfirmer, ShutdownReason, UiEvent, UiSink};
-use atlas_duck_ipc::paths::{DataDirResolution, check_data_dir};
+use atlas_duck_ipc::paths::DataDirResolution;
 use atlas_duck_ipc::proto::RequestHandler;
 use secrecy::SecretString;
 use serde_json::{Map, Value};
@@ -115,6 +115,8 @@ pub struct RuntimeDeps {
     /// M14 PD-246: the process-wide script state; `None` (`ATLAS_DUCK_SCRIPTS=disabled`) answers
     /// every script `sandbox_unavailable`.
     pub scripts: Option<Arc<crate::scripts::ServerScripts>>,
+    /// ADR 0004: the journal mode of every user store (`ATLAS_DUCK_SQLITE_JOURNAL`).
+    pub journal: atlas_duck_audit::JournalMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,9 +275,10 @@ impl UserRuntime {
             return Err(RuntimeError::UnknownUser);
         }
         std::fs::create_dir_all(&dir).map_err(|e| st(e.to_string()))?;
-        let data = match check_data_dir(&dir) {
+        let data = match crate::config::check_dir(&dir, deps.journal) {
             Ok(DataDirResolution::Local(d)) => d,
-            _ => return Err(st("user dir is not a local directory".into())),
+            Ok(other) => return Err(st(format!("user dir refused: {other:?}"))),
+            Err(e) => return Err(st(format!("user dir check failed: {:?}", e.kind()))),
         };
         let lock = acquire_lock(&data).map_err(st)?;
         let keys = Arc::new(ServerKeyStore::new(
@@ -286,6 +289,7 @@ impl UserRuntime {
         let open_cfg = || {
             let mut c = OpenConfig::new(Arc::new(SystemClock::new()), keys.clone());
             c.pinned_install_id = Some(user_id.to_owned());
+            c.journal = deps.journal;
             c
         };
         let store = if exists {

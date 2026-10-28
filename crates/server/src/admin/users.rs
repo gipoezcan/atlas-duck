@@ -167,11 +167,10 @@ pub async fn deactivate(
         });
     }
 
-    let rt = ctx
-        .registry
-        .open_user(user_id)
-        .await
-        .map_err(|_| "admin/user_store_unavailable")?;
+    let rt = ctx.registry.open_user(user_id).await.map_err(|e| {
+        tracing::warn!(event = "user_store_unavailable", user_id, error = ?e);
+        "admin/user_store_unavailable"
+    })?;
     for k in &keys {
         rt.append_server_record(
             EventType::API_KEY_REVOKED,

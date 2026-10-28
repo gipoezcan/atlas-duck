@@ -73,8 +73,14 @@ A="kubectl $NS exec deploy/atlas-duck -- /app/atlas-duck-server admin"
 
    ```sh
    kubectl $NS create secret generic atlas-duck-master-key --from-file=key=/media/offline/new-key \
-     --dry-run=client -o yaml | kubectl $NS apply -f -
+     --dry-run=client -o yaml \
+     | kubectl $NS apply --server-side --force-conflicts --field-manager=atlas-duck-ops \
+       --validate=false -f -
    ```
+
+   The apply runs server-side: a client-side `kubectl apply` fetches the cluster's `/openapi/v2`,
+   which this cluster answers 503. `--validate=false` skips the same schema fetch. The API server
+   still validates the Secret.
 
    Set `masterKey.nextSecret: ""`, deploy, then
    `kubectl $NS delete secret atlas-duck-master-key-next`.

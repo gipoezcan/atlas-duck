@@ -60,9 +60,11 @@ Admin commands run one at a time, and the scheduler's jobs take the same lock.
 
 ## Metrics
 
-`/metrics` serves Prometheus text to in-cluster scrapes only. A request that carries
-`X-Forwarded-For` or `Forwarded` (anything that came through the ingress) gets a 404. Labels never
-carry a username, host or id.
+`/metrics` serves Prometheus text on a listener of its own: `ATLAS_DUCK_METRICS_LISTEN` (the chart
+sets `0.0.0.0:9090`, the Service port `metrics`; unset means no metrics listener). The Ingress
+routes only the `http` port, where `/metrics` is a 404. Scrape the Service's `metrics` port
+in-cluster, or `kubectl port-forward svc/atlas-duck 9090:metrics`. Labels never carry a username,
+host or id.
 
 | Metric | Meaning |
 |---|---|

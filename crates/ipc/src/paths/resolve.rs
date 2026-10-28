@@ -102,6 +102,24 @@ pub fn check_data_dir(path: &Path) -> io::Result<DataDirResolution> {
     }
 }
 
+/// [`check_data_dir`] for the server only (ADR 0004): a data dir on a network filesystem
+/// (`NetworkFs`, NFS among them) counts as `Local`. Only for a single server process that runs
+/// SQLite in rollback-journal mode; FUSE, `NotMntLocal`, an unresolved overlay and UNC paths stay
+/// refused. The desktop never calls it (§7.7).
+pub fn check_data_dir_allowing_network(path: &Path) -> io::Result<DataDirResolution> {
+    check_data_dir(path).map(accept_network)
+}
+
+fn accept_network(r: DataDirResolution) -> DataDirResolution {
+    match r {
+        DataDirResolution::NotLocal {
+            path,
+            kind: NotLocalKind::NetworkFs { .. },
+        } => DataDirResolution::Local(LocalDataDir { path }),
+        other => other,
+    }
+}
+
 /// "Does not exist" in the §7.7 sense (removed folder, unmounted drive).
 fn is_missing(e: &io::Error) -> bool {
     if matches!(
@@ -123,4 +141,49 @@ fn is_missing_os_specific(e: &io::Error) -> bool {
 #[cfg(not(windows))]
 fn is_missing_os_specific(_e: &io::Error) -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn not_local(kind: NotLocalKind) -> DataDirResolution {
+        DataDirResolution::NotLocal {
+            path: PathBuf::from("/data"),
+            kind,
+        }
+    }
+
+    #[test]
+    fn the_server_check_accepts_a_network_filesystem_only() {
+        assert_eq!(
+            accept_network(not_local(NotLocalKind::NetworkFs { f_type: 0x6969 })),
+            DataDirResolution::Local(LocalDataDir {
+                path: PathBuf::from("/data")
+            })
+        );
+        for kind in [
+            NotLocalKind::Unc,
+            NotLocalKind::RemoteDrive,
+            NotLocalKind::UnknownDrive,
+            NotLocalKind::Fuse,
+            NotLocalKind::NotMntLocal,
+            NotLocalKind::OverlayUnresolved,
+        ] {
+            assert_eq!(accept_network(not_local(kind)), not_local(kind));
+        }
+        let missing = DataDirResolution::Missing {
+            path: PathBuf::from("/data"),
+        };
+        assert_eq!(accept_network(missing.clone()), missing);
+    }
+
+    #[test]
+    fn the_server_check_still_answers_local_for_a_local_dir() {
+        let dir = std::env::temp_dir();
+        assert!(matches!(
+            check_data_dir_allowing_network(&dir),
+            Ok(DataDirResolution::Local(_))
+        ));
+    }
 }

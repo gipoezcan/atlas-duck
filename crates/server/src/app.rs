@@ -4,11 +4,12 @@
 
 use std::future::IntoFuture;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use atlas_duck_audit::lock::InstanceLock;
-use atlas_duck_ipc::paths::{DataDirResolution, check_data_dir};
+use atlas_duck_ipc::paths::{DataDirResolution, LocalDataDir};
 use serde_json::json;
 
 use crate::admin::AdminCtx;
@@ -35,6 +36,80 @@ use crate::web::{AppInner, AppState, router};
 
 const LOCK_HOST: &str = "atlas-duck-server";
 
+/// Why `<data>/server` cannot be used: the check that failed, the path, and the I/O error kind
+/// (with its OS error number) or the locality verdict. Never a file's content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DirRefusal {
+    pub check: &'static str,
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+fn io_reason(e: &std::io::Error) -> String {
+    match e.raw_os_error() {
+        Some(n) => format!("{:?} (os error {n})", e.kind()),
+        None => format!("{:?}", e.kind()),
+    }
+}
+
+/// `uid:gid mode` of `path` (Unix), for a refusal's log line; `unknown` when it cannot be read.
+pub(crate) fn owner_of(path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if let Ok(m) = std::fs::metadata(path) {
+            return format!(
+                "{}:{} {:o}",
+                m.uid(),
+                m.gid(),
+                m.permissions().mode() & 0o7777
+            );
+        }
+    }
+    let _ = path;
+    "unknown".into()
+}
+
+/// Creates (or reuses) `<data>/server`, closes it to everyone else (0700, Unix), checks that it
+/// can be written and that it passes the data-dir check of the journal mode (ADR 0004).
+pub(crate) fn prepare_server_dir(
+    data: &Path,
+    journal: atlas_duck_audit::JournalMode,
+) -> Result<LocalDataDir, DirRefusal> {
+    let dir = data.join("server");
+    let refuse = |check: &'static str, reason: String| DirRefusal {
+        check,
+        path: dir.clone(),
+        reason,
+    };
+    std::fs::create_dir_all(&dir).map_err(|e| refuse("create", io_reason(&e)))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| refuse("mode", io_reason(&e)))?;
+    }
+    let probe = dir.join(".write-probe");
+    std::fs::write(&probe, b"")
+        .and_then(|()| std::fs::remove_file(&probe))
+        .map_err(|e| refuse("write", io_reason(&e)))?;
+    match crate::config::check_dir(&dir, journal) {
+        Ok(DataDirResolution::Local(l)) => Ok(l),
+        Ok(DataDirResolution::NotLocal { kind, .. }) => {
+            Err(refuse("locality", format!("{kind:?}")))
+        }
+        Ok(other) => Err(refuse("exists", format!("{other:?}"))),
+        Err(e) => Err(refuse("locality", io_reason(&e))),
+    }
+}
+
+/// A startup or runtime refusal with the reason it happened (an error kind or message, never a
+/// secret).
+fn fail_why(event: &'static str, reason: impl std::fmt::Display) -> u8 {
+    tracing::error!(event, reason = %reason);
+    EXIT_RUNTIME
+}
+
 fn fail(event: &'static str) -> u8 {
     tracing::error!(event);
     EXIT_RUNTIME
@@ -42,11 +117,15 @@ fn fail(event: &'static str) -> u8 {
 
 /// Runs the server until shutdown; answers the process exit code.
 pub fn serve(config: Config) -> u8 {
-    let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
+    // ADR 0004: the data volume's group is the process's own (gid 0 on NFS), so nothing the
+    // server creates is group or other accessible.
+    let _ = atlas_duck_ipc::paths::restrict_umask();
+    let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-    else {
-        return fail("runtime_start_failed");
+    {
+        Ok(rt) => rt,
+        Err(e) => return fail_why("runtime_start_failed", io_reason(&e)),
     };
     rt.block_on(run(config))
 }
@@ -80,32 +159,41 @@ async fn run(config: Config) -> u8 {
     }
     let data = config.data_dir.path().to_path_buf();
     let server_dir = data.join("server");
-    if std::fs::create_dir_all(&server_dir).is_err() {
-        return fail("server_dir_unusable");
-    }
-    let Ok(DataDirResolution::Local(local)) = check_data_dir(&server_dir) else {
-        return fail("server_dir_unusable");
-    };
-    // ADR 0003: one process per data volume.
-    let Ok(_lock) = InstanceLock::acquire(&local, LOCK_HOST) else {
-        return fail("server_running");
-    };
-    let store: Arc<dyn ServerStore> = match SqliteStore::open(&server_dir.join("server.db")) {
-        Ok(s) => Arc::new(s),
-        Err(StoreError::Migration { from, to }) => {
-            // M13 Δ-M13-3: the file stays at `from`; an older build can still open it.
-            tracing::error!(event = "store/migration_failed", from, to);
+    let local = match prepare_server_dir(&data, config.sqlite_journal) {
+        Ok(l) => l,
+        Err(r) => {
+            tracing::error!(
+                event = "server_dir_unusable",
+                check = r.check,
+                path = %r.path.display(),
+                reason = %r.reason,
+                data_dir_owner = %owner_of(&data),
+            );
             return EXIT_RUNTIME;
         }
-        Err(_) => return fail("server_store_unavailable"),
     };
+    // ADR 0003: one process per data volume.
+    let _lock = match InstanceLock::acquire(&local, LOCK_HOST) {
+        Ok(l) => l,
+        Err(e) => return fail_why("server_running", format!("{e:?}")),
+    };
+    let store: Arc<dyn ServerStore> =
+        match SqliteStore::open_with(&server_dir.join("server.db"), config.sqlite_journal) {
+            Ok(s) => Arc::new(s),
+            Err(StoreError::Migration { from, to }) => {
+                // M13 Δ-M13-3: the file stays at `from`; an older build can still open it.
+                tracing::error!(event = "store/migration_failed", from, to);
+                return EXIT_RUNTIME;
+            }
+            Err(e) => return fail_why("server_store_unavailable", e),
+        };
     // Batch-2 review I1: a rotation under way (the next key already wraps rows) keeps the next key
     // as the primary across restarts, so no new data key goes under the key about to retire.
     if let Some(id) = &next_id {
         match crate::admin::rotate::promote_next_if_in_use(&master, store.as_ref(), id) {
             Ok(true) => tracing::warn!(event = "rotation_in_progress", primary = %id),
             Ok(false) => {}
-            Err(_) => return fail("server_store_unavailable"),
+            Err(e) => return fail_why("server_store_unavailable", e),
         }
     }
     // The login directory, and the offboarding check's account lookup (M13 T9, PD-M13-14): the
@@ -117,8 +205,9 @@ async fn run(config: Config) -> u8 {
                 upn_suffix,
                 base_dn,
             } => {
-                let Ok(tls) = client_config(config.ca_bundle_file.as_deref()) else {
-                    return fail("ca_bundle_unusable");
+                let tls = match client_config(config.ca_bundle_file.as_deref()) {
+                    Ok(t) => t,
+                    Err(e) => return fail_why("ca_bundle_unusable", format!("{e:?}")),
                 };
                 let lookup: Option<Arc<dyn AccountLookup>> = match &config.service_bind {
                     None => None,
@@ -157,7 +246,7 @@ async fn run(config: Config) -> u8 {
                     let d = Arc::new(d);
                     (d.clone(), Some(d))
                 }
-                Err(_) => return fail("test_directory_unusable"),
+                Err(e) => return fail_why("test_directory_unusable", format!("{e:?}")),
             },
         };
     let offboarding = match (&lookup, &config.directory) {
@@ -197,6 +286,7 @@ async fn run(config: Config) -> u8 {
             allow_http: false,
             sse_capacity: crate::runtime::SSE_CAPACITY,
             scripts: scripts.clone(),
+            journal: config.sqlite_journal,
         },
         config.max_open_users,
     ));
@@ -208,7 +298,7 @@ async fn run(config: Config) -> u8 {
         config.session_idle.as_secs(),
     ) {
         Ok(s) => Arc::new(s),
-        Err(_) => return fail("server_store_unavailable"),
+        Err(e) => return fail_why("server_store_unavailable", e),
     };
     let sweeper = sessions.spawn_sweeper();
     let login = LoginService {
@@ -231,7 +321,7 @@ async fn run(config: Config) -> u8 {
         crate::api_keys::ApiKeyParams::PRODUCTION,
     ) {
         Ok(k) => Arc::new(k),
-        Err(_) => return fail("api_keys_unusable"),
+        Err(e) => return fail_why("api_keys_unusable", format!("{e:?}")),
     };
     let writer = Arc::new(AnchorWriter::new(
         store.clone(),
@@ -281,8 +371,8 @@ async fn run(config: Config) -> u8 {
         exports: exports.clone(),
     }));
     let started = json!({"version": env!("CARGO_PKG_VERSION"), "mode": format!("{:?}", config.mode).to_lowercase()});
-    if writer.start(&started).is_err() {
-        return fail("anchor_append_failed");
+    if let Err(e) = writer.start(&started) {
+        return fail_why("anchor_append_failed", format!("{e:?}"));
     }
     let anchor_timer = writer.spawn(config.anchor_interval);
     // Batch-1 review I-1: a restore interrupted by a crash keeps the server in maintenance.
@@ -341,10 +431,27 @@ async fn run(config: Config) -> u8 {
             let _ = tokio::task::spawn_blocking(move || e.sweep(false)).await;
         }
     });
-    let Ok(listener) = tokio::net::TcpListener::bind(config.listen).await else {
-        return fail("listen_failed");
+    let listener = match tokio::net::TcpListener::bind(config.listen).await {
+        Ok(l) => l,
+        Err(e) => return fail_why("listen_failed", io_reason(&e)),
     };
     tracing::info!(event = "listening", addr = %config.listen);
+    // M13 T10: /metrics on a listener of its own, which the Ingress never routes.
+    let metrics_task = match config.metrics_listen {
+        None => None,
+        Some(addr) => match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => {
+                tracing::info!(event = "metrics_listening", addr = %addr);
+                let router = crate::web::metrics_router(state.clone());
+                Some(tokio::spawn(async move {
+                    if axum::serve(l, router).await.is_err() {
+                        tracing::error!(event = "metrics_serve_failed");
+                    }
+                }))
+            }
+            Err(e) => return fail_why("metrics_listen_failed", io_reason(&e)),
+        },
+    };
     let served = serve_until(listener, state, &writer, shutdown_signal(), DRAIN).await;
     sweeper.abort();
     anchor_timer.abort();
@@ -353,13 +460,16 @@ async fn run(config: Config) -> u8 {
     export_ttl.abort();
     admin_task.abort();
     scheduler_task.abort();
+    if let Some(m) = metrics_task {
+        m.abort();
+    }
     let _ = std::fs::remove_file(&config.admin_socket);
     match served {
         Ok(()) => {
             tracing::info!(event = "stopped");
             EXIT_OK
         }
-        Err(_) => fail("serve_failed"),
+        Err(e) => fail_why("serve_failed", format!("{e:?}")),
     }
 }
 
@@ -466,5 +576,63 @@ async fn shutdown_signal() {
     tokio::select! {
         () = ctrl_c => {},
         () = term => {},
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod dir_tests {
+    use atlas_duck_audit::JournalMode;
+
+    use super::*;
+
+    #[test]
+    fn the_server_dir_is_created_writable_and_private() {
+        let data = tempfile::tempdir().unwrap();
+        let local = prepare_server_dir(data.path(), JournalMode::Delete).unwrap();
+        assert_eq!(local.path(), data.path().join("server"));
+        assert!(!data.path().join("server").join(".write-probe").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(data.path().join("server"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        // Again on the existing directory.
+        assert!(prepare_server_dir(data.path(), JournalMode::Wal).is_ok());
+    }
+
+    #[test]
+    fn a_refusal_names_the_check_the_path_and_the_reason() {
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(data.path().join("server"), b"not a dir").unwrap();
+        let r = prepare_server_dir(data.path(), JournalMode::Delete).unwrap_err();
+        assert_eq!(r.check, "create");
+        assert_eq!(r.path, data.path().join("server"));
+        assert!(
+            r.reason.contains("AlreadyExists") || r.reason.contains("NotADirectory"),
+            "{}",
+            r.reason
+        );
+        assert!(r.reason.contains("os error"), "{}", r.reason);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_data_dir_this_user_cannot_write_is_refused_at_create() {
+        use std::os::unix::fs::PermissionsExt;
+        let data = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let r = prepare_server_dir(data.path(), JournalMode::Delete);
+        std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Root writes anyway; everyone else gets the reason.
+        if let Err(r) = r {
+            assert_eq!(r.check, "create");
+            assert!(r.reason.contains("PermissionDenied"), "{}", r.reason);
+            assert!(owner_of(data.path()).contains(' '));
+        }
     }
 }

@@ -1,9 +1,9 @@
 #!/bin/sh
 # Review-environment smoke test (M13 plan T14; master-plan exit criterion, SM-2, SM-3.2, SM-8.2).
 # Runs in the `verify:review-smoke` job against the release `deploy:review` just applied, through
-# the ingress with TLS verified against the organisation CA bundle (never -k, SM-9.2):
-#   rollout done; /healthz 200; /readyz 200 with the test directory reported; /metrics not
-#   reachable through the ingress; an instance via the admin socket (kubectl exec); login as a
+# the ingress with TLS verified against the system CA bundle (Let's Encrypt; never -k, SM-9.2):
+#   rollout done; /healthz 200; /readyz 200 with the test directory reported; /metrics 404 through
+#   the ingress and served in-cluster on the Service's metrics port (helm test); an instance via the admin socket (kubectl exec); login as a
 #   test user (CSRF); an API key (scope read); MCP initialize + tools/list with it; the key
 #   revoked -> 401; logout; helm test.
 # The API key lives only in a shell variable and is never printed.
@@ -13,7 +13,10 @@ set -eu
 set +x
 
 : "${REVIEW_URL:?}" "${RELEASE_NAME:?}" "${KUBE_CONTEXT:?}" "${KUBE_NAMESPACE:?}"
-CA="${CA_BUNDLE:-deployment/ca/org-ca.pem}"
+# The ingress certificate comes from cert-manager's ClusterIssuer letsencrypt (Let's Encrypt,
+# chain to ISRG Root X1), so TLS is verified against the image's system bundle. INGRESS_CA_BUNDLE
+# overrides it. deployment/ca/org-ca.pem is the AD root for LDAPS only, not for the ingress.
+INGRESS_CA="${INGRESS_CA_BUNDLE:-}"
 BASE="${REVIEW_URL%/}"
 K="kubectl --context ${KUBE_CONTEXT} -n ${KUBE_NAMESPACE}"
 WORK="$(mktemp -d)"
@@ -26,7 +29,11 @@ fail() {
 command -v curl > /dev/null || fail "no curl in this image"
 
 c() { # curl with the CA bundle, bounded, quiet
-  curl --silent --show-error --max-time 15 --cacert "$CA" "$@"
+  if [ -n "$INGRESS_CA" ]; then
+    curl --silent --show-error --max-time 15 --cacert "$INGRESS_CA" "$@"
+  else
+    curl --silent --show-error --max-time 15 "$@"
+  fi
 }
 status_of() { # url [curl args...] -> HTTP status, body in $WORK/body
   url="$1"
@@ -36,6 +43,19 @@ status_of() { # url [curl args...] -> HTTP status, body in $WORK/body
 
 echo "review smoke: waiting for ${RELEASE_NAME}"
 $K rollout status "deploy/${RELEASE_NAME}" --timeout=600s
+
+# After a rollout the ingress can flap between the new pod and stale endpoints (502; a known
+# cluster issue, docs/server/deployment.md): /healthz through the ingress must answer 200 three
+# times in a row, within 3 minutes; each try is logged.
+streak=0
+for i in $(seq 1 36); do
+  st="$(status_of "$BASE/healthz" || true)"
+  if [ "$st" = 200 ]; then streak=$((streak + 1)); else streak=0; fi
+  echo "review smoke: /healthz through the ingress, try $i: ${st:-no answer} (${streak} in a row)"
+  [ "$streak" -ge 3 ] && break
+  sleep 5
+done
+[ "$streak" -ge 3 ] || fail "/healthz did not answer 200 three times in a row through the ingress within 3 minutes"
 
 ready=0
 for _ in $(seq 1 60); do
@@ -50,7 +70,8 @@ grep -q '"directory":"stub"' "$WORK/body" || fail "/readyz does not report the t
 grep -q '"ready":true' "$WORK/body" || fail "/readyz body: $(cat "$WORK/body")"
 
 [ "$(status_of "$BASE/healthz")" = 200 ] || fail "/healthz"
-# The ingress adds X-Forwarded-For, so the server never answers /metrics through it.
+# /metrics lives on the separate metrics port, which the Ingress never routes (M13 T10); the main
+# port answers it 404. helm test below checks the metrics port in-cluster and the main port's 404.
 [ "$(status_of "$BASE/metrics")" = 404 ] || fail "/metrics is reachable through the ingress"
 
 # An instance through the admin socket (idempotent across redeploys of the same branch).
@@ -92,8 +113,10 @@ sid="$(sed -n 's/^[Mm]cp-[Ss]ession-[Ii]d: *\([^[:space:]]*\).*/\1/p' "$WORK/mcp
 mcp '{"jsonrpc":"2.0","method":"notifications/initialized"}' -H "Mcp-Session-Id: $sid" > /dev/null
 st="$(mcp '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' -H "Mcp-Session-Id: $sid")"
 [ "$st" = 200 ] || fail "tools/list answered $st"
-grep -q 'jira_issue_get' "$WORK/mcp" || fail "tools/list lacks jira_issue_get"
-if grep -q 'jira_issue_edit' "$WORK/mcp"; then fail "a read key lists a write tool"; fi
+# Exact tool names: the read tool jira_issue_editmeta contains the write tool's name as a prefix.
+grep -q '"name":"jira_issue_get"' "$WORK/mcp" || fail "tools/list lacks jira_issue_get"
+grep -q '"name":"jira_issue_editmeta"' "$WORK/mcp" || fail "tools/list lacks jira_issue_editmeta"
+if grep -q '"name":"jira_issue_edit"' "$WORK/mcp"; then fail "a read key lists a write tool"; fi
 
 # Revoked: the key is refused at once.
 st="$(status_of "$BASE/api/me/api-keys/$key_id" -X DELETE -b "$JAR" -H "Origin: $BASE" \

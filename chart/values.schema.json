@@ -59,6 +59,10 @@
       "type": "object",
       "properties": { "port": { "type": "integer" } }
     },
+    "metrics": {
+      "type": "object",
+      "properties": { "port": { "type": "integer", "minimum": 1, "maximum": 65535 } }
+    },
     "ingress": {
       "type": "object",
       "properties": {
@@ -66,6 +70,7 @@
         "className": { "type": "string" },
         "host": { "type": "string" },
         "annotations": { "type": "object" },
+        "useClusterIp": { "type": "boolean" },
         "tls": {
           "type": "object",
           "properties": {
@@ -81,6 +86,8 @@
         }
       }
     },
+    "gid": { "type": "integer", "minimum": 0 },
+    "fsGroup": { "type": "integer", "minimum": 0 },
     "persistence": {
       "type": "object",
       "properties": {
@@ -88,6 +95,7 @@
         "storageClassName": { "type": "string" },
         "size": { "type": "string" },
         "keep": { "type": "boolean" },
+        "sqliteJournal": { "type": "string", "enum": ["delete", "wal"] },
         "backups": {
           "type": "object",
           "properties": {

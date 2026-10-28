@@ -35,6 +35,12 @@ podLabels: {}
 
 # Pod hardening (SM-7.1, SM-9.4). The ids are the distroless `nonroot` user of the image (A-8).
 uid: 65532
+# The process's group and the pod's fsGroup. The team's NFS class does not apply fsGroup and its
+# server ignores supplementary groups, so a new volume's root (root:root 0770) is writable only
+# through the primary gid: review and production set both to 0, as dux-deployment-bot runs.
+# The uid never becomes 0 (chart policy); the server's umask 077 keeps its files private.
+gid: 65532
+fsGroup: 65532
 
 # Memory (M14 PD-246): server baseline 1Gi + (scripts.runsMax + scripts.dryRunsMax) x 512Mi, the
 # per-run process limit (crates/ipc/src/sandbox/limits.rs process_mb). With the defaults below:
@@ -64,6 +70,11 @@ startupProbe:
 service:
   port: 8080
 
+# M13 T10: /metrics on a port of its own (ATLAS_DUCK_METRICS_LISTEN); the Service names it
+# `metrics` and the Ingress never routes it.
+metrics:
+  port: 9090
+
 ingress:
   enabled: true
   className: ""
@@ -75,6 +86,10 @@ ingress:
     nginx.org/proxy-read-timeout: "3600s"
     nginx.org/proxy-send-timeout: "3600s"
     nginx.org/client-max-body-size: "1m"
+  # nginx.org/use-cluster-ip: the controller proxies to the Service's ClusterIP instead of the pod
+  # endpoints it caches; after a Recreate rollout some controller replicas kept the old pod's
+  # endpoints and answered 502 for hours (docs/server/deployment.md, "Known cluster issues").
+  useClusterIp: true
   tls:
     # The TLS Secret's name (PD-M13-6). Required. The chart never renders a Secret; with
     # certManager.issuer set it renders a cert-manager Certificate that fills this Secret.
@@ -84,15 +99,17 @@ ingress:
       issuerKind: ClusterIssuer
 
 persistence:
-  # ADR 0003: SQLite needs ReadWriteOnce block storage; anything else is refused.
+  # ADR 0003: one writer, so ReadWriteOnce; anything else is refused.
   accessMode: ReadWriteOnce
   # Required (Q1); no default.
   storageClassName: ""
   size: 10Gi
+  # ADR 0004: SQLite journal mode (ATLAS_DUCK_SQLITE_JOURNAL). `delete` (rollback journal,
+  # exclusive lock) is right for NFS; `wal` only on node-local or block storage.
+  sqliteJournal: delete
   # `helm.sh/resource-policy: keep` so `helm uninstall` never deletes the data (production).
   keep: true
-  # ADR 0004: a second volume for the scheduler's daily backups (may be NFS: only bundles live
-  # there, never the live SQLite files).
+  # ADR 0004: a second volume for the scheduler's daily backups, apart from the data volume.
   backups:
     enabled: false
     storageClassName: ""

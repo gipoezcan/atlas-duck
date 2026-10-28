@@ -14,12 +14,14 @@ spec:
     - Egress
   ingress:
     {{- if .Values.networkPolicy.ingressFromAllNamespaces }}
-    # The ingress controller's namespace is not visible to the team (deploy facts): every
-    # namespace may reach the HTTP port, nothing else is open.
-    - from:
-        - namespaceSelector: {}
-      ports:
+    # The ingress controller's namespace is not visible to the team (deploy facts), and its
+    # traffic can arrive from node addresses (host networking) that no namespaceSelector matches.
+    # So any source may reach the HTTP port and the metrics port (Prometheus text with no user data,
+    # scraped in-cluster; the Ingress never routes it); nothing else is open.
+    - ports:
         - port: http
+          protocol: TCP
+        - port: metrics
           protocol: TCP
     {{- else }}
     # The ingress controller and monitoring namespaces (Q2), plus `helm test` pods of this release.
@@ -35,6 +37,8 @@ spec:
               atlas-duck/role: helm-test
       ports:
         - port: http
+          protocol: TCP
+        - port: metrics
           protocol: TCP
     {{- end }}
   egress:

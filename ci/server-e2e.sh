@@ -49,6 +49,7 @@ docker run -d --name "$NAME" --network host --read-only --cap-drop ALL \
   -e ATLAS_DUCK_MODE=dev \
   -e ATLAS_DUCK_PUBLIC_URL="$BASE" \
   -e ATLAS_DUCK_LISTEN=127.0.0.1:8080 \
+  -e ATLAS_DUCK_METRICS_LISTEN=127.0.0.1:9090 \
   -e ATLAS_DUCK_DATA_DIR=/data \
   -e ATLAS_DUCK_MASTER_KEY_FILE=/run/secrets/master-key \
   -e ATLAS_DUCK_TEST_DIRECTORY_FILE=/fixtures/test-directory.json \
@@ -74,6 +75,7 @@ ATLAS_DUCK_E2E_BASE_URL="$BASE" \
   ATLAS_DUCK_E2E_USERS_FILE="$USERS_FILE" \
   ATLAS_DUCK_E2E_JIRA=mock \
   ATLAS_DUCK_E2E_MOCK_CA_DIR="$OUT/ca" \
+  ATLAS_DUCK_E2E_METRICS_URL=http://127.0.0.1:9090/metrics \
   ATLAS_DUCK_E2E_ADMIN_EXEC="docker exec $NAME /app/atlas-duck-server admin" \
   ATLAS_DUCK_E2E_SCRIPTS=met \
   ATLAS_DUCK_E2E_VERIFY_EXEC="bash $ROOT/ci/server-e2e-verify.sh" \

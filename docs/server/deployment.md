@@ -10,8 +10,10 @@ Kubernetes Secret) and ADR 0003 (SQLite, one replica).
 - One pod (`replicas: 1`, `strategy: Recreate`) running `atlas-duck-server serve`, with a hardened
   security context: non-root user 65532, read-only root filesystem, all capabilities dropped,
   seccomp `RuntimeDefault`, and no service-account token.
-- A `ReadWriteOnce` PVC at `/var/lib/atlas-duck` on `local-path` (node-local; ADR 0004), holding
-  `server/server.db` and one store per user. Production marks it `helm.sh/resource-policy: keep`.
+- A `ReadWriteOnce` PVC at `/var/lib/atlas-duck` on `team-dux-storage` (NFS; ADR 0004), holding
+  `server/server.db` and one store per user, all in SQLite's rollback-journal mode
+  (`ATLAS_DUCK_SQLITE_JOURNAL=delete`, never WAL on NFS). Production marks it
+  `helm.sh/resource-policy: keep`.
 - A second PVC on `team-dux-storage` (NFS) at `/var/lib/atlas-duck-backups` for the scheduler's
   daily backup bundles (newest 14 kept).
 - Secrets created outside the chart, mounted read-only as files:
@@ -22,8 +24,10 @@ Kubernetes Secret) and ADR 0003 (SQLite, one replica).
 - An Ingress (class `nginx`, the nginx.org controller, with SSE-friendly `nginx.org/*`
   annotations) and a cert-manager `Certificate` (ClusterIssuer `letsencrypt`) that fills the TLS
   Secret; the chart never renders a Secret.
-- A NetworkPolicy: the HTTP port open to every namespace (the ingress controller's namespace is
-  not visible to the team); egress only to DNS, LDAPS (636) on `sro-ad-4` and HTTPS (443).
+- A Service with two ports: `http` (8080), the only one the Ingress routes, and `metrics` (9090),
+  where `/metrics` is served for in-cluster scrapes (the `http` port answers `/metrics` 404).
+- A NetworkPolicy: the HTTP and metrics ports open to every namespace (the ingress controller's
+  namespace is not visible to the team); egress only to DNS, LDAPS (636) on `sro-ad-4` and HTTPS (443).
 - In review environments only: a ConfigMap holding the test users.
 
 Upgrades use `Recreate`, so each one has a short downtime. Sessions survive it because they are
@@ -33,7 +37,7 @@ stored in `server.db`.
 
 | # | Question | Answer |
 |---|---|---|
-| Q1 | Storage | Live data on `local-path` (no RWO block class exists, NFS is out for SQLite), daily backups on `team-dux-storage` (ADR 0004) |
+| Q1 | Storage | Live data and daily backups on `team-dux-storage` (NFS; `local-path` is not provisioned and no RWO block class exists), SQLite in rollback-journal mode (ADR 0004) |
 | Q2 | Hosts | `atlas-duck.dux.intern.gipmbh.de`; reviews `<slug>.atlas-duck.dux.intern.gipmbh.de` (`REVIEW_DOMAIN`) |
 | Q3 | TLS | cert-manager per host: `atlas-duck-tls`, reviews `atlas-duck-<slug>-tls` |
 | Q4 | Directory | `ldaps://sro-ad-4.intern.gipmbh.de:636`, `@gipmbh.de`, `DC=intern,DC=gipmbh,DC=de`; users and admins `CN=G-DUX,OU=Teams,OU=Gruppen,DC=intern,DC=gipmbh,DC=de`; no auditors group |
@@ -169,3 +173,21 @@ A review environment has:
 Those passwords are fixed test values, not secrets. Production refuses the test directory
 twice: a chart guard, then the server itself (exit 78). No real account or data belongs in a
 review environment.
+
+## Known cluster issues
+
+- **`/openapi/v2` answers 503:** a client-side `kubectl apply` fails with `ServiceUnavailable`.
+  The CI jobs, the drill and the runbooks use `kubectl apply --server-side --force-conflicts
+  --field-manager=... --validate=false` instead, and `kubectl create` for new objects.
+- **Stale ingress endpoints after a rollout (2026-10-27/28):** after a `Recreate` rollout the
+  ingress kept answering 502 for many requests while the new pod was ready: a port-forward
+  worked, `/readyz` was ready, and some requests through the ingress got 200. The likely cause is
+  that some nginx.org ingress-controller replicas keep the old pod's endpoints, and once it took
+  hours to heal. The node the pod ran on made no difference. Mitigation: the chart sets
+  `nginx.org/use-cluster-ip: "true"` (value `ingress.useClusterIp`, default true), so the
+  controller proxies to the Service's ClusterIP and kube-proxy picks the current pod. The
+  annotation needs a recent NGINX Ingress Controller; an older one ignores it. The review smoke
+  needs three 200s in a row from `/healthz` through the ingress, within 3 minutes, before it goes
+  on, and logs each try. If 502s persist with the annotation in place, report it to the cluster
+  admins with the controller replica list. The chart's `nodeSelector`, `affinity` and
+  `tolerations` values stay available for scheduling rules.

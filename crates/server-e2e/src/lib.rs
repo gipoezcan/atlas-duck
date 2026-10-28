@@ -7,7 +7,7 @@ use std::fmt;
 /// `usage` of the suite, printed (exit 2) when its environment is incomplete.
 pub const USAGE: &str = "usage: ATLAS_DUCK_E2E_BASE_URL=<url> ATLAS_DUCK_E2E_USERS_FILE=<file> \
 [ATLAS_DUCK_E2E_CA_FILE=<pem>] [ATLAS_DUCK_E2E_JIRA=mock|none] [ATLAS_DUCK_E2E_MOCK_CA_DIR=<dir>] [ATLAS_DUCK_E2E_SCRIPTS=met|not_met] \
-[ATLAS_DUCK_E2E_ADMIN_EXEC=<command prefix>] [ATLAS_DUCK_E2E_VERIFY_EXEC=<command prefix>] \
+[ATLAS_DUCK_E2E_ADMIN_EXEC=<command prefix>] [ATLAS_DUCK_E2E_METRICS_URL=<url>] [ATLAS_DUCK_E2E_VERIFY_EXEC=<command prefix>] \
 cargo test -p atlas-duck-server-e2e --test e2e";
 
 /// Which Jira the server under test can reach.
@@ -36,6 +36,9 @@ pub struct Env {
     pub admin_exec: Option<String>,
     /// A command prefix that runs the image's `verify-export` on a local export dir.
     pub verify_exec: Option<String>,
+    /// `http://host:port/metrics` of the server's metrics listener (`ATLAS_DUCK_METRICS_LISTEN`;
+    /// the main port has no `/metrics`).
+    pub metrics_url: Option<String>,
 }
 
 /// Reads the environment through `get`; `Err` is the usage line (exit 2).
@@ -78,6 +81,7 @@ pub fn parse_env(get: impl Fn(&str) -> Option<String>) -> Result<Env, String> {
         scripts,
         admin_exec: set("ATLAS_DUCK_E2E_ADMIN_EXEC"),
         verify_exec: set("ATLAS_DUCK_E2E_VERIFY_EXEC"),
+        metrics_url: set("ATLAS_DUCK_E2E_METRICS_URL"),
     })
 }
 
@@ -165,6 +169,7 @@ mod tests {
                 scripts: "met".into(),
                 admin_exec: Some("docker exec c /app/atlas-duck-server admin".into()),
                 verify_exec: None,
+                metrics_url: None,
             })
         );
         for bad in [

@@ -8,8 +8,9 @@ Review environments and production (M13 plan T11). `helmfile.yaml` deploys the p
   LDAPS certificate of `sro-ad-4.intern.gipmbh.de`. Public certificate only.
 - `testdir/users.json`: review-only test users (M12 PD-198 format). The passwords are fixed test
   values and not secret; production refuses the test directory twice (chart guard, server exit 78).
-- Storage: live data on `local-path` (node-local ReadWriteOnce), daily backups on
-  `team-dux-storage` (NFS), ADR 0004.
+- Storage: live data and daily backups on two `team-dux-storage` (NFS) ReadWriteOnce claims;
+  SQLite runs in rollback-journal mode there (`persistence.sqliteJournal: delete`), ADR 0004.
+  `local-path` is not provisioned on this cluster.
 - TLS: cert-manager `Certificate` per host (ClusterIssuer `letsencrypt`), Secret `atlas-duck-tls`
   (production) or `atlas-duck-<slug>-tls` (review). No key is ever committed.
 

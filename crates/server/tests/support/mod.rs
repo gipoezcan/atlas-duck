@@ -110,8 +110,13 @@ impl TestServer {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
         std::fs::create_dir_all(data.join("server")).unwrap();
-        let store: Arc<dyn ServerStore> =
-            Arc::new(SqliteStore::open(&data.join("server").join("server.db")).unwrap());
+        let store: Arc<dyn ServerStore> = Arc::new(
+            SqliteStore::open_with(
+                &data.join("server").join("server.db"),
+                atlas_duck_audit::JournalMode::Delete,
+            )
+            .unwrap(),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base = format!("http://{addr}");
@@ -127,6 +132,7 @@ impl TestServer {
                 allow_http: true,
                 sse_capacity: SSE_CAPACITY,
                 scripts,
+                journal: atlas_duck_audit::JournalMode::Delete,
             },
             50,
         ));

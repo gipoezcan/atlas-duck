@@ -87,11 +87,12 @@ async fn verify_staged(
     if !ids.iter().all(|id| deps.master.knows(id)) {
         return Err("restore/unknown_master_key");
     }
-    let staged: Arc<dyn ServerStore> = match SqliteStore::open(&staging.join(SERVER_DB)) {
-        Ok(s) => Arc::new(s),
-        Err(crate::store::StoreError::Newer(_)) => return Err("restore/backup_newer"),
-        Err(_) => return Err("restore/store_invalid"),
-    };
+    let staged: Arc<dyn ServerStore> =
+        match SqliteStore::open_with(&staging.join(SERVER_DB), deps.journal) {
+            Ok(s) => Arc::new(s),
+            Err(crate::store::StoreError::Newer(_)) => return Err("restore/backup_newer"),
+            Err(_) => return Err("restore/store_invalid"),
+        };
     verify(staged.as_ref()).map_err(|_| "restore/anchor_chain_invalid")?;
     let last = staged
         .anchor_last()
@@ -123,6 +124,7 @@ async fn verify_staged(
         allow_http: deps.allow_http,
         sse_capacity: deps.sse_capacity,
         scripts: None,
+        journal: deps.journal,
     };
     let mut heads = Vec::new();
     for (u, _) in users.iter().filter(|(u, s)| live(u, s)) {

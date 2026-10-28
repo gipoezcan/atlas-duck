@@ -20,8 +20,9 @@ spec:
         {{- if .Values.testDirectory.enabled }}
         checksum/test-directory: {{ .Values.testDirectory.usersJson | sha256sum }}
         {{- end }}
-        {{- with .Values.podAnnotations }}
-        {{- toYaml . | nindent 8 }}
+        {{- /* Annotation values are strings; quote them so an all-digit commit id stays one. */}}
+        {{- range $k, $v := .Values.podAnnotations }}
+        {{ $k }}: {{ $v | toString | quote }}
         {{- end }}
       labels:
         {{- include "atlas-duck.labels" . | nindent 8 }}
@@ -42,8 +43,8 @@ spec:
       securityContext:
         runAsNonRoot: true
         runAsUser: {{ .Values.uid }}
-        runAsGroup: {{ .Values.uid }}
-        fsGroup: {{ .Values.uid }}
+        runAsGroup: {{ .Values.gid }}
+        fsGroup: {{ .Values.fsGroup }}
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
@@ -55,7 +56,7 @@ spec:
           securityContext:
             runAsNonRoot: true
             runAsUser: {{ .Values.uid }}
-            runAsGroup: {{ .Values.uid }}
+            runAsGroup: {{ .Values.gid }}
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
             privileged: false
@@ -67,6 +68,9 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
               protocol: TCP
           env:
             # Non-secret configuration and file paths only (SM-9.1, A-4).
@@ -89,8 +93,14 @@ spec:
             {{- end }}
             - name: ATLAS_DUCK_CA_BUNDLE_FILE
               value: /etc/atlas-duck/ca/ca.pem
+            # M13 T10: /metrics on its own port, never routed by the Ingress.
+            - name: ATLAS_DUCK_METRICS_LISTEN
+              value: {{ printf "0.0.0.0:%v" .Values.metrics.port | quote }}
             - name: ATLAS_DUCK_ADMIN_SOCKET
               value: /run/atlas-duck/admin.sock
+            # ADR 0004: the rollback journal on the NFS data volume.
+            - name: ATLAS_DUCK_SQLITE_JOURNAL
+              value: {{ .Values.persistence.sqliteJournal | default "delete" | quote }}
             {{- if .Values.persistence.backups.enabled }}
             - name: ATLAS_DUCK_BACKUP_DIR
               value: /var/lib/atlas-duck-backups/bundles
@@ -205,8 +215,9 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 1Mi
-        # Kubelet adds group read for fsGroup (0400 becomes 0440, group 65532); the server warns on
-        # group bits but runs (M12 master_key.rs).
+        # Kubelet adds group read for fsGroup whatever defaultMode says (0400 becomes 0440, group
+        # .Values.fsGroup, the process's own gid); the server accepts exactly that and warns on any
+        # other group or other bit (master_key.rs loose_mode).
         - name: master-key
           secret:
             secretName: {{ .Values.masterKey.existingSecret }}

@@ -18,13 +18,20 @@ ingress:
       issuer: letsencrypt
       issuerKind: ClusterIssuer
 
+# ADR 0004: the NFS volume's root is root:root 0770, fsGroup is not applied and the NFS server
+# ignores supplementary groups: the primary gid 0 lets the non-root server (uid 65532) create its
+# directories there, as dux-deployment-bot runs. Its umask 077 keeps them private.
+gid: 0
+fsGroup: 0
+
 persistence:
-  # ADR 0004: no ReadWriteOnce block storage exists in the cluster; the team classes are all
-  # NFS, which SQLite must not use (ADR 0003). local-path is node-local ReadWriteOnce: the pod
-  # is pinned to one node, and a node loss is recovered from the daily backups below.
-  storageClassName: local-path
+  # ADR 0004: local-path is not provisioned on this cluster's nodes and no block class exists,
+  # so the data lives on the team's NFS class: ReadWriteOnce, one replica, Recreate, and SQLite
+  # in rollback-journal mode with an exclusive lock (no WAL on NFS).
+  storageClassName: team-dux-storage
   size: 10Gi
   keep: true
+  sqliteJournal: delete
   backups:
     enabled: true
     storageClassName: team-dux-storage

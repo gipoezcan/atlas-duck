@@ -29,6 +29,8 @@ expect_fail() {
 expect_fail "two replicas" 's/^  replicas: 1$/  replicas: 2/'
 expect_fail "rolling update" 's/type: Recreate/type: RollingUpdate/'
 expect_fail "root allowed" 's/runAsNonRoot: true/runAsNonRoot: false/'
+expect_fail "root uid with group 0" 's/runAsUser: 65532/runAsUser: 0/'
+expect_fail "no runAsUser" '/runAsUser: 65532/d'
 expect_fail "writable root" 's/readOnlyRootFilesystem: true/readOnlyRootFilesystem: false/'
 expect_fail "privilege escalation" 's/allowPrivilegeEscalation: false/allowPrivilegeEscalation: true/'
 expect_fail "capabilities kept" 's/- ALL/- NET_RAW/'

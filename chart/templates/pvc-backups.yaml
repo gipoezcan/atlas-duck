@@ -1,6 +1,6 @@
 {{- if .Values.persistence.backups.enabled }}
-# ADR 0004: the scheduled backups' volume. Only finished bundles live here, so a network
-# filesystem is acceptable; the live SQLite stores stay on the ReadWriteOnce data volume.
+# ADR 0004: the scheduled backups' volume, a claim of its own, so losing the data volume's
+# claim leaves the finished bundles.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

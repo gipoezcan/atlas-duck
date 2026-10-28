@@ -589,6 +589,7 @@ fn write_staging(
     plan: &Plan,
     clock: Arc<dyn Clock>,
     hooks: &Hooks,
+    journal: schema::JournalMode,
 ) -> Result<Written, AuditError> {
     let parts = WriterParts {
         clock,
@@ -596,6 +597,7 @@ fn write_staging(
         shared: Shared::new(&staged.kek),
         hooks: hooks.clone(),
         genesis_hash: Some(staged.genesis_hash),
+        journal,
     };
     let mut w = Writer::open(&staged.staging.path, parts).map_err(open_to_audit)?;
     let instances = w.st.settings.instances.keys().cloned().collect();
@@ -922,7 +924,13 @@ impl Writer {
             replaced_db: Some(replaced_name(&live)?),
             records_lost: lost,
         };
-        let written = write_staging(&staged, &plan, self.st.clock.clone(), &self.st.hooks)?;
+        let written = write_staging(
+            &staged,
+            &plan,
+            self.st.clock.clone(),
+            &self.st.hooks,
+            self.st.journal,
+        )?;
         let mut ids: BTreeSet<String> = self.st.settings.instances.keys().cloned().collect();
         ids.extend(written.instances.iter().cloned());
 
@@ -1135,8 +1143,8 @@ pub fn restore_from_source(
             .map_err(audit_to_open)?,
         records_lost: lost,
     };
-    let written =
-        write_staging(&staged, &plan, cfg.clock.clone(), &cfg.hooks).map_err(audit_to_open)?;
+    let written = write_staging(&staged, &plan, cfg.clock.clone(), &cfg.hooks, cfg.journal)
+        .map_err(audit_to_open)?;
     let mut ids: BTreeSet<String> = written.instances.iter().cloned().collect();
     if live.is_some() {
         ids.extend(live_instances(&db, &*cfg.keys));

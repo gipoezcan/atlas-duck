@@ -11,11 +11,18 @@ ingress:
       issuer: letsencrypt
       issuerKind: ClusterIssuer
 
+# ADR 0004: the NFS volume's root is root:root 0770, fsGroup is not applied and the NFS server
+# ignores supplementary groups: the primary gid 0 lets the non-root server (uid 65532) create its
+# directories there, as dux-deployment-bot runs. Its umask 077 keeps them private.
+gid: 0
+fsGroup: 0
+
 persistence:
-  # ADR 0004: node-local ReadWriteOnce (no RWO block class exists; never NFS for SQLite).
-  storageClassName: local-path
+  # ADR 0004: the team's NFS class, ReadWriteOnce, SQLite in rollback-journal mode.
+  storageClassName: team-dux-storage
   size: 1Gi
   keep: false
+  sqliteJournal: delete
 
 testDirectory:
   enabled: true

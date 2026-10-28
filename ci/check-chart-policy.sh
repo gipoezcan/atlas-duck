@@ -60,6 +60,15 @@ for f in "$@"; do
       { prev = $0 }
       END { exit ok ? 0 : 1 }
     ' || finding "$f" "capabilities.drop is not [ALL]"
+    # ADR 0004: group 0 (runAsGroup/fsGroup, the NFS volume's owner group) is allowed, but only
+    # for a non-root user: every runAsUser is set and non-zero, and runAsNonRoot is never false.
+    has "$dep" '^ +runAsUser: [0-9]+$' || finding "$f" "Deployment sets no runAsUser"
+    if has "$dep" '^ +runAsUser: 0+$'; then
+      finding "$f" "runAsUser 0 (root)"
+    fi
+    if has "$dep" 'runAsNonRoot: false$'; then
+      finding "$f" "runAsNonRoot false"
+    fi
   fi
 
   pvc="$(docs_of "$f" PersistentVolumeClaim)"

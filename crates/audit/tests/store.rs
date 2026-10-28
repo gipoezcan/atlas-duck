@@ -18,7 +18,7 @@ use atlas_duck_audit::testing::{
     FaultPoint, Faults, FreeSpaceStub, KeyOpKind, MemKeyStore, MemKeyring,
 };
 use atlas_duck_audit::types::{Actor, EventFlags, EventType, NewEvent, QueryKind};
-use atlas_duck_audit::{OpenConfig, Store, create_new_store, new_ids};
+use atlas_duck_audit::{DB_FILE, JournalMode, OpenConfig, Store, create_new_store, new_ids};
 use common::*;
 use rusqlite::OptionalExtension;
 use secrecy::SecretString;
@@ -928,6 +928,50 @@ fn synchronous_full_by_default() {
         cfg.hooks.synchronous_normal = true;
     });
     assert_eq!(fast.testing_pragma("synchronous"), Ok(1));
+}
+
+/// WAL by default (desktop); `JournalMode::Delete` (server mode on NFS, ADR 0004) gives a
+/// rollback-journal file with no `-wal`, still `synchronous=FULL`.
+#[test]
+fn journal_mode_wal_by_default_delete_on_request() {
+    let mode = |f: &Fixture| -> String {
+        let c = rusqlite::Connection::open_with_flags(
+            f.db_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        c.query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap()
+    };
+    let (_store, f) = new_store(fake_clock(START), MemKeyring::new());
+    assert_eq!(mode(&f), "wal");
+    let (store, f) = new_store_with(fake_clock(START), MemKeyring::new(), |cfg| {
+        cfg.journal = JournalMode::Delete;
+    });
+    assert_eq!(mode(&f), "delete");
+    assert!(!f.dir.path().join(format!("{DB_FILE}-wal")).exists());
+    assert_eq!(store.testing_pragma("synchronous"), Ok(2));
+}
+
+/// A rollback-journal store's pre-open peek never reads past a live writer: with another
+/// connection holding the write lock it fails instead of answering from an unlocked
+/// (`immutable`) read, and answers once the lock is gone.
+#[test]
+fn delete_mode_peek_respects_a_writers_lock() {
+    let (store, f) = new_store_with(fake_clock(START), MemKeyring::new(), |cfg| {
+        cfg.journal = JournalMode::Delete;
+    });
+    store.shutdown();
+    let w = rusqlite::Connection::open(f.db_path()).unwrap();
+    w.execute_batch("BEGIN EXCLUSIVE; INSERT INTO meta(key, value) VALUES ('probe', 'x');")
+        .unwrap();
+    assert!(
+        atlas_duck_audit::schema::read_versions_for(&f.db_path(), JournalMode::Delete).is_err(),
+        "the peek read past the writer's exclusive lock"
+    );
+    w.execute_batch("ROLLBACK;").unwrap();
+    drop(w);
+    assert!(atlas_duck_audit::schema::read_versions_for(&f.db_path(), JournalMode::Delete).is_ok());
 }
 
 #[test]

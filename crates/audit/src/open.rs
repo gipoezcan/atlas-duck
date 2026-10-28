@@ -634,7 +634,7 @@ pub(crate) fn preflight(data: &LocalDataDir, cfg: &OpenConfig) -> Result<Preflig
     }
     let locked = |r: LockedReason| Ok(Preflight::Stop(StartupOutcome::Locked(r)));
     // 1. Version gate (§8.13).
-    let versions = schema::read_versions(&db)?;
+    let versions = schema::read_versions_for(&db, cfg.journal)?;
     let newer = |found: String| {
         Ok(Preflight::Stop(StartupOutcome::StoreNewer {
             found: with_written_by(found, &versions),
@@ -660,16 +660,18 @@ pub(crate) fn preflight(data: &LocalDataDir, cfg: &OpenConfig) -> Result<Preflig
     let kek = match cfg.keys.get(&EntryName::Kek) {
         // An entry whose bytes do not decode is "undecryptable" (§8.7): only recovery (a
         // re-seal) clears it, never a retry.
-        Err(KeyStoreError::Corrupt) => return lost(&schema::open_peek(&db)?),
+        Err(KeyStoreError::Corrupt) => return lost(&schema::open_peek_for(&db, cfg.journal)?),
         Err(e) => return locked(keyring_reason(&e)),
-        Ok(None) => return lost(&schema::open_peek(&db)?),
+        Ok(None) => return lost(&schema::open_peek_for(&db, cfg.journal)?),
         Ok(Some(b)) => match Kek::from_entry_bytes(&b) {
             Ok(k) => k,
             Err(KekEntryError::NewerLayout(n)) => return newer(format!("keychain kek layout {n}")),
-            Err(KekEntryError::Malformed) => return lost(&schema::open_peek(&db)?),
+            Err(KekEntryError::Malformed) => {
+                return lost(&schema::open_peek_for(&db, cfg.journal)?);
+            }
         },
     };
-    let ro = schema::open_peek(&db)?;
+    let ro = schema::open_peek_for(&db, cfg.journal)?;
     if !kek_opens_store(&ro, &kek)? {
         return lost(&ro);
     }

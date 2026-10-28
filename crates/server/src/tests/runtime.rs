@@ -67,6 +67,7 @@ impl Env {
             allow_http: true,
             sse_capacity: crate::runtime::SSE_CAPACITY,
             scripts: self.scripts.clone(),
+            journal: atlas_duck_audit::JournalMode::Delete,
         }
     }
 }
@@ -99,6 +100,38 @@ async fn runtime_opens_and_lists_the_admin_instances() {
     let again = within(reg.runtime(&ctx)).await.unwrap();
     assert!(Arc::ptr_eq(&rt, &again));
     within(reg.close_all()).await;
+}
+
+/// ADR 0004: a user store on the NFS data volume runs the rollback journal (no `-wal`), while
+/// open and after a reopen, and its reads still work beside the writer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_store_runs_the_configured_rollback_journal() {
+    let env = Env::new();
+    let uid = env.user("alice");
+    let db = env
+        .dir
+        .path()
+        .join("users")
+        .join(&uid)
+        .join(atlas_duck_audit::DB_FILE);
+    let mode = || -> String {
+        let c =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        c.query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap()
+    };
+    let wal = db.with_file_name(format!("{}-wal", atlas_duck_audit::DB_FILE));
+    for _ in 0..2 {
+        let reg = Registry::new(env.deps(), 10);
+        let rt = within(reg.open_user(&uid)).await.unwrap();
+        assert_eq!(mode(), "delete");
+        assert!(!wal.exists(), "no WAL beside a delete-mode store");
+        let listed = serde_json::to_value(within(rt.handler().instances_list()).await).unwrap();
+        assert_eq!(listed["status"], "succeeded", "{listed}");
+        drop(rt);
+        within(reg.close_all()).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -66,8 +66,23 @@ async fn call_raw(ctx: &Arc<AdminCtx>, line: &[u8]) -> Response {
     let (mut client, server) = tokio::io::duplex(1 << 20);
     let c = ctx.clone();
     let task = tokio::spawn(async move { serve_conn(&c, server).await });
-    client.write_all(line).await.unwrap();
-    client.write_all(b"\n").await.unwrap();
+    // The server answers a request it refuses (one longer than MAX_LINE) as soon as it has read
+    // MAX_LINE + 1 bytes and hangs up: the rest of the write may then meet a closed pipe. The
+    // answer is already buffered, so a hang-up is not a failure here; any other error is.
+    for part in [line, b"\n".as_slice()] {
+        if let Err(e) = client.write_all(part).await {
+            assert!(
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::WriteZero
+                ),
+                "{e:?}"
+            );
+            break;
+        }
+    }
     let mut out = Vec::new();
     within(client.read_to_end(&mut out)).await.unwrap();
     within(task).await.unwrap().unwrap();

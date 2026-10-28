@@ -4,13 +4,17 @@ publicUrl: https://ci-branch.atlas-duck.ci.example.test
 image:
   repository: harbor.ci.example.test/dux/atlas-duck-server
   tag: ci-branch
+# As deployment/values-review.yaml: 1 + 1 script slots, memory 1Gi + 2 x 512Mi (M14 PD-246).
+scripts:
+  runsMax: 1
+  dryRunsMax: 1
 resources:
   requests:
     cpu: 100m
     memory: 256Mi
   limits:
     cpu: "1"
-    memory: 1Gi
+    memory: 2Gi
 ingress:
   host: ci-branch.atlas-duck.ci.example.test
   tls:

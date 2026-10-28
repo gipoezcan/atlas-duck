@@ -569,14 +569,15 @@ async fn script_run_via_oauth(t: &T) -> R<Outcome> {
 }
 
 async fn script_slots_and_busy(t: &T) -> R<Outcome> {
-    // `/metrics` is never served through a proxy (M13): behind the review ingress it is 404.
+    // `/metrics` is on the metrics listener only (M13 T10); the main port answers 404.
     let (st, _) = t.s.send(Method::GET, "/metrics", None, None).await?;
-    if st == 404 {
-        return skip("/metrics is not reachable here (behind a proxy)");
-    }
+    ensure!(st == 404, "/metrics on the main port answered {st}");
+    let Some(url) = &t.env.metrics_url else {
+        return skip("ATLAS_DUCK_E2E_METRICS_URL is not set (the metrics port is in-cluster only)");
+    };
     let text =
         t.s.http
-            .get(t.s.url("/metrics"))
+            .get(url)
             .send()
             .await
             .ctx("/metrics")?
