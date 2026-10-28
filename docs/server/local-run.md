@@ -66,6 +66,7 @@ case. A user in none of them cannot sign in (`auth/not_permitted`).
 | `ATLAS_DUCK_MODE` | yes | | `production`, `review` or `dev`; only `dev` allows `http://localhost`/`127.0.0.1` and the test directory with a plain-HTTP cookie |
 | `ATLAS_DUCK_PUBLIC_URL` | yes | | the origin users see, `https://host[:port]` (no path) |
 | `ATLAS_DUCK_LISTEN` | no | `0.0.0.0:8080` | listen address |
+| `ATLAS_DUCK_METRICS_LISTEN` | no | unset (no metrics listener) | address of the separate `/metrics` listener (the chart: `0.0.0.0:9090`); the main port has no `/metrics` |
 | `ATLAS_DUCK_DATA_DIR` | yes | | data volume (server store, per-user stores); one server per volume |
 | `ATLAS_DUCK_MASTER_KEY_FILE` | yes | | the master key file (any `*MASTER_KEY` variable is refused: `config/master_key_in_env`) |
 | `ATLAS_DUCK_CA_BUNDLE_FILE` | no | | PEM roots for LDAPS and instances with `ca_ref = org` |

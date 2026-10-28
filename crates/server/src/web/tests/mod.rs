@@ -1916,8 +1916,9 @@ async fn metrics_include_requests_approvals_scheduler_offboarding_test_directory
             .await
             .contains("atlas_duck_offboarding_enabled 0")
     );
-    // The router counts what it answers.
-    let res = get(&h, "/metrics").await;
+    // The main router counts what it answers; the metrics listener shows it.
+    let _ = get(&h, "/api/session").await;
+    let res = metrics_get(&h, "/metrics").await;
     assert_eq!(res.status(), StatusCode::OK);
     let text = String::from_utf8(
         axum::body::to_bytes(res.into_body(), 1 << 20)
@@ -1991,26 +1992,43 @@ async fn metrics_contain_no_usernames_hostnames_or_ids() {
     }
 }
 
+/// One request to the metrics listener's router (M13 T10).
+async fn metrics_get(h: &H, uri: &str) -> Response {
+    let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    tokio::time::timeout(
+        LIMIT,
+        crate::web::metrics_router(h.state.clone()).oneshot(req),
+    )
+    .await
+    .expect("request hung")
+    .unwrap()
+}
+
+/// `/metrics` lives on its own listener: the main port (the one the Ingress routes) answers it
+/// with the plain 404 of an unknown path, whatever headers it carries; the metrics listener
+/// serves Prometheus text and nothing else.
 #[tokio::test]
-async fn metrics_not_served_to_requests_with_x_forwarded_for() {
+async fn metrics_only_on_the_metrics_listener() {
     let h = H::new();
-    for (name, value) in [
-        ("x-forwarded-for", "203.0.113.7"),
-        ("forwarded", "for=203.0.113.7"),
-    ] {
-        let req = Request::builder()
+    for req in [
+        Request::builder()
             .uri("/metrics")
-            .header(name, value)
             .body(Body::empty())
-            .unwrap();
+            .unwrap(),
+        Request::builder()
+            .uri("/metrics")
+            .header("x-forwarded-for", "203.0.113.7")
+            .body(Body::empty())
+            .unwrap(),
+    ] {
         let (status, code) = code(h.send(req).await).await;
         assert_eq!(
             (status, code.as_str()),
-            (StatusCode::NOT_FOUND, "api/not_found"),
-            "{name}"
+            (StatusCode::NOT_FOUND, "api/not_found")
         );
     }
-    let res = get(&h, "/metrics").await;
+    assert!(!super::ROUTES.iter().any(|(_, p, _)| *p == "/metrics"));
+    let res = metrics_get(&h, "/metrics").await;
     assert_eq!(res.status(), StatusCode::OK);
     assert!(
         res.headers()[header::CONTENT_TYPE]
@@ -2018,6 +2036,10 @@ async fn metrics_not_served_to_requests_with_x_forwarded_for() {
             .unwrap()
             .starts_with("text/plain; version=0.0.4")
     );
+    for other in ["/healthz", "/api/session", "/"] {
+        let (status, _) = code(metrics_get(&h, other).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{other}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

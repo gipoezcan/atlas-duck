@@ -59,6 +59,8 @@ pub struct Config {
     /// `scheme://host[:port]`, no path.
     pub public_url: Url,
     pub listen: SocketAddr,
+    /// M13 T10: where `/metrics` is served, a listener of its own (`None`: not served).
+    pub metrics_listen: Option<SocketAddr>,
     pub data_dir: LocalDataDir,
     pub master_key_file: PathBuf,
     /// During a rotation only (M13 T7): the next key, accepted for unwrapping alongside.
@@ -111,6 +113,7 @@ impl std::error::Error for ConfigError {}
 pub const MODE: &str = "ATLAS_DUCK_MODE";
 pub const PUBLIC_URL: &str = "ATLAS_DUCK_PUBLIC_URL";
 pub const LISTEN: &str = "ATLAS_DUCK_LISTEN";
+pub const METRICS_LISTEN: &str = "ATLAS_DUCK_METRICS_LISTEN";
 pub const DATA_DIR: &str = "ATLAS_DUCK_DATA_DIR";
 pub const MASTER_KEY_FILE: &str = "ATLAS_DUCK_MASTER_KEY_FILE";
 pub const MASTER_KEY_NEXT_FILE: &str = "ATLAS_DUCK_MASTER_KEY_NEXT_FILE";
@@ -199,6 +202,14 @@ impl Config {
             None | Some("delete") => JournalMode::Delete,
             Some("wal") => JournalMode::Wal,
             Some(_) => return Err(err("config/invalid_value", SQLITE_JOURNAL)),
+        };
+        // Unset: no metrics listener (the chart sets 0.0.0.0:9090).
+        let metrics_listen = match get(METRICS_LISTEN) {
+            None => None,
+            Some(v) => Some(
+                v.parse()
+                    .map_err(|_| err("config/invalid_value", METRICS_LISTEN))?,
+            ),
         };
         let data_dir = match check_dir(&PathBuf::from(required(DATA_DIR)?), sqlite_journal) {
             Ok(DataDirResolution::Local(d)) => d,
@@ -289,6 +300,7 @@ impl Config {
             mode,
             public_url,
             listen,
+            metrics_listen,
             data_dir,
             master_key_file,
             master_key_next_file,
@@ -421,6 +433,7 @@ mod tests {
         let c = Env::ok().load().unwrap();
         assert_eq!(c.mode, Mode::Production);
         assert_eq!(c.listen, "0.0.0.0:8080".parse().unwrap());
+        assert_eq!(c.metrics_listen, None);
         assert_eq!(c.web_dir, PathBuf::from("/app/web"));
         assert_eq!(c.trusted_proxy_hops, 1);
         assert_eq!(c.max_open_users, 200);
@@ -622,6 +635,19 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn metrics_listen_is_off_unless_set() {
+        let c = Env::ok()
+            .set(METRICS_LISTEN, "0.0.0.0:9090")
+            .load()
+            .unwrap();
+        assert_eq!(c.metrics_listen, Some("0.0.0.0:9090".parse().unwrap()));
+        assert_eq!(
+            code(Env::ok().set(METRICS_LISTEN, "9090")),
+            ("config/invalid_value", METRICS_LISTEN)
+        );
     }
 
     #[test]

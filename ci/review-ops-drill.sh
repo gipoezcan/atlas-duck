@@ -10,7 +10,7 @@
 #     redeploy with masterKey.nextSecret, admin rotate-master-key
 #  4. swap <release>-master-key to the new key, redeploy without nextSecret
 #  5. login still works, the API key still works, anchor verify passes, /metrics shows the new
-#     key id (port-forward: /metrics is never reachable through the ingress)
+#     key id (port-forward to the Service's metrics port: the Ingress never routes it)
 #  4b. admin master-key status must report rows_not_primary 0 before the Secret swap
 #  6. post-rotation backup --stdout through kubectl exec; maintenance on; restoring the pre-rotation bundle is refused
 #     (restore/unknown_master_key, expected); restore --stdin of the post-rotation stream passes;
@@ -150,11 +150,11 @@ csrf="$(login)"
 [ -n "$csrf" ] || fail "login after the rotation"
 [ "$(mcp_status)" = 200 ] || fail "the API key is refused after the rotation"
 admin anchor verify || fail "anchor verify after the rotation: $(cat "$WORK/admin.out")"
-$K port-forward "deploy/${RELEASE_NAME}" 18080:8080 > "$WORK/pf.log" 2>&1 &
+# /metrics is on the Service's metrics port only (M13 T10).
 PF_PID=$!
 metrics=""
 for _ in $(seq 1 30); do
-  if metrics="$(curl --silent --max-time 5 http://127.0.0.1:18080/metrics)"; then break; fi
+  if metrics="$(curl --silent --max-time 5 http://127.0.0.1:19090/metrics)"; then break; fi
   sleep 1
 done
 kill "$PF_PID" 2> /dev/null || true

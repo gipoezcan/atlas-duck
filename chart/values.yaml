@@ -58,6 +58,11 @@ startupProbe:
 service:
   port: 8080
 
+# M13 T10: /metrics on a port of its own (ATLAS_DUCK_METRICS_LISTEN); the Service names it
+# `metrics` and the Ingress never routes it.
+metrics:
+  port: 9090
+
 ingress:
   enabled: true
   className: ""

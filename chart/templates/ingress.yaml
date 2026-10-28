@@ -1,7 +1,7 @@
 {{- if .Values.ingress.enabled }}
 {{- $host := required "atlas-duck: ingress.host is required" .Values.ingress.host }}
-# `/metrics` cannot be excluded by a plain Ingress path list; the server answers it only to
-# requests that carry no X-Forwarded-For, i.e. not through the ingress (M13 T3/T10 decision).
+# Only the Service's `http` port: `/metrics` is served on the separate `metrics` port, which no
+# Ingress routes (the main port answers `/metrics` with 404; M13 T10).
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:

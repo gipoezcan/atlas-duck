@@ -359,11 +359,30 @@ async fn run(config: Config) -> u8 {
         Err(e) => return fail_why("listen_failed", io_reason(&e)),
     };
     tracing::info!(event = "listening", addr = %config.listen);
+    // M13 T10: /metrics on a listener of its own, which the Ingress never routes.
+    let metrics_task = match config.metrics_listen {
+        None => None,
+        Some(addr) => match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => {
+                tracing::info!(event = "metrics_listening", addr = %addr);
+                let router = crate::web::metrics_router(state.clone());
+                Some(tokio::spawn(async move {
+                    if axum::serve(l, router).await.is_err() {
+                        tracing::error!(event = "metrics_serve_failed");
+                    }
+                }))
+            }
+            Err(e) => return fail_why("metrics_listen_failed", io_reason(&e)),
+        },
+    };
     let served = serve_until(listener, state, &writer, shutdown_signal(), DRAIN).await;
     sweeper.abort();
     anchor_timer.abort();
     admin_task.abort();
     scheduler_task.abort();
+    if let Some(m) = metrics_task {
+        m.abort();
+    }
     let _ = std::fs::remove_file(&config.admin_socket);
     match served {
         Ok(()) => {

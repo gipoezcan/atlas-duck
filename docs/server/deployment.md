@@ -24,8 +24,10 @@ Kubernetes Secret) and ADR 0003 (SQLite, one replica).
 - An Ingress (class `nginx`, the nginx.org controller, with SSE-friendly `nginx.org/*`
   annotations) and a cert-manager `Certificate` (ClusterIssuer `letsencrypt`) that fills the TLS
   Secret; the chart never renders a Secret.
-- A NetworkPolicy: the HTTP port open to every namespace (the ingress controller's namespace is
-  not visible to the team); egress only to DNS, LDAPS (636) on `sro-ad-4` and HTTPS (443).
+- A Service with two ports: `http` (8080), the only one the Ingress routes, and `metrics` (9090),
+  where `/metrics` is served for in-cluster scrapes (the `http` port answers `/metrics` 404).
+- A NetworkPolicy: the HTTP and metrics ports open to every namespace (the ingress controller's
+  namespace is not visible to the team); egress only to DNS, LDAPS (636) on `sro-ad-4` and HTTPS (443).
 - In review environments only: a ConfigMap holding the test users.
 
 Upgrades use `Recreate`, so each one has a short downtime. Sessions survive it because they are

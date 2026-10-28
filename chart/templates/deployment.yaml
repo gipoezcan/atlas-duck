@@ -69,6 +69,9 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
           env:
             # Non-secret configuration and file paths only (SM-9.1, A-4).
             - name: ATLAS_DUCK_MODE
@@ -90,6 +93,9 @@ spec:
             {{- end }}
             - name: ATLAS_DUCK_CA_BUNDLE_FILE
               value: /etc/atlas-duck/ca/ca.pem
+            # M13 T10: /metrics on its own port, never routed by the Ingress.
+            - name: ATLAS_DUCK_METRICS_LISTEN
+              value: {{ printf "0.0.0.0:%v" .Values.metrics.port | quote }}
             - name: ATLAS_DUCK_ADMIN_SOCKET
               value: /run/atlas-duck/admin.sock
             # ADR 0004: the rollback journal on the NFS data volume.

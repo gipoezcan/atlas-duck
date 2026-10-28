@@ -2,8 +2,8 @@
 # Review-environment smoke test (M13 plan T14; master-plan exit criterion, SM-2, SM-3.2, SM-8.2).
 # Runs in the `verify:review-smoke` job against the release `deploy:review` just applied, through
 # the ingress with TLS verified against the system CA bundle (Let's Encrypt; never -k, SM-9.2):
-#   rollout done; /healthz 200; /readyz 200 with the test directory reported; /metrics not
-#   reachable through the ingress; an instance via the admin socket (kubectl exec); login as a
+#   rollout done; /healthz 200; /readyz 200 with the test directory reported; /metrics 404 through
+#   the ingress and served in-cluster on the Service's metrics port (helm test); an instance via the admin socket (kubectl exec); login as a
 #   test user (CSRF); an API key (scope read); MCP initialize + tools/list with it; the key
 #   revoked -> 401; logout; helm test.
 # The API key lives only in a shell variable and is never printed.
@@ -57,7 +57,8 @@ grep -q '"directory":"stub"' "$WORK/body" || fail "/readyz does not report the t
 grep -q '"ready":true' "$WORK/body" || fail "/readyz body: $(cat "$WORK/body")"
 
 [ "$(status_of "$BASE/healthz")" = 200 ] || fail "/healthz"
-# The ingress adds X-Forwarded-For, so the server never answers /metrics through it.
+# /metrics lives on the separate metrics port, which the Ingress never routes (M13 T10); the main
+# port answers it 404. helm test below checks the metrics port in-cluster and the main port's 404.
 [ "$(status_of "$BASE/metrics")" = 404 ] || fail "/metrics is reachable through the ingress"
 
 # An instance through the admin socket (idempotent across redeploys of the same branch).

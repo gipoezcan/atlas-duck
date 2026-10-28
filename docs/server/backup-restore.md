@@ -85,8 +85,8 @@ Every restore first writes the live data as a full bundle,
 `<data>/backups/pre-restore-<stamp>/`, with a manifest. Going back is therefore an ordinary
 `admin restore` of that bundle. Still copy it off the cluster afterwards, like any backup.
 
-1. `admin maintenance on`. Users get 503 `server/maintenance`; the probes and `/metrics` still
-   answer.
+1. `admin maintenance on`. Users get 503 `server/maintenance`; the probes and `/metrics` (its own
+   port) still answer.
 2. `admin restore --stdin < bundle.tar` (see "Copying files in and out"), or `admin restore
    /var/lib/atlas-duck/backups/atlas-duck-server-backup-…` for a bundle on the volume. Before
    anything live changes, the server:

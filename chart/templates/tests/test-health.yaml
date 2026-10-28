@@ -24,7 +24,9 @@ spec:
       args:
         - >-
           curl -fsS http://{{ include "atlas-duck.fullname" . }}:{{ .Values.service.port }}/healthz &&
-          curl -fsS http://{{ include "atlas-duck.fullname" . }}:{{ .Values.service.port }}/readyz
+          curl -fsS http://{{ include "atlas-duck.fullname" . }}:{{ .Values.service.port }}/readyz &&
+          curl -fsS http://{{ include "atlas-duck.fullname" . }}:{{ .Values.metrics.port }}/metrics | grep -q '^atlas_duck_' &&
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://{{ include "atlas-duck.fullname" . }}:{{ .Values.service.port }}/metrics)" = 404
       securityContext:
         readOnlyRootFilesystem: true
         allowPrivilegeEscalation: false
