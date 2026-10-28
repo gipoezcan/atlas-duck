@@ -48,7 +48,7 @@ libc = "=0.2.190"
 # Argv tokenizer for the CLI (no dependencies).
 lexopt = "=0.3.2"
 # CommonMark parser for convert (§7.6); no CLI (getopts) or HTML renderer.
-pulldown-cmark = { version = "=0.13.4", default-features = false }
+pulldown-cmark = { version = "=0.13.5", default-features = false }
 quick-xml = { version = "=0.42.0", default-features = false, features = ["escape-html"] }
 htmd = "=0.5.5"
 landlock = "=0.4.7"
