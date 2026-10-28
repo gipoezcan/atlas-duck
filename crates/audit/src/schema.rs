@@ -403,13 +403,28 @@ pub(crate) fn versions_from(conn: &Connection) -> Result<StoreVersions, OpenErro
 /// is neither modified nor removed (a read-only connection never checkpoints) and only `-shm`
 /// may change. Sets no pragmas.
 pub(crate) fn open_peek(path: &Path) -> Result<Connection, OpenError> {
+    open_peek_for(path, JournalMode::Wal)
+}
+
+/// [`open_peek`] for a store in `journal` mode. A rollback-journal store (`Delete`, server mode
+/// on NFS) never gets `immutable=1`: its `-journal` exists only while a write is in progress, so
+/// the absence of a file proves nothing, and it creates no sidecars a reader could leave behind.
+/// It gets a plain read-only connection that waits out a writer's commit (busy timeout) and
+/// refuses a hot journal.
+pub(crate) fn open_peek_for(path: &Path, journal: JournalMode) -> Result<Connection, OpenError> {
+    if journal == JournalMode::Delete {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(sqlite)?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))
+            .map_err(sqlite)?;
+        return Ok(conn);
+    }
     let mut wal = path.as_os_str().to_owned();
     wal.push("-wal");
-    let mut journal = path.as_os_str().to_owned();
-    journal.push("-journal");
-    // A rollback journal left by a crash (journal mode DELETE) must not be read past either: a
-    // normal read-only connection refuses a hot journal instead of reading torn pages.
-    if Path::new(&wal).exists() || Path::new(&journal).exists() {
+    if Path::new(&wal).exists() {
         Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -430,6 +445,11 @@ pub(crate) fn open_peek(path: &Path) -> Result<Connection, OpenError> {
 /// connection with [`gate_open_connection`].
 pub fn read_versions(path: &Path) -> Result<StoreVersions, OpenError> {
     versions_from(&open_peek(path)?)
+}
+
+/// [`read_versions`] for a store in `journal` mode (see [`open_peek_for`]).
+pub fn read_versions_for(path: &Path, journal: JournalMode) -> Result<StoreVersions, OpenError> {
+    versions_from(&open_peek_for(path, journal)?)
 }
 
 /// The version gate on an already open, WAL-aware connection (the writer runs it right after

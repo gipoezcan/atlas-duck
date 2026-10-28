@@ -65,6 +65,30 @@ impl T {
         uid
     }
 
+    /// `users deactivate` over the admin handler; on failure the message carries the answer and
+    /// what reopening the user's store says (the admin code hides the store's error text).
+    async fn deactivate(&self, name: &str) {
+        let r = self
+            .call(Request::UsersDeactivate(UsernameArg {
+                username: name.into(),
+            }))
+            .await;
+        if !r.ok {
+            let uid = self
+                .env
+                .store
+                .user_by_name(name)
+                .ok()
+                .flatten()
+                .map(|u| u.user_id);
+            let reopen = match uid {
+                Some(u) => format!("{:?}", self.ctx.registry.open_user(&u).await.err()),
+                None => "no such user".into(),
+            };
+            panic!("deactivate {name}: {r:?}; reopening the store: {reopen}");
+        }
+    }
+
     async fn call(&self, req: Request) -> Response {
         within(handle(&self.ctx, req)).await
     }
@@ -167,13 +191,7 @@ async fn retention_keeps_active_users_chains() {
     let b = t.anchored_user("bob").await;
     let c = t.anchored_user("carol").await;
     // Carol is deactivated but within her period; Bob never was.
-    assert!(
-        t.call(Request::UsersDeactivate(UsernameArg {
-            username: "carol".into()
-        }))
-        .await
-        .ok
-    );
+    t.deactivate("carol").await;
     within(t.ctx.registry.close_all()).await;
     t.clock.advance(364 * DAY);
     let out = t.retention(false).await;
@@ -204,13 +222,7 @@ async fn retention_keeps_active_users_chains() {
 async fn retention_dry_run_lists_without_deleting() {
     let t = harness();
     let a = t.anchored_user("alice").await;
-    assert!(
-        t.call(Request::UsersDeactivate(UsernameArg {
-            username: "alice".into()
-        }))
-        .await
-        .ok
-    );
+    t.deactivate("alice").await;
     within(t.ctx.registry.close_all()).await;
     t.clock.advance(366 * DAY);
     let rows = t.env.store.anchor_all().unwrap().len();

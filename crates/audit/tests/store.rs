@@ -953,6 +953,27 @@ fn journal_mode_wal_by_default_delete_on_request() {
     assert_eq!(store.testing_pragma("synchronous"), Ok(2));
 }
 
+/// A rollback-journal store's pre-open peek never reads past a live writer: with another
+/// connection holding the write lock it fails instead of answering from an unlocked
+/// (`immutable`) read, and answers once the lock is gone.
+#[test]
+fn delete_mode_peek_respects_a_writers_lock() {
+    let (store, f) = new_store_with(fake_clock(START), MemKeyring::new(), |cfg| {
+        cfg.journal = JournalMode::Delete;
+    });
+    store.shutdown();
+    let w = rusqlite::Connection::open(f.db_path()).unwrap();
+    w.execute_batch("BEGIN EXCLUSIVE; INSERT INTO meta(key, value) VALUES ('probe', 'x');")
+        .unwrap();
+    assert!(
+        atlas_duck_audit::schema::read_versions_for(&f.db_path(), JournalMode::Delete).is_err(),
+        "the peek read past the writer's exclusive lock"
+    );
+    w.execute_batch("ROLLBACK;").unwrap();
+    drop(w);
+    assert!(atlas_duck_audit::schema::read_versions_for(&f.db_path(), JournalMode::Delete).is_ok());
+}
+
 #[test]
 fn os_path_columns() {
     let (store, f) = new_store(fake_clock(START), MemKeyring::new());
