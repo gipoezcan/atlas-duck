@@ -176,6 +176,9 @@ review environment.
 
 ## Known cluster issues
 
+- **`/openapi/v2` answers 503:** a client-side `kubectl apply` fails with `ServiceUnavailable`.
+  The CI jobs, the drill and the runbooks use `kubectl apply --server-side --force-conflicts
+  --field-manager=... --validate=false` instead, and `kubectl create` for new objects.
 - **Stale ingress endpoints after a rollout (2026-10-27/28):** after a `Recreate` rollout the
   ingress kept answering 502 for many requests while the new pod was ready: a port-forward
   worked, `/readyz` was ready, and some requests through the ingress got 200. The likely cause is
