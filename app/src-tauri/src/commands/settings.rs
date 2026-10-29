@@ -1023,6 +1023,9 @@ pub async fn settings_apply<R: Runtime>(
                 state.set_ui_lang(ui);
             }
             emit_lang_changed(&app, ui);
+            // M15 T7 (PD-297): the credential page has no `lang_changed` grant; it re-reads its
+            // context (which carries the language) on the event it already listens to.
+            crate::credential::context_changed(&app);
         }
         applied.view
     });

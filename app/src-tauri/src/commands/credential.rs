@@ -23,8 +23,9 @@ use zeroize::Zeroize;
 use super::dto::{Args, refuse};
 use super::{CommandError, blocking, finish};
 use crate::credential::{self, FirstRunPassphrase, NoteFacts, PatTarget, Purpose};
+use crate::i18n::Lang;
 use crate::serve::{self, ServeState, UnlockKind};
-use crate::state::ServeSlot;
+use crate::state::{AppState, ServeSlot};
 use crate::windows::{self, Label, Show, WindowError};
 
 /// plan text (T20): a secret (PAT or passphrase) is 1 to 1 024 bytes of UTF-8 without `\0`.
@@ -202,6 +203,8 @@ pub struct CredentialContextDto {
     /// "Save recovery note" is offered: the first-run passphrase went to the wizard and the new
     /// store serves (§8.6: right after `GENESIS`).
     pub note_available: bool,
+    /// M15 T7 (PD-297): the UI language Rust resolved (`ui_lang`); the page has no other source.
+    pub lang: Lang,
 }
 
 /// "Connected as <user>, Jira <version>" (§10.3), plus the version warnings (§7.1).
@@ -293,6 +296,7 @@ pub fn context_dto(
     purpose: &Purpose,
     refused_count: Option<u64>,
     note_available: bool,
+    lang: Lang,
 ) -> CredentialContextDto {
     let target = purpose.pat_target();
     CredentialContextDto {
@@ -307,6 +311,7 @@ pub fn context_dto(
         },
         product_version_hint: None,
         note_available,
+        lang,
     }
 }
 
@@ -323,10 +328,17 @@ pub async fn credential_context<R: Runtime>(
             let serve = serve_state(&app);
             let refused = serve.as_ref().and_then(|s| s.refused());
             let note = note_available(&app, &purpose, serve.as_deref());
-            Ok(context_dto(&purpose, refused, note))
+            Ok(context_dto(&purpose, refused, note, ui_lang(&app)))
         }
     };
     finish(&app, response)
+}
+
+/// The UI language of this process (`en` without an `AppState`).
+fn ui_lang<R: Runtime>(app: &AppHandle<R>) -> Lang {
+    app.try_state::<AppState>()
+        .map(|s| s.lang())
+        .unwrap_or_default()
 }
 
 fn note_available<R: Runtime>(
@@ -643,6 +655,7 @@ where
     let (install_id, chain_id, data) = serve_state(app)
         .and_then(|s| s.note_facts())
         .ok_or(CommandError::NotReady)?;
+    let lang = ui_lang(app);
     let facts = NoteFacts {
         host: atlas_duck_ipc::paths::host_name().unwrap_or_default(),
         os_user: credential::os_user(),
@@ -655,7 +668,8 @@ where
         let Some(path) = pick()? else {
             return Ok(NoteSaved { saved: false });
         };
-        std::fs::write(&path, credential::note_text(&facts)).map_err(|_| CommandError::Internal)?;
+        std::fs::write(&path, credential::note_text(&facts, lang))
+            .map_err(|_| CommandError::Internal)?;
         Ok(NoteSaved { saved: true })
     })
     .await
@@ -1028,14 +1042,14 @@ mod tests {
             product: "jira",
             origin: "https://jira.example/jira".into(),
         };
-        let pat = context_dto(&Purpose::ReplacePat(target), Some(4), false);
+        let pat = context_dto(&Purpose::ReplacePat(target), Some(4), false, Lang::De);
         assert_eq!(
             serde_json::to_value(&pat).unwrap_or_default(),
             json!({"purpose": "replace_pat", "alias": "work", "product": "jira",
                    "base_url": "https://jira.example/jira", "refused_count": null,
-                   "product_version_hint": null, "note_available": false})
+                   "product_version_hint": null, "note_available": false, "lang": "de"})
         );
-        let locked = context_dto(&Purpose::RecoverThisLog, Some(6), false);
+        let locked = context_dto(&Purpose::RecoverThisLog, Some(6), false, Lang::En);
         assert_eq!(locked.refused_count, Some(6));
         assert_eq!(locked.alias, None);
     }

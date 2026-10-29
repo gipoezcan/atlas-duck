@@ -386,13 +386,16 @@ fn backup_and_export(world: &World) -> Result<PathBuf> {
             )
             .map_err(|e| format!("export: {e:?}"))?;
         let (install_id, chain_id) = (store.install_id().to_owned(), store.head().2);
-        let note = note_text(&NoteFacts {
-            host: world.host().to_owned(),
-            os_user: atlas_duck_app_lib::credential::os_user(),
-            install_id,
-            chain_id,
-            data_dir: world.data_dir().display().to_string(),
-        });
+        let note = note_text(
+            &NoteFacts {
+                host: world.host().to_owned(),
+                os_user: atlas_duck_app_lib::credential::os_user(),
+                install_id,
+                chain_id,
+                data_dir: world.data_dir().display().to_string(),
+            },
+            atlas_duck_app_lib::i18n::Lang::En,
+        );
         fs::write(out.join("recovery-note.txt"), note)?;
         Ok(())
     })();

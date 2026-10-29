@@ -887,7 +887,7 @@ describe('static rules', () => {
   const sources = Object.entries(raw).map(([f, text]) => [f.replace('./', ''), String(text)] as const);
 
   it('no_storage_api_referenced', () => {
-    expect(sources.map(([f]) => f).sort()).toEqual(['ipc.ts', 'main.ts', 'page.ts', 'text.ts', 'violations.ts']);
+    expect(sources.map(([f]) => f).sort()).toEqual(['i18n.ts', 'ipc.ts', 'main.ts', 'page.ts', 'text.ts', 'violations.ts']);
     const words = ['local' + 'Storage', 'session' + 'Storage', 'indexed' + 'DB', 'Broadcast' + 'Channel', 'service' + 'Worker', 'document.cookie', 'caches.', 'openDatabase'];
     for (const [file, text] of sources) {
       for (const w of words) expect(text.includes(w), `${file} mentions ${w}`).toBe(false);

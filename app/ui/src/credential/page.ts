@@ -8,6 +8,7 @@
 //  - text that came from the agent or the server goes through describe() first;
 //  - one submit at a time.
 
+import { CREDENTIAL_TEXT, type CredentialLang, type CredentialText, formatCount, pageText } from './i18n';
 import { describe } from './text';
 
 export interface Deps {
@@ -34,81 +35,29 @@ interface Context {
   baseUrl: string | null;
   refusedCount: number | null;
   noteAvailable: boolean;
+  /** M15 T7 (PD-297): the language Rust resolved; `en` when absent or unknown. */
+  lang: CredentialLang;
 }
 
 export const MIN_PASSPHRASE_CHARS = 12;
 
-export const PURPOSE_LINE =
-  'Unlocks and restores the audit log (after a keychain loss, from a backup, or on a new machine). ' +
-  'Stored tokens are never recovered (from a backup or after a keychain loss); you re-enter them. ' +
-  'It is not your Atlassian password. Store it where your compliance owner can retrieve it.';
+/** The English purpose and restore lines (the tests' fixed texts; the page reads its table). */
+export const PURPOSE_LINE = CREDENTIAL_TEXT.en.purpose_line;
+export const RESTORE_LINE = CREDENTIAL_TEXT.en.restore_line;
 
-/** The submit button of the passphrase windows; a PAT window says "Test and store", any other "Unlock". */
-const SUBMIT_LABELS: Readonly<Record<string, string>> = {
-  recovery_passphrase: 'Set passphrase',
-  change_recovery_passphrase: 'Change passphrase',
-  restore_backup: 'Restore',
-};
+const PURPOSES: readonly Purpose[] = [
+  'add_pat',
+  'replace_pat',
+  'recovery_passphrase',
+  'unlock',
+  'recover_this_log',
+  'finish_restore',
+  'restore_backup',
+  'change_recovery_passphrase',
+];
 
-/** plan text (PD-168): the one line of the `restore_backup` window, fixed here by its purpose. */
-export const RESTORE_LINE = 'Restore a backup: enter the recovery passphrase of the backup.';
-
-const TITLES: Record<Purpose, string> = {
-  add_pat: 'Add token',
-  replace_pat: 'Replace token',
-  recovery_passphrase: 'Set recovery passphrase',
-  unlock: 'Locked',
-  recover_this_log: 'Recover this log',
-  finish_restore: 'Finish restore',
-  restore_backup: 'Restore a backup',
-  change_recovery_passphrase: 'Change recovery passphrase',
-};
-
-const FAILURES: Record<string, string> = {
-  http_401: 'The server rejected the token (401). Check that it is a valid personal access token that has not expired.',
-  tls: 'The TLS certificate of the server could not be verified. If your server uses an internal CA, add it as the instance custom CA.',
-  proxy: 'A proxy blocked or changed the connection. Check the proxy settings.',
-  network: 'The server could not be reached.',
-  version_below_floor: 'The server version is below the minimum atlas-duck supports.',
-  identity_header_missing:
-    'X-AUSERNAME not received, possibly stripped by a reverse proxy in front of Jira.',
-  identity_header_mismatch: 'The X-AUSERNAME header does not match the user of the token.',
-  other_user: 'The token belongs to a different user than the one stored for this instance.',
-  not_known_user: 'The token belongs to a user that is not known for this instance.',
-  unavailable: 'The server answered with an error. Try again later.',
-  context_changed:
-    'The instance changed while this window was open. Nothing was sent. Close this window and start again from Settings.',
-  passphrase_too_short: `The passphrase needs at least ${MIN_PASSPHRASE_CHARS} characters.`,
-  passphrase_mismatch: 'The two passphrases differ.',
-  wrong_passphrase: 'This is not the recovery passphrase of this log.',
-  keychain_unavailable: 'The OS keychain is not available.',
-  keyring_not_local: 'The OS keychain is not on this machine.',
-  store_newer: 'The audit log was written by a newer atlas-duck.',
-  integrity: 'The audit log failed its integrity check.',
-  io: 'The audit log could not be read or written.',
-  invalid: 'The audit log is not valid.',
-  core_start: 'atlas-duck could not start after the unlock.',
-  not_locked: 'atlas-duck is not locked.',
-  busy: 'Another unlock is running. Try again in a moment.',
-  shutting_down: 'atlas-duck is shutting down.',
-  cancelled: 'Cancelled.',
-  not_ready: 'This window cannot take that now.',
-  // M10 T22: the classes of a refused passphrase change and of a refused restore.
-  passphrase_not_changed: 'The recovery passphrase was not changed.',
-  not_a_backup: 'That folder is not a backup of atlas-duck. Nothing was changed.',
-  broken: 'The backup does not verify. Nothing was changed.',
-  anchor_dir_mismatch: 'The backup does not match the anchor directory. Nothing was changed.',
-  committed_incomplete: 'Restore will be completed at the next start. Restart atlas-duck.',
-  archive_first:
-    'The locked audit log cannot be moved aside because its records cannot be read. Use "Archive old DB and start fresh" first.',
-};
-
-/** What a failed "Restore a backup instead" says: these classes are about the chosen backup. */
-const RESTORE_FAILURES: Record<string, string> = {
-  wrong_passphrase: 'This is not the recovery passphrase of that backup.',
-  store_newer: 'The backup was written by a newer atlas-duck.',
-};
-
+/** The submit buttons with a label of their own; a PAT window says "Test and store", any other "Unlock". */
+const OWN_SUBMIT = ['recovery_passphrase', 'change_recovery_passphrase', 'restore_backup'] as const;
 const REJECTIONS = new Set(['invalid_argument', 'not_ready', 'admin']);
 
 function el<K extends keyof HTMLElementTagNameMap>(
@@ -141,20 +90,24 @@ function parseContext(v: unknown): Context | null {
     baseUrl: str(v.base_url),
     refusedCount: typeof v.refused_count === 'number' ? v.refused_count : null,
     noteAvailable: v.note_available === true,
+    lang: v.lang === 'de' ? 'de' : 'en',
   };
 }
 
 /** The text of a failure class: fixed for the known classes, escaped and cut for any other. */
-function failureText(cls: string): string {
+function failureText(t: CredentialText, cls: string): string {
+  if (cls === 'passphrase_too_short') return t.passphrase_too_short(MIN_PASSPHRASE_CHARS);
   // Own entries only: a class named `constructor` is an unknown class, not a member of `Object`.
-  if (Object.hasOwn(FAILURES, cls)) return FAILURES[cls] ?? '';
-  return `The operation failed (${describe(cls, true).shown.slice(0, 64)}).`;
+  const known: Readonly<Record<string, string>> = t.failures;
+  if (Object.hasOwn(known, cls)) return known[cls] ?? '';
+  return t.unknown_failure(describe(cls, true).shown.slice(0, 64));
 }
 
 /** The text of a failed restore of a locked window: the backup's classes first, then the common ones. */
-function restoreFailureText(cls: string): string {
-  if (Object.hasOwn(RESTORE_FAILURES, cls)) return RESTORE_FAILURES[cls] ?? '';
-  return failureText(cls);
+function restoreFailureText(t: CredentialText, cls: string): string {
+  const own: Readonly<Record<string, string>> = t.restore_failures;
+  if (Object.hasOwn(own, cls)) return own[cls] ?? '';
+  return failureText(t, cls);
 }
 
 function isPat(purpose: string): boolean {
@@ -206,6 +159,11 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
   // Orders overlapping context reads: only the newest one is applied.
   let loadSeq = 0;
 
+  /** The table of the language Rust sent (English before the first context). */
+  function tx(): CredentialText {
+    return pageText(ctx?.lang ?? 'en');
+  }
+
   function clearSecrets(): void {
     if (secretField) secretField.value = '';
     if (confirmField) confirmField.value = '';
@@ -229,12 +187,12 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     if (secretField && ctx && !isPat(ctx.purpose)) {
       const n = Math.min(charCount(secretField.value), MIN_PASSPHRASE_CHARS);
       if (meter) meter.value = n;
-      if (meterText) meterText.textContent = `${n} of ${MIN_PASSPHRASE_CHARS} characters`;
+      if (meterText) meterText.textContent = tx().meter(n, MIN_PASSPHRASE_CHARS);
       if (matchText && confirmField) {
         matchText.textContent =
           confirmField.value.length === 0 || confirmField.value === secretField.value
             ? ''
-            : 'The two passphrases differ.';
+            : tx().differ;
       }
     }
   }
@@ -276,7 +234,7 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
    * label says it quits the whole app, so it is not taken for closing this window.
    */
   function addQuit(parent: HTMLElement): void {
-    const b = el('button', 'action', 'Quit atlas-duck');
+    const b = el('button', 'action', tx().quit);
     b.type = 'button';
     b.addEventListener('click', () => {
       call('quit').catch((e: unknown) => showResult(rejectionText(e), false));
@@ -290,7 +248,7 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
    * token test that is running would still store its token after a "Cancel".
    */
   function addClose(parent: HTMLElement, label: 'Close' | 'Cancel'): void {
-    addAction(parent, label, () => {
+    addAction(parent, label === 'Close' ? tx().close : tx().cancel, () => {
       call('close_credential').catch((e: unknown) => showResult(rejectionText(e), false));
     });
   }
@@ -312,21 +270,21 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
 
   function rejectionText(e: unknown): string {
     const kind = e instanceof Error ? e.message : 'error';
-    return kind === 'not_ready'
-      ? FAILURES['not_ready'] ?? ''
-      : 'The request could not be completed.';
+    return kind === 'not_ready' ? tx().failures.not_ready : tx().not_completed;
+
   }
 
   /** Reads the outcome shapes of submit_secret. */
   function showOutcome(outcome: unknown): void {
     if (!isRecord(outcome)) {
-      showResult('The request could not be completed.', false);
+      showResult(tx().not_completed, false);
       return;
     }
     if (isRecord(outcome.ok)) {
       const user = describe(str(outcome.ok.atlassian_user) ?? '', true);
       const product = str(outcome.ok.product);
-      const name = product === 'confluence' ? 'Confluence' : product === 'jira' ? 'Jira' : 'server';
+      const name =
+        product === 'confluence' ? 'Confluence' : product === 'jira' ? 'Jira' : tx().product_server;
       const version = describe(str(outcome.ok.version) ?? '', true);
       const warnings = Array.isArray(outcome.ok.warnings)
         ? outcome.ok.warnings.filter((w): w is string => typeof w === 'string')
@@ -334,13 +292,10 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
       done = true;
       const extra = warnings.map((w) => describe(w, true).shown);
       if (user.unusual || version.unusual) {
-        extra.push('Some characters in the user or version are shown as escapes.');
+        extra.push(tx().escapes_user_version);
       }
-      showResult(
-        `Connected as ${user.shown}, ${name} ${version.shown}. You can close this window.`,
-        true,
-        extra,
-      );
+      showResult(tx().connected(user.shown, name, version.shown), true, extra);
+
       return;
     }
     if (isRecord(outcome.accepted)) {
@@ -348,10 +303,10 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
       const purpose = ctx?.purpose;
       showResult(
         purpose === 'change_recovery_passphrase'
-          ? 'Recovery passphrase changed.'
+          ? tx().passphrase_changed
           : purpose === 'restore_backup'
-            ? 'Passphrase sent. The restore is running.'
-            : 'Passphrase accepted.',
+            ? tx().restore_running
+            : tx().passphrase_accepted,
         true,
       );
       void reload();
@@ -359,17 +314,17 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     }
     if (isRecord(outcome.unlocked)) {
       done = true;
-      showResult('Unlocked.', true);
+      showResult(tx().unlocked, true);
       return;
     }
     if (isRecord(outcome.failed)) {
       const cls = str(outcome.failed.class) ?? 'unknown';
       const conn = str(outcome.failed.conn);
-      const extra = conn !== null ? [`Detail: ${describe(conn, true).shown.slice(0, 64)}`] : [];
-      showResult(failureText(cls), false, extra);
+      const extra = conn !== null ? [tx().detail(describe(conn, true).shown.slice(0, 64))] : [];
+      showResult(failureText(tx(), cls), false, extra);
       return;
     }
-    showResult('The request could not be completed.', false);
+    showResult(tx().not_completed, false);
   }
 
   async function submit(): Promise<void> {
@@ -405,20 +360,20 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
       const outcome = await call(cmd);
       if (mine !== generation) return;
       if (isRecord(outcome) && isRecord(outcome.failed)) {
-        showResult(failureText(str(outcome.failed.class) ?? 'unknown'), false);
+        showResult(failureText(tx(), str(outcome.failed.class) ?? 'unknown'), false);
       } else if (isRecord(outcome) && isRecord(outcome.archived)) {
         done = true;
-        showResult('The old audit log was moved aside. Set up atlas-duck again in the setup window.', true);
+        showResult(tx().archived, true);
       } else if (isRecord(outcome) && typeof outcome.saved === 'boolean') {
         if (outcome.saved) {
           noteSaved = true;
-          showResult('Recovery note saved.', true);
-        } else showResult('The recovery note was not saved.', false);
+          showResult(tx().note_saved, true);
+        } else showResult(tx().note_not_saved, false);
       } else if (isRecord(outcome) && typeof outcome.started === 'boolean') {
-        if (outcome.started) showResult('Trying the keychain again.', true);
-        else showResult('A keychain retry is already running.', false);
+        if (outcome.started) showResult(tx().keychain_retry, true);
+        else showResult(tx().keychain_retry_running, false);
       } else {
-        showResult('The request could not be completed.', false);
+        showResult(tx().not_completed, false);
       }
     } catch (e) {
       if (mine === generation) showResult(rejectionText(e), false);
@@ -447,15 +402,15 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
       const outcome = await call('restore_from_backup');
       if (isRecord(outcome) && isRecord(outcome.unlocked)) unlocked = true;
       else if (isRecord(outcome) && isRecord(outcome.failed)) {
-        text = restoreFailureText(str(outcome.failed.class) ?? 'unknown');
-      } else text = 'The request could not be completed.';
+        text = restoreFailureText(tx(), str(outcome.failed.class) ?? 'unknown');
+      } else text = tx().not_completed;
     } catch (e) {
       text = rejectionText(e);
     }
     if (mine === generation) {
       if (unlocked) {
         done = true;
-        showResult('Unlocked.', true);
+        showResult(tx().unlocked, true);
       } else showResult(text ?? '', false);
       busy = false;
       refreshControls();
@@ -464,7 +419,7 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     // The context moved on: the busy flag belongs to the newer generation.
     if (unlocked) {
       done = true;
-      showResult('Unlocked.', true);
+      showResult(tx().unlocked, true);
     } else if (ctx !== null && isLocked(ctx.purpose)) {
       showResult(text ?? '', false);
     } else {
@@ -475,8 +430,9 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
   function header(): HTMLElement {
     const h = el('header', 'context');
     const purpose = ctx?.purpose ?? '';
-    const known = Object.hasOwn(TITLES, purpose);
-    const title = known ? TITLES[purpose as Purpose] : describe(purpose, true).shown;
+    const t = tx();
+    const known = PURPOSES.find((p) => p === purpose);
+    const title = known !== undefined ? t.titles[known] : describe(purpose, true).shown;
     h.append(el('h1', 'title', title));
     if (!ctx) return h;
     const rows: [string, string, boolean][] = [];
@@ -488,9 +444,9 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
       rows.push([label, d.shown, d.unusual]);
     };
     if (isPat(ctx.purpose)) {
-      add('Instance', ctx.alias);
-      add('Product', ctx.product);
-      add('Address', ctx.baseUrl);
+      add(t.facts.instance, ctx.alias);
+      add(t.facts.product, ctx.product);
+      add(t.facts.address, ctx.baseUrl);
     }
     const dl = el('dl', 'facts');
     for (const [label, shown, odd] of rows) {
@@ -499,9 +455,8 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     }
     if (rows.length > 0) h.append(dl);
     if (unusual) {
-      h.append(
-        el('p', 'warning', 'Some characters above are not ordinary and are shown as escapes. Check the address before you continue.'),
-      );
+      h.append(el('p', 'warning', t.escapes_warning));
+
     }
     // The two M10 windows are not a locked state: their header is the purpose, nothing else.
     if (
@@ -511,8 +466,8 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     ) {
       // §2.5 / §10.3 verbatim, app-generated: "Locked — N requests refused" and, for the wizard's
       // passphrase purpose (spec fix G1, L46), "Setup required — N requests refused".
-      const label = ctx.purpose === 'recovery_passphrase' ? 'Setup required' : 'Locked';
-      h.append(el('p', 'locked', `${label} \u2014 ${ctx.refusedCount} requests refused`));
+      const setup = ctx.purpose === 'recovery_passphrase';
+      h.append(el('p', 'locked', t.locked_line(setup, formatCount(ctx.lang, ctx.refusedCount))));
     }
     return h;
   }
@@ -521,14 +476,14 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     if (!ctx) return;
     const purpose = ctx.purpose;
     if (purpose === 'unlock') {
-      addAction(bar, 'Retry keychain', () => void plainAction('retry_keychain'));
+      addAction(bar, tx().retry_keychain, () => void plainAction('retry_keychain'));
     }
     if (takesTwoPassphrases(purpose) && ctx.noteAvailable) {
-      addAction(bar, 'Save recovery note', () => void plainAction('save_recovery_note'));
+      addAction(bar, tx().save_note, () => void plainAction('save_recovery_note'));
     }
     if (isLocked(purpose)) {
-      addAction(bar, 'Archive old DB and start fresh', () => void plainAction('archive_and_start_fresh'));
-      addAction(bar, 'Restore a backup instead', () => void restoreInstead());
+      addAction(bar, tx().archive, () => void plainAction('archive_and_start_fresh'));
+      addAction(bar, tx().restore_instead, () => void restoreInstead());
     }
     // A token, restore or passphrase-change window can always be cancelled; any window can be
     // closed once its work is done.
@@ -553,9 +508,10 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     matchText = null;
     actionButtons = [];
     root.replaceChildren();
+    document.documentElement.lang = ctx?.lang ?? 'en';
     if (failedLoad || !ctx) {
-      root.append(el('h1', 'title', 'Credential entry'));
-      root.append(el('p', 'error', 'The window context is unavailable. Quit and start atlas-duck again.'));
+      root.append(el('h1', 'title', tx().fallback_title));
+      root.append(el('p', 'error', tx().context_unavailable));
       const bar = el('div', 'actions');
       addQuit(bar);
       root.append(bar);
@@ -564,6 +520,7 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     headerEl = header();
     root.append(headerEl);
     const purpose = ctx.purpose;
+    const t = tx();
     const bar = el('div', 'actions');
     barEl = bar;
 
@@ -575,9 +532,9 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
         void submit();
       });
       if (isPat(purpose)) {
-        field(form, 'Personal access token', 'secret', 'off');
+        field(form, t.pat_label, 'secret', 'off');
         const wrap = el('label', 'field');
-        wrap.append(el('span', 'label', 'Token expires on (optional)'));
+        wrap.append(el('span', 'label', t.expires_label));
         const date = el('input');
         date.type = 'date';
         date.setAttribute('autocomplete', 'off');
@@ -585,16 +542,16 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
         form.append(wrap);
         dateField = date;
       } else {
-        if (purpose === 'restore_backup') form.append(el('p', 'purpose-line', RESTORE_LINE));
-        form.append(el('p', 'purpose-line', PURPOSE_LINE));
+        if (purpose === 'restore_backup') form.append(el('p', 'purpose-line', t.restore_line));
+        form.append(el('p', 'purpose-line', t.purpose_line));
         field(
           form,
-          purpose === 'change_recovery_passphrase' ? 'New recovery passphrase' : 'Recovery passphrase',
+          purpose === 'change_recovery_passphrase' ? t.new_passphrase : t.passphrase,
           'secret',
           'off',
         );
         if (takesTwoPassphrases(purpose)) {
-          field(form, 'Repeat the passphrase', 'confirm', 'off');
+          field(form, t.repeat, 'confirm', 'off');
           matchText = el('p', 'hint');
           form.append(matchText);
         }
@@ -605,14 +562,19 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
         meterText = el('p', 'hint');
         form.append(meter, meterText);
       }
-      submitButton = el('button', 'primary', Object.hasOwn(SUBMIT_LABELS, purpose) ? (SUBMIT_LABELS[purpose] ?? '') : isPat(purpose) ? 'Test and store' : 'Unlock');
+      const own = OWN_SUBMIT.find((p) => p === purpose);
+      submitButton = el(
+        'button',
+        'primary',
+        own !== undefined ? t.submit[own] : isPat(purpose) ? t.submit.pat : t.submit.unlock,
+      );
       submitButton.type = 'submit';
       form.append(submitButton);
       root.append(form);
     }
 
     if (purpose === 'unlock') {
-      root.append(el('p', 'hint', 'The OS keychain is not available. Unlock it, then try again.'));
+      root.append(el('p', 'hint', t.keychain_hint));
     }
     buildBar(bar);
 
@@ -648,6 +610,23 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     }
   }
 
+  /**
+   * M15 T7: the language changed for the same purpose and target. The page is built again in the
+   * new language; what was typed moves to the new fields (input to input, never into the DOM as
+   * text), and the result and the call in flight stay as they are.
+   */
+  function relabel(next: Context): void {
+    const secret = secretField?.value ?? '';
+    const confirm = confirmField?.value ?? '';
+    const date = dateField?.value ?? '';
+    ctx = next;
+    render();
+    if (secretField) secretField.value = secret;
+    if (confirmField) confirmField.value = confirm;
+    if (dateField) dateField.value = date;
+    refreshControls();
+  }
+
   async function reload(): Promise<void> {
     loadSeq += 1;
     const token = loadSeq;
@@ -659,7 +638,8 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     }
     if (token !== loadSeq) return;
     if (ctx !== null && next !== null && sameTarget(ctx, next)) {
-      updateInPlace(next);
+      if (ctx.lang === next.lang) updateInPlace(next);
+      else relabel(next);
       return;
     }
     // Another purpose or target (or no context at all): whatever was typed belongs to the old

@@ -1260,10 +1260,10 @@ fn credential_contexts() -> Vec<CredentialContextDto> {
         origin: "https://jira.example/jira".into(),
     };
     vec![
-        context_dto(&Purpose::ReplacePat(target), None, false),
-        context_dto(&Purpose::RecoverThisLog, Some(3), false),
-        context_dto(&Purpose::Unlock, Some(0), false),
-        context_dto(&Purpose::RecoveryPassphrase, Some(1), true),
+        context_dto(&Purpose::ReplacePat(target), None, false, Lang::En),
+        context_dto(&Purpose::RecoverThisLog, Some(3), false, Lang::De),
+        context_dto(&Purpose::Unlock, Some(0), false, Lang::En),
+        context_dto(&Purpose::RecoveryPassphrase, Some(1), true, Lang::De),
     ]
 }
 
