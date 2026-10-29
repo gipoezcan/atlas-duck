@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use atlas_duck_core::Lang;
 use axum::body::Body;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -116,7 +117,8 @@ fn content_type(name: &str) -> &'static str {
     }
 }
 
-fn not_found() -> Response {
+/// The plain 404 of the static files (also for `/docs` paths no route names).
+pub fn not_found() -> Response {
     let mut r = (StatusCode::NOT_FOUND, "not found").into_response();
     common_headers(&mut r);
     r
@@ -176,19 +178,13 @@ pub async fn asset(dir: &WebDir, name: &str) -> Response {
     .await
 }
 
-/// `GET /docs` and `/docs/`: to the guide in the language `Accept-Language` prefers (German when
-/// its first English or German tag is German), else English.
-pub fn docs_redirect(accept_language: Option<&str>) -> Response {
-    let lang = accept_language
-        .and_then(|h| {
-            h.split(',').find_map(|tag| {
-                let primary = tag.split(';').next()?.trim().split('-').next()?;
-                DOC_LANGS
-                    .into_iter()
-                    .find(|l| primary.eq_ignore_ascii_case(l))
-            })
-        })
-        .unwrap_or(DOC_LANGS[0]);
+/// `GET /docs` and `/docs/`: to the guide in `lang`, the language the caller's `Accept-Language`
+/// prefers (`pref_routes::accept_language`, the rule the UI language on `auto` follows).
+pub fn docs_redirect(lang: Lang) -> Response {
+    let lang = match lang {
+        Lang::De => "de",
+        Lang::En => "en",
+    };
     let mut r = Response::new(Body::empty());
     *r.status_mut() = StatusCode::FOUND;
     r.headers_mut().insert(
@@ -215,6 +211,8 @@ pub fn docs_add_slash(dir: &WebDir, lang: &str) -> Response {
     if let Ok(v) = HeaderValue::from_str(&format!("/docs/{lang}/")) {
         r.headers_mut().insert(header::LOCATION, v);
     }
+    r.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static(DOCS_CACHE));
     common_headers(&mut r);
     r
 }

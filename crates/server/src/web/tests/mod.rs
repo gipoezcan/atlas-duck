@@ -1097,6 +1097,10 @@ async fn docs_root_redirects_to_lang() {
         (Some("fr-FR,fr;q=0.9"), "/docs/en/"),
         (Some("fr, de;q=0.5"), "/docs/de/"),
         (Some("*"), "/docs/en/"),
+        // RFC 9110 weights, as the UI language on `auto` reads them (pref_routes::accept_language).
+        (Some("en;q=0.1, de;q=0.9"), "/docs/de/"),
+        (Some("de;q=0, en"), "/docs/en/"),
+        (Some("de;q=0.4, en;q=0.8"), "/docs/en/"),
     ] {
         for uri in ["/docs", "/docs/"] {
             let headers: Vec<(&str, &str)> =
@@ -1111,7 +1115,57 @@ async fn docs_root_redirects_to_lang() {
     let res = get(&h, "/docs/de").await;
     assert_eq!(res.status(), StatusCode::MOVED_PERMANENTLY);
     assert_eq!(res.headers()[header::LOCATION], "/docs/de/");
+    assert_eq!(res.headers()[header::CACHE_CONTROL], "no-cache");
     assert_eq!(get(&h, "/docs/fr").await.status(), StatusCode::NOT_FOUND);
+}
+
+/// Positive control for the manifest filter: a file on disk that the manifest does not list is
+/// not served, one it lists is, and a hostile `file` entry is dropped without losing the rest.
+#[tokio::test]
+async fn docs_pages_come_from_the_manifest_only() {
+    let h = H::new();
+    let en = h.dir.path().join("web").join("docs").join("en");
+    assert!(en.join("not-in-manifest.html").is_file());
+    assert_eq!(
+        get(&h, "/docs/en/not-in-manifest").await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(get(&h, "/docs/en/approvals").await.status(), StatusCode::OK);
+    // `ghost` is listed but has no file: 404 from the file system, not a 500.
+    assert_eq!(
+        get(&h, "/docs/en/ghost").await.status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let docs = tmp.path().join("docs").join("en");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::write(
+        docs.join("manifest.json"),
+        r#"{"pages":[{"id":"index","file":"index.html"},{"id":"evil","file":"../../secret.txt"},{"id":"a/b","file":"x.html"},{"id":"ok","file":"ok.html"}]}"#,
+    )
+    .unwrap();
+    let web = crate::static_files::WebDir::new(tmp.path().to_path_buf());
+    assert_eq!(web.1.file("en", "index"), Some("index.html"));
+    assert_eq!(web.1.file("en", "ok"), Some("ok.html"));
+    assert_eq!(web.1.file("en", "evil"), None);
+    assert_eq!(web.1.file("en", "a/b"), None);
+}
+
+/// Misses under /docs answer with the same plain 404 and headers as the other static files.
+#[tokio::test]
+async fn docs_misses_are_plain_text() {
+    let h = H::new();
+    for uri in ["/docs/en/a/b/c", "/docs/en/assets/x/y", "/docs/fr/index"] {
+        let res = get(&h, uri).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(
+            res.headers()[header::CONTENT_SECURITY_POLICY],
+            crate::static_files::CSP,
+            "{uri}"
+        );
+        assert_eq!(text_body(res).await, "not found", "{uri}");
+    }
 }
 
 #[tokio::test]

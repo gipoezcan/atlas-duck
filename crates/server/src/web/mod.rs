@@ -251,7 +251,8 @@ pub fn router(state: AppState) -> Router {
         .route("/docs/{lang}", get(docs_add_slash))
         .route("/docs/{lang}/", get(docs_lang_root))
         .route("/docs/{lang}/{page}", get(docs_page))
-        .route("/docs/{lang}/assets/{name}", get(docs_asset));
+        .route("/docs/{lang}/assets/{name}", get(docs_asset))
+        .route("/docs/{lang}/{page}/{*rest}", get(docs_miss));
     r.merge(crate::mcp::routes(&state))
         .fallback(|| async { ApiError::NOT_FOUND })
         .layer(middleware::from_fn_with_state(state.clone(), api_guard))
@@ -311,7 +312,11 @@ async fn page(State(st): State<AppState>, uri: axum::http::Uri) -> Response {
 }
 
 async fn docs_root(headers: HeaderMap) -> Response {
-    static_files::docs_redirect(header_str(&headers, header::ACCEPT_LANGUAGE))
+    static_files::docs_redirect(pref_routes::accept_language(&headers))
+}
+
+async fn docs_miss() -> Response {
+    static_files::not_found()
 }
 
 async fn docs_add_slash(
