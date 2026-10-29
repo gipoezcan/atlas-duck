@@ -93,12 +93,12 @@ export function ExportBackup({ job }: Props) {
       (done) => {
         release('export');
         setExporting(false);
-        setSaid(exportResult(done, true));
+        setSaid(exportResult(done, true, t));
       },
       (e: unknown) => {
         release('export', e);
         setExporting(false);
-        setSaid(exportRefusal(e));
+        setSaid(exportRefusal(e, t));
       },
     );
   };

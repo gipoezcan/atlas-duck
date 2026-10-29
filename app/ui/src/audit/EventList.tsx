@@ -166,7 +166,7 @@ function Row({
         {/* The flags come first: a narrow row cuts the end of its line, and a caution flag must stay in view. */}
         <Flags flags={h.flags} />
         <span>
-          <Val value={h.ts_utc} time />
+          <Val value={h.ts_utc} time="short" />
         </span>
         <code>
           <Val value={h.event_type} />

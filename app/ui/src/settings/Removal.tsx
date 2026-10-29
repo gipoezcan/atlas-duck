@@ -115,10 +115,10 @@ export function Removal({ onChanged }: { onChanged: () => void }) {
     void action
       .run(
         () => removalExport(),
-        (e) => setSaid(exportRefusal(e)),
+        (e) => setSaid(exportRefusal(e, t)),
       )
       .then((done) => {
-        if (done !== undefined) setSaid(exportResult(done, true));
+        if (done !== undefined) setSaid(exportResult(done, true, t));
         if (live.current) setExporting(false);
       });
   };

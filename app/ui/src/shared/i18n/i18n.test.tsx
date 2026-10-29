@@ -1,7 +1,7 @@
 import { render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
 import { de, en } from './dict';
-import { formatBytes, formatDateTime, formatNumber } from './format';
+import { formatBytes, formatDateTime, formatNumber, formatTimestamp } from './format';
 import { LangProvider, useLang, useText } from './context';
 import { LANG_PREFS, resolveLang, type Dict } from './index';
 import { GLOSSARY_DE } from './de/terms';
@@ -137,5 +137,25 @@ describe('dictionary', () => {
       Auditor: 'Auditor',
       Admin: 'Administrator',
     });
+  });
+});
+
+describe('formatBytes table mode and precise times (M15 T6 fix round 1)', () => {
+  it('table_mode_keeps_one_decimal_and_ungrouped_bytes', () => {
+    expect(formatBytes('en', 1023, { table: true })).toBe('1023 B');
+    expect(formatBytes('de', 1023, { table: true })).toBe('1023 B');
+    expect(formatBytes('en', 1024, { table: true })).toBe('1.0 KiB');
+    expect(formatBytes('de', 182_400, { table: true })).toBe('178,1 KiB');
+    expect(formatBytes('en', 1_048_575, { table: true })).toBe('1.0 MiB');
+    expect(formatBytes('en', 1536)).toBe('1.5 KiB');
+    expect(formatBytes('en', 1024)).toBe('1 KiB');
+  });
+
+  it('precise_time_keeps_seconds_and_a_fraction', () => {
+    expect(formatTimestamp('en', '2026-10-19T08:30:15.250Z', { precise: true })).toBe('2026-10-19 08:30:15.250 UTC');
+    expect(formatTimestamp('de', '2026-10-19T08:30:15.250Z', { precise: true })).toBe('19.10.2026, 08:30:15.250 UTC');
+    expect(formatTimestamp('de', '2026-10-19T08:30:15Z', { precise: true })).toBe('19.10.2026, 08:30:15 UTC');
+    expect(formatTimestamp('en', '2026-10-19T08:30:15.250Z')).toBe('2026-10-19 08:30 UTC');
+    expect(formatDateTime('de', 0, { precise: true })).toBe('01.01.1970, 00:00:00 UTC');
   });
 });

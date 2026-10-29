@@ -3,7 +3,7 @@ import { useText } from '../shared/i18n/context';
 import type { Dict } from '../shared/i18n';
 import { useLang } from '../shared/i18n/context';
 import { en } from '../shared/i18n/dict';
-import { displayTimestamp, formatBytes } from '../shared/i18n/format';
+import { formatBytes, formatTimestamp } from '../shared/i18n/format';
 
 import { on } from '../shared/ipc/events';
 import { runningKill, runningList } from '../shared/ipc/invoke';
@@ -198,10 +198,10 @@ export function Running() {
                   )}
                 </td>
                 <td>{r.instances.length === 0 ? t.running.no_instances : r.instances.join(', ')}</td>
-                <td>{displayTimestamp(lang, r.started_at)}</td>
+                <td>{formatTimestamp(lang, r.started_at)}</td>
                 <td>{elapsedText(r.elapsed_ms, t)}</td>
                 <td>{r.host_calls}</td>
-                <td>{formatBytes(lang, r.bytes_fetched, true)}</td>
+                <td>{formatBytes(lang, r.bytes_fetched, { table: true })}</td>
                 <td>
                   <button
                     type="button"

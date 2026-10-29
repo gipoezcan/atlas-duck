@@ -59,7 +59,7 @@ export function InstanceForm({
       )
       .then((v) => {
         if (v === undefined) return;
-        // dd confirmed the origin in its own dialog: an instance without a token is next.
+        // add confirmed the origin in its own dialog: an instance without a token is next.
         setAdded(v.state === 'needs_token' ? (addedNeedsToken ?? t.settings.add_done_token) : t.settings.add_done);
         setAlias('');
         setBaseUrl('');

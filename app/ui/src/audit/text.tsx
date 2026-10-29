@@ -2,7 +2,7 @@ import type { ReactNode } from 'react';
 import { useLang, useText } from '../shared/i18n/context';
 import type { Dict } from '../shared/i18n';
 import { en } from '../shared/i18n/dict';
-import { displayTimestamp } from '../shared/i18n/format';
+import { formatTimestamp } from '../shared/i18n/format';
 
 import type { ExportDone } from '../shared/ipc/types';
 import { Badge } from '../shared/text/Badge';
@@ -14,12 +14,13 @@ import { unusual } from '../shared/text/unusual';
  * are still untrusted): a bidi-isolated text node with the "unusual characters" flag, never markup.
  * `null` is the fixed "none". Agent strings go through `AgentText` instead.
  */
-export function Val({ value, time = false }: { value: string | number | null; time?: boolean }) {
+export function Val({ value, time }: { value: string | number | null; time?: 'short' | 'precise' }) {
   const t = useText();
   const lang = useLang();
   if (value === null) return <>{t.audit.no_value}</>;
-  // A time column (	s_utc, detected_at) is shown as German UTC text; the other columns are as Rust wrote them.
-  const text = time ? displayTimestamp(lang, String(value)) : String(value);
+  // A time column (ts_utc, detected_at) is shown as UTC text per language (PD-298); the record detail keeps the seconds.
+  const text =
+    time === undefined ? String(value) : formatTimestamp(lang, String(value), { precise: time === 'precise' });
   return (
     <>
       <bdi>{text}</bdi>

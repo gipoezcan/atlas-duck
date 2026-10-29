@@ -79,7 +79,7 @@ export function Trail({ requestId, onOpen }: Props) {
                 <button type="button" onClick={() => onOpen(h)}>
                   {t.audit.open_record(h.seq)}
                 </button>{' '}
-                <Val value={h.ts_utc} time />{' '}
+                <Val value={h.ts_utc} time="short" />{' '}
                 <code>
                   <Val value={h.event_type} />
                 </code>

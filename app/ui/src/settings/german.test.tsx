@@ -93,7 +93,8 @@ describe('the settings window in German (M15 T6)', () => {
   it('plurals_and_dates_are_german', () => {
     expect(de.settings.expiry_in(1)).toBe('Das Token läuft in 1 Tag ab');
     expect(de.settings.expiry_in(5)).toBe('Das Token läuft in 5 Tagen ab');
-    expect(de.settings.pruned(12345, '2026-07-15')).toBe('12.345 Datensatz/Datensätze vor dem 15.07.2026 bereinigt');
+    expect(de.settings.pruned(12345, '2026-07-15')).toBe('12.345 Datensätze vor dem 15.07.2026 bereinigt');
+    expect(de.settings.pruned(1, '2026-07-15')).toBe('1 Datensatz vor dem 15.07.2026 bereinigt');
     expect(de.settings.removal_retention(1, true)).toBe(
       'Der neueste Audit-Datensatz bleibt bis zur Aufhebung des Legal Hold und danach noch mindestens 1 Tag erhalten.',
     );

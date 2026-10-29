@@ -68,7 +68,7 @@ describe('Running scripts shell', () => {
     expect(rows).toHaveLength(2);
     expect(rows[0]?.textContent).toContain(REQ);
     expect(rows[0]?.textContent).toContain('claude-code-billing-api');
-    expect(rows[0]?.textContent).toContain('2026-10-15T08:30:00.000Z');
+    expect(rows[0]?.textContent).toContain('2026-10-15 08:30 UTC');
     expect(rows[1]?.textContent).toContain('no agent name');
     expect(killButtons()).toHaveLength(2);
 
@@ -144,12 +144,12 @@ describe('Running scripts shell', () => {
     expect(first[1]).toContain('claude-code-billing-api');
     expect(first.slice(2, 7)).toEqual([
       'jira-main, wiki',
-      '2026-10-15T08:30:00.000Z',
+      '2026-10-15 08:30 UTC',
       '1 min 33 s',
       '4',
       '178.1 KiB',
     ]);
-    expect(cells(1).slice(1, 7)).toEqual(['no agent name', 'none yet', '2026-10-15T08:30:00.000Z', '4 s', '0', '0 B']);
+    expect(cells(1).slice(1, 7)).toEqual(['no agent name', 'none yet', '2026-10-15 08:30 UTC', '4 s', '0', '0 B']);
     expect(cells(2).slice(4, 7)).toEqual(['1 h 2 min', '4', '5.2 MiB']);
   });
 

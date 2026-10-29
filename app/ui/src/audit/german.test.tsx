@@ -41,11 +41,11 @@ describe('the audit window in German (M15 T6)', () => {
     expect(screen.queryByRole('button', { name: en.audit.open_record(5) })).toBeNull();
   });
 
-  it('event_list_keeps_the_iso_time_in_english', async () => {
+  it('event_list_dates_english_utc', async () => {
     vi.mocked(auditQuery).mockResolvedValue(page([header(5, { ts_utc: '1970-01-01T00:00:00.000Z' })]));
     render(<EventList filter={{}} selected={null} onOpen={() => undefined} />);
     await flush();
-    expect(screen.getByRole('list', { name: en.audit.list_label }).textContent).toContain('1970-01-01T00:00:00.000Z');
+    expect(screen.getByRole('list', { name: en.audit.list_label }).textContent).toContain('1970-01-01 00:00 UTC');
   });
 
   it('incidents_and_errors_in_german', async () => {

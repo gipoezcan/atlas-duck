@@ -89,3 +89,9 @@ never translated. A German leaf equal to its English one needs an allowlist entr
 | old installs (orphans) | alte Installationen | "vergessen" for forget |
 | host call | Host-Aufruf | |
 | elapsed | Dauer | |
+| tray menu | Tray-Menü | |
+| badge (attention mode "badge only") | Kennzeichen | |
+| credential window | Anmeldedatenfenster | the separate window where tokens and passphrases are typed |
+| candidate cache | Kandidaten-Cache | |
+| backlog (pruning) | Rückstand | |
+| heap (script limit) | Heap | stays English |

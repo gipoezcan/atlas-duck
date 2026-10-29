@@ -100,7 +100,7 @@ export const settings = {
   add_default: 'Default instance for its product',
   add_submit: 'Add instance',
   add_done: 'The instance was added.',
-  /** dd confirms the origin in its own native dialog, so the next step is the token. */
+  /** add confirms the origin in its own native dialog, so the next step is the token. */
   add_done_token: 'The instance was added. Add its token next.',
   limits: 'Limits',
   limit_labels: {

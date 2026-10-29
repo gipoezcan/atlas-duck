@@ -125,7 +125,7 @@ export const settings: Dict['settings'] = {
   prune: 'Bereinigung',
   prune_button: 'Rückstand jetzt bereinigen',
   prune_failed_last: 'Die letzte Bereinigung ist fehlgeschlagen.',
-  pruned: (n, cutoff) => `${formatNumber('de', n)} Datensatz/Datensätze vor dem ${formatIsoDate('de', cutoff)} bereinigt`,
+  pruned: (n, cutoff) => `${formatNumber('de', n)} ${n === 1 ? 'Datensatz' : 'Datensätze'} vor dem ${formatIsoDate('de', cutoff)} bereinigt`,
   pruned_clamped: 'Der Stichtag wurde durch das Aufbewahrungsminimum begrenzt.',
   prune_skipped: 'Die Bereinigung wurde übersprungen',
   prune_reasons: {

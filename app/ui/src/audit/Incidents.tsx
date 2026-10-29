@@ -116,7 +116,7 @@ export function Incidents({ status, failed, onRetry, onChanged }: Props) {
           <>
             {' '}
             ({t.audit.incident_result}: <code><Val value={incident.result} /></code>, {t.audit.incident_detected}:{' '}
-            <Val value={incident.detected_at} time />)
+            <Val value={incident.detected_at} time="short" />)
           </>
         )}{' '}
         <button

@@ -248,7 +248,7 @@ function RecordDetail({
           <div key={key}>
             <dt>{t.audit.field[key]}</dt>
             <dd>
-              <Val value={h[key]} time={key === 'ts_utc'} />
+              <Val value={h[key]} time={key === 'ts_utc' ? 'precise' : undefined} />
             </dd>
           </div>
         ))}
