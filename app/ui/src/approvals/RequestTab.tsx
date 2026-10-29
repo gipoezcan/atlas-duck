@@ -5,7 +5,8 @@ import type { QueueDetail } from '../shared/ipc/types';
 import { AgentText } from '../shared/text/AgentText';
 import { Badge } from '../shared/text/Badge';
 import { formatAge } from './Queue';
-import { useText } from '../shared/i18n/context';
+import { useLang, useText } from '../shared/i18n/context';
+import { formatTimestamp } from '../shared/i18n/format';
 
 interface RequestTabProps {
   requestId: string;
@@ -29,6 +30,7 @@ function limitsOf(params: unknown): unknown {
  */
 export function RequestTab({ requestId }: RequestTabProps) {
   const t = useText();
+  const lang = useLang();
   const [detail, setDetail] = useState<QueueDetail | null>(null);
   const [failed, setFailed] = useState(false);
 
@@ -96,7 +98,7 @@ export function RequestTab({ requestId }: RequestTabProps) {
         <dt>{t.approvals.request.params_sha256}</dt>
         <dd>{r.params_sha256}</dd>
         <dt>{t.approvals.request.submitted_at}</dt>
-        <dd>{r.submitted_at}</dd>
+        <dd>{formatTimestamp(lang, r.submitted_at)}</dd>
         <dt>{t.approvals.request.age}</dt>
         <dd>{formatAge(item.age_s, t)}</dd>
         <dt>{t.approvals.request.client_kind}</dt>

@@ -1,3 +1,4 @@
+import { formatNumber } from '../format';
 import type { Dict } from '../index';
 
 export const approvals: Dict['approvals'] = {
@@ -16,7 +17,7 @@ export const approvals: Dict['approvals'] = {
     individually: 'einzeln freigeben',
     excluded: 'Nicht Teil der Sammelentscheidung',
     blocked:
-      'Die Sammelfreigabe ist nicht verfügbar: Öffnen Sie zuerst die Vorschau jeder ausgewählten Anfrage, und jede muss freigabefähig sein',
+      'Die Sammelentscheidung ist nicht verfügbar: Öffnen Sie zuerst die Vorschau jeder ausgewählten Anfrage; jede muss freigabefähig sein',
     blocked_unopened: 'Vorschau nicht geöffnet',
     blocked_not_approvable: 'nicht freigabefähig',
     blocked_unsent:
@@ -29,7 +30,7 @@ export const approvals: Dict['approvals'] = {
     cancel: 'Abbrechen',
     deny_selected: 'Ausgewählte ablehnen',
     deny_session: 'Alle ausstehenden dieser Sitzung ablehnen',
-    deny_selected_title: (n) => `Die ${n} ausgewählte${n === 1 ? '' : 'n'} Anfrage${n === 1 ? '' : 'n'} ablehnen`,
+    deny_selected_title: (n) => (n === 1 ? 'Die ausgewählte Anfrage ablehnen' : `Die ${n} ausgewählten Anfragen ablehnen`),
     deny_session_title: 'Alle ausstehenden Anfragen dieser Sitzung ablehnen',
     deny_session_note:
       'Damit wird jede Anfrage der Sitzung abgelehnt, die beim Drücken der Schaltfläche auf eine Entscheidung wartet, auch solche, die hier nicht angezeigt werden. Anfragen, die noch abgerufen oder angereichert werden, werden übersprungen und erscheinen danach.',
@@ -41,7 +42,7 @@ export const approvals: Dict['approvals'] = {
     rejected: 'Die Sammelentscheidung wurde zurückgewiesen, und es wurde nichts entschieden',
     rejected_unknown:
       'Die Sammelentscheidung wurde zurückgewiesen, und es wurde nichts entschieden; die betroffenen Einträge konnten nicht aufgelistet werden',
-    cancelled: 'Die Sammelentscheidung wurde abgebrochen, und es wurde nichts entschieden',
+    cancelled: 'Die Sammelentscheidung wurde storniert, und es wurde nichts entschieden',
     failed:
       'Die Sammelentscheidung konnte nicht angewendet werden; lesen Sie die Warteschlange neu ein, bevor Sie es erneut versuchen',
     nothing_pending: 'In dieser Sitzung steht nichts aus',
@@ -144,7 +145,7 @@ export const approvals: Dict['approvals'] = {
     consequence_status_only: 'Der Agent erhält `failed` (Exit 6), HTTP <status>, ohne Text',
     consequence_deny: 'Der Agent erhält `denied` (Exit 3) + Ihre Begründung',
     consequence_release_outcome:
-      'Der Agent erhält `failed` (Exit 6), `result_too_large` / `upstream_network` / `upstream_unavailable` und einen festen Hinweis; keine Größe',
+      'Der Agent erhält `failed` (Exit 6), `result_too_large` / `upstream_network` / `upstream_unavailable` und eine feste Meldung; keine Größe',
   },
   keyboard: {
     legend_label: 'Tastatur',
@@ -159,8 +160,8 @@ export const approvals: Dict['approvals'] = {
     submit: 'Ablehnung senden',
     cancel: 'Abbrechen',
     keys: 'Eingabe sendet die Ablehnung, Esc bricht ab',
-    offers: 'Hinweis anhängen',
-    offers_one: 'Höchstens ein Hinweis',
+    offers: 'Tipp anhängen',
+    offers_one: 'Höchstens ein Tipp',
     upstream_http: 'den HTTP-Status der Instanz',
     upstream_http_detail: 'die Fehlermeldungen der Instanz einschließen',
     outcome_hint: 'die Ergebnisklasse mit ihrer festen Meldung (ohne Größe)',
@@ -187,8 +188,8 @@ export const approvals: Dict['approvals'] = {
     submit: 'Bearbeiten und freigeben',
     reset: 'Änderungen verwerfen',
     nothing_to_send: 'Ändern Sie ein Feld, um eine Bearbeitung zu senden',
-    rejected: 'Die Bearbeitung wurde abgelehnt:',
-    rejected_plain: 'Die Bearbeitung wurde abgelehnt',
+    rejected: 'Die Bearbeitung wurde zurückgewiesen:',
+    rejected_plain: 'Die Bearbeitung wurde zurückgewiesen',
     applied:
       'Bearbeitung angewendet: Die Anfrage hat eine neue Revision. Öffnen Sie ihre Vorschau, prüfen Sie sie und geben Sie sie dann frei.',
     unsent:
@@ -220,15 +221,16 @@ export const approvals: Dict['approvals'] = {
     undo_remove_all: 'Schwärzungen behalten',
     selected: 'Ausgewählt',
     value: 'Wert',
-    value_cut: (shown, total) => `${shown} von ${total} Zeichen werden angezeigt`,
+    value_cut: (shown, total) =>
+      `${formatNumber('de', shown)} von ${formatNumber('de', total)} Zeichen werden angezeigt`,
     value_escaped: 'Mit markierten unsichtbaren Zeichen',
     drop_item: 'Eintrag entfernen',
     drop_field_item: 'Feld entfernen (dieser Eintrag)',
     drop_field_all: 'Feld entfernen (alle Einträge)',
-    unaddressable: 'dieser Schlüssel kann nicht angesprochen werden; entfernen Sie seinen übergeordneten Eintrag',
+    unaddressable: 'dieser Schlüssel kann nicht adressiert werden; entfernen Sie seinen übergeordneten Eintrag',
     drop_parent: 'Übergeordneten Eintrag entfernen',
     root_unaddressable:
-      'dieser Schlüssel kann nicht angesprochen werden, und die Wurzel kann nicht entfernt werden; maskieren Sie seinen Text oder lehnen Sie ab',
+      'dieser Schlüssel kann nicht adressiert werden, und die Wurzel kann nicht entfernt werden; maskieren Sie seinen Text oder lehnen Sie ab',
     mask_label: 'Zu maskierender Text',
     mask_use_selection: 'Ausgewählten Text verwenden',
     mask_only_here: 'Nur dieses Vorkommen',
@@ -271,7 +273,7 @@ export const approvals: Dict['approvals'] = {
     also_appears_in: 'kommt auch vor in:',
     other_occurrences: (n) => (n === 1 ? '1 weiteres Vorkommen bleibt' : `${n} weitere Vorkommen bleiben`),
     confirm_others: 'Trotzdem übergeben: Die anderen Vorkommen bleiben in dem, was der Agent erhält',
-    released_bytes: (n) => `Übergebene Größe: ${n} Bytes`,
+    released_bytes: (n) => `Übergebene Größe: ${formatNumber('de', n)} Bytes`,
     release: 'Übergeben',
     release_redacted_hint: '„Übergeben“ sendet diese Schwärzungen; die neue Revision wird danach zur Prüfung geöffnet.',
     unsent:
@@ -295,7 +297,8 @@ export const approvals: Dict['approvals'] = {
     previous: 'Vorherige Seite',
     next: 'Nächste Seite',
     empty: '(leer)',
-    page_status: (page, count, bytes) => `Seite ${page} von ${count}, ${bytes} Bytes`,
+    page_status: (page, count, bytes) =>
+      `Seite ${formatNumber('de', page)} von ${formatNumber('de', count)}, ${formatNumber('de', bytes)} Bytes`,
   },
   request: {
     loading: 'Anfrage wird geladen',
@@ -330,9 +333,9 @@ export const approvals: Dict['approvals'] = {
     released: 'übergeben',
     denied: 'abgelehnt',
     expired: 'abgelaufen',
-    cancelled: 'abgebrochen',
+    cancelled: 'storniert',
     failed: 'fehlgeschlagen',
-    abandoned: 'verworfen',
+    abandoned: 'abgebrochen',
     outcome_unknown: 'Ergebnis unbekannt',
     awaiting_approval: 'zur erneuten Prüfung zurückgegeben',
   },

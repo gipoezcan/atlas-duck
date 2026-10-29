@@ -22,6 +22,12 @@ export function formatDateTime(lang: Lang, secs: number): string {
   return `${date.toISOString().replace('T', ' ').slice(0, 16)} UTC`;
 }
 
+/** An RFC 3339 timestamp as UTC date and time (see ormatDateTime); text that is not one is returned as it is. */
+export function formatTimestamp(lang: Lang, rfc3339: string): string {
+  const ms = Date.parse(rfc3339);
+  return Number.isNaN(ms) ? rfc3339 : formatDateTime(lang, ms / 1000);
+}
+
 export function formatNumber(lang: Lang, n: number): string {
   return new Intl.NumberFormat(LOCALE[lang]).format(n);
 }

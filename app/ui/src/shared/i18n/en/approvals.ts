@@ -1,3 +1,5 @@
+import { formatNumber } from '../format';
+
 /** The Approvals window (and the shared header and agent-text badges): the former shared/strings.ts objects. */
 export const approvals = {
   /** plan text (Task 5): window titles shown by the placeholder entries. */
@@ -234,7 +236,8 @@ export const approvals = {
     undo_remove_all: 'Keep the redactions',
     selected: 'Selected',
     value: 'Value',
-    value_cut: (shown: number, total: number) => `Showing ${shown} of ${total} characters`,
+    value_cut: (shown: number, total: number) =>
+      `Showing ${formatNumber('en', shown)} of ${formatNumber('en', total)} characters`,
     value_escaped: 'With invisible characters marked',
     drop_item: 'Drop item',
     drop_field_item: 'Drop field (this item)',
@@ -288,7 +291,7 @@ export const approvals = {
     other_occurrences: (n: number) =>
       n === 1 ? '1 other occurrence remains' : `${n} other occurrences remain`,
     confirm_others: 'Release anyway: the other occurrences stay in what the agent receives',
-    released_bytes: (n: number) => `Released size: ${n} bytes`,
+    released_bytes: (n: number) => `Released size: ${formatNumber('en', n)} bytes`,
     release: 'Release',
     release_redacted_hint: 'Release sends these redactions; the new revision is then opened for review.',
     unsent:
@@ -315,7 +318,8 @@ export const approvals = {
     previous: 'Previous page',
     next: 'Next page',
     empty: '(empty)',
-    page_status: (page: number, count: number, bytes: number) => `page ${page} of ${count}, ${bytes} bytes`,
+    page_status: (page: number, count: number, bytes: number) =>
+      `page ${formatNumber('en', page)} of ${formatNumber('en', count)}, ${formatNumber('en', bytes)} bytes`,
   },
   /** spec 5.6 (verbatim field list) and plan text (Task 14): the Request tab. */
   request: {
