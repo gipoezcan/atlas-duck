@@ -141,8 +141,9 @@ that changes the schema, and roll back by restoring that bundle with the old ima
 
 The v4 column (M15) holds a display preference only: `auto`, `en` or `de`, set by each user's
 `PUT /api/me/preferences` (session, CSRF, Origin; no bearer) and returned in `/api/session` as
-`lang_pref`. It is not audited and has no anchor row. A backup taken on v4 carries it; restoring it
-with a v3 image is refused like any newer schema, and a v3 backup restored with a v4 image is
-migrated at start (every user `auto`). With `auto`, the server picks German from the browser's
+`lang_pref`. It is not audited and has no anchor row. A backup taken on v4 carries it; a v3 build
+refuses to start on a v4 database (`store/newer`, [deployment.md](deployment.md)), so roll back by
+restoring the pre-upgrade bundle with the old image; a v3 bundle restored with a v4 build is migrated
+forward (every user `auto`). With `auto`, the server picks German from the browser's
 `Accept-Language` by its weights, else English; nothing the server logs, records or sends to agents
 changes language.
