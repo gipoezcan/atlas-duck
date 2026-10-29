@@ -45,17 +45,73 @@
 <main>
 <h1>Audit-Protokoll</h1>
 <h2 id="audit-log">Was das Audit-Protokoll festhält</h2>
-<p>TODO</p>
+<p>atlas-duck hält alles fest, was rund um eine Anfrage geschieht: dass sie eingegangen ist, was Sie gesehen haben, was Sie entschieden haben, was an die Instanz gesendet wurde und was zurückkam, und was der Agent erhalten hat. Die Datensätze sind verkettet: Jeder enthält einen Fingerabdruck seines Vorgängers, sodass ein geänderter oder entfernter Datensatz die Kette bricht und sich finden lässt. Den Inhalt jedes Datensatzes (die „Nutzdaten“) speichert atlas-duck verschlüsselt.</p>
+<p>Das Protokoll gehört Ihnen und liegt auf Ihrem Computer. Sie öffnen es mit „Audit-Protokoll“ in der Kopfzeile des Fensters „Freigaben“. Das Fenster hat diese Bereiche:</p>
+<ul>
+<li>„Prüfung“ mit „Jetzt prüfen“ (siehe <a href="audit.html#verify">Die Kette prüfen</a>) und die Liste „Integritätsvorfälle“;</li>
+<li>„Anker-Verzeichnis“: der Ordner, der zusätzliche Kopien des Protokollkopfs enthält, oder „keines“ (siehe unten);</li>
+<li>„Datensätze“: die Liste der Datensätze, neueste zuerst, mit „Filter“;</li>
+<li>„Export und Backup“ (siehe <a href="audit.html#export">Das Protokoll exportieren</a>).</li>
+</ul>
+<p><strong>Filter.</strong> Sie können nach Zeitraum („Von (UTC)“, „Bis (UTC)“), „Agent-Name“, „Vorgang“, „Klasse“, „Instanz-ID“, „Ziel (beginnt mit)“, „Entscheidung“ und „Markierungen (eine davon)“ filtern. Die Filter treffen nur auf die Klartextspalten eines Datensatzes zu; Nutzdaten werden nicht durchsucht. „Mehr laden“ setzt eine Suche fort.</p>
+<p><strong>Entscheidungen</strong> im Protokoll sind: freigegeben, freigegeben (bearbeitet), übergeben, übergeben (geschwärzt), abgelehnt, abgelaufen, storniert und zurückgewiesen. <strong>Markierungen</strong> sind: bearbeitet, geschwärzt, Sammelentscheidung, veraltet, Uhr ging zurück, Uhr sprang vor, Uhr geht nach und Integritätsvorfall. Die Uhr-Markierungen kennzeichnen Datensätze, die geschrieben wurden, als die Uhr des Computers zurückging, vorsprang oder hinter dem von den Servern gemeldeten Datum nachging. Sie sorgen dafür, dass eine falsche Uhr die Aufbewahrung nicht verkürzen kann.</p>
+<p><strong>Ein Datensatz.</strong> „Datensatz öffnen“ zeigt die Felder: Zeit (UTC), Ereignis, Anfrage, Vorgang, Klasse, Instanz-ID, Ziel, Entscheidung, Markierungen, Agent-Name und seine Herkunft, Client, Verbindung, Prozess-ID der Gegenstelle, Programm der Gegenstelle, Ursprungsprogramm, Betriebssystem-Benutzer, Atlassian-Benutzer und „Nutzdaten in Bytes“. „Entschlüsselte Nutzdaten anzeigen“ öffnet den Inhalt seitenweise.</p>
+<p><strong>Verlauf einer Anfrage.</strong> „Verlauf der Anfrage“ zeigt alle Datensätze einer Anfrage in der Reihenfolge. „N-mal zugestellt“ zählt, wie oft die Antwort übergeben wurde. „mehrfach zugestellt“ und „an ein anderes Programm zugestellt“ sind Hinweise: Sie vergleichen das Programm, das gefragt hat, mit dem Programm, das die Antwort erhalten hat, und weisen auf etwas hin, das zu prüfen ist, nicht auf einen Beweis.</p>
+<p><strong>Was das Protokoll kann und was nicht.</strong> Das Protokoll zeigt, wer wann was entschieden hat, und es macht spätere Änderungen sichtbar. Es hindert niemanden am Handeln. Es schützt nicht vor Schadsoftware, die als Ihr eigener Benutzer läuft, während Sie angemeldet sind: Solcher Code kann die Schlüssel lesen und das Protokoll umschreiben. Auch der protokollierte Benutzer selbst kann das Protokoll löschen oder zerstörerische Aktionen bestätigen. Schutz davor braucht ein Anker-Verzeichnis, das Sie nicht umschreiben können, siehe <a href="audit.html#verify">Die Kette prüfen</a>.</p>
+<p>Das Protokoll enthält personenbezogene Daten, zum Beispiel Namen und Kommentare aus Jira und Confluence. Gehen Sie mit Exporten entsprechend um.</p>
 <h2 id="verify">Die Kette prüfen</h2>
-<p>TODO</p>
+<p>Die Prüfung stellt fest, dass die Kette vollständig und unverändert ist: Jeder Datensatz gehört zu seinem Vorgänger, die Nutzdaten passen zu ihren Fingerabdrücken, und der Protokollkopf stimmt mit den an anderer Stelle gehaltenen Kopien überein.</p>
+<p>atlas-duck prüft das Protokoll beim Start und einmal täglich im Hintergrund. „Jetzt prüfen“ startet die Prüfung auf Wunsch. Das Ergebnis ist eines von:</p>
+<table>
+<thead><tr><th>Ergebnis</th><th>Bedeutung</th></tr></thead>
+<tbody>
+<tr><td>verifiziert</td><td>Die Kette ist intakt.</td></tr>
+<tr><td>Prüfung nicht abgeschlossen</td><td>atlas-duck konnte die Prüfung nicht beenden. Das ist kein Befund, dass etwas nicht stimmt; versuchen Sie es erneut.</td></tr>
+<tr><td>Integritätsvorfall: siehe Audit</td><td>Die Prüfung hat etwas Falsches gefunden. Siehe <a href="audit.html#integrity-incident">Integritätsvorfälle</a>.</td></tr>
+</tbody></table>
+<p>Zwei Arten von Kopien schützen den Kopf der Kette. atlas-duck hält eine im Schlüsselbund Ihres Computers. Das erkennt ein Protokoll, das abgeschnitten wurde, doch wer Ihr Konto kontrolliert, kann auch den Schlüsselbund ändern. Für mehr Schutz legen Sie in den Einstellungen ein <strong>Anker-Verzeichnis</strong> fest („Externes Anker-Verzeichnis“, „Anker-Verzeichnis festlegen…“): atlas-duck schreibt dann einmal täglich und nach wichtigen Änderungen, etwa bei Änderungen von Aufbewahrung oder Legal Hold, Kopien des Protokollkopfs in einen Ordner. Das schützt vor einer umgeschriebenen Historie nur dann, wenn Sie den Ordner nicht selbst umschreiben können, zum Beispiel bei einer Freigabe, die jemand anderes verwaltet und die nur Anhängen erlaubt. atlas-duck bittet Sie, jede Änderung des Anker-Verzeichnisses in einem eigenen Dialog zu bestätigen, weil Ändern oder Entfernen den Schutz schwächt. „Anker-Verzeichnis“ im Fenster Audit-Protokoll zeigt Ihnen, wenn das Schreiben dorthin fehlschlägt; die Zeilen warten dann und werden erneut versucht.</p>
 <h2 id="export">Das Protokoll exportieren</h2>
-<p>TODO</p>
+<p>Ein Export kopiert die Datensätze eines Zeitraums samt entschlüsselten Nutzdaten, damit jemand anderes sie prüfen kann, zum Beispiel ein Auditor oder der Verantwortliche für Compliance. Die Dateien kann jeder lesen, der sie öffnen kann. Schützen Sie sie so gut wie die Originaldaten.</p>
+<p>Im Fenster Audit-Protokoll hat „Compliance-Export“ unter „Export und Backup“ die Felder „Export von (UTC)“ und „Export bis (UTC)“. Lassen Sie beide leer, um das ganze Protokoll zu exportieren. Wählen Sie „Exportieren…“. atlas-duck zeigt eine Warnung und fragt in eigenen Dialogen nach dem Ordner. Es schreibt den Export in einen neuen Ordner und gibt ihm seinen endgültigen Namen erst, wenn alles geschrieben ist. Ein Ordner, dessen Name noch auf „.partial“ endet, ist unfertig und darf nicht weitergegeben werden.</p>
+<p>Ist der Export fertig, zeigt atlas-duck ein SHA-256 des Manifests, den Fingerabdruck, der die Dateien zusammenbindet. Geben Sie es dem Empfänger <strong>über einen anderen Kanal</strong> als die Dateien. Ohne es kann der Empfänger nicht sicher sein, dass die Dateien die sind, die Sie erstellt haben.</p>
+<p>„Vollbackup“ mit „Jetzt sichern…“ ist etwas anderes: Es sichert das ganze Protokoll mit seinen Wiederherstellungsdaten, damit Sie es wiederherstellen können. Ein Backup enthält nie gespeicherte Tokens, daher braucht nach einer Wiederherstellung jede Instanz wieder ihr Token. Backups und Exporte unterliegen nicht der Aufbewahrung; Aufbewahren und Löschen liegt bei Ihnen.</p>
 <h2 id="verify-export">Einen Export mit verify-export prüfen</h2>
-<p>TODO</p>
+<p>Der Empfänger prüft einen Export mit dem Befehl <code>atlas-duck verify-export</code>. Er braucht dafür keinen Zugriff auf Ihren Computer oder Server und arbeitet offline.</p>
+<pre><code>atlas-duck verify-export &lt;Ordner&gt; --manifest-sha256 &lt;hex&gt; [--anchor-dir &lt;Ordner&gt;]
+</code></pre>
+<p>Er berechnet jeden Datensatz-Fingerabdruck und die Kette neu, prüft, dass die entschlüsselten Nutzdaten zu ihren Fingerabdrücken passen, und vergleicht das Ergebnis mit dem, was Sie ihm als <strong>Vertrauensanker</strong> geben:</p>
+<ul>
+<li><code>--manifest-sha256</code> ist der Fingerabdruck, den Sie getrennt weitergegeben haben. Er belegt, dass die Dateien die exportierten sind.</li>
+<li><code>--anchor-dir</code> ist eine Kopie des Anker-Verzeichnisses. Sie zeigt, dass die Historie zu dem passt, was dort früher geschrieben wurde.</li>
+</ul>
+<p>Der Exit-Code sagt Ihnen, wie weit Sie dem Ergebnis trauen können:</p>
+<table>
+<thead><tr><th>Exit-Code</th><th>Bedeutung</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>Verifiziert gegen einen Vertrauensanker, der den ganzen Export abdeckt.</td></tr>
+<tr><td>20</td><td>In sich stimmig, aber kein Vertrauensanker deckt alles ab. Der Befehl meldet „internally consistent; trust root NOT verified“. Behandeln Sie das als nicht verifiziert.</td></tr>
+<tr><td>21</td><td>Manipulation oder eine Verzweigung: zwei Exporte, die denselben Anfang haben und dann auseinanderlaufen.</td></tr>
+<tr><td>22</td><td>Der Befehl konnte nicht laufen: falsche Verwendung, nicht lesbare Dateien oder ein unfertiger Ordner mit „.partial“.</td></tr>
+</tbody></table>
+<p>Eine Verzweigung ist nicht zwingend ein Angriff. Sie entsteht, wenn ein Protokoll aus einem Backup wiederhergestellt wurde, während die alte Installation weiterlief. Die alte Installation sollte außer Betrieb genommen werden.</p>
 <h2 id="retention">Aufbewahrung und Legal Hold</h2>
-<p>TODO</p>
+<p>Das Audit-Protokoll wird nicht ewig aufbewahrt. Die Aufbewahrungsfrist legt fest, wie lange Datensätze bleiben.</p>
+<p>In den Einstellungen hat „Aufbewahrung und Legal Hold“ das Feld „Aufbewahrung des Audit-Protokolls (Tage)“. Der Standard sind 100 Tage, das Minimum 92. atlas-duck löscht die ältesten Datensätze erst, wenn sie älter als die Frist sind, und nur vom Anfang des Protokolls her, damit die Kette prüfbar bleibt. Jede Löschung wird selbst festgehalten. Die Nutzdaten schützen Schlüssel je Monat. Der Schlüssel eines Monats wird vernichtet, sobald ihn kein Datensatz mehr braucht, sodass sich die gelöschten Datensätze nicht aus Resten lesen lassen (Crypto-Shredding).</p>
+<p>„Legal Hold (Bereinigung stoppt)“ hält jede Löschung an, und die Schlüssel bleiben. Verwenden Sie es, wenn Sie Datensätze aufbewahren müssen, zum Beispiel für eine Untersuchung. Das Ein- und Ausschalten wird im Protokoll und im Anker-Verzeichnis festgehalten. Das Aufheben oder das Verkürzen der Frist braucht Ihre Bestätigung in der App; eine Änderung allein in der Konfigurationsdatei genügt nicht.</p>
+<p>Die Einstellungen zeigen „Bereinigung“. War atlas-duck längere Zeit aus, holt es langsam auf, und die Seite sagt „Die Bereinigung ist N Tage im Rückstand“. „Rückstand jetzt bereinigen“ holt nach Ihrer Bestätigung sofort auf. Wurde die Bereinigung übersprungen, nennen die Einstellungen den Grund, zum Beispiel „Legal Hold ist aktiv“, „noch kein Serverdatum hat das aktuelle Datum bestätigt“ oder „die Systemuhr geht hinter dem Serverdatum nach“. atlas-duck vertraut einem Datum nur, wenn ein Atlassian-Server es bestätigt hat, damit eine falsche Uhr keine Datensätze zu früh löschen kann.</p>
+<p>Die Aufbewahrung erreicht keine Backups, keine Exporte und keine Kopien Ihrer Daten, die das Betriebssystem angelegt hat, etwa Snapshots. Sie können weiterhin Datensätze enthalten, die gelöscht wurden. Entfernen Sie sie selbst, wenn Sie sie nicht mehr brauchen. Auch das Deinstallieren von atlas-duck löscht das Protokoll nicht. „Auf die Entfernung vorbereiten“ sagt Ihnen, wie lange der neueste Datensatz noch aufbewahrt werden muss.</p>
 <h2 id="integrity-incident">Integritätsvorfälle</h2>
-<p>TODO</p>
+<p>Ein Integritätsvorfall bedeutet, dass eine Prüfung etwas gefunden hat, das nicht sein sollte. Die Ursache kann harmlos sein, etwa die Wiederherstellung eines Backups, oder eine Manipulation. atlas-duck kann nicht unterscheiden, was es ist.</p>
+<p>Tritt er auf, hält atlas-duck den Befund im Protokoll fest, bevor es etwas anderes tut, und zeigt in der App und im Tray ein rotes Banner. Das Fenster Audit-Protokoll listet ihn unter „Integritätsvorfälle“ mit seinem „Ergebnis“ und wann er „Erkannt“ wurde.</p>
+<p>Was Sie tun sollten:</p>
+<ol>
+<li>Ignorieren Sie ihn nicht, und nehmen Sie ihn nicht zur Kenntnis, bevor Sie die Ursache kennen. Informieren Sie den Verantwortlichen für Compliance oder Ihren Administrator.</li>
+<li>Erstellen Sie einen Export des Protokolls, damit der Zustand erhalten bleibt, siehe <a href="audit.html#export">Das Protokoll exportieren</a>.</li>
+<li>Finden Sie die Ursache. Typische Gründe sind: eine Wiederherstellung aus einem älteren Backup, ein verlorener Schlüsselbund-Eintrag oder ein benutztes Anker-Verzeichnis, das zu einer früheren Installation gehört.</li>
+<li>Wenn Sie ihn verstanden haben, wählen Sie „Integritätsvorfall zur Kenntnis nehmen“, schreiben Sie eine Notiz (bis zu 1000 Zeichen) und bestätigen Sie im eigenen Dialog von atlas-duck. Die Notiz und Ihr Benutzername werden festgehalten. Das rote Banner verschwindet dann für diesen Vorfall.</li>
+</ol>
+<p>Die Kenntnisnahme repariert nichts. Sie hält fest, dass Sie den Vorfall gesehen haben und was Sie daraus geschlossen haben. Der Vorfall selbst bleibt im Protokoll.</p>
+<p>Melden die Einstellungen, dass ein Anker-Eintrag im Schlüsselbund fehlt, schreibt „Neu verankern…“ ihn aus dem Protokoll in seinem jetzigen Zustand neu. Das ist nur sicher, wenn Sie dem Protokoll vertrauen, und es wird als Integritätsvorfall festgehalten, den Sie dann zur Kenntnis nehmen.</p>
 </main>
 </div>
 </body>
