@@ -198,6 +198,17 @@ pub fn body_digest_line(bytes: u64, sha256: &str) -> String {
     format!("{bytes} bytes, SHA-256 {sha256} (not shown)")
 }
 
+/// [`body_digest_line`] in `lang` (M15 T10b).
+pub fn body_digest_line_in(lang: crate::Lang, bytes: u64, sha256: &str) -> String {
+    match lang {
+        crate::Lang::En => body_digest_line(bytes, sha256),
+        crate::Lang::De => format!(
+            "{} Bytes, SHA-256 {sha256} (nicht angezeigt)",
+            lang.count(bytes)
+        ),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RequestView {
     pub index: u32,

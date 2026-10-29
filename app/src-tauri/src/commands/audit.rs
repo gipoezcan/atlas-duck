@@ -212,8 +212,9 @@ pub fn payload_dto(
     seq: u64,
     page: u32,
     platform: Platform,
+    lang: atlas_duck_preview::Lang,
 ) -> Result<AuditPayloadDto, CommandError> {
-    audit_wire::payload(store, seq, page, platform).map_err(wire_error)
+    audit_wire::payload(store, seq, page, platform, lang).map_err(wire_error)
 }
 
 /// The result and detected-at time of the `VERIFY` record `seq` (fail closed: `unreadable`).
@@ -483,9 +484,11 @@ pub async fn audit_payload<R: Runtime>(
     args: Args<AuditPayloadArgs>,
 ) -> Result<AuditPayloadDto, CommandError> {
     let Args(AuditPayloadArgs { seq, page }) = args;
+    let lang = crate::windows::ui_lang(&app).into();
     let response = match open_store(&app) {
         Ok(store) => {
-            blocking(move || payload_dto(&store, seq, page.unwrap_or(0), Platform::current())).await
+            blocking(move || payload_dto(&store, seq, page.unwrap_or(0), Platform::current(), lang))
+                .await
         }
         Err(e) => Err(e),
     };
@@ -1235,7 +1238,13 @@ pub(crate) mod tests {
         assert_eq!(trail.deliveries.count, 0);
         assert!(!trail.deliveries.to_other_peer);
 
-        let p = payload_dto(&r.store, row.seq, 0, Platform::MacOsLinux)?;
+        let p = payload_dto(
+            &r.store,
+            row.seq,
+            0,
+            Platform::MacOsLinux,
+            atlas_duck_preview::Lang::En,
+        )?;
         assert_eq!((p.page, p.page_count), (0, 1));
         assert!(p.srcdoc.starts_with("<!doctype html>"), "{}", p.srcdoc);
         assert!(
@@ -1250,11 +1259,23 @@ pub(crate) mod tests {
             p.display
         );
         assert_eq!(
-            payload_dto(&r.store, row.seq, 1, Platform::MacOsLinux),
+            payload_dto(
+                &r.store,
+                row.seq,
+                1,
+                Platform::MacOsLinux,
+                atlas_duck_preview::Lang::En
+            ),
             Err(CommandError::InvalidArgument { field: "page" })
         );
         assert_eq!(
-            payload_dto(&r.store, 999, 0, Platform::MacOsLinux),
+            payload_dto(
+                &r.store,
+                999,
+                0,
+                Platform::MacOsLinux,
+                atlas_duck_preview::Lang::En
+            ),
             Err(CommandError::NotFound)
         );
         Ok(())
@@ -1281,8 +1302,20 @@ pub(crate) mod tests {
             flags: EventFlags::default(),
             payload: json!({ "s": text }),
         })?;
-        let first = payload_dto(&r.store, c.seq, 0, Platform::MacOsLinux)?;
-        let second = payload_dto(&r.store, c.seq, 1, Platform::MacOsLinux)?;
+        let first = payload_dto(
+            &r.store,
+            c.seq,
+            0,
+            Platform::MacOsLinux,
+            atlas_duck_preview::Lang::En,
+        )?;
+        let second = payload_dto(
+            &r.store,
+            c.seq,
+            1,
+            Platform::MacOsLinux,
+            atlas_duck_preview::Lang::En,
+        )?;
         assert_eq!(first.page_count, 2);
         assert!(
             !first.display.contains('⟨'),
@@ -1349,7 +1382,13 @@ pub(crate) mod tests {
         ] {
             let c = append(event_type, change.clone())?;
             let reads = r.store.testing_payload_reads();
-            let p = payload_dto(&r.store, c.seq, 0, Platform::MacOsLinux)?;
+            let p = payload_dto(
+                &r.store,
+                c.seq,
+                0,
+                Platform::MacOsLinux,
+                atlas_duck_preview::Lang::En,
+            )?;
             assert_eq!(p.credential_change, want, "{event_type:?} {change}");
             // The view's own read, plus one more only for a `CREDENTIAL_CHANGED` record: the kind
             // comes from the header row, so no other record is decrypted a second time.
@@ -1361,10 +1400,22 @@ pub(crate) mod tests {
             );
         }
         let c = append(credential, json!("delete_failed"))?;
-        let wire = serde_json::to_value(payload_dto(&r.store, c.seq, 0, Platform::MacOsLinux)?)?;
+        let wire = serde_json::to_value(payload_dto(
+            &r.store,
+            c.seq,
+            0,
+            Platform::MacOsLinux,
+            atlas_duck_preview::Lang::En,
+        )?)?;
         assert_eq!(wire["credential_change"], json!("delete_failed"));
         let c = append(EventType::READ_FETCHED, json!("x"))?;
-        let wire = serde_json::to_value(payload_dto(&r.store, c.seq, 0, Platform::MacOsLinux)?)?;
+        let wire = serde_json::to_value(payload_dto(
+            &r.store,
+            c.seq,
+            0,
+            Platform::MacOsLinux,
+            atlas_duck_preview::Lang::En,
+        )?)?;
         assert_eq!(wire["credential_change"], Value::Null);
         Ok(())
     }
@@ -1390,7 +1441,13 @@ pub(crate) mod tests {
             }),
         })?;
         for page in 0..2 {
-            let p = payload_dto(&r.store, c.seq, page, Platform::MacOsLinux)?;
+            let p = payload_dto(
+                &r.store,
+                c.seq,
+                page,
+                Platform::MacOsLinux,
+                atlas_duck_preview::Lang::En,
+            )?;
             assert_eq!(p.page_count, 2);
             assert_eq!(
                 p.credential_change,

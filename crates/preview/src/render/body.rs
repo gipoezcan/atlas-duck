@@ -7,10 +7,11 @@ use super::{
 };
 use crate::diff::{DiffLine, DiffOp};
 use crate::json_tree::JsonNode;
+use crate::lang::Lang;
 use crate::model::{
     BodyView, CommentView, ConfluenceComment, ConstructList, ConversionFacts, FieldRow, IssueCard,
     ItemCount, OutcomeKind, PreviewBody, ProvenanceRow, RequestView, ScriptItemKind,
-    body_digest_line,
+    body_digest_line_in,
 };
 use crate::warning;
 
@@ -18,6 +19,8 @@ use crate::warning;
 
 /// §6.3 Conflict (verbatim): the card's heading.
 pub const CONFLICT_HEADING: &str = "Changed since the agent read it";
+/// [`CONFLICT_HEADING`] in German.
+pub const CONFLICT_HEADING_DE: &str = "Geändert, seit der Agent es gelesen hat";
 
 /// plan text (PD-100): the label of a server-rendered (`format=view`) page body (§6.4 "labelled
 /// as a secondary view").
@@ -36,8 +39,11 @@ pub const ATTACHMENT_ALREADY_EXISTS: &str = "attachment already exists";
 pub const NO_THUMBNAIL: &str = "no thumbnail (not an image, or larger than 2 MiB)";
 
 /// "replaces existing attachment vN" (§6.3 verbatim).
-pub fn replaces_existing_attachment(version: u64) -> String {
-    format!("replaces existing attachment v{version}")
+pub fn replaces_existing_attachment(lang: Lang, version: u64) -> String {
+    match lang {
+        Lang::En => format!("replaces existing attachment v{version}"),
+        Lang::De => format!("ersetzt den vorhandenen Anhang v{version}"),
+    }
 }
 
 /// Deepest list nesting of a comment thread in the document: a deeper reply is shown at this
@@ -45,114 +51,137 @@ pub fn replaces_existing_attachment(version: u64) -> String {
 const MAX_COMMENT_NESTING: u32 = 32;
 
 /// One §6.3 consequence line: the action and what the agent receives, in parts (the backticked
-/// words of the spec render as `<code>`).
+/// words of the spec render as `<code>`). Each text is `(English, German)` (M15 T10b).
 struct Consequence {
-    action: &'static str,
+    action: (&'static str, &'static str),
     parts: &'static [Part],
 }
 
 enum Part {
-    Text(&'static str),
+    Text(&'static str, &'static str),
     Code(&'static str),
     /// The card's HTTP status.
     Status,
 }
 
+const RECEIVES: Part = Part::Text("agent receives ", "Der Agent erhält ");
+
 /// §6.3 Upstream error (verbatim): Release → "agent receives `failed` (exit 6), HTTP <status> + the
 /// text below".
 const UPSTREAM_RELEASE: Consequence = Consequence {
-    action: "Release",
+    action: ("Release", "Übergeben"),
     parts: &[
-        Part::Text("agent receives "),
+        RECEIVES,
         Part::Code("failed"),
-        Part::Text(" (exit 6), HTTP "),
+        Part::Text(" (exit 6), HTTP ", " (Exit 6), HTTP "),
         Part::Status,
-        Part::Text(" + the text below"),
+        Part::Text(" + the text below", " + den Text darunter"),
     ],
 };
 
 /// §6.3 Upstream error (verbatim): Release status only → "agent receives `failed` (exit 6), HTTP
 /// <status>, no text".
 const UPSTREAM_STATUS_ONLY: Consequence = Consequence {
-    action: "Release status only",
+    action: ("Release status only", "Nur Status übergeben"),
     parts: &[
-        Part::Text("agent receives "),
+        RECEIVES,
         Part::Code("failed"),
-        Part::Text(" (exit 6), HTTP "),
+        Part::Text(" (exit 6), HTTP ", " (Exit 6), HTTP "),
         Part::Status,
-        Part::Text(", no text"),
+        Part::Text(", no text", ", ohne Text"),
     ],
 };
 
 /// §6.3 / §5.2 step 6 (verbatim): Deny → "agent receives `denied` (exit 3) + your reason".
 const DENY: Consequence = Consequence {
-    action: "Deny",
+    action: ("Deny", "Ablehnen"),
     parts: &[
-        Part::Text("agent receives "),
+        RECEIVES,
         Part::Code("denied"),
-        Part::Text(" (exit 3) + your reason"),
+        Part::Text(" (exit 3) + your reason", " (Exit 3) + Ihre Begründung"),
     ],
 };
 
 /// §6.3 Read outcome (verbatim): Release outcome → "agent receives `failed` (exit 6),
 /// `result_too_large` / `upstream_network` / `upstream_unavailable` and a fixed hint; no size".
 const OUTCOME_RELEASE: Consequence = Consequence {
-    action: "Release outcome",
+    action: ("Release outcome", "Ergebnis übergeben"),
     parts: &[
-        Part::Text("agent receives "),
+        RECEIVES,
         Part::Code("failed"),
-        Part::Text(" (exit 6), "),
+        Part::Text(" (exit 6), ", " (Exit 6), "),
         Part::Code("result_too_large"),
-        Part::Text(" / "),
+        Part::Text(" / ", " / "),
         Part::Code("upstream_network"),
-        Part::Text(" / "),
+        Part::Text(" / ", " / "),
         Part::Code("upstream_unavailable"),
-        Part::Text(" and a fixed hint; no size"),
+        Part::Text(
+            " and a fixed hint; no size",
+            " und einen festen Hinweis; ohne Größe",
+        ),
     ],
 };
 
 /// §6.3 Enrichment error (verbatim): the deny of an outcome → "agent receives `denied` (exit 3),
 /// `upstream_network` / `upstream_unavailable` / `result_too_large`, no size".
 const ENRICHMENT_OUTCOME_DENY: Consequence = Consequence {
-    action: "Deny",
+    action: ("Deny", "Ablehnen"),
     parts: &[
-        Part::Text("agent receives "),
+        RECEIVES,
         Part::Code("denied"),
-        Part::Text(" (exit 3), "),
+        Part::Text(" (exit 3), ", " (Exit 3), "),
         Part::Code("upstream_network"),
-        Part::Text(" / "),
+        Part::Text(" / ", " / "),
         Part::Code("upstream_unavailable"),
-        Part::Text(" / "),
+        Part::Text(" / ", " / "),
         Part::Code("result_too_large"),
-        Part::Text(", no size"),
+        Part::Text(", no size", ", ohne Größe"),
     ],
 };
 
 /// §6.3 Read outcome / §7.2: which cap, budget or failure was hit. `LaterPageRefused` is the
 /// M5 T21 class (plan text).
-pub fn outcome_text(o: OutcomeKind) -> &'static str {
+pub fn outcome_text(lang: Lang, o: OutcomeKind) -> &'static str {
     match o {
-        OutcomeKind::ReleaseCap16 => "16 MiB release cap",
-        OutcomeKind::ResponseCap32 => "32 MiB per-response cap",
-        OutcomeKind::FetchCap50 => "50 MiB fetch cap",
-        OutcomeKind::ReadBudget120 => "120 s read budget",
-        OutcomeKind::PerCallTimeout30 => "30 s per-call timeout",
-        OutcomeKind::NetworkAfterSend => "network error after send",
-        OutcomeKind::JsonBodyUnreadable => "JSON body that failed to read or parse",
-        OutcomeKind::LaterPageRefused => "a later page was refused or answered without usable JSON",
+        OutcomeKind::ReleaseCap16 => {
+            lang.pick("16 MiB release cap", "Übergabe-Obergrenze von 16 MiB")
+        }
+        OutcomeKind::ResponseCap32 => lang.pick(
+            "32 MiB per-response cap",
+            "Obergrenze von 32 MiB pro Antwort",
+        ),
+        OutcomeKind::FetchCap50 => lang.pick("50 MiB fetch cap", "Abruf-Obergrenze von 50 MiB"),
+        OutcomeKind::ReadBudget120 => lang.pick("120 s read budget", "Lesebudget von 120 s"),
+        OutcomeKind::PerCallTimeout30 => {
+            lang.pick("30 s per-call timeout", "Zeitlimit von 30 s pro Aufruf")
+        }
+        OutcomeKind::NetworkAfterSend => {
+            lang.pick("network error after send", "Netzwerkfehler nach dem Senden")
+        }
+        OutcomeKind::JsonBodyUnreadable => lang.pick(
+            "JSON body that failed to read or parse",
+            "JSON-Inhalt, der nicht gelesen oder geparst werden konnte",
+        ),
+        OutcomeKind::LaterPageRefused => lang.pick(
+            "a later page was refused or answered without usable JSON",
+            "eine spätere Seite wurde abgelehnt oder ohne verwendbares JSON beantwortet",
+        ),
     }
 }
 
 fn consequences(doc: &mut Doc, lines: &[&Consequence], status: Option<u16>) {
-    doc.el("h3", "What the agent receives");
+    doc.el(
+        "h3",
+        doc.t("What the agent receives", "Was der Agent erhält"),
+    );
     doc.open("ul");
     for c in lines {
         doc.open("li");
-        doc.el("strong", c.action);
+        doc.el("strong", doc.t(c.action.0, c.action.1));
         doc.fixed(" → ");
         for part in c.parts {
             match part {
-                Part::Text(t) => doc.fixed(t),
+                Part::Text(en, de) => doc.fixed(doc.t(en, de)),
                 Part::Code(t) => doc.el("code", t),
                 Part::Status => doc.fixed(&status.map_or_else(String::new, |s| s.to_string())),
             }
@@ -161,33 +190,40 @@ fn consequences(doc: &mut Doc, lines: &[&Consequence], status: Option<u16>) {
     }
     doc.close("ul");
 }
-
 // ---- dispatch ----------------------------------------------------------------------------------
 
 pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
     match body {
         PreviewBody::JsonTree { tree } => {
-            section(doc, "Result (JSON tree)");
+            section(doc, doc.t("Result (JSON tree)", "Ergebnis (JSON-Baum)"));
             doc.open("ul");
             json_node(doc, None, tree);
             doc.close("ul");
             doc.close("section");
         }
-        PreviewBody::WriteRequests { requests } => {
-            requests_section(doc, "Requests to be sent", requests)
-        }
+        PreviewBody::WriteRequests { requests } => requests_section(
+            doc,
+            doc.t("Requests to be sent", "Zu sendende Anfragen"),
+            requests,
+        ),
         PreviewBody::UpstreamError {
             status,
             error_messages_text,
         } => {
-            section(doc, "Upstream error");
-            fact_table(doc, &[("HTTP status", &status.to_string())]);
+            section(doc, doc.t("Upstream error", "Fehler des Servers"));
+            fact_table(
+                doc,
+                &[(doc.t("HTTP status", "HTTP-Status"), &status.to_string())],
+            );
             consequences(
                 doc,
                 &[&UPSTREAM_RELEASE, &UPSTREAM_STATUS_ONLY, &DENY],
                 Some(*status),
             );
-            doc.el("h3", "Atlassian error messages");
+            doc.el(
+                "h3",
+                doc.t("Atlassian error messages", "Fehlermeldungen von Atlassian"),
+            );
             pre_text(doc, error_messages_text);
             doc.close("section");
         }
@@ -196,15 +232,25 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             size_or_pages,
             query,
         } => {
-            section(doc, "Read outcome");
+            section(doc, doc.t("Read outcome", "Leseergebnis"));
             doc.open("table");
             doc.open("tbody");
-            fixed_row(doc, "outcome", outcome_text(*outcome));
-            text_row(doc, "reached", size_or_pages);
-            text_row(doc, "query", query);
+            fixed_row(
+                doc,
+                doc.t("outcome", "Ergebnis"),
+                outcome_text(doc.lang, *outcome),
+            );
+            text_row(doc, doc.t("reached", "erreicht"), size_or_pages);
+            text_row(doc, doc.t("query", "Abfrage"), query);
             doc.close("tbody");
             doc.close("table");
-            doc.el("p", "No fetched content is shown or released.");
+            doc.el(
+                "p",
+                doc.t(
+                    "No fetched content is shown or released.",
+                    "Kein abgerufener Inhalt wird angezeigt oder übergeben.",
+                ),
+            );
             consequences(doc, &[&OUTCOME_RELEASE, &DENY], None);
             doc.close("section");
         }
@@ -213,14 +259,21 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             text,
             outcome,
         } => {
-            section(doc, "Enrichment error");
+            section(
+                doc,
+                doc.t("Enrichment error", "Fehler bei der Anreicherung"),
+            );
             doc.open("table");
             doc.open("tbody");
             if let Some(s) = status {
-                fixed_row(doc, "HTTP status", &s.to_string());
+                fixed_row(doc, doc.t("HTTP status", "HTTP-Status"), &s.to_string());
             }
             if let Some(o) = outcome {
-                fixed_row(doc, "outcome", outcome_text(*o));
+                fixed_row(
+                    doc,
+                    doc.t("outcome", "Ergebnis"),
+                    outcome_text(doc.lang, *o),
+                );
             }
             doc.close("tbody");
             doc.close("table");
@@ -231,7 +284,10 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             };
             consequences(doc, &[deny], *status);
             if !text.is_empty() {
-                doc.el("h3", "Atlassian error messages");
+                doc.el(
+                    "h3",
+                    doc.t("Atlassian error messages", "Fehlermeldungen von Atlassian"),
+                );
                 pre_text(doc, text);
             }
             doc.close("section");
@@ -242,15 +298,15 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             matches,
             candidates,
         } => {
-            section(doc, "Unresolved name");
+            section(doc, doc.t("Unresolved name", "Nicht aufgelöster Name"));
             doc.open("table");
             doc.open("tbody");
-            text_row(doc, "parameter", param);
-            text_row(doc, "submitted value", value);
-            fixed_row(doc, "matches", &matches.to_string());
+            text_row(doc, doc.t("parameter", "Parameter"), param);
+            text_row(doc, doc.t("submitted value", "übermittelter Wert"), value);
+            fixed_row(doc, doc.t("matches", "Treffer"), &doc.lang.count(*matches));
             doc.close("tbody");
             doc.close("table");
-            doc.el("h3", "Candidates");
+            doc.el("h3", doc.t("Candidates", "Kandidaten"));
             text_list(doc, candidates, "candidates");
             consequences(doc, &[&DENY], None);
             doc.close("section");
@@ -262,23 +318,41 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             intended,
             requests,
         } => {
-            section(doc, CONFLICT_HEADING);
+            section(doc, doc.t(CONFLICT_HEADING, CONFLICT_HEADING_DE));
             doc.open("div");
             doc.text(summary);
             doc.close("div");
             if !diff_text.is_empty() {
-                doc.el("h3", "Agent's base against the current state");
+                doc.el(
+                    "h3",
+                    doc.t(
+                        "Agent's base against the current state",
+                        "Grundlage des Agenten im Vergleich zum aktuellen Stand",
+                    ),
+                );
                 pre_text(doc, diff_text);
             }
             // §6.3: the diff from the agent's base to the current state and the agent's intended
             // change (M7 Δ2); Jira computes neither, so an empty list has no section. The heading
             // names the rendered diff apart from the `diff_text` one above (T8 review m-1).
             if !base_to_current.is_empty() {
-                doc.el("h3", "Rendered diff: the agent's base → the current state");
+                doc.el(
+                    "h3",
+                    doc.t(
+                        "Rendered diff: the agent's base → the current state",
+                        "Gerenderter Diff: Grundlage des Agenten → aktueller Stand",
+                    ),
+                );
                 diff(doc, base_to_current);
             }
             if !intended.is_empty() {
-                doc.el("h3", "The agent's intended change");
+                doc.el(
+                    "h3",
+                    doc.t(
+                        "The agent's intended change",
+                        "Die beabsichtigte Änderung des Agenten",
+                    ),
+                );
                 diff(doc, intended);
             }
             consequences(doc, &[&DENY], None);
@@ -287,19 +361,36 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             // none built yet (Task 15 widens the engine's gate), and "none" would read as a
             // write that sends nothing. The model still carries the list (§5.1 inv. 4).
             if !requests.is_empty() {
-                requests_section(doc, "Requests to be sent", requests);
+                requests_section(
+                    doc,
+                    doc.t("Requests to be sent", "Zu sendende Anfragen"),
+                    requests,
+                );
             }
         }
         PreviewBody::CouldNotRecheck { class, requests } => {
-            section(doc, warning::TEXT_COULD_NOT_RECHECK);
+            section(
+                doc,
+                doc.t(
+                    warning::TEXT_COULD_NOT_RECHECK,
+                    "Ziel konnte nicht erneut geprüft werden",
+                ),
+            );
             doc.open("table");
             doc.open("tbody");
-            text_row(doc, "failure class", class);
+            text_row(doc, doc.t("failure class", "Fehlerklasse"), class);
             doc.close("tbody");
             doc.close("table");
             consequences(doc, &[&DENY], None);
             doc.close("section");
-            requests_section(doc, "Requests to be sent (unchanged)", requests);
+            requests_section(
+                doc,
+                doc.t(
+                    "Requests to be sent (unchanged)",
+                    "Zu sendende Anfragen (unverändert)",
+                ),
+                requests,
+            );
         }
         PreviewBody::JiraIssue {
             card,
@@ -312,10 +403,10 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             rows,
             count,
         } => {
-            section(doc, "Results");
+            section(doc, doc.t("Results", "Ergebnisse"));
             doc.open("table");
             if let Some(c) = count {
-                doc.el("caption", &item_count_text(c));
+                doc.el("caption", &item_count_text(doc.lang, c));
             }
             doc.open("thead");
             doc.open("tr");
@@ -356,7 +447,7 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             constructs,
             requests,
         } => {
-            section(doc, "Summary");
+            section(doc, doc.t("Summary", "Zusammenfassung"));
             doc.open("div");
             doc.text(sentence);
             doc.close("div");
@@ -365,7 +456,11 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
                 construct_list(doc, WIKI_CONSTRUCTS, c);
             }
             doc.close("section");
-            requests_section(doc, "Requests to be sent", requests);
+            requests_section(
+                doc,
+                doc.t("Requests to be sent", "Zu sendende Anfragen"),
+                requests,
+            );
         }
         PreviewBody::EditDiff {
             rendered,
@@ -374,13 +469,20 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             constructs,
             requests,
         } => {
-            section(doc, "Rendered diff");
+            section(doc, doc.t("Rendered diff", "Gerenderter Diff"));
             diff(doc, rendered);
             doc.close("section");
-            section(doc, "Raw diff");
+            section(doc, doc.t("Raw diff", "Roher Diff"));
             if *raw_only_changes > 0 {
                 doc.open("p");
-                doc.el("strong", &warning::raw_only_diff(*raw_only_changes));
+                let line = warning::shown(
+                    doc.lang,
+                    &warning::Warning::new(
+                        warning::WarningId::RawOnlyDiff,
+                        warning::raw_only_diff(*raw_only_changes),
+                    ),
+                );
+                doc.el("strong", &line);
                 doc.close("p");
             }
             diff(doc, raw);
@@ -389,7 +491,11 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
                 construct_list(doc, STORAGE_CONSTRUCTS, c);
             }
             doc.close("section");
-            requests_section(doc, "Requests to be sent", requests);
+            requests_section(
+                doc,
+                doc.t("Requests to be sent", "Zu sendende Anfragen"),
+                requests,
+            );
         }
         PreviewBody::Transition {
             transition,
@@ -399,7 +505,7 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             constructs,
             requests,
         } => {
-            section(doc, "Transition");
+            section(doc, doc.t("Transition", "Übergang"));
             doc.open("div");
             doc.text(from);
             doc.fixed(" → ");
@@ -407,12 +513,18 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             doc.close("div");
             doc.open("table");
             doc.open("tbody");
-            text_row(doc, "transition", transition);
+            text_row(doc, doc.t("transition", "Übergang"), transition);
             doc.close("tbody");
             doc.close("table");
-            doc.el("h3", "Fields set during the transition");
+            doc.el(
+                "h3",
+                doc.t(
+                    "Fields set during the transition",
+                    "Beim Übergang gesetzte Felder",
+                ),
+            );
             if fields.is_empty() {
-                doc.el("p", "none");
+                doc.el("p", doc.t("none", "keine"));
             } else {
                 pair_table(doc, fields);
             }
@@ -420,7 +532,11 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
                 construct_list(doc, WIKI_CONSTRUCTS, c);
             }
             doc.close("section");
-            requests_section(doc, "Requests to be sent", requests);
+            requests_section(
+                doc,
+                doc.t("Requests to be sent", "Zu sendende Anfragen"),
+                requests,
+            );
         }
         PreviewBody::ConfluencePage {
             title,
@@ -431,23 +547,30 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             body_html,
             conversion,
         } => {
-            section(doc, "Confluence page");
+            section(doc, doc.t("Confluence page", "Confluence-Seite"));
             doc.open("table");
             doc.open("tbody");
-            text_row(doc, "title", title);
-            text_row(doc, "space", space);
+            text_row(doc, doc.t("title", "Titel"), title);
+            text_row(doc, doc.t("space", "Bereich"), space);
+            let version_label = doc.t("version", "Version");
             match version {
-                Some(v) => fixed_row(doc, "version", &v.to_string()),
-                None => fixed_row(doc, "version", "none"),
+                Some(v) => fixed_row(doc, version_label, &v.to_string()),
+                None => fixed_row(doc, version_label, doc.t("none", "keine")),
             }
-            joined_row(doc, "ancestors", ancestors, " / ");
-            text_row(doc, "format", format);
+            joined_row(doc, doc.t("ancestors", "Vorfahren"), ancestors, " / ");
+            text_row(doc, doc.t("format", "Format"), format);
             doc.close("tbody");
             doc.close("table");
-            doc.el("h3", "Body");
+            doc.el("h3", doc.t("Body", "Inhalt"));
             if format == "view" {
                 doc.open("p");
-                doc.el("strong", SERVER_VIEW_LABEL);
+                doc.el(
+                    "strong",
+                    doc.t(
+                        SERVER_VIEW_LABEL,
+                        "serverseitig gerenderte Ansicht (zweitrangig)",
+                    ),
+                );
                 doc.close("p");
             }
             doc.html(body_html);
@@ -466,20 +589,24 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             constructs,
             requests,
         } => {
-            section(doc, "Summary");
+            section(doc, doc.t("Summary", "Zusammenfassung"));
             doc.open("div");
             doc.text(sentence);
             doc.close("div");
             pair_table(doc, rows);
             if let Some(html) = body_html {
-                doc.el("h3", "Body");
+                doc.el("h3", doc.t("Body", "Inhalt"));
                 doc.html(html);
             }
             if let Some(c) = constructs {
                 construct_list(doc, STORAGE_CONSTRUCTS, c);
             }
             doc.close("section");
-            requests_section(doc, "Requests to be sent", requests);
+            requests_section(
+                doc,
+                doc.t("Requests to be sent", "Zu sendende Anfragen"),
+                requests,
+            );
         }
         PreviewBody::PageMove {
             page,
@@ -487,20 +614,31 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             to_path,
             requests,
         } => {
-            section(doc, "Page move");
+            section(doc, doc.t("Page move", "Seite verschieben"));
             doc.open("table");
             doc.open("tbody");
-            text_row(doc, "page", page);
+            text_row(doc, doc.t("page", "Seite"), page);
             // PD-106: a fixed row next to the page (T8 review m-3).
-            fixed_row(doc, "body", PAGE_MOVE_BODY_NOT_SENT);
+            fixed_row(
+                doc,
+                doc.t("body", "Inhalt"),
+                doc.t(
+                    PAGE_MOVE_BODY_NOT_SENT,
+                    "Inhalt nicht gesendet; Titel und Inhalt behält Confluence bei",
+                ),
+            );
             doc.close("tbody");
             doc.close("table");
-            doc.el("h3", "Old ancestor path");
+            doc.el("h3", doc.t("Old ancestor path", "Alter Vorfahrenpfad"));
             path_list(doc, from_path);
-            doc.el("h3", "New ancestor path");
+            doc.el("h3", doc.t("New ancestor path", "Neuer Vorfahrenpfad"));
             path_list(doc, to_path);
             doc.close("section");
-            requests_section(doc, "Requests to be sent", requests);
+            requests_section(
+                doc,
+                doc.t("Requests to be sent", "Zu sendende Anfragen"),
+                requests,
+            );
         }
         PreviewBody::AttachmentUpload {
             filename,
@@ -514,10 +652,13 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             notes,
             requests,
         } => {
-            section(doc, "Attachment upload");
+            section(doc, doc.t("Attachment upload", "Anhang hochladen"));
             if let Some(facts) = existing {
                 doc.open("p");
-                doc.el("strong", ATTACHMENT_ALREADY_EXISTS);
+                doc.el(
+                    "strong",
+                    doc.t(ATTACHMENT_ALREADY_EXISTS, "Anhang existiert bereits"),
+                );
                 doc.close("p");
                 doc.open("div");
                 doc.text(facts);
@@ -525,13 +666,18 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             }
             doc.open("table");
             doc.open("tbody");
-            text_row(doc, "file name", filename);
-            fixed_row(doc, "size", &format!("{size} bytes"));
-            text_row(doc, "MIME type", mime);
+            text_row(doc, doc.t("file name", "Dateiname"), filename);
+            let size_text = match doc.lang {
+                Lang::En => format!("{size} bytes"),
+                Lang::De => format!("{} Bytes", doc.lang.count(*size)),
+            };
+            fixed_row(doc, doc.t("size", "Größe"), &size_text);
+            text_row(doc, doc.t("MIME type", "MIME-Typ"), mime);
             text_row(doc, "SHA-256", sha256);
+            let comment_label = doc.t("comment", "Kommentar");
             match comment {
-                Some(c) => text_row(doc, "comment", c),
-                None => fixed_row(doc, "comment", "none"),
+                Some(c) => text_row(doc, comment_label, c),
+                None => fixed_row(doc, comment_label, doc.t("none", "keiner")),
             }
             doc.close("tbody");
             doc.close("table");
@@ -541,9 +687,9 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
                 text_list(doc, notes, "notes");
             }
             if let Some(v) = replaces_version {
-                doc.el("p", &replaces_existing_attachment(*v));
+                doc.el("p", &replaces_existing_attachment(doc.lang, *v));
             }
-            doc.el("h3", "Thumbnail");
+            doc.el("h3", doc.t("Thumbnail", "Vorschaubild"));
             match thumbnail_data_uri
                 .as_deref()
                 .filter(|u| is_raster_data_uri(u))
@@ -551,10 +697,20 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
                 // The URI is `data:image/<raster>;base64,` + base64 only, so it cannot leave the
                 // attribute; the sanitizer passes keep it (`img src`, data rasters only).
                 Some(uri) => doc.html(&format!("<img src=\"{uri}\" alt=\"\">")),
-                None => doc.el("p", NO_THUMBNAIL),
+                None => doc.el(
+                    "p",
+                    doc.t(
+                        NO_THUMBNAIL,
+                        "kein Vorschaubild (kein Bild oder größer als 2 MiB)",
+                    ),
+                ),
             }
             doc.close("section");
-            requests_section(doc, "Requests to be sent", requests);
+            requests_section(
+                doc,
+                doc.t("Requests to be sent", "Zu sendende Anfragen"),
+                requests,
+            );
         }
         PreviewBody::Script {
             item,
@@ -568,22 +724,25 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             // T18 review I-1: the script's own sections are in no other tab, so each has its
             // reserved share of the body; the candidate view (sized by the agent) gets the rest.
             // They are written first to know the rest, and shown after the view (plan order).
-            let mut own = Doc::default();
-            section(&mut own, "Script source");
-            own.append(record(DOC_SCRIPT_SOURCE_BYTES, |d| {
+            let mut own = Doc::default().in_lang(doc.lang);
+            section(&mut own, doc.t("Script source", "Skriptquelle"));
+            let lang = doc.lang;
+            own.append(record(lang, DOC_SCRIPT_SOURCE_BYTES, |d| {
                 script_source(d, source)
             }));
             own.close("section");
-            section(&mut own, "Host calls");
-            own.append(record(DOC_SCRIPT_CALLS_BYTES, |d| {
+            section(&mut own, doc.t("Host calls", "Host-Aufrufe"));
+            own.append(record(lang, DOC_SCRIPT_CALLS_BYTES, |d| {
                 host_calls(d, provenance)
             }));
             own.close("section");
             section(&mut own, "atlas.log");
-            own.append(record(DOC_SCRIPT_LOG_BYTES, |d| raw_list(d, logs, "lines")));
+            own.append(record(lang, DOC_SCRIPT_LOG_BYTES, |d| {
+                raw_list(d, logs, "lines")
+            }));
             if let Some(note) = logs_note {
                 // Its own share: it shows even when the lines filled theirs.
-                own.append(record(DOC_SCRIPT_NOTE_BYTES, |d| {
+                own.append(record(lang, DOC_SCRIPT_NOTE_BYTES, |d| {
                     d.open("div");
                     d.raw_text(note);
                     d.close("div");
@@ -591,14 +750,16 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             }
             own.close("section");
             section(&mut own, "stderr");
-            own.append(record(DOC_SCRIPT_STDERR_BYTES, |d| pre_raw_text(d, stderr)));
+            own.append(record(lang, DOC_SCRIPT_STDERR_BYTES, |d| {
+                pre_raw_text(d, stderr)
+            }));
             own.close("section");
 
-            section(doc, script_item_heading(*item));
+            section(doc, script_item_heading(doc.lang, *item));
             let rest = doc
                 .limit
                 .saturating_sub(doc.out.len().saturating_add(own.out.len()));
-            let mut shown = Doc::with_limit(rest);
+            let mut shown = Doc::with_limit(rest).in_lang(lang);
             shown.nested = true;
             self::body(&mut shown, view);
             doc.append(shown);
@@ -664,7 +825,7 @@ fn pre_text(doc: &mut Doc, text: &str) {
 /// A `<ul>` of display texts, at most [`DOC_MAX_ROWS`]; `none` when empty.
 fn text_list(doc: &mut Doc, items: &[String], unit: &str) {
     if items.is_empty() {
-        doc.el("p", "none");
+        doc.el("p", doc.t("none", "keine"));
         return;
     }
     doc.open("ul");
@@ -717,24 +878,27 @@ fn pair_table(doc: &mut Doc, rows: &[(String, String)]) {
 }
 
 /// The construct list's heading on a Jira card (PD-47).
-const WIKI_CONSTRUCTS: &str = "Wiki constructs in the text";
+const WIKI_CONSTRUCTS: (&str, &str) = ("Wiki constructs in the text", "Wiki-Konstrukte im Text");
 /// The construct list's heading on a Confluence card (M7 Δ2: the storage constructs of the
 /// outgoing body).
-const STORAGE_CONSTRUCTS: &str = "Storage constructs in the body";
+const STORAGE_CONSTRUCTS: (&str, &str) = (
+    "Storage constructs in the body",
+    "Storage-Konstrukte im Inhalt",
+);
 
 /// PD-47: the constructs of the outgoing text, per kind, as text (never a live link).
-fn construct_list(doc: &mut Doc, heading: &str, c: &ConstructList) {
-    doc.el("h3", heading);
+fn construct_list(doc: &mut Doc, heading: (&'static str, &'static str), c: &ConstructList) {
+    doc.el("h3", doc.t(heading.0, heading.1));
     let kinds: [(&str, &[String]); 6] = [
-        ("macros", &c.macros),
-        ("mentions", &c.mentions),
-        ("includes", &c.includes),
-        ("links", &c.links),
-        ("images", &c.images),
-        ("attachments", &c.attachments),
+        (doc.t("macros", "Makros"), &c.macros),
+        (doc.t("mentions", "Erwähnungen"), &c.mentions),
+        (doc.t("includes", "Einbindungen"), &c.includes),
+        (doc.t("links", "Links"), &c.links),
+        (doc.t("images", "Bilder"), &c.images),
+        (doc.t("attachments", "Anhänge"), &c.attachments),
     ];
     if kinds.iter().all(|(_, items)| items.is_empty()) {
-        doc.el("p", "none");
+        doc.el("p", doc.t("none", "keine"));
         return;
     }
     doc.open("table");
@@ -756,7 +920,7 @@ fn construct_list(doc: &mut Doc, heading: &str, c: &ConstructList) {
             let rest = &items[DOC_MAX_ROWS..];
             doc.hide(strings_len(rest));
             doc.fixed(", ");
-            doc.fixed(&more_not_shown(len_u64(rest.len()), "entries"));
+            doc.fixed(&more_not_shown(doc.lang, len_u64(rest.len()), "entries"));
         }
         doc.close("td");
         doc.close("tr");
@@ -769,7 +933,7 @@ fn construct_list(doc: &mut Doc, heading: &str, c: &ConstructList) {
 /// most [`DOC_MAX_ROWS`] entries; `none` when empty.
 fn joined_row(doc: &mut Doc, label: &str, items: &[String], sep: &str) {
     if items.is_empty() {
-        fixed_row(doc, label, "none");
+        fixed_row(doc, label, doc.t("none", "keine"));
         return;
     }
     doc.open("tr");
@@ -785,7 +949,7 @@ fn joined_row(doc: &mut Doc, label: &str, items: &[String], sep: &str) {
         let rest = &items[DOC_MAX_ROWS..];
         doc.hide(strings_len(rest));
         doc.fixed(sep);
-        doc.fixed(&more_not_shown(len_u64(rest.len()), "entries"));
+        doc.fixed(&more_not_shown(doc.lang, len_u64(rest.len()), "entries"));
     }
     doc.close("td");
     doc.close("tr");
@@ -795,7 +959,7 @@ fn joined_row(doc: &mut Doc, label: &str, items: &[String], sep: &str) {
 /// `none` when empty.
 fn path_list(doc: &mut Doc, items: &[String]) {
     if items.is_empty() {
-        doc.el("p", "none");
+        doc.el("p", doc.t("none", "keine"));
         return;
     }
     doc.open("ol");
@@ -818,18 +982,35 @@ fn path_list(doc: &mut Doc, items: &[String]) {
 
 /// The storage→Markdown conversion facts as a fact table.
 fn conversion_facts(doc: &mut Doc, c: &ConversionFacts) {
-    let yes_no = |b: bool| if b { "yes" } else { "no" };
-    doc.el("h3", "Conversion");
+    let lang = doc.lang;
+    let yes_no = |b: bool| {
+        if b {
+            lang.pick("yes", "ja")
+        } else {
+            lang.pick("no", "nein")
+        }
+    };
+    let n = |v: u64| lang.count(v);
+    doc.el("h3", doc.t("Conversion", "Umwandlung"));
     fact_table(
         doc,
         &[
-            ("lossy", yes_no(c.lossy)),
-            ("macros lost", &c.macros.to_string()),
-            ("images lost", &c.images.to_string()),
-            ("links lost", &c.links.to_string()),
-            ("layouts lost", &c.layouts.to_string()),
-            ("unresolved mentions", &c.unresolved_users.to_string()),
-            ("fallback conversion", yes_no(c.fallback)),
+            (lang.pick("lossy", "verlustbehaftet"), yes_no(c.lossy)),
+            (lang.pick("macros lost", "verlorene Makros"), &n(c.macros)),
+            (lang.pick("images lost", "verlorene Bilder"), &n(c.images)),
+            (lang.pick("links lost", "verlorene Links"), &n(c.links)),
+            (
+                lang.pick("layouts lost", "verlorene Layouts"),
+                &n(c.layouts),
+            ),
+            (
+                lang.pick("unresolved mentions", "nicht aufgelöste Erwähnungen"),
+                &n(c.unresolved_users),
+            ),
+            (
+                lang.pick("fallback conversion", "Ersatzumwandlung"),
+                yes_no(c.fallback),
+            ),
         ],
     );
 }
@@ -856,12 +1037,12 @@ fn is_raster_data_uri(uri: &str) -> bool {
 /// (and at most [`MAX_COMMENT_NESTING`] levels deep), whatever depth the server reported, so the
 /// lists always nest and close properly.
 fn confluence_comments(doc: &mut Doc, comments: &[ConfluenceComment], count: Option<&ItemCount>) {
-    section(doc, "Comments");
+    section(doc, doc.t("Comments", "Kommentare"));
     if let Some(c) = count {
-        doc.el("p", &item_count_text(c));
+        doc.el("p", &item_count_text(doc.lang, c));
     }
     if comments.is_empty() {
-        doc.el("p", "none");
+        doc.el("p", doc.t("none", "keine"));
         doc.close("section");
         return;
     }
@@ -927,13 +1108,13 @@ fn comment_len(c: &ConfluenceComment) -> u64 {
 fn confluence_comment(doc: &mut Doc, c: &ConfluenceComment) {
     doc.open("section");
     doc.open("h4");
-    doc.fixed("Comment ");
+    doc.fixed(doc.t("Comment ", "Kommentar "));
     doc.text(&c.id);
     doc.close("h4");
     doc.open("div");
     match &c.author {
         Some(a) => doc.text(a),
-        None => doc.fixed("unknown author"),
+        None => doc.fixed(doc.t("unknown author", "unbekannter Autor")),
     }
     if let Some(created) = &c.created {
         doc.fixed(", ");
@@ -946,7 +1127,7 @@ fn confluence_comment(doc: &mut Doc, c: &ConfluenceComment) {
             doc.text(l);
             doc.close("strong");
         }
-        None => doc.fixed(LOCATION_NOT_REPORTED),
+        None => doc.fixed(doc.t(LOCATION_NOT_REPORTED, "Ort nicht angegeben")),
     }
     doc.close("div");
     doc.html(&c.body_html);
@@ -967,7 +1148,7 @@ fn request_len(r: &RequestView) -> u64 {
 fn requests_section(doc: &mut Doc, title: &str, requests: &[RequestView]) {
     section(doc, title);
     if requests.is_empty() {
-        doc.el("p", "none");
+        doc.el("p", doc.t("none", "keine"));
     }
     for (i, r) in requests.iter().enumerate() {
         if i >= DOC_MAX_ROWS || doc.full() {
@@ -976,21 +1157,24 @@ fn requests_section(doc: &mut Doc, title: &str, requests: &[RequestView]) {
             more_note(doc, rest.len(), "requests");
             break;
         }
-        doc.el("h3", &format!("Request {}", r.index));
+        doc.el(
+            "h3",
+            &format!("{} {}", doc.t("Request", "Anfrage"), r.index),
+        );
         doc.open("table");
         doc.open("tbody");
-        raw_row(doc, "method", &r.method);
+        raw_row(doc, doc.t("method", "Methode"), &r.method);
         raw_row(doc, "URL", &r.resolved_url);
         match &r.content_type {
             Some(ct) => raw_row(doc, "Content-Type", ct),
-            None => fixed_row(doc, "Content-Type", "none"),
+            None => fixed_row(doc, "Content-Type", doc.t("none", "keiner")),
         }
         doc.close("tbody");
         doc.close("table");
         match &r.body {
-            BodyView::None => doc.el("p", "No body."),
+            BodyView::None => doc.el("p", doc.t("No body.", "Kein Inhalt.")),
             BodyView::Text(t) => {
-                doc.el("p", "Body:");
+                doc.el("p", doc.t("Body:", "Inhalt:"));
                 doc.open("pre");
                 doc.open("code");
                 doc.raw_text(t);
@@ -998,7 +1182,10 @@ fn requests_section(doc: &mut Doc, title: &str, requests: &[RequestView]) {
                 doc.close("pre");
             }
             BodyView::Base64(b) => {
-                doc.el("p", "Binary body (base64):");
+                doc.el(
+                    "p",
+                    doc.t("Binary body (base64):", "Binärer Inhalt (Base64):"),
+                );
                 doc.open("pre");
                 doc.open("code");
                 doc.raw_text(b);
@@ -1008,7 +1195,7 @@ fn requests_section(doc: &mut Doc, title: &str, requests: &[RequestView]) {
             // M7 Δ2: the one fixed line, no body text.
             BodyView::Digest { bytes, sha256 } => {
                 doc.open("p");
-                doc.raw_text(&body_digest_line(*bytes, sha256));
+                doc.raw_text(&body_digest_line_in(doc.lang, *bytes, sha256));
                 doc.close("p");
             }
         }
@@ -1060,11 +1247,28 @@ fn json_node(doc: &mut Doc, key: Option<Key<'_>>, n: &JsonNode) {
         JsonNode::String { text } => doc.raw_quoted(text),
         // Plan text (M5, PD-90 class; no spec sentence): the placeholder of a collapsed string. The
         // spec's §5.2 step 4 only requires that such a region is counted as hidden in preview.
-        JsonNode::Collapsed { byte_len, .. } => doc.fixed(&format!(
-            "string of {byte_len} bytes, not shown here; see Structured or Raw"
-        )),
+        JsonNode::Collapsed { byte_len, .. } => {
+            let text = match doc.lang {
+                Lang::En => {
+                    format!("string of {byte_len} bytes, not shown here; see Structured or Raw")
+                }
+                Lang::De => format!(
+                    "Zeichenkette mit {} Bytes, hier nicht angezeigt; siehe Strukturiert oder Roh",
+                    doc.lang.count(*byte_len)
+                ),
+            };
+            doc.fixed(&text);
+        }
         JsonNode::Array { size, items } => {
-            doc.fixed(&format!("array, {} items, {size} bytes", items.len()));
+            let text = match doc.lang {
+                Lang::En => format!("array, {} items, {size} bytes", items.len()),
+                Lang::De => format!(
+                    "Array, {} Einträge, {} Bytes",
+                    doc.lang.count(len_u64(items.len())),
+                    doc.lang.count(*size)
+                ),
+            };
+            doc.fixed(&text);
             if !items.is_empty() {
                 doc.open("ul");
                 for (i, item) in items.iter().enumerate() {
@@ -1080,7 +1284,15 @@ fn json_node(doc: &mut Doc, key: Option<Key<'_>>, n: &JsonNode) {
             }
         }
         JsonNode::Object { size, entries } => {
-            doc.fixed(&format!("object, {} keys, {size} bytes", entries.len()));
+            let text = match doc.lang {
+                Lang::En => format!("object, {} keys, {size} bytes", entries.len()),
+                Lang::De => format!(
+                    "Objekt, {} Schlüssel, {} Bytes",
+                    doc.lang.count(len_u64(entries.len())),
+                    doc.lang.count(*size)
+                ),
+            };
+            doc.fixed(&text);
             if !entries.is_empty() {
                 doc.open("ul");
                 for (i, (k, v)) in entries.iter().enumerate() {
@@ -1111,7 +1323,7 @@ enum Key<'a> {
 
 fn more_item(doc: &mut Doc, n: usize) {
     doc.open("li");
-    doc.fixed(&more_not_shown(len_u64(n), "items"));
+    doc.fixed(&more_not_shown(doc.lang, len_u64(n), "items"));
     doc.close("li");
 }
 
@@ -1123,7 +1335,7 @@ fn more_item(doc: &mut Doc, n: usize) {
 /// stylesheet, T10 review I-1). At most [`DOC_MAX_DIFF_LINES`] lines.
 fn diff(doc: &mut Doc, lines: &[DiffLine]) {
     if lines.is_empty() {
-        doc.el("p", "no changes");
+        doc.el("p", doc.t("no changes", "keine Änderungen"));
         return;
     }
     // `None`: no table open; `Some(changed)`: a `<tbody>` of changed (or same) lines is open.
@@ -1225,36 +1437,36 @@ fn jira_issue(
     description_html: Option<&str>,
     comments: &[CommentView],
 ) {
-    section(doc, "Issue");
+    section(doc, doc.t("Issue", "Vorgang"));
     doc.open("table");
     doc.open("tbody");
-    text_row(doc, "key", &card.key);
-    text_row(doc, "summary", &card.summary);
-    text_row(doc, "type", &card.issue_type);
-    text_row(doc, "status", &card.status);
+    text_row(doc, doc.t("key", "Schlüssel"), &card.key);
+    text_row(doc, doc.t("summary", "Zusammenfassung"), &card.summary);
+    text_row(doc, doc.t("type", "Typ"), &card.issue_type);
+    text_row(doc, doc.t("status", "Status"), &card.status);
     for (label, value) in [
-        ("priority", &card.priority),
-        ("assignee", &card.assignee),
-        ("reporter", &card.reporter),
+        (doc.t("priority", "Priorität"), &card.priority),
+        (doc.t("assignee", "Bearbeiter"), &card.assignee),
+        (doc.t("reporter", "Autor"), &card.reporter),
     ] {
         match value {
             Some(v) => text_row(doc, label, v),
-            None => fixed_row(doc, label, "none"),
+            None => fixed_row(doc, label, doc.t("none", "keiner")),
         }
     }
     doc.close("tbody");
     doc.close("table");
 
-    doc.el("h3", "Fields");
+    doc.el("h3", doc.t("Fields", "Felder"));
     if fields.is_empty() {
-        doc.el("p", "none");
+        doc.el("p", doc.t("none", "keine"));
     } else {
         doc.open("table");
         doc.open("thead");
         doc.open("tr");
-        doc.el("th", "field");
-        doc.el("th", "id");
-        doc.el("th", "value");
+        doc.el("th", doc.t("field", "Feld"));
+        doc.el("th", doc.t("id", "ID"));
+        doc.el("th", doc.t("value", "Wert"));
         doc.close("tr");
         doc.close("thead");
         doc.open("tbody");
@@ -1273,7 +1485,10 @@ fn jira_issue(
             doc.close("td");
             doc.open("td");
             if f.restricted {
-                doc.el("strong", "restricted visibility");
+                doc.el(
+                    "strong",
+                    doc.t("restricted visibility", "eingeschränkte Sichtbarkeit"),
+                );
                 doc.fixed(" ");
             }
             doc.text(&f.value_text);
@@ -1293,13 +1508,14 @@ fn jira_issue(
         }
     }
 
-    doc.el("h3", "Description");
+    doc.el("h3", doc.t("Description", "Beschreibung"));
     match description_html {
         Some(html) => doc.html(html),
-        None => doc.el("p", "none"),
+        None => doc.el("p", doc.t("none", "keine")),
     }
 
-    doc.el("h3", &format!("Comments ({})", comments.len()));
+    let n = doc.lang.count(len_u64(comments.len()));
+    doc.el("h3", &format!("{} ({n})", doc.t("Comments", "Kommentare")));
     for (i, c) in comments.iter().enumerate() {
         if i >= DOC_MAX_ROWS || doc.full() {
             let rest = &comments[i..];
@@ -1309,13 +1525,13 @@ fn jira_issue(
         }
         doc.open("section");
         doc.open("h4");
-        doc.fixed("Comment ");
+        doc.fixed(doc.t("Comment ", "Kommentar "));
         doc.text(&c.id);
         doc.close("h4");
         doc.open("div");
         match &c.author {
             Some(a) => doc.text(a),
-            None => doc.fixed("unknown author"),
+            None => doc.fixed(doc.t("unknown author", "unbekannter Autor")),
         }
         if let Some(created) = &c.created {
             doc.fixed(", ");
@@ -1323,7 +1539,10 @@ fn jira_issue(
         }
         if c.restricted {
             doc.fixed(" ");
-            doc.el("strong", "restricted visibility");
+            doc.el(
+                "strong",
+                doc.t("restricted visibility", "eingeschränkte Sichtbarkeit"),
+            );
         }
         doc.close("div");
         doc.html(&c.body_html);
@@ -1334,17 +1553,19 @@ fn jira_issue(
 // ---- scripts (§6.3 Script result / Script error details, M8 T18) ------------------------------
 
 /// §6.3 row names: the heading of the section the candidate view sits in.
-fn script_item_heading(item: ScriptItemKind) -> &'static str {
+fn script_item_heading(lang: Lang, item: ScriptItemKind) -> &'static str {
     match item {
-        ScriptItemKind::Result => "Script result",
-        ScriptItemKind::ErrorDetails => "Script error details",
+        ScriptItemKind::Result => lang.pick("Script result", "Skriptergebnis"),
+        ScriptItemKind::ErrorDetails => {
+            lang.pick("Script error details", "Details zum Skriptfehler")
+        }
     }
 }
 
 /// A script's own section written by `write` into a [`Doc::record`] part with its share `limit`
 /// of the body.
-fn record(limit: usize, write: impl FnOnce(&mut Doc)) -> Doc {
-    let mut part = Doc::record(limit);
+fn record(lang: Lang, limit: usize, write: impl FnOnce(&mut Doc)) -> Doc {
+    let mut part = Doc::record(limit).in_lang(lang);
     write(&mut part);
     part
 }
@@ -1355,7 +1576,7 @@ fn record(limit: usize, write: impl FnOnce(&mut Doc)) -> Doc {
 /// ([`DOC_SCRIPT_SOURCE_BYTES`], T18 review I-2), not by a line count.
 fn script_source(doc: &mut Doc, source: &str) {
     if source.is_empty() {
-        doc.el("p", "none");
+        doc.el("p", doc.t("none", "keine"));
         return;
     }
     doc.open("table");
@@ -1389,13 +1610,19 @@ fn script_source(doc: &mut Doc, source: &str) {
 /// response). At most [`DOC_MAX_ROWS`] rows.
 fn host_calls(doc: &mut Doc, rows: &[ProvenanceRow]) {
     if rows.is_empty() {
-        doc.el("p", "none");
+        doc.el("p", doc.t("none", "keine"));
         return;
     }
     doc.open("table");
     doc.open("thead");
     doc.open("tr");
-    for label in ["call", "operation", "instance", "target", "outcome"] {
+    for label in [
+        doc.t("call", "Aufruf"),
+        doc.t("operation", "Vorgang"),
+        doc.t("instance", "Instanz"),
+        doc.t("target", "Ziel"),
+        doc.t("outcome", "Ergebnis"),
+    ] {
         doc.el("th", label);
     }
     doc.close("tr");

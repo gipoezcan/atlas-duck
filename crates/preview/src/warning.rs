@@ -315,3 +315,269 @@ pub fn custom_fields(n: u64) -> String {
 pub fn host_calls_lossy(n: u64) -> String {
     format!("{n} host calls returned truncated or lossy data")
 }
+// ---- M15 T10b: the warnings in the preview's language ---------------------------------------
+
+/// The English form of each warning text (`{}` for a value, in order) and its German form. A text
+/// matches the first form of its id whose literal parts it carries; the values are taken from it
+/// unchanged (a number is written the German way). More specific forms come first.
+const FORMS: &[(WarningId, &str, &str)] = &[
+    (
+        WarningId::RestrictedComments,
+        TEXT_RESTRICTED_COMMENTS,
+        "enthält Kommentare mit eingeschränkter Sichtbarkeit",
+    ),
+    (
+        WarningId::SecurityLevel,
+        TEXT_SECURITY_LEVEL,
+        "Vorgang hat eine Sicherheitsstufe",
+    ),
+    (
+        WarningId::AllFields,
+        TEXT_ALL_FIELDS,
+        "alle Felder angefordert (`*all`)",
+    ),
+    (
+        WarningId::ServerRenderedView,
+        TEXT_SERVER_RENDERED_VIEW,
+        "serverseitig gerenderte Ansicht: Makros können Inhalte anderer Seiten enthalten",
+    ),
+    (
+        WarningId::ChangedSinceReview,
+        TEXT_CHANGED_SINCE_REVIEW,
+        "Seit Ihrer Prüfung geändert",
+    ),
+    (
+        WarningId::ChangedSinceReview,
+        "Changed since you reviewed: {}",
+        "Seit Ihrer Prüfung geändert: {}",
+    ),
+    (
+        WarningId::CouldNotRecheck,
+        TEXT_COULD_NOT_RECHECK,
+        "Ziel konnte nicht erneut geprüft werden",
+    ),
+    (
+        WarningId::IdentityHeaderLost,
+        TEXT_IDENTITY_HEADER_LOST,
+        "Jira hat kein passendes X-AUSERNAME gesendet (möglicherweise von einem Reverse Proxy entfernt); wenden Sie sich an den Jira-Administrator",
+    ),
+    (
+        WarningId::UnknownMacros,
+        TEXT_UNKNOWN_MACROS,
+        "Inhalt enthält unbekannte Makros",
+    ),
+    (
+        WarningId::UnresolvedMention,
+        TEXT_UNRESOLVED_MENTION,
+        "Erwähnung konnte nicht aufgelöst werden",
+    ),
+    (
+        WarningId::CqlBroad,
+        TEXT_CQL_BROAD,
+        "CQL kann sehr viele Ergebnisse liefern",
+    ),
+    (
+        WarningId::SourceFormattingRemoved,
+        TEXT_SOURCE_FORMATTING_REMOVED,
+        "Quellformatierung entfernt (versteckte oder farbige Formatierung vorhanden)",
+    ),
+    (
+        WarningId::ScriptRenderedCopies,
+        TEXT_SCRIPT_RENDERED_COPIES,
+        "dieses Ergebnis kann gerenderte Kopien von Feldern enthalten (renderedFields); das Entfernen eines Felds entfernt seine Kopie nicht; maskieren Sie jedes Vorkommen",
+    ),
+    (
+        WarningId::TokenChanged,
+        "token changed: now executes as {}",
+        "Token geändert: wird jetzt ausgeführt als {}",
+    ),
+    (
+        WarningId::TokenIdentityMismatch,
+        "token no longer resolves to {}",
+        "Token gehört nicht mehr zu {}",
+    ),
+    (
+        WarningId::UserRenamed,
+        "Atlassian username changed: {} → {}",
+        "Atlassian-Benutzername geändert: {} → {}",
+    ),
+    (
+        WarningId::InstanceUrlChanged,
+        "instance URL changed: {} → {}",
+        "Instanz-URL geändert: {} → {}",
+    ),
+    (
+        WarningId::Conflict,
+        "conflict: page changed since the agent read it (v{} → v{})",
+        "Konflikt: Die Seite wurde geändert, seit der Agent sie gelesen hat (v{} → v{})",
+    ),
+    (
+        WarningId::PossibleDuplicate,
+        "possible duplicate of {}",
+        "mögliches Duplikat von {}",
+    ),
+    (
+        WarningId::SimilarRequest,
+        "similar to {} pending",
+        "ähnlich zu {}, ausstehend",
+    ),
+    (
+        WarningId::SimilarRequest,
+        "similar to {} outcome unknown",
+        "ähnlich zu {}, Ergebnis unbekannt",
+    ),
+    (
+        WarningId::SimilarRequest,
+        "similar to {} executed {}",
+        "ähnlich zu {}, ausgeführt {}",
+    ),
+    (
+        WarningId::SimilarRequest,
+        "similar to {} denied {}",
+        "ähnlich zu {}, abgelehnt {}",
+    ),
+    (
+        WarningId::SimilarRequest,
+        "similar to {} released {}",
+        "ähnlich zu {}, übergeben {}",
+    ),
+    (
+        WarningId::SimilarRequest,
+        "similar to {} failed {}",
+        "ähnlich zu {}, fehlgeschlagen {}",
+    ),
+    (
+        WarningId::BidiControls,
+        "contains {} bidirectional control characters",
+        "enthält {} bidirektionale Steuerzeichen",
+    ),
+    (
+        WarningId::OtherInvisible,
+        "contains {} other invisible characters",
+        "enthält {} andere unsichtbare Zeichen",
+    ),
+    (
+        WarningId::MixedScript,
+        "mixed-script identifier: {}",
+        "Bezeichner mit gemischter Schrift: {}",
+    ),
+    (
+        WarningId::MissingRequiredFields,
+        "missing required fields: {}",
+        "fehlende Pflichtfelder: {}",
+    ),
+    (
+        WarningId::RequiredFieldListIncomplete,
+        "required-field list incomplete: {} of more than {} pages read",
+        "Pflichtfeldliste unvollständig: {} von mehr als {} Seiten gelesen",
+    ),
+    (
+        WarningId::RequiredFieldListIncomplete,
+        "required-field list incomplete: {} of {} pages read",
+        "Pflichtfeldliste unvollständig: {} von {} Seiten gelesen",
+    ),
+    (
+        WarningId::TruncatedByCap,
+        "result truncated by cap ({} of {})",
+        "Ergebnis durch Obergrenze gekürzt ({} von {})",
+    ),
+    (
+        WarningId::RawOnlyDiff,
+        "{} changes not visible in rendered diff",
+        "{} Änderungen sind im gerenderten Diff nicht sichtbar",
+    ),
+    (
+        WarningId::DiffTruncated,
+        "diff truncated: {} bytes not shown (see Request)",
+        "Diff gekürzt: {} Bytes nicht angezeigt (siehe Anfrage)",
+    ),
+    (
+        WarningId::NoCurrentValue,
+        "{} fields shown as sent, without their current value",
+        "{} Felder wie gesendet angezeigt, ohne ihren aktuellen Wert",
+    ),
+    (
+        WarningId::LinkTypeInwardPhrase,
+        "link type named by its inward phrase '{}': the inward issue gets the outward phrase '{}'",
+        "Verknüpfungstyp über seine eingehende Bezeichnung „{}“ benannt: Der eingehende Vorgang erhält die ausgehende Bezeichnung „{}“",
+    ),
+    (
+        WarningId::DuplicateTitle,
+        "a page titled '{}' already exists in {}",
+        "Eine Seite mit dem Titel „{}“ gibt es bereits in {}",
+    ),
+    (
+        WarningId::LossyUpdate,
+        "this update will remove {} macros / {} images / {} links, {} layouts",
+        "diese Aktualisierung entfernt {} Makros / {} Bilder / {} Links, {} Layouts",
+    ),
+    (
+        WarningId::LossyUpdate,
+        "this update will remove {} macros / {} images / {} links",
+        "diese Aktualisierung entfernt {} Makros / {} Bilder / {} Links",
+    ),
+    (
+        WarningId::LinkedIssueSummaries,
+        "includes summary/status of {} linked/parent/sub-task issues",
+        "enthält Zusammenfassung/Status von {} verknüpften, übergeordneten oder Unteraufgaben-Vorgängen",
+    ),
+    (
+        WarningId::CustomFields,
+        "contains {} custom fields",
+        "enthält {} benutzerdefinierte Felder",
+    ),
+    (
+        WarningId::HostCallsLossy,
+        "{} host calls returned truncated or lossy data",
+        "{} Host-Aufrufe lieferten gekürzte oder verlustbehaftete Daten",
+    ),
+];
+
+/// The values of `text` in `form` (`{}` placeholders), or `None` when it does not match.
+fn values<'a>(form: &str, text: &'a str) -> Option<Vec<&'a str>> {
+    let parts: Vec<&str> = form.split("{}").collect();
+    let (first, rest_parts) = parts.split_first()?;
+    if rest_parts.is_empty() {
+        return (text == form).then(Vec::new);
+    }
+    let mut rest = text.strip_prefix(first)?;
+    let mut out = Vec::with_capacity(rest_parts.len());
+    for (k, lit) in rest_parts.iter().enumerate() {
+        if k + 1 == rest_parts.len() {
+            out.push(rest.strip_suffix(lit)?);
+            rest = "";
+        } else {
+            let at = rest.find(lit)?;
+            out.push(&rest[..at]);
+            rest = &rest[at + lit.len()..];
+        }
+    }
+    rest.is_empty().then_some(out)
+}
+
+/// The warning's text in `lang`: English as core wrote it; German by its id's form, with the
+/// values taken over (numbers grouped the German way). A text no form matches stays English.
+pub fn shown(lang: crate::Lang, w: &Warning) -> String {
+    if lang == crate::Lang::En {
+        return w.text.clone();
+    }
+    for (id, en, de) in FORMS {
+        if *id != w.id {
+            continue;
+        }
+        if let Some(vals) = values(en, &w.text) {
+            let mut out = String::with_capacity(de.len() + w.text.len());
+            let mut parts = de.split("{}");
+            out.push_str(parts.next().unwrap_or_default());
+            for (v, lit) in vals.iter().zip(parts) {
+                match v.parse::<u64>() {
+                    Ok(n) => out.push_str(&lang.count(n)),
+                    Err(_) => out.push_str(v),
+                }
+                out.push_str(lit);
+            }
+            return out;
+        }
+    }
+    w.text.clone()
+}

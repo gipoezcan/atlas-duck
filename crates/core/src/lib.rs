@@ -78,6 +78,9 @@ pub use crate::core::{
     Confirm, Core, CoreDeps, NativeConfirmer, ShutdownReason, ShutdownReport, StartError,
 };
 pub use atlas_duck_preview::CandidateRev;
+/// M15 T10b: the language of the text core and the preview write for a person (dialogs, the
+/// preview document); English unless the caller says otherwise.
+pub use atlas_duck_preview::Lang;
 /// The product of `AddInstance` (M6 T25: the app parses the add-instance form's `product` into it
 /// without a registry dependency of its own).
 pub use atlas_duck_registry::Product;

@@ -697,7 +697,7 @@ async fn request_view_never_carries_file_bytes() -> TestResult {
     upload_server(mock, &[]).await;
     let id = queued(&h, p).await?;
     let preview = h.approver().open(&id).map_err(de)?.preview;
-    let doc = render::document(&preview, Platform::current());
+    let doc = render::document(atlas_duck_preview::Lang::En, &preview, Platform::current());
     no_file_bytes(&doc, TEXT)?;
     no_file_bytes(&serde_json::to_string(&preview.body)?, TEXT)?;
     no_file_bytes(&serde_json::to_string(&preview.header)?, TEXT)?;
@@ -1570,7 +1570,7 @@ async fn opened_doc(
     id: &str,
 ) -> Result<(atlas_duck_preview::Preview, String), TestError> {
     let preview = h.approver().open(id).map_err(de)?.preview;
-    let doc = render::document(&preview, Platform::current());
+    let doc = render::document(atlas_duck_preview::Lang::En, &preview, Platform::current());
     Ok((preview, doc))
 }
 
@@ -2162,7 +2162,7 @@ async fn upload_10mib_preview_is_bounded() -> TestResult {
     let preview = h.decisions().preview_fetch(&id, None).map_err(de)?.preview;
     let build = t.elapsed();
     let t = Instant::now();
-    let doc = render::document(&preview, Platform::current());
+    let doc = render::document(atlas_duck_preview::Lang::En, &preview, Platform::current());
     let render_took = t.elapsed();
     println!(
         "P01-style upload_10mib preview {:.1} ms (build), render::document {:.1} ms",

@@ -26,6 +26,8 @@ pub async fn command(
     if !cmd::SERVER_COMMANDS.contains(&name.as_str()) {
         return cmd_error(CmdError::UnknownCommand);
     }
+    // M15 T10b: the preview and payload documents in the reader's language.
+    let lang = super::pref_routes::reader_lang(&st, &user.0.user_id, req.headers());
     let bytes = match body_bytes(req.into_body()).await {
         Ok(b) => b,
         Err(e) => return e.into_response(),
@@ -44,9 +46,9 @@ pub async fn command(
     };
     // M14 T16: the audit reads go to the user's own store (SM-6.4 first sentence).
     let answer = if cmd::AUDIT_COMMANDS.contains(&name.as_str()) {
-        cmd::run_audit(rt.audit_handle(), name, body).await
+        cmd::run_audit(rt.audit_handle(), name, body, lang).await
     } else {
-        cmd::run(rt.decisions(), name, body).await
+        cmd::run(rt.decisions(), name, body, lang).await
     };
     match answer {
         Ok(v) => Json(v).into_response(),

@@ -954,7 +954,11 @@ fn audit_payloads() -> Vec<AuditPayloadDto> {
             r#"{{"change":"{change}","expires_at":null,"new_user_key":"JIRAUSER10100","old_user_key":null}}"#
         );
         AuditPayloadDto {
-            srcdoc: render::audit_payload_document(json.as_bytes(), Platform::MacOsLinux),
+            srcdoc: render::audit_payload_document(
+                atlas_duck_preview::Lang::En,
+                json.as_bytes(),
+                Platform::MacOsLinux,
+            ),
             page: 0,
             page_count: 1,
             total_bytes: json.len() as u64,
@@ -965,7 +969,11 @@ fn audit_payloads() -> Vec<AuditPayloadDto> {
     vec![
         credential("store_failed", CredentialChangeFailure::StoreFailed),
         AuditPayloadDto {
-            srcdoc: render::audit_payload_document(json, Platform::MacOsLinux),
+            srcdoc: render::audit_payload_document(
+                atlas_duck_preview::Lang::En,
+                json,
+                Platform::MacOsLinux,
+            ),
             page: 0,
             page_count: 1,
             total_bytes: 25,
@@ -973,7 +981,11 @@ fn audit_payloads() -> Vec<AuditPayloadDto> {
             credential_change: None,
         },
         AuditPayloadDto {
-            srcdoc: render::audit_payload_page_document(&page, Platform::MacOsLinux),
+            srcdoc: render::audit_payload_page_document(
+                atlas_duck_preview::Lang::En,
+                &page,
+                Platform::MacOsLinux,
+            ),
             page: 1,
             page_count: 2,
             total_bytes: 262_150,
@@ -1965,10 +1977,13 @@ fn preview_fetch_sends_the_thumbnail_in_the_srcdoc_only() -> TestResult {
             assert_eq!(thumbnail_data_uri.as_deref(), Some(uri));
             *thumbnail_data_uri = None;
         }
-        let r = preview_fetch_response(PreviewDelivery {
-            preview,
-            redaction: None,
-        });
+        let r = preview_fetch_response(
+            PreviewDelivery {
+                preview,
+                redaction: None,
+            },
+            atlas_duck_preview::Lang::En,
+        );
         assert_eq!(r.preview, want);
         assert_eq!(
             r.srcdoc.contains(&format!("<img src=\"{uri}\"")),

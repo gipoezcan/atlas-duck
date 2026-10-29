@@ -373,6 +373,59 @@ async fn other_user_pref_untouched() {
     assert_eq!(status, 400);
 }
 
+/// M15 T10b: the preview document is in the reader's language: the stored preference, and for
+/// `auto` the request's `Accept-Language`. The previewed data is the same in every language.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preview_document_follows_the_readers_language() {
+    let s = TestServer::start().await;
+    let (a, _key, id, waiting) = a_pending_write(&s).await;
+    let body = json!({"request_id": id});
+    let srcdoc = |v: &Value| v["srcdoc"].as_str().unwrap_or_default().to_owned();
+    let (status, en) = s.cmd(&a, "preview_fetch", body.clone()).await;
+    assert_eq!(status, 200, "{en}");
+    assert!(srcdoc(&en).contains("hidden in preview"));
+    // `auto` + a German browser.
+    let (status, de) = s
+        .send_with(
+            Method::POST,
+            "/api/cmd/preview_fetch",
+            Some(&a),
+            Some(body.clone()),
+            &[("accept-language", "de-DE,de;q=0.9,en;q=0.5")],
+        )
+        .await;
+    assert_eq!(status, 200, "{de}");
+    assert!(
+        srcdoc(&de).contains("in der Vorschau verborgen"),
+        "{}",
+        srcdoc(&de)
+    );
+    assert!(!srcdoc(&de).contains("hidden in preview"));
+    // The stored preference wins over the browser.
+    let (status, _) = s
+        .send(
+            Method::PUT,
+            "/api/me/preferences",
+            Some(&a),
+            Some(json!({"lang_pref": "en"})),
+        )
+        .await;
+    assert_eq!(status, 204);
+    let (_, pinned) = s
+        .send_with(
+            Method::POST,
+            "/api/cmd/preview_fetch",
+            Some(&a),
+            Some(body),
+            &[("accept-language", "de-DE")],
+        )
+        .await;
+    assert!(srcdoc(&pinned).contains("hidden in preview"));
+    // The preview itself (not its document) is the same.
+    assert_eq!(en["preview"], de["preview"]);
+    waiting.abort();
+}
+
 /// A concrete path for a ROUTES pattern.
 fn concrete(path: &str) -> String {
     path.replace("{name}", "x.js")

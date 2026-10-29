@@ -1184,7 +1184,7 @@ mod approvals_commands {
                 "{kind} recorded without a preview"
             );
 
-            let fetched = preview_fetch_dto(&*d, id, Some(rev))?;
+            let fetched = preview_fetch_dto(&*d, id, Some(rev), atlas_duck_preview::Lang::En)?;
             assert_eq!(fetched.preview.candidate_rev, rev);
             // The rendered document is the isolated one: doctype first, its own CSP meta.
             assert!(
@@ -1284,7 +1284,7 @@ mod approvals_commands {
         let ops = json!({"redactions": [{"preset": "status_only"}]});
 
         let rev1 = queue_get_dto(&*d, &id)?.candidate_rev;
-        let shown = preview_fetch_dto(&*d, &id, Some(rev1))?;
+        let shown = preview_fetch_dto(&*d, &id, Some(rev1), atlas_duck_preview::Lang::En)?;
         assert!(matches!(
             shown.preview.body,
             PreviewBody::UpstreamError { status: 404, .. }
@@ -1312,7 +1312,7 @@ mod approvals_commands {
             ),
             "{unopened:?}"
         );
-        preview_fetch_dto(&*d, &id, Some(rev2))?;
+        preview_fetch_dto(&*d, &id, Some(rev2), atlas_duck_preview::Lang::En)?;
         let out = decide_dto(&*d, decide_args(&id, "release_redacted", rev2, ops)?)?;
         assert_eq!(out.status, Status::Failed);
 
@@ -1358,7 +1358,7 @@ mod approvals_commands {
             ),
             "{unopened:?}"
         );
-        preview_fetch_dto(&*d, &id, Some(rev))?;
+        preview_fetch_dto(&*d, &id, Some(rev), atlas_duck_preview::Lang::En)?;
         let events_before = h.events(&id).await?.len();
         let report = redaction_preview_dto(&*d, &args(mask)?)?;
         assert!(report.blocked.is_empty(), "{report:?}");
@@ -1482,7 +1482,7 @@ mod approvals_commands {
             if evict {
                 h.evict_candidate(&id);
             }
-            let shown = preview_fetch_dto(&*d, &id, Some(rev))?;
+            let shown = preview_fetch_dto(&*d, &id, Some(rev), atlas_duck_preview::Lang::En)?;
             assert!(!shown.preview.approvable);
             assert_eq!(
                 shown.preview.header.release_blocked,
@@ -1495,7 +1495,7 @@ mod approvals_commands {
         let rev = queue_get_dto(&*d, &id)?.candidate_rev;
         let events = h.event_count().await?;
         assert_eq!(
-            preview_fetch_dto(&*d, &id, Some(rev)).err(),
+            preview_fetch_dto(&*d, &id, Some(rev), atlas_duck_preview::Lang::En).err(),
             Some(CommandError::ReleaseBlocked)
         );
         assert_eq!(
@@ -1607,7 +1607,7 @@ mod approvals_commands {
         let mut items = Vec::new();
         for id in [&read, &write] {
             let rev = queue_get_dto(&*d, id)?.candidate_rev;
-            preview_fetch_dto(&*d, id, Some(rev))?;
+            preview_fetch_dto(&*d, id, Some(rev), atlas_duck_preview::Lang::En)?;
             items.push(json!({"request_id": id, "candidate_rev": rev_wire(rev)}));
         }
         let batch: BatchItems = {

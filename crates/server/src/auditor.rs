@@ -228,6 +228,8 @@ pub async fn read(
     if !valid_user_id(&target) || !matches!(st.store.user(&target), Ok(Some(_))) {
         return ApiError::AUDIT_USER_UNKNOWN.into_response();
     }
+    // M15 T10b: the auditor's own language, not the target's.
+    let lang = crate::web::pref_routes::reader_lang(&st, &user.0.user_id, req.headers());
     let bytes = match body_bytes(req.into_body()).await {
         Ok(b) => b,
         Err(e) => return e.into_response(),
@@ -265,7 +267,7 @@ pub async fn read(
     if let Err(e) = record(&st, &user, &read).await {
         return e.into_response();
     }
-    match cmd::run_audit(store, command, body).await {
+    match cmd::run_audit(store, command, body, lang).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => cmd_error(e),
     }

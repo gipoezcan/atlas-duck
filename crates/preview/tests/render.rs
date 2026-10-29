@@ -9,6 +9,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use atlas_duck_preview::Lang;
 use atlas_duck_preview::diff::{DiffLine, DiffOp, line_diff, line_diff_lines};
 use atlas_duck_preview::invisible::{self, escape_for_display};
 use atlas_duck_preview::render::{
@@ -708,7 +709,7 @@ fn golden_dir() -> PathBuf {
 }
 
 fn doc(p: &Preview) -> String {
-    render::document(p, Platform::MacOsLinux)
+    render::document(Lang::En, p, Platform::MacOsLinux)
 }
 
 /// The text between `<body>` and `</body>`.
@@ -736,6 +737,80 @@ fn text_outside_tags(html: &str) -> String {
     out
 }
 
+// ---- M15 T10b: the preview's own text in German --------------------------------------------------
+
+/// Every `<bdi>` of `html` in order: the values (server, agent and core texts), never a label.
+fn bdi_values(html: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = html;
+    while let Some(start) = rest.find("<bdi>") {
+        let from = &rest[start + "<bdi>".len()..];
+        let Some(end) = from.find("</bdi>") else {
+            break;
+        };
+        out.push(&from[..end]);
+        rest = &from[end..];
+    }
+    out
+}
+
+/// In German, every body variant and the extras keep every value exactly (the Jira/Confluence
+/// content and the agent's text are never translated) and show none of the English labels.
+#[test]
+fn german_labels_and_untouched_content() {
+    const ENGLISH_LABELS: [&str; 14] = [
+        "What the agent receives",
+        "agent receives",
+        "Requests to be sent",
+        "hidden in preview",
+        "Result (JSON tree)",
+        "Upstream error",
+        "Read outcome",
+        "Unresolved name",
+        "Rendered diff",
+        "Fields set during the transition",
+        "Confluence page",
+        "Attachment upload",
+        "Script source",
+        "Comments",
+    ];
+    let mut all = variants();
+    all.extend(confluence_extras());
+    for (name, p) in &all {
+        let en = render::document(Lang::En, p, Platform::MacOsLinux);
+        let de = render::document(Lang::De, p, Platform::MacOsLinux);
+        // After the header (whose warnings are shown in the language) every value is the same.
+        let after_header = |d: &'_ str| -> String {
+            let b = body_of(d);
+            b.find("</header>").map_or(b, |i| &b[i..]).to_owned()
+        };
+        let (en_body, de_body) = (after_header(&en), after_header(&de));
+        // The body-digest line is the preview's own (a value-shaped label); everything else is data.
+        let data = |d: &'_ str| -> Vec<String> {
+            bdi_values(d)
+                .into_iter()
+                .filter(|v| !v.contains(", SHA-256 "))
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(
+            data(&en_body),
+            data(&de_body),
+            "{name}: a value of the body changed with the language"
+        );
+        let text = text_outside_tags(body_of(&de));
+        for label in ENGLISH_LABELS {
+            assert!(
+                !text.contains(label),
+                "{name}: English label {label:?} in German"
+            );
+        }
+        assert!(
+            text.contains("Instanz") && text.contains("in der Vorschau verborgen"),
+            "{name}: the German header"
+        );
+    }
+}
 // ---- goldens -------------------------------------------------------------------------------------
 
 #[test]
@@ -1337,7 +1412,7 @@ proptest! {
     ) {
         let platform = if windows { Platform::Windows } else { Platform::MacOsLinux };
         let p = arbitrary_preview(kind, &strings);
-        assert_inert(&render::document(&p, platform), platform);
+        assert_inert(&render::document(Lang::En, &p, platform), platform);
     }
 }
 
@@ -1377,7 +1452,7 @@ fn every_golden_variant_is_inert() {
         .chain([("header", header_and_strip())])
     {
         for platform in [Platform::MacOsLinux, Platform::Windows] {
-            let d = render::document(&p, platform);
+            let d = render::document(Lang::En, &p, platform);
             assert_inert(&d, platform);
             assert!(!d.is_empty(), "{name}");
         }
@@ -1782,19 +1857,25 @@ fn u34_caution_strip_info_line_levels() {
         assert!(d.contains(row), "{row}\n{d}");
     }
     assert_eq!(
-        render::item_count_text(&ItemCount {
-            shown: 2,
-            total: Some(9),
-            more_available: true
-        }),
+        render::item_count_text(
+            Lang::En,
+            &ItemCount {
+                shown: 2,
+                total: Some(9),
+                more_available: true
+            }
+        ),
         "2 of 9"
     );
     assert_eq!(
-        render::item_count_text(&ItemCount {
-            shown: 2,
-            total: None,
-            more_available: false
-        }),
+        render::item_count_text(
+            Lang::En,
+            &ItemCount {
+                shown: 2,
+                total: None,
+                more_available: false
+            }
+        ),
         "2 shown"
     );
 }
@@ -2032,7 +2113,7 @@ fn flagged_characters_in_attribute_values_are_escaped() {
 fn meta_csp_is_first_head_element() {
     for (_, p) in variants() {
         for platform in [Platform::MacOsLinux, Platform::Windows] {
-            let d = render::document(&p, platform);
+            let d = render::document(Lang::En, &p, platform);
             assert!(d.starts_with(&head(platform)));
             assert_eq!(d.matches("<meta").count(), 1);
             assert_eq!(d.matches("<link").count(), 0);
@@ -2047,8 +2128,8 @@ fn meta_csp_is_first_head_element() {
 #[test]
 fn iframe_document_origin_per_platform() {
     let (_, p) = variants().swap_remove(0);
-    let w = render::document(&p, Platform::Windows);
-    let m = render::document(&p, Platform::MacOsLinux);
+    let w = render::document(Lang::En, &p, Platform::Windows);
+    let m = render::document(Lang::En, &p, Platform::MacOsLinux);
     assert_eq!(w, m);
     assert!(w.contains(&format!("style-src {PREVIEW_CSS_HASH}; img-src data:")));
     assert!(!w.contains("tauri://") && !w.contains("tauri.localhost"));
@@ -2364,7 +2445,7 @@ fn script_source_and_logs_are_escaped_text() {
         }
         let d = doc(&p);
         for platform in [Platform::MacOsLinux, Platform::Windows] {
-            assert_inert(&render::document(&p, platform), platform);
+            assert_inert(&render::document(Lang::En, &p, platform), platform);
         }
         assert!(!d.contains('\u{202E}'));
         let body = body_of(&d).to_ascii_lowercase();
@@ -2456,7 +2537,7 @@ proptest! {
         let p = arbitrary_preview(18, &strings);
         let is_script = matches!(p.body, PreviewBody::Script { .. });
         prop_assert!(is_script);
-        assert_inert(&render::document(&p, platform), platform);
+        assert_inert(&render::document(Lang::En, &p, platform), platform);
     }
 }
 
@@ -2473,7 +2554,7 @@ proptest! {
         long_first in any::<bool>(),
     ) {
         let platform = if windows { Platform::Windows } else { Platform::MacOsLinux };
-        let d = render::document(&script_caps_preview(&strings, long_first), platform);
+        let d = render::document(Lang::En, &script_caps_preview(&strings, long_first), platform);
         prop_assert!(d.matches(IN_RECORD).count() >= 4);
         assert_inert(&d, platform);
     }
@@ -2558,6 +2639,7 @@ fn s06_script_caps_seed_cut_inside_an_emoji_sequence() {
     .into();
     for long_first in [true, false] {
         let d = render::document(
+            Lang::En,
             &script_caps_preview(&strings, long_first),
             Platform::Windows,
         );
@@ -3503,7 +3585,7 @@ fn audit_payload_document_is_sandboxed_text_tree() -> TestResult {
         "nested": {"k": "  two spaces"},
     });
     for platform in [Platform::MacOsLinux, Platform::Windows] {
-        let d = render::audit_payload_document(&serde_json::to_vec(&payload)?, platform);
+        let d = render::audit_payload_document(Lang::En, &serde_json::to_vec(&payload)?, platform);
         assert_inert(&d, platform);
         let body = body_of(&d);
         assert!(body.starts_with("<ul><li>object, 4 keys<ul>"), "{body}");
@@ -3533,21 +3615,22 @@ fn audit_payload_document_is_sandboxed_text_tree() -> TestResult {
 
     // A list past its row cap: the first DOC_MAX_ROWS items, then the note.
     let many: Vec<u32> = (0..u32::try_from(DOC_MAX_ROWS)? + 3).collect();
-    let d = render::audit_payload_document(&serde_json::to_vec(&many)?, Platform::MacOsLinux);
+    let d =
+        render::audit_payload_document(Lang::En, &serde_json::to_vec(&many)?, Platform::MacOsLinux);
     assert_inert(&d, Platform::MacOsLinux);
     assert!(d.contains(&format!("[{}]: ", DOC_MAX_ROWS - 1)));
     assert!(!d.contains(&format!("[{}]: ", DOC_MAX_ROWS)));
     assert!(
         d.contains(&format!(
             "<li>{}</li>",
-            render::more_in_raw_text(3, "items")
+            render::more_in_raw_text(Lang::En, 3, "items")
         )),
         "{}",
         &d[d.len().saturating_sub(400)..]
     );
 
     // Not JSON: the bytes as display text in a `<pre>`, an invalid byte as its escape.
-    let d = render::audit_payload_document(b"{\"a\": <b>\xff", Platform::MacOsLinux);
+    let d = render::audit_payload_document(Lang::En, b"{\"a\": <b>\xff", Platform::MacOsLinux);
     assert_inert(&d, Platform::MacOsLinux);
     assert_eq!(
         body_of(&d),
@@ -3555,7 +3638,7 @@ fn audit_payload_document_is_sandboxed_text_tree() -> TestResult {
     );
     // Larger than the tree cap: never parsed, shown as text.
     let big = serde_json::to_vec(&json!({"s": "x".repeat(render::AUDIT_TREE_MAX_BYTES)}))?;
-    let d = render::audit_payload_document(&big, Platform::MacOsLinux);
+    let d = render::audit_payload_document(Lang::En, &big, Platform::MacOsLinux);
     assert_inert(&d, Platform::MacOsLinux);
     assert!(
         body_of(&d).starts_with("<pre><code><bdi>{\"s\":\"xxx"),
@@ -3564,7 +3647,7 @@ fn audit_payload_document_is_sandboxed_text_tree() -> TestResult {
 
     // A Raw page: the display text the command layer projected, as text.
     let page = render::raw_display_last("<img src=x onerror=y>\u{200B}".as_bytes(), &[]).text;
-    let d = render::audit_payload_page_document(&page, Platform::Windows);
+    let d = render::audit_payload_page_document(Lang::En, &page, Platform::Windows);
     assert_inert(&d, Platform::Windows);
     assert_eq!(
         body_of(&d),
@@ -3577,7 +3660,7 @@ fn audit_payload_document_is_sandboxed_text_tree() -> TestResult {
 #[test]
 fn audit_payload_document_notes_a_cut_text() -> TestResult {
     let long = "y".repeat(DOC_MAX_BYTES + 10);
-    let d = render::audit_payload_page_document(&long, Platform::MacOsLinux);
+    let d = render::audit_payload_page_document(Lang::En, &long, Platform::MacOsLinux);
     assert_inert(&d, Platform::MacOsLinux);
     assert!(d.len() < DOC_MAX_BYTES + 64 * 1024, "{}", d.len());
     let body = body_of(&d);
@@ -3586,7 +3669,7 @@ fn audit_payload_document_notes_a_cut_text() -> TestResult {
     assert!(
         body.ends_with(&format!(
             "…</bdi></code></pre><p>{}</p>",
-            render::more_in_raw_text(u64::try_from(cut)?, "bytes")
+            render::more_in_raw_text(Lang::En, u64::try_from(cut)?, "bytes")
         )),
         "{}",
         &body[body.len().saturating_sub(300)..]
@@ -3610,12 +3693,12 @@ proptest! {
             object.insert(s.clone(), json!([s, i, {"inner": s}]));
         }
         let bytes = serde_json::to_vec(&serde_json::Value::Object(object)).unwrap_or_default();
-        let tree = render::audit_payload_document(&bytes, platform);
+        let tree = render::audit_payload_document(Lang::En, &bytes, platform);
         prop_assert!(tree.contains("<ul><li>object, "), "not a tree");
         assert_inert(&tree, platform);
         let page = render::raw_display_last(&bytes, &[]).text;
-        assert_inert(&render::audit_payload_page_document(&page, platform), platform);
-        let raw = render::audit_payload_document(strings.concat().as_bytes(), platform);
+        assert_inert(&render::audit_payload_page_document(Lang::En, &page, platform), platform);
+        let raw = render::audit_payload_document(Lang::En, strings.concat().as_bytes(), platform);
         assert_inert(&raw, platform);
     }
 }

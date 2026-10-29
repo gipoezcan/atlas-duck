@@ -134,6 +134,16 @@ pub enum LangPref {
     De,
 }
 
+impl From<Lang> for atlas_duck_preview::Lang {
+    /// M15 T10b: the preview document's language.
+    fn from(l: Lang) -> Self {
+        match l {
+            Lang::En => atlas_duck_preview::Lang::En,
+            Lang::De => atlas_duck_preview::Lang::De,
+        }
+    }
+}
+
 impl LangPref {
     /// The word on the wire and in the `ui-lang` file.
     pub fn as_str(self) -> &'static str {
