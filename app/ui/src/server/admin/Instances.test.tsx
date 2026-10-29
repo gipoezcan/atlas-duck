@@ -3,7 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { loadSession } from '../../shared/ipc/transport-http';
 import { RequireSession } from '../shell/RequireSession';
-import { ADMIN_TEXT, adminError, dialogs, Instances } from './Instances';
+import { en } from '../../shared/i18n/dict';
+import { adminError, dialogs, Instances } from './Instances';
+
+const ADMIN_TEXT = en.admin.instances;
 
 vi.mock('../../shared/ipc/transport-http', () => ({ loadSession: vi.fn(), csrf: () => 'csrf-1' }));
 

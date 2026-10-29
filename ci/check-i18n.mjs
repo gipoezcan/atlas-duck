@@ -50,6 +50,12 @@ export const I18N_SAME_ALLOWLIST = {
   "server.credentials.col_url": "URL is the same in German",
   "server.credentials.col_token": "Token is the German word (glossary)",
   "server.connected_apps.col_app": "App is the German word",
+  "admin.instances.alias": "Alias is the German word for the instance name",
+  "admin.instances.col_url": "URL is the same in German",
+  "admin.instances.col_proxy": "Proxy is the German word",
+  "admin.instances.none_value": "a dash, language-neutral",
+  "admin.auditor.title": "Auditor is the German role name (CONTEXT.md)",
+  "admin.export.title": "Export is the German word",
 };
 
 /** Dotted key paths of fixed-width texts (buttons, tray tooltip parts); German <= 1.5 x English + 4. */

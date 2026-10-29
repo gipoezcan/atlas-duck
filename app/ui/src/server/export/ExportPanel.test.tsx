@@ -1,7 +1,10 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { EXPORT_TEXT, ExportPanel, exportBrowser } from './ExportPanel';
+import { en } from '../../shared/i18n/dict';
+import { ExportPanel, exportBrowser } from './ExportPanel';
+
+const EXPORT_TEXT = en.admin.export;
 
 const BASE = '/api/me/audit/exports';
 const JOB = '0123456789abcdef0123456789abcdef';

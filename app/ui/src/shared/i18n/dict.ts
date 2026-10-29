@@ -1,3 +1,4 @@
+import { admin as deAdmin } from './de/admin';
 import { approvals as deApprovals } from './de/approvals';
 import { audit as deAudit } from './de/audit';
 import { common as deCommon } from './de/common';
@@ -7,6 +8,7 @@ import { running as deRunning } from './de/running';
 import { server as deServer } from './de/server';
 import { settings as deSettings } from './de/settings';
 import { setup as deSetup } from './de/setup';
+import { admin as enAdmin } from './en/admin';
 import { approvals as enApprovals } from './en/approvals';
 import { audit as enAudit } from './en/audit';
 import { common as enCommon } from './en/common';
@@ -29,6 +31,7 @@ export const en = {
   audit: enAudit,
   running: enRunning,
   server: enServer,
+  admin: enAdmin,
 } as const;
 
 /** German must satisfy the widened English type; a missing key does not compile. */
@@ -42,4 +45,5 @@ export const de: Dict = {
   audit: deAudit,
   running: deRunning,
   server: deServer,
+  admin: deAdmin,
 };

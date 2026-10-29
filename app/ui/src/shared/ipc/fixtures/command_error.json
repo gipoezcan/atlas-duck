@@ -133,7 +133,9 @@
     "error": {
       "banner": {
         "kind": "read_only",
-        "text": "config written by v9.9.0; settings read-only until you upgrade"
+        "parsed": true,
+        "text": "config written by v9.9.0; settings read-only until you upgrade",
+        "version": "v9.9.0"
       },
       "kind": "config_read_only"
     },

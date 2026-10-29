@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 
+import { useText } from '../../shared/i18n/context';
 import { api, arrayOf } from '../http';
 import { useSession } from '../shell/RequireSession';
 import { UserAudit } from './UserAudit';
@@ -9,21 +10,6 @@ import { UserAudit } from './UserAudit';
  * `/api/auditor/users/<id>/...`. The page is for the `auditor` role only: anyone else sees one line
  * and the page sends no request. Every read is recorded in the auditor's own chain (PD-258).
  */
-
-export const AUDITOR_TEXT = {
-  title: 'Auditor',
-  only: 'Auditors only.',
-  intro: 'Choose a user to read their audit chain. Every view is recorded in your own audit chain.',
-  search: 'Search by username',
-  state: 'State',
-  state_all: 'All',
-  state_active: 'Active',
-  state_deactivated: 'Deactivated',
-  loading: 'Loading…',
-  load_failed: 'The users could not be loaded.',
-  none: 'No user matches.',
-  back: 'Back to the users',
-} as const;
 
 export interface AuditedUser {
   user_id: string;
@@ -52,6 +38,7 @@ type StateFilter = 'all' | 'active' | 'deactivated';
 
 /** The user list with its search and state filter. */
 export function Users({ onPick }: { onPick: (u: AuditedUser) => void }) {
+  const t = useText();
   const [users, setUsers] = useState<AuditedUser[] | null>(null);
   const [failed, setFailed] = useState(false);
   const [query, setQuery] = useState('');
@@ -72,33 +59,33 @@ export function Users({ onPick }: { onPick: (u: AuditedUser) => void }) {
   if (failed) {
     return (
       <p role="alert" className="notice notice-danger">
-        {AUDITOR_TEXT.load_failed}
+        {t.admin.auditor.load_failed}
       </p>
     );
   }
-  if (users === null) return <p role="status">{AUDITOR_TEXT.loading}</p>;
+  if (users === null) return <p role="status">{t.admin.auditor.loading}</p>;
   const q = query.trim().toLowerCase();
   const shown = users.filter(
     (u) => (state === 'all' || u.state === state) && (q === '' || u.username.toLowerCase().includes(q)),
   );
   return (
-    <section aria-label="Users">
+    <section aria-label={t.admin.auditor.users}>
       <p>
         <label>
-          {AUDITOR_TEXT.search}{' '}
+          {t.admin.auditor.search}{' '}
           <input type="search" value={query} onChange={(e) => setQuery(e.target.value)} />
         </label>{' '}
         <label>
-          {AUDITOR_TEXT.state}{' '}
+          {t.admin.auditor.state}{' '}
           <select value={state} onChange={(e) => setState(e.target.value as StateFilter)}>
-            <option value="all">{AUDITOR_TEXT.state_all}</option>
-            <option value="active">{AUDITOR_TEXT.state_active}</option>
-            <option value="deactivated">{AUDITOR_TEXT.state_deactivated}</option>
+            <option value="all">{t.admin.auditor.state_all}</option>
+            <option value="active">{t.admin.auditor.state_active}</option>
+            <option value="deactivated">{t.admin.auditor.state_deactivated}</option>
           </select>
         </label>
       </p>
       {shown.length === 0 ? (
-        <p>{AUDITOR_TEXT.none}</p>
+        <p>{t.admin.auditor.none}</p>
       ) : (
         <ul className="auditor-users">
           {shown.map((u) => (
@@ -108,7 +95,7 @@ export function Users({ onPick }: { onPick: (u: AuditedUser) => void }) {
               </button>{' '}
               {u.display_name !== null ? <span>{u.display_name}</span> : null}{' '}
               <span className="muted">
-                {u.state === 'active' ? AUDITOR_TEXT.state_active : AUDITOR_TEXT.state_deactivated}
+                {u.state === 'active' ? t.admin.auditor.state_active : t.admin.auditor.state_deactivated}
               </span>
             </li>
           ))}
@@ -120,22 +107,23 @@ export function Users({ onPick }: { onPick: (u: AuditedUser) => void }) {
 
 /** The page: the role gate, the list, and the selected user's chain. */
 export function AuditorPage() {
+  const t = useText();
   const session = useSession();
   const [picked, setPicked] = useState<AuditedUser | null>(null);
   const auditor = session?.roles.includes('auditor') ?? false;
   if (!auditor) {
     return (
       <main className="window window-auditor">
-        <h1>{AUDITOR_TEXT.title}</h1>
-        <p role="alert">{AUDITOR_TEXT.only}</p>
+        <h1>{t.admin.auditor.title}</h1>
+        <p role="alert">{t.admin.auditor.only}</p>
       </main>
     );
   }
   if (picked === null) {
     return (
       <main className="window window-auditor">
-        <h1>{AUDITOR_TEXT.title}</h1>
-        <p>{AUDITOR_TEXT.intro}</p>
+        <h1>{t.admin.auditor.title}</h1>
+        <p>{t.admin.auditor.intro}</p>
         <Users onPick={setPicked} />
       </main>
     );
@@ -143,9 +131,9 @@ export function AuditorPage() {
   // The audit components render their own `main`; the back button sits above it.
   return (
     <>
-      <nav aria-label={AUDITOR_TEXT.title} className="window">
+      <nav aria-label={t.admin.auditor.title} className="window">
         <button type="button" onClick={() => setPicked(null)}>
-          {AUDITOR_TEXT.back}
+          {t.admin.auditor.back}
         </button>
       </nav>
       <UserAudit key={picked.user_id} user={picked} />

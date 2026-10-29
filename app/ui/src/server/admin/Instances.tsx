@@ -1,52 +1,24 @@
 import { type FormEvent, useCallback, useEffect, useState } from 'react';
 
+import type { Dict } from '../../shared/i18n';
+import { useText } from '../../shared/i18n/context';
+import { en } from '../../shared/i18n/dict';
 import { api, arrayOf, type InstanceView, isInstanceView, isNull } from '../http';
 import { useSession } from '../shell/RequireSession';
 
-export const ADMIN_TEXT = {
-  title: 'Instances',
-  admins_only: 'Admins only.',
-  intro: 'Every user sees these instances and enters their own token for each.',
-  load_failed: 'The instances could not be loaded.',
-  loading: 'Loading…',
-  none: 'No instance is configured.',
-  add_title: 'Add an instance',
-  alias: 'Alias',
-  product: 'Product',
-  base_url: 'Base URL',
-  proxy: 'Proxy (optional: direct, system or a proxy URL)',
-  org_ca: 'Use the organisation CA bundle',
-  is_default: 'Default instance for this product',
-  add: 'Add instance',
-  added: (alias: string) => `Instance ${alias} added.`,
-  remove: 'Remove',
-  remove_confirm: (alias: string) =>
-    `Remove the instance ${alias}? Every user's token for this instance will be deleted.`,
-  removed: (alias: string) => `Instance ${alias} removed.`,
-  yes: 'yes',
-  no: 'no',
-  errors: {
-    invalid:
-      'The instance is not valid: check the alias (letters, digits, - and _), the product, an https:// base URL, the proxy and that the product has only one default.',
-    exists: 'An instance with this alias exists already.',
-    unknown: 'This instance no longer exists.',
-    role: 'Admins only.',
-    failed: 'The change failed. Try again.',
-  },
-} as const;
-
-export function adminError(code: string | null): string {
+export function adminError(code: string | null, t: Dict = en): string {
+  const errors = t.admin.instances.errors;
   switch (code) {
     case 'instance/invalid':
-      return ADMIN_TEXT.errors.invalid;
+      return errors.invalid;
     case 'instance/exists':
-      return ADMIN_TEXT.errors.exists;
+      return errors.exists;
     case 'instance/unknown':
-      return ADMIN_TEXT.errors.unknown;
+      return errors.unknown;
     case 'auth/role_required':
-      return ADMIN_TEXT.errors.role;
+      return errors.role;
     default:
-      return ADMIN_TEXT.errors.failed;
+      return errors.failed;
   }
 }
 
@@ -56,6 +28,7 @@ export const dialogs = {
 };
 
 function AdminInstances() {
+  const t = useText();
   const [list, setList] = useState<InstanceView[] | null>(null);
   const [failed, setFailed] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -92,41 +65,41 @@ function AdminInstances() {
     };
     const r = await api('POST', '/api/admin/instances', isInstanceView, body);
     if (r.ok) {
-      setNotice(ADMIN_TEXT.added(r.value.alias));
+      setNotice(t.admin.instances.added(r.value.alias));
       setAlias('');
       setBaseUrl('');
       setProxy('');
       load();
     } else {
-      setError(adminError(r.code));
+      setError(adminError(r.code, t));
     }
   };
 
   const remove = async (a: string) => {
-    if (!dialogs.confirm(ADMIN_TEXT.remove_confirm(a))) return;
+    if (!dialogs.confirm(t.admin.instances.remove_confirm(a))) return;
     const r = await api('DELETE', `/api/admin/instances/${encodeURIComponent(a)}`, isNull);
-    setNotice(r.ok ? ADMIN_TEXT.removed(a) : adminError(r.ok ? null : r.code));
+    setNotice(r.ok ? t.admin.instances.removed(a) : adminError(r.ok ? null : r.code, t));
     load();
   };
 
   return (
     <>
-      <p>{ADMIN_TEXT.intro}</p>
+      <p>{t.admin.instances.intro}</p>
       {notice !== null ? <p role="status" className="notice notice-info">{notice}</p> : null}
-      {failed ? <p role="alert" className="notice notice-danger">{ADMIN_TEXT.load_failed}</p> : null}
-      {list === null && !failed ? <p role="status" className="notice notice-info">{ADMIN_TEXT.loading}</p> : null}
-      {list !== null && list.length === 0 ? <p>{ADMIN_TEXT.none}</p> : null}
+      {failed ? <p role="alert" className="notice notice-danger">{t.admin.instances.load_failed}</p> : null}
+      {list === null && !failed ? <p role="status" className="notice notice-info">{t.admin.instances.loading}</p> : null}
+      {list !== null && list.length === 0 ? <p>{t.admin.instances.none}</p> : null}
       {list !== null && list.length > 0 ? (
         <table>
           <thead>
             <tr>
-              <th scope="col">{ADMIN_TEXT.alias}</th>
-              <th scope="col">{ADMIN_TEXT.product}</th>
-              <th scope="col">URL</th>
-              <th scope="col">Proxy</th>
-              <th scope="col">Org CA</th>
-              <th scope="col">Default</th>
-              <th scope="col">Actions</th>
+              <th scope="col">{t.admin.instances.alias}</th>
+              <th scope="col">{t.admin.instances.product}</th>
+              <th scope="col">{t.admin.instances.col_url}</th>
+              <th scope="col">{t.admin.instances.col_proxy}</th>
+              <th scope="col">{t.admin.instances.col_org_ca}</th>
+              <th scope="col">{t.admin.instances.col_default}</th>
+              <th scope="col">{t.admin.instances.col_actions}</th>
             </tr>
           </thead>
           <tbody>
@@ -135,12 +108,12 @@ function AdminInstances() {
                 <td>{i.alias}</td>
                 <td>{i.product}</td>
                 <td>{i.base_url}</td>
-                <td>{i.proxy ?? '—'}</td>
-                <td>{i.ca_ref === 'org' ? ADMIN_TEXT.yes : ADMIN_TEXT.no}</td>
-                <td>{i.is_default ? ADMIN_TEXT.yes : ADMIN_TEXT.no}</td>
+                <td>{i.proxy ?? t.admin.instances.none_value}</td>
+                <td>{i.ca_ref === 'org' ? t.admin.instances.yes : t.admin.instances.no}</td>
+                <td>{i.is_default ? t.admin.instances.yes : t.admin.instances.no}</td>
                 <td>
                   <button type="button" onClick={() => void remove(i.alias)}>
-                    {ADMIN_TEXT.remove}
+                    {t.admin.instances.remove}
                   </button>
                 </td>
               </tr>
@@ -148,35 +121,35 @@ function AdminInstances() {
           </tbody>
         </table>
       ) : null}
-      <h2>{ADMIN_TEXT.add_title}</h2>
+      <h2>{t.admin.instances.add_title}</h2>
       <form className="server-form" onSubmit={(e) => void add(e)}>
         <label>
-          {ADMIN_TEXT.alias}
+          {t.admin.instances.alias}
           <input value={alias} onChange={(e) => setAlias(e.target.value)} required />
         </label>
         <label>
-          {ADMIN_TEXT.product}
+          {t.admin.instances.product}
           <select value={product} onChange={(e) => setProduct(e.target.value === 'confluence' ? 'confluence' : 'jira')}>
             <option value="jira">Jira</option>
             <option value="confluence">Confluence</option>
           </select>
         </label>
         <label>
-          {ADMIN_TEXT.base_url}
+          {t.admin.instances.base_url}
           <input type="url" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} required />
         </label>
         <label>
-          {ADMIN_TEXT.proxy}
+          {t.admin.instances.proxy}
           <input value={proxy} onChange={(e) => setProxy(e.target.value)} />
         </label>
         <label>
-          <input type="checkbox" checked={orgCa} onChange={(e) => setOrgCa(e.target.checked)} /> {ADMIN_TEXT.org_ca}
+          <input type="checkbox" checked={orgCa} onChange={(e) => setOrgCa(e.target.checked)} /> {t.admin.instances.org_ca}
         </label>
         <label>
           <input type="checkbox" checked={isDefault} onChange={(e) => setIsDefault(e.target.checked)} />{' '}
-          {ADMIN_TEXT.is_default}
+          {t.admin.instances.is_default}
         </label>
-        <button type="submit" className="primary">{ADMIN_TEXT.add}</button>
+        <button type="submit" className="primary">{t.admin.instances.add}</button>
         {error !== null ? <p role="alert" className="notice notice-danger">{error}</p> : null}
       </form>
     </>
@@ -185,12 +158,13 @@ function AdminInstances() {
 
 /** The admin instances page (SM-4.1, SM-2.5): admins only; others send no data request. */
 export function Instances() {
+  const t = useText();
   const session = useSession();
   const admin = session?.roles.includes('admin') ?? false;
   return (
     <main className="window window-admin">
-      <h1>{ADMIN_TEXT.title}</h1>
-      {admin ? <AdminInstances /> : <p role="alert" className="notice notice-danger">{ADMIN_TEXT.admins_only}</p>}
+      <h1>{t.admin.instances.title}</h1>
+      {admin ? <AdminInstances /> : <p role="alert" className="notice notice-danger">{t.admin.instances.admins_only}</p>}
     </main>
   );
 }

@@ -52,7 +52,9 @@
       "attention_mode": "badge_only",
       "config_read_only": {
         "kind": "read_only",
-        "text": "config written by v9.9.0; settings read-only until you upgrade"
+        "parsed": true,
+        "text": "config written by v9.9.0; settings read-only until you upgrade",
+        "version": "v9.9.0"
       },
       "health": {
         "anchor_dir_lines_pending": 3,
@@ -254,7 +256,9 @@
       "attention_mode": "badge_only",
       "config_read_only": {
         "kind": "read_only",
-        "text": "config written by v9.9.0; settings read-only until you upgrade"
+        "parsed": true,
+        "text": "config written by v9.9.0; settings read-only until you upgrade",
+        "version": "v9.9.0"
       },
       "health": {
         "anchor_dir_lines_pending": 3,

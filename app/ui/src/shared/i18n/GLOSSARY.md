@@ -101,3 +101,7 @@ never translated. A German leaf equal to its English one needs an allowlist entr
 | revoke (a key, a grant, a token) | widerrufen | "Widerrufen" is also the state |
 | sign in / sign out | anmelden / abmelden | |
 | admin (link in the header) | Administration | the role itself stays "Administrator" |
+| manifest (export) | Manifest | "SHA-256 des Manifests" |
+| anchor head | Anker-Kopf | |
+| organisation CA | Organisations-CA | "CA-Bundle der Organisation" in the long form |
+| default (instance) | Standard | "Standardinstanz" |

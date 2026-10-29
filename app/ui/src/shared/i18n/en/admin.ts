@@ -1,0 +1,87 @@
+/** The server admin, auditor and export pages (M15 T9): the former ADMIN_TEXT, AUDITOR_TEXT, USER_AUDIT_TEXT and EXPORT_TEXT. */
+export const admin = {
+  /** The admin instances page (SM-4.1, SM-2.5). */
+  instances: {
+    title: 'Instances',
+    admins_only: 'Admins only.',
+    intro: 'Every user sees these instances and enters their own token for each.',
+    load_failed: 'The instances could not be loaded.',
+    loading: 'Loading…',
+    none: 'No instance is configured.',
+    add_title: 'Add an instance',
+    alias: 'Alias',
+    product: 'Product',
+    base_url: 'Base URL',
+    proxy: 'Proxy (optional: direct, system or a proxy URL)',
+    org_ca: 'Use the organisation CA bundle',
+    is_default: 'Default instance for this product',
+    add: 'Add instance',
+    added: (alias: string) => `Instance ${alias} added.`,
+    remove: 'Remove',
+    remove_confirm: (alias: string) =>
+      `Remove the instance ${alias}? Every user's token for this instance will be deleted.`,
+    removed: (alias: string) => `Instance ${alias} removed.`,
+    col_url: 'URL',
+    col_proxy: 'Proxy',
+    col_org_ca: 'Org CA',
+    col_default: 'Default',
+    col_actions: 'Actions',
+    none_value: '—',
+    yes: 'yes',
+    no: 'no',
+    errors: {
+      invalid:
+        'The instance is not valid: check the alias (letters, digits, - and _), the product, an https:// base URL, the proxy and that the product has only one default.',
+      exists: 'An instance with this alias exists already.',
+      unknown: 'This instance no longer exists.',
+      role: 'Admins only.',
+      failed: 'The change failed. Try again.',
+    },
+  },
+  /** The auditor page (SM-6.4, PD-257) and the banner over a user's chain. */
+  auditor: {
+    title: 'Auditor',
+    only: 'Auditors only.',
+    intro: 'Choose a user to read their audit chain. Every view is recorded in your own audit chain.',
+    search: 'Search by username',
+    state: 'State',
+    state_all: 'All',
+    state_active: 'Active',
+    state_deactivated: 'Deactivated',
+    loading: 'Loading…',
+    load_failed: 'The users could not be loaded.',
+    none: 'No user matches.',
+    back: 'Back to the users',
+    users: 'Users',
+    recorded_view: 'Recorded view',
+    banner: (username: string) =>
+      `You are viewing ${username}'s audit chain. Every view is recorded in your own audit chain.`,
+  },
+  /** The export panel (M14 PD-254..PD-256). */
+  export: {
+    title: 'Export',
+    intro:
+      'Exports the audit chain as a tar archive that anyone can verify offline with atlas-duck verify-export.',
+    range_all: 'All records',
+    range_from: 'From date (UTC)',
+    start: 'Start export',
+    starting: 'Starting…',
+    running: (done: number, total: number) =>
+      total > 0 ? `Exporting… ${done} of ${total} records` : 'Exporting…',
+    done: 'The export is ready. It can be downloaded once.',
+    download: 'Download',
+    manifest: 'Manifest SHA-256',
+    anchor: 'Anchor head',
+    verify: 'Verify with',
+    copy: 'Copy',
+    copied: 'Copied.',
+    copy_failed: 'Copying failed; select the text instead.',
+    out_of_band:
+      'Give the recipient the manifest SHA-256 and the anchor head by another channel than the archive.',
+    busy: 'An export is already running. Start again when it has finished.',
+    expired: 'This export is no longer available. Start a new one.',
+    failed: 'The export failed. Start a new one.',
+    start_failed: 'The export could not be started. Try again.',
+    bad_date: 'Enter a date, or choose all records.',
+  },
+} as const;
