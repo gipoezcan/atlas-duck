@@ -559,7 +559,7 @@ fn confluence_extras() -> Vec<(&'static str, Preview)> {
         "write",
         "confluence.page.update",
         PreviewBody::Conflict {
-            summary: warning::conflict(5, 6),
+            summary: warning::conflict(5, 6).into(),
             diff_text: "base version v5, current version v6".into(),
             base_to_current: line_diff("# Plan\nold line\nend\n", "# Plan\ncurrent line\nend\n")
                 .lines,
@@ -2370,7 +2370,7 @@ fn script_result_document_table_and_tree() {
         "{d}"
     );
     // The host-computed lossy warning is on the Info line.
-    assert!(d.contains(&warning::host_calls_lossy(1)), "{d}");
+    assert!(d.contains(warning::host_calls_lossy(1).as_str()), "{d}");
 
     // A table view (the M7 list rule) goes through the table arm.
     let mut t = p.clone();

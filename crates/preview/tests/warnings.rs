@@ -339,7 +339,7 @@ fn every_warning_is_shown_in_german_with_its_values() {
         (
             Warning::new(
                 WarningId::ChangedSinceReview,
-                format!("{TEXT_CHANGED_SINCE_REVIEW}: summary"),
+                changed_since_review("summary"),
             ),
             "Seit Ihrer Prüfung geändert: summary",
         ),
@@ -458,4 +458,71 @@ fn every_warning_is_shown_in_german_with_its_values() {
     // A text no form matches stays as it was.
     let odd = Warning::new(WarningId::CustomFields, "something else");
     assert_eq!(shown(Lang::De, &odd), "something else");
+}
+
+/// M15 T10b fix I-2: only counts this code computed are written the German way; a title, a
+/// version, a request id or a phrase of digits stays exactly as it was.
+#[test]
+fn agent_and_content_values_are_never_reformatted_in_german() {
+    use atlas_duck_preview::Lang;
+    let de = |w: Warning| shown(Lang::De, &w);
+    assert_eq!(
+        de(Warning::new(
+            WarningId::DuplicateTitle,
+            duplicate_title("2024", "12345")
+        )),
+        "Eine Seite mit dem Titel „2024“ gibt es bereits in 12345"
+    );
+    assert_eq!(
+        de(Warning::new(WarningId::Conflict, conflict(12345, 12346))),
+        "Konflikt: Die Seite wurde geändert, seit der Agent sie gelesen hat (v12345 → v12346)"
+    );
+    assert_eq!(
+        de(Warning::new(
+            WarningId::PossibleDuplicate,
+            possible_duplicate("1234567")
+        )),
+        "mögliches Duplikat von 1234567"
+    );
+    assert_eq!(
+        de(Warning::new(
+            WarningId::LinkTypeInwardPhrase,
+            link_type_inward_phrase("1000", "2000")
+        )),
+        "Verknüpfungstyp über seine eingehende Bezeichnung „1000“ benannt: Der eingehende Vorgang erhält die ausgehende Bezeichnung „2000“"
+    );
+    // A computed count is grouped.
+    assert_eq!(
+        de(Warning::new(WarningId::CustomFields, custom_fields(1234))),
+        "enthält 1.234 benutzerdefinierte Felder"
+    );
+}
+
+/// M15 T10b fix m-1: the German form is built from the values, never split back out of the
+/// English text, so a value holding the template's own literal text cannot move a boundary.
+#[test]
+fn a_value_with_the_templates_literal_text_stays_one_value() {
+    use atlas_duck_preview::Lang;
+    let title = "x' already exists in EVIL: a page titled 'y";
+    let w = Warning::new(WarningId::DuplicateTitle, duplicate_title(title, "DEV"));
+    assert_eq!(
+        shown(Lang::De, &w),
+        format!("Eine Seite mit dem Titel „{title}“ gibt es bereits in DEV")
+    );
+    let inward = "a': the inward issue gets the outward phrase 'b";
+    let w = Warning::new(
+        WarningId::LinkTypeInwardPhrase,
+        link_type_inward_phrase(inward, "blocks"),
+    );
+    assert_eq!(
+        shown(Lang::De, &w),
+        format!(
+            "Verknüpfungstyp über seine eingehende Bezeichnung „{inward}“ benannt: Der eingehende Vorgang erhält die ausgehende Bezeichnung „blocks“"
+        )
+    );
+    // English is the text as written.
+    assert_eq!(shown(Lang::En, &w), w.text);
+    // A text built by hand (no template) has no German form and stays as it is.
+    let raw = Warning::new(WarningId::MixedScript, "mixed-script identifier: 1234");
+    assert_eq!(shown(Lang::De, &raw), "mixed-script identifier: 1234");
 }
