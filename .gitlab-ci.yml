@@ -62,6 +62,8 @@ ui:
 
 rust:test:
   stage: check
+  # The whole workspace with CARGO_BUILD_JOBS=1 outgrew the default 1h (pipeline 43216).
+  timeout: 2h 30m
   needs:
     - job: ui
       artifacts: true
