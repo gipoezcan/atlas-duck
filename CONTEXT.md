@@ -76,6 +76,14 @@ _Avoid_: password, secret (too broad)
 The end-user documentation for users, admins and auditors, in English and German, shipped with the desktop app and served by the server; opened from the "Help" entry.
 _Avoid_: docs, documentation (too broad: the operations docs are separate), manual
 
+**UI language**:
+The language (English or German) a user's windows and web pages, notifications and native dialogs are shown in; agent-facing text, audit records, logs, the CLI and the operations docs stay English.
+_Avoid_: locale (that is the OS or browser setting the choice may follow), translation
+
+**Language preference**:
+A user's choice of **UI language**: Automatic (German when the OS or browser language is German, else English), Deutsch or English; per user in **Server mode**, an app setting in **Desktop mode**; not audited.
+_Avoid_: language setting (ambiguous with the OS locale)
+
 **Operations docs**:
 The documentation for the people who deploy and run the server; kept in the repository, never shipped to users.
 _Avoid_: admin docs (an **Admin** is a user role, not an operator)

@@ -858,7 +858,10 @@ Each milestone entry lists: scope (§14, with the placements this plan makes whe
 - **Tests:** existing UI tests keep running in English; new tests check German completeness and run key flows in German.
 - **Depends on:** M14.
 - **Exit criterion:** every window and web page renders fully in German when chosen; the language setting works in both modes; completeness check and German flow tests green in CI (GitHub and GitLab); deployed to production.
-- **Status:** not started.
+- **Status:** implemented on branch `m15-german-ui` (2026-10-29, plan `2026-10-28-atlas-duck-m15-german-ui.md`, Tasks 1–11 and 10b reviewed); final review, merge and production deploy pending (Task 12).
+- **Delivered:** typed English/German dictionary with compile-time and CI completeness (`ci/check-i18n.mjs`) and a branch-wide control-byte check; desktop preference in `<data dir>/ui-lang` (Settings), server preference `users.lang_pref` (schema v4, `PUT /api/me/preferences`, header switch; `auto` follows `Accept-Language` by weight); every desktop window, server page, notification, toast, tray text and native dialog in German; preview labels, notes and warnings in the reader's language (content and agent text untouched); core-built confirmations in the UI language with `dialog_lang` recorded next to `dialog_text_sha256` (additive; older records verify as before).
+- **Accepted English residuals:** core-built fact strings and `body_digest_line` inside the request text; the `NO_NEWLINE_AT_END` marker; the " [mixed scripts]" suffix; the failure-class value "network error after send"; the deny-reason prefill; the Recent list's `error_text`; the onboarding sections' copyable text (written for agents); core's edit-validator message (PD-293); the Confluence conflict card's `summary` and `diff_text`; the Jira field-conflict warning (`ops/jira.rs`); plus everything agents, the CLI, audit records and logs carry (by design).
+- **Parked review minors:** m-4 the server reads `lang_pref` synchronously in async handlers (as other handlers do); m-5 an agent named exactly the UI's "no agent name" word looks like a nameless session (pre-existing).
 
 ### M16 — User guide
 
