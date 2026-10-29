@@ -1,5 +1,6 @@
 import { createContext, type ReactNode, useContext, useEffect, useState } from 'react';
 
+import { useText } from '../../shared/i18n/context';
 import { loadSession, type SessionInfo } from '../../shared/ipc/transport-http';
 import { useServerLangPref } from './ServerLangRoot';
 
@@ -28,6 +29,7 @@ export const nav = {
  */
 export function RequireSession({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<SessionInfo | null>(null);
+  const t = useText();
   const setPref = useServerLangPref()?.setPref;
   useEffect(() => {
     let live = true;
@@ -50,6 +52,6 @@ export function RequireSession({ children }: { children: ReactNode }) {
       live = false;
     };
   }, [setPref]);
-  if (session === null) return <p role="status" className="window muted">Loading…</p>;
+  if (session === null) return <p role="status" className="window muted">{t.server.header.loading}</p>;
   return <SessionContext.Provider value={session}>{children}</SessionContext.Provider>;
 }

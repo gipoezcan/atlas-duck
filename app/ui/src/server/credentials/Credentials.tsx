@@ -1,38 +1,13 @@
 import { type FormEvent, useCallback, useEffect, useState } from 'react';
 
+import type { Dict } from '../../shared/i18n';
+import { useText } from '../../shared/i18n/context';
+import { en } from '../../shared/i18n/dict';
 import { api, arrayOf, type InstancePatRow, isInstancePatRow, isNull, isPatStored } from '../http';
 
-export const CRED_TEXT = {
-  title: 'Credentials',
-  intro: 'Your personal access token for each instance. atlas-duck never shows a stored token.',
-  load_failed: 'The instances could not be loaded.',
-  loading: 'Loading…',
-  none_configured: 'No instance is configured yet. An admin adds instances.',
-  add: 'Add token',
-  replace: 'Replace token',
-  remove: 'Remove',
-  save: 'Check and save',
-  cancel: 'Cancel',
-  token_label: (alias: string) => `Personal access token for ${alias}`,
-  state: { none: 'No token', stored: 'Token stored', invalid: 'Token stored, not usable' },
-  as_user: (name: string) => `as ${name}`,
-  saved: (alias: string) => `The token for ${alias} is saved.`,
-  removed: (alias: string) => `The token for ${alias} is removed.`,
-  remove_confirm: (alias: string) => `Remove your token for ${alias}?`,
-  errors: {
-    check_failed: 'The instance refused this token. Check it and try again.',
-    other_user: 'This token belongs to another Atlassian user. Remove the stored token first.',
-    instance_unusable: 'This instance cannot be used right now. Ask an admin.',
-    unreachable: 'The instance cannot be reached. Try again later.',
-    unknown_instance: 'This instance no longer exists.',
-    bad_request: 'The token is empty or too long.',
-    failed: 'Saving failed. Try again.',
-  },
-} as const;
-
 /** The text for a failed `PUT /api/me/pats/{alias}`. */
-export function patError(code: string | null, reason: string | null): string {
-  const e = CRED_TEXT.errors;
+export function patError(code: string | null, reason: string | null, t: Dict = en): string {
+  const e = t.server.credentials.errors;
   switch (code) {
     case 'pat/check_failed':
       if (reason === 'other_user') return e.other_user;
@@ -63,6 +38,7 @@ function TokenForm({
   onDone: (message: string) => void;
   onCancel: () => void;
 }) {
+  const t = useText();
   const [token, setToken] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -75,13 +51,13 @@ function TokenForm({
     setToken('');
     const r = await api('PUT', `/api/me/pats/${encodeURIComponent(alias)}`, isPatStored, { pat });
     setBusy(false);
-    if (r.ok) onDone(CRED_TEXT.saved(alias));
-    else setError(patError(r.code, r.reason));
+    if (r.ok) onDone(t.server.credentials.saved(alias));
+    else setError(patError(r.code, r.reason, t));
   };
   return (
     <form className="server-form" onSubmit={(e) => void submit(e)}>
       <label>
-        {CRED_TEXT.token_label(alias)}
+        {t.server.credentials.token_label(alias)}
         <input
           type="password"
           autoComplete="off"
@@ -93,10 +69,10 @@ function TokenForm({
       </label>
       <div>
         <button type="submit" className="primary" disabled={busy}>
-          {CRED_TEXT.save}
+          {t.server.credentials.save}
         </button>{' '}
         <button type="button" onClick={onCancel}>
-          {CRED_TEXT.cancel}
+          {t.server.credentials.cancel}
         </button>
       </div>
       {error !== null ? <p role="alert" className="notice notice-danger">{error}</p> : null}
@@ -106,6 +82,7 @@ function TokenForm({
 
 /** The credentials page (SM-4.2): one row per admin instance with this user's PAT state. */
 export function Credentials() {
+  const t = useText();
   const [rows, setRows] = useState<InstancePatRow[] | null>(null);
   const [failed, setFailed] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
@@ -124,29 +101,29 @@ export function Credentials() {
   useEffect(load, [load]);
 
   const remove = async (alias: string) => {
-    if (!dialogs.confirm(CRED_TEXT.remove_confirm(alias))) return;
+    if (!dialogs.confirm(t.server.credentials.remove_confirm(alias))) return;
     const r = await api('DELETE', `/api/me/pats/${encodeURIComponent(alias)}`, isNull);
-    setNotice(r.ok ? CRED_TEXT.removed(alias) : patError(r.ok ? null : r.code, null));
+    setNotice(r.ok ? t.server.credentials.removed(alias) : patError(r.ok ? null : r.code, null, t));
     load();
   };
 
   return (
     <main className="window window-credentials">
-      <h1>{CRED_TEXT.title}</h1>
-      <p>{CRED_TEXT.intro}</p>
+      <h1>{t.server.credentials.title}</h1>
+      <p>{t.server.credentials.intro}</p>
       {notice !== null ? <p role="status" className="notice notice-info">{notice}</p> : null}
-      {failed ? <p role="alert" className="notice notice-danger">{CRED_TEXT.load_failed}</p> : null}
-      {rows === null && !failed ? <p role="status" className="notice notice-info">{CRED_TEXT.loading}</p> : null}
-      {rows !== null && rows.length === 0 ? <p>{CRED_TEXT.none_configured}</p> : null}
+      {failed ? <p role="alert" className="notice notice-danger">{t.server.credentials.load_failed}</p> : null}
+      {rows === null && !failed ? <p role="status" className="notice notice-info">{t.server.credentials.loading}</p> : null}
+      {rows !== null && rows.length === 0 ? <p>{t.server.credentials.none_configured}</p> : null}
       {rows !== null && rows.length > 0 ? (
         <table>
           <thead>
             <tr>
-              <th scope="col">Instance</th>
-              <th scope="col">Product</th>
-              <th scope="col">URL</th>
-              <th scope="col">Token</th>
-              <th scope="col">Actions</th>
+              <th scope="col">{t.server.credentials.col_instance}</th>
+              <th scope="col">{t.server.credentials.col_product}</th>
+              <th scope="col">{t.server.credentials.col_url}</th>
+              <th scope="col">{t.server.credentials.col_token}</th>
+              <th scope="col">{t.server.credentials.col_actions}</th>
             </tr>
           </thead>
           <tbody>
@@ -156,8 +133,8 @@ export function Credentials() {
                 <td>{row.product}</td>
                 <td>{row.base_url}</td>
                 <td>
-                  {CRED_TEXT.state[row.pat]}
-                  {row.identity !== null ? ` (${CRED_TEXT.as_user(row.identity)})` : ''}
+                  {t.server.credentials.state[row.pat]}
+                  {row.identity !== null ? ` (${t.server.credentials.as_user(row.identity)})` : ''}
                 </td>
                 <td>
                   {editing === row.alias ? (
@@ -173,13 +150,13 @@ export function Credentials() {
                   ) : (
                     <>
                       <button type="button" onClick={() => setEditing(row.alias)}>
-                        {row.pat === 'none' ? CRED_TEXT.add : CRED_TEXT.replace}
+                        {row.pat === 'none' ? t.server.credentials.add : t.server.credentials.replace}
                       </button>
                       {row.pat !== 'none' ? (
                         <>
                           {' '}
                           <button type="button" onClick={() => void remove(row.alias)}>
-                            {CRED_TEXT.remove}
+                            {t.server.credentials.remove}
                           </button>
                         </>
                       ) : null}

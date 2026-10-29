@@ -3,7 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { loadSession, type SessionInfo } from '../../shared/ipc/transport-http';
 import { nav, RequireSession } from './RequireSession';
-import { SHELL_TEXT, ServerHeader } from './ServerHeader';
+import { en } from '../../shared/i18n/dict';
+import { ServerHeader } from './ServerHeader';
+
+const SHELL_TEXT = en.server.header;
 
 vi.mock('../../shared/ipc/transport-http', () => ({
   loadSession: vi.fn(),

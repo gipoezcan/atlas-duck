@@ -95,3 +95,9 @@ never translated. A German leaf equal to its English one needs an allowlist entr
 | candidate cache | Kandidaten-Cache | |
 | backlog (pruning) | Rückstand | |
 | heap (script limit) | Heap | stays English |
+| scope (API key, OAuth) | Berechtigung | the wire names read, propose_write, scripts stay as they are |
+| credentials (the server page) | Zugangsdaten | the page title; "Token" for the item |
+| connected apps | Verbundene Apps | |
+| revoke (a key, a grant, a token) | widerrufen | "Widerrufen" is also the state |
+| sign in / sign out | anmelden / abmelden | |
+| admin (link in the header) | Administration | the role itself stays "Administrator" |

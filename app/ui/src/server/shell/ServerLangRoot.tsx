@@ -18,7 +18,7 @@ export function useServerLangPref(): ServerLangPref | null {
 
 /** The browser's language: `navigator.language`, then the first of `navigator.languages`. */
 export function browserLocale(): string | undefined {
-  return navigator.language || navigator.languages[0];
+  return navigator.language || navigator.languages?.[0];
 }
 
 /**

@@ -130,4 +130,46 @@ describe('server language (M15 T4)', () => {
     await flush();
     expect(document.documentElement.lang).toBe('en');
   });
+
+  it('rapid_changes_are_sent_in_order_and_the_last_wins', async () => {
+    browserLanguage('en-US');
+    vi.mocked(loadSession).mockResolvedValue(session());
+    const answers: ((r: Response) => void)[] = [];
+    const fetchMock = vi.fn().mockImplementation(
+      () => new Promise<Response>((resolve) => answers.push(resolve)),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    shell();
+    await flush();
+    const label = () => screen.getByRole('combobox', { name: /Language|Sprache/ }) as HTMLSelectElement;
+    fireEvent.change(label(), { target: { value: 'de' } });
+    fireEvent.change(label(), { target: { value: 'en' } });
+    await flush();
+    // Only the first PUT is out; the second waits for it, so the store ends on the last choice.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String((fetchMock.mock.calls[0] as [string, RequestInit])[1].body))).toEqual({ lang_pref: 'de' });
+    // While saving, the select shows the last choice and is marked busy.
+    expect(label().value).toBe('en');
+    expect(label().closest('label')?.getAttribute('aria-busy')).toBe('true');
+    answers[0]?.(new Response(null, { status: 204 }));
+    await flush();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(String((fetchMock.mock.calls[1] as [string, RequestInit])[1].body))).toEqual({ lang_pref: 'en' });
+    // The stale answer did not switch the page.
+    expect(document.documentElement.lang).toBe('en');
+    answers[1]?.(new Response(null, { status: 204 }));
+    await flush();
+    expect(document.documentElement.lang).toBe('en');
+    expect(label().value).toBe('en');
+    expect(label().closest('label')?.getAttribute('aria-busy')).toBe('false');
+  });
+
+  it('a_browser_without_navigator_languages_does_not_break_the_page', async () => {
+    vi.spyOn(navigator, 'language', 'get').mockReturnValue('');
+    vi.spyOn(navigator, 'languages', 'get').mockReturnValue(undefined as unknown as string[]);
+    vi.mocked(loadSession).mockResolvedValue(session());
+    shell();
+    await flush();
+    expect(document.documentElement.lang).toBe('en');
+  });
 });

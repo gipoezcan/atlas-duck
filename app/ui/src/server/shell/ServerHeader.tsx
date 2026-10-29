@@ -1,22 +1,10 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 
 import { LANG_PREFS, type LangPref } from '../../shared/i18n';
 import { useText } from '../../shared/i18n/context';
 import { csrf } from '../../shared/ipc/transport-http';
 import { nav, useSession } from './RequireSession';
 import { saveLangPref, useServerLangPref } from './ServerLangRoot';
-
-export const SHELL_TEXT = {
-  approvals: 'Approvals',
-  credentials: 'Credentials',
-  api_keys: 'API keys',
-  connected_apps: 'Connected apps',
-  my_audit: 'My audit',
-  admin: 'Admin',
-  auditor: 'Auditor',
-  sign_out: 'Sign out',
-  sign_out_failed: 'Signing out failed. Try again.',
-} as const;
 
 /** `POST /api/logout` (cookie + CSRF + Origin), then the login page. */
 export async function signOut(): Promise<boolean> {
@@ -42,7 +30,15 @@ export function ServerHeader() {
   const session = useSession();
   const [failed, setFailed] = useState(false);
   const [langFailed, setLangFailed] = useState(false);
+  // The choice whose PUT is in flight (null when none): shown in the select at once, so it does
+  // not snap back to the old value until the answer arrives.
+  const [pending, setPending] = useState<LangPref | null>(null);
+  // The choices are sent one after the other and only the last one is applied, so the stored
+  // preference and the page always end on the last choice (M15 T4 review).
+  const latest = useRef(0);
+  const queue = useRef<Promise<unknown>>(Promise.resolve());
   const t = useText();
+  const h = t.server.header;
   const langPref = useServerLangPref();
   const label: Record<LangPref, string> = {
     auto: t.common.lang_auto,
@@ -51,7 +47,13 @@ export function ServerHeader() {
   };
   // M15 T4 (PD-295): stored first, then switched in place (no reload).
   const chooseLang = (value: LangPref) => {
-    void saveLangPref(value).then((ok) => {
+    const mine = ++latest.current;
+    setPending(value);
+    const saved = queue.current.then(() => saveLangPref(value));
+    queue.current = saved;
+    void saved.then((ok) => {
+      if (mine !== latest.current) return;
+      setPending(null);
       setLangFailed(!ok);
       if (ok) langPref?.setPref(value);
     });
@@ -60,19 +62,19 @@ export function ServerHeader() {
   const auditor = session?.roles.includes('auditor') ?? false;
   return (
     <header className="app-header server-header">
-      <nav aria-label="Pages">
-        <a href="/approvals">{SHELL_TEXT.approvals}</a>
-        <a href="/credentials">{SHELL_TEXT.credentials}</a>
-        <a href="/api-keys">{SHELL_TEXT.api_keys}</a>
-        <a href="/connected-apps">{SHELL_TEXT.connected_apps}</a>
-        <a href="/audit">{SHELL_TEXT.my_audit}</a>
-        {auditor ? <a href="/auditor">{SHELL_TEXT.auditor}</a> : null}
-        {admin ? <a href="/admin">{SHELL_TEXT.admin}</a> : null}
+      <nav aria-label={h.pages}>
+        <a href="/approvals">{h.approvals}</a>
+        <a href="/credentials">{h.credentials}</a>
+        <a href="/api-keys">{h.api_keys}</a>
+        <a href="/connected-apps">{h.connected_apps}</a>
+        <a href="/audit">{h.my_audit}</a>
+        {auditor ? <a href="/auditor">{h.auditor}</a> : null}
+        {admin ? <a href="/admin">{h.admin}</a> : null}
         {langPref === null ? null : (
-          <label>
-            {t.common.language}{' '}
+          <label className="server-lang" aria-busy={pending !== null}>
+            {t.common.language}
             <select
-              value={langPref.pref}
+              value={pending ?? langPref.pref}
               onChange={(e) => {
                 const value = LANG_PREFS.find((p) => p === e.target.value);
                 if (value !== undefined) chooseLang(value);
@@ -93,10 +95,10 @@ export function ServerHeader() {
             void signOut().then((ok) => setFailed(!ok));
           }}
         >
-          {SHELL_TEXT.sign_out}
+          {h.sign_out}
         </button>
       </nav>
-      {failed ? <p role="alert" className="notice notice-danger">{SHELL_TEXT.sign_out_failed}</p> : null}
+      {failed ? <p role="alert" className="notice notice-danger">{h.sign_out_failed}</p> : null}
       {langFailed ? <p role="alert" className="notice notice-danger">{t.common.lang_save_failed}</p> : null}
     </header>
   );

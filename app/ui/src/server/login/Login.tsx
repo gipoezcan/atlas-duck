@@ -1,19 +1,10 @@
 import { type FormEvent, useState } from 'react';
 
-import { nav } from '../shell/RequireSession';
+import type { Dict } from '../../shared/i18n';
+import { useText } from '../../shared/i18n/context';
+import { en } from '../../shared/i18n/dict';
 
-export const LOGIN_TEXT = {
-  title: 'Sign in to atlas-duck',
-  username: 'Username',
-  password: 'Password',
-  submit: 'Sign in',
-  invalid_credentials: 'Username or password is wrong.',
-  rate_limited: (minutes: number) =>
-    `Too many attempts. Try again in ${minutes} ${minutes === 1 ? 'minute' : 'minutes'}.`,
-  directory_unavailable: 'The directory cannot be reached. Try again later.',
-  not_permitted: 'Your account is not permitted to use atlas-duck.',
-  failed: 'Signing in failed. Try again.',
-} as const;
+import { nav } from '../shell/RequireSession';
 
 const HOME = '/approvals';
 
@@ -30,19 +21,20 @@ export function safeNext(raw: string | null): string {
 }
 
 /** The fixed text for a failed `POST /api/login`. */
-export function loginError(code: string | undefined, retryAfterS: number | null): string {
+export function loginError(code: string | undefined, retryAfterS: number | null, t: Dict = en): string {
+  const l = t.server.login;
   switch (code) {
     case 'auth/invalid_credentials':
     case 'auth/empty_password':
-      return LOGIN_TEXT.invalid_credentials;
+      return l.invalid_credentials;
     case 'auth/rate_limited':
-      return LOGIN_TEXT.rate_limited(Math.max(1, Math.ceil((retryAfterS ?? 60) / 60)));
+      return l.rate_limited(Math.max(1, Math.ceil((retryAfterS ?? 60) / 60)));
     case 'auth/directory_unavailable':
-      return LOGIN_TEXT.directory_unavailable;
+      return l.directory_unavailable;
     case 'auth/not_permitted':
-      return LOGIN_TEXT.not_permitted;
+      return l.not_permitted;
     default:
-      return LOGIN_TEXT.failed;
+      return l.failed;
   }
 }
 
@@ -63,6 +55,7 @@ async function codeOf(res: Response): Promise<string | undefined> {
 }
 
 export function Login({ next }: { next: string | null }) {
+  const t = useText();
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -83,7 +76,7 @@ export function Login({ next }: { next: string | null }) {
     } catch {
       setPassword('');
       setBusy(false);
-      setError(LOGIN_TEXT.failed);
+      setError(t.server.login.failed);
       return;
     }
     // The password never outlives the attempt.
@@ -93,16 +86,16 @@ export function Login({ next }: { next: string | null }) {
       return;
     }
     const retry = Number(res.headers.get('Retry-After'));
-    setError(loginError(await codeOf(res), Number.isFinite(retry) && retry > 0 ? retry : null));
+    setError(loginError(await codeOf(res), Number.isFinite(retry) && retry > 0 ? retry : null, t));
     setBusy(false);
   };
 
   return (
     <main className="window window-login">
-      <h1>{LOGIN_TEXT.title}</h1>
+      <h1>{t.server.login.title}</h1>
       <form className="server-form" onSubmit={(e) => void submit(e)}>
         <label>
-          {LOGIN_TEXT.username}
+          {t.server.login.username}
           <input
             name="username"
             autoComplete="username"
@@ -112,7 +105,7 @@ export function Login({ next }: { next: string | null }) {
           />
         </label>
         <label>
-          {LOGIN_TEXT.password}
+          {t.server.login.password}
           <input
             name="password"
             type="password"
@@ -123,7 +116,7 @@ export function Login({ next }: { next: string | null }) {
           />
         </label>
         <button type="submit" className="primary" disabled={busy}>
-          {LOGIN_TEXT.submit}
+          {t.server.login.submit}
         </button>
         {error !== null ? <p role="alert" className="notice notice-danger">{error}</p> : null}
       </form>

@@ -6,7 +6,8 @@ import { on } from '../../shared/ipc/events';
 import { appStatus, previewFetch, queueList, recentList } from '../../shared/ipc/invoke';
 import type { QueueItem } from '../../shared/ipc/types';
 import { loadSession } from '../../shared/ipc/transport-http';
-import { NOTIFY_TEXT, type NotifyEnv } from './notify';
+import { en } from '../../shared/i18n/dict';
+import type { NotifyEnv } from './notify';
 import { ServerApprovals } from './ServerApprovals';
 
 vi.mock('../../shared/ipc/invoke', () => ({
@@ -78,9 +79,9 @@ describe('ServerApprovals', () => {
     render(<ServerApprovals item={null} env={quietEnv(request)} />);
     await flush();
     expect(request).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: NOTIFY_TEXT.enable }));
+    fireEvent.click(screen.getByRole('button', { name: en.server.approvals.enable }));
     await flush();
     expect(request).toHaveBeenCalledTimes(1);
-    expect(screen.getByText(NOTIFY_TEXT.enabled)).toBeTruthy();
+    expect(screen.getByText(en.server.approvals.enabled)).toBeTruthy();
   });
 });

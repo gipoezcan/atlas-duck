@@ -2,7 +2,10 @@ import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { isInstancePatRow } from '../http';
-import { CRED_TEXT, Credentials, dialogs, patError } from './Credentials';
+import { Credentials, dialogs, patError } from './Credentials';
+import { en } from '../../shared/i18n/dict';
+
+const CRED_TEXT = en.server.credentials;
 
 vi.mock('../../shared/ipc/transport-http', () => ({ csrf: () => 'csrf-1' }));
 

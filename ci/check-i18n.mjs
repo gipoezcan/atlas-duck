@@ -42,6 +42,14 @@ export const I18N_SAME_ALLOWLIST = {
   "settings.product.jira": "a product name",
   "settings.product.confluence": "a product name",
   "settings.limits": "Limits is the usual German IT word",
+  "server.header.auditor": "Auditor is the German role name (CONTEXT.md)",
+  "server.api_keys.name": "Name is the same German word",
+  "server.api_keys.col_name": "Name is the same German word",
+  "server.api_keys.never": "a dash, language-neutral",
+  "server.connected_apps.never": "a dash, language-neutral",
+  "server.credentials.col_url": "URL is the same in German",
+  "server.credentials.col_token": "Token is the German word (glossary)",
+  "server.connected_apps.col_app": "App is the German word",
 };
 
 /** Dotted key paths of fixed-width texts (buttons, tray tooltip parts); German <= 1.5 x English + 4. */
