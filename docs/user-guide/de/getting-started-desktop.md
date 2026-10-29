@@ -16,7 +16,7 @@ atlas-duck installiert drei Programme nebeneinander: `atlas-duck-app` (die Tray-
 | Ubuntu | 22.04 und neuer | `.deb`, AppImage |
 | Fedora | 40 und neuer | `.rpm`, AppImage |
 
-- **Windows:** Der Installer bietet eine Installation pro Benutzer und eine pro Computer an. Die Installation pro Computer (Programme) wird empfohlen, weil normale Benutzer die Programmdateien dann nicht ändern können. Führen Sie atlas-duck nicht als Administrator aus. Läuft die App mit erhöhten Rechten und das Terminal des Agents nicht, verweigert die Befehlszeile das Gespräch mit ihr; starten Sie beide mit denselben Rechten.
+- **Windows:** Der Installer bietet eine Installation pro Benutzer und eine pro Computer an. Die Installation pro Computer (Program Files) wird empfohlen, weil normale Benutzer die Programmdateien dann nicht ändern können. Führen Sie atlas-duck nicht als Administrator aus. Läuft die App mit erhöhten Rechten und das Terminal des Agents nicht, verweigert die Befehlszeile das Gespräch mit ihr; starten Sie beide mit denselben Rechten.
 - **macOS:** Öffnen Sie die `.dmg` und ziehen Sie die App in den Ordner Programme.
 - **Linux:** atlas-duck legt seine Schlüssel und Ihre Tokens im Schlüsselbund des Betriebssystems ab. Dafür brauchen Sie einen Secret-Service-Anbieter mit einer nutzbaren Standardsammlung, zum Beispiel GNOME Keyring oder KWallet. Ohne ihn bricht der erste Start ab und meldet: "atlas-duck braucht einen Schlüsselbund des Systems (Secret Service, z. B. GNOME Keyring oder KWallet). Installieren oder entsperren Sie einen und starten Sie atlas-duck dann neu."
 
@@ -38,7 +38,7 @@ Beim ersten Start führt Sie das Einrichtungsfenster der Reihe nach durch diese 
 8. **Einführung für Agents.** Anweisungen, die Sie in die `CLAUDE.md` oder `AGENTS.md` der Repositories kopieren, in denen Ihre Agents arbeiten. Siehe [Agents (Desktop)](agents-desktop).
 9. **Einrichtung abschließen.** "Die Einrichtung ist abgeschlossen": atlas-duck ist bereit, und das Freigabefenster öffnet sich.
 
-Wenn Sie bereits ein Backup eines atlas-duck-Audit-Protokolls haben, bietet das Einrichtungsfenster "Aus einem Backup wiederherstellen…" an, statt ein neues Protokoll zu erstellen, solange es noch kein Protokoll gibt. Sie geben dann die Wiederherstellungs-Passphrase des Backups ein, und es wird keine neue Passphrase festgelegt.
+Wenn Sie bereits ein Backup eines atlas-duck-Audit-Protokolls haben, bietet das Einrichtungsfenster "Aus einem Backup wiederherstellen…" im Schritt "Anker-Verzeichnis" an, statt ein neues Protokoll zu erstellen, solange es noch kein Protokoll gibt. Sie geben dann die Wiederherstellungs-Passphrase des Backups ein, und es wird keine neue Passphrase festgelegt.
 
 ## Instanz verbinden {#connect-instance}
 

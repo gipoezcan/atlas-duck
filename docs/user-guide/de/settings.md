@@ -13,7 +13,7 @@ Im Desktopmodus sind die Einstellungen ein eigenes Fenster. Neben den Themen die
 
 ::: server
 
-Im Servermodus gibt es keine Einstellungsseite. Die Auswahlmöglichkeiten, die Ihnen gehören, Sprache und Benachrichtigungen, befinden sich in der Kopfzeile und auf der Seite Freigaben. Instanzen, Schlüssel und der Rest der Installation gehören zu den Aufgaben der Administratoren ([Administration](admin)).
+Im Servermodus gibt es keine Einstellungsseite. Was Sie selbst einstellen können, Sprache und Benachrichtigungen, finden Sie in der Kopfzeile und auf der Seite Freigaben. Instanzen, Schlüssel und der Rest der Installation gehören zu den Aufgaben der Administratoren ([Administration](admin)).
 
 :::
 

@@ -106,7 +106,7 @@ Your tokens are kept in the operating system keychain of this computer. atlas-du
 
 ::: server
 
-Your tokens are stored on the server, encrypted with a key of your own. atlas-duck never shows a stored token again. Your tokens are deleted at once if your account is deactivated, and when an admin removes an instance, every user's token for it is deleted.
+Your tokens are stored on the server, encrypted at rest with the server's master key. Operators who have access to that key can decrypt every stored token, so treat the server's key material as you would the tokens themselves. atlas-duck never shows a stored token again. Your tokens are deleted at once if your account is deactivated, and when an admin removes an instance, every user's token for it is deleted.
 
 :::
 

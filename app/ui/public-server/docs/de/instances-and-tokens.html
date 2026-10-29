@@ -65,7 +65,7 @@
 <tr><td>Die Serverversion liegt unter dem Minimum, das atlas-duck unterstützt.</td><td>Die Instanz muss aktualisiert werden.</td></tr>
 </tbody></table>
 <h2 id="token-storage">Wo Tokens gespeichert werden</h2>
-<p>Ihre Tokens werden auf dem Server gespeichert, verschlüsselt mit einem Schlüssel, der Ihnen gehört. atlas-duck zeigt ein gespeichertes Token nie wieder an. Ihre Tokens werden sofort gelöscht, wenn Ihr Konto deaktiviert wird, und wenn ein Administrator eine Instanz entfernt, werden die Tokens aller Benutzer für sie gelöscht.</p>
+<p>Ihre Tokens werden auf dem Server gespeichert, im Ruhezustand verschlüsselt mit dem Hauptschlüssel des Servers. Betreiber, die Zugriff auf diesen Schlüssel haben, können jedes gespeicherte Token entschlüsseln; behandeln Sie das Schlüsselmaterial des Servers deshalb wie die Tokens selbst. atlas-duck zeigt ein gespeichertes Token nie wieder an. Ihre Tokens werden sofort gelöscht, wenn Ihr Konto deaktiviert wird, und wenn ein Administrator eine Instanz entfernt, werden die Tokens aller Benutzer für sie gelöscht.</p>
 <p>Tokens geben Zugriff auf Jira und Confluence in Ihrem Namen. Erneuern Sie sie regelmäßig und widerrufen Sie ein Token auf seinem Server, wenn Sie es nicht mehr brauchen.</p>
 <h2 id="credentials-page">Die Zugangsdaten-Seite</h2>
 <p>&quot;Zugangsdaten&quot; in der Kopfzeile listet jede Instanz mit Produkt, URL und Token-Status:</p>

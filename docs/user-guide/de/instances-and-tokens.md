@@ -106,7 +106,7 @@ Ihre Tokens liegen im Schlüsselbund des Betriebssystems dieses Computers. atlas
 
 ::: server
 
-Ihre Tokens werden auf dem Server gespeichert, verschlüsselt mit einem Schlüssel, der Ihnen gehört. atlas-duck zeigt ein gespeichertes Token nie wieder an. Ihre Tokens werden sofort gelöscht, wenn Ihr Konto deaktiviert wird, und wenn ein Administrator eine Instanz entfernt, werden die Tokens aller Benutzer für sie gelöscht.
+Ihre Tokens werden auf dem Server gespeichert, im Ruhezustand verschlüsselt mit dem Hauptschlüssel des Servers. Betreiber, die Zugriff auf diesen Schlüssel haben, können jedes gespeicherte Token entschlüsseln; behandeln Sie das Schlüsselmaterial des Servers deshalb wie die Tokens selbst. atlas-duck zeigt ein gespeichertes Token nie wieder an. Ihre Tokens werden sofort gelöscht, wenn Ihr Konto deaktiviert wird, und wenn ein Administrator eine Instanz entfernt, werden die Tokens aller Benutzer für sie gelöscht.
 
 :::
 

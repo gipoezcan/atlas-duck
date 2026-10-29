@@ -38,7 +38,7 @@ The first time atlas-duck starts, the setup window leads you through these steps
 8. **Agent onboarding.** Instructions to copy into the `CLAUDE.md` or `AGENTS.md` of the repositories your agents work in. See [Agents (desktop)](agents-desktop).
 9. **Finish setup.** "Setup is complete": atlas-duck is ready and the approvals window opens.
 
-If you already have a backup of an atlas-duck audit log, the setup window offers "Restore from a backup…" instead of a new log, before the log exists. You then enter the recovery passphrase of the backup and no new passphrase is set.
+If you already have a backup of an atlas-duck audit log, the setup window offers "Restore from a backup…" instead of a new log, on the anchor directory step, before the log exists. You then enter the recovery passphrase of the backup and no new passphrase is set.
 
 ## Connect an instance {#connect-instance}
 

@@ -14,7 +14,7 @@ order: 21
 | Benutzername oder Passwort ist falsch. | Das Verzeichnis hat die Zugangsdaten nicht akzeptiert. |
 | Zu viele Versuche. Versuchen Sie es in N Minuten erneut. | Fehlgeschlagene Anmeldungen sind begrenzt. Warten Sie die angezeigte Zeit ab. |
 | Das Verzeichnis ist nicht erreichbar. Versuchen Sie es später erneut. | Das Verzeichnis Ihrer Organisation antwortet nicht. |
-| Ihr Konto darf atlas-duck nicht verwenden. | Ihr Konto gehört zu keiner der Verzeichnisgruppen, die atlas-duck zulässt, oder es ist deaktiviert. Wenden Sie sich an Ihre Administration. |
+| Ihr Konto darf atlas-duck nicht verwenden. | Ihr Konto gehört zu keiner der Verzeichnisgruppen, die atlas-duck zulässt, oder es ist deaktiviert. Wenden Sie sich an Ihren Administrator. |
 | Die Anmeldung ist fehlgeschlagen. Versuchen Sie es erneut. | Jeder andere Fehler. |
 
 Nach der Anmeldung hält Ihr Browser eine Sitzung. Eine Sitzung ist kurzlebig: Sie endet nach einer Zeit ohne Aktivität und nach einer Höchstdauer, beides legen die Betreiber des Servers fest (standardmäßig 30 Minuten Inaktivität und insgesamt 8 Stunden). Danach melden Sie sich neu an. "Abmelden" in der Kopfzeile beendet die Sitzung sofort.
@@ -36,7 +36,7 @@ Wie Sie das Token erstellen, was die Status bedeuten und was die Fehlermeldungen
 Ein Agent erreicht atlas-duck über MCP auf einem von zwei Wegen:
 
 - Mit einem **API-Schlüssel**, den Sie unter "API-Schlüssel" erstellen. Ein Schlüssel hat Berechtigungen (read, propose_write, scripts), läuft nach 1 bis 90 Tagen ab und lässt sich widerrufen. Siehe [Agents (Server)](agents-server#api-keys).
-- Über **OAuth**: Ein MCP-Client, der es unterstützt, schickt Sie zu atlas-duck, damit Sie ihn zulassen. Sie antworten auf der Zustimmungsseite und können die App später unter "Verbundene Apps" widerrufen. Siehe [Agents (Server)](agents-server#oauth-consent).
+- Über **OAuth**, wenn Ihre Organisation es aktiviert: Ein MCP-Client, der es unterstützt, schickt Sie zu atlas-duck, damit Sie ihn zulassen. Sie antworten auf der Zustimmungsseite und können die App später unter "Verbundene Apps" widerrufen. Siehe [Agents (Server)](agents-server#oauth-consent).
 
 Weder ein API-Schlüssel noch eine verbundene App kann etwas freigeben. Sie entscheiden auf der Seite "Freigaben": siehe [Freigaben](approvals). Damit Sie benachrichtigt werden, wenn etwas auf Sie wartet, wählen Sie dort "Benachrichtigungen aktivieren" ([Einstellungen](settings#notifications)).
 
