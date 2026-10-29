@@ -59,7 +59,9 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     process.exit(2);
   }
   const problems = check(readFileSync(log, "utf8"), readFileSync(list, "utf8"), readFileSync(ignored, "utf8"));
-  for (const p of problems) console.error(`::error::${label}: ${p}`);
+  // stdout: the runner turns `::error::` lines on stdout into annotations, so the reason shows
+  // without the job log (M15: a Windows e2e failure showed only "exit code 1").
+  for (const p of problems) console.log(`::error::${label}: ${p}`);
   if (problems.length > 0) process.exit(1);
   console.log(`${label}: no skipped tests, pass count meets the listed minimum`);
 }
