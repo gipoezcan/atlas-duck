@@ -141,7 +141,11 @@ describe('the server user pages in German (M15 T8)', () => {
         client_id: 'c1',
         redirect_host: 'localhost',
         redirect_uri: 'http://localhost/cb',
-        scopes: [{ name: 'read', text: 'read data' }],
+        scopes: [
+          { name: 'read', text: 'read data' },
+          { name: 'propose_write', text: 'propose' },
+          { name: 'scripts', text: 'run scripts' },
+        ],
         expires_at: '2026-10-27T10:10:00.000Z',
       }),
     );
@@ -152,6 +156,11 @@ describe('the server user pages in German (M15 T8)', () => {
     expect(screen.getByRole('button', { name: 'Erlauben' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Ablehnen' })).toBeTruthy();
     expect(screen.getByText('Immer enthalten.')).toBeTruthy();
+    const list = document.body.textContent ?? '';
+    expect(list).toContain('read: Jira- und Confluence-Daten lesen, die Sie lesen können, nachdem Sie sie freigegeben haben.');
+    expect(list).toContain('propose_write: Änderungen vorschlagen. Jede Änderung braucht hier weiterhin Ihre Freigabe.');
+    expect(list).toContain('scripts: Schreibgeschützte Skripte in der Sandbox ausführen; Sie geben jedes Endergebnis frei.');
+    expect(list).not.toContain('read data');
     cleanup();
     german(<ConsentError code="invalid_client" />);
     expect(screen.getByRole('alert').textContent).toBe(
@@ -167,7 +176,7 @@ describe('the server user pages in German (M15 T8)', () => {
     expect(screen.getByRole('link', { name: 'Zugangsdaten' })).toBeTruthy();
     expect(screen.getByRole('link', { name: 'API-Schlüssel' })).toBeTruthy();
     expect(screen.getByRole('link', { name: 'Verbundene Apps' })).toBeTruthy();
-    expect(screen.getByRole('link', { name: 'Mein Audit' })).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'Mein Audit-Protokoll' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Abmelden' })).toBeTruthy();
   });
 });

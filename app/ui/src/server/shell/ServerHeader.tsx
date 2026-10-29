@@ -2,7 +2,7 @@ import { useRef, useState } from 'react';
 
 import { LANG_PREFS, type LangPref } from '../../shared/i18n';
 import { useText } from '../../shared/i18n/context';
-import { csrf } from '../../shared/ipc/transport-http';
+import { csrf, loadSession } from '../../shared/ipc/transport-http';
 import { nav, useSession } from './RequireSession';
 import { saveLangPref, useServerLangPref } from './ServerLangRoot';
 
@@ -49,13 +49,28 @@ export function ServerHeader() {
   const chooseLang = (value: LangPref) => {
     const mine = ++latest.current;
     setPending(value);
-    const saved = queue.current.then(() => saveLangPref(value));
+    // A choice that a newer one has superseded by the time its turn comes is not sent at all.
+    const saved = queue.current.then(async (): Promise<boolean | null> =>
+      mine === latest.current ? saveLangPref(value) : null,
+    );
     queue.current = saved;
-    void saved.then((ok) => {
-      if (mine !== latest.current) return;
-      setPending(null);
-      setLangFailed(!ok);
-      if (ok) langPref?.setPref(value);
+    void saved.then(async (ok) => {
+      if (ok === null || mine !== latest.current) return;
+      if (ok) {
+        setPending(null);
+        setLangFailed(false);
+        langPref?.setPref(value);
+        return;
+      }
+      // The last choice failed: show what is actually stored (an earlier choice may have been saved).
+      setLangFailed(true);
+      try {
+        const s = await loadSession();
+        if (mine === latest.current && s !== null) langPref?.setPref(s.lang_pref ?? 'auto');
+      } catch {
+        // keep the shown value; the notice already says the save failed
+      }
+      if (mine === latest.current) setPending(null);
     });
   };
   const admin = session?.roles.includes('admin') ?? false;

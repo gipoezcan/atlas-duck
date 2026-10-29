@@ -7,12 +7,14 @@ import {
   I18N_SAME_ALLOWLIST,
   SHORT_KEYS,
   checkApprovalCodes,
+  checkConsentScopes,
   checkErrorCodes,
   checkLeaves,
   main,
   parseBatchFailureCodes,
   parseBlockReasons,
   parseCmdKinds,
+  parseConsentScopes,
   parseDecisionKinds,
   parseEnvelopeCodes,
   parseServerCodes,
@@ -281,4 +283,34 @@ test("the repository passes", () => {
   } finally {
     console.log = log;
   }
+});
+
+// ---------- consent scopes (M15 T8 fix round 1) ----------
+
+const CONSENT_RS = `
+pub fn scope_text(scope: &str) -> &'static str {
+    match scope {
+        "read" => "Read data.",
+        "propose_write" => "Propose changes.",
+        _ => "",
+    }
+}
+`;
+
+test("a scope of consent.rs without a dictionary text fails, in either language", () => {
+  const scopes = parseConsentScopes(CONSENT_RS);
+  assert.deepEqual(scopes, { read: "Read data.", propose_write: "Propose changes." });
+  const en = { server: { consent: { scope_text: { read: "Read data.", propose_write: "Propose changes." } } } };
+  const de = { server: { consent: { scope_text: { read: "Daten lesen.", propose_write: "Änderungen vorschlagen." } } } };
+  assert.deepEqual(checkConsentScopes(scopes, en, de), []);
+  const missingDe = { server: { consent: { scope_text: { read: "Daten lesen." } } } };
+  assert.match(checkConsentScopes(scopes, en, missingDe).join("\n"), /de: consent scope "propose_write" has no text/);
+  const changedEn = { server: { consent: { scope_text: { read: "Read data!", propose_write: "Propose changes." } } } };
+  assert.match(checkConsentScopes(scopes, changedEn, de).join("\n"), /differs from the sentence in consent\.rs/);
+  const extra = { server: { consent: { scope_text: { read: "x", propose_write: "y", scripts: "z" } } } };
+  assert.match(checkConsentScopes(scopes, extra, de).join("\n"), /is not a scope of consent\.rs/);
+});
+
+test("the real consent scopes are covered", () => {
+  assert.equal(main([], REPO), 0);
 });

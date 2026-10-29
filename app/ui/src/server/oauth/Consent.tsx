@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import type { Dict } from '../../shared/i18n';
 import { useText } from '../../shared/i18n/context';
 import { en } from '../../shared/i18n/dict';
+import { own } from '../../shared/text/own';
 import { api, type ConsentDetails, isConsentDetails, isConsentRedirect } from '../http';
 import { nav } from '../shell/RequireSession';
 
@@ -150,7 +151,7 @@ export function Consent({ req }: { req: string }) {
                   disabled={s.name === 'read' || busy}
                   onChange={() => toggle(s.name)}
                 />{' '}
-                <strong>{s.name}</strong>: {s.text}
+                <strong>{s.name}</strong>: {own(t.server.consent.scope_text, s.name) ?? s.text}
                 {s.name === 'read' ? <span className="muted"> {t.server.consent.read_always}</span> : null}
               </label>
             ))}

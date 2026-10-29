@@ -143,6 +143,7 @@ describe('server language (M15 T4)', () => {
     await flush();
     const label = () => screen.getByRole('combobox', { name: /Language|Sprache/ }) as HTMLSelectElement;
     fireEvent.change(label(), { target: { value: 'de' } });
+    await flush();
     fireEvent.change(label(), { target: { value: 'en' } });
     await flush();
     // Only the first PUT is out; the second waits for it, so the store ends on the last choice.
@@ -164,6 +165,83 @@ describe('server language (M15 T4)', () => {
     expect(label().closest('label')?.getAttribute('aria-busy')).toBe('false');
   });
 
+  const pending = () => {
+    const answers: ((r: Response) => void)[] = [];
+    const fetchMock = vi.fn().mockImplementation(
+      () => new Promise<Response>((resolve) => answers.push(resolve)),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    return { answers, fetchMock };
+  };
+  const bodyOf = (fetchMock: ReturnType<typeof vi.fn>, i: number): unknown =>
+    JSON.parse(String((fetchMock.mock.calls[i] as [string, RequestInit])[1].body));
+  const select = () => screen.getByRole('combobox', { name: /Language|Sprache/ }) as HTMLSelectElement;
+
+  it('a_superseded_choice_is_never_sent', async () => {
+    browserLanguage('en-US');
+    vi.mocked(loadSession).mockResolvedValue(session());
+    const { answers, fetchMock } = pending();
+    shell();
+    await flush();
+    fireEvent.change(select(), { target: { value: 'de' } });
+    await flush();
+    fireEvent.change(select(), { target: { value: 'en' } });
+    fireEvent.change(select(), { target: { value: 'auto' } });
+    await flush();
+    answers[0]?.(new Response(null, { status: 204 }));
+    await flush();
+    answers[1]?.(new Response(null, { status: 204 }));
+    await flush();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(bodyOf(fetchMock, 0)).toEqual({ lang_pref: 'de' });
+    expect(bodyOf(fetchMock, 1)).toEqual({ lang_pref: 'auto' });
+    expect(select().value).toBe('auto');
+    expect(document.documentElement.lang).toBe('en');
+  });
+
+  it('first_saved_and_last_fails_shows_the_stored_value', async () => {
+    browserLanguage('en-US');
+    vi.mocked(loadSession).mockResolvedValue(session());
+    const { answers, fetchMock } = pending();
+    shell();
+    await flush();
+    fireEvent.change(select(), { target: { value: 'de' } });
+    await flush();
+    fireEvent.change(select(), { target: { value: 'en' } });
+    await flush();
+    // The server now holds the first choice; the last one fails.
+    vi.mocked(loadSession).mockResolvedValue(session({ lang_pref: 'de' }));
+    answers[0]?.(new Response(null, { status: 204 }));
+    await flush();
+    answers[1]?.(new Response(null, { status: 500 }));
+    await flush();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('alert').textContent).toBe(de.common.lang_save_failed);
+    // The page and the select show what is stored, not the failed choice.
+    expect(select().value).toBe('de');
+    expect(document.documentElement.lang).toBe('de');
+    expect(select().closest('label')?.getAttribute('aria-busy')).toBe('false');
+  });
+
+  it('a_failing_first_followed_by_a_saved_last_ends_on_the_last', async () => {
+    browserLanguage('en-US');
+    vi.mocked(loadSession).mockResolvedValue(session());
+    const { answers, fetchMock } = pending();
+    shell();
+    await flush();
+    fireEvent.change(select(), { target: { value: 'de' } });
+    await flush();
+    fireEvent.change(select(), { target: { value: 'en' } });
+    await flush();
+    answers[0]?.(new Response(null, { status: 500 }));
+    await flush();
+    answers[1]?.(new Response(null, { status: 204 }));
+    await flush();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(select().value).toBe('en');
+    expect(document.documentElement.lang).toBe('en');
+  });
   it('a_browser_without_navigator_languages_does_not_break_the_page', async () => {
     vi.spyOn(navigator, 'language', 'get').mockReturnValue('');
     vi.spyOn(navigator, 'languages', 'get').mockReturnValue(undefined as unknown as string[]);

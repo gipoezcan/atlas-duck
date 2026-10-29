@@ -135,6 +135,12 @@ export const server = {
     returns_to: 'After your answer you return to',
     scopes: 'It asks to',
     read_always: 'Always included.',
+    /** The effect of each scope, the sentences of crates/server/src/oauth/consent.rs (checked by ci/check-i18n.mjs). */
+    scope_text: {
+      read: 'Read Jira and Confluence data you can read, after you release it.',
+      propose_write: 'Propose changes. Every change still needs your approval here.',
+      scripts: 'Run read-only scripts in the sandbox; you approve each final result.',
+    },
     allow: 'Allow',
     deny: 'Deny',
     note: 'You can revoke this at any time under Connected apps. Every change still needs your approval.',

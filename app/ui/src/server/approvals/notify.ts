@@ -24,7 +24,7 @@ export const browserEnv: NotifyEnv = {
 
 /**
  * Tracks the pending ids seen so far and shows one notification per new id while the tab is
- * hidden and permission is granted. The first queue only seeds what was already there. 	itle
+ * hidden and permission is granted. The first queue only seeds what was already there. The title
  * is read for every notification, so a language switch applies to the next one (PD-207: a fixed
  * title, the body is the registry op id, never agent text).
  */
