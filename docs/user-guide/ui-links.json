@@ -1,0 +1,23 @@
+{
+  "desktop": {
+    "approvals": "approvals#queue",
+    "settings": "settings#language",
+    "audit": "audit#audit-log",
+    "running_scripts": "scripts#running-scripts",
+    "onboarding": "index#how-it-works",
+    "credential": "instances-and-tokens#credential-window",
+    "setup": "getting-started-desktop#first-start"
+  },
+  "server": {
+    "/": "index#where-to-start",
+    "/login": "getting-started-server#sign-in",
+    "/approvals": "approvals#queue",
+    "/credentials": "instances-and-tokens#credentials-page",
+    "/api-keys": "agents-server#api-keys",
+    "/admin": "admin#users-and-roles",
+    "/oauth/consent": "agents-server#oauth-consent",
+    "/connected-apps": "agents-server#connected-apps",
+    "/audit": "audit#audit-log",
+    "/auditor": "auditor#auditor-role"
+  }
+}
