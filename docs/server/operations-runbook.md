@@ -37,6 +37,13 @@ Admin commands run one at a time, and the scheduler's jobs take the same lock.
 | `anchor head` | `{seq, hash}` of the anchor chain's last row: a pin for `verify-export --anchor-chain-head` ([auditing.md](auditing.md)) |
 | `sandbox probe` | The script sandbox state (`met`, `not_met`, `probing`, `disabled`) and the probe's evidence ([scripts.md](scripts.md)) |
 
+## The user guide (`/docs`)
+
+The server serves the end-user guide (English and German, server set) under `/docs/<lang>/` and `/docs/<lang>/assets/…`, with `/docs` redirecting to the language the browser asks for. It is public: no session, no cookie, no data of any user or instance, only the static pages that were baked into the image (`/app/web/docs`, built from `app/ui/public-server/docs`, which is generated from `docs/user-guide`). Nothing is read from the data volume, so it needs no configuration and adds no state. The pages carry the same CSP as the other pages and `Cache-Control: no-cache`.
+
+- Maintenance mode covers it like everything else: with `admin maintenance on` the guide answers 503 `server/maintenance` too (every request except the probes is refused). The guide lives in the image, not on the volume, so a restore never changes it.
+- A new guide ships only with a new image: edit `docs/user-guide`, regenerate (`atlas-duck-docgen`), commit the output, deploy.
+- Unknown pages, languages or paths answer a plain 404; the guide never reflects the request path.
 ## Health
 
 - `/healthz`: `ok` while the process serves. Used by the liveness and startup probes.
