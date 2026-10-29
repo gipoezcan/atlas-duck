@@ -44,6 +44,11 @@ impl NativeConfirmer for DialogConfirmer {
             .blocking_show();
         answer(ok)
     }
+
+    /// M15 T10b: core writes its dialog texts (and their proof hash) in the app's UI language.
+    fn lang(&self) -> atlas_duck_core::Lang {
+        crate::windows::ui_lang(&self.app).into()
+    }
 }
 
 /// Best effort: the main thread is the one named "main" (Rust's main thread; the Tauri event

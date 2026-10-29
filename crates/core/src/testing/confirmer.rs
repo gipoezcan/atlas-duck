@@ -16,6 +16,8 @@ pub struct StubConfirmer {
     answers: Mutex<VecDeque<Confirm>>,
     texts: Mutex<Vec<String>>,
     hook: Mutex<Option<ConfirmHook>>,
+    /// M15 T10b: the language the stub reports (`set_lang`).
+    lang: Mutex<crate::Lang>,
 }
 
 impl std::fmt::Debug for StubConfirmer {
@@ -37,6 +39,7 @@ impl StubConfirmer {
             answers: Mutex::new(answers.into()),
             texts: Mutex::new(Vec::new()),
             hook: Mutex::new(None),
+            lang: Mutex::new(crate::Lang::En),
         }
     }
 
@@ -48,6 +51,11 @@ impl StubConfirmer {
     /// Every dialog text shown so far, in order.
     pub fn texts(&self) -> Vec<String> {
         lock(&self.texts).clone()
+    }
+
+    /// M15 T10b: the language every later dialog is written in.
+    pub fn set_lang(&self, lang: crate::Lang) {
+        *lock(&self.lang) = lang;
     }
 
     /// Runs `hook` in every later `confirm` call while the dialog is "open".
@@ -64,5 +72,9 @@ impl NativeConfirmer for StubConfirmer {
             h(text);
         }
         lock(&self.answers).pop_front().unwrap_or(Confirm::Cancel)
+    }
+
+    fn lang(&self) -> crate::Lang {
+        *lock(&self.lang)
     }
 }

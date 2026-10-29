@@ -161,11 +161,11 @@ fn shown(text: &str) -> String {
     strip(text, false).0
 }
 
-fn cautions(warnings: &[atlas_duck_preview::warning::Warning]) -> Vec<String> {
+fn cautions(lang: crate::Lang, warnings: &[atlas_duck_preview::warning::Warning]) -> Vec<String> {
     warnings
         .iter()
         .filter(|w| w.level == Level::Caution)
-        .map(|w| shown(&w.text))
+        .map(|w| shown(&atlas_duck_preview::warning::shown(lang, w)))
         .collect()
 }
 
@@ -283,7 +283,7 @@ async fn check(engine: &Arc<Engine>, item: &BatchItem) -> Result<Checked, Fail> 
         op_id: entry.head.op_id.clone(),
         target: shown(&entry.target_display),
         alias,
-        cautions: cautions(&warnings),
+        cautions: cautions(engine.confirmer().lang(), &warnings),
     };
     Ok(Checked {
         entry,
@@ -317,7 +317,10 @@ async fn check_all(
 
 /// §5.6: "count, op ids, `target_display` per item, instance, and each item's Caution-level
 /// warning texts". App-generated; the agent's reason never appears.
-fn dialog_text(lines: &[Line]) -> String {
+fn dialog_text(lang: crate::Lang, lines: &[Line]) -> String {
+    if lang == crate::Lang::De {
+        return dialog_text_de(lines);
+    }
     let n = lines.len();
     let reads = lines.iter().filter(|l| l.class == "read").count();
     let scripts = lines.iter().filter(|l| l.class == "script").count();
@@ -352,6 +355,49 @@ fn dialog_text(lines: &[Line]) -> String {
         }
         for c in &l.cautions {
             let _ = write!(s, "\n   Caution: {c}");
+        }
+    }
+    s
+}
+
+/// M15 T10b: [`dialog_text`] in German (the cautions are already in the language).
+fn dialog_text_de(lines: &[Line]) -> String {
+    let n = lines.len();
+    let reads = lines.iter().filter(|l| l.class == "read").count();
+    let scripts = lines.iter().filter(|l| l.class == "script").count();
+    let writes = n - reads - scripts;
+    let count = |k: usize, one: &str, many: &str| {
+        let shown = crate::Lang::De.count(k as u64);
+        format!("{shown} {}", if k == 1 { one } else { many })
+    };
+    let mut parts = Vec::new();
+    if reads > 0 {
+        parts.push(format!(
+            "{} übergeben",
+            count(reads, "Lesevorgang", "Lesevorgänge")
+        ));
+    }
+    if scripts > 0 {
+        parts.push(format!("{} übergeben", count(scripts, "Skript", "Skripte")));
+    }
+    if writes > 0 {
+        parts.push(format!(
+            "{} freigeben",
+            count(writes, "Schreibvorgang", "Schreibvorgänge")
+        ));
+    }
+    let mut s = format!(
+        "Sammelentscheidung: {} ({})\n",
+        count(n, "Anfrage", "Anfragen"),
+        parts.join(", ")
+    );
+    for (i, l) in lines.iter().enumerate() {
+        let _ = write!(s, "\n{}. {} {}", i + 1, l.op_id, l.target);
+        if !l.alias.is_empty() {
+            let _ = write!(s, " auf {}", l.alias);
+        }
+        for c in &l.cautions {
+            let _ = write!(s, "\n   Vorsicht: {c}");
         }
     }
     s
@@ -430,7 +476,7 @@ pub(super) async fn decide_batch(
         .map(|c| c.line)
         .collect();
     // 2. The dialog.
-    let text = dialog_text(&lines);
+    let text = dialog_text(engine.confirmer().lang(), &lines);
     let text_sha256: [u8; 32] = Sha256::digest(text.as_bytes()).into();
     if confirm(&engine, text).await == Confirm::Cancel {
         return Err(DecisionError::Cancelled);
@@ -632,19 +678,42 @@ mod tests {
 
     #[test]
     fn dialog_text_lists_every_item_and_its_cautions() {
-        let text = dialog_text(&[
-            line("read", "ABC-1", &["all fields requested (`*all`)"]),
-            line("write", "ABC-2", &[]),
-        ]);
+        let text = dialog_text(
+            crate::Lang::En,
+            &[
+                line("read", "ABC-1", &["all fields requested (`*all`)"]),
+                line("write", "ABC-2", &[]),
+            ],
+        );
         assert!(text.starts_with("Batch decision: 2 requests (release 1 read, approve 1 write)"));
         assert!(text.contains("\n1. jira.issue.get ABC-1 on jira-main"));
         assert!(text.contains("\n   Caution: all fields requested (`*all`)"));
         assert!(text.contains("\n2. jira.issue.get ABC-2 on jira-main"));
     }
 
+    /// M15 T10b: the German batch dialog, with German plurals.
+    #[test]
+    fn dialog_text_in_german() {
+        let text = dialog_text(
+            crate::Lang::De,
+            &[
+                line("read", "ABC-1", &["alle Felder angefordert (`*all`)"]),
+                line("write", "ABC-2", &[]),
+                line("write", "ABC-3", &[]),
+            ],
+        );
+        assert!(
+            text.starts_with(
+                "Sammelentscheidung: 3 Anfragen (1 Lesevorgang übergeben, 2 Schreibvorgänge freigeben)"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("\n1. jira.issue.get ABC-1 auf jira-main"));
+        assert!(text.contains("\n   Vorsicht: alle Felder angefordert (`*all`)"));
+    }
     #[test]
     fn dialog_targets_lose_invisible_characters() {
-        let text = dialog_text(&[line("read", "ABC\u{202E}-1", &[])]);
+        let text = dialog_text(crate::Lang::En, &[line("read", "ABC\u{202E}-1", &[])]);
         assert!(!text.contains('\u{202E}'), "{text:?}");
     }
 

@@ -39,6 +39,11 @@ use crate::similarity::SimilarityIndex;
 /// §2.2: the native confirmation dialog (`app`: Tauri; tests: `testing::StubConfirmer`).
 pub trait NativeConfirmer: Send + Sync {
     fn confirm(&self, text: &str) -> Confirm;
+    /// M15 T10b: the language the dialog texts are written in. Core builds each text in it and
+    /// hashes exactly that text into its `Confirmed` proof. English unless the app says otherwise.
+    fn lang(&self) -> crate::Lang {
+        crate::Lang::En
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
