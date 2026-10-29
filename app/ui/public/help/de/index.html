@@ -23,7 +23,7 @@
 <ul>
 <li><a href="index.html" aria-current="page">Übersicht</a>
 <ul>
-<li><a href="#what-is-atlas-duck">Was Atlas Duck ist</a></li>
+<li><a href="#what-is-atlas-duck">Was atlas-duck ist</a></li>
 <li><a href="#how-it-works">So läuft eine Anfrage ab</a></li>
 <li><a href="#where-to-start">Wo Sie anfangen</a></li>
 </ul>
@@ -41,12 +41,40 @@
 </nav>
 <main>
 <h1>Übersicht</h1>
-<h2 id="what-is-atlas-duck">Was Atlas Duck ist</h2>
-<p>TODO</p>
+<p>Dieses Handbuch richtet sich an alle, die atlas-duck verwenden: Benutzer und im Servermodus auch Administratoren und Auditoren.</p>
+<h2 id="what-is-atlas-duck">Was atlas-duck ist</h2>
+<p>atlas-duck lässt KI-Agents Jira und Confluence Data Center lesen und Schreibvorgänge vorschlagen, die Sie freigeben. Jede Aktion wird in einer manipulationssicheren Audit-Kette festgehalten.</p>
+<p>Es gibt zwei Betriebsarten:</p>
+<ul>
+<li><strong>Desktopmodus</strong>: atlas-duck ist auf Ihrem eigenen Computer installiert und läuft dort. Es bedient Sie und die Agents, die auf diesem Computer laufen.</li>
+<li><strong>Servermodus</strong>: Ihre Organisation betreibt atlas-duck einmal in ihrem eigenen Netz. Es bedient viele Benutzer und ihre Agents. Auf Ihrem Computer wird nichts installiert, Sie arbeiten im Browser.</li>
+</ul>
+<p>Für Sie funktionieren beide Modi gleich. Diese Begriffe kehren auf jeder Seite wieder:</p>
+<table>
+<thead><tr><th>Begriff</th><th>Bedeutung</th></tr></thead>
+<tbody>
+<tr><td>Agent</td><td>Ein KI-Programm, das über atlas-duck in Ihrem Auftrag handelt. Es schlägt Schreibvorgänge vor, gibt aber nie etwas frei.</td></tr>
+<tr><td>Instanz</td><td>Ein Jira- oder Confluence-Data-Center-Server, mit dem atlas-duck spricht, bekannt unter einem Alias.</td></tr>
+<tr><td>Persönliches Zugriffstoken (PAT)</td><td>Ihr eigenes Jira- oder Confluence-Token. atlas-duck handelt immer als Sie, nie als gemeinsames Dienstkonto.</td></tr>
+<tr><td>Freigabe</td><td>Ihr ausdrückliches Ja oder Nein zu einem vorgeschlagenen Schreibvorgang, bevor er eine Instanz erreicht. Jeder Schreibvorgang braucht eine, in beiden Modi.</td></tr>
+<tr><td>Audit-Kette</td><td>Ihr manipulationssicherer Nachweis über alles, was atlas-duck für Sie getan hat. Jeder Benutzer hat eine, in beiden Modi.</td></tr>
+</tbody></table>
 <h2 id="how-it-works">So läuft eine Anfrage ab</h2>
-<p>TODO</p>
+<ol>
+<li>Ein Agent bittet atlas-duck um etwas, zum Beispiel ein Jira-Ticket zu lesen oder zu ändern.</li>
+<li>Die Anfrage erscheint in Ihren Freigaben. Noch erreicht nichts die Instanz.</li>
+<li>Sie entscheiden. Sie geben einen Schreibvorgang frei, übergeben das Ergebnis eines Lesezugriffs oder eines Skripts an den Agent oder lehnen die Anfrage ab. Ein Agent kann nie etwas freigeben.</li>
+<li>Nach Ihrer Freigabe sendet atlas-duck die Anfrage als Sie an die Instanz, mit Ihrem eigenen persönlichen Zugriffstoken.</li>
+<li>atlas-duck hält fest, was geschehen ist, und zwar in Ihrer Audit-Kette.</li>
+</ol>
+<p>Eine Anfrage, über die niemand entscheidet, läuft ab.</p>
 <h2 id="where-to-start">Wo Sie anfangen</h2>
-<p>TODO</p>
+<ol>
+<li><a href="getting-started-desktop.html">Erste Schritte (Desktop)</a> installiert atlas-duck und führt durch den ersten Start.</li>
+<li><a href="instances-and-tokens.html">Instanzen und Tokens</a> verbindet Ihre Jira- und Confluence-Server.</li>
+<li><a href="agents-desktop.html">Agents (Desktop)</a> zeigt, wie ein Agent atlas-duck erreicht.</li>
+</ol>
+<p>Lesen Sie danach <a href="approvals.html">Freigaben</a>, die Seite, die Sie am häufigsten brauchen, und <a href="audit.html">Audit-Protokoll</a>. Wenn etwas schiefgeht, helfen <a href="troubleshooting.html">Fehlerbehebung</a> und die <a href="error-reference.html">Fehlerreferenz</a>.</p>
 </main>
 </div>
 </body>

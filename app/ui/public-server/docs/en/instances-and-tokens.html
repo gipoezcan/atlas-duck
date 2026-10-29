@@ -46,15 +46,38 @@
 <main>
 <h1>Instances and tokens</h1>
 <h2 id="instances">Instances</h2>
-<p>TODO</p>
+<p>An instance is one Jira or Confluence Data Center server that atlas-duck talks to. It is known by an alias, for example the short name of the server.</p>
+<p>In server mode an admin defines the instances for everyone. You see them on the &quot;Credentials&quot; page and add only your own token for each. If the page says &quot;No instance is configured yet. An admin adds instances.&quot;, ask your admin. Admins: see <a href="/docs/en/admin#instances-admin">Administration</a>.</p>
 <h2 id="add-instance">Add an instance</h2>
-<p>TODO</p>
+<p>Users do not add instances in server mode. Ask your admin to add one. Before you store a token, check that the URL on the &quot;Credentials&quot; page is the server you mean.</p>
 <h2 id="tokens">Tokens</h2>
-<p>TODO</p>
+<p>atlas-duck always acts as you, with your own personal access token (PAT), never with a shared service account. Create the token in Jira or Confluence (Profile → Personal Access Tokens) and give it only the permissions your work needs. Whatever the token may not do in Jira or Confluence, an agent cannot do either.</p>
+<p>Enter the token on the <a href="#credentials-page">Credentials page</a>.</p>
+<p>When you store a token, atlas-duck first tests it against the instance. These are the reasons for a refusal:</p>
+<table>
+<thead><tr><th>Reason</th><th>What to do</th></tr></thead>
+<tbody>
+<tr><td>The server rejected the token (401).</td><td>Check that it is a valid personal access token that has not expired.</td></tr>
+<tr><td>The token belongs to another user.</td><td>A token is already stored for a different Atlassian user. Remove the stored token first.</td></tr>
+<tr><td>The TLS certificate of the server could not be verified.</td><td>If your server uses an internal CA, the instance needs it as its custom CA.</td></tr>
+<tr><td>A proxy blocked or changed the connection.</td><td>Check the proxy settings.</td></tr>
+<tr><td>The server could not be reached.</td><td>Try again later.</td></tr>
+<tr><td>The server version is below the minimum atlas-duck supports.</td><td>The instance has to be upgraded.</td></tr>
+</tbody></table>
 <h2 id="token-storage">Where tokens are stored</h2>
-<p>TODO</p>
+<p>Your tokens are stored on the server, encrypted with a key of your own. atlas-duck never shows a stored token again. Your tokens are deleted at once if your account is deactivated, and when an admin removes an instance, every user's token for it is deleted.</p>
+<p>Tokens give access to Jira and Confluence in your name. Rotate them regularly, and revoke a token on its server when you no longer need it.</p>
 <h2 id="credentials-page">The credentials page</h2>
-<p>TODO</p>
+<p>&quot;Credentials&quot; in the header lists every instance with its product, URL and token state:</p>
+<table>
+<thead><tr><th>State</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>No token</td><td>You have not stored one.</td></tr>
+<tr><td>Token stored</td><td>The token works. The row shows the Atlassian user, for example &quot;as jdoe&quot;.</td></tr>
+<tr><td>Token stored, not usable</td><td>The stored token does not work any more. Replace it.</td></tr>
+</tbody></table>
+<p>Use &quot;Add token&quot; or &quot;Replace token&quot;, enter the token in &quot;Personal access token for <em>alias</em>&quot; and choose &quot;Check and save&quot;. &quot;Remove&quot; deletes your token for that instance after a confirmation. atlas-duck never shows a stored token.</p>
+<p>Errors you may see: &quot;The instance refused this token. Check it and try again.&quot;; &quot;This token belongs to another Atlassian user. Remove the stored token first.&quot;; &quot;This instance cannot be used right now. Ask an admin.&quot;; &quot;The instance cannot be reached. Try again later.&quot;; &quot;This instance no longer exists.&quot;; &quot;The token is empty or too long.&quot;</p>
 </main>
 </div>
 </body>

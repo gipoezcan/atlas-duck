@@ -42,14 +42,48 @@
 </nav>
 <main>
 <h1>Einstellungen</h1>
+<p>Im Desktopmodus sind die Einstellungen ein eigenes Fenster. Neben den Themen dieser Seite enthalten sie Ihre Instanzen (<a href="instances-and-tokens.html">Instanzen und Tokens</a>), die Limits für Anfragen und <a href="scripts.html#limits">Skripte</a>, Aufbewahrung und Legal Hold (<a href="audit.html#retention">Audit-Protokoll</a>), die Bereinigung und &quot;Auf die Entfernung vorbereiten&quot;.</p>
 <h2 id="language">Sprache</h2>
-<p>TODO</p>
+<p>atlas-duck gibt es auf Englisch und auf Deutsch. Die Sprache gilt für die Fenster und Seiten, die Benachrichtigungen und die nativen Dialoge sowie für dieses Handbuch. Texte, die Agents lesen, Audit-Datensätze, Protokolle, die Befehlszeile und die Betriebsdokumentation bleiben Englisch.</p>
+<p>Zur Wahl stehen:</p>
+<ul>
+<li><strong>Automatisch</strong>: Deutsch, wenn die Sprache Ihres Betriebssystems (Desktop) oder Ihres Browsers (Server) Deutsch ist, sonst Englisch.</li>
+<li><strong>Deutsch</strong></li>
+<li><strong>English</strong></li>
+</ul>
+<p>Öffnen Sie die Einstellungen, suchen Sie den Abschnitt &quot;Sprache&quot; und verwenden Sie das Menü &quot;Sprache&quot;. Alle geöffneten Fenster wechseln sofort. Die Wahl ist eine App-Einstellung, sie wird außerhalb des Audit-Protokolls gespeichert und nicht protokolliert.</p>
+<p>Jede Seite dieses Handbuchs hat einen Link auf dieselbe Seite in der anderen Sprache, sodass Sie auch hier wechseln können.</p>
 <h2 id="notifications">Benachrichtigungen und Aufmerksamkeit</h2>
-<p>TODO</p>
+<p>Der &quot;Benachrichtigungsmodus&quot; in den Einstellungen legt fest, was geschieht, wenn eine Anfrage Sie braucht:</p>
+<table>
+<thead><tr><th>Option</th><th>Was geschieht</th></tr></thead>
+<tbody>
+<tr><td>Fenster anzeigen, ohne den Fokus zu übernehmen</td><td>Das Freigabefenster erscheint, übernimmt aber nicht den Tastaturfokus.</td></tr>
+<tr><td>Nur Kennzeichen</td><td>Es öffnet sich kein Fenster. Nur ein Kennzeichen zeigt, dass etwas aussteht.</td></tr>
+<tr><td>Fenster anzeigen und Fokus übernehmen</td><td>Das Freigabefenster erscheint und übernimmt den Fokus.</td></tr>
+</tbody></table>
+<p>Wählen Sie eine Option und dann &quot;Anwenden&quot;. Der &quot;Präsentationsmodus&quot; lässt sich im Tray-Menü umschalten. Er schaltet auf &quot;Nur Kennzeichen&quot; und wird in den Einstellungen nicht gespeichert.</p>
 <h2 id="cli-install">Befehlszeile installieren</h2>
-<p>TODO</p>
+<p>Agents rufen den Befehl <code>atlas-duck</code> aus einem Terminal auf. Der Abschnitt &quot;Befehlszeile&quot; in den Einstellungen zeigt, ob er in Ihrem PATH liegt (&quot;Der Befehl atlas-duck befindet sich in Ihrem PATH.&quot; oder &quot;...befindet sich nicht in Ihrem PATH.&quot;) und hat die Schaltflächen &quot;CLI im PATH installieren&quot; und &quot;CLI aus dem PATH entfernen&quot;. Was die Installation tut, hängt vom System ab:</p>
+<table>
+<thead><tr><th>System</th><th>Installation</th></tr></thead>
+<tbody>
+<tr><td>Windows</td><td>Fügt den Installationsordner Ihrem Benutzer-PATH hinzu.</td></tr>
+<tr><td>macOS</td><td>Legt den Link <code>~/.local/bin/atlas-duck</code> auf das Programm in der App an.</td></tr>
+<tr><td>Linux AppImage</td><td>Schreibt ein Wrapper-Skript <code>~/.local/bin/atlas-duck</code> und einen Starter in <code>~/.local/share/applications</code>.</td></tr>
+<tr><td>Linux <code>.deb</code> und <code>.rpm</code></td><td>Nichts zu tun: Der Befehl liegt bereits im PATH, und die Einstellungen sagen das.</td></tr>
+</tbody></table>
+<p>Öffnen Sie nach einer Installation ein neues Terminal und starten Sie Ihre MCP-Clients neu, damit sie den Befehl finden. Liegt <code>~/.local/bin</code> nicht im PATH Ihrer Terminals, weisen die Einstellungen darauf hin, dass Sie es hinzufügen müssen. Wenn Sie die AppImage-Datei verschieben oder umbenennen, wählen Sie &quot;CLI im PATH installieren&quot; erneut: Bis dahin meldet der Wrapper, dass die AppImage nicht gefunden wurde.</p>
 <h2 id="backup">Backup und Wiederherstellung</h2>
-<p>TODO</p>
+<p>Der Abschnitt &quot;Wiederherstellung und Backup&quot; in den Einstellungen schützt Ihr Audit-Protokoll.</p>
+<ul>
+<li>&quot;Jetzt sichern…&quot; erstellt ein Vollbackup in einem Ordner, den Sie wählen. Erstellen Sie vor jedem Upgrade eines.</li>
+<li>Backups enthalten nie gespeicherte Tokens. Nach einer Wiederherstellung braucht jede Instanz ihr Token erneut.</li>
+<li>Backups und Exporte unterliegen weder der Aufbewahrung noch dem Crypto-Shredding: Aufbewahren und Löschen liegt bei Ihnen.</li>
+<li>&quot;Backup wiederherstellen…&quot; ersetzt dieses Audit-Protokoll durch das Protokoll eines Backups. atlas-duck bittet Sie, in eigenen Dialogen zu bestätigen und die Wiederherstellungs-Passphrase des Backups einzugeben. Anfragen warten, solange die Wiederherstellung läuft. Datensätze, die nach dem Backup geschrieben wurden, sind danach nicht mehr im Protokoll, und gespeicherte Tokens werden gelöscht.</li>
+<li>&quot;Wiederherstellungs-Passphrase ändern…&quot; öffnet das Anmeldedatenfenster. Die Wiederherstellungs-Passphrase entsperrt das Audit-Protokoll nach einem Verlust des Schlüsselbunds, aus einem Backup oder auf einem neuen Computer.</li>
+</ul>
+<p>Bevor Sie atlas-duck deinstallieren, führen Sie &quot;Auf die Entfernung vorbereiten&quot; aus: Es kann ein Backup erstellen, löscht die gespeicherten Tokens, bittet Sie, jedes Token auf seinem Server zu widerrufen, und entfernt den Autostart-Eintrag und die Befehlszeile. Das Audit-Protokoll, seine Schlüssel und seine Anker bleiben auf dem Computer.</p>
 </main>
 </div>
 </body>

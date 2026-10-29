@@ -42,14 +42,48 @@
 </nav>
 <main>
 <h1>Settings</h1>
+<p>In desktop mode, Settings is its own window. Besides the topics on this page it holds your instances (<a href="instances-and-tokens.html">Instances and tokens</a>), the limits for requests and <a href="scripts.html#limits">scripts</a>, retention and legal hold (<a href="audit.html#retention">Audit log</a>), pruning, and &quot;Prepare for removal&quot;.</p>
 <h2 id="language">Language</h2>
-<p>TODO</p>
+<p>atlas-duck is available in English and German. The language applies to the windows and pages, notifications and native dialogs, and to this guide. Text that agents read, audit records, logs, the command line and the operations documentation stay in English.</p>
+<p>The choices are:</p>
+<ul>
+<li><strong>Automatic</strong>: German if the language of your operating system (desktop) or browser (server) is German, otherwise English.</li>
+<li><strong>Deutsch</strong></li>
+<li><strong>English</strong></li>
+</ul>
+<p>Open Settings, find the section &quot;Language&quot; and use the &quot;Language&quot; menu. Every open window switches at once. The choice is an app setting, stored outside the audit log, and it is not audited.</p>
+<p>Every page of this guide has a link to the same page in the other language, so you can switch here as well.</p>
 <h2 id="notifications">Notifications and attention</h2>
-<p>TODO</p>
+<p>&quot;Attention mode&quot; in Settings decides what happens when a request needs you:</p>
+<table>
+<thead><tr><th>Option</th><th>What happens</th></tr></thead>
+<tbody>
+<tr><td>Show the window without taking focus</td><td>The approvals window appears but does not take the keyboard focus.</td></tr>
+<tr><td>Badge only</td><td>No window opens. Only a badge shows that something is pending.</td></tr>
+<tr><td>Show the window and take focus</td><td>The approvals window appears and takes the focus.</td></tr>
+</tbody></table>
+<p>Choose an option and select &quot;Apply&quot;. &quot;Presentation mode&quot; is a toggle in the tray menu. It switches to &quot;badge only&quot; and is not saved in Settings.</p>
 <h2 id="cli-install">Install the command line</h2>
-<p>TODO</p>
+<p>Agents call the <code>atlas-duck</code> command from a terminal. The section &quot;Command line&quot; in Settings tells you whether it is on your PATH (&quot;The atlas-duck command is on your PATH.&quot; or &quot;...is not on your PATH.&quot;) and has the buttons &quot;Install CLI to PATH&quot; and &quot;Remove CLI from PATH&quot;. What the install does depends on the system:</p>
+<table>
+<thead><tr><th>System</th><th>Install</th></tr></thead>
+<tbody>
+<tr><td>Windows</td><td>Adds the install folder to your user PATH.</td></tr>
+<tr><td>macOS</td><td>Creates the link <code>~/.local/bin/atlas-duck</code> to the program inside the app.</td></tr>
+<tr><td>Linux AppImage</td><td>Writes a wrapper script <code>~/.local/bin/atlas-duck</code> and a launcher in <code>~/.local/share/applications</code>.</td></tr>
+<tr><td>Linux <code>.deb</code> and <code>.rpm</code></td><td>Nothing to do: the command is on the PATH already, and Settings says so.</td></tr>
+</tbody></table>
+<p>After an install, open a new terminal and restart your MCP clients so they find the command. If <code>~/.local/bin</code> is not on the PATH of your terminals, Settings tells you to add it. If you move or rename the AppImage file, choose &quot;Install CLI to PATH&quot; again: until then the wrapper reports that the AppImage was not found.</p>
 <h2 id="backup">Backup and restore</h2>
-<p>TODO</p>
+<p>The section &quot;Recovery and backup&quot; in Settings protects your audit log.</p>
+<ul>
+<li>&quot;Back up now…&quot; makes a full backup into a folder you choose. Make one before every upgrade.</li>
+<li>Backups never contain stored tokens. After a restore every instance needs its token again.</li>
+<li>Backups and exports are outside retention and crypto-shredding: keeping and deleting them is up to you.</li>
+<li>&quot;Restore backup…&quot; replaces this audit log with the log of a backup. atlas-duck asks you to confirm in its own dialogs and to enter the recovery passphrase of the backup. Requests wait while the restore runs. Records written after the backup are no longer in the log, and stored tokens are deleted.</li>
+<li>&quot;Change recovery passphrase…&quot; opens the credential window. The recovery passphrase unlocks the audit log after a keychain loss, from a backup or on a new machine.</li>
+</ul>
+<p>Before you uninstall atlas-duck, run &quot;Prepare for removal&quot;: it can make a backup, deletes the stored tokens, asks you to revoke each token on its server, and removes the login item and the command line. The audit log, its keys and its anchors stay on the computer.</p>
 </main>
 </div>
 </body>

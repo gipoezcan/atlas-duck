@@ -23,7 +23,7 @@
 <ul>
 <li><a href="index.html" aria-current="page">Overview</a>
 <ul>
-<li><a href="#what-is-atlas-duck">What Atlas Duck is</a></li>
+<li><a href="#what-is-atlas-duck">What atlas-duck is</a></li>
 <li><a href="#how-it-works">How a request flows</a></li>
 <li><a href="#where-to-start">Where to start</a></li>
 </ul>
@@ -41,12 +41,40 @@
 </nav>
 <main>
 <h1>Overview</h1>
-<h2 id="what-is-atlas-duck">What Atlas Duck is</h2>
-<p>TODO</p>
+<p>This guide is for the people who use atlas-duck: users and, in server mode, admins and auditors.</p>
+<h2 id="what-is-atlas-duck">What atlas-duck is</h2>
+<p>atlas-duck lets AI agents read Jira and Confluence Data Center and propose writes that you approve. Every action is recorded in a tamper-evident audit chain.</p>
+<p>There are two ways to run it:</p>
+<ul>
+<li><strong>Desktop mode</strong>: atlas-duck is installed and runs on your own machine. It serves you and the agents that run on that machine.</li>
+<li><strong>Server mode</strong>: your organisation hosts atlas-duck once, on its own network. It serves many users and their agents, and nothing is installed on your machine: you use it in a browser.</li>
+</ul>
+<p>Both modes work the same way for you. These terms come back on every page:</p>
+<table>
+<thead><tr><th>Term</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>Agent</td><td>An AI program that acts on your behalf through atlas-duck. It proposes writes but never approves them.</td></tr>
+<tr><td>Instance</td><td>One Jira or Confluence Data Center server that atlas-duck talks to, known by an alias.</td></tr>
+<tr><td>Personal access token (PAT)</td><td>Your own Jira or Confluence token. atlas-duck always acts as you, never as a shared service account.</td></tr>
+<tr><td>Approval</td><td>Your explicit yes or no to one proposed write before it reaches an instance. Every write needs one, in both modes.</td></tr>
+<tr><td>Audit chain</td><td>Your tamper-evident record of everything atlas-duck did for you. Each user has one, in both modes.</td></tr>
+</tbody></table>
 <h2 id="how-it-works">How a request flows</h2>
-<p>TODO</p>
+<ol>
+<li>An agent asks atlas-duck for something, for example to read a Jira issue or to change one.</li>
+<li>The request appears in your approvals. Nothing reaches the instance yet.</li>
+<li>You decide. You approve a write, release the result of a read or a script to the agent, or deny the request. An agent can never approve anything.</li>
+<li>After your approval, atlas-duck sends the request to the instance as you, with your own personal access token.</li>
+<li>atlas-duck records what happened in your audit chain.</li>
+</ol>
+<p>A request that nobody decides expires.</p>
 <h2 id="where-to-start">Where to start</h2>
-<p>TODO</p>
+<ol>
+<li><a href="getting-started-desktop.html">Getting started (desktop)</a> installs atlas-duck and walks through the first start.</li>
+<li><a href="instances-and-tokens.html">Instances and tokens</a> connects your Jira and Confluence servers.</li>
+<li><a href="agents-desktop.html">Agents (desktop)</a> shows how an agent reaches atlas-duck.</li>
+</ol>
+<p>Then read <a href="approvals.html">Approvals</a>, the page you will use most, and <a href="audit.html">Audit log</a>. If something goes wrong, see <a href="troubleshooting.html">Troubleshooting</a> and the <a href="error-reference.html">Error reference</a>.</p>
 </main>
 </div>
 </body>

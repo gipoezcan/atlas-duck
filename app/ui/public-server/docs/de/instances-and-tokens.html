@@ -46,15 +46,38 @@
 <main>
 <h1>Instanzen und Tokens</h1>
 <h2 id="instances">Instanzen</h2>
-<p>TODO</p>
+<p>Eine Instanz ist ein Jira- oder Confluence-Data-Center-Server, mit dem atlas-duck spricht. Sie ist unter einem Alias bekannt, zum Beispiel dem Kurznamen des Servers.</p>
+<p>Im Servermodus legt ein Administrator die Instanzen für alle fest. Sie sehen sie auf der Seite &quot;Zugangsdaten&quot; und fügen nur Ihr eigenes Token für jede hinzu. Steht auf der Seite &quot;Es ist noch keine Instanz eingerichtet. Instanzen fügt ein Administrator hinzu.&quot;, fragen Sie Ihren Administrator. Für Administratoren: siehe <a href="/docs/de/admin#instances-admin">Administration</a>.</p>
 <h2 id="add-instance">Instanz hinzufügen</h2>
-<p>TODO</p>
+<p>Benutzer fügen im Servermodus keine Instanzen hinzu. Bitten Sie Ihren Administrator, eine hinzuzufügen. Prüfen Sie, bevor Sie ein Token speichern, dass die URL auf der Seite &quot;Zugangsdaten&quot; der Server ist, den Sie meinen.</p>
 <h2 id="tokens">Tokens</h2>
-<p>TODO</p>
+<p>atlas-duck handelt immer als Sie, mit Ihrem eigenen persönlichen Zugriffstoken (PAT), nie mit einem gemeinsamen Dienstkonto. Erstellen Sie das Token in Jira oder Confluence (Profil → Persönliche Zugriffstoken) und geben Sie ihm nur die Berechtigungen, die Ihre Arbeit braucht. Was das Token in Jira oder Confluence nicht darf, kann auch ein Agent nicht.</p>
+<p>Geben Sie das Token auf der <a href="#credentials-page">Seite Zugangsdaten</a> ein.</p>
+<p>Wenn Sie ein Token speichern, testet atlas-duck es zuerst gegen die Instanz. Das sind die Gründe für eine Ablehnung:</p>
+<table>
+<thead><tr><th>Grund</th><th>Was Sie tun können</th></tr></thead>
+<tbody>
+<tr><td>Der Server hat das Token zurückgewiesen (401).</td><td>Prüfen Sie, ob es ein gültiges persönliches Zugriffstoken ist, das nicht abgelaufen ist.</td></tr>
+<tr><td>Das Token gehört einem anderen Benutzer.</td><td>Für die Instanz ist schon ein Token eines anderen Atlassian-Benutzers gespeichert. Entfernen Sie zuerst das gespeicherte Token.</td></tr>
+<tr><td>Das TLS-Zertifikat des Servers konnte nicht geprüft werden.</td><td>Verwendet Ihr Server eine interne CA, braucht die Instanz sie als eigene CA.</td></tr>
+<tr><td>Ein Proxy hat die Verbindung blockiert oder verändert.</td><td>Prüfen Sie die Proxy-Einstellungen.</td></tr>
+<tr><td>Der Server war nicht erreichbar.</td><td>Versuchen Sie es später erneut.</td></tr>
+<tr><td>Die Serverversion liegt unter dem Minimum, das atlas-duck unterstützt.</td><td>Die Instanz muss aktualisiert werden.</td></tr>
+</tbody></table>
 <h2 id="token-storage">Wo Tokens gespeichert werden</h2>
-<p>TODO</p>
+<p>Ihre Tokens werden auf dem Server gespeichert, verschlüsselt mit einem Schlüssel, der Ihnen gehört. atlas-duck zeigt ein gespeichertes Token nie wieder an. Ihre Tokens werden sofort gelöscht, wenn Ihr Konto deaktiviert wird, und wenn ein Administrator eine Instanz entfernt, werden die Tokens aller Benutzer für sie gelöscht.</p>
+<p>Tokens geben Zugriff auf Jira und Confluence in Ihrem Namen. Erneuern Sie sie regelmäßig und widerrufen Sie ein Token auf seinem Server, wenn Sie es nicht mehr brauchen.</p>
 <h2 id="credentials-page">Die Zugangsdaten-Seite</h2>
-<p>TODO</p>
+<p>&quot;Zugangsdaten&quot; in der Kopfzeile listet jede Instanz mit Produkt, URL und Token-Status:</p>
+<table>
+<thead><tr><th>Status</th><th>Bedeutung</th></tr></thead>
+<tbody>
+<tr><td>Kein Token</td><td>Sie haben keines gespeichert.</td></tr>
+<tr><td>Token gespeichert</td><td>Das Token funktioniert. Die Zeile zeigt den Atlassian-Benutzer, zum Beispiel &quot;als jdoe&quot;.</td></tr>
+<tr><td>Token gespeichert, nicht verwendbar</td><td>Das gespeicherte Token funktioniert nicht mehr. Ersetzen Sie es.</td></tr>
+</tbody></table>
+<p>Verwenden Sie &quot;Token hinzufügen&quot; oder &quot;Token ersetzen&quot;, geben Sie das Token unter &quot;Persönliches Zugriffstoken für <em>Alias</em>&quot; ein und wählen Sie &quot;Prüfen und speichern&quot;. &quot;Entfernen&quot; löscht Ihr Token für diese Instanz nach einer Rückfrage. atlas-duck zeigt ein gespeichertes Token nie an.</p>
+<p>Fehlermeldungen, die Sie sehen können: &quot;Die Instanz hat dieses Token zurückgewiesen. Prüfen Sie es und versuchen Sie es erneut.&quot;; &quot;Dieses Token gehört einem anderen Atlassian-Benutzer. Entfernen Sie zuerst das gespeicherte Token.&quot;; &quot;Diese Instanz lässt sich gerade nicht verwenden. Wenden Sie sich an einen Administrator.&quot;; &quot;Die Instanz ist nicht erreichbar. Versuchen Sie es später erneut.&quot;; &quot;Diese Instanz gibt es nicht mehr.&quot;; &quot;Das Token ist leer oder zu lang.&quot;</p>
 </main>
 </div>
 </body>

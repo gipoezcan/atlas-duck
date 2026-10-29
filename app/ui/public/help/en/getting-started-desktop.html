@@ -43,13 +43,57 @@
 <main>
 <h1>Getting started (desktop)</h1>
 <h2 id="install">Install</h2>
-<p>TODO</p>
+<p>atlas-duck installs three programs side by side: <code>atlas-duck-app</code> (the tray application with the approval windows), <code>atlas-duck</code> (the command line and the MCP server that agents call) and <code>atlas-duck-sandbox</code> (the helper that runs agent scripts). The command line and the MCP server do nothing on their own. They ask the running app, and the app asks you before any write.</p>
+<table>
+<thead><tr><th>System</th><th>Versions</th><th>Package</th></tr></thead>
+<tbody>
+<tr><td>Windows</td><td>Windows 10 22H2 and later, Windows 11 (x86_64)</td><td>NSIS installer</td></tr>
+<tr><td>macOS</td><td>macOS 13 and later (arm64 and x86_64, one build each)</td><td><code>.dmg</code></td></tr>
+<tr><td>Ubuntu</td><td>22.04 and later</td><td><code>.deb</code>, AppImage</td></tr>
+<tr><td>Fedora</td><td>40 and later</td><td><code>.rpm</code>, AppImage</td></tr>
+</tbody></table>
+<ul>
+<li><strong>Windows:</strong> the installer offers a per-user and a per-machine install. The per-machine install (Program Files) is recommended, because ordinary users cannot change the program files. Do not run atlas-duck as administrator. If the app runs elevated and the agent's terminal does not, the command line refuses to talk to it; start both at the same privilege level.</li>
+<li><strong>macOS:</strong> open the <code>.dmg</code> and move the app to Applications.</li>
+<li><strong>Linux:</strong> atlas-duck keeps its keys and your tokens in the operating system keychain. That needs a Secret Service provider with a usable default collection, for example GNOME Keyring or KWallet. Without one, the first start stops and says: &quot;atlas-duck needs a system keyring (Secret Service, e.g. GNOME Keyring or KWallet). Install or unlock one, then restart atlas-duck.&quot;</li>
+</ul>
+<p>The <code>atlas-duck</code> command is not on your PATH after the install, except with the Linux <code>.deb</code> and <code>.rpm</code> packages. See <a href="settings.html#cli-install">Install the command line</a>.</p>
+<p>An uninstall removes the programs and nothing else: the audit log, your settings and your keychain entries stay. Use &quot;Prepare for removal&quot; in Settings before you uninstall.</p>
 <h2 id="first-start">First start and setup</h2>
-<p>TODO</p>
+<p>The first time atlas-duck starts, the setup window leads you through these steps in order. Until setup is finished, requests from agents are refused and the window shows &quot;Setup required&quot; with the number of refused requests.</p>
+<ol>
+<li><strong>Where atlas-duck keeps its data.</strong> The audit log and the settings live in one folder on a local disk. Choose &quot;Use the default folder&quot; or &quot;Choose another folder…&quot;. A network folder is refused. If the folder already holds an audit log, atlas-duck says &quot;An audit log already exists here&quot;, keeps it, and you choose &quot;Continue with this log&quot;.</li>
+<li><strong>Anchor directory (optional).</strong> For advanced use: a folder outside this computer, for example a network share, to which atlas-duck also writes its audit anchors. You can skip it and change it later in Settings.</li>
+<li><strong>Recovery passphrase.</strong> It lets you read the audit log again if this computer's keychain is lost. You enter it twice in the credential window, and atlas-duck cannot show it again. It is not your Atlassian password. Store it where your compliance owner can retrieve it.</li>
+<li><strong>Creating the audit log.</strong> atlas-duck creates the log.</li>
+<li><strong>Recovery note.</strong> The credential window offers to save a note with your install id, chain id and data folder. Save it if you want one.</li>
+<li><strong>Add your Jira or Confluence instances.</strong> See <a href="#connect-instance">Connect an instance</a>. You can also do this later.</li>
+<li><strong>Command line.</strong> &quot;Install CLI to PATH&quot; puts the <code>atlas-duck</code> command on your PATH so agents can find it.</li>
+<li><strong>Agent onboarding.</strong> Instructions to copy into the <code>CLAUDE.md</code> or <code>AGENTS.md</code> of the repositories your agents work in. See <a href="agents-desktop.html">Agents (desktop)</a>.</li>
+<li><strong>Finish setup.</strong> &quot;Setup is complete&quot;: atlas-duck is ready and the approvals window opens.</li>
+</ol>
+<p>If you already have a backup of an atlas-duck audit log, the setup window offers &quot;Restore from a backup…&quot; instead of a new log, before the log exists. You then enter the recovery passphrase of the backup and no new passphrase is set.</p>
 <h2 id="connect-instance">Connect an instance</h2>
-<p>TODO</p>
+<p>An instance is one Jira or Confluence Data Center server. In desktop mode you define your own, either in the setup window or later in Settings under &quot;Add an instance&quot;.</p>
+<ol>
+<li>Enter an alias, the product (Jira or Confluence) and the base URL. The URL must use https and include the context path. If the server uses an internal certificate authority, choose &quot;Use a custom CA certificate&quot;.</li>
+<li>Choose &quot;Add instance&quot;. atlas-duck shows the alias and the origin in its own dialog; confirm it (&quot;Confirm instance&quot;).</li>
+<li>Add your personal access token. The setup window leaves this for Settings: &quot;Add its token in Settings after setup.&quot;</li>
+</ol>
+<p>Details, fields and the token steps are in <a href="instances-and-tokens.html">Instances and tokens</a>.</p>
 <h2 id="tray">The tray menu</h2>
-<p>TODO</p>
+<p>atlas-duck runs in the system tray. Closing a window only hides it. The tooltip shows how many requests are pending (&quot;atlas-duck: N pending&quot;). The menu has these entries:</p>
+<table>
+<thead><tr><th>Entry</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td>Open approvals (N)</td><td>Opens the approvals window, or the window atlas-duck needs from you instead. N is the number of pending requests.</td></tr>
+<tr><td>Unlock…</td><td>Opens the credential window. Only while atlas-duck is locked.</td></tr>
+<tr><td>Retry keychain</td><td>One more attempt to reach the keychain. Only while the keychain is unavailable.</td></tr>
+<tr><td>Presentation mode</td><td>Switches to &quot;badge only&quot; without confirmation, until you switch it off again.</td></tr>
+<tr><td>Help</td><td>Opens this guide.</td></tr>
+<tr><td>Quit</td><td>Shuts atlas-duck down.</td></tr>
+</tbody></table>
+<p>Status lines above the entries show why atlas-duck cannot serve, for example &quot;Locked&quot;, &quot;Setup required&quot; or &quot;Waiting for keyring&quot;.</p>
 </main>
 </div>
 </body>

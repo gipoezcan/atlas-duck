@@ -43,13 +43,57 @@
 <main>
 <h1>Erste Schritte (Desktop)</h1>
 <h2 id="install">Installation</h2>
-<p>TODO</p>
+<p>atlas-duck installiert drei Programme nebeneinander: <code>atlas-duck-app</code> (die Tray-Anwendung mit den Freigabefenstern), <code>atlas-duck</code> (die Befehlszeile und der MCP-Server, die Agents aufrufen) und <code>atlas-duck-sandbox</code> (das Hilfsprogramm, das Agent-Skripte ausführt). Befehlszeile und MCP-Server tun von sich aus nichts. Sie fragen die laufende App, und die App fragt Sie vor jedem Schreibvorgang.</p>
+<table>
+<thead><tr><th>System</th><th>Versionen</th><th>Paket</th></tr></thead>
+<tbody>
+<tr><td>Windows</td><td>Windows 10 22H2 und neuer, Windows 11 (x86_64)</td><td>NSIS-Installer</td></tr>
+<tr><td>macOS</td><td>macOS 13 und neuer (arm64 und x86_64, je ein Build)</td><td><code>.dmg</code></td></tr>
+<tr><td>Ubuntu</td><td>22.04 und neuer</td><td><code>.deb</code>, AppImage</td></tr>
+<tr><td>Fedora</td><td>40 und neuer</td><td><code>.rpm</code>, AppImage</td></tr>
+</tbody></table>
+<ul>
+<li><strong>Windows:</strong> Der Installer bietet eine Installation pro Benutzer und eine pro Computer an. Die Installation pro Computer (Programme) wird empfohlen, weil normale Benutzer die Programmdateien dann nicht ändern können. Führen Sie atlas-duck nicht als Administrator aus. Läuft die App mit erhöhten Rechten und das Terminal des Agents nicht, verweigert die Befehlszeile das Gespräch mit ihr; starten Sie beide mit denselben Rechten.</li>
+<li><strong>macOS:</strong> Öffnen Sie die <code>.dmg</code> und ziehen Sie die App in den Ordner Programme.</li>
+<li><strong>Linux:</strong> atlas-duck legt seine Schlüssel und Ihre Tokens im Schlüsselbund des Betriebssystems ab. Dafür brauchen Sie einen Secret-Service-Anbieter mit einer nutzbaren Standardsammlung, zum Beispiel GNOME Keyring oder KWallet. Ohne ihn bricht der erste Start ab und meldet: &quot;atlas-duck needs a system keyring (Secret Service, e.g. GNOME Keyring or KWallet). Install or unlock one, then restart atlas-duck.&quot; (Diese Meldung erscheint auf Englisch.)</li>
+</ul>
+<p>Der Befehl <code>atlas-duck</code> liegt nach der Installation nicht in Ihrem PATH, außer bei den Linux-Paketen <code>.deb</code> und <code>.rpm</code>. Siehe <a href="settings.html#cli-install">Befehlszeile installieren</a>.</p>
+<p>Eine Deinstallation entfernt nur die Programme: Das Audit-Protokoll, Ihre Einstellungen und Ihre Schlüsselbund-Einträge bleiben erhalten. Verwenden Sie vor dem Deinstallieren &quot;Auf die Entfernung vorbereiten&quot; in den Einstellungen.</p>
 <h2 id="first-start">Erster Start und Einrichtung</h2>
-<p>TODO</p>
+<p>Beim ersten Start führt Sie das Einrichtungsfenster der Reihe nach durch diese Schritte. Bis die Einrichtung abgeschlossen ist, werden Anfragen von Agents zurückgewiesen, und das Fenster zeigt &quot;Einrichtung erforderlich&quot; mit der Zahl der zurückgewiesenen Anfragen.</p>
+<ol>
+<li><strong>Wo atlas-duck seine Daten ablegt.</strong> Das Audit-Protokoll und die Einstellungen liegen in einem Ordner auf einem lokalen Datenträger. Wählen Sie &quot;Standardordner verwenden&quot; oder &quot;Anderen Ordner wählen…&quot;. Ein Netzwerkordner wird abgelehnt. Enthält der Ordner bereits ein Audit-Protokoll, meldet atlas-duck &quot;Hier gibt es bereits ein Audit-Protokoll&quot;, behält es, und Sie wählen &quot;Mit diesem Protokoll fortfahren&quot;.</li>
+<li><strong>Anker-Verzeichnis (optional).</strong> Für Fortgeschrittene: ein Ordner außerhalb dieses Computers, zum Beispiel eine Netzwerkfreigabe, in den atlas-duck seine Audit-Anker zusätzlich schreibt. Sie können ihn überspringen und später in den Einstellungen ändern.</li>
+<li><strong>Wiederherstellungs-Passphrase.</strong> Mit ihr können Sie das Audit-Protokoll wieder lesen, wenn der Schlüsselbund dieses Computers verloren geht. Sie geben sie zweimal im Anmeldedatenfenster ein, und atlas-duck kann sie nicht noch einmal anzeigen. Sie ist nicht Ihr Atlassian-Passwort. Bewahren Sie sie so auf, dass Ihr Compliance-Verantwortlicher sie abrufen kann.</li>
+<li><strong>Das Audit-Protokoll wird erstellt.</strong> atlas-duck legt das Protokoll an.</li>
+<li><strong>Wiederherstellungsnotiz.</strong> Das Anmeldedatenfenster bietet an, eine Notiz mit Ihrer Installations-ID, Ketten-ID und Ihrem Datenordner zu speichern. Speichern Sie sie, wenn Sie eine möchten.</li>
+<li><strong>Jira- oder Confluence-Instanzen hinzufügen.</strong> Siehe <a href="#connect-instance">Instanz verbinden</a>. Das können Sie auch später tun.</li>
+<li><strong>Befehlszeile.</strong> &quot;CLI im PATH installieren&quot; legt den Befehl <code>atlas-duck</code> in Ihren PATH, damit Agents ihn finden.</li>
+<li><strong>Einführung für Agents.</strong> Anweisungen, die Sie in die <code>CLAUDE.md</code> oder <code>AGENTS.md</code> der Repositories kopieren, in denen Ihre Agents arbeiten. Siehe <a href="agents-desktop.html">Agents (Desktop)</a>.</li>
+<li><strong>Einrichtung abschließen.</strong> &quot;Die Einrichtung ist abgeschlossen&quot;: atlas-duck ist bereit, und das Freigabefenster öffnet sich.</li>
+</ol>
+<p>Wenn Sie bereits ein Backup eines atlas-duck-Audit-Protokolls haben, bietet das Einrichtungsfenster &quot;Aus einem Backup wiederherstellen…&quot; an, statt ein neues Protokoll zu erstellen, solange es noch kein Protokoll gibt. Sie geben dann die Wiederherstellungs-Passphrase des Backups ein, und es wird keine neue Passphrase festgelegt.</p>
 <h2 id="connect-instance">Instanz verbinden</h2>
-<p>TODO</p>
+<p>Eine Instanz ist ein Jira- oder Confluence-Data-Center-Server. Im Desktopmodus legen Sie Ihre eigenen an, entweder im Einrichtungsfenster oder später in den Einstellungen unter &quot;Instanz hinzufügen&quot;.</p>
+<ol>
+<li>Geben Sie einen Alias, das Produkt (Jira oder Confluence) und die Basis-URL ein. Die URL muss https verwenden und den Kontextpfad enthalten. Verwendet der Server eine interne Zertifizierungsstelle, wählen Sie &quot;Eigenes CA-Zertifikat verwenden&quot;.</li>
+<li>Wählen Sie &quot;Instanz hinzufügen&quot;. atlas-duck zeigt Alias und Origin in einem eigenen Dialog; bestätigen Sie sie (&quot;Instanz bestätigen&quot;).</li>
+<li>Fügen Sie Ihr persönliches Zugriffstoken hinzu. Das Einrichtungsfenster überlässt das den Einstellungen: &quot;Fügen Sie ihr Token nach der Einrichtung in den Einstellungen hinzu.&quot;</li>
+</ol>
+<p>Felder und Token-Schritte im Einzelnen stehen unter <a href="instances-and-tokens.html">Instanzen und Tokens</a>.</p>
 <h2 id="tray">Das Tray-Menü</h2>
-<p>TODO</p>
+<p>atlas-duck läuft im Infobereich der Taskleiste (Tray). Das Schließen eines Fensters blendet es nur aus. Der Tooltip zeigt, wie viele Anfragen ausstehen (&quot;atlas-duck: N ausstehend&quot;). Das Menü enthält diese Einträge:</p>
+<table>
+<thead><tr><th>Eintrag</th><th>Wirkung</th></tr></thead>
+<tbody>
+<tr><td>Freigaben öffnen (N)</td><td>Öffnet das Freigabefenster oder das Fenster, das atlas-duck stattdessen von Ihnen braucht. N ist die Zahl der ausstehenden Anfragen.</td></tr>
+<tr><td>Entsperren…</td><td>Öffnet das Anmeldedatenfenster. Nur solange atlas-duck gesperrt ist.</td></tr>
+<tr><td>Schlüsselbund erneut versuchen</td><td>Ein weiterer Versuch, den Schlüsselbund zu erreichen. Nur solange der Schlüsselbund nicht verfügbar ist.</td></tr>
+<tr><td>Präsentationsmodus</td><td>Schaltet ohne Rückfrage auf &quot;Nur Kennzeichen&quot;, bis Sie ihn wieder ausschalten.</td></tr>
+<tr><td>Hilfe</td><td>Öffnet dieses Handbuch.</td></tr>
+<tr><td>Beenden</td><td>Beendet atlas-duck.</td></tr>
+</tbody></table>
+<p>Statuszeilen über den Einträgen zeigen, warum atlas-duck nicht bedienen kann, zum Beispiel &quot;Gesperrt&quot;, &quot;Einrichtung erforderlich&quot; oder &quot;Warte auf den Schlüsselbund&quot;.</p>
 </main>
 </div>
 </body>
