@@ -1267,7 +1267,7 @@ mod tests {
         );
     }
 
-    /// The §12.5 step text reaches the user through the page's own copy (`shared/strings.ts`); the
+    /// The §12.5 step text reaches the user through the page's own copy (`shared/i18n/en/settings.ts`); the
     /// Rust constant, that copy and the spec's sentence must be one string: each is read from its
     /// file, none is compared with itself.
     #[test]
@@ -1281,7 +1281,7 @@ mod tests {
             spec.contains(&format!("\"{REVOKE_STEP}\"")),
             "the spec (12.5) differs"
         );
-        let page = read("app/ui/src/shared/strings.ts");
+        let page = read("app/ui/src/shared/i18n/en/settings.ts");
         assert!(
             page.contains(&format!("'{REVOKE_STEP}'")),
             "the page's copy differs"

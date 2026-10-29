@@ -2530,7 +2530,7 @@ mod settings_commands {
             json!({"kind": "admin", "error": {"kind": "insecure_scheme"}})
         );
         // (The hint's text is the page's: `the_https_hint_is_the_spec_sentence_and_the_pages_copy`
-        // ties it to the spec and to `shared/strings.ts`.)
+        // ties it to the spec and to `shared/i18n/en/settings.ts`.)
         // A URL change to http is refused the same way; the hint is for both entry points.
         let a = admin.clone();
         let change = parse::<InstanceChangeUrlArgs>(

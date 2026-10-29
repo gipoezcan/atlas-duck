@@ -2022,7 +2022,7 @@ mod tests {
                "proxy": "", "use_custom_ca": false, "is_default": true})
     }
 
-    /// The hint reaches the page through the page's own copy (`shared/strings.ts`, shown for
+    /// The hint reaches the page through the page's own copy (`shared/i18n/en/settings.ts`, shown for
     /// `admin/insecure_scheme`; the wire carries only the kind). The Rust constant, that copy and
     /// the spec's §7.1 text must be one string: each is read from its file, none is compared with
     /// itself.
@@ -2034,7 +2034,8 @@ mod tests {
         };
         let spec = read("docs/superpowers/specs/2026-10-07-atlas-duck-design.md");
         assert!(spec.contains(HTTPS_REQUIRED_HINT), "the spec (7.1) differs");
-        let page = read("app/ui/src/shared/strings.ts");
+        // M15: the English dictionary holds the page's copy (the German one translates it).
+        let page = read("app/ui/src/shared/i18n/en/settings.ts");
         assert!(
             page.contains(&format!("'{HTTPS_REQUIRED_HINT}'"))
                 || page.contains(&format!("\"{HTTPS_REQUIRED_HINT}\"")),
