@@ -48,6 +48,18 @@ export const CMD_ERROR_KINDS = [
 ] as const;
 export type CmdErrorKind = (typeof CMD_ERROR_KINDS)[number];
 
+/** The DecisionError kinds of crates/core/src/decision/mod.rs (the decision variant of a command error). */
+export const DECISION_ERROR_KINDS = [
+  'stale',
+  'invalid',
+  'edit_rejected',
+  'audit',
+  'batch_rejected',
+  'cancelled',
+  'not_decidable',
+] as const;
+export type DecisionErrorKind = (typeof DECISION_ERROR_KINDS)[number];
+
 export type { ServerErrorCode } from '../../server/http';
 
 /** An own-property lookup: `toString` or `__proto__` are not codes. */
@@ -63,6 +75,11 @@ export function envelopeErrorText(t: Dict, code: string): string {
 /** Text for a command error `kind`. */
 export function cmdErrorText(t: Dict, kind: string): string {
   return lookup(t.errors.cmd, kind) ?? t.errors.generic(kind);
+}
+
+/** Text for a `DecisionError` kind (`{kind: 'decision', error: {kind}}`). */
+export function decisionErrorText(t: Dict, kind: string): string {
+  return lookup(t.errors.decision, kind) ?? t.errors.generic(kind);
 }
 
 /** Text for a server `error.code` (`null`: the answer had none); `reason` is not used yet. */

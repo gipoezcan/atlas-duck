@@ -2,8 +2,10 @@ import { Fragment, useId, type ReactNode } from 'react';
 
 import type { DecideArgs } from '../shared/ipc/invoke';
 import type { Preview, RedactionOp } from '../shared/ipc/types';
-import { DETAIL_TEXT, KEYBOARD_TEXT } from '../shared/strings';
 import { POSITIVE_ATTR } from './keyboard';
+import { useText } from '../shared/i18n/context';
+import { en } from '../shared/i18n/dict';
+import type { Dict } from '../shared/i18n';
 
 export type DecisionArgs = Omit<DecideArgs, 'request_id' | 'candidate_rev'>;
 
@@ -32,7 +34,7 @@ export interface Card {
   lines: string[];
 }
 
-export function cardOf(preview: Preview): Card {
+export function cardOf(preview: Preview, t: Dict = en): Card {
   const kind = preview.body.kind;
   const status = typeof preview.body.status === 'number' ? preview.body.status : null;
   const withStatus = (s: string) => s.replace('<status>', String(status ?? ''));
@@ -42,25 +44,25 @@ export function cardOf(preview: Preview): Card {
   if (kind === 'upstream_error') {
     return {
       positives: [
-        { label: DETAIL_TEXT.release, args: { decision: 'release' } },
+        { label: t.approvals.detail.release, args: { decision: 'release' } },
         {
-          label: DETAIL_TEXT.release_status_only,
+          label: t.approvals.detail.release_status_only,
           args: { decision: 'release_redacted', redactions: [...STATUS_ONLY] },
         },
       ],
       approveShownDisabled: false,
       lines: [
-        withStatus(DETAIL_TEXT.consequence_release),
-        withStatus(DETAIL_TEXT.consequence_status_only),
-        DETAIL_TEXT.consequence_deny,
+        withStatus(t.approvals.detail.consequence_release),
+        withStatus(t.approvals.detail.consequence_status_only),
+        t.approvals.detail.consequence_deny,
       ],
     };
   }
   if (kind === 'outcome') {
     return {
-      positives: [{ label: DETAIL_TEXT.release_outcome, args: { decision: 'release' } }],
+      positives: [{ label: t.approvals.detail.release_outcome, args: { decision: 'release' } }],
       approveShownDisabled: false,
-      lines: [DETAIL_TEXT.consequence_release_outcome, DETAIL_TEXT.consequence_deny],
+      lines: [t.approvals.detail.consequence_release_outcome, t.approvals.detail.consequence_deny],
     };
   }
   if (DENY_ONLY_KINDS.has(kind)) {
@@ -70,8 +72,8 @@ export function cardOf(preview: Preview): Card {
   return {
     positives: [
       isWrite
-        ? { label: DETAIL_TEXT.approve, args: { decision: 'approve' } }
-        : { label: DETAIL_TEXT.release, args: { decision: 'release' } },
+        ? { label: t.approvals.detail.approve, args: { decision: 'approve' } }
+        : { label: t.approvals.detail.release, args: { decision: 'release' } },
     ],
     approveShownDisabled: false,
     lines: [],
@@ -105,12 +107,13 @@ export function DecisionBar({
   onDeny,
   denyDialog,
 }: DecisionBarProps) {
+  const t = useText();
   const marker = { [POSITIVE_ATTR]: '' };
   const legendId = useId();
   const several = (card?.positives.length ?? 0) > 1;
   return (
     <>
-      <div className="detail-actions" role="group" aria-label={DETAIL_TEXT.actions_label}>
+      <div className="detail-actions" role="group" aria-label={t.approvals.detail.actions_label}>
         {card?.positives.map((p, i) => (
           <Fragment key={p.label}>
             <button
@@ -126,18 +129,18 @@ export function DecisionBar({
               {p.label}
             </button>
             {i === 0 && several ? (
-              <span className="chord-marker">({KEYBOARD_TEXT.chord_runs})</span>
+              <span className="chord-marker">({t.approvals.keyboard.chord_runs})</span>
             ) : null}
           </Fragment>
         ))}
         {card?.approveShownDisabled === true ? (
           <button type="button" className="primary" {...marker} disabled>
-            {DETAIL_TEXT.approve}
+            {t.approvals.detail.approve}
           </button>
         ) : null}
         {canDeny ? (
           <button type="button" className="danger" disabled={busy} aria-expanded={denyDialog !== null} onClick={onDeny}>
-            {DETAIL_TEXT.deny}
+            {t.approvals.detail.deny}
           </button>
         ) : null}
         {card === null || card.lines.length === 0 ? null : (
@@ -149,10 +152,10 @@ export function DecisionBar({
         )}
       </div>
       {denyDialog}
-      <ul className="keyboard-legend" aria-label={KEYBOARD_TEXT.legend_label}>
-        <li id={legendId}>{KEYBOARD_TEXT.approve}</li>
-        <li>{KEYBOARD_TEXT.deny}</li>
-        <li>{KEYBOARD_TEXT.navigate}</li>
+      <ul className="keyboard-legend" aria-label={t.approvals.keyboard.legend_label}>
+        <li id={legendId}>{t.approvals.keyboard.approve}</li>
+        <li>{t.approvals.keyboard.deny}</li>
+        <li>{t.approvals.keyboard.navigate}</li>
       </ul>
     </>
   );

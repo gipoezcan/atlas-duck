@@ -1,4 +1,6 @@
-import { DETAIL_TEXT } from '../shared/strings';
+
+
+import { useText } from '../shared/i18n/context';
 
 interface PreviewFrameProps {
   /** The document Rust built and sanitized (spec 6.4); it carries its own CSP `<meta>`. */
@@ -14,6 +16,7 @@ interface PreviewFrameProps {
  * `allow`, `referrerpolicy` or `credentialless` attribute is set here. The Audit window's decrypted
  * payload pages (`audit_payload`, M10 T20) are shown through this frame too.
  */
-export function PreviewFrame({ srcdoc, title = DETAIL_TEXT.preview_title }: PreviewFrameProps) {
-  return <iframe sandbox="" srcDoc={srcdoc} title={title} />;
+export function PreviewFrame({ srcdoc, title }: PreviewFrameProps) {
+  const t = useText();
+  return <iframe sandbox="" srcDoc={srcdoc} title={title ?? t.approvals.detail.preview_title} />;
 }

@@ -1,12 +1,14 @@
 import type { RecentItem } from '../shared/ipc/types';
 import { own } from '../shared/text/own';
-import { CLASS_LABELS, RECENT_TEXT, STATUS_LABELS } from '../shared/strings';
 import { Badge } from '../shared/text/Badge';
+import { useLang, useText } from '../shared/i18n/context';
+import type { Lang } from '../shared/i18n';
 
-/** "2026-10-14T09:30:00.000Z" as "2026-10-14 09:30 UTC": no locale, so it reads the same everywhere. */
-export function formatDecidedAt(rfc3339: string): string {
-  const m = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/.exec(rfc3339);
-  return m ? `${m[1]} ${m[2]} UTC` : rfc3339;
+/** "2026-10-14T09:30:00.000Z" as "2026-10-14 09:30 UTC" ("14.10.2026, 09:30 UTC" in German): always UTC. */
+export function formatDecidedAt(rfc3339: string, lang: Lang = 'en'): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}:\d{2})/.exec(rfc3339);
+  if (!m) return rfc3339;
+  return lang === 'de' ? `${m[3]}.${m[2]}.${m[1]}, ${m[4]} UTC` : `${m[1]}-${m[2]}-${m[3]} ${m[4]} UTC`;
 }
 
 interface RecentProps {
@@ -19,17 +21,18 @@ interface RecentProps {
  * and unknown outcomes are pinned above the rest until acknowledged.
  */
 export function Recent({ items, onAcknowledge }: RecentProps) {
+  const t = useText();
   const pinned = items.filter((i) => i.needs_attention && !i.acknowledged);
   const rest = items.filter((i) => !(i.needs_attention && !i.acknowledged));
   return (
-    <section className="recent" aria-label={RECENT_TEXT.heading}>
+    <section className="recent" aria-label={t.approvals.recent.heading}>
       {pinned.length > 0 ? (
-        <section aria-label={RECENT_TEXT.needs_attention}>
+        <section aria-label={t.approvals.recent.needs_attention}>
           <h2>
-            {RECENT_TEXT.needs_attention} ({pinned.length})
+            {t.approvals.recent.needs_attention} ({pinned.length})
           </h2>
           <button type="button" onClick={() => onAcknowledge(pinned.map((i) => i.request_id))}>
-            {RECENT_TEXT.acknowledge_all}
+            {t.approvals.recent.acknowledge_all}
           </button>
           <ul>
             {pinned.map((i) => (
@@ -38,9 +41,9 @@ export function Recent({ items, onAcknowledge }: RecentProps) {
           </ul>
         </section>
       ) : null}
-      <h2>{RECENT_TEXT.heading}</h2>
+      <h2>{t.approvals.recent.heading}</h2>
       {rest.length === 0 ? (
-        <p className="empty empty-state">{RECENT_TEXT.empty}</p>
+        <p className="empty empty-state">{t.approvals.recent.empty}</p>
       ) : (
         <ul>
           {rest.map((i) => (
@@ -59,22 +62,24 @@ function RecentRow({
   item: RecentItem;
   onAcknowledge?: (requestIds: string[]) => void;
 }) {
+  const t = useText();
+  const lang = useLang();
   return (
     <li className="recent-item">
       <span className="op-id">{item.op_id}</span>
       <span className="alias">{item.instance_alias}</span>
       <span className="target">{item.target_display}</span>
-      <span className="class">{own(CLASS_LABELS, item.class) ?? item.class}</span>
+      <span className="class">{own(t.approvals.class_labels, item.class) ?? item.class}</span>
       <Badge
-        label={own(STATUS_LABELS, item.status) ?? item.status}
+        label={own(t.approvals.status_labels, item.status) ?? item.status}
         tone={item.needs_attention ? 'caution' : 'neutral'}
       />
-      {item.status === 'outcome_unknown' ? <Badge label={RECENT_TEXT.check_target} tone="caution" /> : null}
-      <time dateTime={item.decided_at}>{formatDecidedAt(item.decided_at)}</time>
+      {item.status === 'outcome_unknown' ? <Badge label={t.approvals.recent.check_target} tone="caution" /> : null}
+      <time dateTime={item.decided_at}>{formatDecidedAt(item.decided_at, lang)}</time>
       {item.error_text === null ? null : <bdi className="error-text">{item.error_text}</bdi>}
       {onAcknowledge ? (
         <button type="button" onClick={() => onAcknowledge([item.request_id])}>
-          {RECENT_TEXT.acknowledge}
+          {t.approvals.recent.acknowledge}
         </button>
       ) : null}
     </li>

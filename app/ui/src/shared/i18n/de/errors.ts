@@ -43,6 +43,15 @@ export const errors: Dict['errors'] = {
     audit_failed: 'Das Audit-Protokoll konnte nicht gelesen werden.',
     internal: 'Es ist ein interner Fehler aufgetreten.',
   },
+  decision: {
+    stale: 'Die Anfrage hat sich inzwischen geändert. Lesen Sie die Warteschlange neu ein.',
+    invalid: 'Die Entscheidung ist für diese Anfrage nicht zulässig.',
+    edit_rejected: 'Die Bearbeitung wurde abgelehnt.',
+    audit: 'Die Entscheidung konnte nicht im Audit-Protokoll festgehalten werden, daher wurde nichts ausgeführt.',
+    batch_rejected: 'Die Sammelentscheidung wurde zurückgewiesen, und es wurde nichts entschieden.',
+    cancelled: 'Die Entscheidung wurde abgebrochen.',
+    not_decidable: 'Die Anfrage wartet nicht auf eine Entscheidung.',
+  },
   server: {
     'auth/invalid_credentials': 'Benutzername oder Passwort ist falsch.',
     'auth/empty_password': 'Geben Sie ein Passwort ein.',

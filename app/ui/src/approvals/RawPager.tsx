@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 
 import { rawPage } from '../shared/ipc/invoke';
 import type { CandidateRev, RawPage } from '../shared/ipc/types';
-import { RAW_TEXT } from '../shared/strings';
+import { useText } from '../shared/i18n/context';
 
 interface RawPagerProps {
   requestId: string;
@@ -15,6 +15,7 @@ interface RawPagerProps {
  * It shows `display` (Rust's marked projection) and never decodes `bytes_b64`.
  */
 export function RawPager({ requestId, candidateRev }: RawPagerProps) {
+  const t = useText();
   const [page, setPage] = useState(0);
   const [data, setData] = useState<RawPage | null>(null);
   const [failed, setFailed] = useState(false);
@@ -39,30 +40,30 @@ export function RawPager({ requestId, candidateRev }: RawPagerProps) {
   const loaded = data !== null && data.page === page ? data : null;
   const count = data?.page_count ?? 1;
   return (
-    <section className="raw-pager" aria-label={RAW_TEXT.label}>
+    <section className="raw-pager" aria-label={t.approvals.raw.label}>
       <div className="raw-nav">
         <button type="button" disabled={page <= 0} onClick={() => setPage((p) => Math.max(0, p - 1))}>
-          {RAW_TEXT.previous}
+          {t.approvals.raw.previous}
         </button>
         <span role="status">
           {data === null
-            ? RAW_TEXT.loading
-            : `page ${data.page + 1} of ${Math.max(1, data.page_count)}, ${data.total_bytes} bytes`}
+            ? t.approvals.raw.loading
+            : t.approvals.raw.page_status(data.page + 1, Math.max(1, data.page_count), data.total_bytes)}
         </span>
         <button
           type="button"
           disabled={data === null || page + 1 >= count}
           onClick={() => setPage((p) => p + 1)}
         >
-          {RAW_TEXT.next}
+          {t.approvals.raw.next}
         </button>
       </div>
-      {failed ? <p role="alert">{RAW_TEXT.load_failed}</p> : null}
+      {failed ? <p role="alert">{t.approvals.raw.load_failed}</p> : null}
       {loaded === null ? (
-        failed ? null : <p>{RAW_TEXT.loading}</p>
+        failed ? null : <p>{t.approvals.raw.loading}</p>
       ) : (
         <>
-          {loaded.display === '' ? <p>{RAW_TEXT.empty}</p> : null}
+          {loaded.display === '' ? <p>{t.approvals.raw.empty}</p> : null}
           <pre className="raw-text" tabIndex={0}>
             {loaded.display}
           </pre>

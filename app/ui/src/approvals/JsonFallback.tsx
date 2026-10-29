@@ -1,5 +1,5 @@
 import { EDIT_ENTRY_ATTR } from './keyboard';
-import { EDIT_TEXT } from '../shared/strings';
+import { useText } from '../shared/i18n/context';
 
 /** The result of reading a raw-JSON field's text. Only a syntax hint: Rust validates the value again. */
 export type JsonRead = { ok: true; value: unknown } | { ok: false };
@@ -28,6 +28,7 @@ interface JsonFallbackProps {
  * is decided by `buildEdits` and checked again by Rust.
  */
 export function JsonFallback({ id, value, onChange, invalid, hintId, required }: JsonFallbackProps) {
+  const t = useText();
   return (
     <>
       <textarea
@@ -42,7 +43,7 @@ export function JsonFallback({ id, value, onChange, invalid, hintId, required }:
         onChange={(e) => onChange(e.target.value)}
       />
       <span id={hintId} className="field-hint" aria-live="polite">
-        {invalid ? EDIT_TEXT.json_invalid : ''}
+        {invalid ? t.approvals.edit.json_invalid : ''}
       </span>
     </>
   );

@@ -53,7 +53,8 @@ describe('a language switch (M15 T3, Review Focus 2)', () => {
 
     expect(document.documentElement.lang).toBe('de');
     // The same field, still open, with the typed reason: the switch re-rendered, nothing remounted.
-    const after = screen.getByRole('textbox', { name: /Reason/ }) as HTMLTextAreaElement;
+    // The label is German now (T5): the field is found under its new name.
+    const after = screen.getByRole('textbox', { name: /Begründung/ }) as HTMLTextAreaElement;
     expect(after).toBe(reason);
     expect(after.value).toBe('not this sprint');
   });

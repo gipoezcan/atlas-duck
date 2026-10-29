@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { de, en } from './dict';
 import {
   CMD_ERROR_KINDS,
+  DECISION_ERROR_KINDS,
+  decisionErrorText,
   ENVELOPE_ERROR_CODES,
   cmdErrorText,
   envelopeErrorText,
@@ -34,6 +36,19 @@ describe('error texts', () => {
         expect(serverErrorText(t, code, null), `${name} ${code}`).not.toBe(t.errors.generic(code));
       }
     }
+  });
+
+  it('every_decision_kind_has_text_in_both_and_unknown_shows_the_kind', () => {
+    for (const [name, t] of Object.entries(DICTS)) {
+      for (const kind of DECISION_ERROR_KINDS) {
+        expect(decisionErrorText(t, kind), `${name} ${kind}`).not.toBe(t.errors.generic(kind));
+      }
+    }
+    for (const kind of DECISION_ERROR_KINDS) {
+      expect(decisionErrorText(de, kind), kind).not.toBe(decisionErrorText(en, kind));
+    }
+    expect(decisionErrorText(de, 'zzz')).toContain('zzz');
+    expect(decisionErrorText(en, 'constructor')).toContain('constructor');
   });
 
   it('german texts differ from english ones', () => {

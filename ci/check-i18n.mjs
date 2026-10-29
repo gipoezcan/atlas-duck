@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 // i18n completeness check (M15 T2; PD-291..PD-298, PD-296).
-// Encodes: (a) the three closed error-code sets of Rust -- `ErrorCode::ALL`
-// (crates/ipc/src/envelope.rs), the `CmdError` variants (crates/server/src/cmd.rs) and the
-// `e(StatusCode::..., "<code>", ...)` constants (crates/server/src/errors.rs) -- equal the keys of
-// `errors.envelope`, `errors.cmd` and `errors.server` in app/ui/src/shared/i18n/{en,de}/errors.ts,
-// both ways; (b) a German string leaf equal to its English one needs an entry in
+// Encodes: (a) the closed code sets of Rust -- `ErrorCode::ALL` (crates/ipc/src/envelope.rs), the
+// `CmdError` variants (crates/server/src/cmd.rs), the `e(StatusCode::..., "<code>", ...)` constants
+// (crates/server/src/errors.rs), the `DecisionError` kinds, the `BatchFailure` codes (with every
+// `InvalidReason`) and `BlockReason` (crates/core) -- equal the keys of `errors.{envelope,cmd,server,
+// decision}` in app/ui/src/shared/i18n/{en,de}/errors.ts and of `approvals.{batch_failure,block_reason}`
+// in {en,de}/approvals.ts, both ways; (b) a German string leaf equal to its English one needs an entry in
 // `I18N_SAME_ALLOWLIST` (with a reason; an entry that no longer matches is stale and fails);
 // (c) no empty string leaf; (d) the keys of `SHORT_KEYS` (buttons and other fixed-width texts) stay
 // within 1.5x the English length + 4 in German. The two dictionaries also have exactly the same keys.
@@ -28,15 +29,38 @@ const I18N_DIR = "app/ui/src/shared/i18n";
 export const I18N_SAME_ALLOWLIST = {
   "common.lang_de": "a language is named in its own language, in both dictionaries",
   "common.lang_en": "a language is named in its own language, in both dictionaries",
+  "approvals.request.params_sha256": "the name of a field of the request, shown as it is on the wire",
+  "approvals.request.cwd_basename": "the name of a field of the request, shown as it is on the wire",
 };
 
 /** Dotted key paths of fixed-width texts (buttons, tray tooltip parts); German <= 1.5 x English + 4. */
-export const SHORT_KEYS = [];
+export const SHORT_KEYS = [
+  // The decision bar and the batch and deny buttons (M15 T5, Review Focus 1).
+  "approvals.detail.approve",
+  "approvals.detail.release",
+  "approvals.detail.release_outcome",
+  "approvals.detail.release_status_only",
+  "approvals.detail.deny",
+  "approvals.deny.submit",
+  "approvals.deny.cancel",
+  "approvals.batch.confirm",
+  "approvals.batch.cancel",
+  "approvals.batch.deny_selected",
+  "approvals.batch.deny_send",
+  "approvals.edit.submit",
+  "approvals.edit.reset",
+  "approvals.queue.open",
+  "approvals.recent.acknowledge",
+];
 
-/** `CmdError` variants that are not UI error kinds: the decision errors have their own maps. */
+/** `CmdError` variants that are not UI error kinds: the decision errors have their own map (`errors.decision`). */
 const CMD_NOT_UI = ["Decision"];
+/** `BatchFailure` variants that stand for other codes: `Invalid(InvalidReason)` is the reasons themselves. */
+const BATCH_FAILURE_NOT_CODE = ["Invalid"];
 
-const SECTIONS = ["envelope", "cmd", "server"];
+/** The code sets of `errors.ts` and of `approvals.ts` (root object, then section). */
+const ERROR_SECTIONS = ["envelope", "cmd", "decision", "server"];
+const APPROVAL_SECTIONS = ["batch_failure", "block_reason"];
 
 // ---------- Rust sources ----------
 
@@ -49,9 +73,10 @@ export function parseEnvelopeCodes(src) {
   return [...src.slice(start, end).matchAll(/ErrorCode::(\w+)/g)].map((m) => snake(m[1]));
 }
 
-export function parseCmdKinds(raw) {
+/** The variant names of `pub enum <name> { ... }` (first level only), as snake_case, minus `exclude`. */
+function enumVariants(raw, name, exclude = []) {
   const src = raw.replace(/^\s*\/\/.*$/gm, "");
-  const start = src.indexOf("pub enum CmdError");
+  const start = src.search(new RegExp(`pub enum ${name}\\b`));
   if (start < 0) return [];
   const open = src.indexOf("{", start);
   const kinds = [];
@@ -76,10 +101,26 @@ export function parseCmdKinds(raw) {
   }
   function collect(text) {
     const m = /^\s*([A-Z]\w*)\s*(\(.*\))?\s*$/.exec(text);
-    if (m && !CMD_NOT_UI.includes(m[1])) kinds.push(snake(m[1]));
+    if (m && !exclude.includes(m[1])) kinds.push(snake(m[1]));
   }
   return kinds;
 }
+
+export const parseCmdKinds = (src) => enumVariants(src, "CmdError", CMD_NOT_UI);
+
+/** `DecisionError` (crates/core/src/decision/mod.rs): its serializer writes the snake_case variant as `kind`. */
+export const parseDecisionKinds = (src) => enumVariants(src, "DecisionError");
+
+/** `BatchFailure` codes: its own variants plus every `InvalidReason` (serialized by `as_str`). */
+export function parseBatchFailureCodes(decisionSrc, payloadsSrc) {
+  return [
+    ...enumVariants(decisionSrc, "BatchFailure", BATCH_FAILURE_NOT_CODE),
+    ...enumVariants(payloadsSrc, "InvalidReason"),
+  ];
+}
+
+/** `BlockReason` (crates/core/src/redact/mod.rs): serde `tag = "reason"`, snake_case. */
+export const parseBlockReasons = (src) => enumVariants(src, "BlockReason");
 
 export function parseServerCodes(src) {
   const code = src.split("#[cfg(test)]")[0];
@@ -241,15 +282,15 @@ function parseAllRoots(src) {
 
 // ---------- checks ----------
 
-/** (a) The Rust code sets equal the keys of `errors.{envelope,cmd,server}` in both languages. */
-export function checkErrorCodes(rust, enSrc, deSrc) {
+/** (a) The Rust code sets equal the keys of the dictionary sections in both languages. */
+function checkSections(root, fileName, sections, rust, enSrc, deSrc) {
   const errors = [];
   for (const [file, src] of [
-    ["en/errors.ts", enSrc],
-    ["de/errors.ts", deSrc],
+    [`en/${fileName}`, enSrc],
+    [`de/${fileName}`, deSrc],
   ]) {
-    const tree = parseTsDict(src, "errors");
-    for (const section of SECTIONS) {
+    const tree = parseTsDict(src, root);
+    for (const section of sections.filter((s) => s in rust)) {
       const node = tree?.[section];
       if (node === null || node === undefined || typeof node !== "object") {
         errors.push(`${file}: section "${section}" is missing`);
@@ -263,6 +304,14 @@ export function checkErrorCodes(rust, enSrc, deSrc) {
   }
   return errors;
 }
+
+/** `errors.{envelope,cmd,decision,server}`: the error code sets of Rust. */
+export const checkErrorCodes = (rust, enSrc, deSrc) =>
+  checkSections("errors", "errors.ts", ERROR_SECTIONS, rust, enSrc, deSrc);
+
+/** `approvals.{batch_failure,block_reason}`: the batch failure codes and block reasons of core. */
+export const checkApprovalCodes = (rust, enSrc, deSrc) =>
+  checkSections("approvals", "approvals.ts", APPROVAL_SECTIONS, rust, enSrc, deSrc);
 
 function flatten(tree, prefix, out) {
   for (const [k, v] of Object.entries(tree)) {
@@ -332,12 +381,16 @@ export function main(_argv = process.argv.slice(2), repo = REPO) {
     envelope: parseEnvelopeCodes(read("crates/ipc/src/envelope.rs")),
     cmd: parseCmdKinds(read("crates/server/src/cmd.rs")),
     server: parseServerCodes(read("crates/server/src/errors.rs")),
+    decision: parseDecisionKinds(read("crates/core/src/decision/mod.rs")),
+    batch_failure: parseBatchFailureCodes(read("crates/core/src/decision/mod.rs"), read("crates/core/src/payloads.rs")),
+    block_reason: parseBlockReasons(read("crates/core/src/redact/mod.rs")),
   };
   const errors = [];
   for (const [section, codes] of Object.entries(rust)) {
     if (codes.length === 0) errors.push(`no ${section} codes found in the Rust sources (parser out of date?)`);
   }
   errors.push(...checkErrorCodes(rust, read(`${I18N_DIR}/en/errors.ts`), read(`${I18N_DIR}/de/errors.ts`)));
+  errors.push(...checkApprovalCodes(rust, read(`${I18N_DIR}/en/approvals.ts`), read(`${I18N_DIR}/de/approvals.ts`)));
   errors.push(
     ...checkLeaves(readRoots(join(repo, I18N_DIR, "en")), readRoots(join(repo, I18N_DIR, "de")), I18N_SAME_ALLOWLIST, SHORT_KEYS),
   );

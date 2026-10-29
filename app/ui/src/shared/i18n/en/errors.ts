@@ -1,4 +1,4 @@
-import type { CmdErrorKind, EnvelopeErrorCode } from '../errors';
+import type { CmdErrorKind, DecisionErrorKind, EnvelopeErrorCode } from '../errors';
 import type { ServerErrorCode } from '../../../server/http';
 
 /** Texts for the closed error-code sets of Rust (checked by ci/check-i18n.mjs). */
@@ -46,6 +46,16 @@ export const errors = {
     audit_unreadable: 'An audit entry could not be read.',
     audit_failed: 'The audit log could not be read.',
     internal: 'An internal error occurred.',
+  },
+  /** `DecisionError` kinds (crates/core/src/decision/mod.rs); the window keeps its fixed action texts. */
+  decision: {
+    stale: 'The request changed in the meantime. Re-read the queue.',
+    invalid: 'The decision is not allowed for this request.',
+    edit_rejected: 'The edit was refused.',
+    audit: 'The decision could not be recorded in the audit log, so nothing was done.',
+    batch_rejected: 'The batch was rejected and nothing was decided.',
+    cancelled: 'The decision was cancelled.',
+    not_decidable: 'The request is not waiting for a decision.',
   },
   /** `ApiError` codes (crates/server/src/errors.rs). */
   server: {
@@ -95,6 +105,7 @@ export const errors = {
 } as const satisfies {
   envelope: Record<EnvelopeErrorCode, string>;
   cmd: Record<CmdErrorKind, string>;
+  decision: Record<DecisionErrorKind, string>;
   server: Record<ServerErrorCode, string>;
   generic: (code: string) => string;
 };

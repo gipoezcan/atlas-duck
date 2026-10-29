@@ -6,10 +6,14 @@ import { fileURLToPath } from "node:url";
 import {
   I18N_SAME_ALLOWLIST,
   SHORT_KEYS,
+  checkApprovalCodes,
   checkErrorCodes,
   checkLeaves,
   main,
+  parseBatchFailureCodes,
+  parseBlockReasons,
   parseCmdKinds,
+  parseDecisionKinds,
   parseEnvelopeCodes,
   parseServerCodes,
   parseTsDict,
@@ -136,6 +140,74 @@ test("a missing section is a violation, not a crash", () => {
   assert.ok(errors.some((e) => /envelope/.test(e)));
 });
 
+// ---------- decision errors, batch failures, block reasons ----------
+
+const DECISION_RS = `
+pub enum BatchFailure {
+    Stale,
+    Invalid(InvalidReason),
+    NotPending,
+}
+/// C.7
+pub enum DecisionError {
+    Stale {
+        current: CandidateRev,
+    },
+    Invalid(InvalidReason),
+    /// doc with {braces}
+    EditRejected(ValidationError),
+    Cancelled,
+}`;
+const PAYLOADS_RS = `
+pub enum InvalidReason {
+    TargetParamEdit,
+    NotOpened,
+}
+impl InvalidReason { pub fn as_str(self) { match self { Self::TargetParamEdit => "target_param_edit" } } }`;
+const REDACT_RS = `
+pub enum BlockReason {
+    /// An every-occurrence mask
+    MaskStillOccurs { path: String },
+    OverReleaseCap { path: String },
+}
+impl BlockReason { fn name(&self) { match self { Self::MaskStillOccurs { .. } => "MaskStillOccurs" } } }`;
+
+test("parsers read the decision kinds, batch failure codes and block reasons", () => {
+  assert.deepEqual(parseDecisionKinds(DECISION_RS), ["stale", "invalid", "edit_rejected", "cancelled"]);
+  assert.deepEqual(parseBatchFailureCodes(DECISION_RS, PAYLOADS_RS), [
+    "stale",
+    "not_pending",
+    "target_param_edit",
+    "not_opened",
+  ]);
+  assert.deepEqual(parseBlockReasons(REDACT_RS), ["mask_still_occurs", "over_release_cap"]);
+});
+
+test("a missing decision text is a violation naming it", () => {
+  const withDecision = (keys) => dict(FULL.envelope, FULL.cmd, FULL.server).replace("generic:", `decision: { ${keys} },\n  generic:`);
+  const r = { ...rust(), decision: ["stale", "cancelled"] };
+  assert.deepEqual(checkErrorCodes(r, withDecision("stale: 'S', cancelled: 'C'"), withDecision("stale: 'S', cancelled: 'C'")), []);
+  const errors = checkErrorCodes(r, withDecision("stale: 'S', cancelled: 'C'"), withDecision("stale: 'S'"));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /de\/errors\.ts: decision code "cancelled"/);
+});
+
+const approvals = (failure, block) => `
+export const approvals = {
+  batch_failure: { ${failure} },
+  block_reason: { ${block} },
+} as const;`;
+
+test("approval code sets must match in both languages", () => {
+  const r = { batch_failure: ["stale", "not_pending"], block_reason: ["mask_still_occurs"] };
+  const ok = approvals("stale: 'a', not_pending: 'b'", "mask_still_occurs: 'c'");
+  assert.deepEqual(checkApprovalCodes(r, ok, ok), []);
+  const de = approvals("stale: 'a', extra: 'x'", "mask_still_occurs: 'c'");
+  const errors = checkApprovalCodes(r, ok, de);
+  assert.equal(errors.length, 2);
+  assert.ok(errors.some((e) => /de\/approvals\.ts: batch_failure code "not_pending"/.test(e)));
+  assert.ok(errors.some((e) => /batch_failure key "extra" is not in Rust/.test(e)));
+});
 // ---------- (b)-(d) leaves ----------
 
 const tree = (o) => o;
