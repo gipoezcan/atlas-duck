@@ -161,7 +161,7 @@ export function Audit({ mode = 'desktop', exportPanel = null }: { mode?: AuditMo
       {desktop ? (
         <section aria-label={t.audit.verification}>
           <h2>{t.audit.verification}</h2>
-          <HelpLink section="audit/verification" />
+          <HelpLink section="audit/verification" label={t.audit.verification} />
           <button type="button" disabled={running} onClick={verify}>
             {running ? t.audit.verifying : t.audit.verify}
           </button>

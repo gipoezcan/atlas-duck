@@ -26,7 +26,7 @@ export function Language({ uiLang, onChanged }: { uiLang: UiLang; onChanged: () 
   return (
     <section aria-label={t.common.language}>
       <h2>{t.common.language}</h2>
-      <HelpLink section="settings/language" />
+      <HelpLink section="settings/language" label={t.common.language} />
       <div className="field">
         <label>
           {t.common.language}{' '}

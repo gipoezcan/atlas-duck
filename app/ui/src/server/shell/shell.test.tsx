@@ -120,7 +120,7 @@ describe('server shell', () => {
     expect(help.getAttribute('href')).toBe('/docs/en/');
     expect(help.getAttribute('target')).toBe('_blank');
     expect(help.getAttribute('rel')).toBe('noreferrer');
-    const q = screen.getByRole('link', { name: SHELL_TEXT.help_page });
+    const q = screen.getByRole('link', { name: `Help: ${SHELL_TEXT.credentials}` });
     expect(q.getAttribute('href')).toBe('/docs/en/instances-and-tokens#credentials-page');
   });
 
@@ -134,6 +134,6 @@ describe('server shell', () => {
     );
     await flush();
     expect(screen.getByRole('link', { name: SHELL_TEXT.help })).toBeTruthy();
-    expect(screen.queryByRole('link', { name: SHELL_TEXT.help_page })).toBeNull();
+    expect(screen.queryByRole('link', { name: /^Help: / })).toBeNull();
   });
 });

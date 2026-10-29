@@ -3,7 +3,7 @@ export const common = {
   cancel: 'Cancel',
   close: 'Close',
   help: 'Help',
-  help_section: 'Help for this section',
+  help_for: (name: string) => `Help: ${name}`,
   save: 'Save',
   retry: 'Retry',
   language: 'Language',

@@ -27,12 +27,12 @@ describe('server help links', () => {
 
   it.each(Object.entries(uiLinks.server))('question_mark_for_%s_resolves_through_ui_links', (path, target) => {
     for (const [lang, name] of [
-      ['en', 'Help for this page'],
-      ['de', 'Hilfe zu dieser Seite'],
+      ['en', 'Help: Name'],
+      ['de', 'Hilfe: Name'],
     ] as const) {
       const { unmount } = render(
         <LangProvider lang={lang}>
-          <ServerHelpLink path={path as keyof typeof uiLinks.server} />
+          <ServerHelpLink path={path as keyof typeof uiLinks.server} label="Name" />
         </LangProvider>,
       );
       const a = screen.getByRole('link', { name });
@@ -49,7 +49,7 @@ describe('server help links', () => {
     render(
       <ServerLangRoot>
         <HelpButton window="audit" />
-        <HelpLink section="audit/verification" />
+        <HelpLink section="audit/verification" label="Verification" />
       </ServerLangRoot>,
     );
     expect(screen.queryByRole('button')).toBeNull();

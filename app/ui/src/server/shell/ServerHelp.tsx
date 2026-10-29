@@ -16,7 +16,7 @@ export function docsHref(lang: Lang, target: string | undefined): string {
 }
 
 /** The "?" of a server page: the guide section `ui-links.json` names for `path`, in a new tab. */
-export function ServerHelpLink({ path }: { path: ServerPath }) {
+export function ServerHelpLink({ path, label }: { path: ServerPath; label: string }) {
   const t = useText();
   const lang = useLang();
   return (
@@ -25,7 +25,7 @@ export function ServerHelpLink({ path }: { path: ServerPath }) {
       href={docsHref(lang, serverTarget(path))}
       target="_blank"
       rel="noreferrer"
-      aria-label={t.server.header.help_page}
+      aria-label={t.common.help_for(label)}
     >
       ?
     </a>

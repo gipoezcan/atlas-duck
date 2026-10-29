@@ -30,15 +30,18 @@ export function HelpButton({ window }: { window: HelpWindow }) {
   );
 }
 
-/** The "?" next to a section: `section` is a `desktop_sections` key of `ui-links.json`. */
-export function HelpLink({ section }: { section: keyof typeof uiLinks.desktop_sections }) {
+/**
+ * The "?" next to a section: `section` is a `desktop_sections` key of `ui-links.json`, `label` the
+ * section's heading, which the accessible name carries ("Help: Language").
+ */
+export function HelpLink({ section, label }: { section: keyof typeof uiLinks.desktop_sections; label: string }) {
   const t = useText();
   if (useContext(HelpMode) === 'server') return null;
   return (
     <button
       type="button"
       className="help-link"
-      aria-label={t.common.help_section}
+      aria-label={t.common.help_for(label)}
       onClick={() => open(uiLinks.desktop_sections[section])}
     >
       ?

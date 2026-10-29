@@ -4,7 +4,7 @@ export const common: Dict['common'] = {
   cancel: 'Abbrechen',
   close: 'Schließen',
   help: 'Hilfe',
-  help_section: 'Hilfe zu diesem Abschnitt',
+  help_for: (name) => `Hilfe: ${name}`,
   save: 'Speichern',
   retry: 'Erneut versuchen',
   language: 'Sprache',

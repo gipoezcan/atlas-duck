@@ -28,7 +28,6 @@ export const server = {
     sign_out: 'Sign out',
     sign_out_failed: 'Signing out failed. Try again.',
     help: 'Help',
-    help_page: 'Help for this page',
   },
   /** The API-key page (SM-3.2). */
   api_keys: {

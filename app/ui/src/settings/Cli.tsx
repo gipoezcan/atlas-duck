@@ -53,7 +53,7 @@ export function Cli({
   return (
     <section aria-label={t.settings.cli}>
       <h2>{t.settings.cli}</h2>
-      <HelpLink section="settings/cli" />
+      <HelpLink section="settings/cli" label={t.settings.cli} />
       <p>{status}</p>
       {packaged ? null : (
         <button type="button" disabled={action.pending} onClick={click}>

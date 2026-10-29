@@ -27,7 +27,6 @@ export const server: Dict['server'] = {
     sign_out: 'Abmelden',
     sign_out_failed: 'Das Abmelden ist fehlgeschlagen. Versuchen Sie es erneut.',
     help: 'Hilfe',
-    help_page: 'Hilfe zu dieser Seite',
   },
   api_keys: {
     title: 'API-Schlüssel',

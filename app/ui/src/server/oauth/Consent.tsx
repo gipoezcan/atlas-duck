@@ -60,7 +60,7 @@ export function ConsentError({ code }: { code: string }) {
   return (
     <main className="window window-consent">
       <h1>{t.server.consent.title}</h1>
-      <ServerHelpLink path="/oauth/consent" />
+      <ServerHelpLink path="/oauth/consent" label={t.server.consent.title} />
       <p role="alert" className="notice notice-danger">
         {errorText(code, t)}
       </p>
@@ -124,7 +124,7 @@ export function Consent({ req }: { req: string }) {
   return (
     <main className="window window-consent">
       <h1>{t.server.consent.title}</h1>
-      <ServerHelpLink path="/oauth/consent" />
+      <ServerHelpLink path="/oauth/consent" label={t.server.consent.title} />
       {errorKey !== null ? (
         <p role="alert" className="notice notice-danger">
           {t.server.consent.errors[errorKey]}

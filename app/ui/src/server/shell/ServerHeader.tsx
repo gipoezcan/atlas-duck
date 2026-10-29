@@ -74,6 +74,19 @@ export function ServerHeader() {
       if (mine === latest.current) setPending(null);
     });
   };
+  // The page's name as the header's own link calls it; the "?" carries it ("Help: Credentials").
+  const pageName: Record<ServerPath, string> = {
+    '/': h.approvals,
+    '/login': h.approvals,
+    '/approvals': h.approvals,
+    '/credentials': h.credentials,
+    '/api-keys': h.api_keys,
+    '/admin': h.admin,
+    '/oauth/consent': h.connected_apps,
+    '/connected-apps': h.connected_apps,
+    '/audit': h.my_audit,
+    '/auditor': h.auditor,
+  };
   const path = window.location.pathname;
   const here = serverTarget(path) === undefined ? undefined : (path as ServerPath);
   const admin = session?.roles.includes('admin') ?? false;
@@ -107,7 +120,7 @@ export function ServerHeader() {
           </label>
         )}
         <ServerHelpIndex />
-        {here === undefined ? null : <ServerHelpLink path={here} />}
+        {here === undefined ? null : <ServerHelpLink path={here} label={pageName[here]} />}
         <span className="server-user">{session?.user ?? ''}</span>
         <button
           type="button"
