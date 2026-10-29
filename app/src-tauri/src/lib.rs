@@ -15,6 +15,7 @@ pub mod credential;
 pub mod csp;
 pub mod diag;
 pub mod early_argv;
+pub mod i18n;
 pub mod os_hooks;
 pub mod recovery_tier;
 pub mod removal;
@@ -30,6 +31,7 @@ pub mod status;
 pub mod testing;
 pub mod tray;
 pub mod tray_host;
+pub mod ui_lang;
 pub mod ui_sink;
 pub mod windows;
 pub mod wizard;
@@ -195,10 +197,19 @@ pub fn run_gui(background: bool) -> ! {
             let (host, pinned) = startup::read_this_host_pinned();
             // T19: serving needs the pinned config dir and install id; the gate consumes `pinned`.
             let pinned_paths = pinned.as_ref().ok().cloned().flatten();
+            // M15 T10: the startup texts (the gate's dialog, the tray) come before `AppState`;
+            // they take the stored preference of the pinned data dir (`auto` without one).
+            let startup_lang = state::UiLang::of(
+                pinned_paths
+                    .as_ref()
+                    .map(|p| ui_lang::load(&p.data_dir))
+                    .unwrap_or_default(),
+            )
+            .lang;
             let state = startup::gate(pinned, &host);
             let presenter = DialogPresenter::new(app.handle().clone());
             if let StartupAction::Exit { message } =
-                startup::apply_startup_state(&state, diag, &presenter)
+                startup::apply_startup_state(startup_lang, &state, diag, &presenter)
             {
                 // §3.1: a second instance exits immediately, after showing the
                 // "running on another machine" text when the holder is on another host.
@@ -216,8 +227,10 @@ pub fn run_gui(background: bool) -> ! {
                 diag.extend_allowed_fields(fields);
             }
             os_hooks::install(app.handle());
-            // The tray text, taken before the `Ready` arm below moves the state.
-            let tray_status = tray::tray_status_text(&state);
+            // The tray text, taken before the `Ready` arm below moves the state. It is kept in
+            // English and put into the UI language where it is shown (`localize`), so it follows
+            // a language switch (M15 T10 review M2).
+            let tray_status = tray::tray_status_text(i18n::Lang::En, &state);
 
             // Linux tray-host check (bounded by TRAY_HOST_TIMEOUT); the allowlist must know the
             // field before the line is written.
@@ -225,8 +238,18 @@ pub fn run_gui(background: bool) -> ! {
             let tray_host = tray_host::check_tray_host();
             tray_host::log_tray_host(tray_host);
 
+            // M15 T3 (PD-294): the language preference lives in the local data dir of `Ready`;
+            // every other state uses `auto` (the OS locale).
+            let ui_lang_dir = match &state {
+                StartupState::Ready { data, .. } => Some(data.path().to_path_buf()),
+                _ => None,
+            };
             if let Some(summary) = state.summary() {
-                app.manage(AppState::new(summary, tray_host).with_startup_text(tray_status));
+                app.manage(
+                    AppState::new(summary, tray_host)
+                        .with_startup_text(tray_status)
+                        .with_ui_lang_dir(ui_lang_dir),
+                );
             }
             // M6 T6: the window registry. In `Ready` the cold start opens its window once
             // `serve::start` finished (§2.5); in every other state nothing waits.

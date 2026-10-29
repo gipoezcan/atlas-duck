@@ -14,8 +14,8 @@ use super::schema::{SCHEMA_VERSION, V1};
 use super::{
     AccessRecord, AnchorHasher, AnchorHead, AnchorRow, ApiKeyRecord, CLIENT_ENDED_SECS,
     CLIENT_UNUSED_SECS, CodeRecord, ConsentRequestRecord, ExportJobRecord, GrantRecord,
-    InstanceRecord, JobState, OAuthClientRecord, PatRecord, Redeem, RefreshRecord, Rotate, Sealed,
-    ServerStore, SessionRecord, StoreError, StoreResult, UserRecord, UserState,
+    InstanceRecord, JobState, LangPref, OAuthClientRecord, PatRecord, Redeem, RefreshRecord,
+    Rotate, Sealed, ServerStore, SessionRecord, StoreError, StoreResult, UserRecord, UserState,
 };
 
 pub struct SqliteStore {
@@ -319,6 +319,32 @@ impl ServerStore for SqliteStore {
             )
             .optional()
             .map_err(db)
+    }
+
+    fn user_lang_pref(&self, user_id: &str) -> StoreResult<LangPref> {
+        let word: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT lang_pref FROM users WHERE user_id = ?1",
+                [user_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db)?;
+        Ok(word
+            .as_deref()
+            .and_then(LangPref::parse)
+            .unwrap_or_default())
+    }
+
+    fn set_user_lang_pref(&self, user_id: &str, pref: LangPref) -> StoreResult<()> {
+        self.conn()
+            .execute(
+                "UPDATE users SET lang_pref = ?2 WHERE user_id = ?1",
+                params![user_id, pref.as_str()],
+            )
+            .map_err(db)?;
+        Ok(())
     }
 
     fn user_set_last_login(&self, user_id: &str, at: i64) -> StoreResult<()> {

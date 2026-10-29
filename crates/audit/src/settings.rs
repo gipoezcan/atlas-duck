@@ -424,12 +424,9 @@ pub(crate) fn load_view(conn: &Connection, kek: &Kek) -> Result<(Settings, bool)
     Ok((view, trusted))
 }
 
-/// `{dialog_text_sha256: <hex>}` or null.
+/// `{dialog_text_sha256: <hex>, dialog_lang?}` or null.
 fn confirmed_json(c: Option<&Confirmed>) -> Value {
-    c.map_or(
-        Value::Null,
-        |c| json!({ "dialog_text_sha256": hex::encode(c.dialog_text_sha256) }),
-    )
+    c.map_or(Value::Null, Confirmed::payload)
 }
 
 /// One change as the writer will log it.

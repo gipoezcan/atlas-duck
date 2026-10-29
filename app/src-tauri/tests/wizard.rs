@@ -2037,7 +2037,7 @@ async fn archive_confirmation_survives_from_credential_window_to_first_store() -
     let archived_file = answer["archived"]["archived_file"].clone();
     assert!(archived_file.is_string(), "{answer}");
     assert_eq!(state.gate_state(), Some(GateState::FirstRun));
-    let shown = serve::archive_confirm_text(&data);
+    let shown = serve::archive_confirm_text(atlas_duck_app_lib::i18n::Lang::En, &data);
     assert_eq!(
         *m.confirmer.0.lock().map_err(|_| "poisoned")?,
         std::slice::from_ref(&shown)
@@ -2713,7 +2713,9 @@ async fn the_archive_proof_survives_a_failed_first_attempt() -> TestResult {
     assert_eq!(record["archived_db_file"], a.archived.file, "{record}");
     assert_eq!(
         record["dialog_text_sha256"],
-        atlas_duck_core::payloads::sha256_hex(serve::archive_confirm_text(&data).as_bytes()),
+        atlas_duck_core::payloads::sha256_hex(
+            serve::archive_confirm_text(atlas_duck_app_lib::i18n::Lang::En, &data).as_bytes()
+        ),
         "{record}"
     );
     assert_eq!(a.state.testing_archive_confirmation_file(), None);

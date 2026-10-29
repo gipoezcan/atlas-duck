@@ -249,3 +249,280 @@ fn raw_pager_pages() {
     assert_eq!(RawPager::for_total(RAW_PAGE_BYTES + 1).page_count, 2);
     assert_eq!(RawPager::for_total(5).page_bytes, RAW_PAGE_BYTES);
 }
+
+// ---- M15 T10b: the warnings in German ----------------------------------------------------------
+
+#[test]
+fn every_warning_is_shown_in_german_with_its_values() {
+    use atlas_duck_preview::Lang;
+    let cases: Vec<(Warning, &str)> = vec![
+        (
+            Warning::new(WarningId::RestrictedComments, TEXT_RESTRICTED_COMMENTS),
+            "enthält Kommentare mit eingeschränkter Sichtbarkeit",
+        ),
+        (
+            Warning::new(WarningId::SecurityLevel, TEXT_SECURITY_LEVEL),
+            "Vorgang hat eine Sicherheitsstufe",
+        ),
+        (
+            Warning::new(WarningId::AllFields, TEXT_ALL_FIELDS),
+            "alle Felder angefordert (`*all`)",
+        ),
+        (
+            Warning::new(WarningId::BidiControls, bidi_controls(1234)),
+            "enthält 1.234 bidirektionale Steuerzeichen",
+        ),
+        (
+            Warning::new(WarningId::OtherInvisible, other_invisible(2)),
+            "enthält 2 andere unsichtbare Zeichen",
+        ),
+        (
+            Warning::new(WarningId::MixedScript, mixed_script("PRОJ")),
+            "Bezeichner mit gemischter Schrift: PRОJ",
+        ),
+        (
+            Warning::new(WarningId::RawOnlyDiff, raw_only_diff(3)),
+            "3 Änderungen sind im gerenderten Diff nicht sichtbar",
+        ),
+        (
+            Warning::new(WarningId::LossyUpdate, lossy_update(1, 2, 3, 0)),
+            "diese Aktualisierung entfernt 1 Makros / 2 Bilder / 3 Links",
+        ),
+        (
+            Warning::new(WarningId::LossyUpdate, lossy_update(1, 2, 3, 4)),
+            "diese Aktualisierung entfernt 1 Makros / 2 Bilder / 3 Links, 4 Layouts",
+        ),
+        (
+            Warning::new(WarningId::ServerRenderedView, TEXT_SERVER_RENDERED_VIEW),
+            "serverseitig gerenderte Ansicht: Makros können Inhalte anderer Seiten enthalten",
+        ),
+        (
+            Warning::new(WarningId::PossibleDuplicate, possible_duplicate("req_1")),
+            "mögliches Duplikat von req_1",
+        ),
+        (
+            Warning::new(
+                WarningId::SimilarRequest,
+                similar_request("req_2", "executed 14:02"),
+            ),
+            "ähnlich zu req_2, ausgeführt 14:02",
+        ),
+        (
+            Warning::new(
+                WarningId::SimilarRequest,
+                similar_request("req_3", "outcome unknown"),
+            ),
+            "ähnlich zu req_3, Ergebnis unbekannt",
+        ),
+        (
+            Warning::new(
+                WarningId::SimilarRequest,
+                similar_request("req_4", "pending"),
+            ),
+            "ähnlich zu req_4, ausstehend",
+        ),
+        (
+            Warning::new(WarningId::Conflict, conflict(5, 6)),
+            "Konflikt: Die Seite wurde geändert, seit der Agent sie gelesen hat (v5 → v6)",
+        ),
+        (
+            Warning::new(
+                WarningId::MissingRequiredFields,
+                missing_required_fields("Team (customfield_10200, option)"),
+            ),
+            "fehlende Pflichtfelder: Team (customfield_10200, option)",
+        ),
+        (
+            Warning::new(WarningId::ChangedSinceReview, TEXT_CHANGED_SINCE_REVIEW),
+            "Seit Ihrer Prüfung geändert",
+        ),
+        (
+            Warning::new(
+                WarningId::ChangedSinceReview,
+                changed_since_review("summary"),
+            ),
+            "Seit Ihrer Prüfung geändert: summary",
+        ),
+        (
+            Warning::new(WarningId::CouldNotRecheck, TEXT_COULD_NOT_RECHECK),
+            "Ziel konnte nicht erneut geprüft werden",
+        ),
+        (
+            Warning::new(WarningId::TokenChanged, token_changed("bob")),
+            "Token geändert: wird jetzt ausgeführt als bob",
+        ),
+        (
+            Warning::new(
+                WarningId::TokenIdentityMismatch,
+                token_no_longer_resolves("bob"),
+            ),
+            "Token gehört nicht mehr zu bob",
+        ),
+        (
+            Warning::new(WarningId::IdentityHeaderLost, TEXT_IDENTITY_HEADER_LOST),
+            "Jira hat kein passendes X-AUSERNAME gesendet (möglicherweise von einem Reverse Proxy entfernt); wenden Sie sich an den Jira-Administrator",
+        ),
+        (
+            Warning::new(WarningId::UserRenamed, user_renamed("a", "b")),
+            "Atlassian-Benutzername geändert: a → b",
+        ),
+        (
+            Warning::new(
+                WarningId::InstanceUrlChanged,
+                instance_url_changed("https://a", "https://b"),
+            ),
+            "Instanz-URL geändert: https://a → https://b",
+        ),
+        (
+            Warning::new(WarningId::DiffTruncated, diff_truncated(12345)),
+            "Diff gekürzt: 12.345 Bytes nicht angezeigt (siehe Anfrage)",
+        ),
+        (
+            Warning::new(WarningId::NoCurrentValue, no_current_value(2)),
+            "2 Felder wie gesendet angezeigt, ohne ihren aktuellen Wert",
+        ),
+        (
+            Warning::new(
+                WarningId::LinkTypeInwardPhrase,
+                link_type_inward_phrase("is blocked by", "blocks"),
+            ),
+            "Verknüpfungstyp über seine eingehende Bezeichnung „is blocked by“ benannt: Der eingehende Vorgang erhält die ausgehende Bezeichnung „blocks“",
+        ),
+        (
+            Warning::new(WarningId::DuplicateTitle, duplicate_title("Plan", "ENG")),
+            "Eine Seite mit dem Titel „Plan“ gibt es bereits in ENG",
+        ),
+        (
+            Warning::new(WarningId::ScriptRenderedCopies, TEXT_SCRIPT_RENDERED_COPIES),
+            "dieses Ergebnis kann gerenderte Kopien von Feldern enthalten (renderedFields); das Entfernen eines Felds entfernt seine Kopie nicht; maskieren Sie jedes Vorkommen",
+        ),
+        (
+            Warning::new(WarningId::LinkedIssueSummaries, linked_issue_summaries(4)),
+            "enthält Zusammenfassung/Status von 4 verknüpften, übergeordneten oder Unteraufgaben-Vorgängen",
+        ),
+        (
+            Warning::new(WarningId::CustomFields, custom_fields(9)),
+            "enthält 9 benutzerdefinierte Felder",
+        ),
+        (
+            Warning::new(WarningId::TruncatedByCap, truncated_by_cap(50, 1200)),
+            "Ergebnis durch Obergrenze gekürzt (50 von 1.200)",
+        ),
+        (
+            Warning::new(WarningId::HostCallsLossy, host_calls_lossy(1)),
+            "1 Host-Aufrufe lieferten gekürzte oder verlustbehaftete Daten",
+        ),
+        (
+            Warning::new(WarningId::UnknownMacros, TEXT_UNKNOWN_MACROS),
+            "Inhalt enthält unbekannte Makros",
+        ),
+        (
+            Warning::new(WarningId::UnresolvedMention, TEXT_UNRESOLVED_MENTION),
+            "Erwähnung konnte nicht aufgelöst werden",
+        ),
+        (
+            Warning::new(WarningId::CqlBroad, TEXT_CQL_BROAD),
+            "CQL kann sehr viele Ergebnisse liefern",
+        ),
+        (
+            Warning::new(
+                WarningId::SourceFormattingRemoved,
+                TEXT_SOURCE_FORMATTING_REMOVED,
+            ),
+            "Quellformatierung entfernt (versteckte oder farbige Formatierung vorhanden)",
+        ),
+        (
+            Warning::new(
+                WarningId::RequiredFieldListIncomplete,
+                required_field_list_incomplete(4, Some(9)),
+            ),
+            "Pflichtfeldliste unvollständig: 4 von 9 Seiten gelesen",
+        ),
+        (
+            Warning::new(
+                WarningId::RequiredFieldListIncomplete,
+                required_field_list_incomplete(4, None),
+            ),
+            "Pflichtfeldliste unvollständig: 4 von mehr als 4 Seiten gelesen",
+        ),
+    ];
+    let mut covered = std::collections::HashSet::new();
+    for (w, de) in &cases {
+        assert_eq!(shown(Lang::De, w), *de, "{:?}", w.id);
+        assert_eq!(shown(Lang::En, w), w.text, "{:?}: English stays", w.id);
+        covered.insert(w.id);
+    }
+    for id in WarningId::ALL {
+        assert!(covered.contains(&id), "{id:?} has no German case");
+    }
+    // A text no form matches stays as it was.
+    let odd = Warning::new(WarningId::CustomFields, "something else");
+    assert_eq!(shown(Lang::De, &odd), "something else");
+}
+
+/// M15 T10b fix I-2: only counts this code computed are written the German way; a title, a
+/// version, a request id or a phrase of digits stays exactly as it was.
+#[test]
+fn agent_and_content_values_are_never_reformatted_in_german() {
+    use atlas_duck_preview::Lang;
+    let de = |w: Warning| shown(Lang::De, &w);
+    assert_eq!(
+        de(Warning::new(
+            WarningId::DuplicateTitle,
+            duplicate_title("2024", "12345")
+        )),
+        "Eine Seite mit dem Titel „2024“ gibt es bereits in 12345"
+    );
+    assert_eq!(
+        de(Warning::new(WarningId::Conflict, conflict(12345, 12346))),
+        "Konflikt: Die Seite wurde geändert, seit der Agent sie gelesen hat (v12345 → v12346)"
+    );
+    assert_eq!(
+        de(Warning::new(
+            WarningId::PossibleDuplicate,
+            possible_duplicate("1234567")
+        )),
+        "mögliches Duplikat von 1234567"
+    );
+    assert_eq!(
+        de(Warning::new(
+            WarningId::LinkTypeInwardPhrase,
+            link_type_inward_phrase("1000", "2000")
+        )),
+        "Verknüpfungstyp über seine eingehende Bezeichnung „1000“ benannt: Der eingehende Vorgang erhält die ausgehende Bezeichnung „2000“"
+    );
+    // A computed count is grouped.
+    assert_eq!(
+        de(Warning::new(WarningId::CustomFields, custom_fields(1234))),
+        "enthält 1.234 benutzerdefinierte Felder"
+    );
+}
+
+/// M15 T10b fix m-1: the German form is built from the values, never split back out of the
+/// English text, so a value holding the template's own literal text cannot move a boundary.
+#[test]
+fn a_value_with_the_templates_literal_text_stays_one_value() {
+    use atlas_duck_preview::Lang;
+    let title = "x' already exists in EVIL: a page titled 'y";
+    let w = Warning::new(WarningId::DuplicateTitle, duplicate_title(title, "DEV"));
+    assert_eq!(
+        shown(Lang::De, &w),
+        format!("Eine Seite mit dem Titel „{title}“ gibt es bereits in DEV")
+    );
+    let inward = "a': the inward issue gets the outward phrase 'b";
+    let w = Warning::new(
+        WarningId::LinkTypeInwardPhrase,
+        link_type_inward_phrase(inward, "blocks"),
+    );
+    assert_eq!(
+        shown(Lang::De, &w),
+        format!(
+            "Verknüpfungstyp über seine eingehende Bezeichnung „{inward}“ benannt: Der eingehende Vorgang erhält die ausgehende Bezeichnung „blocks“"
+        )
+    );
+    // English is the text as written.
+    assert_eq!(shown(Lang::En, &w), w.text);
+    // A text built by hand (no template) has no German form and stays as it is.
+    let raw = Warning::new(WarningId::MixedScript, "mixed-script identifier: 1234");
+    assert_eq!(shown(Lang::De, &raw), "mixed-script identifier: 1234");
+}

@@ -11,6 +11,11 @@ use tauri::{AppHandle, Emitter, Runtime};
 /// The seam between the sink and Tauri: tests record instead of emitting.
 pub trait EventOut: Send + Sync {
     fn emit(&self, name: &str, payload: Value);
+    /// M15 T10: the language of the native dialogs a flow behind this sink shows (English unless
+    /// the app says otherwise; the tests' recorders stay English).
+    fn lang(&self) -> crate::i18n::Lang {
+        crate::i18n::Lang::En
+    }
 }
 
 impl<R: Runtime> EventOut for AppHandle<R> {
@@ -20,6 +25,10 @@ impl<R: Runtime> EventOut for AppHandle<R> {
         crate::commands::capture::event(self, name, &payload);
         // A failed emit (no webview, app closing) must not disturb the core.
         let _ = Emitter::emit(self, name, payload);
+    }
+
+    fn lang(&self) -> crate::i18n::Lang {
+        crate::windows::ui_lang(self)
     }
 }
 
@@ -52,6 +61,21 @@ pub const EVENT_SETTINGS_CHANGED: &str = "settings_changed";
 /// `settings_get` again). Recorded like every payload a webview can receive (S-16).
 pub fn emit_settings_changed<R: Runtime>(app: &AppHandle<R>) {
     EventOut::emit(app, EVENT_SETTINGS_CHANGED, Value::Null);
+}
+
+/// The event every React window re-reads `ui_lang_get` on (M15 T3, PD-294): the language
+/// preference changed. App-owned, not a core event; `{lang, pref}` (two fixed words).
+pub const EVENT_LANG_CHANGED: &str = "lang_changed";
+
+/// The payload of `lang_changed`: exactly `{lang, pref}`.
+pub fn lang_changed_payload(ui: crate::state::UiLang) -> Value {
+    json!({ "lang": ui.lang, "pref": ui.pref })
+}
+
+/// Tells every window that the UI language changed. Recorded like every payload a webview can
+/// receive (S-16).
+pub fn emit_lang_changed<R: Runtime>(app: &AppHandle<R>, ui: crate::state::UiLang) {
+    EventOut::emit(app, EVENT_LANG_CHANGED, lang_changed_payload(ui));
 }
 
 /// The event the setup page re-reads `wizard_state` on (Δ1, M6 T23): a step ended, the serving
@@ -244,6 +268,21 @@ mod tests {
         assert_eq!(
             got,
             vec![("status_banner".to_owned(), json!({ "line_ids": [] }))]
+        );
+    }
+
+    /// M15 T3: `lang_changed` carries two fixed words and nothing else.
+    #[test]
+    fn lang_changed_payload_is_lang_and_pref() {
+        use crate::i18n::{Lang, LangPref};
+        use crate::state::UiLang;
+        let ui = UiLang {
+            pref: LangPref::Auto,
+            lang: Lang::De,
+        };
+        assert_eq!(
+            lang_changed_payload(ui),
+            json!({ "lang": "de", "pref": "auto" })
         );
     }
 

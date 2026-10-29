@@ -139,6 +139,6 @@ describe('Audit request trail (spec 8.10)', () => {
     });
     render(<Trail requestId="req_0123456789abcdefghij" onOpen={() => undefined} />);
     await flush();
-    expect(screen.getByText('2026-10-19T08:30:15.250Z').tagName).toBe('BDI');
+    expect(screen.getByText('2026-10-19 08:30 UTC').tagName).toBe('BDI');
   });
 });

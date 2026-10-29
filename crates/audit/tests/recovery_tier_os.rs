@@ -45,6 +45,7 @@ fn pass(s: &str) -> SecretString {
 fn confirmed() -> Confirmed {
     Confirmed {
         dialog_text_sha256: [7; 32],
+        dialog_lang: None,
     }
 }
 

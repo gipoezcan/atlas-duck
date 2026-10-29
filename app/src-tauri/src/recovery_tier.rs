@@ -46,11 +46,17 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::commands::{AnchorDirFailure, CommandError, ForgetFailure, ReAnchorFailure};
+use crate::i18n::{Lang, T, count};
 use crate::ui_sink::{EVENT_SETTINGS_CHANGED, EventOut, emit_audit_changed, emit_status_changed};
 
 /// plan text (T14): the title of Rust's folder dialog for the anchor directory.
-pub const ANCHOR_DIR_DIALOG_TITLE: &str =
-    "Choose the anchor directory for the atlas-duck audit log";
+pub const ANCHOR_DIR_DIALOG_TITLE: T = T::new(
+    "Choose the anchor directory for the atlas-duck audit log",
+    "Wählen Sie das Anker-Verzeichnis für das Audit-Protokoll von atlas-duck",
+);
+
+/// The texts of this module, for [`crate::i18n::all`].
+pub const TEXTS: &[&T] = &[&ANCHOR_DIR_DIALOG_TITLE];
 
 /// `CONFIG_CHANGED.key` of "Forget old install" (PD-170).
 pub const KEY_FORGET_INSTALL: &str = "forget_install";
@@ -102,7 +108,7 @@ pub struct ForgottenDto {
 
 /// `items` for a dialog: the first [`DIALOG_LIST_MAX`], each cut to [`DIALOG_ITEM_MAX`]
 /// characters, comma-separated, then "and N more".
-fn listed(items: &[String]) -> String {
+fn listed(lang: Lang, items: &[String]) -> String {
     let shown: Vec<String> = items
         .iter()
         .take(DIALOG_LIST_MAX)
@@ -118,7 +124,11 @@ fn listed(items: &[String]) -> String {
         .collect();
     let mut s = shown.join(", ");
     if items.len() > DIALOG_LIST_MAX {
-        s.push_str(&format!(" and {} more", items.len() - DIALOG_LIST_MAX));
+        let more = count(lang, (items.len() - DIALOG_LIST_MAX) as u64);
+        s.push_str(&match lang {
+            Lang::En => format!(" and {more} more"),
+            Lang::De => format!(" und {more} weitere"),
+        });
     }
     s
 }
@@ -128,7 +138,31 @@ fn listed(items: &[String]) -> String {
 /// folder picked), `current` (the directory in force, which gets the detached line; `None`: no
 /// directory is set) and `chain_file` (the chain's `<chain_id>.jsonl`), all display-escaped by
 /// the caller. True whether the file is already in the folder or not (PD-166's two branches).
-pub fn anchor_dir_set_text(chosen: &str, current: Option<&str>, chain_file: &str) -> String {
+pub fn anchor_dir_set_text(
+    lang: Lang,
+    chosen: &str,
+    current: Option<&str>,
+    chain_file: &str,
+) -> String {
+    if lang == Lang::De {
+        let files = format!(
+            "atlas-duck legt die Datei {chain_file} in diesem Ordner an oder hängt Zeilen an sie \
+             an, wenn sie schon dort liegt, und löscht oder überschreibt nie etwas in dem Ordner \
+             (eine Netzwerkfreigabe ist in Ordnung)"
+        );
+        return match current {
+            Some(dir) => format!(
+                "Das Anker-Verzeichnis des Audit-Protokolls auf {chosen} ändern? Es ist jetzt \
+                 {dir}; dieses Verzeichnis erhält eine letzte Zeile, die es als abgelöst \
+                 kennzeichnet, und seine Zeilen bleiben, wie sie sind. {files}."
+            ),
+            None => format!(
+                "{chosen} als Anker-Verzeichnis des Audit-Protokolls festlegen? Zurzeit ist kein \
+                 Anker-Verzeichnis festgelegt. {files}, sodass eine Kopie der Anker des \
+                 Protokolls außerhalb des Schlüsselbunds dieses Computers liegt."
+            ),
+        };
+    }
     let files = format!(
         "atlas-duck adds the file {chain_file} to that folder, or appends lines to it if it is \
          already there, and never deletes or rewrites anything in the folder (a network share is \
@@ -149,7 +183,15 @@ pub fn anchor_dir_set_text(chosen: &str, current: Option<&str>, chain_file: &str
 }
 
 /// plan text (T14, PD-166, §8.5): the native confirmation of "Remove anchor directory".
-pub fn anchor_dir_remove_text(current: &str) -> String {
+pub fn anchor_dir_remove_text(lang: Lang, current: &str) -> String {
+    if lang == Lang::De {
+        return format!(
+            "Das Anker-Verzeichnis {current} entfernen? Ab jetzt ist das Audit-Protokoll nur im \
+             Schlüsselbund dieses Computers verankert, ohne Kopie seiner Anker außerhalb davon. \
+             Das Verzeichnis erhält eine letzte Zeile, die es als abgelöst kennzeichnet; nichts \
+             darin wird gelöscht."
+        );
+    }
     format!(
         "Remove the anchor directory {current}? From now on the audit log is anchored in this \
          computer's keychain only, with no copy of its anchors outside it. The directory gets a \
@@ -161,7 +203,24 @@ pub fn anchor_dir_remove_text(current: &str) -> String {
 /// entry and saying it is an incident; truthful about a rollback (T9 review I-2(a): with no anchor
 /// directory, a rolled-back log whose anchors were deleted is re-anchored too) and about the
 /// effect (T14 review M-1: `Store::re_anchor` writes both anchors, PD-170).
-pub fn re_anchor_text(missing: MissingAnchor) -> String {
+pub fn re_anchor_text(lang: Lang, missing: MissingAnchor) -> String {
+    if lang == Lang::De {
+        let which = match missing {
+            MissingAnchor::Head => "den Kopf-Anker des Audit-Protokolls",
+            MissingAnchor::FirstRetained => "den ersten aufbewahrten Anker des Audit-Protokolls",
+            MissingAnchor::Both => "beide Anker des Audit-Protokolls",
+        };
+        return format!(
+            "Das Audit-Protokoll neu verankern? Der Schlüsselbund dieses Computers enthält \
+             {which} nicht mehr. Zuerst wird das ganze Protokoll geprüft, und nur wenn es \
+             verifiziert ist, werden beide Anker neu daraus geschrieben. Das wird als \
+             Integritätsvorfall (re_anchored) aufgezeichnet, der im Fenster Audit-Protokoll zur \
+             Kenntnis genommen werden muss. Ein Protokoll, das zurückgesetzt oder bearbeitet \
+             wurde, während seine Anker fehlten, verifiziert ebenfalls, außer ein \
+             Anker-Verzeichnis enthält seine Zeilen: Das Neuverankern macht dieses Protokoll dann \
+             zur Referenz."
+        );
+    }
     let which = match missing {
         MissingAnchor::Head => "the head anchor of the audit log",
         MissingAnchor::FirstRetained => "the first-retained anchor of the audit log",
@@ -190,11 +249,47 @@ pub struct ForgetFacts<'a> {
 
 /// plan text (T14, PD-170): the first native confirmation of "Forget old install" (T14 review
 /// M-2, M-5: it names the canary entry only when there is one, and the archived files in number).
-pub fn forget_text(f: &ForgetFacts<'_>) -> String {
+pub fn forget_text(lang: Lang, f: &ForgetFacts<'_>) -> String {
+    if lang == Lang::De {
+        let tokens = if f.tokens.is_empty() {
+            "Es ist kein gespeichertes Token von ihr übrig.".to_owned()
+        } else {
+            format!(
+                "Ihre gespeicherten Token werden gelöscht: {}.",
+                listed(lang, f.tokens)
+            )
+        };
+        let canary = if f.canary {
+            " Ihr Canary-Eintrag wird ebenfalls gelöscht."
+        } else {
+            ""
+        };
+        let archived = match f.archived_files {
+            [one] => format!(
+                "Nur das archivierte Protokoll {one} nennt diese Installation; diese Datei bleibt \
+                 unberührt."
+            ),
+            many => format!(
+                "Nur die archivierten Protokolle {} nennen diese Installation; diese Dateien \
+                 bleiben unberührt.",
+                listed(lang, many)
+            ),
+        };
+        let keys = if f.keys_left {
+            " Die Schlüssel des archivierten Protokolls liegen noch im Schlüsselbund: Sie werden \
+             als Nächstes gefragt, ob sie ebenfalls gelöscht werden sollen."
+        } else {
+            ""
+        };
+        return format!(
+            "Die alte Installation {} vergessen? {tokens}{canary} {archived}{keys}",
+            f.install_id
+        );
+    }
     let tokens = if f.tokens.is_empty() {
         "No stored token of it is left.".to_owned()
     } else {
-        format!("Its stored tokens are deleted: {}.", listed(f.tokens))
+        format!("Its stored tokens are deleted: {}.", listed(lang, f.tokens))
     };
     let canary = if f.canary {
         " Its canary entry is deleted too."
@@ -207,7 +302,7 @@ pub fn forget_text(f: &ForgetFacts<'_>) -> String {
         }
         many => format!(
             "Only the archived logs {} name this install; those files are not touched.",
-            listed(many)
+            listed(lang, many)
         ),
     };
     let keys = if f.keys_left {
@@ -224,12 +319,21 @@ pub fn forget_text(f: &ForgetFacts<'_>) -> String {
 
 /// plan text (T14, PD-170): the second native dialog, "also delete the archived log's keys",
 /// naming the key entries present. Cancel keeps them.
-pub fn forget_keys_text(install_id: &str, keys: &[String]) -> String {
+pub fn forget_keys_text(lang: Lang, install_id: &str, keys: &[String]) -> String {
+    if lang == Lang::De {
+        return format!(
+            "Auch die Schlüssel des archivierten Protokolls der Installation {install_id} ({}) \
+             löschen? Ohne sie lässt sich dieses Protokoll nur mit seiner eigenen \
+             Wiederherstellungs-Passphrase über eine Wiederherstellung öffnen. Abbrechen behält \
+             sie; die Token werden in jedem Fall gelöscht.",
+            listed(lang, keys)
+        );
+    }
     format!(
         "Also delete the keys of the archived log of install {install_id} ({})? Without them that \
          log can be opened only with its own recovery passphrase, through a restore. Cancel keeps \
          them; the tokens are deleted either way.",
-        listed(keys)
+        listed(lang, keys)
     )
 }
 
@@ -331,7 +435,9 @@ pub fn set_anchor_dir(
     if same_dir(Some(Path::new(path)), current.as_deref().map(Path::new)) {
         return Err(CommandError::AnchorDir(AnchorDirFailure::Unchanged));
     }
+    let lang = out.lang();
     let set_text = anchor_dir_set_text(
+        lang,
         &one_line(path),
         current.as_deref().map(one_line).as_deref(),
         &one_line(&file_name(chain_id)),
@@ -339,7 +445,7 @@ pub fn set_anchor_dir(
     if confirmer.confirm(&set_text) != Confirm::Ok {
         return Err(CommandError::Cancelled);
     }
-    let confirmed = crate::serve::confirmed_by(&set_text);
+    let confirmed = crate::serve::confirmed_by(lang, &set_text);
     if stop() {
         return Err(CommandError::NotReady);
     }
@@ -366,11 +472,12 @@ pub fn remove_anchor_dir(
     let Some(current) = facts.0.as_deref() else {
         return Err(CommandError::AnchorDir(AnchorDirFailure::NotSet));
     };
-    let remove_text = anchor_dir_remove_text(&one_line(current));
+    let lang = out.lang();
+    let remove_text = anchor_dir_remove_text(lang, &one_line(current));
     if confirmer.confirm(&remove_text) != Confirm::Ok {
         return Err(CommandError::Cancelled);
     }
-    let confirmed = crate::serve::confirmed_by(&remove_text);
+    let confirmed = crate::serve::confirmed_by(lang, &remove_text);
     if stop() {
         return Err(CommandError::NotReady);
     }
@@ -423,11 +530,12 @@ pub fn re_anchor(
     out: &dyn EventOut,
 ) -> Result<ReAnchoredDto, CommandError> {
     let missing = re_anchor_gate(store)?;
-    let re_text = re_anchor_text(missing);
+    let lang = out.lang();
+    let re_text = re_anchor_text(lang, missing);
     if confirmer.confirm(&re_text) != Confirm::Ok {
         return Err(CommandError::Cancelled);
     }
-    let confirmed = crate::serve::confirmed_by(&re_text);
+    let confirmed = crate::serve::confirmed_by(lang, &re_text);
     if stop() {
         return Err(CommandError::NotReady);
     }
@@ -477,13 +585,14 @@ pub fn orphans(
 /// archived log's keys, so its proof can never be the first dialog's. `Ok` deletes them too; any
 /// other answer keeps them (`None`). Its own function, so the proof check sees this dialog alone.
 fn ask_keys(
+    lang: Lang,
     confirmer: &dyn NativeConfirmer,
     install_id: &str,
     key_entries: &[String],
 ) -> (String, Option<atlas_duck_audit::Confirmed>) {
-    let text = forget_keys_text(install_id, &shown(key_entries));
+    let text = forget_keys_text(lang, install_id, &shown(key_entries));
     let confirmed = if confirmer.confirm(&text) == Confirm::Ok {
-        Some(crate::serve::confirmed_by(&text))
+        Some(crate::serve::confirmed_by(lang, &text))
     } else {
         None
     };
@@ -540,24 +649,28 @@ pub fn forget(
     let id = orphan.install_id().to_owned();
     let (key_entries, others) = split_keys(&orphan);
     let tokens: Vec<String> = others.iter().filter(|e| *e != "canary").cloned().collect();
-    let first_text = forget_text(&ForgetFacts {
-        install_id: &id,
-        archived_files: &shown(orphan.archived_files()),
-        tokens: &shown(&tokens),
-        canary: others.len() > tokens.len(),
-        keys_left: !key_entries.is_empty(),
-    });
+    let lang = out.lang();
+    let first_text = forget_text(
+        lang,
+        &ForgetFacts {
+            install_id: &id,
+            archived_files: &shown(orphan.archived_files()),
+            tokens: &shown(&tokens),
+            canary: others.len() > tokens.len(),
+            keys_left: !key_entries.is_empty(),
+        },
+    );
     if confirmer.confirm(&first_text) != Confirm::Ok {
         return Err(CommandError::Cancelled);
     }
-    let confirmed = crate::serve::confirmed_by(&first_text);
+    let confirmed = crate::serve::confirmed_by(lang, &first_text);
     if stop() {
         return Err(CommandError::NotReady);
     }
     // The second dialog only while keys are left; its Cancel keeps them (not a cancel of the call).
     let keys_asked = !key_entries.is_empty();
     let (keys_text, keys_confirmed) = if keys_asked {
-        let (t, c) = ask_keys(confirmer, &id, &key_entries);
+        let (t, c) = ask_keys(lang, confirmer, &id, &key_entries);
         (Some(t), c)
     } else {
         (None, None)
@@ -590,16 +703,21 @@ pub fn forget(
         "entries": orphan.entries(),
         "archived_files": orphan.archived_files(),
     });
-    let new = json!({
+    let mut new = json!({
         "install_id": id,
         "delete": delete,
         "keys": with_keys,
         "keys_asked": keys_asked,
         "dialog_text_sha256": sha256_hex(first_text.as_bytes()),
+        "dialog_lang": atlas_duck_audit::DialogLang::from(lang).as_str(),
         "keys_dialog_text_sha256": keys_text
             .filter(|_| with_keys)
             .map(|t| sha256_hex(t.as_bytes())),
     });
+    // M15: the keys dialog was shown in the same language; its field only with its hash.
+    if with_keys {
+        new["keys_dialog_lang"] = json!(atlas_duck_audit::DialogLang::from(lang).as_str());
+    }
     // Audit before effect: a record that cannot be written deletes nothing.
     record(KEY_FORGET_INSTALL, old, new.clone()).map_err(CommandError::Settings)?;
     emit_audit_changed(out);
@@ -793,6 +911,7 @@ mod tests {
     fn confirmed_test() -> atlas_duck_audit::Confirmed {
         atlas_duck_audit::Confirmed {
             dialog_text_sha256: [2; 32],
+            dialog_lang: None,
         }
     }
 
@@ -902,6 +1021,7 @@ mod tests {
     fn set_text_for(r: &Rig, dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
         let current = r.store.settings().anchor_dir;
         Ok(anchor_dir_set_text(
+            Lang::En,
             &one_line(dir.to_str().ok_or("utf-8")?),
             current.as_deref().map(one_line).as_deref(),
             &one_line(&file_name(&r.store.head().2)),
@@ -1327,7 +1447,7 @@ mod tests {
             &Events::default(),
         )?;
         let a_text = a.to_str().ok_or("utf-8")?.to_owned();
-        let shown = anchor_dir_remove_text(&one_line(&a_text));
+        let shown = anchor_dir_remove_text(Lang::En, &one_line(&a_text));
         let cancel = Answers::new(&[Confirm::Cancel]);
         assert_eq!(
             remove_anchor_dir(&r.store, &cancel, &never, &Events::default()),
@@ -1427,7 +1547,7 @@ mod tests {
         );
         assert_eq!(
             cancel.texts(),
-            [re_anchor_text(MissingAnchor::FirstRetained)]
+            [re_anchor_text(Lang::En, MissingAnchor::FirstRetained)]
         );
         assert_eq!(r.store.open_incidents(), incidents, "nothing recorded");
         assert_eq!(
@@ -1449,7 +1569,7 @@ mod tests {
         assert_eq!(
             p["dialog_text_sha256"],
             json!(sha256_hex(
-                re_anchor_text(MissingAnchor::FirstRetained).as_bytes()
+                re_anchor_text(Lang::En, MissingAnchor::FirstRetained).as_bytes()
             ))
         );
         assert!(r.store.open_incidents().contains(&done.verify_seq));
@@ -1458,7 +1578,7 @@ mod tests {
             names,
             ["audit_changed", "status_banner", EVENT_SETTINGS_CHANGED]
         );
-        let text = re_anchor_text(MissingAnchor::FirstRetained);
+        let text = re_anchor_text(Lang::En, MissingAnchor::FirstRetained);
         assert!(text.contains("integrity incident"), "{text}");
         Ok(())
     }
@@ -1674,6 +1794,7 @@ mod tests {
             &r.lock,
             atlas_duck_audit::Confirmed {
                 dialog_text_sha256: [1; 32],
+                dialog_lang: None,
             },
         )?;
         let (b_id, b_chain) = new_ids()?;
@@ -2169,7 +2290,7 @@ mod tests {
     fn forget_texts_are_bounded_and_escaped() -> TestResult {
         let one = ["archived/x.db".to_owned()];
         let many: Vec<String> = (0..30).map(|i| format!("pat/i{i}")).collect();
-        let t = forget_text(&facts(&one, &many));
+        let t = forget_text(Lang::En, &facts(&one, &many));
         assert!(t.contains("pat/i19") && !t.contains("pat/i20"), "{t}");
         assert!(t.contains("and 10 more"), "{t}");
         assert!(
@@ -2178,11 +2299,14 @@ mod tests {
         );
         assert!(!t.contains("canary") && !t.contains("keys"), "{t}");
         let two = ["archived/x.db".to_owned(), "archived/y.db".to_owned()];
-        let t = forget_text(&ForgetFacts {
-            canary: true,
-            keys_left: true,
-            ..facts(&two, &many)
-        });
+        let t = forget_text(
+            Lang::En,
+            &ForgetFacts {
+                canary: true,
+                keys_left: true,
+                ..facts(&two, &many)
+            },
+        );
         assert!(
             t.contains("Only the archived logs archived/x.db, archived/y.db name this install"),
             "{t}"
@@ -2193,14 +2317,14 @@ mod tests {
         let long: Vec<String> = (0..DIALOG_LIST_MAX + 5)
             .map(|i| format!("pat/{i}{}", "⟨U+202E⟩".repeat(300)))
             .collect();
-        let t = forget_text(&facts(&one, &long));
+        let t = forget_text(Lang::En, &facts(&one, &long));
         assert!(t.contains('…'), "{t}");
         assert!(
             t.chars().count() < DIALOG_LIST_MAX * (DIALOG_ITEM_MAX + 3) + 1000,
             "{} chars",
             t.chars().count()
         );
-        let keys_text = forget_keys_text("0123456789abcdef0123456789abcdef", &long);
+        let keys_text = forget_keys_text(Lang::En, "0123456789abcdef0123456789abcdef", &long);
         assert!(
             keys_text.chars().count() < DIALOG_LIST_MAX * (DIALOG_ITEM_MAX + 3) + 1000,
             "{} chars",

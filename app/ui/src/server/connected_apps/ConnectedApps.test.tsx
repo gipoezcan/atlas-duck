@@ -2,7 +2,10 @@ import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { isGrantView } from '../http';
-import { APPS_TEXT, browser, ConnectedApps } from './ConnectedApps';
+import { browser, ConnectedApps } from './ConnectedApps';
+import { en } from '../../shared/i18n/dict';
+
+const APPS_TEXT = en.server.connected_apps;
 
 vi.mock('../../shared/ipc/transport-http', () => ({ csrf: () => 'csrf-1' }));
 

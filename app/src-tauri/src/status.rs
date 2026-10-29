@@ -14,6 +14,7 @@ use atlas_duck_preview::invisible::escape_for_display;
 use tauri::{AppHandle, Manager, Runtime};
 
 use crate::commands::dto::{StatusLevel, StatusLineDto};
+use crate::i18n::{Lang, T, count};
 use crate::sandbox_probe::{SCRIPTS_DEGRADED, scripts_state};
 use crate::state::{AppState, ServeSlot};
 
@@ -42,29 +43,86 @@ pub const IDS: [&str; 20] = [
 ];
 
 /// §8.7 (verbatim).
-pub const TEXT_WAITING_KEYRING: &str = "Waiting for keyring";
+pub const TEXT_WAITING_KEYRING: T = T::new("Waiting for keyring", "Warte auf den Schlüsselbund");
 /// §12.2 (verbatim); the trigger is the script glue's identity check (`StatusInputs::update_pending`,
 /// PD-133).
-pub const TEXT_UPDATED_RESTART: &str = "Updated — restart to apply";
+pub const TEXT_UPDATED_RESTART: T = T::new(
+    "Updated — restart to apply",
+    "Aktualisiert — zum Übernehmen neu starten",
+);
 /// plan text (PD-141, M8 Task 21): `scripts_degraded`, a caution while the sandbox floor is not met
 /// and the user allowed degraded confinement, so scripts do run.
-pub const TEXT_SCRIPTS_DEGRADED: &str = "scripts run with degraded confinement";
+pub const TEXT_SCRIPTS_DEGRADED: T = T::new(
+    "scripts run with degraded confinement",
+    "Skripte laufen mit eingeschränkter Isolierung",
+);
 /// plan text (PD-90): `ipc_not_accepting` (M4 T19 bind failure).
-pub const TEXT_IPC_NOT_ACCEPTING: &str = "not accepting agent requests; see doctor";
+pub const TEXT_IPC_NOT_ACCEPTING: T = T::new(
+    "not accepting agent requests; see doctor",
+    "Nimmt keine Anfragen von Agenten an; siehe doctor",
+);
 /// plan text (PD-90, L78): `keychain_prompt`.
-pub const TEXT_KEYCHAIN_PROMPT: &str = "waiting for keychain authorization";
+pub const TEXT_KEYCHAIN_PROMPT: T = T::new(
+    "waiting for keychain authorization",
+    "Warte auf die Autorisierung im Schlüsselbund",
+);
 /// plan text (PD-90): `storage_low`, after §8.1 "new agent requests are refused".
-pub const TEXT_STORAGE_LOW: &str = "audit storage is low: new requests are refused";
+pub const TEXT_STORAGE_LOW: T = T::new(
+    "audit storage is low: new requests are refused",
+    "Der Speicher für das Audit-Protokoll wird knapp: Neue Anfragen werden zurückgewiesen",
+);
 /// plan text (PD-90): `anchor_write_failing`, after §8.5/§8.8/§8.11 (retried, never an incident).
-pub const TEXT_ANCHOR_WRITE_FAILING: &str = "audit anchor could not be written; retrying";
+pub const TEXT_ANCHOR_WRITE_FAILING: T = T::new(
+    "audit anchor could not be written; retrying",
+    "Der Audit-Anker konnte nicht geschrieben werden; neuer Versuch folgt",
+);
 /// plan text (PD-90): `integrity_incident`, the §8.7 banner; the PD-82 wording.
-pub const TEXT_INTEGRITY_INCIDENT: &str = "integrity incident: see Audit";
+pub const TEXT_INTEGRITY_INCIDENT: T = T::new(
+    "integrity incident: see Audit",
+    "Integritätsvorfall: siehe Audit-Protokoll",
+);
 /// plan text (PD-90): `store_newer`, generic on purpose: the gate keeps no writer version, so the
 /// text cannot name one (§8.13 words it "audit data was written by atlas-duck vX; install vX or
 /// newer"; naming the version needs the gate to keep it).
-pub const TEXT_STORE_NEWER: &str =
-    "audit data was written by a newer atlas-duck; install that version or newer";
+pub const TEXT_STORE_NEWER: T = T::new(
+    "audit data was written by a newer atlas-duck; install that version or newer",
+    "Die Audit-Daten wurden von einem neueren atlas-duck geschrieben; installieren Sie diese oder eine neuere Version",
+);
+/// §8.7 (the fallback of an unknown `anchors_missing` name).
+pub const TEXT_ANCHOR_MISSING: T = T::new(
+    "An anchor entry is missing from the keychain.",
+    "Ein Anker-Eintrag fehlt im Schlüsselbund.",
+);
+/// T21b, PD-170: the `anchors_missing` texts by the view's wire name, the Settings wording.
+pub const TEXT_ANCHORS_MISSING_HEAD: T = T::new(
+    "The head anchor entry is missing from the keychain.",
+    "Der Kopf-Anker-Eintrag fehlt im Schlüsselbund.",
+);
+pub const TEXT_ANCHORS_MISSING_FIRST: T = T::new(
+    "The first-retained anchor entry is missing from the keychain.",
+    "Der Eintrag des ersten aufbewahrten Ankers fehlt im Schlüsselbund.",
+);
+pub const TEXT_ANCHORS_MISSING_BOTH: T = T::new(
+    "The head anchor and the first-retained anchor entries are missing from the keychain.",
+    "Die Einträge des Kopf-Ankers und des ersten aufbewahrten Ankers fehlen im Schlüsselbund.",
+);
 
+/// The texts of this module, for [`crate::i18n::all`].
+pub const TEXTS: &[&T] = &[
+    &TEXT_WAITING_KEYRING,
+    &TEXT_UPDATED_RESTART,
+    &TEXT_SCRIPTS_DEGRADED,
+    &TEXT_IPC_NOT_ACCEPTING,
+    &TEXT_KEYCHAIN_PROMPT,
+    &TEXT_STORAGE_LOW,
+    &TEXT_ANCHOR_WRITE_FAILING,
+    &TEXT_INTEGRITY_INCIDENT,
+    &TEXT_STORE_NEWER,
+    &TEXT_ANCHOR_MISSING,
+    &TEXT_ANCHORS_MISSING_HEAD,
+    &TEXT_ANCHORS_MISSING_FIRST,
+    &TEXT_ANCHORS_MISSING_BOTH,
+];
 /// One instance whose token expiry is within the PD-84 warning window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenExpiry {
@@ -107,6 +165,8 @@ pub struct StatusInputs {
     /// the user allowed degraded confinement. Needs the core (the setting), so only [`gather`]
     /// fills it; false means nothing is degraded or it is not known.
     pub scripts_degraded: bool,
+    /// M15 T10: the language the lines are written in (`AppState`'s; English without one).
+    pub lang: Lang,
 }
 
 impl Default for StatusInputs {
@@ -125,6 +185,7 @@ impl Default for StatusInputs {
             keychain_prompt: false,
             update_pending: false,
             scripts_degraded: false,
+            lang: Lang::En,
         }
     }
 }
@@ -133,69 +194,169 @@ fn line(id: &'static str, level: StatusLevel, text: String) -> StatusLineDto {
     StatusLineDto { id, text, level }
 }
 
+/// A `YYYY-MM-DD` date as the language writes it (German `DD.MM.YYYY`); anything else unchanged.
+fn shown_date(lang: Lang, iso: &str) -> String {
+    let parts: Vec<&str> = iso.split('-').collect();
+    match (lang, parts.as_slice()) {
+        (Lang::De, [y, m, d])
+            if y.len() == 4
+                && m.len() == 2
+                && d.len() == 2
+                && iso.bytes().all(|b| b.is_ascii_digit() || b == b'-') =>
+        {
+            format!("{d}.{m}.{y}")
+        }
+        _ => iso.to_owned(),
+    }
+}
+
 /// plan text (PD-84): the token lines.
-fn expiry_text(e: &TokenExpiry) -> String {
+fn expiry_text(lang: Lang, e: &TokenExpiry) -> String {
     let alias = escape_for_display(&e.alias);
-    match e.days_left {
-        d if d < 0 => format!(
-            "token for {alias} expired on {}",
-            escape_for_display(&e.expires_at)
-        ),
-        0 => format!("token for {alias} expires today"),
-        1 => format!("token for {alias} expires in 1 day"),
-        d => format!("token for {alias} expires in {d} days"),
+    let date = escape_for_display(&shown_date(lang, &e.expires_at));
+    match (lang, e.days_left) {
+        (Lang::En, d) if d < 0 => format!("token for {alias} expired on {date}"),
+        (Lang::En, 0) => format!("token for {alias} expires today"),
+        (Lang::En, 1) => format!("token for {alias} expires in 1 day"),
+        (Lang::En, d) => format!("token for {alias} expires in {d} days"),
+        (Lang::De, d) if d < 0 => format!("Token für {alias} ist am {date} abgelaufen"),
+        (Lang::De, 0) => format!("Token für {alias} läuft heute ab"),
+        (Lang::De, 1) => format!("Token für {alias} läuft in 1 Tag ab"),
+        (Lang::De, d) => format!("Token für {alias} läuft in {d} Tagen ab"),
     }
 }
 
 /// Plan text (written by the plan, not the spec): the startup "check target" notice, with the
 /// spec's §4/§11 wording "check the target before retrying".
-fn check_target_text(n: u64) -> String {
-    if n == 1 {
-        "1 write has an unknown outcome: check its target before retrying".to_owned()
-    } else {
-        format!("{n} writes have an unknown outcome: check their targets before retrying")
+fn check_target_text(lang: Lang, n: u64) -> String {
+    match (lang, n) {
+        (Lang::En, 1) => "1 write has an unknown outcome: check its target before retrying".to_owned(),
+        (Lang::En, n) => {
+            format!("{n} writes have an unknown outcome: check their targets before retrying")
+        }
+        (Lang::De, 1) => "1 Schreibvorgang hat ein unbekanntes Ergebnis: Prüfen Sie sein Ziel, bevor Sie ihn wiederholen".to_owned(),
+        (Lang::De, n) => format!(
+            "{} Schreibvorgänge haben ein unbekanntes Ergebnis: Prüfen Sie ihre Ziele, bevor Sie sie wiederholen",
+            count(lang, n)
+        ),
     }
-}
-
-fn lines_wait(n: u32) -> &'static str {
-    if n == 1 { "line waits" } else { "lines wait" }
 }
 
 /// T21b, §8.5 (a failing anchor-directory append is shown in Settings and the tray, never as an
 /// incident): `anchor_dir_write_failing`. The wording is the Settings window's
-/// (`AUDIT_TEXT.anchor_dir_failing`).
-fn anchor_dir_failing_text(pending: u32) -> String {
-    format!(
-        "Writing to the anchor directory fails; {pending} {} and will be retried.",
-        lines_wait(pending)
-    )
+/// (`audit.anchor_dir_failing` in the UI dictionary).
+fn anchor_dir_failing_text(lang: Lang, pending: u32) -> String {
+    let one = pending == 1;
+    match lang {
+        Lang::En => format!(
+            "Writing to the anchor directory fails; {pending} {} and will be retried.",
+            if one { "line waits" } else { "lines wait" }
+        ),
+        Lang::De => format!(
+            "Das Schreiben in das Anker-Verzeichnis schlägt fehl; {} {} und {} erneut versucht.",
+            count(lang, u64::from(pending)),
+            if one { "Zeile wartet" } else { "Zeilen warten" },
+            if one { "wird" } else { "werden" }
+        ),
+    }
 }
 
 /// T21b, PD-156: `anchor_dir_lines_pending`, the Settings wording (`anchor_dir_pending`).
-fn anchor_dir_pending_text(pending: u32) -> String {
-    format!(
-        "{pending} {} to be written to the anchor directory.",
-        lines_wait(pending)
-    )
+fn anchor_dir_pending_text(lang: Lang, pending: u32) -> String {
+    let one = pending == 1;
+    match lang {
+        Lang::En => format!(
+            "{pending} {} to be written to the anchor directory.",
+            if one { "line waits" } else { "lines wait" }
+        ),
+        Lang::De => format!(
+            "{} {} darauf, in das Anker-Verzeichnis geschrieben zu werden.",
+            count(lang, u64::from(pending)),
+            if one { "Zeile wartet" } else { "Zeilen warten" }
+        ),
+    }
 }
 
 /// T21b, PD-170: `anchors_missing`, the Settings wording (`anchors_missing`) by the view's wire
 /// name (`head`, `first_retained`, `both`).
-fn anchors_missing_text(missing: &str) -> &'static str {
+fn anchors_missing_text(lang: Lang, missing: &str) -> &'static str {
     match missing {
-        "head" => "The head anchor entry is missing from the keychain.",
-        "first_retained" => "The first-retained anchor entry is missing from the keychain.",
-        "both" => {
-            "The head anchor and the first-retained anchor entries are missing from the keychain."
-        }
-        _ => "An anchor entry is missing from the keychain.",
+        "head" => TEXT_ANCHORS_MISSING_HEAD.get(lang),
+        "first_retained" => TEXT_ANCHORS_MISSING_FIRST.get(lang),
+        "both" => TEXT_ANCHORS_MISSING_BOTH.get(lang),
+        _ => TEXT_ANCHOR_MISSING.get(lang),
     }
 }
 
+/// §8.8 "pruning is N days behind": core's own text in English; German by the day count.
+fn prune_backlog_text(lang: Lang, core_text: &str, days: u32) -> String {
+    match (lang, days) {
+        (Lang::En, _) => core_text.to_owned(),
+        (Lang::De, 1) => "Die Bereinigung ist 1 Tag im Rückstand".to_owned(),
+        (Lang::De, d) => format!(
+            "Die Bereinigung ist {} Tage im Rückstand",
+            count(lang, u64::from(d))
+        ),
+    }
+}
+
+/// "Locked — N requests refused" / "Setup required — N requests refused" (§2.5 verbatim in
+/// English, "1 requests" for one, L128); German with its plural.
+fn refused_text(lang: Lang, setup: bool, n: u64) -> String {
+    match lang {
+        Lang::En => format!(
+            "{} — {n} requests refused",
+            if setup { "Setup required" } else { "Locked" }
+        ),
+        Lang::De => format!(
+            "{} — {} {} zurückgewiesen",
+            if setup {
+                "Einrichtung erforderlich"
+            } else {
+                "Gesperrt"
+            },
+            count(lang, n),
+            if n == 1 { "Anfrage" } else { "Anfragen" }
+        ),
+    }
+}
+
+/// PD-90 `needs_attention`, plan text (L114).
+fn needs_attention_text(lang: Lang, n: u64) -> String {
+    match (lang, n) {
+        (Lang::En, n) => format!("{n} need attention"),
+        (Lang::De, 1) => "1 braucht Aufmerksamkeit".to_owned(),
+        (Lang::De, n) => format!("{} brauchen Aufmerksamkeit", count(lang, n)),
+    }
+}
+
+/// §7.7: the config banner. English is core's own text; German is built from the banner's facts
+/// (`version` and `parsed`, M15 T10).
+pub fn config_banner_text(lang: Lang, b: &ConfigBanner) -> String {
+    if lang == Lang::En {
+        return b.text.clone();
+    }
+    let by = b.version.as_deref().map_or_else(
+        || "einer neueren atlas-duck-Version".to_owned(),
+        |v| format!("atlas-duck {v}"),
+    );
+    match (b.kind, b.parsed) {
+        ("unreadable", false) => {
+            "Die Konfiguration konnte nicht gelesen werden; die Einstellungen sind nicht verfügbar, bis sie lesbar ist".to_owned()
+        }
+        ("unreadable", true) => format!(
+            "Die Konfiguration von {by} konnte nicht gelesen werden; aktualisieren Sie atlas-duck"
+        ),
+        _ => format!(
+            "Die Konfiguration wurde von {by} geschrieben; die Einstellungen sind schreibgeschützt, bis Sie aktualisieren"
+        ),
+    }
+}
 /// The status lines, in the order of [`IDS`] (a token line per instance). One input gives one line;
 /// nothing here reads a request.
 pub fn lines(i: &StatusInputs) -> Vec<StatusLineDto> {
     use StatusLevel::{Caution, Info};
+    let lang = i.lang;
     let mut out = Vec::new();
     match i.gate {
         // PD-90 `locked_refused`; §2.5 verbatim "Locked — N requests refused" (app-generated; the
@@ -203,14 +364,14 @@ pub fn lines(i: &StatusInputs) -> Vec<StatusLineDto> {
         Some(GateState::Locked(_)) => out.push(line(
             "locked_refused",
             Caution,
-            format!("Locked — {} requests refused", i.refused),
+            refused_text(lang, false, i.refused),
         )),
         // PD-90 `setup_refused`; §2.5 verbatim "Setup required — N requests refused" (spec fix G1,
         // L46; app-generated, the current gate state's count only, L74).
         Some(GateState::FirstRun) => out.push(line(
             "setup_refused",
             Caution,
-            format!("Setup required — {} requests refused", i.refused),
+            refused_text(lang, true, i.refused),
         )),
         _ => {}
     }
@@ -224,47 +385,55 @@ pub fn lines(i: &StatusInputs) -> Vec<StatusLineDto> {
         out.push(line(
             "waiting_keyring",
             Caution,
-            TEXT_WAITING_KEYRING.to_owned(),
+            TEXT_WAITING_KEYRING.get(lang).to_owned(),
         ));
     }
     if i.update_pending {
         out.push(line(
             "updated_restart",
             Info,
-            TEXT_UPDATED_RESTART.to_owned(),
+            TEXT_UPDATED_RESTART.get(lang).to_owned(),
         ));
     }
     if i.scripts_degraded {
         out.push(line(
             "scripts_degraded",
             Caution,
-            TEXT_SCRIPTS_DEGRADED.to_owned(),
+            TEXT_SCRIPTS_DEGRADED.get(lang).to_owned(),
         ));
     }
     if i.gate == Some(GateState::StoreNewer) {
-        out.push(line("store_newer", Caution, TEXT_STORE_NEWER.to_owned()));
+        out.push(line(
+            "store_newer",
+            Caution,
+            TEXT_STORE_NEWER.get(lang).to_owned(),
+        ));
     }
     // PD-90 `needs_attention`, plan text (L114): "N need attention" is in no spec sentence.
     if i.needs_attention > 0 {
         out.push(line(
             "needs_attention",
             Caution,
-            format!("{} need attention", i.needs_attention),
+            needs_attention_text(lang, i.needs_attention),
         ));
     }
     for e in &i.expiries {
         let level = if e.days_left <= 7 { Caution } else { Info };
-        out.push(line("token_expiry", level, expiry_text(e)));
+        out.push(line("token_expiry", level, expiry_text(lang, e)));
     }
     if let Some(h) = &i.health {
         if h.storage_low {
-            out.push(line("storage_low", Caution, TEXT_STORAGE_LOW.to_owned()));
+            out.push(line(
+                "storage_low",
+                Caution,
+                TEXT_STORAGE_LOW.get(lang).to_owned(),
+            ));
         }
         if h.anchor_write_failing || h.anchor_thread_dead {
             out.push(line(
                 "anchor_write_failing",
                 Caution,
-                TEXT_ANCHOR_WRITE_FAILING.to_owned(),
+                TEXT_ANCHOR_WRITE_FAILING.get(lang).to_owned(),
             ));
         }
         // T21b: the same `StoreHealthView` Settings reads. The failing line's text carries the
@@ -273,38 +442,42 @@ pub fn lines(i: &StatusInputs) -> Vec<StatusLineDto> {
             out.push(line(
                 "anchor_dir_write_failing",
                 Caution,
-                anchor_dir_failing_text(h.anchor_dir_lines_pending),
+                anchor_dir_failing_text(lang, h.anchor_dir_lines_pending),
             ));
         } else if h.anchor_dir_lines_pending > 0 {
             out.push(line(
                 "anchor_dir_lines_pending",
                 Caution,
-                anchor_dir_pending_text(h.anchor_dir_lines_pending),
+                anchor_dir_pending_text(lang, h.anchor_dir_lines_pending),
             ));
         }
         if let Some(missing) = h.anchors_missing {
             out.push(line(
                 "anchors_missing",
                 Caution,
-                anchors_missing_text(missing).to_owned(),
+                anchors_missing_text(lang, missing).to_owned(),
             ));
         }
         if h.open_incidents > 0 {
             out.push(line(
                 "integrity_incident",
                 Caution,
-                TEXT_INTEGRITY_INCIDENT.to_owned(),
+                TEXT_INTEGRITY_INCIDENT.get(lang).to_owned(),
             ));
         }
         if let Some(text) = &h.prune_backlog {
-            out.push(line("prune_backlog", Caution, text.clone()));
+            out.push(line(
+                "prune_backlog",
+                Caution,
+                prune_backlog_text(lang, text, h.prune_backlog_days),
+            ));
         }
     }
     if i.startup_notice > 0 {
         out.push(line(
             LINE_CHECK_TARGET,
             Caution,
-            check_target_text(i.startup_notice),
+            check_target_text(lang, i.startup_notice),
         ));
     }
     if let Some(b) = &i.config_banner {
@@ -314,20 +487,20 @@ pub fn lines(i: &StatusInputs) -> Vec<StatusLineDto> {
             "unreadable" => ("config_unreadable", Caution),
             _ => ("config_read_only", Info),
         };
-        out.push(line(id, level, b.text.clone()));
+        out.push(line(id, level, config_banner_text(lang, b)));
     }
     if !i.ipc_accepting {
         out.push(line(
             "ipc_not_accepting",
             Caution,
-            TEXT_IPC_NOT_ACCEPTING.to_owned(),
+            TEXT_IPC_NOT_ACCEPTING.get(lang).to_owned(),
         ));
     }
     if i.keychain_prompt {
         out.push(line(
             "keychain_prompt",
             Info,
-            TEXT_KEYCHAIN_PROMPT.to_owned(),
+            TEXT_KEYCHAIN_PROMPT.get(lang).to_owned(),
         ));
     }
     out
@@ -416,6 +589,7 @@ pub fn spawn_health_ticker<R: Runtime>(
 /// The part of [`gather_gate`] that reads `AppState`: the flag the script glue sets when it finds
 /// the sandbox binary replaced since the probe (PD-133, `updated_restart`). A flag, no core.
 pub fn gather_app_state(i: &mut StatusInputs, state: &AppState) {
+    i.lang = state.lang();
     i.update_pending = state.update_pending();
     // T36b: the tray's store-health lines come from the snapshot [`note_health`] keeps (no core,
     // no store read); [`gather`] replaces it with the core's own read.
@@ -510,6 +684,8 @@ mod tests {
         Some(ConfigBanner {
             kind,
             text: text.to_owned(),
+            version: Some("v9.9.0".into()),
+            parsed: true,
         })
     }
 
@@ -589,7 +765,7 @@ mod tests {
                     gate: Some(GateState::StoreNewer),
                     ..StatusInputs::default()
                 },
-                vec![("store_newer", TEXT_STORE_NEWER, Caution)],
+                vec![("store_newer", TEXT_STORE_NEWER.en, Caution)],
             ),
             (
                 StatusInputs {
@@ -629,7 +805,7 @@ mod tests {
                     }),
                     ..StatusInputs::default()
                 },
-                vec![("storage_low", TEXT_STORAGE_LOW, Caution)],
+                vec![("storage_low", TEXT_STORAGE_LOW.en, Caution)],
             ),
             (
                 StatusInputs {
@@ -639,7 +815,11 @@ mod tests {
                     }),
                     ..StatusInputs::default()
                 },
-                vec![("anchor_write_failing", TEXT_ANCHOR_WRITE_FAILING, Caution)],
+                vec![(
+                    "anchor_write_failing",
+                    TEXT_ANCHOR_WRITE_FAILING.en,
+                    Caution,
+                )],
             ),
             (
                 StatusInputs {
@@ -649,7 +829,11 @@ mod tests {
                     }),
                     ..StatusInputs::default()
                 },
-                vec![("anchor_write_failing", TEXT_ANCHOR_WRITE_FAILING, Caution)],
+                vec![(
+                    "anchor_write_failing",
+                    TEXT_ANCHOR_WRITE_FAILING.en,
+                    Caution,
+                )],
             ),
             (
                 StatusInputs {
@@ -901,6 +1085,88 @@ mod tests {
         );
     }
 
+    /// M15 T10: the lines keep their ids, levels and order in German; only the text changes.
+    #[test]
+    fn status_lines_keep_ids_across_languages() {
+        let mut i = StatusInputs {
+            gate: Some(GateState::Locked(LockedReason::KeychainUnavailable)),
+            refused: 1234,
+            keychain_retrying: true,
+            health: Some(StoreHealthView {
+                storage_low: true,
+                anchor_write_failing: true,
+                anchor_dir_write_failing: true,
+                anchor_dir_lines_pending: 1,
+                anchors_missing: Some("both"),
+                open_incidents: 1,
+                prune_backlog_days: 12,
+                prune_backlog: Some("pruning is 12 days behind".into()),
+                ..health()
+            }),
+            config_banner: banner(
+                "read_only",
+                "config written by v9.9.0; settings read-only until you upgrade",
+            ),
+            needs_attention: 1,
+            expiries: vec![expiry("a", 2), expiry("b", -1)],
+            startup_notice: 2,
+            ipc_accepting: false,
+            keychain_prompt: true,
+            update_pending: true,
+            scripts_degraded: true,
+            lang: Lang::En,
+        };
+        let en = lines(&i);
+        i.lang = Lang::De;
+        let de = lines(&i);
+        let shape = |v: &[StatusLineDto]| v.iter().map(|l| (l.id, l.level)).collect::<Vec<_>>();
+        assert_eq!(shape(&en), shape(&de));
+        for (a, b) in en.iter().zip(&de) {
+            assert_ne!(a.text, b.text, "{}", a.id);
+        }
+        let text = |id: &str| {
+            de.iter()
+                .find(|l| l.id == id)
+                .map(|l| l.text.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            text("locked_refused"),
+            "Gesperrt — 1.234 Anfragen zurückgewiesen"
+        );
+        assert_eq!(text("needs_attention"), "1 braucht Aufmerksamkeit");
+        assert_eq!(
+            text("prune_backlog"),
+            "Die Bereinigung ist 12 Tage im Rückstand"
+        );
+        assert_eq!(
+            text("anchor_dir_write_failing"),
+            "Das Schreiben in das Anker-Verzeichnis schlägt fehl; 1 Zeile wartet und wird erneut versucht."
+        );
+        assert_eq!(
+            text(LINE_CHECK_TARGET),
+            "2 Schreibvorgänge haben ein unbekanntes Ergebnis: Prüfen Sie ihre Ziele, bevor Sie sie wiederholen"
+        );
+        assert_eq!(
+            text("config_read_only"),
+            "Die Konfiguration wurde von atlas-duck v9.9.0 geschrieben; die Einstellungen sind schreibgeschützt, bis Sie aktualisieren"
+        );
+        let tokens: Vec<String> = de
+            .iter()
+            .filter(|l| l.id == "token_expiry")
+            .map(|l| l.text.clone())
+            .collect();
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens[0].ends_with("läuft in 2 Tagen ab"), "{tokens:?}");
+        assert!(tokens[1].contains("abgelaufen"), "{tokens:?}");
+        // The setup gate's plural.
+        i.gate = Some(GateState::FirstRun);
+        i.refused = 1;
+        assert_eq!(
+            lines(&i)[0].text,
+            "Einrichtung erforderlich — 1 Anfrage zurückgewiesen"
+        );
+    }
     /// Order follows [`IDS`] whatever mix is set.
     #[test]
     fn lines_follow_the_id_order() {
@@ -925,6 +1191,7 @@ mod tests {
             keychain_prompt: true,
             update_pending: true,
             scripts_degraded: true,
+            lang: Lang::En,
         };
         let ids: Vec<&str> = only(all).into_iter().map(|l| l.0).collect();
         let positions: Vec<usize> = ids
@@ -1155,12 +1422,12 @@ mod tests {
             ids(Some(unmet()), allowed),
             [(
                 "scripts_degraded",
-                TEXT_SCRIPTS_DEGRADED.to_owned(),
+                TEXT_SCRIPTS_DEGRADED.en.to_owned(),
                 StatusLevel::Caution
             )]
         );
         assert_eq!(
-            TEXT_SCRIPTS_DEGRADED,
+            TEXT_SCRIPTS_DEGRADED.en,
             "scripts run with degraded confinement"
         );
         assert!(ids(Some(unmet()), refused).is_empty());

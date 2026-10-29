@@ -52,7 +52,9 @@
       "attention_mode": "badge_only",
       "config_read_only": {
         "kind": "read_only",
-        "text": "config written by v9.9.0; settings read-only until you upgrade"
+        "parsed": true,
+        "text": "config written by v9.9.0; settings read-only until you upgrade",
+        "version": "v9.9.0"
       },
       "health": {
         "anchor_dir_lines_pending": 3,
@@ -91,6 +93,10 @@
         "candidate_cache_mb"
       ],
       "retention_days": 365
+    },
+    "ui_lang": {
+      "lang": "de",
+      "pref": "auto"
     }
   },
   {
@@ -164,6 +170,10 @@
       },
       "restart_pending": [],
       "retention_days": 100
+    },
+    "ui_lang": {
+      "lang": "en",
+      "pref": "auto"
     }
   },
   {
@@ -219,6 +229,10 @@
       },
       "restart_pending": [],
       "retention_days": 100
+    },
+    "ui_lang": {
+      "lang": "de",
+      "pref": "de"
     }
   },
   {
@@ -242,7 +256,9 @@
       "attention_mode": "badge_only",
       "config_read_only": {
         "kind": "read_only",
-        "text": "config written by v9.9.0; settings read-only until you upgrade"
+        "parsed": true,
+        "text": "config written by v9.9.0; settings read-only until you upgrade",
+        "version": "v9.9.0"
       },
       "health": {
         "anchor_dir_lines_pending": 3,
@@ -281,6 +297,10 @@
         "candidate_cache_mb"
       ],
       "retention_days": 365
+    },
+    "ui_lang": {
+      "lang": "en",
+      "pref": "en"
     }
   }
 ]

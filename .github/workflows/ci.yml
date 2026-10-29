@@ -2042,6 +2042,15 @@ jobs:
           node ci/check-csp.mjs
           node ci/check-commands.mjs
 
+      # M15 T11: the German dictionary is complete (every Rust code, no English leftover, short
+      # buttons) and no source holds a control byte. Both read the checkout only; their tests run
+      # with the other CI script tests (`node --test "ci/*.test.mjs"`, rust job).
+      - name: German dictionary and control-byte checks (M15, PD-291..PD-298)
+        run: |
+          set -euo pipefail
+          node ci/check-i18n.mjs
+          node ci/check-control-bytes.mjs
+
       - name: Isolation hook tests (payload allowlist, 2 MiB cap)
         run: node --test app/isolation/hook.test.mjs
 
@@ -2197,7 +2206,13 @@ jobs:
           $list = Join-Path $env:RUNNER_TEMP 'e2e.list'
           $ignored = Join-Path $env:RUNNER_TEMP 'e2e.ignored'
           cargo @a -- --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath $log
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $rc = $LASTEXITCODE
+          Write-Output "::notice::e2e cargo exit code $rc"
+          if ($rc -ne 0) {
+            # The job log needs a login; the tail as annotations shows the failure on the public API.
+            Get-Content $log -Tail 40 | Where-Object { $_.Trim() } | ForEach-Object { Write-Output "::error::$($_ -replace '::', ':')" }
+            exit $rc
+          }
           cargo @a -- --list 2>$null | Set-Content -Path $list -Encoding utf8
           cargo @a -- --list --ignored 2>$null | Set-Content -Path $ignored -Encoding utf8
           node ci/check-no-skips.mjs $log $list $ignored e2e

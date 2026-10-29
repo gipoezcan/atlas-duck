@@ -1,5 +1,5 @@
-import { UNUSUAL_CHARACTERS, UNVERIFIED } from '../strings';
 import { Badge } from './Badge';
+import { useText } from '../i18n/context';
 
 interface AgentTextProps {
   value: string;
@@ -13,13 +13,14 @@ interface AgentTextProps {
  * The value is a React text node, never markup.
  */
 export function AgentText({ value, unusual = false }: AgentTextProps) {
+  const t = useText();
   return (
     <span className="agent-text">
       <span className="badge-fixed">
-        <Badge label={UNVERIFIED} />
+        <Badge label={t.approvals.unverified} />
       </span>
       <bdi className="agent-text-value">{`\u201C${value}\u201D`}</bdi>
-      {unusual ? <Badge label={UNUSUAL_CHARACTERS} tone="caution" /> : null}
+      {unusual ? <Badge label={t.approvals.unusual_characters} tone="caution" /> : null}
     </span>
   );
 }

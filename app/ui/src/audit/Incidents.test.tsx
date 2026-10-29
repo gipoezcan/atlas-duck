@@ -35,7 +35,7 @@ describe('Audit integrity incidents (spec 8.7, PD-180, L134)', () => {
     expect(items).toHaveLength(2);
     expect(items[0]?.textContent).toContain('Incident 42');
     expect(items[0]?.textContent).toContain('anchor_missing');
-    expect(items[0]?.textContent).toContain('2026-10-19T08:31:00.000Z');
+    expect(items[0]?.textContent).toContain('2026-10-19 08:31 UTC');
     expect(items[1]?.textContent).toContain('its record could not be read');
     // The anchor directory, display only, and its failing writes (spec 8.5: shown, never an incident).
     expect(region.textContent).toContain('\\\\nas\\audit\\anchors');

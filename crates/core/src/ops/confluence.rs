@@ -615,7 +615,7 @@ fn page_update_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict 
             verdict
                 .warnings
                 .push(Warning::new(WarningId::Conflict, text.clone()));
-            verdict.conflict = Some(text);
+            verdict.conflict = Some(text.into());
             verdict.diff_text = format!("base version v{base}, current version v{current}");
         }
     } else if is_markdown(ctx.params) && !storage::parse(current_storage).xml_ok {

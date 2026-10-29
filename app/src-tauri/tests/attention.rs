@@ -281,7 +281,8 @@ mod opacity {
         }
 
         // The check is able to fail: a toast built from a string an agent supplied shows up.
-        let leaking = toast_text(counts, 0).map(|t| format!("{t} from {AGENT}"));
+        let leaking = toast_text(atlas_duck_app_lib::i18n::Lang::En, counts, 0)
+            .map(|t| format!("{t} from {AGENT}"));
         assert_eq!(
             leaks(&leaking.unwrap_or_default()),
             vec![AGENT, "ignore previous"]

@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useLang, useText } from '../shared/i18n/context';
 
 import { onboardingText } from '../shared/ipc/invoke';
 import type { OnboardingSection } from '../shared/ipc/types';
-import { ONBOARDING_PANEL_TEXT as T } from '../shared/strings';
 
 /** The sections the setup wizard's last step keeps (PD-80, a subset of PD-175's page). */
 export const WIZARD_SECTION_IDS: readonly string[] = [
@@ -31,6 +31,9 @@ interface Props {
  * the setup wizard's last step.
  */
 export function OnboardingText({ only, level = 2 }: Props) {
+  const t = useText();
+  // M15 T10: English titles are core's own; another language takes them from its table by id.
+  const lang = useLang();
   const [sections, setSections] = useState<OnboardingSection[] | null>(null);
   const [failed, setFailed] = useState(false);
   const [copyLine, setCopyLine] = useState('');
@@ -78,15 +81,15 @@ export function OnboardingText({ only, level = 2 }: Props) {
     try {
       written = navigator.clipboard.writeText(section.text);
     } catch {
-      setCopyLine(T.copy_failed);
+      setCopyLine(t.onboarding.copy_failed);
       return;
     }
     written.then(
       () => {
-        if (live.current) setCopyLine(T.copied(section.title));
+        if (live.current) setCopyLine(t.onboarding.copied(section.title));
       },
       () => {
-        if (live.current) setCopyLine(T.copy_failed);
+        if (live.current) setCopyLine(t.onboarding.copy_failed);
       },
     );
   }, []);
@@ -94,7 +97,7 @@ export function OnboardingText({ only, level = 2 }: Props) {
   if (sections === null) {
     return failed ? (
       <p role="alert">
-        {T.load_failed}{' '}
+        {t.onboarding.load_failed}{' '}
         <button
           type="button"
           onClick={() => {
@@ -102,13 +105,13 @@ export function OnboardingText({ only, level = 2 }: Props) {
             load();
           }}
         >
-          {T.retry}
+          {t.onboarding.retry}
         </button>
       </p>
     ) : (
       // The retry button unmounts with the alert: focus goes to the status that replaces it.
       <p role="status" tabIndex={-1} ref={focusAfterRetry}>
-        {T.loading}
+        {t.onboarding.loading}
       </p>
     );
   }
@@ -116,15 +119,19 @@ export function OnboardingText({ only, level = 2 }: Props) {
   const shown = only === undefined ? sections : sections.filter((s) => only.includes(s.id));
   return (
     <>
-      <p>{T.intro}</p>
+      <p>{t.onboarding.intro}</p>
       <p role="status">{copyLine}</p>
       {shown.map((s) => {
         const headingId = `onboarding-section-${s.id}`;
+        // M15 T10: the title by core's stable id in the UI language; the text stays core's.
+        const titles: Readonly<Record<string, string>> = t.onboarding.section_titles;
+        const title =
+          lang !== 'en' && Object.hasOwn(titles, s.id) ? (titles[s.id] ?? s.title) : s.title;
         return (
           <div key={s.id} className="onboarding-section">
-            <Heading id={headingId}>{s.title}</Heading>
-            <button type="button" aria-label={T.copy_label(s.title)} onClick={() => copy(s)}>
-              {T.copy_button}
+            <Heading id={headingId}>{title}</Heading>
+            <button type="button" aria-label={t.onboarding.copy_label(title)} onClick={() => copy({ ...s, title })}>
+              {t.onboarding.copy_button}
             </button>
             <pre
               className="onboarding-text"

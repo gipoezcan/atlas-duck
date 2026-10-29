@@ -1,4 +1,8 @@
 import { Fragment, useId, useState } from 'react';
+import { useLang, useText } from '../shared/i18n/context';
+import type { Dict } from '../shared/i18n';
+import { en } from '../shared/i18n/dict';
+import { formatIsoDate } from '../shared/i18n/format';
 
 import {
   credentialWindowOpen,
@@ -9,12 +13,6 @@ import {
   retestToken,
 } from '../shared/ipc/invoke';
 import type { InstanceView, RetestOutcome } from '../shared/ipc/types';
-import {
-  HTTPS_REQUIRED_HINT,
-  IDENTITY_HEADER_HINT,
-  PAC_HINT,
-  SETTINGS_TEXT as T,
-} from '../shared/strings';
 import { AgentText } from '../shared/text/AgentText';
 import { unusual } from '../shared/text/unusual';
 import { Guard } from './Guard';
@@ -33,21 +31,22 @@ interface InstancesProps {
 
 /** The instances table (spec 7.1): one row per instance, its actions, the pending URL change. */
 export function Instances({ instances, onChanged, readOnly }: InstancesProps) {
-  if (instances.length === 0) return <p>{T.no_instances}</p>;
+  const t = useText();
+  if (instances.length === 0) return <p>{t.settings.no_instances}</p>;
   return (
     <div className="table-scroll">
     <table className="instances">
-      <caption>{T.instances}</caption>
+      <caption>{t.settings.instances}</caption>
       <thead>
         <tr>
-          <th scope="col">{T.col_alias}</th>
-          <th scope="col">{T.col_product}</th>
-          <th scope="col">{T.col_origin}</th>
-          <th scope="col">{T.col_state}</th>
-          <th scope="col">{T.col_executes_as}</th>
-          <th scope="col">{T.col_expiry}</th>
-          <th scope="col">{T.col_proxy}</th>
-          <th scope="col">{T.col_actions}</th>
+          <th scope="col">{t.settings.col_alias}</th>
+          <th scope="col">{t.settings.col_product}</th>
+          <th scope="col">{t.settings.col_origin}</th>
+          <th scope="col">{t.settings.col_state}</th>
+          <th scope="col">{t.settings.col_executes_as}</th>
+          <th scope="col">{t.settings.col_expiry}</th>
+          <th scope="col">{t.settings.col_proxy}</th>
+          <th scope="col">{t.settings.col_actions}</th>
         </tr>
       </thead>
       <tbody>
@@ -60,8 +59,8 @@ export function Instances({ instances, onChanged, readOnly }: InstancesProps) {
   );
 }
 
-function stateLabel(state: string) {
-  const known = own(T.states, state);
+function stateLabel(state: string, t: Dict = en) {
+  const known = own(t.settings.states, state);
   return known === undefined ? <Cfg value={state} /> : <>{known}</>;
 }
 
@@ -74,9 +73,11 @@ function InstanceRow({
   onChanged: () => void;
   readOnly: boolean;
 }) {
+  const t = useText();
+  const lang = useLang();
   // The repeated per-row controls point at the alias cell, so a reader hears which instance.
   const aliasId = useId();
-  const warning = expiryWarningText(inst);
+  const warning = expiryWarningText(inst, t);
   const headerState = HEADER_STATES.includes(inst.state);
   return (
     <Fragment>
@@ -84,30 +85,30 @@ function InstanceRow({
         <th scope="row" id={aliasId}>
           <Cfg value={inst.alias} />
         </th>
-        <td>{T.product[inst.product]}</td>
-        <td>{inst.origin === null ? T.no_origin : <Cfg value={inst.origin} />}</td>
+        <td>{t.settings.product[inst.product]}</td>
+        <td>{inst.origin === null ? t.settings.no_origin : <Cfg value={inst.origin} />}</td>
         <td>
-          {stateLabel(inst.state)}
-          {inst.state === 'insecure_scheme' ? <p>{HTTPS_REQUIRED_HINT}</p> : null}
-          {headerState ? <p>{IDENTITY_HEADER_HINT}</p> : null}
+          {stateLabel(inst.state, t)}
+          {inst.state === 'insecure_scheme' ? <p>{t.settings.https_required_hint}</p> : null}
+          {headerState ? <p>{t.settings.identity_header_hint}</p> : null}
           {inst.note !== null && !headerState ? (
             <p>
               <AgentText value={inst.note} unusual={unusual(inst.note)} />
             </p>
           ) : null}
         </td>
-        <td>{inst.executes_as === null ? T.none : <AgentText value={inst.executes_as} unusual={unusual(inst.executes_as)} />}</td>
+        <td>{inst.executes_as === null ? t.settings.none : <AgentText value={inst.executes_as} unusual={unusual(inst.executes_as)} />}</td>
         <td>
-          {inst.expires_at === null ? T.none : <Cfg value={inst.expires_at} />}
+          {inst.expires_at === null ? t.settings.none : <Cfg value={formatIsoDate(lang, inst.expires_at)} />}
           {warning === null ? null : (
             <p className="expiry-warning">
-              {warning}. {T.expiry_note}
+              {warning}. {t.settings.expiry_note}
             </p>
           )}
         </td>
         <td>
-          {inst.proxy_effective === null ? T.proxy_os : <Cfg value={inst.proxy_effective} />}
-          {inst.pac_configured ? <p>{PAC_HINT}</p> : null}
+          {inst.proxy_effective === null ? t.settings.proxy_os : <Cfg value={inst.proxy_effective} />}
+          {inst.pac_configured ? <p>{t.settings.pac_hint}</p> : null}
         </td>
         <td>
           <RowActions inst={inst} onChanged={onChanged} readOnly={readOnly} aliasId={aliasId} />
@@ -140,14 +141,15 @@ function PendingUrlChange({
   onChanged: () => void;
   readOnly: boolean;
 }) {
+  const t = useText();
   const accept = useAction();
   return (
     <div role="note">
       <p>
-        {T.url_change} <Cfg value={inst.alias} />
+        {t.settings.url_change} <Cfg value={inst.alias} />
       </p>
       <p>
-        {T.url_change_requested} <Cfg value={url} />
+        {t.settings.url_change_requested} <Cfg value={url} />
       </p>
       <Guard disabled={readOnly}>
         <button
@@ -159,7 +161,7 @@ function PendingUrlChange({
             })
           }
         >
-          {T.url_change_accept}
+          {t.settings.url_change_accept}
         </button>
       </Guard>
       {accept.error === null ? null : <p role="alert">{accept.error}</p>}
@@ -168,18 +170,19 @@ function PendingUrlChange({
 }
 
 function RetestResult({ outcome }: { outcome: RetestOutcome }) {
+  const t = useText();
   if ('ok' in outcome) {
     const { atlassian_user: user, product, version, warnings } = outcome.ok;
     return (
       <div role="status">
         <p>
-          {T.retest_connected} <AgentText value={user} unusual={unusual(user)} />
+          {t.settings.retest_connected} <AgentText value={user} unusual={unusual(user)} />
           {', '}
-          {product === 'jira' || product === 'confluence' ? T.product[product] : null}{' '}<AgentText value={version} unusual={unusual(version)} />
+          {product === 'jira' || product === 'confluence' ? t.settings.product[product] : null}{' '}<AgentText value={version} unusual={unusual(version)} />
         </p>
         {warnings.length === 0 ? null : (
           <>
-            <p>{T.retest_warnings}</p>
+            <p>{t.settings.retest_warnings}</p>
             <ul>
               {warnings.map((w, i) => (
                 <li key={i}>
@@ -193,10 +196,10 @@ function RetestResult({ outcome }: { outcome: RetestOutcome }) {
     );
   }
   // An unrecognized class is shown as fixed text only: the wire name is not echoed.
-  const known = own(T.retest_classes, outcome.failed.class) ?? T.retest_class_unknown;
+  const known = own(t.settings.retest_classes, outcome.failed.class) ?? t.settings.retest_class_unknown;
   return (
     <p role="status">
-      {T.retest_failed} {known}
+      {t.settings.retest_failed} {known}
     </p>
   );
 }
@@ -212,6 +215,7 @@ function RowActions({
   readOnly: boolean;
   aliasId: string;
 }) {
+  const t = useText();
   const confirm = useAction();
   const retest = useAction();
   const token = useAction();
@@ -224,12 +228,12 @@ function RowActions({
   // The replace button is not offered while the identity header is lost: a new token does not help.
   const tokenable = (inst.state === 'needs_token' || inst.state === 'ok');
   const adds = inst.executes_as === null;
-  const tokenLabel = adds ? T.add_token : T.replace_token;
+  const tokenLabel = adds ? t.settings.add_token : t.settings.replace_token;
   return (
     <div className="instance-actions">
       {unconfirmed ? (
         <>
-          <p>{T.confirm_hint}</p>
+          <p>{t.settings.confirm_hint}</p>
           <Guard disabled={readOnly}>
             <button
               type="button"
@@ -237,7 +241,7 @@ function RowActions({
               aria-describedby={aliasId}
               onClick={() => void confirm.run(() => instanceConfirmConfig(inst.alias)).then(done)}
             >
-              {T.confirm}
+              {t.settings.confirm}
             </button>
           </Guard>
           {confirm.error === null ? null : <p role="alert">{confirm.error}</p>}
@@ -257,7 +261,7 @@ function RowActions({
             })
           }
         >
-          {T.retest}
+          {t.settings.retest}
         </button>
       ) : null}
       {tokenable ? (
@@ -293,6 +297,7 @@ function EditConnection({
   readOnly: boolean;
   aliasId: string;
 }) {
+  const t = useText();
   const url = useAction();
   const proxy = useAction();
   const [newUrl, setNewUrl] = useState('');
@@ -302,10 +307,10 @@ function EditConnection({
   const proxyShown = newProxy ?? '';
   return (
     <details>
-      <summary aria-describedby={aliasId}>{T.change_url}</summary>
+      <summary aria-describedby={aliasId}>{t.settings.change_url}</summary>
       <Guard disabled={readOnly}>
       <label>
-        {T.change_url_label}
+        {t.settings.change_url_label}
         <input type="text" value={newUrl} aria-describedby={aliasId} onChange={(e) => setNewUrl(e.target.value)} />
       </label>
       <button
@@ -321,11 +326,11 @@ function EditConnection({
           })
         }
       >
-        {T.change_url_apply}
+        {t.settings.change_url_apply}
       </button>
       {url.error === null ? null : <p role="alert">{url.error}</p>}
       <label>
-        {T.proxy_label}
+        {t.settings.proxy_label}
         <input type="text" value={proxyShown} aria-describedby={aliasId} onChange={(e) => setNewProxy(e.target.value)} />
       </label>
       <button
@@ -341,7 +346,7 @@ function EditConnection({
           })
         }
       >
-        {T.proxy_apply}
+        {t.settings.proxy_apply}
       </button>
       {proxy.error === null ? null : <p role="alert">{proxy.error}</p>}
       </Guard>

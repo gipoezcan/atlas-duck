@@ -11,7 +11,7 @@
 
 use std::cell::Cell;
 
-use atlas_duck_preview::{Platform, Preview, PreviewBody, render};
+use atlas_duck_preview::{Lang, Platform, Preview, PreviewBody, render};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
@@ -711,8 +711,10 @@ impl From<&RedactionContext> for RedactionContextDto {
 /// the attachment thumbnail (T20b review m-1). The thumbnail reaches the screen only through the
 /// document (no UI code reads `thumbnail_data_uri`), so at the 2 MiB cap it is sent once, not
 /// twice.
-pub fn preview_fetch_response(delivery: PreviewDelivery) -> PreviewFetchResponse {
-    let srcdoc = render::document(&delivery.preview, Platform::current());
+/// M15 T10b: `lang` is the reader's language for the document's own text (labels, notes,
+/// warnings); the previewed content is never translated.
+pub fn preview_fetch_response(delivery: PreviewDelivery, lang: Lang) -> PreviewFetchResponse {
+    let srcdoc = render::document(lang, &delivery.preview, Platform::current());
     let mut preview = delivery.preview;
     if let PreviewBody::AttachmentUpload {
         thumbnail_data_uri, ..
@@ -916,6 +918,8 @@ pub mod golden {
             similar_to: None,
             session_id: session.id(),
             session_label: session.label(),
+            session_agent_name: session.shown_agent_name(),
+            session_cwd: session.shown_cwd(),
             session,
             opened: false,
             approvable: true,

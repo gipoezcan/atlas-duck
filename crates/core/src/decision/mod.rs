@@ -158,10 +158,20 @@ impl SessionKey {
     /// normalized at hello and display-escaped here; never `peer_origin_exe`.
     pub fn label(&self) -> String {
         let agent = self
-            .agent_name
-            .as_deref()
-            .map_or_else(|| SESSION_NO_AGENT_NAME.to_owned(), escape_for_display);
-        format!("{agent} · {}", escape_for_display(&self.cwd_basename))
+            .shown_agent_name()
+            .unwrap_or_else(|| SESSION_NO_AGENT_NAME.to_owned());
+        format!("{agent} · {}", self.shown_cwd())
+    }
+
+    /// M15: the agent name of [`Self::label`], display-escaped; `None` when the agent sent none,
+    /// which the UI words in its own language.
+    pub fn shown_agent_name(&self) -> Option<String> {
+        self.agent_name.as_deref().map(escape_for_display)
+    }
+
+    /// M15: the `cwd_basename` of [`Self::label`], display-escaped.
+    pub fn shown_cwd(&self) -> String {
+        escape_for_display(&self.cwd_basename)
     }
 }
 
@@ -325,8 +335,13 @@ pub struct QueueItem {
     pub session: SessionKey,
     /// [`SessionKey::id`].
     pub session_id: String,
-    /// [`SessionKey::label`].
+    /// [`SessionKey::label`], in English; kept for older readers. The UI composes its own label
+    /// from `session_agent_name` and `session_cwd` (M15).
     pub session_label: String,
+    /// [`SessionKey::shown_agent_name`].
+    pub session_agent_name: Option<String>,
+    /// [`SessionKey::shown_cwd`].
+    pub session_cwd: String,
     pub opened: bool,
     pub approvable: bool,
     pub candidate_rev: CandidateRev,
@@ -512,6 +527,8 @@ fn in_queue(engine: &Engine, e: &RequestEntry) -> Option<QueueItem> {
         session: e.session.clone(),
         session_id: e.session.id(),
         session_label: e.session.label(),
+        session_agent_name: e.session.shown_agent_name(),
+        session_cwd: e.session.shown_cwd(),
         opened: m.opened(),
         approvable: st.approvable(),
         candidate_rev: current_rev(&st),

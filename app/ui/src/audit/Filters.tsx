@@ -1,7 +1,9 @@
 import { useId, useState, type FormEvent } from 'react';
+import { useText } from '../shared/i18n/context';
+import type { Dict } from '../shared/i18n';
+import { en } from '../shared/i18n/dict';
 
 import type { AuditFilter, AuditFlag } from '../shared/ipc/types';
-import { AUDIT_TEXT as T } from '../shared/strings';
 import { own } from '../shared/text/own';
 import { utcOf } from './text';
 
@@ -74,22 +76,22 @@ const utf8 = new TextEncoder();
  * one, so the store sees no constraint there. Texts are matched exactly (the target by prefix) and
  * sent as typed; one over `MAX_FILTER_TEXT_BYTES` or holding a NUL is refused here, as Rust would.
  */
-export function buildFilter(form: Form): { filter: AuditFilter } | { errors: Errors } {
+export function buildFilter(form: Form, t: Dict = en): { filter: AuditFilter } | { errors: Errors } {
   const errors: Errors = {};
   const filter: AuditFilter = {};
   const from = utcOf(form.from);
   const to = utcOf(form.to);
-  if (from === undefined) errors.from = T.time_invalid;
+  if (from === undefined) errors.from = t.audit.time_invalid;
   else if (from !== null) filter.from_utc = from;
-  if (to === undefined) errors.to = T.time_invalid;
+  if (to === undefined) errors.to = t.audit.time_invalid;
   else if (to !== null) filter.to_utc = to;
   // Both are the fixed-width `ts_utc` form: text order is time order.
-  if (typeof from === 'string' && typeof to === 'string' && from > to) errors.to = T.range_order;
+  if (typeof from === 'string' && typeof to === 'string' && from > to) errors.to = t.audit.range_order;
   for (const key of TEXT_KEYS) {
     const value = form[key];
     if (value === '') continue;
-    if (value.includes('\u0000')) errors[key] = T.filter_nul;
-    else if (utf8.encode(value).length > MAX_FILTER_TEXT_BYTES) errors[key] = T.filter_too_long;
+    if (value.includes('\u0000')) errors[key] = t.audit.filter_nul;
+    else if (utf8.encode(value).length > MAX_FILTER_TEXT_BYTES) errors[key] = t.audit.filter_too_long;
     else filter[key] = value;
   }
   if (form.op_class !== '') filter.op_class = form.op_class;
@@ -104,6 +106,7 @@ export function buildFilter(form: Form): { filter: AuditFilter } | { errors: Err
  * the typed filter to the list; a refused field is named next to it and nothing is sent.
  */
 export function Filters({ onApply }: { onApply: (filter: AuditFilter) => void }) {
+  const t = useText();
   const [form, setForm] = useState<Form>(EMPTY);
   const [errors, setErrors] = useState<Errors>({});
   const ids = useId();
@@ -112,7 +115,7 @@ export function Filters({ onApply }: { onApply: (filter: AuditFilter) => void })
 
   const apply = (e: FormEvent) => {
     e.preventDefault();
-    const built = buildFilter(form);
+    const built = buildFilter(form, t);
     if ('errors' in built) {
       setErrors(built.errors);
       // To the first refused field, in the form's order.
@@ -169,10 +172,10 @@ export function Filters({ onApply }: { onApply: (filter: AuditFilter) => void })
       <div className="audit-field">
         <label htmlFor={id}>{label}</label>
         <select id={id} value={form[key]} onChange={(e) => set(key, e.currentTarget.value)}>
-          <option value="">{T.any}</option>
+          <option value="">{t.audit.any}</option>
           {values.map((v) => (
             <option key={v} value={v}>
-              {own(labels, v) ?? T.unknown_name}
+              {own(labels, v) ?? t.audit.unknown_name}
             </option>
           ))}
         </select>
@@ -181,20 +184,20 @@ export function Filters({ onApply }: { onApply: (filter: AuditFilter) => void })
   };
 
   return (
-    <form className="audit-filters" aria-label={T.filters} onSubmit={apply} noValidate>
-      <p>{T.filters_note}</p>
+    <form className="audit-filters" aria-label={t.audit.filters} onSubmit={apply} noValidate>
+      <p>{t.audit.filters_note}</p>
       <div className="audit-fields">
-        {field('from', T.from, 'datetime-local')}
-        {field('to', T.to, 'datetime-local')}
-        {field('agent_name', T.agent_name, 'text')}
-        {field('op_id', T.op_id, 'text')}
-        {select('op_class', T.op_class, CLASSES, T.class_labels)}
-        {field('instance_id', T.instance_id, 'text')}
-        {field('target', T.target, 'text')}
-        {select('decision', T.decision, DECISIONS, T.decision_labels)}
+        {field('from', t.audit.from, 'datetime-local')}
+        {field('to', t.audit.to, 'datetime-local')}
+        {field('agent_name', t.audit.agent_name, 'text')}
+        {field('op_id', t.audit.op_id, 'text')}
+        {select('op_class', t.audit.op_class, CLASSES, t.audit.class_labels)}
+        {field('instance_id', t.audit.instance_id, 'text')}
+        {field('target', t.audit.target, 'text')}
+        {select('decision', t.audit.decision, DECISIONS, t.audit.decision_labels)}
       </div>
       <fieldset className="audit-flags">
-        <legend>{T.flags}</legend>
+        <legend>{t.audit.flags}</legend>
         {FLAGS.map((flag) => (
           <label key={flag}>
             <input
@@ -202,15 +205,15 @@ export function Filters({ onApply }: { onApply: (filter: AuditFilter) => void })
               checked={form.flags.includes(flag)}
               onChange={(e) => toggle(flag, e.currentTarget.checked)}
             />
-            {own(T.flag_labels, flag) ?? flag}
+            {own(t.audit.flag_labels, flag) ?? flag}
           </label>
         ))}
       </fieldset>
-      {Object.keys(errors).length > 0 ? <p role="alert">{T.filter_errors}</p> : null}
+      {Object.keys(errors).length > 0 ? <p role="alert">{t.audit.filter_errors}</p> : null}
       <div className="audit-actions">
-        <button type="submit" className="primary">{T.apply}</button>
+        <button type="submit" className="primary">{t.audit.apply}</button>
         <button type="button" onClick={clear}>
-          {T.clear}
+          {t.audit.clear}
         </button>
       </div>
     </form>

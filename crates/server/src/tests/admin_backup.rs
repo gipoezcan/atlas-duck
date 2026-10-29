@@ -711,6 +711,7 @@ async fn restore_upgrades_a_v1_bundle() {
              ALTER TABLE users DROP COLUMN last_login_at;
              ALTER TABLE users DROP COLUMN retention_until;
              ALTER TABLE users DROP COLUMN chain_deleted_at;
+             ALTER TABLE users DROP COLUMN lang_pref;
              DROP TABLE scheduler_state;
              DROP TABLE offboarding_gone;
              DROP TABLE oauth_access;
@@ -732,6 +733,12 @@ async fn restore_upgrades_a_v1_bundle() {
     assert!(
         s.store().scheduler_get("retention").is_ok(),
         "v2 tables exist"
+    );
+    // M15 T4: the v3 -> v4 step ran too; the restored user has `auto`.
+    let alice = s.store().user_by_name("alice").unwrap().unwrap();
+    assert_eq!(
+        s.store().user_lang_pref(&alice.user_id).unwrap(),
+        crate::store::LangPref::Auto
     );
     s.maintenance(false).await;
     within(s.ctx.registry.close_all()).await;

@@ -4,15 +4,12 @@ import { own } from '../shared/text/own';
 import { decideBatch, denyBatch, denySession } from '../shared/ipc/invoke';
 import type { BatchItem } from '../shared/ipc/invoke';
 import type { QueueItem } from '../shared/ipc/types';
-import {
-  BATCH_FAILURE_TEXT,
-  BATCH_FAILURE_UNKNOWN,
-  BATCH_TEXT,
-  CLASS_LABELS,
-  DETAIL_TEXT,
-} from '../shared/strings';
 import { AgentText } from '../shared/text/AgentText';
+import { sessionLabel } from './Queue';
 import { useInert } from './inert';
+import { useText } from '../shared/i18n/context';
+import { en } from '../shared/i18n/dict';
+import type { Dict } from '../shared/i18n';
 
 /** plan text (PD-66): a reason is at most 1 000 characters; Rust re-validates. */
 const REASON_MAX = 1_000;
@@ -63,22 +60,15 @@ function signature(selected: readonly QueueItem[], unsentId: string | null): str
     .join('|');
 }
 
-const plural = (n: number, [one, many]: readonly [string, string]) => `${n} ${n === 1 ? one : many}`;
-
 /** "release 2 reads, approve 1 write": the classes of the items the confirmation names. */
-export function classSummary(items: readonly QueueItem[]): string {
+export function classSummary(items: readonly QueueItem[], t: Dict = en): string {
   const count = (cls: string) => items.filter((i) => i.class === cls).length;
   const reads = count('read');
   const scripts = count('script');
   // Like the native dialog: every request that is neither a read nor a script counts as a write.
   const writes = items.length - reads - scripts;
-  const parts: string[] = [];
-  if (reads > 0) parts.push(`release ${plural(reads, BATCH_TEXT.class_read)}`);
-  if (scripts > 0) parts.push(`release ${plural(scripts, BATCH_TEXT.class_script)}`);
-  if (writes > 0) parts.push(`approve ${plural(writes, BATCH_TEXT.class_write)}`);
-  return `${plural(items.length, ['request', 'requests'])}: ${parts.join(', ')}`;
+  return t.approvals.batch.class_summary(items.length, reads, scripts, writes);
 }
-
 /** What one panel is open: the confirmation of a batch approve/release, or a deny reason field. */
 type Panel =
   | { kind: 'confirm'; sig: string; items: BatchItem[]; shown: QueueItem[] }
@@ -143,6 +133,7 @@ interface BatchProps {
  * - A call in flight blocks every other one; nothing advances on its own.
  */
 export function Batch({ items, selectedIds, unsentId = null, onEngagedChange }: BatchProps) {
+  const t = useText();
   const selected = useMemo(() => {
     const ids = new Set(selectedIds);
     return items.filter((i) => ids.has(i.request_id));
@@ -302,10 +293,10 @@ export function Batch({ items, selectedIds, unsentId = null, onEngagedChange }: 
     const seen = new Map<string, { label: string; unusual: boolean }>();
     for (const i of selected) {
       const s = seen.get(i.session_id);
-      seen.set(i.session_id, { label: i.session_label, unusual: (s?.unusual ?? false) || i.unusual });
+      seen.set(i.session_id, { label: sessionLabel(i, t), unusual: (s?.unusual ?? false) || i.unusual });
     }
     return [...seen.entries()];
-  }, [selected]);
+  }, [selected, t]);
 
   const reviewDisabled = !canBatch || busy || inert.approveInert;
   const confirmDisabled = busy || inert.approveInert;
@@ -313,18 +304,18 @@ export function Batch({ items, selectedIds, unsentId = null, onEngagedChange }: 
   if (selected.length === 0 && result === null) return null;
 
   return (
-    <section className="batch" aria-label={BATCH_TEXT.label}>
-      <h2>{BATCH_TEXT.label}</h2>
+    <section className="batch" aria-label={t.approvals.batch.label}>
+      <h2>{t.approvals.batch.label}</h2>
       {selected.length > 0 ? (
         <>
-          <p role="status">{BATCH_TEXT.selected(selected.length)}</p>
+          <p role="status">{t.approvals.batch.selected(selected.length)}</p>
           {split.flagged.length > 0 ? (
             <div className="batch-excluded">
-              <p>{BATCH_TEXT.excluded}</p>
+              <p>{t.approvals.batch.excluded}</p>
               <ul>
                 {split.flagged.map((i) => (
                   <li key={i.request_id}>
-                    {i.op_id} {i.target_display}: {BATCH_TEXT.individually}
+                    {i.op_id} {i.target_display}: {t.approvals.batch.individually}
                   </li>
                 ))}
               </ul>
@@ -332,16 +323,16 @@ export function Batch({ items, selectedIds, unsentId = null, onEngagedChange }: 
           ) : null}
           {split.blocked.length > 0 ? (
             <div className="batch-blocked" role="note">
-              <p>{BATCH_TEXT.blocked}</p>
+              <p>{t.approvals.batch.blocked}</p>
               <ul>
                 {split.blocked.map(({ item, why }) => (
                   <li key={item.request_id}>
                     {item.op_id} {item.target_display}:{' '}
                     {why === 'unopened'
-                      ? BATCH_TEXT.blocked_unopened
+                      ? t.approvals.batch.blocked_unopened
                       : why === 'unsent'
-                        ? BATCH_TEXT.blocked_unsent
-                        : BATCH_TEXT.blocked_not_approvable}
+                        ? t.approvals.batch.blocked_unsent
+                        : t.approvals.batch.blocked_not_approvable}
                   </li>
                 ))}
               </ul>
@@ -349,40 +340,40 @@ export function Batch({ items, selectedIds, unsentId = null, onEngagedChange }: 
           ) : null}
           <div className="batch-actions">
             <button type="button" disabled={reviewDisabled} onClick={openConfirm}>
-              {BATCH_TEXT.review(split.eligible.length)}
+              {t.approvals.batch.review(split.eligible.length)}
             </button>
             <button type="button" disabled={busy} onClick={() => openDeny(null)}>
-              {BATCH_TEXT.deny_selected}
+              {t.approvals.batch.deny_selected}
             </button>
           </div>
           {sessions.map(([sessionId, s]) => (
             <div key={sessionId} className="batch-session" role="group" aria-labelledby={`${ids}-${sessionId}`}>
               <span id={`${ids}-${sessionId}`}>
-                {BATCH_TEXT.session} <AgentText value={s.label} unusual={s.unusual} />
+                {t.approvals.batch.session} <AgentText value={s.label} unusual={s.unusual} />
               </span>{' '}
               <button type="button" disabled={busy} onClick={() => openDeny(sessionId)}>
-                {BATCH_TEXT.deny_session}
+                {t.approvals.batch.deny_session}
               </button>
             </div>
           ))}
         </>
       ) : null}
       {open?.kind === 'confirm' ? (
-        <div className="batch-confirm" role="group" aria-label={BATCH_TEXT.confirm_title}>
-          <p>{BATCH_TEXT.confirm_summary(classSummary(open.shown))}</p>
+        <div className="batch-confirm" role="group" aria-label={t.approvals.batch.confirm_title}>
+          <p>{t.approvals.batch.confirm_summary(classSummary(open.shown, t))}</p>
           <ul>
             {open.shown.map((i) => (
               <li key={i.request_id}>
-                {own(CLASS_LABELS, i.class) ?? i.class} {i.op_id} {i.instance_alias} {i.target_display}
+                {own(t.approvals.class_labels, i.class) ?? i.class} {i.op_id} {i.instance_alias} {i.target_display}
               </li>
             ))}
           </ul>
-          <p>{BATCH_TEXT.confirm_note}</p>
+          <p>{t.approvals.batch.confirm_note}</p>
           <button type="button" disabled={confirmDisabled} onClick={confirm} onKeyDown={onConfirmKey}>
-            {BATCH_TEXT.confirm}
+            {t.approvals.batch.confirm}
           </button>
           <button type="button" ref={cancelButton} disabled={busy} onClick={() => setPanel(null)}>
-            {BATCH_TEXT.cancel}
+            {t.approvals.batch.cancel}
           </button>
         </div>
       ) : null}
@@ -391,17 +382,17 @@ export function Batch({ items, selectedIds, unsentId = null, onEngagedChange }: 
           className="deny-dialog"
           role="group"
           aria-label={
-            open.scope.session === null ? BATCH_TEXT.deny_selected_title(selected.length) : BATCH_TEXT.deny_session_title
+            open.scope.session === null ? t.approvals.batch.deny_selected_title(selected.length) : t.approvals.batch.deny_session_title
           }
         >
           {open.scope.session === null ? (
-            <p>{BATCH_TEXT.deny_selected_title(selected.length)}</p>
+            <p>{t.approvals.batch.deny_selected_title(selected.length)}</p>
           ) : (
             <p>
-              {BATCH_TEXT.deny_session_title}. {BATCH_TEXT.deny_session_note}
+              {t.approvals.batch.deny_session_title}. {t.approvals.batch.deny_session_note}
             </p>
           )}
-          <label htmlFor={`${ids}-reason`}>{BATCH_TEXT.deny_reason}</label>
+          <label htmlFor={`${ids}-reason`}>{t.approvals.batch.deny_reason}</label>
           <input
             id={`${ids}-reason`}
             ref={reasonField}
@@ -415,12 +406,12 @@ export function Batch({ items, selectedIds, unsentId = null, onEngagedChange }: 
             }}
             onKeyDown={onReasonKey}
           />
-          {reasonMissing ? <span role="alert">{BATCH_TEXT.deny_reason_required}</span> : null}
+          {reasonMissing ? <span role="alert">{t.approvals.batch.deny_reason_required}</span> : null}
           <button type="button" disabled={busy} onClick={sendDeny}>
-            {BATCH_TEXT.deny_send}
+            {t.approvals.batch.deny_send}
           </button>
           <button type="button" onClick={() => setPanel(null)}>
-            {BATCH_TEXT.cancel}
+            {t.approvals.batch.cancel}
           </button>
         </div>
       ) : null}
@@ -431,46 +422,47 @@ export function Batch({ items, selectedIds, unsentId = null, onEngagedChange }: 
 
 /** An approved write answers `pending` until it starts (its stale check runs first): said as the
  * Detail card says it, not as the raw status. */
-function itemStatus(status: string): string {
-  return status === 'pending' ? `${DETAIL_TEXT.decided}: ${DETAIL_TEXT.decided_approved}` : status;
+function itemStatus(status: string, t: Dict): string {
+  return status === 'pending' ? `${t.approvals.detail.decided}: ${t.approvals.detail.decided_approved}` : status;
 }
 
 function ResultView({ result }: { result: Result | null }) {
+  const t = useText();
   if (result === null) return null;
   switch (result.kind) {
     case 'decided':
       return (
         <div role="status">
-          <p>{BATCH_TEXT.decided(result.items.length)}</p>
+          <p>{t.approvals.batch.decided(result.items.length)}</p>
           <ul>
             {result.items.map((i) => (
               <li key={i.request_id}>
-                {result.names.get(i.request_id) ?? i.request_id}: {itemStatus(i.status)}
+                {result.names.get(i.request_id) ?? i.request_id}: {itemStatus(i.status, t)}
               </li>
             ))}
           </ul>
         </div>
       );
     case 'denied':
-      return <p role="status">{BATCH_TEXT.denied(result.count)}</p>;
+      return <p role="status">{t.approvals.batch.denied(result.count)}</p>;
     case 'nothing_pending':
-      return <p role="status">{BATCH_TEXT.nothing_pending}</p>;
+      return <p role="status">{t.approvals.batch.nothing_pending}</p>;
     case 'cancelled':
-      return <p role="status">{BATCH_TEXT.cancelled}</p>;
+      return <p role="status">{t.approvals.batch.cancelled}</p>;
     case 'rejected':
       return (
         <div role="alert">
-          <p>{result.failed === null ? BATCH_TEXT.rejected_unknown : BATCH_TEXT.rejected}</p>
+          <p>{result.failed === null ? t.approvals.batch.rejected_unknown : t.approvals.batch.rejected}</p>
           <ul>
             {(result.failed ?? []).map((f) => (
               <li key={`${f.request_id}-${f.code}`}>
-                {result.names.get(f.request_id) ?? f.request_id}: {own(BATCH_FAILURE_TEXT, f.code) ?? BATCH_FAILURE_UNKNOWN}
+                {result.names.get(f.request_id) ?? f.request_id}: {own(t.approvals.batch_failure, f.code) ?? t.approvals.batch_failure_unknown}
               </li>
             ))}
           </ul>
         </div>
       );
     case 'failed':
-      return <p role="alert">{result.deny ? BATCH_TEXT.deny_failed : BATCH_TEXT.failed}</p>;
+      return <p role="alert">{result.deny ? t.approvals.batch.deny_failed : t.approvals.batch.failed}</p>;
   }
 }

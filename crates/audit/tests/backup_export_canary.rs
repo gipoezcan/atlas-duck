@@ -113,6 +113,7 @@ fn backup_and_export_bytes_carry_no_pat_or_passphrase_canary() {
                 },
                 Some(Confirmed {
                     dialog_text_sha256: [7; 32],
+                    dialog_lang: None,
                 }),
             )
             .expect("origin");

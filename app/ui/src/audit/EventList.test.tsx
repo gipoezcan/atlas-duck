@@ -124,7 +124,7 @@ describe('Audit event list (spec 8.10, PD-74)', () => {
     const event = within(row).getByText('VERIFY');
     expect(flag.compareDocumentPosition(event) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     // The time is a bidi-isolated text node like the other columns.
-    expect(within(row).getByText('2026-10-19T08:30:15.250Z').tagName).toBe('BDI');
+    expect(within(row).getByText('2026-10-19 08:30 UTC').tagName).toBe('BDI');
   });
 
   it('the summary region is in the page before the first answer, empty, and is filled in later', async () => {

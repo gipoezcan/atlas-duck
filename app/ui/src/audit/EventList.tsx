@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useText } from '../shared/i18n/context';
 
 import { auditQuery } from '../shared/ipc/invoke';
 import type { AuditCursor, AuditFilter, EventHeader } from '../shared/ipc/types';
 import { Windowed } from '../shared/list/Windowed';
-import { AUDIT_TEXT as T } from '../shared/strings';
 import { AgentText } from '../shared/text/AgentText';
 import { Badge } from '../shared/text/Badge';
 import { own } from '../shared/text/own';
@@ -40,6 +40,7 @@ interface Props {
  * agent's name sits behind the "unverified" badge; flags are text labels.
  */
 export function EventList({ filter, selected, onOpen }: Props) {
+  const t = useText();
   const [rows, setRows] = useState<EventHeader[]>([]);
   const [next, setNext] = useState<AuditCursor | null>(null);
   const [examined, setExamined] = useState(0);
@@ -69,7 +70,7 @@ export function EventList({ filter, selected, onOpen }: Props) {
         if (page.rows.length > 0 || page.next === null) break;
       }
     } catch (e) {
-      if (live.current) setError(errorText(e));
+      if (live.current) setError(errorText(e, t));
     } finally {
       inFlight.current = false;
       if (live.current) setLoading(false);
@@ -94,26 +95,26 @@ export function EventList({ filter, selected, onOpen }: Props) {
       <p role="status">
         {started ? (
           <>
-            <span>{T.list_summary(rows.length, examined)}</span>
+            <span>{t.audit.list_summary(rows.length, examined)}</span>
             {next === null ? (
               <>
                 {' '}
-                <span>{T.list_end}</span>
+                <span>{t.audit.list_end}</span>
               </>
             ) : null}
           </>
         ) : null}
       </p>
-      {loading && !started ? <p>{T.list_loading}</p> : null}
+      {loading && !started ? <p>{t.audit.list_loading}</p> : null}
       {error === null ? null : (
         <p role="alert">
-          {T.list_failed}: {error}
+          {t.audit.list_failed}: {error}
         </p>
       )}
-      {nothing ? <p className="empty-state">{T.list_empty}</p> : null}
+      {nothing ? <p className="empty-state">{t.audit.list_empty}</p> : null}
       {rows.length === 0 ? null : (
         <Windowed
-          label={T.list_label}
+          label={t.audit.list_label}
           rows={rows}
           rowHeight={rowHeight}
           height={Math.min(480, rows.length * rowHeight)}
@@ -122,12 +123,12 @@ export function EventList({ filter, selected, onOpen }: Props) {
         />
       )}
       {next !== null && started && rows.length === 0 && !loading && error === null ? (
-        <p>{T.list_partial}</p>
+        <p>{t.audit.list_partial}</p>
       ) : null}
       {/* More to read, or a first read that failed and can be tried again. */}
       {next !== null || (error !== null && !started) ? (
         <button type="button" disabled={loading} onClick={more}>
-          {T.list_more}
+          {t.audit.list_more}
         </button>
       ) : null}
     </div>
@@ -136,10 +137,11 @@ export function EventList({ filter, selected, onOpen }: Props) {
 
 /** The flags of a record as text labels (the 8.2 names are closed; `own` keeps it so). */
 export function Flags({ flags }: { flags: readonly string[] }) {
+  const t = useText();
   return (
     <>
       {flags.map((f) => (
-        <Badge key={f} label={own(T.flag_labels, f) ?? T.unknown_name} tone={f === 'integrity_incident' ? 'caution' : 'neutral'} />
+        <Badge key={f} label={own(t.audit.flag_labels, f) ?? t.audit.unknown_name} tone={f === 'integrity_incident' ? 'caution' : 'neutral'} />
       ))}
     </>
   );
@@ -154,16 +156,17 @@ function Row({
   current: boolean;
   onOpen: (header: EventHeader) => void;
 }) {
+  const t = useText();
   return (
     <div className="audit-row">
       <div className="audit-line">
         <button type="button" aria-current={current ? 'true' : undefined} onClick={() => onOpen(h)}>
-          {T.open_record(h.seq)}
+          {t.audit.open_record(h.seq)}
         </button>
         {/* The flags come first: a narrow row cuts the end of its line, and a caution flag must stay in view. */}
         <Flags flags={h.flags} />
         <span>
-          <Val value={h.ts_utc} />
+          <Val value={h.ts_utc} time="short" />
         </span>
         <code>
           <Val value={h.event_type} />

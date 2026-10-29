@@ -1,10 +1,10 @@
 import { Windowed } from '../../shared/list/Windowed';
-import { REDACTION_TEXT } from '../../shared/strings';
 import { AgentText } from '../../shared/text/AgentText';
 import { Badge } from '../../shared/text/Badge';
 import { unusual } from '../../shared/text/unusual';
 import { members, scalarText, stringOf, type Candidate, type Span } from './json';
 import { IDENT_KEYS, selectorSafe, type Ident, type Loc, type Step } from './paths';
+import { useText } from '../../shared/i18n/context';
 
 /** One value of the candidate as the tree shows it. `id` (its offset in the text) is unique. */
 export interface TreeNode {
@@ -130,8 +130,9 @@ export class TreeModel {
 const isContainer = (s: Span): boolean => s.kind === 'object' || s.kind === 'array';
 
 function Label({ node }: { node: TreeNode }) {
+  const t = useText();
   const last = node.loc[node.loc.length - 1];
-  if (last === undefined) return <span className="tree-key">{REDACTION_TEXT.root}</span>;
+  if (last === undefined) return <span className="tree-key">{t.approvals.redaction.root}</span>;
   if ('index' in last) return <span className="tree-key">{`[${last.index}]`}</span>;
   return (
     <span className="tree-key">
@@ -170,13 +171,14 @@ interface TreeProps {
  * agent or upstream text: `AgentText` only.
  */
 export function Tree({ model, expanded, onToggle, selectedId, onSelect, marks }: TreeProps) {
+  const t = useText();
   const rows = model.rows(expanded);
   return (
     <Windowed
       rows={rows}
       rowHeight={TREE_ROW_PX}
       height={360}
-      label={REDACTION_TEXT.tree_label}
+      label={t.approvals.redaction.tree_label}
       rowKey={(n) => n.id}
       render={(node) => {
         const open = expanded.has(node.id);
@@ -188,7 +190,7 @@ export function Tree({ model, expanded, onToggle, selectedId, onSelect, marks }:
                 type="button"
                 className="tree-toggle"
                 aria-expanded={open}
-                aria-label={open ? REDACTION_TEXT.collapse : REDACTION_TEXT.expand}
+                aria-label={open ? t.approvals.redaction.collapse : t.approvals.redaction.expand}
                 onClick={() => onToggle(node)}
               >
                 {open ? '▾' : '▸'}
@@ -206,8 +208,8 @@ export function Tree({ model, expanded, onToggle, selectedId, onSelect, marks }:
             >
               <Label node={node} /> <Summary model={model} node={node} open={open} />
             </button>
-            {m.link ? <Badge label={REDACTION_TEXT.link_field} /> : null}
-            {m.dropped ? <Badge label={REDACTION_TEXT.dropped} tone="caution" /> : null}
+            {m.link ? <Badge label={t.approvals.redaction.link_field} /> : null}
+            {m.dropped ? <Badge label={t.approvals.redaction.dropped} tone="caution" /> : null}
           </div>
         );
       }}

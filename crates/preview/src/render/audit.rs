@@ -11,6 +11,7 @@
 use serde_json::Value;
 
 use super::{DOC_MAX_ROWS, Doc, Frame, Platform, len_u64, raw};
+use crate::lang::Lang;
 use crate::sanitize::iframe_document;
 
 /// Most bytes of a payload the document shows as a JSON tree: one page of the Audit window's
@@ -20,14 +21,21 @@ pub const AUDIT_TREE_MAX_BYTES: usize = 256 << 10;
 
 /// What a cap of the payload document left out (the PD-67 note for this window: the Raw text of
 /// the payload holds every byte).
-pub fn more_in_raw_text(n: u64, unit: &str) -> String {
-    format!("{n} more {unit} not shown here; see the Raw text")
+pub fn more_in_raw_text(lang: Lang, n: u64, unit: &str) -> String {
+    match lang {
+        Lang::En => format!("{n} more {unit} not shown here; see the Raw text"),
+        Lang::De => format!(
+            "{} weitere {} werden hier nicht angezeigt; siehe den Rohtext",
+            lang.count(n),
+            lang.unit(unit)
+        ),
+    }
 }
 
 /// The whole document of one payload of at most [`AUDIT_TREE_MAX_BYTES`]: the JSON tree, or, for
 /// bytes that are no JSON (or more than the cap), their display text.
-pub fn audit_payload_document(json: &[u8], platform: Platform) -> String {
-    let mut doc = Doc::default();
+pub fn audit_payload_document(lang: Lang, json: &[u8], platform: Platform) -> String {
+    let mut doc = Doc::default().in_lang(lang);
     let parsed = (json.len() <= AUDIT_TREE_MAX_BYTES)
         .then(|| serde_json::from_slice::<Value>(json).ok())
         .flatten();
@@ -44,8 +52,8 @@ pub fn audit_payload_document(json: &[u8], platform: Platform) -> String {
 
 /// The document of one page of a payload: `display` is the page's PD-68 projection
 /// ([`raw::raw_display`] / [`raw::raw_display_last`]), shown as text.
-pub fn audit_payload_page_document(display: &str, platform: Platform) -> String {
-    let mut doc = Doc::default();
+pub fn audit_payload_page_document(lang: Lang, display: &str, platform: Platform) -> String {
+    let mut doc = Doc::default().in_lang(lang);
     text_block(&mut doc, display);
     finish(doc, platform)
 }
@@ -60,7 +68,7 @@ fn text_block(doc: &mut Doc, shown: &str) {
 /// The note for a text cut at the byte budget, then the sandboxed document.
 fn finish(mut doc: Doc, platform: Platform) -> String {
     if doc.cut_text > 0 {
-        let note = more_in_raw_text(doc.cut_text, "bytes");
+        let note = more_in_raw_text(doc.lang, doc.cut_text, "bytes");
         doc.open("p");
         doc.fixed(&note);
         doc.close("p");
@@ -93,7 +101,11 @@ fn node(doc: &mut Doc, key: Option<Key<'_>>, v: &Value) {
         Value::Number(n) => doc.raw_code_text(&n.to_string()),
         Value::String(s) => doc.raw_quoted(s),
         Value::Array(items) => {
-            doc.fixed(&format!("array, {} items", items.len()));
+            let n = doc.lang.count(len_u64(items.len()));
+            doc.fixed(&match doc.lang {
+                Lang::En => format!("array, {n} items"),
+                Lang::De => format!("Array, {n} Einträge"),
+            });
             if !items.is_empty() {
                 doc.open("ul");
                 for (i, item) in items.iter().enumerate() {
@@ -107,7 +119,11 @@ fn node(doc: &mut Doc, key: Option<Key<'_>>, v: &Value) {
             }
         }
         Value::Object(entries) => {
-            doc.fixed(&format!("object, {} keys", entries.len()));
+            let n = doc.lang.count(len_u64(entries.len()));
+            doc.fixed(&match doc.lang {
+                Lang::En => format!("object, {n} keys"),
+                Lang::De => format!("Objekt, {n} Schlüssel"),
+            });
             if !entries.is_empty() {
                 doc.open("ul");
                 for (i, (k, item)) in entries.iter().enumerate() {
@@ -126,6 +142,6 @@ fn node(doc: &mut Doc, key: Option<Key<'_>>, v: &Value) {
 
 fn more(doc: &mut Doc, n: usize) {
     doc.open("li");
-    doc.fixed(&more_in_raw_text(len_u64(n), "items"));
+    doc.fixed(&more_in_raw_text(doc.lang, len_u64(n), "items"));
     doc.close("li");
 }

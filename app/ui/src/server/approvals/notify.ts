@@ -1,14 +1,5 @@
 import type { QueueItem } from '../../shared/ipc/types';
 
-/** PD-207: fixed title; the body is the registry op id, never agent text. */
-export const NOTIFY_TITLE = 'atlas-duck: approval needed';
-
-export const NOTIFY_TEXT = {
-  enable: 'Enable notifications',
-  enabled: 'Notifications are on.',
-  denied: 'Notifications are blocked in this browser.',
-} as const;
-
 /** The browser pieces the notifier uses (replaced in tests). */
 export interface NotifyEnv {
   permission(): NotificationPermission | 'unsupported';
@@ -33,7 +24,9 @@ export const browserEnv: NotifyEnv = {
 
 /**
  * Tracks the pending ids seen so far and shows one notification per new id while the tab is
- * hidden and permission is granted. The first queue only seeds what was already there.
+ * hidden and permission is granted. The first queue only seeds what was already there. The title
+ * is read for every notification, so a language switch applies to the next one (PD-207: a fixed
+ * title, the body is the registry op id, never agent text).
  */
 export class Notifier {
   private seen: Set<string> | null = null;
@@ -41,6 +34,7 @@ export class Notifier {
   constructor(
     private readonly env: NotifyEnv,
     private readonly select: (requestId: string) => void,
+    private readonly title: () => string,
   ) {}
 
   queue(items: readonly QueueItem[]): void {
@@ -52,7 +46,7 @@ export class Notifier {
     for (const item of items) {
       if (before.has(item.request_id)) continue;
       const id = item.request_id;
-      this.env.show(NOTIFY_TITLE, item.op_id, id, () => this.select(id));
+      this.env.show(this.title(), item.op_id, id, () => this.select(id));
     }
   }
 }

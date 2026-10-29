@@ -11,7 +11,6 @@ import {
 import { own } from '../shared/text/own';
 import { decide, previewFetch, type DenyDetails } from '../shared/ipc/invoke';
 import type { PreviewFetchResponse, QueueItem, UrlMode } from '../shared/ipc/types';
-import { CLASS_LABELS, DETAIL_TEXT, EDIT_TEXT, REDACTION_TEXT, STATUS_LABELS } from '../shared/strings';
 import { cardOf, DecisionBar, STATUS_ONLY, type DecisionArgs } from './DecisionBar';
 import { DenyDialog } from './DenyDialog';
 import { buildEdits, EditForm, type Draft, type Drafts } from './EditForm';
@@ -30,15 +29,12 @@ import {
   useRedactionReport,
 } from './redaction/state';
 import { RequestTab } from './RequestTab';
+import { useText } from '../shared/i18n/context';
+import { en } from '../shared/i18n/dict';
 
 type TabId = 'preview' | 'structured' | 'raw' | 'request';
 
-const TABS: readonly { id: TabId; label: string }[] = [
-  { id: 'preview', label: DETAIL_TEXT.tab_preview },
-  { id: 'structured', label: DETAIL_TEXT.tab_structured },
-  { id: 'raw', label: DETAIL_TEXT.tab_raw },
-  { id: 'request', label: DETAIL_TEXT.tab_request },
-];
+const TAB_IDS: readonly TabId[] = ['preview', 'structured', 'raw', 'request'];
 
 type OpenState =
   | { kind: 'idle' }
@@ -135,6 +131,7 @@ function editRejection(e: unknown): string | null {
  * approving it would silently leave the changes out.
  */
 export function Detail({ item, openToken = 0, gone = false, renderStructured, ref, onUnsentChange }: DetailProps) {
+  const t = useText();
   const [tab, setTab] = useState<TabId>('preview');
   const [state, setState] = useState<OpenState>({ kind: 'idle' });
   const [actionFailed, setActionFailed] = useState(false);
@@ -210,12 +207,15 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
   );
   const inert = useInert(displayed);
 
-  const releaseBlocked =
+  const blockedRaw =
     state.kind === 'blocked' ? state.text : (shown?.preview.header.release_blocked ?? null);
-  const card = gone || shown === null ? null : cardOf(shown.preview);
+  // M15 T10: core's one release-blocked sentence in the UI language; any other text as Rust sent it.
+  const releaseBlocked =
+    blockedRaw === en.approvals.release_blocked_internal ? t.approvals.release_blocked_internal : blockedRaw;
+  const card = gone || shown === null ? null : cardOf(shown.preview, t);
   const canDeny = !gone && (shown !== null || releaseBlocked !== null);
   const form = shown?.preview.edit_form ?? null;
-  const built = form === null ? null : buildEdits(form, drafts);
+  const built = form === null ? null : buildEdits(form, drafts, t);
   /** The form holds changes that are not sent: an approve would leave them out. */
   const unsentEdits = built?.changed ?? false;
   // Reads and scripts (task 17): the redaction round and what Release would send. The revision
@@ -360,8 +360,8 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
           setState({ kind: 'idle' });
           setDecided(
             outcome.status === 'pending'
-              ? DETAIL_TEXT.decided_approved
-              : (own(STATUS_LABELS, outcome.status) ?? outcome.status),
+              ? t.approvals.detail.decided_approved
+              : (own(t.approvals.status_labels, outcome.status) ?? outcome.status),
           );
         }
       },
@@ -449,15 +449,15 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
   const panel = (): ReactNode => {
     if (tab === 'request') return <RequestTab requestId={item.request_id} />;
     if (shown === null) {
-      if (state.kind === 'loading') return <p role="status">{DETAIL_TEXT.loading}</p>;
+      if (state.kind === 'loading') return <p role="status">{t.approvals.detail.loading}</p>;
       if (state.kind === 'failed') {
         return (
           <p role="alert" data-error={state.error}>
-            {DETAIL_TEXT.load_failed}
+            {t.approvals.detail.load_failed}
           </p>
         );
       }
-      return <p>{DETAIL_TEXT.not_opened}</p>;
+      return <p>{t.approvals.detail.not_opened}</p>;
     }
     if (tab === 'preview') return <PreviewFrame srcdoc={shown.srcdoc} />;
     if (tab === 'raw') {
@@ -521,36 +521,36 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
       );
     }
     // A probe that failed fails closed: no panel (so no drop offer and no release path), only the way out.
-    if (mirrorProbe && flagged !== null && 'failed' in flagged) return <p role="alert">{REDACTION_TEXT.flagged_missing}</p>;
-    return <p>{REDACTION_TEXT.nothing}</p>;
+    if (mirrorProbe && flagged !== null && 'failed' in flagged) return <p role="alert">{t.approvals.redaction.flagged_missing}</p>;
+    return <p>{t.approvals.redaction.nothing}</p>;
   };
 
   return (
-    <article className="detail" aria-label={DETAIL_TEXT.heading}>
+    <article className="detail" aria-label={t.approvals.detail.heading}>
       <h2 ref={heading} tabIndex={-1}>
-        {DETAIL_TEXT.heading}
+        {t.approvals.detail.heading}
       </h2>
       <p className="detail-summary">
         <span className="op-id">{item.op_id}</span> <span className="alias">{item.instance_alias}</span>{' '}
         <span className="target">{item.target_display}</span>{' '}
-        <span className="class">{own(CLASS_LABELS, item.class) ?? item.class}</span>
+        <span className="class">{own(t.approvals.class_labels, item.class) ?? item.class}</span>
       </p>
       {releaseBlocked === null ? null : (
         <div className="caution-strip" role="alert">
-          <strong>{DETAIL_TEXT.caution_prefix}</strong> {releaseBlocked}
+          <strong>{t.approvals.detail.caution_prefix}</strong> {releaseBlocked}
         </div>
       )}
       {!gone && (stale || needsOpen) ? (
         <button type="button" onClick={open}>
-          {DETAIL_TEXT.open}
+          {t.approvals.detail.open}
         </button>
       ) : null}
-      {decided === null ? null : <p role="status">{`${DETAIL_TEXT.decided}: ${decided}`}</p>}
-      {edited ? <p role="status">{EDIT_TEXT.applied}</p> : null}
-      {unsentEdits ? <p role="status">{EDIT_TEXT.unsent}</p> : null}
-      {redactionApplied ? <p role="status">{REDACTION_TEXT.applied}</p> : null}
-      {unsentRedactions ? <p role="status">{REDACTION_TEXT.unsent}</p> : null}
-      {actionFailed ? <p role="alert">{DETAIL_TEXT.action_failed}</p> : null}
+      {decided === null ? null : <p role="status">{`${t.approvals.detail.decided}: ${decided}`}</p>}
+      {edited ? <p role="status">{t.approvals.edit.applied}</p> : null}
+      {unsentEdits ? <p role="status">{t.approvals.edit.unsent}</p> : null}
+      {redactionApplied ? <p role="status">{t.approvals.redaction.applied}</p> : null}
+      {unsentRedactions ? <p role="status">{t.approvals.redaction.unsent}</p> : null}
+      {actionFailed ? <p role="alert">{t.approvals.detail.action_failed}</p> : null}
       <DecisionBar
         card={card}
         canDeny={canDeny}
@@ -572,16 +572,16 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
           ) : null
         }
       />
-      <div role="tablist" aria-label={DETAIL_TEXT.tabs_label}>
-        {TABS.map((t) => (
+      <div role="tablist" aria-label={t.approvals.detail.tabs_label}>
+        {TAB_IDS.map((id) => (
           <button
-            key={t.id}
+            key={id}
             type="button"
             role="tab"
-            aria-selected={tab === t.id}
-            onClick={() => setTab(t.id)}
+            aria-selected={tab === id}
+            onClick={() => setTab(id)}
           >
-            {t.label}
+            {t.approvals.detail[`tab_${id}`]}
           </button>
         ))}
       </div>

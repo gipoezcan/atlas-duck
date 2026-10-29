@@ -35,12 +35,14 @@ use atlas_duck_app_lib::commands::{
     ReAnchorFailure, RestoreFailure,
 };
 use atlas_duck_app_lib::credential::{PatTarget, Purpose};
+use atlas_duck_app_lib::i18n::{Lang, LangPref};
 use atlas_duck_app_lib::recovery_tier::{
     AnchorDirDto, ForgottenDto, OrphanInstallDto, ReAnchoredDto,
 };
 use atlas_duck_app_lib::removal::{
     BackupAnswer, Choice, FinishAnswer, ItemDto, RemovalDto, RemovalError,
 };
+use atlas_duck_app_lib::state::UiLang;
 use atlas_duck_app_lib::ui_sink::audit_job_payload;
 use atlas_duck_app_lib::wizard::{
     MSG_NEEDS_SECRET_SERVICE, MSG_PIN_WRITE_FAILED, MSG_PREVIOUS_CHAIN_FOUND, WizardError,
@@ -131,6 +133,8 @@ fn queue_items() -> Vec<QueueItem> {
             similar_to: None,
             session_id: session.id(),
             session_label: session.label(),
+            session_agent_name: session.shown_agent_name(),
+            session_cwd: session.shown_cwd(),
             session,
             opened: false,
             approvable: true,
@@ -153,6 +157,8 @@ fn queue_items() -> Vec<QueueItem> {
             similar_to: None,
             session_id: unnamed.id(),
             session_label: unnamed.label(),
+            session_agent_name: unnamed.shown_agent_name(),
+            session_cwd: unnamed.shown_cwd(),
             session: unnamed,
             opened: false,
             approvable: true,
@@ -687,6 +693,8 @@ fn command_errors() -> Vec<CommandError> {
         CommandError::Settings(SettingsError::ConfigReadOnly(ConfigBanner {
             kind: "read_only",
             text: "config written by v9.9.0; settings read-only until you upgrade".into(),
+            version: Some("v9.9.0".into()),
+            parsed: true,
         })),
         CommandError::Settings(SettingsError::NoConfigFile),
         CommandError::Settings(SettingsError::Conflict),
@@ -946,7 +954,11 @@ fn audit_payloads() -> Vec<AuditPayloadDto> {
             r#"{{"change":"{change}","expires_at":null,"new_user_key":"JIRAUSER10100","old_user_key":null}}"#
         );
         AuditPayloadDto {
-            srcdoc: render::audit_payload_document(json.as_bytes(), Platform::MacOsLinux),
+            srcdoc: render::audit_payload_document(
+                atlas_duck_preview::Lang::En,
+                json.as_bytes(),
+                Platform::MacOsLinux,
+            ),
             page: 0,
             page_count: 1,
             total_bytes: json.len() as u64,
@@ -957,7 +969,11 @@ fn audit_payloads() -> Vec<AuditPayloadDto> {
     vec![
         credential("store_failed", CredentialChangeFailure::StoreFailed),
         AuditPayloadDto {
-            srcdoc: render::audit_payload_document(json, Platform::MacOsLinux),
+            srcdoc: render::audit_payload_document(
+                atlas_duck_preview::Lang::En,
+                json,
+                Platform::MacOsLinux,
+            ),
             page: 0,
             page_count: 1,
             total_bytes: 25,
@@ -965,7 +981,11 @@ fn audit_payloads() -> Vec<AuditPayloadDto> {
             credential_change: None,
         },
         AuditPayloadDto {
-            srcdoc: render::audit_payload_page_document(&page, Platform::MacOsLinux),
+            srcdoc: render::audit_payload_page_document(
+                atlas_duck_preview::Lang::En,
+                &page,
+                Platform::MacOsLinux,
+            ),
             page: 1,
             page_count: 2,
             total_bytes: 262_150,
@@ -1258,10 +1278,10 @@ fn credential_contexts() -> Vec<CredentialContextDto> {
         origin: "https://jira.example/jira".into(),
     };
     vec![
-        context_dto(&Purpose::ReplacePat(target), None, false),
-        context_dto(&Purpose::RecoverThisLog, Some(3), false),
-        context_dto(&Purpose::Unlock, Some(0), false),
-        context_dto(&Purpose::RecoveryPassphrase, Some(1), true),
+        context_dto(&Purpose::ReplacePat(target), None, false, Lang::En),
+        context_dto(&Purpose::RecoverThisLog, Some(3), false, Lang::De),
+        context_dto(&Purpose::Unlock, Some(0), false, Lang::En),
+        context_dto(&Purpose::RecoveryPassphrase, Some(1), true, Lang::De),
     ]
 }
 
@@ -1400,6 +1420,8 @@ fn settings_views() -> Vec<SettingsView> {
             config_read_only: Some(ConfigBanner {
                 kind: "read_only",
                 text: "config written by v9.9.0; settings read-only until you upgrade".into(),
+                version: Some("v9.9.0".into()),
+                parsed: true,
             }),
             restart_pending: vec!["candidate_cache_mb"],
         },
@@ -1467,6 +1489,11 @@ fn settings_gets() -> Vec<SettingsGet> {
             cli_installed: true,
             cli_removable: true,
             cli_dir_on_path: Some(true),
+            // M15 T3: every preference and both languages are in the fixtures.
+            ui_lang: UiLang {
+                pref: LangPref::Auto,
+                lang: Lang::De,
+            },
         },
         SettingsGet {
             settings: views.next().unwrap_or_else(|| unreachable!()),
@@ -1475,6 +1502,10 @@ fn settings_gets() -> Vec<SettingsGet> {
             cli_installed: false,
             cli_removable: true,
             cli_dir_on_path: Some(false),
+            ui_lang: UiLang {
+                pref: LangPref::Auto,
+                lang: Lang::En,
+            },
         },
         // deb/rpm: the CLI is in `/usr/bin` and nothing can be removed.
         SettingsGet {
@@ -1484,6 +1515,10 @@ fn settings_gets() -> Vec<SettingsGet> {
             cli_installed: true,
             cli_removable: false,
             cli_dir_on_path: None,
+            ui_lang: UiLang {
+                pref: LangPref::De,
+                lang: Lang::De,
+            },
         },
         // The degraded state: the setting on (the first view) and an unmet floor.
         SettingsGet {
@@ -1494,6 +1529,10 @@ fn settings_gets() -> Vec<SettingsGet> {
             cli_removable: true,
             // Installed to ~/.local/bin, which this process's PATH does not have.
             cli_dir_on_path: Some(false),
+            ui_lang: UiLang {
+                pref: LangPref::En,
+                lang: Lang::En,
+            },
         },
     ]
 }
@@ -1938,10 +1977,13 @@ fn preview_fetch_sends_the_thumbnail_in_the_srcdoc_only() -> TestResult {
             assert_eq!(thumbnail_data_uri.as_deref(), Some(uri));
             *thumbnail_data_uri = None;
         }
-        let r = preview_fetch_response(PreviewDelivery {
-            preview,
-            redaction: None,
-        });
+        let r = preview_fetch_response(
+            PreviewDelivery {
+                preview,
+                redaction: None,
+            },
+            atlas_duck_preview::Lang::En,
+        );
         assert_eq!(r.preview, want);
         assert_eq!(
             r.srcdoc.contains(&format!("<img src=\"{uri}\"")),

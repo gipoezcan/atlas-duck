@@ -247,6 +247,7 @@ mod u18 {
                 },
                 Some(Confirmed {
                     dialog_text_sha256: [7; 32],
+                    dialog_lang: None,
                 }),
             )
             .expect("origin");

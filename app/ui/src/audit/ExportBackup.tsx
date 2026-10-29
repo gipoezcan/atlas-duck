@@ -1,8 +1,10 @@
 import { useEffect, useId, useRef, useState } from 'react';
+import { useText } from '../shared/i18n/context';
+import type { Dict } from '../shared/i18n';
+import { en } from '../shared/i18n/dict';
 
 import { backupTrigger, exportCancel, exportTrigger } from '../shared/ipc/invoke';
 import type { AuditJobEvent, AuditJobKind } from '../shared/ipc/types';
-import { AUDIT_TEXT as T } from '../shared/strings';
 import { Announce, errorText, exportRefusal, exportResult, kinds, type Said, say, utcOf } from './text';
 
 interface Props {
@@ -10,9 +12,9 @@ interface Props {
   job: AuditJobEvent | null;
 }
 
-function backupRefusal(e: unknown): Said {
-  if (kinds(e).kind === 'cancelled') return say('status', T.backup_cancelled);
-  return say('alert', errorText(e));
+function backupRefusal(e: unknown, t: Dict = en): Said {
+  if (kinds(e).kind === 'cancelled') return say('status', t.audit.backup_cancelled);
+  return say('alert', errorText(e, t));
 }
 
 const running = (job: AuditJobEvent | null, kind: AuditJobKind) =>
@@ -29,6 +31,7 @@ const running = (job: AuditJobEvent | null, kind: AuditJobKind) =>
  * One job at a time: both triggers are off while any runs (Rust answers `busy` otherwise).
  */
 export function ExportBackup({ job }: Props) {
+  const t = useText();
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
   const [exporting, setExporting] = useState(false);
@@ -76,11 +79,11 @@ export function ExportBackup({ job }: Props) {
     const fromUtc = utcOf(from);
     const toUtc = utcOf(to);
     if (fromUtc === undefined || toUtc === undefined) {
-      setSaid(say('alert', T.export_errors['from_utc'] ?? ''));
+      setSaid(say('alert', t.audit.export_errors['from_utc'] ?? ''));
       return;
     }
     if (fromUtc !== null && toUtc !== null && fromUtc > toUtc) {
-      setSaid(say('alert', T.export_errors['to_utc'] ?? ''));
+      setSaid(say('alert', t.audit.export_errors['to_utc'] ?? ''));
       return;
     }
     if (!claim()) return;
@@ -90,20 +93,20 @@ export function ExportBackup({ job }: Props) {
       (done) => {
         release('export');
         setExporting(false);
-        setSaid(exportResult(done, true));
+        setSaid(exportResult(done, true, t));
       },
       (e: unknown) => {
         release('export', e);
         setExporting(false);
-        setSaid(exportRefusal(e));
+        setSaid(exportRefusal(e, t));
       },
     );
   };
 
   const cancel = () => {
     exportCancel().then(
-      (a) => setSaid(say('status', a.cancelled ? T.export_cancel_requested : T.export_cancel_none)),
-      (e: unknown) => setSaid(say('alert', errorText(e))),
+      (a) => setSaid(say('status', a.cancelled ? t.audit.export_cancel_requested : t.audit.export_cancel_none)),
+      (e: unknown) => setSaid(say('alert', errorText(e, t))),
     );
   };
 
@@ -115,24 +118,24 @@ export function ExportBackup({ job }: Props) {
       (a) => {
         release('backup');
         setBackingUp(false);
-        setSaid(say('status', a.saved ? T.backup_saved : T.backup_not_saved));
+        setSaid(say('status', a.saved ? t.audit.backup_saved : t.audit.backup_not_saved));
       },
       (e: unknown) => {
         release('backup', e);
         setBackingUp(false);
-        setSaid(backupRefusal(e));
+        setSaid(backupRefusal(e, t));
       },
     );
   };
 
   return (
-    <section className="audit-jobs" aria-label={T.jobs}>
-      <h2>{T.jobs}</h2>
-      <h3>{T.export}</h3>
-      <p>{T.export_intro}</p>
+    <section className="audit-jobs" aria-label={t.audit.jobs}>
+      <h2>{t.audit.jobs}</h2>
+      <h3>{t.audit.export}</h3>
+      <p>{t.audit.export_intro}</p>
       <div className="audit-fields">
         <div className="audit-field">
-          <label htmlFor={`${ids}-from`}>{T.export_from}</label>
+          <label htmlFor={`${ids}-from`}>{t.audit.export_from}</label>
           <input
             id={`${ids}-from`}
             type="datetime-local"
@@ -142,7 +145,7 @@ export function ExportBackup({ job }: Props) {
           />
         </div>
         <div className="audit-field">
-          <label htmlFor={`${ids}-to`}>{T.export_to}</label>
+          <label htmlFor={`${ids}-to`}>{t.audit.export_to}</label>
           <input
             id={`${ids}-to`}
             type="datetime-local"
@@ -153,40 +156,40 @@ export function ExportBackup({ job }: Props) {
         </div>
       </div>
       <button type="button" className="primary" disabled={busy} onClick={startExport}>
-        {T.export_start}
+        {t.audit.export_start}
       </button>
       {exportActive ? (
         <div className="audit-job">
-          <span id={`${ids}-export`}>{T.export_running}</span>{' '}
+          <span id={`${ids}-export`}>{t.audit.export_running}</span>{' '}
           {progress === null ? (
             <>
-              <progress aria-labelledby={`${ids}-export`} /> <span>{T.export_starting}</span>
+              <progress aria-labelledby={`${ids}-export`} /> <span>{t.audit.export_starting}</span>
             </>
           ) : (
             <>
               <progress aria-labelledby={`${ids}-export`} value={progress.done} max={progress.total} />{' '}
-              <span>{T.export_progress(progress.done, progress.total)}</span>
+              <span>{t.audit.export_progress(progress.done, progress.total)}</span>
             </>
           )}{' '}
           <button type="button" onClick={cancel}>
-            {T.export_cancel}
+            {t.audit.export_cancel}
           </button>
         </div>
       ) : null}
 
-      <h3>{T.backup}</h3>
-      <p>{T.backup_note}</p>
+      <h3>{t.audit.backup}</h3>
+      <p>{t.audit.backup_note}</p>
       <button type="button" className="primary" disabled={busy} onClick={startBackup}>
-        {T.backup_start}
+        {t.audit.backup_start}
       </button>
       {backupActive ? (
         <div className="audit-job">
-          <span id={`${ids}-backup`}>{T.backup_running}</span> <progress aria-labelledby={`${ids}-backup`} />
+          <span id={`${ids}-backup`}>{t.audit.backup_running}</span> <progress aria-labelledby={`${ids}-backup`} />
         </div>
       ) : null}
       {restoreActive ? (
         <div className="audit-job">
-          <span id={`${ids}-restore`}>{T.restore_running}</span> <progress aria-labelledby={`${ids}-restore`} />
+          <span id={`${ids}-restore`}>{t.audit.restore_running}</span> <progress aria-labelledby={`${ids}-restore`} />
         </div>
       ) : null}
       <Announce said={said} />

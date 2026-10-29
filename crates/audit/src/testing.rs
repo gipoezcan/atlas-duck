@@ -763,6 +763,7 @@ pub fn export_fixture(kind: FixtureKind, out: &Path) -> std::io::Result<FixtureI
                 Some(RustChosenPath::from_native_dialog(anchor.clone())),
                 crate::types::Confirmed {
                     dialog_text_sha256: [7; 32],
+                    dialog_lang: None,
                 },
             )
             .map_err(|_| fail("anchor dir"))?;

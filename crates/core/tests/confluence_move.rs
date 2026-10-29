@@ -1285,7 +1285,7 @@ async fn page_move_preview_old_and_new_paths() -> TestResult {
         }
         other => return Err(format!("not the page-move card: {other:?}").into()),
     }
-    let doc = render::document(&p, Platform::current());
+    let doc = render::document(atlas_duck_preview::Lang::En, &p, Platform::current());
     assert!(doc.contains(BODY_NOT_SENT), "the fixed row");
     assert!(doc.contains("Old ancestor path") && doc.contains("New ancestor path"));
     Ok(())

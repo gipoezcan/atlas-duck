@@ -80,7 +80,11 @@ fn build_and_render(h: &Harness, id: &str, what: &str) -> Result<Preview, TestEr
     assert_eq!(built.preview.candidate_rev, first.preview.candidate_rev);
 
     let t = Instant::now();
-    let doc = render::document(&built.preview, Platform::current());
+    let doc = render::document(
+        atlas_duck_preview::Lang::En,
+        &built.preview,
+        Platform::current(),
+    );
     within(&format!("{what} render::document"), t.elapsed(), P01_BUDGET);
     assert!(doc.contains("<html"), "{what}: not a document");
     Ok(built.preview)
@@ -96,7 +100,8 @@ async fn p01_rust_preview_build_and_document_under_budget() -> TestResult {
     let id = queued(&h, "jira.issue.get", json!({ "key": "ABC-7" })).await?;
     let p = build_and_render(&h, &id, "jira.issue.get")?;
     assert!(
-        render::document(&p, Platform::current()).contains("Login page times out"),
+        render::document(atlas_duck_preview::Lang::En, &p, Platform::current())
+            .contains("Login page times out"),
         "the issue card shows the summary"
     );
 
@@ -183,7 +188,7 @@ async fn p01_script_200_rows_preview_under_budget() -> TestResult {
     let id = request_id(&env)?;
     h.queued(&id, 20_000).await.ok_or("never queued")?;
     let p = build_and_render(&h, &id, "script 200 rows")?;
-    let doc = render::document(&p, Platform::current());
+    let doc = render::document(atlas_duck_preview::Lang::En, &p, Platform::current());
     assert!(
         doc.contains("Issue 0: login page times out"),
         "the card shows the first row"
@@ -219,7 +224,7 @@ async fn p01_confluence_page_and_update_diff_under_budget() -> TestResult {
     mount_users(mock, &users).await;
     let id = queued(&h, "confluence.page.get", json!({ "id": "65537" })).await?;
     let p = build_and_render(&h, &id, "confluence.page.get 5000 words")?;
-    let doc = render::document(&p, Platform::current());
+    let doc = render::document(atlas_duck_preview::Lang::En, &p, Platform::current());
     assert!(
         doc.contains("Release checklist"),
         "the card shows the title"
@@ -239,7 +244,7 @@ async fn p01_confluence_page_and_update_diff_under_budget() -> TestResult {
     )
     .await?;
     let p = build_and_render(&h, &id, "confluence.page.update small diff")?;
-    let doc = render::document(&p, Platform::current());
+    let doc = render::document(atlas_duck_preview::Lang::En, &p, Platform::current());
     assert!(
         doc.contains("Release checklist"),
         "the card shows the title"
@@ -335,7 +340,11 @@ fn measure(h: &Harness, id: &str, what: &str) -> Result<(), TestError> {
         t.elapsed().as_secs_f64() * 1000.0
     );
     let t = Instant::now();
-    let doc = render::document(&built.preview, Platform::current());
+    let doc = render::document(
+        atlas_duck_preview::Lang::En,
+        &built.preview,
+        Platform::current(),
+    );
     println!(
         "perf_sc3 {what} render::document: {:.1} ms ({} bytes)",
         t.elapsed().as_secs_f64() * 1000.0,

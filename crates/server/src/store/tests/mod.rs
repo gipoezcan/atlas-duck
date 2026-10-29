@@ -379,11 +379,11 @@ fn reopen_keeps_sessions_and_newer_schema_is_refused() {
     }
     let s = SqliteStore::open(&path).unwrap();
     assert_eq!(s.session_get(&[7; 32]).unwrap(), Some(session(7, A)));
-    s.raw().execute_batch("PRAGMA user_version = 4;").unwrap();
+    s.raw().execute_batch("PRAGMA user_version = 5;").unwrap();
     drop(s);
     assert!(matches!(
         SqliteStore::open(&path),
-        Err(StoreError::Newer(4))
+        Err(StoreError::Newer(5))
     ));
 }
 
@@ -492,7 +492,7 @@ fn migrate_v1_to_v2_keeps_rows_and_sessions() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, super::schema::SCHEMA_VERSION);
-    assert_eq!(v, 3);
+    assert_eq!(v, 4);
     let u = s.user(A).unwrap().unwrap();
     assert_eq!((u.username.as_str(), u.created_at), ("alice", 100));
     assert_eq!(s.user_state(A).unwrap(), Some(UserState::default()));
@@ -1024,7 +1024,7 @@ fn m14_tables_are_the_v3_step_and_keep_the_rows() {
     let v: u32 = c
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 3, "M13's v2, then M14's v3");
+    assert_eq!(v, 4, "M13's v2, M14's v3, then M15's v4");
     drop(c);
     drop(s);
     // Reopening is a no-op.
@@ -1053,6 +1053,109 @@ fn a_failed_v3_step_leaves_the_database_at_v2() {
         .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
         .unwrap();
     assert_eq!(users, 1);
+}
+
+// ---- M15 T4: the language preference (schema v4) -----------------------------------------
+
+#[test]
+fn lang_pref_is_per_user_and_defaults_to_auto() {
+    for (name, s) in stores() {
+        let s = s.as_ref();
+        with_users(s);
+        assert_eq!(s.user_lang_pref(A).unwrap(), LangPref::Auto, "{name}");
+        s.set_user_lang_pref(A, LangPref::De).unwrap();
+        assert_eq!(s.user_lang_pref(A).unwrap(), LangPref::De, "{name}");
+        assert_eq!(
+            s.user_lang_pref(B).unwrap(),
+            LangPref::Auto,
+            "{name}: B untouched"
+        );
+        s.set_user_lang_pref(B, LangPref::En).unwrap();
+        assert_eq!(
+            s.user_lang_pref(A).unwrap(),
+            LangPref::De,
+            "{name}: A untouched"
+        );
+        assert_eq!(s.user_lang_pref(B).unwrap(), LangPref::En, "{name}");
+        // A login refreshes the user row; the preference stays.
+        s.upsert_user(&user(A, "alice")).unwrap();
+        assert_eq!(
+            s.user_lang_pref(A).unwrap(),
+            LangPref::De,
+            "{name}: upsert keeps it"
+        );
+        // An unknown user: nothing is stored, the answer is `auto`.
+        s.set_user_lang_pref("nobody", LangPref::De).unwrap();
+        assert_eq!(
+            s.user_lang_pref("nobody").unwrap(),
+            LangPref::Auto,
+            "{name}"
+        );
+        assert_eq!(s.user_state("nobody").unwrap(), None, "{name}: no row made");
+    }
+}
+
+#[test]
+fn migrate_v3_to_v4_defaults_auto() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.db");
+    v1_db_with_rows(&path);
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        super::migrate::migrate(&c, 1, 3).unwrap();
+        assert!(!columns(&c, "users").contains(&"lang_pref".to_owned()));
+    }
+    let s = SqliteStore::open(&path).unwrap();
+    let v: u32 = s
+        .raw()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 4);
+    let raw: String = s
+        .raw()
+        .query_row("SELECT lang_pref FROM users WHERE user_id = ?1", [A], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(raw, "auto", "an existing user gets auto");
+    assert_eq!(s.user_lang_pref(A).unwrap(), LangPref::Auto);
+    assert_eq!(s.session_get(&[7; 32]).unwrap().unwrap().user_id, A);
+    s.set_user_lang_pref(A, LangPref::En).unwrap();
+    drop(s);
+    // Reopening migrates nothing and keeps the value.
+    let s = SqliteStore::open(&path).unwrap();
+    assert_eq!(s.user_lang_pref(A).unwrap(), LangPref::En);
+}
+
+#[test]
+fn a_failed_v4_step_leaves_the_database_at_v3() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.db");
+    v1_db_with_rows(&path);
+    let c = rusqlite::Connection::open(&path).unwrap();
+    super::migrate::migrate(&c, 1, 3).unwrap();
+    // The column already exists, so the v3 -> v4 step fails inside its transaction.
+    c.execute_batch("ALTER TABLE users ADD COLUMN lang_pref TEXT;")
+        .unwrap();
+    assert!(matches!(
+        super::migrate::migrate(&c, 3, 4),
+        Err(StoreError::Migration { from: 3, to: 4 })
+    ));
+    let v: u32 = c
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 3);
+}
+
+/// A value the column should never hold reads as `auto`.
+#[test]
+fn a_garbled_lang_pref_reads_as_auto() {
+    let s = SqliteStore::open_in_memory().unwrap();
+    with_users(&s);
+    s.raw()
+        .execute("UPDATE users SET lang_pref = 'fr' WHERE user_id = ?1", [A])
+        .unwrap();
+    assert_eq!(s.user_lang_pref(A).unwrap(), LangPref::Auto);
 }
 
 /// M13 merge: retention removes the user's OAuth state and export jobs with the rest.

@@ -1,35 +1,25 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useText } from '../shared/i18n/context';
+import type { Dict } from '../shared/i18n';
+import { useLang } from '../shared/i18n/context';
+import { en } from '../shared/i18n/dict';
+import { formatBytes, formatTimestamp } from '../shared/i18n/format';
 
 import { on } from '../shared/ipc/events';
 import { runningKill, runningList } from '../shared/ipc/invoke';
 import type { KillAnswer, RunningScriptView } from '../shared/ipc/types';
-import { RUNNING_TEXT as T, WINDOW_TITLES } from '../shared/strings';
 import { AgentText } from '../shared/text/AgentText';
 import { unusual } from '../shared/text/unusual';
 
 type Notice = KillAnswer['answer'] | 'kill_failed';
 
 /** Elapsed time as text, from Rust's whole milliseconds (formatting only, nothing is computed). */
-function elapsedText(ms: number): string {
+function elapsedText(ms: number, t: Dict = en): string {
   const total = Math.floor(ms / 1000);
-  if (total < 60) return T.elapsed.seconds(total);
+  if (total < 60) return t.running.elapsed.seconds(total);
   const minutes = Math.floor(total / 60);
-  if (minutes < 60) return T.elapsed.minutes(minutes, total % 60);
-  return T.elapsed.hours(Math.floor(minutes / 60), minutes % 60);
-}
-
-/** A byte count as text (binary units, one decimal above 1 KiB). */
-function bytesText(n: number): string {
-  const units = ['KiB', 'MiB', 'GiB', 'TiB'];
-  if (n < 1024) return `${n} B`;
-  let value = n / 1024;
-  let unit = 0;
-  // Choose the unit after rounding: 1048575 B is "1.0 MiB", never "1024.0 KiB".
-  while (Math.round(value * 10) >= 10240 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return `${value.toFixed(1)} ${units[unit]}`;
+  if (minutes < 60) return t.running.elapsed.minutes(minutes, total % 60);
+  return t.running.elapsed.hours(Math.floor(minutes / 60), minutes % 60);
 }
 
 /**
@@ -46,6 +36,8 @@ function bytesText(n: number): string {
  * nodes.
  */
 export function Running() {
+  const t = useText();
+  const lang = useLang();
   const [rows, setRows] = useState<RunningScriptView[] | null>(null);
   const [failed, setFailed] = useState(false);
   const [killing, setKilling] = useState<string | null>(null);
@@ -143,16 +135,16 @@ export function Running() {
   if (rows === null) {
     return (
       <main className="window window-running">
-        <h1>{WINDOW_TITLES.running_scripts}</h1>
+        <h1>{t.approvals.window_titles.running_scripts}</h1>
         {failed ? (
           <p role="alert">
-            {T.load_failed}{' '}
+            {t.running.load_failed}{' '}
             <button type="button" onClick={reload}>
-              {T.retry}
+              {t.running.retry}
             </button>
           </p>
         ) : (
-          <p role="status">{T.loading}</p>
+          <p role="status">{t.running.loading}</p>
         )}
       </main>
     );
@@ -160,35 +152,35 @@ export function Running() {
 
   return (
     <main className="window window-running">
-      <h1>{WINDOW_TITLES.running_scripts}</h1>
+      <h1>{t.approvals.window_titles.running_scripts}</h1>
       {failed ? (
         <p role="alert">
-          {T.load_failed}{' '}
+          {t.running.load_failed}{' '}
           <button type="button" onClick={reload}>
-            {T.retry}
+            {t.running.retry}
           </button>
         </p>
       ) : null}
       {notice === null ? null : (
         <p role={notice === 'kill_failed' ? 'alert' : 'status'}>
-          {notice === 'kill_failed' ? T.kill_failed : T.kill_answer[notice]}
+          {notice === 'kill_failed' ? t.running.kill_failed : t.running.kill_answer[notice]}
         </p>
       )}
       {rows.length === 0 ? (
-        <p className="empty-state">{T.empty}</p>
+        <p className="empty-state">{t.running.empty}</p>
       ) : (
-        <table aria-label={T.list_label}>
+        <table aria-label={t.running.list_label}>
           <thead>
             <tr>
-              <th scope="col">{T.col_request}</th>
-              <th scope="col">{T.col_agent}</th>
-              <th scope="col">{T.col_instances}</th>
-              <th scope="col">{T.col_started}</th>
-              <th scope="col">{T.col_elapsed}</th>
-              <th scope="col">{T.col_calls}</th>
-              <th scope="col">{T.col_bytes}</th>
+              <th scope="col">{t.running.col_request}</th>
+              <th scope="col">{t.running.col_agent}</th>
+              <th scope="col">{t.running.col_instances}</th>
+              <th scope="col">{t.running.col_started}</th>
+              <th scope="col">{t.running.col_elapsed}</th>
+              <th scope="col">{t.running.col_calls}</th>
+              <th scope="col">{t.running.col_bytes}</th>
               <th scope="col">
-                <span className="visually-hidden">{T.col_actions}</span>
+                <span className="visually-hidden">{t.running.col_actions}</span>
               </th>
             </tr>
           </thead>
@@ -200,26 +192,26 @@ export function Running() {
                 </td>
                 <td>
                   {r.agent_name === null ? (
-                    T.no_agent
+                    t.running.no_agent
                   ) : (
                     <AgentText value={r.agent_name} unusual={unusual(r.agent_name)} />
                   )}
                 </td>
-                <td>{r.instances.length === 0 ? T.no_instances : r.instances.join(', ')}</td>
-                <td>{r.started_at}</td>
-                <td>{elapsedText(r.elapsed_ms)}</td>
+                <td>{r.instances.length === 0 ? t.running.no_instances : r.instances.join(', ')}</td>
+                <td>{formatTimestamp(lang, r.started_at)}</td>
+                <td>{elapsedText(r.elapsed_ms, t)}</td>
                 <td>{r.host_calls}</td>
-                <td>{bytesText(r.bytes_fetched)}</td>
+                <td>{formatBytes(lang, r.bytes_fetched, { table: true })}</td>
                 <td>
                   <button
                     type="button"
                     className="danger"
-                    aria-label={T.kill_label(r.request_id)}
+                    aria-label={t.running.kill_label(r.request_id)}
                     disabled={killing !== null}
                     aria-busy={killing === r.request_id}
                     onClick={() => kill(r.request_id)}
                   >
-                    {killing === r.request_id ? T.killing : T.kill}
+                    {killing === r.request_id ? t.running.killing : t.running.kill}
                   </button>
                 </td>
               </tr>

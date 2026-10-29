@@ -52,6 +52,10 @@ ui:
     - cd app/ui
     - npm ci --ignore-scripts
     - npm run lint
+    # M15 T11: the German dictionary and the control-byte check (the node tests of both run in
+    # node:ci-checks with the other ci/*.test.mjs).
+    - node ../../ci/check-i18n.mjs
+    - node ../../ci/check-control-bytes.mjs
     - npm test -- --pool=forks --maxWorkers=2
     - npm run test:scripts
     - npm run build

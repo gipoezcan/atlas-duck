@@ -4,6 +4,7 @@ pub mod diff;
 pub mod form;
 pub mod invisible;
 mod json_tree;
+pub mod lang;
 pub mod mixed_script;
 mod model;
 pub mod render;
@@ -11,6 +12,7 @@ mod sanitize;
 pub mod warning;
 
 pub use json_tree::{JSON_STRING_COLLAPSE_BYTES, JsonNode, json_tree};
+pub use lang::Lang;
 pub use model::{
     BodyView, CandidateRev, CommentView, ConfluenceComment, ConstructList, ConversionFacts,
     DenyOffer, DenyOfferKind, ERROR_TEXT_CAP_BYTES, FieldRow, IssueCard, ItemCount, OutcomeKind,

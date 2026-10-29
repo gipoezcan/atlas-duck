@@ -415,7 +415,7 @@ describe('batch approve and release', () => {
   });
 
   it('null_option_fields_render_and_batch', () => {
-    const nulls = row('req_n', { agent_name: null, reason_excerpt: null, session_label: '(no agent name) · dir' });
+    const nulls = row('req_n', { agent_name: null, reason_excerpt: null, session_agent_name: null, session_cwd: 'dir' });
     view([nulls], [nulls]);
     confirmation(1);
     expect(screen.getByRole('group', { name: 'Confirm batch decision' }).textContent).toContain('T-req_n');
@@ -425,7 +425,8 @@ describe('batch approve and release', () => {
     const hostile = row('req_h', {
       target_display: '<img src=x onerror=alert(1)>',
       op_id: '<script>x</script>',
-      session_label: '<b>label</b> · <i>dir</i>',
+      session_agent_name: '<b>label</b>',
+      session_cwd: '<i>dir</i>',
     });
     const { container } = view([hostile], [hostile]);
     confirmation(1);

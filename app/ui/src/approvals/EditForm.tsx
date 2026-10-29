@@ -4,9 +4,11 @@ import { AgentText } from '../shared/text/AgentText';
 import { own } from '../shared/text/own';
 import { unusual } from '../shared/text/unusual';
 import type { EditForm as EditFormModel, EditInput } from '../shared/ipc/types';
-import { EDIT_TEXT } from '../shared/strings';
 import { JsonFallback, readJson } from './JsonFallback';
 import { EDIT_ENTRY_ATTR } from './keyboard';
+import { useText } from '../shared/i18n/context';
+import { en } from '../shared/i18n/dict';
+import type { Dict } from '../shared/i18n';
 
 /** What the user typed into one input; which fields count depends on the input's kind. */
 export interface Draft {
@@ -61,7 +63,7 @@ const DECIMAL = /^-?\d+(\.\d+)?([eE][+-]?\d+)?$/;
  * is checked only far enough to build a JSON value (a number, a JSON text); whether the edit is
  * acceptable is Rust's decision (spec 2.4).
  */
-export function buildEdits(form: EditFormModel, drafts: Drafts): BuiltEdits {
+export function buildEdits(form: EditFormModel, drafts: Drafts, t: Dict = en): BuiltEdits {
   const set: [string, unknown][] = [];
   const remove: string[] = [];
   // No prototype: a path such as `__proto__` is a key like any other.
@@ -76,7 +78,7 @@ export function buildEdits(form: EditFormModel, drafts: Drafts): BuiltEdits {
     };
     const readJsonInto = (text: string) => {
       const read = readJson(text);
-      if (!read.ok) errors[input.path] = EDIT_TEXT.json_invalid;
+      if (!read.ok) errors[input.path] = t.approvals.edit.json_invalid;
       else if (read.value === null) {
         if (input.value !== null) remove.push(input.path);
       } else setIfChanged(read.value);
@@ -109,12 +111,12 @@ export function buildEdits(form: EditFormModel, drafts: Drafts): BuiltEdits {
       case 'integer':
         if (INTEGER.test(d.text) && Number.isSafeInteger(Number(d.text))) {
           setIfChanged(Number(d.text));
-        } else errors[input.path] = EDIT_TEXT.integer_invalid;
+        } else errors[input.path] = t.approvals.edit.integer_invalid;
         break;
       case 'number':
         if (DECIMAL.test(d.text) && Number.isFinite(Number(d.text))) {
           setIfChanged(Number(d.text));
-        } else errors[input.path] = EDIT_TEXT.number_invalid;
+        } else errors[input.path] = t.approvals.edit.number_invalid;
         break;
       case 'json': {
         // Blank text is a clear of the original value, or no change when there was none.
@@ -172,8 +174,9 @@ interface EditFormProps {
  * text is only ever a control's value or inside `AgentText`; nothing here is markup.
  */
 export function EditForm({ form, drafts, onDraft, onReset, onSubmit, canSubmit, rejection }: EditFormProps) {
+  const t = useText();
   const base = useId();
-  const built = buildEdits(form, drafts);
+  const built = buildEdits(form, drafts, t);
   const hasErrors = Object.keys(built.errors).length > 0 || built.oversize;
   const own = form.inputs.filter((i) => !i.pre_added);
   const added = form.inputs.filter((i) => i.pre_added);
@@ -185,8 +188,8 @@ export function EditForm({ form, drafts, onDraft, onReset, onSubmit, canSubmit, 
     const set = (patch: Partial<Draft>) => onDraft(input.path, { ...d, ...patch });
     const marks = (
       <>
-        {input.required ? <span className="required"> ({EDIT_TEXT.required})</span> : null}
-        {input.read_only ? <span className="read-only"> ({EDIT_TEXT.read_only})</span> : null}
+        {input.required ? <span className="required"> ({t.approvals.edit.required})</span> : null}
+        {input.read_only ? <span className="read-only"> ({t.approvals.edit.read_only})</span> : null}
       </>
     );
     const entry = { [EDIT_ENTRY_ATTR]: '' };
@@ -212,7 +215,7 @@ export function EditForm({ form, drafts, onDraft, onReset, onSubmit, canSubmit, 
             {marks}
           </span>{' '}
           {input.value === null || text === undefined ? (
-            <span className="none">{EDIT_TEXT.none}</span>
+            <span className="none">{t.approvals.edit.none}</span>
           ) : (
             <AgentText value={text} unusual={unusual(text)} />
           )}
@@ -260,7 +263,7 @@ export function EditForm({ form, drafts, onDraft, onReset, onSubmit, canSubmit, 
           aria-describedby={hintId}
           onChange={(e) => set({ text: e.target.value })}
         >
-          <option value="">{EDIT_TEXT.choice_none}</option>
+          <option value="">{t.approvals.edit.choice_none}</option>
           {kind.allowed_values.map((label, i) => (
             <option key={`${i}-${label}`} value={label}>
               {label}
@@ -326,39 +329,39 @@ export function EditForm({ form, drafts, onDraft, onReset, onSubmit, canSubmit, 
   };
 
   return (
-    <section className="edit-form" aria-label={EDIT_TEXT.label}>
-      <p>{EDIT_TEXT.intro}</p>
-      <p className="field-keys">{EDIT_TEXT.keys}</p>
+    <section className="edit-form" aria-label={t.approvals.edit.label}>
+      <p>{t.approvals.edit.intro}</p>
+      <p className="field-keys">{t.approvals.edit.keys}</p>
       <fieldset>
-        <legend>{EDIT_TEXT.params}</legend>
+        <legend>{t.approvals.edit.params}</legend>
         {own.map((input, n) => field(input, n))}
       </fieldset>
       {added.length === 0 ? null : (
         <fieldset className="missing-fields">
-          <legend>{EDIT_TEXT.missing}</legend>
+          <legend>{t.approvals.edit.missing}</legend>
           {added.map((input, n) => field(input, own.length + n))}
         </fieldset>
       )}
       {rejection === null ? null : (
         <p role="alert" className="edit-rejected">
           {rejection === '' ? (
-            EDIT_TEXT.rejected_plain
+            t.approvals.edit.rejected_plain
           ) : (
             <>
-              {EDIT_TEXT.rejected} <AgentText value={rejection} />
+              {t.approvals.edit.rejected} <AgentText value={rejection} />
             </>
           )}
         </p>
       )}
       <div className="edit-actions">
         <button type="button" {...{ [EDIT_ENTRY_ATTR]: '' }} disabled={!canSubmit || !built.changed || hasErrors} onClick={onSubmit}>
-          {EDIT_TEXT.submit}
+          {t.approvals.edit.submit}
         </button>
         <button type="button" {...{ [EDIT_ENTRY_ATTR]: '' }} disabled={!built.changed} onClick={onReset}>
-          {EDIT_TEXT.reset}
+          {t.approvals.edit.reset}
         </button>
         <span className="field-hint" aria-live="polite">
-          {built.oversize ? EDIT_TEXT.too_large : built.changed ? '' : EDIT_TEXT.nothing_to_send}
+          {built.oversize ? t.approvals.edit.too_large : built.changed ? '' : t.approvals.edit.nothing_to_send}
         </span>
       </div>
     </section>
@@ -366,10 +369,11 @@ export function EditForm({ form, drafts, onDraft, onReset, onSubmit, canSubmit, 
 }
 
 function AsJson({ id, label, on, onChange }: { id: string; label: string; on: boolean; onChange: (on: boolean) => void }) {
+  const t = useText();
   return (
     <label className="as-json" htmlFor={id}>
       <input id={id} type="checkbox" {...{ [EDIT_ENTRY_ATTR]: '' }} checked={on} onChange={(e) => onChange(e.target.checked)} />{' '}
-      {EDIT_TEXT.as_json(label)}
+      {t.approvals.edit.as_json(label)}
     </label>
   );
 }

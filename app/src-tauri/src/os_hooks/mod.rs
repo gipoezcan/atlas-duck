@@ -138,6 +138,10 @@ pub trait ShutdownPort: Send + Sync {
     /// True while a write request is on the wire (§2.5 step 4): the one thing the hooks hold the
     /// OS back for.
     fn write_in_flight(&self) -> bool;
+    /// M15 T10: the language of the text the OS shows for the block (English by default).
+    fn lang(&self) -> crate::i18n::Lang {
+        crate::i18n::Lang::En
+    }
 }
 
 /// An action run at the end of the path, before the exit (a hook releasing its OS block).
@@ -368,6 +372,10 @@ impl<R: Runtime> AppPort<R> {
 }
 
 impl<R: Runtime> ShutdownPort for AppPort<R> {
+    fn lang(&self) -> crate::i18n::Lang {
+        crate::windows::ui_lang(&self.app)
+    }
+
     fn begin(&self, reason: ShutdownReason) -> ShutdownTicket {
         serve::shutdown_then_exit(&self.app, reason)
     }

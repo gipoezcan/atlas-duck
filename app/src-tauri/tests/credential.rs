@@ -544,7 +544,9 @@ fn credential_context_is_rust_fixed() -> TestResult {
     credential::open_for_pat(handle, &views, "A", false)?;
     let w = window(&app, "credential")?;
     let context = json!({"purpose": "add_pat", "alias": "A", "product": "jira", "base_url": a,
-        "refused_count": null, "product_version_hint": null, "note_available": false});
+        "refused_count": null, "product_version_hint": null, "note_available": false,
+        // M15 T7: the language Rust sends; English without an `AppState` (this harness).
+        "lang": "en"});
     assert_eq!(
         invoke(&w, "credential_context", json!({})),
         Ok(context.clone())
@@ -571,7 +573,23 @@ fn credential_context_is_rust_fixed() -> TestResult {
     );
     // The same purpose again only shows the window.
     credential::open_for_pat(handle, &views, "A", false)?;
-    assert_eq!(invoke(&w, "credential_context", json!({})), Ok(context));
+    assert_eq!(
+        invoke(&w, "credential_context", json!({})),
+        Ok(context.clone())
+    );
+    // M15 T7 (PD-297): with an `AppState` the page gets the app's UI language.
+    let state = atlas_duck_app_lib::state::AppState::new(
+        atlas_duck_app_lib::state::StartupSummary::Ready,
+        None,
+    );
+    state.set_ui_lang(atlas_duck_app_lib::state::UiLang {
+        pref: atlas_duck_app_lib::i18n::LangPref::De,
+        lang: atlas_duck_app_lib::i18n::Lang::De,
+    });
+    app.manage(state);
+    let mut german = context;
+    german["lang"] = json!("de");
+    assert_eq!(invoke(&w, "credential_context", json!({})), Ok(german));
     // No argument can name another alias.
     assert_eq!(
         invoke(&w, "credential_context", json!({"alias": "B"})),
@@ -1930,11 +1948,11 @@ async fn a_failed_retry_is_a_failed_store_the_relaunch_says_so() -> TestResult {
     assert_eq!(state.gate_state(), Some(GateState::StoreFailed));
     assert_eq!(
         status_lines(&snapshot, &StatusInputs::default()),
-        vec![MSG_STORE_UNAVAILABLE.to_owned()]
+        vec![MSG_STORE_UNAVAILABLE.en.to_owned()]
     );
     assert_eq!(
         route_relaunch(&snapshot, &[std::ffi::OsString::from("atlas-duck")]),
-        Relaunch::ShowErrorDialog(MSG_STORE_UNAVAILABLE.into())
+        Relaunch::ShowErrorDialog(MSG_STORE_UNAVAILABLE.en.into())
     );
     assert_eq!(retry_keychain_now(&state), RetryNow::NotLocked);
     stop(&state).await

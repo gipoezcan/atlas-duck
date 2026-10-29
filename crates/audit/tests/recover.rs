@@ -36,6 +36,7 @@ const INSTANCES: [&str; 2] = ["i1", "i2"];
 fn confirmed() -> Confirmed {
     Confirmed {
         dialog_text_sha256: [7; 32],
+        dialog_lang: None,
     }
 }
 

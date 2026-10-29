@@ -6,7 +6,9 @@ import { on } from '../../shared/ipc/events';
 import { appStatus, previewFetch, queueList, recentList } from '../../shared/ipc/invoke';
 import type { QueueItem } from '../../shared/ipc/types';
 import { loadSession } from '../../shared/ipc/transport-http';
-import { NOTIFY_TEXT, type NotifyEnv } from './notify';
+import { LangProvider } from '../../shared/i18n/context';
+import { en } from '../../shared/i18n/dict';
+import type { NotifyEnv } from './notify';
 import { ServerApprovals } from './ServerApprovals';
 
 vi.mock('../../shared/ipc/invoke', () => ({
@@ -78,9 +80,30 @@ describe('ServerApprovals', () => {
     render(<ServerApprovals item={null} env={quietEnv(request)} />);
     await flush();
     expect(request).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: NOTIFY_TEXT.enable }));
+    fireEvent.click(screen.getByRole('button', { name: en.server.approvals.enable }));
     await flush();
     expect(request).toHaveBeenCalledTimes(1);
-    expect(screen.getByText(NOTIFY_TEXT.enabled)).toBeTruthy();
+    expect(screen.getByText(en.server.approvals.enabled)).toBeTruthy();
+  });
+
+  it('the_notification_button_in_german_for_every_permission', async () => {
+    const envWith = (permission: NotificationPermission): NotifyEnv => ({ ...quietEnv(), permission: () => permission });
+    const german = (permission: NotificationPermission) =>
+      render(
+        <LangProvider lang="de">
+          <ServerApprovals item={null} env={envWith(permission)} />
+        </LangProvider>,
+      );
+    const first = german('default');
+    await flush();
+    expect(screen.getByRole('button', { name: 'Benachrichtigungen aktivieren' })).toBeTruthy();
+    first.unmount();
+    const second = german('granted');
+    await flush();
+    expect(screen.getByText('Benachrichtigungen sind aktiv.')).toBeTruthy();
+    second.unmount();
+    german('denied');
+    await flush();
+    expect(screen.getByText('Benachrichtigungen sind in diesem Browser blockiert.')).toBeTruthy();
   });
 });

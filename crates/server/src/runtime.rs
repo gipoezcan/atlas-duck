@@ -168,6 +168,7 @@ fn apply_instance_settings(store: &Store, deps: &RuntimeDeps) -> Result<(), Runt
             b"atlas-duck server: admin-defined instance",
         ))
         .into(),
+        dialog_lang: None,
     };
     let list = deps
         .store

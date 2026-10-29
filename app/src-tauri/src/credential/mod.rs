@@ -36,6 +36,7 @@ use secrecy::{ExposeSecret, SecretString};
 use tauri::{AppHandle, Manager, Runtime};
 use tokio::sync::oneshot;
 
+use crate::i18n::Lang;
 use crate::ui_sink::{EventOut, emit_wizard_changed, wire};
 use crate::windows::{self, Label, Show, Unlock, WindowError, WindowRegistry};
 
@@ -46,6 +47,18 @@ pub use atlas_duck_audit::MIN_PASSPHRASE_CHARS;
 /// §8.6 (verbatim): the one fixed line that states the recovery passphrase's purpose, shown at
 /// entry and printed at the top of the recovery note.
 pub const PASSPHRASE_PURPOSE: &str = "Unlocks and restores the audit log (after a keychain loss, from a backup, or on a new machine). Stored tokens are never recovered (from a backup or after a keychain loss); you re-enter them. It is not your Atlassian password. Store it where your compliance owner can retrieve it.";
+
+/// M15 T7 (PD-297): the German purpose line; the page's own table (`credential/i18n.ts`) holds
+/// the same literal.
+pub const PASSPHRASE_PURPOSE_DE: &str = "Die Passphrase entsperrt das Audit-Protokoll und stellt es wieder her (nach einem Verlust des Schlüsselbunds, aus einem Backup oder auf einem neuen Computer). Gespeicherte Token werden nie wiederhergestellt (weder aus einem Backup noch nach einem Verlust des Schlüsselbunds); Sie geben sie erneut ein. Die Passphrase ist nicht Ihr Atlassian-Passwort. Bewahren Sie sie so auf, dass Ihr Compliance-Verantwortlicher sie abrufen kann.";
+
+/// The purpose line in `lang`.
+pub fn passphrase_purpose(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => PASSPHRASE_PURPOSE,
+        Lang::De => PASSPHRASE_PURPOSE_DE,
+    }
+}
 
 /// The PAT a credential window takes: the instance as Rust read it when it opened the window.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -707,16 +720,47 @@ After an interrupted restore the window offers \"Finish restore\": enter the rec
 To move to a new machine, or to go back to a backup: restore the full backup in atlas-duck and enter that backup's recovery passphrase. Tokens are never restored; enter them again.
 Without the passphrase the only way on is \"Archive old DB and start fresh\": the old log is moved to the archived folder of the data directory, never deleted. Keep it for its retention period; it can be read later only with this passphrase.";
 
+/// M15 T7: the German note. The button names are the credential page's German labels.
+const NOTE_TITLE_DE: &str = "atlas-duck Wiederherstellungsnotiz";
+const NOTE_STEPS_DE: &str = "\
+Geht der Schlüsselbund dieses Computers verloren (Passwort zurückgesetzt, Profil gelöscht, Neuinstallation), startet atlas-duck gesperrt und das Anmeldedatenfenster bietet „Dieses Protokoll wiederherstellen“ an: Geben Sie die Wiederherstellungs-Passphrase ein. Das Protokoll wird geprüft, ein Integritätsvorfall wird aufgezeichnet (er muss zur Kenntnis genommen werden), und jedes gespeicherte Token muss erneut eingegeben werden.
+Nach einer unterbrochenen Wiederherstellung bietet das Fenster „Wiederherstellung abschließen“ an: Geben Sie die Wiederherstellungs-Passphrase des wiederhergestellten Backups ein.
+Für einen neuen Computer oder die Rückkehr zu einem Backup: Stellen Sie das Vollbackup in atlas-duck wieder her und geben Sie die Wiederherstellungs-Passphrase dieses Backups ein. Token werden nie wiederhergestellt; geben Sie sie erneut ein.
+Ohne die Passphrase bleibt nur „Alte DB archivieren und neu beginnen“: Das alte Protokoll wird in den Archivordner des Datenverzeichnisses verschoben, nie gelöscht. Bewahren Sie es für seine Aufbewahrungsfrist auf; es ist später nur mit dieser Passphrase lesbar.";
+
 /// The recovery note (§8.6): the purpose line, host, OS user, `install_id`, `chain_id`, the data
 /// directory, the recovery and restore steps, and a blank line to write the passphrase on by
-/// hand. It never contains the passphrase: this function cannot be given one.
-pub fn note_text(f: &NoteFacts) -> String {
+/// hand, in `lang` (M15 T7; the field names `install_id` and `chain_id` stay as they are). It
+/// never contains the passphrase: this function cannot be given one.
+pub fn note_text(f: &NoteFacts, lang: Lang) -> String {
+    let (title, steps, host, user, data, blank) = match lang {
+        Lang::En => (
+            NOTE_TITLE,
+            NOTE_STEPS,
+            "Host",
+            "OS user",
+            "Data directory",
+            "Recovery passphrase (write it here by hand)",
+        ),
+        Lang::De => (
+            NOTE_TITLE_DE,
+            NOTE_STEPS_DE,
+            "Host",
+            "Betriebssystem-Benutzer",
+            "Datenverzeichnis",
+            "Wiederherstellungs-Passphrase (hier von Hand eintragen)",
+        ),
+    };
     format!(
-        "{NOTE_TITLE}\n\n{PASSPHRASE_PURPOSE}\n\nHost: {}\nOS user: {}\ninstall_id: {}\nchain_id: {}\nData directory: {}\n\n{NOTE_STEPS}\n\nRecovery passphrase (write it here by hand):\n\n________________________________________\n",
-        f.host, f.os_user, f.install_id, f.chain_id, f.data_dir
+        "{title}\n\n{}\n\n{host}: {}\n{user}: {}\ninstall_id: {}\nchain_id: {}\n{data}: {}\n\n{steps}\n\n{blank}:\n\n________________________________________\n",
+        passphrase_purpose(lang),
+        f.host,
+        f.os_user,
+        f.install_id,
+        f.chain_id,
+        f.data_dir
     )
 }
-
 /// The OS user the note names (best effort; never fails).
 pub fn os_user() -> String {
     ["USERNAME", "USER", "LOGNAME"]
@@ -878,7 +922,7 @@ mod tests {
             chain_id: "fedcba9876543210fedcba9876543210".into(),
             data_dir: "/home/alice/.local/share/atlas-duck".into(),
         };
-        let text = note_text(&f);
+        let text = note_text(&f, Lang::En);
         assert!(text.contains(PASSPHRASE_PURPOSE));
         for v in [&f.host, &f.os_user, &f.install_id, &f.chain_id, &f.data_dir] {
             assert!(text.contains(v.as_str()), "{v}");
@@ -886,5 +930,71 @@ mod tests {
         assert!(text.contains("Recover this log") && text.contains("Finish restore"));
         assert!(text.ends_with("Recovery passphrase (write it here by hand):\n\n________________________________________\n"));
         assert!(PASSPHRASE_PURPOSE.starts_with("Unlocks and restores the audit log"));
+        // M15 T7: the German note carries the German purpose and labels, the same facts and the
+        // same blank line.
+        let de = note_text(&f, Lang::De);
+        assert!(de.starts_with("atlas-duck Wiederherstellungsnotiz\n\n"));
+        assert!(de.contains(PASSPHRASE_PURPOSE_DE));
+        assert!(!de.contains(PASSPHRASE_PURPOSE));
+        for v in [&f.host, &f.os_user, &f.install_id, &f.chain_id, &f.data_dir] {
+            assert!(de.contains(v.as_str()), "{v}");
+        }
+        assert!(de.contains("Dieses Protokoll wiederherstellen"));
+        assert!(
+            de.ends_with(
+                "(hier von Hand eintragen):\n\n________________________________________\n"
+            )
+        );
+    }
+
+    /// M15 T7 (PD-297): the purpose texts, pinned in both languages.
+    #[test]
+    fn passphrase_purpose_texts_pinned() {
+        assert_eq!(passphrase_purpose(Lang::En), PASSPHRASE_PURPOSE);
+        assert_eq!(passphrase_purpose(Lang::De), PASSPHRASE_PURPOSE_DE);
+        assert!(PASSPHRASE_PURPOSE_DE.starts_with("Die Passphrase entsperrt das Audit-Protokoll"));
+        assert_ne!(PASSPHRASE_PURPOSE, PASSPHRASE_PURPOSE_DE);
+    }
+
+    /// M15 T7 review m-5: the note's steps name the page's buttons and titles. Each of the three in
+    /// both languages is one literal in the page's table and is quoted verbatim in the note.
+    #[test]
+    fn note_steps_name_the_pages_labels_in_both_languages() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/src/credential/i18n.ts");
+        let page = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(!page.is_empty(), "{}", path.display());
+        let labels = [
+            ("Recover this log", "Dieses Protokoll wiederherstellen"),
+            ("Finish restore", "Wiederherstellung abschließen"),
+            (
+                "Archive old DB and start fresh",
+                "Alte DB archivieren und neu beginnen",
+            ),
+        ];
+        for (en, de) in labels {
+            for label in [en, de] {
+                assert!(
+                    page.contains(&format!("'{label}'")),
+                    "the page has no {label:?}"
+                );
+            }
+            assert!(NOTE_STEPS.contains(&format!("\"{en}\"")), "{en}");
+            assert!(NOTE_STEPS_DE.contains(&format!("„{de}“")), "{de}");
+        }
+    }
+
+    /// M15 T7: the credential page's table holds each purpose line as one literal, verbatim (PD-71:
+    /// the page imports nothing, so the two copies are compared here).
+    #[test]
+    fn passphrase_purpose_matches_the_page_in_both_languages() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/src/credential/i18n.ts");
+        let page = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(!page.is_empty(), "{}", path.display());
+        for lang in [Lang::En, Lang::De] {
+            let literal = format!("'{}'", passphrase_purpose(lang));
+            assert!(page.contains(&literal), "{lang:?}: the page's line differs");
+        }
     }
 }

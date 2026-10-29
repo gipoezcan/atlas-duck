@@ -3600,17 +3600,20 @@ async fn bidi_counts_cover_source_provenance_logs_and_stderr() -> TestResult {
     // The source: two bidi controls.
     assert_eq!(
         invisible_counts(&previews[0]),
-        ((2, 0), vec![bidi_controls(2)])
+        ((2, 0), vec![bidi_controls(2).to_string()])
     );
     // A result's log and stderr, read from its record.
     assert_eq!(
         invisible_counts(&previews[1]),
-        ((1, 1), vec![bidi_controls(1), other_invisible(1)])
+        (
+            (1, 1),
+            vec![bidi_controls(1).to_string(), other_invisible(1).to_string()]
+        )
     );
     // An error item's log: in its candidate and in atlas.log, counted once.
     assert_eq!(
         invisible_counts(&previews[2]),
-        ((1, 0), vec![bidi_controls(1)])
+        ((1, 0), vec![bidi_controls(1).to_string()])
     );
     // The provenance row's target.
     let b = script_body(&previews[3])?;
@@ -3623,7 +3626,7 @@ async fn bidi_counts_cover_source_provenance_logs_and_stderr() -> TestResult {
     );
     assert_eq!(
         invisible_counts(&previews[3]),
-        ((0, 1), vec![other_invisible(1)])
+        ((0, 1), vec![other_invisible(1).to_string()])
     );
     Ok(())
 }
@@ -5076,7 +5079,7 @@ async fn result_output_bidi_raises_the_queue_count_and_the_batch_line() -> TestR
         .map_err(de)?;
     let texts = h.confirmer().texts();
     assert_eq!(texts.len(), 1);
-    assert!(texts[0].contains(&bidi_controls(1)), "{}", texts[0]);
+    assert!(texts[0].contains(bidi_controls(1).as_str()), "{}", texts[0]);
     Ok(())
 }
 

@@ -1,9 +1,9 @@
 import { useRef, useState } from 'react';
+import { useText } from '../shared/i18n/context';
 
 import { Announce, type Said, say } from '../audit/text';
 import { anchorDirRemove, anchorDirSet, reAnchor } from '../shared/ipc/invoke';
 import type { SettingsView } from '../shared/ipc/types';
-import { AUDIT_TEXT, RECOVERY_TEXT as T } from '../shared/strings';
 import { Cfg, errorText, own } from './text';
 import { useAction } from './useAction';
 
@@ -25,11 +25,12 @@ interface Props {
  * so a read-only config does not turn these controls off.
  */
 export function AnchorDir({ view, onChanged }: Props) {
+  const t = useText();
   const action = useAction();
   const [said, setSaid] = useState<Said | null>(null);
   const heading = useRef<HTMLHeadingElement>(null);
   const { health } = view;
-  const failure = (e: unknown) => setSaid(say('alert', errorText(e)));
+  const failure = (e: unknown) => setSaid(say('alert', errorText(e, t)));
 
   const change = (remove: boolean) => {
     setSaid(null);
@@ -37,7 +38,7 @@ export function AnchorDir({ view, onChanged }: Props) {
       .run(() => (remove ? anchorDirRemove() : anchorDirSet()), failure)
       .then((a) => {
         if (a === undefined) return;
-        setSaid(say('status', a.anchor_dir === null ? T.anchor_dir_removed : T.anchor_dir_changed));
+        setSaid(say('status', a.anchor_dir === null ? t.settings.recovery.anchor_dir_removed : t.settings.recovery.anchor_dir_changed));
         onChanged();
       });
   };
@@ -48,46 +49,46 @@ export function AnchorDir({ view, onChanged }: Props) {
         onChanged();
         return;
       }
-      setSaid(say('status', T.reanchor_done));
+      setSaid(say('status', t.settings.recovery.reanchor_done));
       onChanged();
       // The button goes away once Rust no longer offers it: the focus stays in the section.
       heading.current?.focus();
     });
   };
 
-  const missing = health.anchors_missing === null ? null : own(T.anchors_missing, health.anchors_missing);
+  const missing = health.anchors_missing === null ? null : own(t.settings.recovery.anchors_missing, health.anchors_missing);
   return (
-    <section aria-label={T.anchor_dir}>
-      <h2>{T.anchor_dir}</h2>
+    <section aria-label={t.settings.recovery.anchor_dir}>
+      <h2>{t.settings.recovery.anchor_dir}</h2>
       <p>
-        {T.anchor_dir}: {view.anchor_dir === null ? T.anchor_dir_none : <Cfg value={view.anchor_dir} />}
+        {t.settings.recovery.anchor_dir}: {view.anchor_dir === null ? t.settings.recovery.anchor_dir_none : <Cfg value={view.anchor_dir} />}
       </p>
-      <p>{T.anchor_dir_note}</p>
+      <p>{t.settings.recovery.anchor_dir_note}</p>
       {health.anchor_dir_write_failing ? (
-        <p>{AUDIT_TEXT.anchor_dir_failing(health.anchor_dir_lines_pending)}</p>
+        <p>{t.audit.anchor_dir_failing(health.anchor_dir_lines_pending)}</p>
       ) : health.anchor_dir_lines_pending > 0 ? (
-        <p>{T.anchor_dir_pending(health.anchor_dir_lines_pending)}</p>
+        <p>{t.settings.recovery.anchor_dir_pending(health.anchor_dir_lines_pending)}</p>
       ) : null}
       <button type="button" className="primary" disabled={action.pending} onClick={() => change(false)}>
-        {view.anchor_dir === null ? T.anchor_dir_set : T.anchor_dir_change}
+        {view.anchor_dir === null ? t.settings.recovery.anchor_dir_set : t.settings.recovery.anchor_dir_change}
       </button>
       {view.anchor_dir === null ? null : (
         <>
           {' '}
           <button type="button" disabled={action.pending} onClick={() => change(true)}>
-            {T.anchor_dir_remove}
+            {t.settings.recovery.anchor_dir_remove}
           </button>
         </>
       )}
       <h3 tabIndex={-1} ref={heading}>
-        {T.reanchor_heading}
+        {t.settings.recovery.reanchor_heading}
       </h3>
       {missing === null ? null : <p>{missing}</p>}
       {health.re_anchor_offered ? (
         <>
-          <p>{T.reanchor_note}</p>
+          <p>{t.settings.recovery.reanchor_note}</p>
           <button type="button" disabled={action.pending} onClick={doReAnchor}>
-            {T.reanchor}
+            {t.settings.recovery.reanchor}
           </button>
         </>
       ) : null}

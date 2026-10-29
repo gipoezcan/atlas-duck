@@ -210,11 +210,12 @@ pub fn preview_fetch_dto(
     decisions: &dyn DecisionApi,
     request_id: &str,
     rev: Option<CandidateRev>,
+    lang: atlas_duck_preview::Lang,
 ) -> Result<PreviewFetchResponse, CommandError> {
     let delivery = decisions
         .preview_fetch(request_id, rev)
         .map_err(CommandError::from_candidate_read)?;
-    Ok(preview_fetch_response(delivery))
+    Ok(preview_fetch_response(delivery, lang))
 }
 
 /// `preview_fetch` (§5.6 "Opened"): on the blocking pool as well (a large candidate takes a
@@ -228,8 +229,9 @@ pub async fn preview_fetch<R: Runtime>(
         request_id,
         candidate_rev,
     }) = args;
+    let lang = crate::windows::ui_lang(&app).into();
     with_decisions(&app, move |d| {
-        preview_fetch_dto(d, request_id.as_str(), candidate_rev.map(|r| r.0))
+        preview_fetch_dto(d, request_id.as_str(), candidate_rev.map(|r| r.0), lang)
     })
     .await
 }

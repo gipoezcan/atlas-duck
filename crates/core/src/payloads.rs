@@ -594,7 +594,8 @@ pub fn preview_shown(
     )
 }
 
-/// `BATCH_CONFIRMED {batch_id, items: [{request_id, candidate_rev}], dialog_text_sha256}`
+/// `BATCH_CONFIRMED {batch_id, items: [{request_id, candidate_rev}], dialog_text_sha256,
+/// dialog_lang}`
 /// (`request_id` column null; `actor` is the approver). Payload only: no `batch` flag, which
 /// marks the per-item decisions that follow it.
 pub fn batch_confirmed(
@@ -602,6 +603,7 @@ pub fn batch_confirmed(
     batch_id: &str,
     items: &[(String, CandidateRev)],
     dialog_text_sha256: &[u8; 32],
+    dialog_lang: atlas_duck_audit::DialogLang,
 ) -> NewEvent {
     let items: Vec<Value> = items
         .iter()
@@ -618,6 +620,7 @@ pub fn batch_confirmed(
             "batch_id": batch_id,
             "items": items,
             "dialog_text_sha256": hex::encode(dialog_text_sha256),
+            "dialog_lang": dialog_lang.as_str(),
         }),
     )
 }

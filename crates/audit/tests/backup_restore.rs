@@ -43,6 +43,7 @@ const INSTANCES: [&str; 2] = ["i1", "i2"];
 fn confirmed() -> Confirmed {
     Confirmed {
         dialog_text_sha256: [7; 32],
+        dialog_lang: None,
     }
 }
 
@@ -2374,6 +2375,7 @@ fn committed_incomplete_handle_reads_nothing() {
 fn restore_dialog() -> Confirmed {
     Confirmed {
         dialog_text_sha256: [0x11; 32],
+        dialog_lang: None,
     }
 }
 
@@ -2381,6 +2383,7 @@ fn restore_dialog() -> Confirmed {
 fn rollback_dialog() -> Confirmed {
     Confirmed {
         dialog_text_sha256: [0x22; 32],
+        dialog_lang: None,
     }
 }
 

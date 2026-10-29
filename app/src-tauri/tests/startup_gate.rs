@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use atlas_duck_app_lib::diag::Diag;
+use atlas_duck_app_lib::i18n::Lang;
 use atlas_duck_app_lib::startup::{
     ErrorPresenter, LOG_FIELDS, MSG_DATA_DIR_NOT_FOUND, MSG_DATA_DIR_NOT_LOCAL,
     MSG_DATA_DIR_UNUSABLE, MSG_PINNED_UNREADABLE, MSG_RUNNING_ON_OTHER_HOST, StartupAction,
@@ -160,22 +161,22 @@ fn buffered_diag() -> &'static Diag {
 
 #[test]
 fn message_templates_are_the_spec_texts_and_the_plan_placeholders() {
-    assert_eq!(MSG_DATA_DIR_NOT_FOUND, "data directory <path> not found");
+    assert_eq!(MSG_DATA_DIR_NOT_FOUND.en, "data directory <path> not found");
     assert_eq!(
-        MSG_RUNNING_ON_OTHER_HOST,
+        MSG_RUNNING_ON_OTHER_HOST.en,
         "atlas-duck is running on another machine (<host>) with this data directory"
     );
     // Spec silent: plan placeholders awaiting user confirmation.
     assert_eq!(
-        MSG_DATA_DIR_NOT_LOCAL,
+        MSG_DATA_DIR_NOT_LOCAL.en,
         "data directory <path> is not on a local filesystem"
     );
     assert_eq!(
-        MSG_PINNED_UNREADABLE,
+        MSG_PINNED_UNREADABLE.en,
         "atlas-duck path settings <path> could not be read"
     );
     assert_eq!(
-        MSG_DATA_DIR_UNUSABLE,
+        MSG_DATA_DIR_UNUSABLE.en,
         "data directory <path> could not be opened"
     );
     assert_eq!(LOG_FIELDS, ["startup_state"]);
@@ -184,11 +185,11 @@ fn message_templates_are_the_spec_texts_and_the_plan_placeholders() {
 #[test]
 fn render_message_substitutes_once_and_never_rescans_the_value() {
     assert_eq!(
-        render_message(MSG_RUNNING_ON_OTHER_HOST, "otherhost"),
+        render_message(MSG_RUNNING_ON_OTHER_HOST.en, "otherhost"),
         "atlas-duck is running on another machine (otherhost) with this data directory"
     );
     assert_eq!(
-        render_message(MSG_DATA_DIR_NOT_FOUND, "/mnt/gone"),
+        render_message(MSG_DATA_DIR_NOT_FOUND.en, "/mnt/gone"),
         "data directory /mnt/gone not found"
     );
     // The value contains the other placeholder: it stays literal.
@@ -208,7 +209,7 @@ fn no_pinned_file_is_before_first_run_and_writes_nothing() {
 
     let state = home.run_gate();
     assert!(matches!(state, StartupState::BeforeFirstRun), "{state:?}");
-    let action = apply_startup_state(&state, buffered_diag(), &presenter);
+    let action = apply_startup_state(Lang::En, &state, buffered_diag(), &presenter);
 
     assert_eq!(action, StartupAction::Stay);
     assert!(presenter.shown().is_empty(), "no dialog before first run");
@@ -249,7 +250,7 @@ fn removed_pinned_data_dir_is_missing_and_nothing_is_recreated() {
         StartupState::DataDirMissing { path } => assert_eq!(path, &gone),
         other => panic!("expected DataDirMissing, got {other:?}"),
     }
-    let action = apply_startup_state(&state, buffered_diag(), &presenter);
+    let action = apply_startup_state(Lang::En, &state, buffered_diag(), &presenter);
 
     assert_eq!(action, StartupAction::Stay);
     assert_eq!(
@@ -311,7 +312,7 @@ fn unc_pinned_path_is_not_local_and_nothing_is_written() {
                 unc.display()
             ),
         }
-        let action = apply_startup_state(&state, buffered_diag(), &presenter);
+        let action = apply_startup_state(Lang::En, &state, buffered_diag(), &presenter);
 
         assert_eq!(action, StartupAction::Stay);
         assert_eq!(
@@ -343,7 +344,7 @@ fn network_mounts_are_refused_without_taking_the_lock_or_writing() {
             matches!(state, StartupState::DataDirNotLocal { .. }),
             "{var}: expected DataDirNotLocal, got {state:?}"
         );
-        let action = apply_startup_state(&state, buffered_diag(), &presenter);
+        let action = apply_startup_state(Lang::En, &state, buffered_diag(), &presenter);
 
         assert_eq!(action, StartupAction::Stay, "{var}");
         assert_eq!(presenter.shown().len(), 1, "{var}: the error is shown once");
@@ -422,7 +423,7 @@ fn corrupt_pinned_file_is_unreadable_never_before_first_run() {
             StartupState::PinnedUnreadable { path } => assert_eq!(path, &file, "{name}"),
             other => panic!("{name}: expected PinnedUnreadable, got {other:?}"),
         }
-        let action = apply_startup_state(&state, buffered_diag(), &presenter);
+        let action = apply_startup_state(Lang::En, &state, buffered_diag(), &presenter);
 
         assert_eq!(action, StartupAction::Stay, "{name}");
         assert_eq!(
@@ -499,7 +500,7 @@ fn local_pinned_dir_is_ready_and_attach_writes_the_log() {
     assert!(data_tmp.path().join(INSTANCE_LOCK_FILE).exists());
     assert_eq!(tree(data_tmp.path()), vec![INSTANCE_LOCK_FILE.to_owned()]);
 
-    let action = apply_startup_state(&state, buffered_diag(), &presenter);
+    let action = apply_startup_state(Lang::En, &state, buffered_diag(), &presenter);
 
     assert_eq!(action, StartupAction::Stay);
     assert!(presenter.shown().is_empty());
@@ -581,7 +582,7 @@ fn second_instance_is_refused_and_names_another_host_where_the_record_is_readabl
 
     let state = home.run_gate();
     let presenter = FakePresenter::default();
-    let action = apply_startup_state(&state, buffered_diag(), &presenter);
+    let action = apply_startup_state(Lang::En, &state, buffered_diag(), &presenter);
 
     assert!(
         presenter.shown().is_empty(),
@@ -601,7 +602,7 @@ fn second_instance_is_refused_and_names_another_host_where_the_record_is_readabl
             other => panic!("expected AlreadyRunning, got {other:?}"),
         }
         let text = "atlas-duck is running on another machine (otherhost) with this data directory";
-        assert_eq!(startup_message(&state).as_deref(), Some(text));
+        assert_eq!(startup_message(Lang::En, &state).as_deref(), Some(text));
         assert_eq!(
             action,
             StartupAction::Exit {
@@ -645,8 +646,8 @@ fn second_instance_on_the_same_host_exits_without_a_message() {
         StartupState::AlreadyRunning { other_host } => assert_eq!(other_host, &None),
         other => panic!("expected AlreadyRunning, got {other:?}"),
     }
-    assert_eq!(startup_message(&state), None);
-    let action = apply_startup_state(&state, buffered_diag(), &FakePresenter::default());
+    assert_eq!(startup_message(Lang::En, &state), None);
+    let action = apply_startup_state(Lang::En, &state, buffered_diag(), &FakePresenter::default());
     assert_eq!(action, StartupAction::Exit { message: None });
 }
 
@@ -670,7 +671,7 @@ fn unwritable_data_dir_is_unusable_and_stays_unchanged() {
     let presenter = FakePresenter::default();
 
     let state = home.run_gate();
-    let action = apply_startup_state(&state, buffered_diag(), &presenter);
+    let action = apply_startup_state(Lang::En, &state, buffered_diag(), &presenter);
     std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
     match &state {

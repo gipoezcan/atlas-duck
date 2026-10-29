@@ -792,7 +792,7 @@ pub(crate) struct RestoreConfirmations {
 }
 
 /// `CONFIG_CHANGED {source: app, key: restore_backup, dialog_text_sha256,
-/// rollback_dialog_text_sha256?}` (PD-168, §10.3 "logged as `CONFIG_CHANGED`"): appended to the
+/// dialog_lang?, rollback_dialog_text_sha256?, rollback_dialog_lang?}` (PD-168, §10.3 "logged as `CONFIG_CHANGED`"): appended to the
 /// restored store once the restore completed (after the KEK re-seal, so a crash before it still
 /// leaves `RESTORE` the newest record for "Finish restore").
 pub(crate) fn confirmation_event(c: &RestoreConfirmations) -> Result<PreparedEvent, AuditError> {
@@ -801,8 +801,14 @@ pub(crate) fn confirmation_event(c: &RestoreConfirmations) -> Result<PreparedEve
         "key": RESTORE_BACKUP_KEY,
         "dialog_text_sha256": hex::encode(c.restore.dialog_text_sha256),
     });
+    if let Some(lang) = c.restore.dialog_lang {
+        payload["dialog_lang"] = json!(lang.as_str());
+    }
     if let Some(r) = &c.rollback {
         payload["rollback_dialog_text_sha256"] = json!(hex::encode(r.dialog_text_sha256));
+        if let Some(lang) = r.dialog_lang {
+            payload["rollback_dialog_lang"] = json!(lang.as_str());
+        }
     }
     PreparedEvent::system(EventType::CONFIG_CHANGED, &payload)
 }

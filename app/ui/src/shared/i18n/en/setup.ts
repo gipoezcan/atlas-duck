@@ -1,5 +1,5 @@
 /** plan text (Task 24, PD-77, PD-80): the first-run wizard. Spec 2.5 fixes the order, not the words. */
-export const SETUP_TEXT = {
+export const setup = {
   loading: 'Loading the setup',
   load_failed: 'Could not load the setup',
   retry: 'Try again',
@@ -112,7 +112,7 @@ export const SETUP_TEXT = {
     committed_incomplete: 'The restore will be completed at the next start. Restart atlas-duck.',
     archive_first: 'The existing audit log cannot be moved aside, so no backup can be restored over it.',
     other: 'The step could not be completed.',
-  } as Readonly<Record<string, string>>,
+  },
   /** A refused command by error kind. */
   command_failed: 'The step could not be completed',
 } as const;

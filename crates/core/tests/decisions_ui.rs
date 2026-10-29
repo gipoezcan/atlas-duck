@@ -1576,6 +1576,8 @@ async fn session_id_stable_and_path_free() -> TestResult {
             .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
     );
     assert_eq!(one.session_label, "bot · proj");
+    assert_eq!(one.session_agent_name.as_deref(), Some("bot"));
+    assert_eq!(one.session_cwd, "proj");
     // The serialized row is path-free: no `SessionKey`, no origin.
     let line = serde_json::to_string(&one)?;
     assert!(!line.contains("PATHCANARY"), "{line}");

@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 use tauri::{AppHandle, Manager, Runtime, UserAttentionType, Wry};
 use tauri_plugin_notification::NotificationExt;
 
+use crate::i18n::{Lang, count};
 use crate::tray_host::TrayHost;
 use crate::windows::{self, Label, Show};
 
@@ -51,6 +52,10 @@ pub trait Notifier: Send + Sync {
     fn toast(&self, text: &str);
     /// The tray badge and tooltip show `pending` requests.
     fn set_badge(&self, pending: u32);
+    /// M15 T10: the language of the toast text (English unless the app says otherwise).
+    fn lang(&self) -> Lang {
+        Lang::En
+    }
 }
 
 /// The pending queue by class (§5.6 "N pending: x reads, y writes, z scripts").
@@ -83,19 +88,42 @@ impl Counts {
 /// The toast text (§5.6, counts only). `N pending: x reads, y writes, z scripts` is §5.6's
 /// wording; the `; M need attention` suffix (failed or unknown write outcomes unacknowledged) is
 /// PD-90 plan text (L114), not §5.6. `None` when there is nothing to say.
-pub fn toast_text(counts: Counts, needs_attention: u32) -> Option<String> {
+pub fn toast_text(lang: Lang, counts: Counts, needs_attention: u32) -> Option<String> {
     let mut parts = Vec::with_capacity(2);
     if counts.pending() > 0 {
-        parts.push(format!(
-            "{} pending: {} reads, {} writes, {} scripts",
-            counts.pending(),
-            counts.reads,
-            counts.writes,
-            counts.scripts
-        ));
+        parts.push(match lang {
+            Lang::En => format!(
+                "{} pending: {} reads, {} writes, {} scripts",
+                counts.pending(),
+                counts.reads,
+                counts.writes,
+                counts.scripts
+            ),
+            // M15 T10: German counts with their own plurals ("1 Lesevorgang", "2 Lesevorgänge").
+            Lang::De => {
+                let n = |v: u32, one: &str, many: &str| {
+                    format!(
+                        "{} {}",
+                        count(lang, u64::from(v)),
+                        if v == 1 { one } else { many }
+                    )
+                };
+                format!(
+                    "{} ausstehend: {}, {}, {}",
+                    count(lang, u64::from(counts.pending())),
+                    n(counts.reads, "Lesevorgang", "Lesevorgänge"),
+                    n(counts.writes, "Schreibvorgang", "Schreibvorgänge"),
+                    n(counts.scripts, "Skript", "Skripte")
+                )
+            }
+        });
     }
     if needs_attention > 0 {
-        parts.push(format!("{needs_attention} need attention"));
+        parts.push(match (lang, needs_attention) {
+            (Lang::En, n) => format!("{n} need attention"),
+            (Lang::De, 1) => "1 braucht Aufmerksamkeit".to_owned(),
+            (Lang::De, n) => format!("{} brauchen Aufmerksamkeit", count(lang, u64::from(n))),
+        });
     }
     (!parts.is_empty()).then(|| parts.join("; "))
 }
@@ -306,7 +334,7 @@ impl AttentionEngine {
             return;
         }
         st.toast_wanted = false;
-        if let Some(text) = toast_text(counts, st.needs) {
+        if let Some(text) = toast_text(self.notifier.lang(), counts, st.needs) {
             st.last_toast = Some(now);
             self.notifier.toast(&text);
         }
@@ -714,6 +742,13 @@ impl Notifier for TauriNotifier {
         if let Some(w) = self.app.get_webview_window(Label::Approvals.as_str()) {
             let _ = w.request_user_attention(Some(UserAttentionType::Informational));
         }
+    }
+
+    fn lang(&self) -> Lang {
+        self.app
+            .try_state::<crate::state::AppState>()
+            .map(|s| s.lang())
+            .unwrap_or_default()
     }
 
     fn toast(&self, text: &str) {
@@ -1442,14 +1477,25 @@ mod tests {
     #[test]
     fn toast_text_has_the_fixed_shape_and_counts_only() {
         assert_eq!(
-            toast_text(counts(3, 2, 1), 0).as_deref(),
+            toast_text(Lang::En, counts(3, 2, 1), 0).as_deref(),
             Some("6 pending: 3 reads, 2 writes, 1 scripts")
         );
         assert_eq!(
-            toast_text(counts(1, 0, 0), 2).as_deref(),
+            toast_text(Lang::En, counts(1, 0, 0), 2).as_deref(),
             Some("1 pending: 1 reads, 0 writes, 0 scripts; 2 need attention")
         );
-        assert_eq!(toast_text(Counts::default(), 0), None);
+        assert_eq!(toast_text(Lang::En, Counts::default(), 0), None);
+        // M15 T10: the German toast, with German plurals and grouping.
+        assert_eq!(
+            toast_text(Lang::De, counts(1, 2, 0), 1).as_deref(),
+            Some(
+                "3 ausstehend: 1 Lesevorgang, 2 Schreibvorgänge, 0 Skripte; 1 braucht Aufmerksamkeit"
+            )
+        );
+        assert_eq!(
+            toast_text(Lang::De, counts(1000, 0, 1), 0).as_deref(),
+            Some("1.001 ausstehend: 1.000 Lesevorgänge, 0 Schreibvorgänge, 1 Skript")
+        );
         assert_eq!(
             Counts {
                 reads: u32::MAX,

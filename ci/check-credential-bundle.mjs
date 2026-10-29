@@ -19,6 +19,12 @@ export const FORBIDDEN = [
   'serviceWorker',
   'cookie',
   'caches',
+  // M15 T7 (PD-297): the page's language comes from Rust (`credential_context`), never the browser.
+  // A tripwire for the plain forms (a minifier may alias `navigator`): best effort, not a proof.
+  'navigator.language',
+  'navigator.languages',
+  'navigator[',
+  'resolvedOptions',
 ];
 
 /** Every file reachable from a manifest key: its chunk, static and dynamic imports, css, assets. */

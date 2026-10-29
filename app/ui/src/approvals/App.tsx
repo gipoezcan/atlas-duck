@@ -9,13 +9,13 @@ import {
 } from '../shared/ipc/invoke';
 import { on } from '../shared/ipc/events';
 import type { QueueItem, RecentItem, StatusLine } from '../shared/ipc/types';
-import { DETAIL_TEXT, QUEUE_TEXT, RECENT_TEXT, WINDOW_TITLES } from '../shared/strings';
 import { Batch } from './Batch';
 import { Detail, type DetailHandle } from './Detail';
 import { useWindowInert, WindowInertContext } from './inert';
 import { useChords } from './keyboard';
 import { Queue, queueOrder } from './Queue';
 import { Recent } from './Recent';
+import { useText } from '../shared/i18n/context';
 
 /**
  * Re-reads `load` on mount and on each of `events`. Event payloads are ids and counts only; the
@@ -78,6 +78,7 @@ export interface AppProps {
 }
 
 export function App({ header, openId = null }: AppProps = {}) {
+  const t = useText();
   const queue = useReloaded<QueueItem[]>(queueList, QUEUE_EVENTS);
   const recent = useReloaded<RecentItem[]>(recentList, RECENT_EVENTS);
   const status = useReloaded<StatusLine[]>(appStatus, STATUS_EVENTS);
@@ -164,9 +165,9 @@ export function App({ header, openId = null }: AppProps = {}) {
       {header ?? <Header lines={status.value ?? []} />}
       <main className="window window-approvals">
         <h1 ref={heading} tabIndex={-1}>
-          {WINDOW_TITLES.approvals}
+          {t.approvals.window_titles.approvals}
         </h1>
-        {queue.failed ? <p role="alert">{QUEUE_TEXT.load_failed}</p> : null}
+        {queue.failed ? <p role="alert">{t.approvals.queue.load_failed}</p> : null}
         {queue.value !== null ? (
           <Queue
             items={queue.value}
@@ -175,7 +176,7 @@ export function App({ header, openId = null }: AppProps = {}) {
             selectedId={selected?.item.request_id ?? null}
           />
         ) : queue.failed ? null : (
-          <p role="status">{QUEUE_TEXT.loading}</p>
+          <p role="status">{t.approvals.queue.loading}</p>
         )}
         {queue.value !== null ? (
           <Batch
@@ -186,7 +187,7 @@ export function App({ header, openId = null }: AppProps = {}) {
           />
         ) : null}
         {selected === null || shownItem === undefined ? (
-          <p>{DETAIL_TEXT.select_prompt}</p>
+          <p>{t.approvals.detail.select_prompt}</p>
         ) : (
           <Detail
             key={selected.item.request_id}
@@ -197,11 +198,11 @@ export function App({ header, openId = null }: AppProps = {}) {
             onUnsentChange={onUnsentChange}
           />
         )}
-        {recent.failed ? <p role="alert">{RECENT_TEXT.load_failed}</p> : null}
+        {recent.failed ? <p role="alert">{t.approvals.recent.load_failed}</p> : null}
         {recent.value !== null ? (
           <Recent items={recent.value} onAcknowledge={acknowledge} />
         ) : recent.failed ? null : (
-          <p role="status">{RECENT_TEXT.loading}</p>
+          <p role="status">{t.approvals.recent.loading}</p>
         )}
       </main>
     </WindowInertContext.Provider>

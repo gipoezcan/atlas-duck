@@ -1,8 +1,10 @@
 import { useEffect, useId, useRef, useState } from 'react';
+import { useText } from '../shared/i18n/context';
+import type { Dict } from '../shared/i18n';
+import { en } from '../shared/i18n/dict';
 
 import { acknowledgeIncident } from '../shared/ipc/invoke';
 import type { AuditIncident, AuditStatus } from '../shared/ipc/types';
-import { AUDIT_TEXT as T } from '../shared/strings';
 import { own } from '../shared/text/own';
 import { Announce, errorText, kinds, type Said, Val } from './text';
 
@@ -19,18 +21,18 @@ interface Props {
   onChanged: () => void;
 }
 
-function refusal(e: unknown): Said {
+function refusal(e: unknown, t: Dict = en): Said {
   const { kind, inner, field } = kinds(e);
-  if (kind === 'cancelled') return { body: T.ack_cancelled, role: 'status' };
+  if (kind === 'cancelled') return { body: t.audit.ack_cancelled, role: 'status' };
   const text =
     kind === 'not_found'
-      ? own(T.ack_errors, 'not_found')
+      ? own(t.audit.ack_errors, 'not_found')
       : kind === 'invalid_argument' && field === 'note'
-        ? own(T.ack_errors, 'note')
+        ? own(t.audit.ack_errors, 'note')
         : kind === 'audit' && inner === 'unreadable'
-          ? own(T.ack_errors, 'unreadable')
+          ? own(t.audit.ack_errors, 'unreadable')
           : undefined;
-  return { body: text ?? errorText(e), role: 'alert' };
+  return { body: text ?? errorText(e, t), role: 'alert' };
 }
 
 /**
@@ -41,6 +43,7 @@ function refusal(e: unknown): Said {
  * failing appends (spec 8.5) are shown with them, display only.
  */
 export function Incidents({ status, failed, onRetry, onChanged }: Props) {
+  const t = useText();
   const [open, setOpen] = useState<number | null>(null);
   const [note, setNote] = useState('');
   const [sending, setSending] = useState(false);
@@ -88,14 +91,14 @@ export function Incidents({ status, failed, onRetry, onChanged }: Props) {
         setOpen(null);
         // The incident drops out of the list: focus goes to the section, which stays.
         heading.current?.focus();
-        setOutcome({ body: T.ack_done(ack.verify_seq, ack.ack_seq), role: 'status' });
+        setOutcome({ body: t.audit.ack_done(ack.verify_seq, ack.ack_seq), role: 'status' });
         onChanged();
       },
       (e: unknown) => {
         inFlight.current = false;
         if (!live.current) return;
         setSending(false);
-        setOutcome(refusal(e));
+        setOutcome(refusal(e, t));
         if (kinds(e).kind === 'not_found') onChanged();
       },
     );
@@ -106,14 +109,14 @@ export function Incidents({ status, failed, onRetry, onChanged }: Props) {
     const unreadable = incident.result === null || incident.detected_at === null;
     return (
       <li key={seq}>
-        <span>{T.incident_label(seq)}</span>
+        <span>{t.audit.incident_label(seq)}</span>
         {unreadable ? (
-          <>: {T.incident_unreadable}</>
+          <>: {t.audit.incident_unreadable}</>
         ) : (
           <>
             {' '}
-            ({T.incident_result}: <code><Val value={incident.result} /></code>, {T.incident_detected}:{' '}
-            <Val value={incident.detected_at} />)
+            ({t.audit.incident_result}: <code><Val value={incident.result} /></code>, {t.audit.incident_detected}:{' '}
+            <Val value={incident.detected_at} time="short" />)
           </>
         )}{' '}
         <button
@@ -122,16 +125,16 @@ export function Incidents({ status, failed, onRetry, onChanged }: Props) {
             if (el === null) triggers.current.delete(seq);
             else triggers.current.set(seq, el);
           }}
-          aria-label={T.acknowledge_label(seq)}
+          aria-label={t.audit.acknowledge_label(seq)}
           aria-expanded={open === seq}
           disabled={sending}
           onClick={() => start(seq)}
         >
-          {T.acknowledge}
+          {t.audit.acknowledge}
         </button>
         {open === seq ? (
-          <div className="audit-ack" role="group" aria-label={T.acknowledge_label(seq)}>
-            <label htmlFor={`${ids}-note`}>{T.ack_note}</label>
+          <div className="audit-ack" role="group" aria-label={t.audit.acknowledge_label(seq)}>
+            <label htmlFor={`${ids}-note`}>{t.audit.ack_note}</label>
             <textarea
               id={`${ids}-note`}
               ref={field}
@@ -140,12 +143,12 @@ export function Incidents({ status, failed, onRetry, onChanged }: Props) {
               aria-describedby={`${ids}-hint`}
               onChange={(e) => setNote(e.currentTarget.value)}
             />
-            <p id={`${ids}-hint`}>{T.ack_hint}</p>
+            <p id={`${ids}-hint`}>{t.audit.ack_hint}</p>
             <button type="button" className="primary" disabled={sending} onClick={() => send(seq)}>
-              {T.ack_send}
+              {t.audit.ack_send}
             </button>{' '}
             <button type="button" disabled={sending} onClick={() => close(seq)}>
-              {T.ack_close}
+              {t.audit.ack_close}
             </button>
           </div>
         ) : null}
@@ -154,34 +157,34 @@ export function Incidents({ status, failed, onRetry, onChanged }: Props) {
   };
 
   return (
-    <section className="audit-incidents" aria-label={T.incidents}>
+    <section className="audit-incidents" aria-label={t.audit.incidents}>
       <h2 ref={heading} tabIndex={-1}>
-        {T.incidents}
+        {t.audit.incidents}
       </h2>
       {status === null ? (
         failed ? (
           <p role="alert">
-            {T.incidents_failed}{' '}
+            {t.audit.incidents_failed}{' '}
             <button type="button" onClick={onRetry}>
-              {T.retry}
+              {t.audit.retry}
             </button>
           </p>
         ) : (
-          <p>{T.loading}</p>
+          <p>{t.audit.loading}</p>
         )
       ) : (
         <>
-          <p>{T.incident_count(status.incident_count)}</p>
+          <p>{t.audit.incident_count(status.incident_count)}</p>
           {status.open_incidents.length < status.incident_count ? (
-            <p>{T.incidents_listed(status.open_incidents.length, status.incident_count)}</p>
+            <p>{t.audit.incidents_listed(status.open_incidents.length, status.incident_count)}</p>
           ) : null}
           {status.open_incidents.length === 0 ? null : <ul>{status.open_incidents.map(item)}</ul>}
           <p>
-            {T.anchor_dir}:{' '}
-            {status.anchor_dir === null ? <span>{T.anchor_dir_none}</span> : <Val value={status.anchor_dir} />}
+            {t.audit.anchor_dir}:{' '}
+            {status.anchor_dir === null ? <span>{t.audit.anchor_dir_none}</span> : <Val value={status.anchor_dir} />}
           </p>
           {status.health.anchor_dir_write_failing ? (
-            <p>{T.anchor_dir_failing(status.health.anchor_dir_lines_pending)}</p>
+            <p>{t.audit.anchor_dir_failing(status.health.anchor_dir_lines_pending)}</p>
           ) : null}
         </>
       )}

@@ -40,6 +40,7 @@ import type {
   RunningScriptView,
   SettingChange,
   SettingsGet,
+  UiLang,
   SettingsView,
   StatusLine,
   VerifyNow,
@@ -81,6 +82,7 @@ import {
   isRetestOutcome,
   isRunningScriptView,
   isSettingsGet,
+  isUiLang,
   isSettingsView,
   isStatusLine,
   isVerifyNow,
@@ -214,8 +216,14 @@ export function settingsGet(): Promise<SettingsGet> {
   return call('settings_get', {}, isSettingsGet);
 }
 
-export function settingsApply(changes: SettingChange[]): Promise<SettingsView> {
-  return call('settings_apply', { changes }, isSettingsView);
+/** M15 T3 (PD-294): the UI language; answered without a serving core (every React window). */
+export function uiLangGet(): Promise<UiLang> {
+  return call('ui_lang_get', {}, isUiLang);
+}
+
+/** `null` only for a language-only change while no core serves (M15 T3: no view to answer). */
+export function settingsApply(changes: SettingChange[]): Promise<SettingsView | null> {
+  return call('settings_apply', { changes }, (v): v is SettingsView | null => v === null || isSettingsView(v));
 }
 
 export function instanceAdd(args: InstanceAddArgs): Promise<InstanceView> {

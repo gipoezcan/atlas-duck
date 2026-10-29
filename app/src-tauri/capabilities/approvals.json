@@ -17,6 +17,7 @@
     "allow-raw-page",
     "allow-recent-list",
     "allow-redaction-preview",
+    "allow-ui-lang-get",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

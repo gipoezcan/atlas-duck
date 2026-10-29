@@ -8,7 +8,6 @@ import type {
   RedactionPreset,
   UrlMode,
 } from '../../shared/ipc/types';
-import { BLOCK_REASON_TEXT, REDACTION_TEXT } from '../../shared/strings';
 import { AgentText } from '../../shared/text/AgentText';
 import { escapeInvisible, unusual } from '../../shared/text/unusual';
 import { EDIT_ENTRY_ATTR, POSITIVE_ATTR } from '../keyboard';
@@ -37,15 +36,18 @@ import {
 } from './paths';
 import { baseUrlMode, type CandidateState, type Draft, type FlaggedState, type ReportState } from './state';
 import { cut, Tree, TreeModel, type TreeNode } from './Tree';
+import { useText } from '../../shared/i18n/context';
+import type { Dict } from '../../shared/i18n';
 
 /** The selected value's text is shown up to this many code points. */
 export const VALUE_SHOWN_MAX = 100_000;
 
-const SINGLE_PROBLEM_TEXT = {
-  bracket: REDACTION_TEXT.single_bracket,
-  repeated: REDACTION_TEXT.single_repeated,
-  encoded: REDACTION_TEXT.single_encoded,
-} as const;
+const singleProblemText = (t: Dict) =>
+  ({
+    bracket: t.approvals.redaction.single_bracket,
+    repeated: t.approvals.redaction.single_repeated,
+    encoded: t.approvals.redaction.single_encoded,
+  }) as const;
 
 /** Why the last action added nothing, next to the controls it came from. */
 interface Hint {
@@ -58,17 +60,18 @@ const Text = ({ value }: { value: string }) => <AgentText value={value} unusual=
 
 /** One op as text: a fixed label and the op's own strings (agent or upstream text). */
 function OpText({ op }: { op: RedactionOp }) {
+  const t = useText();
   if ('drop_item' in op) {
     const { array_loc, key, value } = op.drop_item;
     return (
       <>
-        {REDACTION_TEXT.drop_item}: <Text value={array_loc} /> <Text value={`${key} = ${JSON.stringify(value)}`} />
+        {t.approvals.redaction.drop_item}: <Text value={array_loc} /> <Text value={`${key} = ${JSON.stringify(value)}`} />
       </>
     );
   }
   if ('drop_field' in op) {
     const label =
-      op.drop_field.scope === 'all_items' ? REDACTION_TEXT.drop_field_all : REDACTION_TEXT.drop_field_item;
+      op.drop_field.scope === 'all_items' ? t.approvals.redaction.drop_field_all : t.approvals.redaction.drop_field_item;
     return (
       <>
         {label}: <Text value={op.drop_field.field_loc} />
@@ -79,11 +82,11 @@ function OpText({ op }: { op: RedactionOp }) {
     const { text, at } = op.mask_text;
     return (
       <>
-        {REDACTION_TEXT.mask_add}: <Text value={text} />
+        {t.approvals.redaction.mask_add}: <Text value={text} />
         {at === null ? null : (
           <>
             {' '}
-            {REDACTION_TEXT.mask_only_here}: <Text value={at} />
+            {t.approvals.redaction.mask_only_here}: <Text value={at} />
           </>
         )}
       </>
@@ -92,13 +95,13 @@ function OpText({ op }: { op: RedactionOp }) {
   if ('url_field' in op) {
     return (
       <>
-        {REDACTION_TEXT.url_mode}:{' '}
-        {op.url_field.mode === 'drop' ? REDACTION_TEXT.url_drop : REDACTION_TEXT.url_replace_whole}
+        {t.approvals.redaction.url_mode}:{' '}
+        {op.url_field.mode === 'drop' ? t.approvals.redaction.url_drop : t.approvals.redaction.url_replace_whole}
       </>
     );
   }
   return (
-    <>{op.preset === 'status_only' ? REDACTION_TEXT.preset_status_only : REDACTION_TEXT.preset_error_class_only}</>
+    <>{op.preset === 'status_only' ? t.approvals.redaction.preset_status_only : t.approvals.redaction.preset_error_class_only}</>
   );
 }
 
@@ -142,6 +145,7 @@ export interface PanelProps {
  * in `Detail` (`send()`); this component builds ops and shows text, it decides nothing.
  */
 export function Panel(props: PanelProps) {
+  const t = useText();
   const { candidate, context, round, onRound, draft, removeAll, ref } = props;
   const model = useMemo(
     () => (candidate?.state === 'ready' ? new TreeModel(candidate.candidate) : null),
@@ -192,7 +196,7 @@ export function Panel(props: PanelProps) {
     if (op === null) return false;
     const key = canonical(op);
     if (inRound.has(key) || applied.has(key)) {
-      setHint({ text: inRound.has(key) ? REDACTION_TEXT.already_in_round : REDACTION_TEXT.already_applied, at: where });
+      setHint({ text: inRound.has(key) ? t.approvals.redaction.already_in_round : t.approvals.redaction.already_applied, at: where });
       return false;
     }
     onRound([...round, { op, loc }]);
@@ -205,12 +209,12 @@ export function Panel(props: PanelProps) {
   const addMask = (node: TreeNode, value: string, single: boolean) => {
     const refusal =
       maskText === ''
-        ? REDACTION_TEXT.mask_empty
+        ? t.approvals.redaction.mask_empty
         : maskText.includes(REDACTED)
-          ? REDACTION_TEXT.mask_placeholder
+          ? t.approvals.redaction.mask_placeholder
           : value.includes(maskText)
             ? null
-            : REDACTION_TEXT.mask_not_in_value;
+            : t.approvals.redaction.mask_not_in_value;
     if (refusal !== null) {
       setHint({ text: refusal, at: 'node' });
       return;
@@ -250,19 +254,19 @@ export function Panel(props: PanelProps) {
       const parent = loc.slice(0, bad);
       drops = (
         <p className="unaddressable">
-          {parent.length === 0 ? REDACTION_TEXT.root_unaddressable : REDACTION_TEXT.unaddressable}{' '}
-          {parent.length === 0 ? null : dropButton(REDACTION_TEXT.drop_parent, dropOf(parent), parent)}
+          {parent.length === 0 ? t.approvals.redaction.root_unaddressable : t.approvals.redaction.unaddressable}{' '}
+          {parent.length === 0 ? null : dropButton(t.approvals.redaction.drop_parent, dropOf(parent), parent)}
         </p>
       );
     } else if (loc.length > 0) {
       const last = loc[loc.length - 1];
       drops =
         last !== undefined && 'index' in last ? (
-          dropButton(REDACTION_TEXT.drop_item, dropItemOp(loc), loc)
+          dropButton(t.approvals.redaction.drop_item, dropItemOp(loc), loc)
         ) : (
           <>
-            {dropButton(REDACTION_TEXT.drop_field_item, dropFieldOp(loc, 'per_item'), loc)}
-            {inItems(loc) ? dropButton(REDACTION_TEXT.drop_field_all, dropFieldOp(loc, 'all_items'), loc) : null}
+            {dropButton(t.approvals.redaction.drop_field_item, dropFieldOp(loc, 'per_item'), loc)}
+            {inItems(loc) ? dropButton(t.approvals.redaction.drop_field_all, dropFieldOp(loc, 'all_items'), loc) : null}
           </>
         );
     }
@@ -272,14 +276,14 @@ export function Panel(props: PanelProps) {
       <>
         <div className="redaction-actions">
           {drops}
-          {already ? <span>{REDACTION_TEXT.already_dropped}</span> : null}
-          {roundSingles ? <p>{REDACTION_TEXT.drops_need_no_singles}</p> : null}
-          {baseSingles && drops !== null ? <p>{REDACTION_TEXT.drops_need_no_applied_singles}</p> : null}
+          {already ? <span>{t.approvals.redaction.already_dropped}</span> : null}
+          {roundSingles ? <p>{t.approvals.redaction.drops_need_no_singles}</p> : null}
+          {baseSingles && drops !== null ? <p>{t.approvals.redaction.drops_need_no_applied_singles}</p> : null}
         </div>
         {value === null ? null : (
           <div className="mask-form">
             <label>
-              {REDACTION_TEXT.mask_label}{' '}
+              {t.approvals.redaction.mask_label}{' '}
               <input
                 type="text"
                 value={maskText}
@@ -291,7 +295,7 @@ export function Panel(props: PanelProps) {
               />
             </label>
             <button type="button" disabled={removeAll} onClick={takeSelection}>
-              {REDACTION_TEXT.mask_use_selection}
+              {t.approvals.redaction.mask_use_selection}
             </button>
             <label>
               <input
@@ -300,13 +304,13 @@ export function Panel(props: PanelProps) {
                 disabled={!singleOk || removeAll}
                 onChange={(e) => setOnlyHere(e.target.checked)}
               />{' '}
-              {REDACTION_TEXT.mask_only_here}
+              {t.approvals.redaction.mask_only_here}
             </label>
             <button type="button" disabled={removeAll} onClick={() => addMask(node, value, onlyHere && singleOk)}>
-              {REDACTION_TEXT.mask_add}
+              {t.approvals.redaction.mask_add}
             </button>
-            {roundDrops.length > 0 ? <p>{REDACTION_TEXT.single_needs_no_drops}</p> : null}
-            {problem === null ? null : <p>{SINGLE_PROBLEM_TEXT[problem]}</p>}
+            {roundDrops.length > 0 ? <p>{t.approvals.redaction.single_needs_no_drops}</p> : null}
+            {problem === null ? null : <p>{singleProblemText(t)[problem]}</p>}
           </div>
         )}
         <span className="field-hint" role="alert">
@@ -323,19 +327,19 @@ export function Panel(props: PanelProps) {
     const shownValue = value === null ? null : cut(value, VALUE_SHOWN_MAX);
     const escaped = shownValue === null ? null : escapeInvisible(shownValue);
     return (
-      <section className="redaction-selected" aria-label={REDACTION_TEXT.selected}>
+      <section className="redaction-selected" aria-label={t.approvals.redaction.selected}>
         <p>
-          {REDACTION_TEXT.selected}: <Text value={displayOf(node.loc)} />
+          {t.approvals.redaction.selected}: <Text value={displayOf(node.loc)} />
         </p>
         {value === null || shownValue === null ? null : (
           <>
-            <div className="tree-value-full" ref={valueRef} tabIndex={0} aria-label={REDACTION_TEXT.value}>
+            <div className="tree-value-full" ref={valueRef} tabIndex={0} aria-label={t.approvals.redaction.value}>
               <AgentText value={shownValue} unusual={unusual(value)} />
-              {points > VALUE_SHOWN_MAX ? <p>{REDACTION_TEXT.value_cut(VALUE_SHOWN_MAX, points)}</p> : null}
+              {points > VALUE_SHOWN_MAX ? <p>{t.approvals.redaction.value_cut(VALUE_SHOWN_MAX, points)}</p> : null}
             </div>
             {escaped === null || escaped === shownValue ? null : (
-              <div className="tree-value-escaped" aria-label={REDACTION_TEXT.value_escaped}>
-                {REDACTION_TEXT.value_escaped}: <AgentText value={escaped} unusual={unusual(escaped)} />
+              <div className="tree-value-escaped" aria-label={t.approvals.redaction.value_escaped}>
+                {t.approvals.redaction.value_escaped}: <AgentText value={escaped} unusual={unusual(escaped)} />
               </div>
             )}
           </>
@@ -348,18 +352,18 @@ export function Panel(props: PanelProps) {
   const report = props.report;
   const reportView = (): ReactNode => {
     if (!draft.unsent) return null;
-    if (report === null) return <p role="status">{REDACTION_TEXT.checking}</p>;
-    if (!('report' in report)) return <p role="alert">{REDACTION_TEXT.check_failed}</p>;
+    if (report === null) return <p role="status">{t.approvals.redaction.checking}</p>;
+    if (!('report' in report)) return <p role="alert">{t.approvals.redaction.check_failed}</p>;
     const r = report.report;
     return (
       <div className="redaction-report">
         {r.blocked.length === 0 ? null : (
           <div role="alert">
-            <strong>{REDACTION_TEXT.blocked}</strong>
+            <strong>{t.approvals.redaction.blocked}</strong>
             <ul>
               {r.blocked.map((b, i) => (
                 <li key={i}>
-                  {own(BLOCK_REASON_TEXT, b.reason) ?? b.reason}
+                  {own(t.approvals.block_reason, b.reason) ?? b.reason}
                   {b.path === '' ? null : (
                     <>
                       {': '}
@@ -373,7 +377,7 @@ export function Panel(props: PanelProps) {
         )}
         {r.also_appears_in.length === 0 ? null : (
           <div>
-            {REDACTION_TEXT.also_appears_in}
+            {t.approvals.redaction.also_appears_in}
             <ul className="also-appears-in">
               {r.also_appears_in.map((p, i) => (
                 <li key={i}>
@@ -385,18 +389,18 @@ export function Panel(props: PanelProps) {
         )}
         {r.other_occurrences === 0 ? null : (
           <p>
-            {REDACTION_TEXT.other_occurrences(r.other_occurrences)}{' '}
+            {t.approvals.redaction.other_occurrences(r.other_occurrences)}{' '}
             <label>
               <input
                 type="checkbox"
                 checked={props.confirmed}
                 onChange={(e) => props.onConfirm(e.target.checked)}
               />{' '}
-              {REDACTION_TEXT.confirm_others}
+              {t.approvals.redaction.confirm_others}
             </label>
           </p>
         )}
-        <p>{REDACTION_TEXT.released_bytes(r.released_bytes)}</p>
+        <p>{t.approvals.redaction.released_bytes(r.released_bytes)}</p>
       </div>
     );
   };
@@ -407,17 +411,17 @@ export function Panel(props: PanelProps) {
    */
   const flaggedView = (): ReactNode => {
     const found = props.flagged;
-    if (found === null) return <p role="status">{REDACTION_TEXT.flagged_checking}</p>;
-    if ('failed' in found || found.flagged.length === 0) return <p role="alert">{REDACTION_TEXT.flagged_missing}</p>;
+    if (found === null) return <p role="status">{t.approvals.redaction.flagged_checking}</p>;
+    if ('failed' in found || found.flagged.length === 0) return <p role="alert">{t.approvals.redaction.flagged_missing}</p>;
     const plan = flaggedPlan;
     const missing = plan === null ? [] : plan.round.filter((r) => !inRound.has(canonical(r.op)));
     return (
       <div className="redaction-flagged">
-        <strong>{REDACTION_TEXT.flagged_heading}</strong>
+        <strong>{t.approvals.redaction.flagged_heading}</strong>
         <ul>
           {found.flagged.slice(0, FLAGGED_SHOWN).map((b, i) => (
             <li key={i}>
-              {own(BLOCK_REASON_TEXT, b.reason) ?? b.reason}
+              {own(t.approvals.block_reason, b.reason) ?? b.reason}
               {': '}
               <Text value={b.path} />
             </li>
@@ -425,17 +429,17 @@ export function Panel(props: PanelProps) {
         </ul>
         {/* Only the list is cut: the drops below name every flagged entry. */}
         {found.flagged.length > FLAGGED_SHOWN ? (
-          <p>{REDACTION_TEXT.flagged_more(found.flagged.length - FLAGGED_SHOWN)}</p>
+          <p>{t.approvals.redaction.flagged_more(found.flagged.length - FLAGGED_SHOWN)}</p>
         ) : null}
         <button
           type="button"
           disabled={plan === null || plan.round.length === 0 || missing.length === 0 || roundSingles || removeAll}
           onClick={() => onRound([...round, ...missing])}
         >
-          {REDACTION_TEXT.drop_flagged}
+          {t.approvals.redaction.drop_flagged}
         </button>{' '}
-        <span>{REDACTION_TEXT.drop_flagged_note}</span>
-        {plan !== null && plan.unresolved ? <p role="alert">{REDACTION_TEXT.flagged_unresolved}</p> : null}
+        <span>{t.approvals.redaction.drop_flagged_note}</span>
+        {plan !== null && plan.unresolved ? <p role="alert">{t.approvals.redaction.flagged_unresolved}</p> : null}
       </div>
     );
   };
@@ -447,18 +451,18 @@ export function Panel(props: PanelProps) {
   const showUrl = context.url_fields.length > 0 || anyMask;
 
   const body = (): ReactNode => {
-    if (candidate === null || candidate.state === 'loading') return <p role="status">{REDACTION_TEXT.loading}</p>;
+    if (candidate === null || candidate.state === 'loading') return <p role="status">{t.approvals.redaction.loading}</p>;
     if (candidate.state === 'failed') {
       return (
         <p role="alert">
-          {REDACTION_TEXT.read_failed}{' '}
+          {t.approvals.redaction.read_failed}{' '}
           <button type="button" onClick={candidate.retry}>
-            {REDACTION_TEXT.retry}
+            {t.approvals.redaction.retry}
           </button>
         </p>
       );
     }
-    if (model === null) return <p role="alert">{REDACTION_TEXT.unavailable}</p>;
+    if (model === null) return <p role="alert">{t.approvals.redaction.unavailable}</p>;
     return (
       <>
         <Tree
@@ -485,13 +489,13 @@ export function Panel(props: PanelProps) {
   };
 
   return (
-    <section className="redaction-panel" aria-label={REDACTION_TEXT.label} ref={ref} {...{ [EDIT_ENTRY_ATTR]: '' }}>
-      <p>{REDACTION_TEXT.intro}</p>
-      <p className="field-keys">{REDACTION_TEXT.keys}</p>
+    <section className="redaction-panel" aria-label={t.approvals.redaction.label} ref={ref} {...{ [EDIT_ENTRY_ATTR]: '' }}>
+      <p>{t.approvals.redaction.intro}</p>
+      <p className="field-keys">{t.approvals.redaction.keys}</p>
       <div className="redaction-ops">
-        <strong>{REDACTION_TEXT.applied_heading}</strong>
+        <strong>{t.approvals.redaction.applied_heading}</strong>
         {context.ops.length === 0 ? (
-          <span> {REDACTION_TEXT.none_applied}</span>
+          <span> {t.approvals.redaction.none_applied}</span>
         ) : (
           <ul>
             {context.ops.map((op, i) => (
@@ -503,7 +507,7 @@ export function Panel(props: PanelProps) {
         )}
         {props.appliedAlsoAppearsIn.length === 0 ? null : (
           <div>
-            {REDACTION_TEXT.also_appears_in}
+            {t.approvals.redaction.also_appears_in}
             <ul className="also-appears-in">
               {props.appliedAlsoAppearsIn.map((p, i) => (
                 <li key={i}>
@@ -515,26 +519,26 @@ export function Panel(props: PanelProps) {
         )}
         {context.ops.length === 0 ? null : removeAll ? (
           <p role="status">
-            {REDACTION_TEXT.remove_all_pending}{' '}
+            {t.approvals.redaction.remove_all_pending}{' '}
             <button type="button" onClick={() => props.onRemoveAll(false)}>
-              {REDACTION_TEXT.undo_remove_all}
+              {t.approvals.redaction.undo_remove_all}
             </button>
           </p>
         ) : (
           <button type="button" onClick={() => props.onRemoveAll(true)}>
-            {REDACTION_TEXT.remove_all}
+            {t.approvals.redaction.remove_all}
           </button>
         )}
       </div>
       {round.length === 0 ? null : (
         <div className="redaction-ops">
-          <strong>{REDACTION_TEXT.round_heading}</strong>
+          <strong>{t.approvals.redaction.round_heading}</strong>
           <ul>
             {round.map((r, i) => (
               <li key={i}>
                 <OpText op={r.op} />{' '}
                 <button type="button" onClick={() => onRound(round.filter((_, j) => j !== i))}>
-                  {REDACTION_TEXT.remove}
+                  {t.approvals.redaction.remove}
                 </button>
               </li>
             ))}
@@ -542,7 +546,7 @@ export function Panel(props: PanelProps) {
         </div>
       )}
       {presets.length === 0 ? null : (
-        <div className="redaction-presets" role="group" aria-label={REDACTION_TEXT.presets}>
+        <div className="redaction-presets" role="group" aria-label={t.approvals.redaction.presets}>
           {presets.map((p) => (
             <button
               key={p}
@@ -550,10 +554,10 @@ export function Panel(props: PanelProps) {
               disabled={removeAll || roundSingles || baseSingles}
               onClick={() => add(presetOp(p), null, 'presets')}
             >
-              {p === 'status_only' ? REDACTION_TEXT.preset_status_only : REDACTION_TEXT.preset_error_class_only}
+              {p === 'status_only' ? t.approvals.redaction.preset_status_only : t.approvals.redaction.preset_error_class_only}
             </button>
           ))}
-          {baseSingles ? <p>{REDACTION_TEXT.drops_need_no_applied_singles}</p> : null}
+          {baseSingles ? <p>{t.approvals.redaction.drops_need_no_applied_singles}</p> : null}
           <span className="field-hint" role="alert">
             {hint?.at === 'presets' ? hint.text : ''}
           </span>
@@ -561,11 +565,11 @@ export function Panel(props: PanelProps) {
       )}
       {showUrl ? (
         <fieldset className="redaction-url" disabled={removeAll}>
-          <legend>{REDACTION_TEXT.url_mode}</legend>
+          <legend>{t.approvals.redaction.url_mode}</legend>
           {(['replace_whole', 'drop'] as const).map((m) => (
             <label key={m}>
               <input type="radio" name="url-mode" checked={mode === m} onChange={() => props.onUrlChoice(m)} />{' '}
-              {m === 'drop' ? REDACTION_TEXT.url_drop : REDACTION_TEXT.url_replace_whole}
+              {m === 'drop' ? t.approvals.redaction.url_drop : t.approvals.redaction.url_replace_whole}
             </label>
           ))}
         </fieldset>
@@ -580,9 +584,9 @@ export function Panel(props: PanelProps) {
           disabled={!props.canRelease}
           onClick={props.onRelease}
         >
-          {REDACTION_TEXT.release}
+          {t.approvals.redaction.release}
         </button>{' '}
-        <span id={releaseHint}>{REDACTION_TEXT.release_redacted_hint}</span>
+        <span id={releaseHint}>{t.approvals.redaction.release_redacted_hint}</span>
       </div>
       {body()}
     </section>

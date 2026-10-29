@@ -1,3 +1,5 @@
+import { formatDateTime } from '../shared/i18n/format';
+import type { Lang } from '../shared/i18n';
 import { csrf } from '../shared/ipc/transport-http';
 import { loginUrl, nav } from './shell/RequireSession';
 
@@ -6,6 +8,54 @@ import { loginUrl, nav } from './shell/RequireSession';
  * `/api/admin/*`), with runtime validators in the style of `shared/ipc/validate.ts`: an answer of
  * an unexpected shape is a failure, never rendered.
  */
+
+/**
+ * Every error code of crates/server/src/errors.rs (checked by ci/check-i18n.mjs through the keys of
+ * the dictionaries' errors.server).
+ */
+export const SERVER_ERROR_CODES = [
+  'auth/invalid_credentials',
+  'auth/empty_password',
+  'auth/directory_unavailable',
+  'auth/not_permitted',
+  'auth/no_session',
+  'auth/session_expired',
+  'auth/csrf_mismatch',
+  'auth/origin_mismatch',
+  'auth/role_required',
+  'auth/bearer_not_accepted',
+  'auth/api_key_invalid',
+  'auth/scope_missing',
+  'api/bad_request',
+  'api/not_found',
+  'api/unknown_command',
+  'api/body_too_large',
+  'api/too_many_streams',
+  'instance/invalid',
+  'instance/exists',
+  'instance/unknown',
+  'pat/check_failed',
+  'pat/instance_unreachable',
+  'api_key/limit_reached',
+  'api_key/expiry_out_of_range',
+  'api_key/name_invalid',
+  'api_key/scope_invalid',
+  'store/unavailable',
+  'oauth/disabled',
+  'oauth/request_unknown',
+  'oauth/request_expired',
+  'oauth/grant_unknown',
+  'audit/user_unknown',
+  'audit/read_not_recorded',
+  'audit/export_busy',
+  'audit/export_unknown',
+  'audit/export_expired',
+  'audit/export_failed',
+  'server/maintenance',
+  'internal',
+  'auth/rate_limited',
+] as const;
+export type ServerErrorCode = (typeof SERVER_ERROR_CODES)[number];
 
 export type ApiResult<T> =
   | { ok: true; value: T }
@@ -258,6 +308,6 @@ export function isGrantView(v: unknown): v is GrantView {
 }
 
 /** A Unix time in seconds as a short UTC date and time. */
-export function when(secs: number): string {
-  return new Date(secs * 1000).toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
+export function when(secs: number, lang: Lang = 'en'): string {
+  return formatDateTime(lang, secs);
 }

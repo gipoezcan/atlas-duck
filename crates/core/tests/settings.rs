@@ -69,6 +69,44 @@ fn raise(name: &str, old: &str, new: &str) -> String {
     )
 }
 
+/// M15 T10b: in German the dialog shows German text, and the record's proof is the hash of exactly
+/// that text (never of the English one).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn german_confirmation_hash_is_of_the_german_text() -> TestResult {
+    let h = Harness::jira().await?;
+    h.confirmer().set_lang(atlas_duck_core::Lang::De);
+    let s = h.core().settings();
+    apply(&s, vec![LegalHold(true)]).await??;
+    h.confirmer().push(Confirm::Ok);
+    h.confirmer().push(Confirm::Ok);
+    apply(&s, vec![LegalHold(false), JiraCommentsCap(1000)]).await??;
+    let texts = h.confirmer().texts();
+    assert_eq!(texts.len(), 2, "{texts:?}");
+    assert_eq!(texts[0], atlas_duck_core::settings::LIFT_HOLD_TEXT_DE);
+    assert!(
+        texts[1].starts_with("die Obergrenze für Jira-Kommentare von ")
+            && texts[1].contains(" auf 1.000 erhöhen?"),
+        "{}",
+        texts[1]
+    );
+    let holds = h.events_of(EventType::LEGAL_HOLD_CHANGED).await?;
+    let lifted = holds.last().ok_or("no LEGAL_HOLD_CHANGED")?;
+    assert_eq!(
+        lifted["confirmed"]["dialog_text_sha256"],
+        sha_hex(atlas_duck_core::settings::LIFT_HOLD_TEXT_DE)
+    );
+    assert_ne!(
+        lifted["confirmed"]["dialog_text_sha256"],
+        sha_hex(LIFT_HOLD_TEXT)
+    );
+    let cap = config_changed(&h, "jira_comments_cap").await?;
+    let last = cap.last().ok_or("no jira_comments_cap record")?;
+    assert_eq!(last["confirmed"]["dialog_text_sha256"], sha_hex(&texts[1]));
+    // T10b fix I-1: the record says which language's text the hash is of.
+    assert_eq!(lifted["confirmed"]["dialog_lang"], "de");
+    assert_eq!(last["confirmed"]["dialog_lang"], "de");
+    Ok(())
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn x02_lift_hold_and_lower_retention_need_confirmation() -> TestResult {
     let h = Harness::jira().await?;
@@ -1218,7 +1256,7 @@ async fn degraded_toggle_needs_native_confirmation_and_logs_config_changed() -> 
         json!({
             "source": "app", "key": "allow_degraded_scripts", "old": false, "requested": true,
             "new": true, "applied": true,
-            "confirmed": {"dialog_text_sha256": sha_hex(ALLOW_DEGRADED_TEXT)},
+            "confirmed": {"dialog_text_sha256": sha_hex(ALLOW_DEGRADED_TEXT), "dialog_lang": "en"},
         })
     );
     // Audit-authoritative (L32): the store's view holds it, nothing else.

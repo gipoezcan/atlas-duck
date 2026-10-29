@@ -3,9 +3,11 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { own } from '../shared/text/own';
 import { Windowed } from '../shared/list/Windowed';
 import type { QueueItem } from '../shared/ipc/types';
-import { CLASS_LABELS, QUEUE_TEXT } from '../shared/strings';
 import { AgentText } from '../shared/text/AgentText';
 import { Badge } from '../shared/text/Badge';
+import { useText } from '../shared/i18n/context';
+import { en } from '../shared/i18n/dict';
+import type { Dict } from '../shared/i18n';
 
 /** A row is two one-line rows (2 rem each) and a flags line of up to two lines (3.5 rem), see app.css. */
 export const QUEUE_ROW_REM = 7.5;
@@ -17,7 +19,7 @@ function rowHeightPx(): number {
 }
 
 type Row =
-  | { kind: 'group'; sessionId: string; label: string; unusual: boolean; ids: string[] }
+  | { kind: 'group'; sessionId: string; head: QueueItem; unusual: boolean; ids: string[] }
   | { kind: 'item'; item: QueueItem };
 
 /**
@@ -42,7 +44,7 @@ export function buildRows(items: readonly QueueItem[]): Row[] {
       {
         kind: 'group' as const,
         sessionId: head.session_id,
-        label: head.session_label,
+        head,
         // `unusual` is about an agent's name or reason, not the label: a group may be flagged for
         // another member's text. That over-flags, which is harmless.
         unusual: members.some((i) => i.unusual),
@@ -51,6 +53,11 @@ export function buildRows(items: readonly QueueItem[]): Row[] {
       ...sorted.map((item) => ({ kind: 'item' as const, item })),
     ];
   });
+}
+
+/** A session as the queue shows it: the agent's name (the UI's words when it sent none) and the cwd. */
+export function sessionLabel(item: QueueItem, t: Dict = en): string {
+  return `${item.session_agent_name ?? t.approvals.queue.no_agent_name} · ${item.session_cwd}`;
 }
 
 /** The request ids in the order the queue shows them (next/prev follows it). */
@@ -63,10 +70,8 @@ function revKey(item: QueueItem): string {
   return `${item.candidate_rev.counter}:${item.candidate_rev.candidate_hash}`;
 }
 
-export function formatAge(seconds: number): string {
-  if (seconds < 60) return `${Math.floor(seconds)} s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)} min`;
-  return `${Math.floor(seconds / 3600)} h`;
+export function formatAge(seconds: number, t: Dict = en): string {
+  return t.approvals.queue.age(seconds);
 }
 
 interface QueueProps {
@@ -80,6 +85,7 @@ interface QueueProps {
 }
 
 export function Queue({ items, onSelectionChange, onOpen, selectedId = null }: QueueProps) {
+  const t = useText();
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const rows = useMemo(() => buildRows(items), [items]);
   const byId = useMemo(() => new Map(items.map((i) => [i.request_id, i])), [items]);
@@ -126,12 +132,12 @@ export function Queue({ items, onSelectionChange, onOpen, selectedId = null }: Q
     });
 
   if (items.length === 0) {
-    return <p className="empty empty-state">{QUEUE_TEXT.empty}</p>;
+    return <p className="empty empty-state">{t.approvals.queue.empty}</p>;
   }
 
   return (
     <Windowed
-      label={QUEUE_TEXT.heading}
+      label={t.approvals.queue.heading}
       rows={rows}
       rowHeight={rowHeight}
       rowKey={(row) => (row.kind === 'group' ? `group-${row.sessionId}` : row.item.request_id)}
@@ -166,6 +172,7 @@ function GroupRow({
   checked: boolean;
   onToggle: (on: boolean) => void;
 }) {
+  const t = useText();
   const labelId = `session-${row.sessionId}`;
   const selectId = `select-${labelId}`;
   return (
@@ -176,9 +183,9 @@ function GroupRow({
         checked={checked}
         onChange={(e) => onToggle(e.currentTarget.checked)}
       />
-      <span id={selectId}>{QUEUE_TEXT.select_session}</span>{' '}
+      <span id={selectId}>{t.approvals.queue.select_session}</span>{' '}
       <span id={labelId}>
-        <AgentText value={row.label} unusual={row.unusual} />
+        <AgentText value={sessionLabel(row.head, t)} unusual={row.unusual} />
       </span>
     </div>
   );
@@ -199,58 +206,59 @@ function ItemRow({
   current: boolean;
   onOpen: ((requestId: string) => void) | undefined;
 }) {
+  const t = useText();
   return (
     <div className="queue-item" aria-current={current ? 'true' : undefined}>
       <div className="queue-line">
         <input
           type="checkbox"
-          aria-label={`${QUEUE_TEXT.select_item} ${item.op_id} ${item.target_display}`}
+          aria-label={`${t.approvals.queue.select_item} ${item.op_id} ${item.target_display}`}
           checked={checked}
           onChange={(e) => onToggle(e.currentTarget.checked)}
         />
-        <AgentText value={item.agent_name ?? QUEUE_TEXT.no_agent_name} unusual={item.unusual} />
+        <AgentText value={item.agent_name ?? t.approvals.queue.no_agent_name} unusual={item.unusual} />
         <span className="op-id">{item.op_id}</span>
         <span className="alias">{item.instance_alias}</span>
         <span className="target">{item.target_display}</span>
-        <span className="class">{own(CLASS_LABELS, item.class) ?? item.class}</span>
+        <span className="class">{own(t.approvals.class_labels, item.class) ?? item.class}</span>
         {onOpen === undefined ? null : (
           <button
             type="button"
-            aria-label={`${QUEUE_TEXT.open} ${item.op_id} ${item.target_display}`}
+            aria-label={`${t.approvals.queue.open} ${item.op_id} ${item.target_display}`}
             onClick={() => onOpen(item.request_id)}
           >
-            {QUEUE_TEXT.open}
+            {t.approvals.queue.open}
           </button>
         )}
       </div>
       <div className="queue-line">
         {item.reason_excerpt === null || item.reason_excerpt === '' ? (
-          <Badge label={QUEUE_TEXT.no_reason} />
+          <Badge label={t.approvals.queue.no_reason} />
         ) : (
           <AgentText value={item.reason_excerpt} unusual={item.unusual} />
         )}
-        <span className="age">{formatAge(item.age_s)}</span>
+        <span className="age">{formatAge(item.age_s, t)}</span>
       </div>
       <div className="queue-line queue-flags">
-        {item.stale ? <Badge label={QUEUE_TEXT.stale} tone="caution" /> : null}
+        {item.stale ? <Badge label={t.approvals.queue.stale} tone="caution" /> : null}
         {item.caution_count > 0 ? (
-          <Badge label={QUEUE_TEXT.caution} count={item.caution_count} tone="caution" />
+          <Badge label={t.approvals.queue.caution} count={item.caution_count} tone="caution" />
         ) : null}
         {item.possible_duplicate_of === null ? null : (
           <span className="flag">
-            <Badge label={QUEUE_TEXT.possible_duplicate} tone="caution" />{' '}
+            <Badge label={t.approvals.queue.possible_duplicate} tone="caution" />{' '}
             <span className="flag-ref">{item.possible_duplicate_of}</span>
             {other === undefined ? null : (
               <>
                 {' '}
-                {QUEUE_TEXT.of_session} <AgentText value={other.session_label} unusual={other.unusual} />
+                {t.approvals.queue.of_session} <AgentText value={sessionLabel(other, t)} unusual={other.unusual} />
               </>
             )}
           </span>
         )}
         {item.similar_to === null ? null : (
           <span className="flag">
-            <Badge label={QUEUE_TEXT.similar_request} tone="caution" />{' '}
+            <Badge label={t.approvals.queue.similar_request} tone="caution" />{' '}
             <span className="flag-ref">{item.similar_to}</span>
           </span>
         )}

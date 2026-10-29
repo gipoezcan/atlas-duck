@@ -1,11 +1,10 @@
 import { instanceAcceptUrlChange, instanceConfirmConfig } from '../shared/ipc/invoke';
 import type { InstanceView } from '../shared/ipc/types';
-import { SETTINGS_TEXT } from '../shared/strings';
 import { AgentText } from '../shared/text/AgentText';
 import { unusual } from '../shared/text/unusual';
 import { Cfg, own } from '../settings/text';
 import { useAction } from '../settings/useAction';
-import { SETUP_TEXT as T } from './text';
+import { useText } from '../shared/i18n/context';
 
 /**
  * The instances of the wizard's instances step. The list comes from `wizard_state` (setup has no
@@ -19,15 +18,16 @@ export function SetupInstances({
   instances: readonly InstanceView[];
   onChanged: () => void;
 }) {
-  if (instances.length === 0) return <p>{T.instances_none}</p>;
+  const t = useText();
+  if (instances.length === 0) return <p>{t.setup.instances_none}</p>;
   return (
     <table className="instances">
-      <caption>{T.instances_list}</caption>
+      <caption>{t.setup.instances_list}</caption>
       <thead>
         <tr>
-          <th scope="col">{T.col_alias}</th>
-          <th scope="col">{T.col_origin}</th>
-          <th scope="col">{T.col_state}</th>
+          <th scope="col">{t.setup.col_alias}</th>
+          <th scope="col">{t.setup.col_origin}</th>
+          <th scope="col">{t.setup.col_state}</th>
         </tr>
       </thead>
       <tbody>
@@ -40,15 +40,16 @@ export function SetupInstances({
 }
 
 function Row({ inst, onChanged }: { inst: InstanceView; onChanged: () => void }) {
+  const t = useText();
   const confirm = useAction();
   const accept = useAction();
-  const known = own(SETTINGS_TEXT.states, inst.state);
+  const known = own(t.settings.states, inst.state);
   return (
     <tr>
       <th scope="row">
         <Cfg value={inst.alias} />
       </th>
-      <td>{inst.origin === null ? T.no_origin : <Cfg value={inst.origin} />}</td>
+      <td>{inst.origin === null ? t.setup.no_origin : <Cfg value={inst.origin} />}</td>
       <td>
         {known === undefined ? <Cfg value={inst.state} /> : known}
         {inst.note === null ? null : (
@@ -56,10 +57,10 @@ function Row({ inst, onChanged }: { inst: InstanceView; onChanged: () => void })
             <AgentText value={inst.note} unusual={unusual(inst.note)} />
           </p>
         )}
-        {inst.state === 'needs_token' ? <p>{T.token_in_settings}</p> : null}
+        {inst.state === 'needs_token' ? <p>{t.setup.token_in_settings}</p> : null}
         {inst.state === 'instance_unconfirmed' ? (
           <>
-            <p>{T.confirm_hint}</p>
+            <p>{t.setup.confirm_hint}</p>
             <button
               type="button"
               disabled={confirm.pending}
@@ -69,7 +70,7 @@ function Row({ inst, onChanged }: { inst: InstanceView; onChanged: () => void })
                 })
               }
             >
-              {T.confirm}
+              {t.setup.confirm}
             </button>
             {confirm.error === null ? null : <p role="alert">{confirm.error}</p>}
           </>
@@ -77,10 +78,10 @@ function Row({ inst, onChanged }: { inst: InstanceView; onChanged: () => void })
         {inst.pending_url_change === null ? null : (
           <div role="note">
             <p>
-              {T.url_change} <Cfg value={inst.alias} />
+              {t.setup.url_change} <Cfg value={inst.alias} />
             </p>
             <p>
-              {T.url_change_requested} <Cfg value={inst.pending_url_change} />
+              {t.setup.url_change_requested} <Cfg value={inst.pending_url_change} />
             </p>
             <button
               type="button"
@@ -91,7 +92,7 @@ function Row({ inst, onChanged }: { inst: InstanceView; onChanged: () => void })
                 })
               }
             >
-              {T.url_change_accept}
+              {t.setup.url_change_accept}
             </button>
             {accept.error === null ? null : <p role="alert">{accept.error}</p>}
           </div>

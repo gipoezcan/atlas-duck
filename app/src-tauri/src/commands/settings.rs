@@ -44,6 +44,7 @@ use crate::cli_install::{
     self, APP_CHANGE_KEY, Artifact, Inputs, InstallError, Kind, Layout, PlatformOps, SystemOps,
 };
 use crate::credential::{self, PatOpenError};
+use crate::i18n::{LangPref, T};
 use crate::recovery_tier;
 use crate::removal::{
     self, BackupAnswer, Choice, FinishAnswer, PluginAutostart, RemovalDto, RemovalError,
@@ -52,8 +53,8 @@ use crate::removal::{
 use crate::restore_flow;
 use crate::sandbox_probe::{floor_label, mode_label, probe_id_name, scripts_state};
 use crate::serve::{JobRefused, RestoreCancel, StoreCall};
-use crate::state::{AppState, ServeSlot};
-use crate::ui_sink::{emit_settings_changed, emit_status_changed};
+use crate::state::{AppState, ServeSlot, UiLang};
+use crate::ui_sink::{emit_lang_changed, emit_settings_changed, emit_status_changed};
 use crate::windows::{Show, WindowError};
 
 /// §7.1 (verbatim): the fixed hint beside an `http://` base URL. Core refuses the URL
@@ -64,8 +65,11 @@ pub const HTTPS_REQUIRED_HINT: &str = "atlas-duck requires https; if your server
 /// few KiB); core parses it and shows every certificate before anything is trusted.
 pub const CA_MAX_BYTES: usize = 1 << 20;
 /// plan text (T25): the file dialog's title and filter.
-const CA_DIALOG_TITLE: &str = "Choose the custom CA certificate file (PEM)";
-const CA_FILTER: &str = "Certificates (PEM)";
+const CA_DIALOG_TITLE: T = T::new(
+    "Choose the custom CA certificate file (PEM)",
+    "Wählen Sie die Datei des eigenen CA-Zertifikats (PEM)",
+);
+const CA_FILTER: T = T::new("Certificates (PEM)", "Zertifikate (PEM)");
 const CA_EXTENSIONS: &[&str] = &["pem", "crt", "cer"];
 
 /// plan text (T25): a base URL is at most 2 048 bytes (core normalizes and rejects the rest).
@@ -195,9 +199,18 @@ impl<'de> Deserialize<'de> for PatPurposeDto {
 /// `changes`: one to [`MAX_CHANGES`] `{key, value}` settings in `SettingChangeReq`'s own closed
 /// form. Ranges are core's to check (`SettingsError::Invalid {key}`, before anything happens),
 /// except the eight script limits (M8 Δ6, PD-139): each is bounded here too, before core is called,
-/// and a refused one is `InvalidArgument` naming the limit.
+/// and a refused one is `InvalidArgument` naming the limit. M15 T3 (PD-294): one `{key: "ui_lang",
+/// value: "auto"|"en"|"de"}` is the app's own language preference, peeled off here and never
+/// handed to core (it is not a core setting and not audited).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SettingChanges(pub Vec<SettingChangeReq>);
+pub struct SettingChanges {
+    /// Core's changes, in request order (may be empty when only `ui_lang` changes).
+    pub core: Vec<SettingChangeReq>,
+    pub ui_lang: Option<LangPref>,
+}
+
+/// The `key` of the app-side language change.
+pub const KEY_UI_LANG: &str = "ui_lang";
 
 /// The name of the first limit of `req` outside its PD-139 bound (core's own table). A limit is
 /// found by the wire key `ScriptLimitsReq` serializes, which skips the unchanged ones.
@@ -238,10 +251,26 @@ impl<'de> Deserialize<'de> for SettingChanges {
                 return Err(refuse(key));
             }
         }
-        let changes = items
-            .into_iter()
-            .map(|v| SettingChangeReq::deserialize(v).map_err(|_| bad()))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut ui_lang = None;
+        let mut changes = Vec::with_capacity(items.len());
+        for item in items {
+            if item.get("key").and_then(Value::as_str) == Some(KEY_UI_LANG) {
+                let Value::Object(fields) = &item else {
+                    return Err(bad());
+                };
+                let pref = fields
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .and_then(LangPref::parse)
+                    .filter(|_| fields.len() == 2)
+                    .ok_or_else(|| refuse::<D::Error>(KEY_UI_LANG))?;
+                if ui_lang.replace(pref).is_some() {
+                    return Err(bad());
+                }
+            } else {
+                changes.push(SettingChangeReq::deserialize(item).map_err(|_| bad())?);
+            }
+        }
         for change in &changes {
             if let SettingChangeReq::ScriptLimits(req) = change
                 && let Some(key) = script_limit_out_of_bounds(req)
@@ -249,7 +278,10 @@ impl<'de> Deserialize<'de> for SettingChanges {
                 return Err(refuse(key));
             }
         }
-        Ok(SettingChanges(changes))
+        Ok(SettingChanges {
+            core: changes,
+            ui_lang,
+        })
     }
 }
 
@@ -259,6 +291,11 @@ impl<'de> Deserialize<'de> for SettingChanges {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SettingsGetArgs {}
+
+/// `ui_lang_get {}` (read-only, every React window).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiLangGetArgs {}
 
 /// `settings_apply {changes}`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -479,6 +516,8 @@ pub struct SettingsGet {
     /// CLI is in `/usr/bin`) and when this machine has no stable install layout. Settings words
     /// its status line by it.
     pub cli_dir_on_path: Option<bool>,
+    /// M15 T3 (PD-294): the language preference and the language it resolves to (app-side).
+    pub ui_lang: UiLang,
 }
 
 /// `retest_token`'s answer: "Connected as <user>" or a fixed failure class (§10.3); the instance
@@ -568,6 +607,7 @@ pub fn settings_get_dto(
     instances: &dyn InstanceAdmin,
     confinement: ConfinementDto,
     cli: CliState,
+    ui_lang: UiLang,
 ) -> SettingsGet {
     SettingsGet {
         settings: settings.view(),
@@ -576,6 +616,7 @@ pub fn settings_get_dto(
         cli_installed: cli.installed,
         cli_removable: cli.removable,
         cli_dir_on_path: cli.dir_on_path,
+        ui_lang,
     }
 }
 
@@ -674,12 +715,44 @@ pub fn cli_uninstall_dto(
 }
 
 /// `settings_apply`: core confirms each security-weakening change natively, in request order (a
-/// `Cancel` applies none), writes the audit records first and the file last.
+/// `Cancel` applies none), writes the audit records first and the file last. M15 T3 (PD-294,
+/// review I-2): the language change is the app's and comes last, only after core committed, so a
+/// refused or cancelled request changes no language either. A language-only request never asks
+/// core to apply: it needs no serving core (`settings` is `None` then and the answer has no view).
+/// A failed language write after core committed is `Internal` (the windows re-read on
+/// `settings_changed` and see core's part).
 pub fn settings_apply_dto(
-    settings: &dyn SettingsAdmin,
+    settings: Option<&dyn SettingsAdmin>,
+    ui_lang_dir: Option<&Path>,
     changes: SettingChanges,
-) -> Result<SettingsView, CommandError> {
-    Ok(settings.apply(changes.0)?)
+) -> Result<SettingsApplied, CommandError> {
+    let view = if changes.core.is_empty() {
+        settings.map(|s| s.view())
+    } else {
+        let settings = settings.ok_or(CommandError::NotReady)?;
+        Some(settings.apply(changes.core)?)
+    };
+    let ui_lang = changes
+        .ui_lang
+        .map(|pref| apply_ui_lang(ui_lang_dir, pref))
+        .transpose()?;
+    Ok(SettingsApplied { view, ui_lang })
+}
+
+/// What [`settings_apply_dto`] did: core's view (`None` for a language-only request without a
+/// serving core) and the new language, when the request set one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsApplied {
+    pub view: Option<SettingsView>,
+    pub ui_lang: Option<UiLang>,
+}
+
+/// M15 T3 (PD-294): stores `pref` in `dir`'s `ui-lang` file and answers the new language. No
+/// folder (a state that stores nothing) or a failed write is `Internal`.
+pub fn apply_ui_lang(dir: Option<&Path>, pref: LangPref) -> Result<UiLang, CommandError> {
+    let dir = dir.ok_or(CommandError::Internal)?;
+    crate::ui_lang::store(dir, pref).map_err(|_| CommandError::Internal)?;
+    Ok(UiLang::of(pref))
 }
 
 /// Runs `apply` and says whether "allow scripts with degraded confinement" (as `read` reports it)
@@ -887,6 +960,7 @@ pub async fn settings_get<R: Runtime>(
     let report = app
         .try_state::<AppState>()
         .and_then(|s| s.probe_report().cloned());
+    let ui_lang = current_ui_lang(&app);
     let response = match core(&app) {
         Ok(core) => {
             let (settings, instances) = (core.settings(), core.instances());
@@ -897,7 +971,7 @@ pub async fn settings_get<R: Runtime>(
                 // Δ8: the setting is core's run policy as the glue reads it at each call.
                 let confinement =
                     ConfinementDto::of_probe(report.as_ref(), core.script_policy().allow_degraded);
-                let got = settings_get_dto(&*settings, &*instances, confinement, cli);
+                let got = settings_get_dto(&*settings, &*instances, confinement, cli, ui_lang);
                 // T36b: the view's health is the freshest read there is; the tray follows it.
                 crate::status::note_health(&noted, Some(got.settings.health.clone()));
                 Ok(got)
@@ -915,42 +989,87 @@ pub async fn settings_get<R: Runtime>(
 pub async fn settings_apply<R: Runtime>(
     app: AppHandle<R>,
     args: Args<SettingsApplyArgs>,
-) -> Result<SettingsView, CommandError> {
+) -> Result<Option<SettingsView>, CommandError> {
     let Args(SettingsApplyArgs { changes }) = args;
     let mut flipped = false;
-    let response = match core(&app) {
-        Ok(core) => {
-            let settings = core.settings();
-            blocking(move || {
-                // The header's `scripts_degraded` line follows this setting (T21 review I-2).
-                Ok(apply_noting_degraded(
-                    || settings.view().allow_degraded_scripts,
-                    || settings_apply_dto(&*settings, changes),
-                ))
-            })
-            .await
-            // If the blocking task itself fails (a join error) after core committed a flip, `flipped`
-            // stays false and no `status_banner` follows: accepted (T23 review m-5), the header
-            // re-reads `app_status` on its next refresh and `settings_changed` is still emitted.
-            .and_then(|(applied, flip)| {
-                flipped = flip;
-                applied
-            })
-        }
-        Err(e) => Err(e),
+    let state = app.try_state::<AppState>();
+    let dir = state
+        .as_ref()
+        .and_then(|s| s.ui_lang_dir().map(Path::to_path_buf));
+    // M15 T3 (PD-294, review I-2): a language-only request needs no serving core; any other one
+    // fails as before without one.
+    let settings = match core(&app) {
+        Ok(core) => Some(core.settings()),
+        Err(_) if changes.core.is_empty() => None,
+        Err(e) => return conclude_settings_apply(&app, Err(e), false),
     };
+    let response = blocking(move || {
+        let apply = || settings_apply_dto(settings.as_deref(), dir.as_deref(), changes);
+        Ok(match &settings {
+            // The header's `scripts_degraded` line follows this setting (T21 review I-2).
+            Some(s) => apply_noting_degraded(|| s.view().allow_degraded_scripts, apply),
+            None => (apply(), false),
+        })
+    })
+    .await
+    // If the blocking task itself fails (a join error) after core committed a flip, `flipped`
+    // stays false and no `status_banner` follows: accepted (T23 review m-5), the header
+    // re-reads `app_status` on its next refresh and `settings_changed` is still emitted.
+    .and_then(|(applied, flip)| {
+        flipped = flip;
+        applied
+    });
+    // The language switched only once everything else was applied.
+    let response = response.map(|applied| {
+        if let Some(ui) = applied.ui_lang {
+            if let Some(state) = &state {
+                state.set_ui_lang(ui);
+            }
+            emit_lang_changed(&app, ui);
+            // M15 T7 (PD-297): the credential page has no `lang_changed` grant; it re-reads its
+            // context (which carries the language) on the event it already listens to.
+            crate::credential::context_changed(&app);
+            // M15 T10: the tray, the header's status lines and the window titles are Rust's text:
+            // rebuilt now.
+            crate::windows::retitle(&app, ui.lang);
+            if let Some(state) = &state {
+                state.refresh_tray();
+            }
+            emit_status_changed(&app);
+        }
+        applied.view
+    });
     conclude_settings_apply(&app, response, flipped)
+}
+
+/// The language preference of this process: `auto` (the OS locale) without an `AppState`.
+fn current_ui_lang<R: Runtime>(app: &AppHandle<R>) -> UiLang {
+    app.try_state::<AppState>()
+        .map(|s| s.ui_lang())
+        .unwrap_or_else(|| UiLang::of(LangPref::Auto))
+}
+
+/// `ui_lang_get {}` (M15 T3, PD-294): the language preference and the language every window
+/// renders in. Needs no serving core: the setup wizard and the windows of a locked app read it too.
+#[tauri::command]
+pub async fn ui_lang_get<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<UiLangGetArgs>,
+) -> Result<UiLang, CommandError> {
+    let Args(UiLangGetArgs {}) = args;
+    let response = Ok(current_ui_lang(&app));
+    finish(&app, response)
 }
 
 /// The end of `settings_apply`: logs a failure by kind, tells the windows that settings changed
 /// (whatever core answered: it can commit and then fail) and, when "allow scripts with degraded
 /// confinement" flipped, that the status changed (`status_banner`, T21 review I-2: the header's
 /// `scripts_degraded` line follows that setting), then answers.
-pub fn conclude_settings_apply<R: Runtime>(
+pub fn conclude_settings_apply<R: Runtime, T: Serialize>(
     app: &AppHandle<R>,
-    response: Result<SettingsView, CommandError>,
+    response: Result<T, CommandError>,
     flipped: bool,
-) -> Result<SettingsView, CommandError> {
+) -> Result<T, CommandError> {
     note_failure(&response);
     emit_settings_changed(app);
     if flipped {
@@ -966,8 +1085,8 @@ fn pick_ca_file<R: Runtime>(app: &AppHandle<R>) -> Result<Vec<u8>, CommandError>
     let Some(chosen) = app
         .dialog()
         .file()
-        .set_title(CA_DIALOG_TITLE)
-        .add_filter(CA_FILTER, CA_EXTENSIONS)
+        .set_title(CA_DIALOG_TITLE.get(crate::windows::ui_lang(app)))
+        .add_filter(CA_FILTER.get(crate::windows::ui_lang(app)), CA_EXTENSIONS)
         .blocking_pick_file()
     else {
         return Err(CommandError::Admin(AdminError::Cancelled));
@@ -1152,7 +1271,13 @@ pub async fn prune_backlog_now<R: Runtime>(
 // ---------- "Prepare for removal" (§12.5, M6 T28) ----------
 
 /// plan text (T28): the title of the folder dialog the backup bundle is written into.
-const BACKUP_DIALOG_TITLE: &str = "Choose the folder for the atlas-duck backup";
+const BACKUP_DIALOG_TITLE: T = T::new(
+    "Choose the folder for the atlas-duck backup",
+    "Wählen Sie den Ordner für das Backup von atlas-duck",
+);
+
+/// The texts of this module, for [`crate::i18n::all`].
+pub const TEXTS: &[&T] = &[&CA_DIALOG_TITLE, &CA_FILTER, &BACKUP_DIALOG_TITLE];
 
 /// What the removal commands need of the serving core.
 struct Served {
@@ -1320,7 +1445,7 @@ pub(crate) fn pick_backup_folder<R: Runtime>(
     let Some(chosen) = app
         .dialog()
         .file()
-        .set_title(BACKUP_DIALOG_TITLE)
+        .set_title(BACKUP_DIALOG_TITLE.get(crate::windows::ui_lang(app)))
         .blocking_pick_folder()
     else {
         return Ok(None);
@@ -1351,6 +1476,7 @@ pub async fn removal_begin<R: Runtime>(
             served.confirmer,
             || removal_held_off(&app, &serving),
             retention,
+            crate::windows::ui_lang(&app),
         )
         .await
     }
@@ -1405,6 +1531,7 @@ pub async fn removal_finish<R: Runtime>(
             layout,
             fallback,
             || removal_held_off(&app, &serving),
+            crate::windows::ui_lang(&app),
         )
         .await
     }
@@ -1704,7 +1831,7 @@ fn pick_anchor_folder<R: Runtime>(
     let chosen = app
         .dialog()
         .file()
-        .set_title(recovery_tier::ANCHOR_DIR_DIALOG_TITLE)
+        .set_title(recovery_tier::ANCHOR_DIR_DIALOG_TITLE.get(crate::windows::ui_lang(app)))
         .blocking_pick_folder()?;
     let folder = chosen.into_path().ok()?;
     Some(RustChosenPath::from_native_dialog(folder))
@@ -1913,7 +2040,7 @@ mod tests {
                "proxy": "", "use_custom_ca": false, "is_default": true})
     }
 
-    /// The hint reaches the page through the page's own copy (`shared/strings.ts`, shown for
+    /// The hint reaches the page through the page's own copy (`shared/i18n/en/settings.ts`, shown for
     /// `admin/insecure_scheme`; the wire carries only the kind). The Rust constant, that copy and
     /// the spec's §7.1 text must be one string: each is read from its file, none is compared with
     /// itself.
@@ -1925,7 +2052,8 @@ mod tests {
         };
         let spec = read("docs/superpowers/specs/2026-10-07-atlas-duck-design.md");
         assert!(spec.contains(HTTPS_REQUIRED_HINT), "the spec (7.1) differs");
-        let page = read("app/ui/src/shared/strings.ts");
+        // M15: the English dictionary holds the page's copy (the German one translates it).
+        let page = read("app/ui/src/shared/i18n/en/settings.ts");
         assert!(
             page.contains(&format!("'{HTTPS_REQUIRED_HINT}'"))
                 || page.contains(&format!("\"{HTTPS_REQUIRED_HINT}\"")),
@@ -2114,6 +2242,7 @@ mod tests {
         );
         for (name, body) in [
             ("settings_get", field::<SettingsGetArgs>(json!({"x": 1}))),
+            ("ui_lang_get", field::<UiLangGetArgs>(json!({"x": 1}))),
             (
                 "prune",
                 field::<PruneBacklogNowArgs>(json!({"force": true})),
@@ -2161,9 +2290,12 @@ mod tests {
             {"key": "legal_hold", "value": true},
         ]}))
         .unwrap_or_else(|e| panic!("{e:?}"));
-        assert_eq!(ok.changes.0.len(), 4);
-        assert_eq!(ok.changes.0[0], SettingChangeReq::JiraCommentsCap(50));
-        assert_eq!(ok.changes.0[1], SettingChangeReq::MaxPendingBytesMb(None));
+        assert_eq!(ok.changes.core.len(), 4);
+        assert_eq!(ok.changes.core[0], SettingChangeReq::JiraCommentsCap(50));
+        assert_eq!(
+            ok.changes.core[1],
+            SettingChangeReq::MaxPendingBytesMb(None)
+        );
         let seven: Vec<Value> = (0..MAX_CHANGES)
             .map(|_| json!({"key": "legal_hold", "value": false}))
             .collect();
@@ -2198,6 +2330,62 @@ mod tests {
                 json!({"changes": [{"key": "legal_hold", "value": true}], "force": true})
             ),
             Some(FIELD_PAYLOAD)
+        );
+    }
+
+    /// M15 T3 (PD-294): `ui_lang` is peeled off for the app; core gets the rest in order. A bad
+    /// value names `ui_lang`; a second one is a malformed `changes`.
+    #[test]
+    fn ui_lang_change_is_the_apps_own() {
+        let both = parse::<SettingsApplyArgs>(&json!({"changes": [
+            {"key": "legal_hold", "value": true},
+            {"key": "ui_lang", "value": "de"},
+            {"key": "jira_comments_cap", "value": 50},
+        ]}))
+        .unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(both.changes.ui_lang, Some(LangPref::De));
+        assert_eq!(
+            both.changes.core,
+            vec![
+                SettingChangeReq::LegalHold(true),
+                SettingChangeReq::JiraCommentsCap(50)
+            ]
+        );
+        for word in ["auto", "en", "de"] {
+            let only = parse::<SettingsApplyArgs>(
+                &json!({"changes": [{"key": "ui_lang", "value": word}]}),
+            )
+            .unwrap_or_else(|e| panic!("{e:?}"));
+            assert!(only.changes.core.is_empty());
+            assert_eq!(only.changes.ui_lang.map(LangPref::as_str), Some(word));
+        }
+        for bad in [
+            json!([{"key": "ui_lang", "value": "fr"}]),
+            json!([{"key": "ui_lang", "value": "DE"}]),
+            json!([{"key": "ui_lang", "value": null}]),
+            json!([{"key": "ui_lang", "value": 1}]),
+            json!([{"key": "ui_lang"}]),
+            json!([{"key": "ui_lang", "value": "de", "extra": 1}]),
+        ] {
+            assert_eq!(
+                field::<SettingsApplyArgs>(json!({ "changes": bad.clone() })),
+                Some(KEY_UI_LANG),
+                "{bad}"
+            );
+        }
+        let twice = json!([{"key": "ui_lang", "value": "de"}, {"key": "ui_lang", "value": "en"}]);
+        assert_eq!(
+            field::<SettingsApplyArgs>(json!({ "changes": twice })),
+            Some("changes")
+        );
+        // The bound counts the language change too.
+        let mut eight: Vec<Value> = (0..MAX_CHANGES)
+            .map(|_| json!({"key": "legal_hold", "value": false}))
+            .collect();
+        eight.push(json!({"key": "ui_lang", "value": "de"}));
+        assert_eq!(
+            field::<SettingsApplyArgs>(json!({ "changes": eight })),
+            Some("changes")
         );
     }
 

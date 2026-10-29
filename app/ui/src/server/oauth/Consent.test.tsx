@@ -3,7 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { isConsentDetails, isConsentRedirect } from '../http';
 import { nav } from '../shell/RequireSession';
-import { chosenScopes, Consent, CONSENT_TEXT, ConsentError, errorText, safeRedirect } from './Consent';
+import { en } from '../../shared/i18n/dict';
+import { chosenScopes, Consent, ConsentError, errorText, safeRedirect } from './Consent';
+
+const CONSENT_TEXT = en.server.consent;
 
 vi.mock('../../shared/ipc/transport-http', () => ({ csrf: () => 'csrf-1' }));
 

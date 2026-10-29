@@ -183,7 +183,7 @@ pub struct SimHit {
 
 impl SimHit {
     /// The §6.2 Caution text: "similar to req_… executed 14:02".
-    pub fn text(&self) -> String {
+    pub fn text(&self) -> warning::WarnText {
         warning::similar_request(&self.request_id, &self.when)
     }
 }

@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 
+import { useText } from '../shared/i18n/context';
 import { errorText } from './text';
 
 export interface Action {
@@ -46,6 +47,7 @@ export function useWindowBusy(): WindowBusy {
  * same tick is dropped, and a refusal is text.
  */
 export function useAction(): Action {
+  const t = useText();
   const win = useContext(WindowBusyContext);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -72,7 +74,7 @@ export function useAction(): Action {
       } catch (e) {
         if (live.current) {
           if (onFail === undefined) {
-            setError(errorText(e));
+            setError(errorText(e, t));
           } else {
             onFail(e);
           }
@@ -84,7 +86,7 @@ export function useAction(): Action {
         if (live.current) setPending(false);
       }
     },
-    [claim, release],
+    [claim, release, t],
   );
   return { pending: pending || (win?.busy ?? false), error, run };
 }

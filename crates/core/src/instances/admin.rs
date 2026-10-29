@@ -25,6 +25,7 @@ use super::{
     AddInstance, AdminError, CaBundleReason, ConnectionFailure, ConnectionReport, InstanceAdmin,
     InstanceView,
 };
+use crate::Lang;
 use crate::config::instances::{
     InstanceConfig, add_instance, instances, is_valid_alias, set_base_url, set_proxy_setting,
 };
@@ -40,6 +41,8 @@ use crate::proxy::ProxySetting;
 
 /// §7.1 verbatim.
 const TOKEN_OWNER_CHANGE: &str = "This token belongs to ";
+/// [`TOKEN_OWNER_CHANGE`] in German (M15 T10b): "Dieses Token gehört <user>, zuvor <old>".
+const TOKEN_OWNER_CHANGE_DE: &str = "Dieses Token gehört ";
 
 /// The thread the token-owner dialog runs on (PD-13, PD-25, M3 M-6).
 pub const OWNER_CONFIRM_THREAD: &str = "atlas-duck-owner-confirm";
@@ -69,9 +72,10 @@ fn config_write_error(e: ConfigWriteError) -> AdminError {
     }
 }
 
-fn confirmed(text: &str) -> Confirmed {
+fn confirmed(lang: crate::Lang, text: &str) -> Confirmed {
     Confirmed {
         dialog_text_sha256: Sha256::digest(text.as_bytes()).into(),
+        dialog_lang: Some(crate::dialog_lang(lang)),
     }
 }
 
@@ -83,53 +87,89 @@ fn product_name(p: Product) -> &'static str {
 }
 
 /// `Warning: <host> is a loopback address.` / `... an IP address.` (§7.1).
-fn host_warnings(host: &str) -> Option<String> {
+fn host_warnings(lang: Lang, host: &str) -> Option<String> {
     let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = || match lang {
+        Lang::En => format!("Warning: {host} is a loopback address."),
+        Lang::De => format!("Warnung: {host} ist eine Loopback-Adresse."),
+    };
     match bare.parse::<IpAddr>() {
-        Ok(ip) if ip.is_loopback() => Some(format!("Warning: {host} is a loopback address.")),
-        Err(_) if bare.eq_ignore_ascii_case("localhost") => {
-            Some(format!("Warning: {host} is a loopback address."))
-        }
-        Ok(_) => Some(format!("Warning: {host} is an IP address.")),
+        Ok(ip) if ip.is_loopback() => Some(loopback()),
+        Err(_) if bare.eq_ignore_ascii_case("localhost") => Some(loopback()),
+        Ok(_) => Some(match lang {
+            Lang::En => format!("Warning: {host} is an IP address."),
+            Lang::De => format!("Warnung: {host} ist eine IP-Adresse."),
+        }),
         Err(_) => None,
     }
 }
 
 /// §10.3: the text of the add dialog. The warnings come first: the URL is attacker-sized (a long
 /// percent-encoded path) and a native message box cuts what does not fit (M6 T25 review I-2).
-pub(crate) fn add_text(product: Product, alias: &str, origin: &NormalizedBaseUrl) -> String {
+pub(crate) fn add_text(
+    lang: Lang,
+    product: Product,
+    alias: &str,
+    origin: &NormalizedBaseUrl,
+) -> String {
     let mut text = String::new();
-    if let Some(w) = host_warnings(origin.host()) {
+    if let Some(w) = host_warnings(lang, origin.host()) {
         text.push_str(&w);
         text.push('\n');
     }
-    text.push_str(&format!(
-        "Add {} instance \"{alias}\" at {}?",
-        product_name(product),
-        origin.as_str()
-    ));
+    text.push_str(&match lang {
+        Lang::En => format!(
+            "Add {} instance \"{alias}\" at {}?",
+            product_name(product),
+            origin.as_str()
+        ),
+        Lang::De => format!(
+            "{}-Instanz \"{alias}\" unter {} hinzufügen?",
+            product_name(product),
+            origin.as_str()
+        ),
+    });
     text
 }
 
 /// §10.3: the text of the URL-change dialog; the warnings come first (see [`add_text`]).
-pub(crate) fn change_text(alias: &str, old: &NormalizedBaseUrl, new: &NormalizedBaseUrl) -> String {
+pub(crate) fn change_text(
+    lang: Lang,
+    alias: &str,
+    old: &NormalizedBaseUrl,
+    new: &NormalizedBaseUrl,
+) -> String {
     let mut text = String::new();
-    if let Some(w) = host_warnings(new.host()) {
+    if let Some(w) = host_warnings(lang, new.host()) {
         text.push_str(&w);
         text.push('\n');
     }
     if old.host() != new.host() {
-        text.push_str(&format!(
-            "Warning: the host changes from {} to {}.\n",
-            old.host(),
-            new.host()
-        ));
+        text.push_str(&match lang {
+            Lang::En => format!(
+                "Warning: the host changes from {} to {}.\n",
+                old.host(),
+                new.host()
+            ),
+            Lang::De => format!(
+                "Warnung: Der Host ändert sich von {} zu {}.\n",
+                old.host(),
+                new.host()
+            ),
+        });
     }
-    text.push_str(&format!(
-        "Change \"{alias}\" from {} to {}? The stored token will be deleted.",
-        old.as_str(),
-        new.as_str()
-    ));
+    text.push_str(&match lang {
+        Lang::En => format!(
+            "Change \"{alias}\" from {} to {}? The stored token will be deleted.",
+            old.as_str(),
+            new.as_str()
+        ),
+        Lang::De => format!(
+            "\"{alias}\" von {} auf {} ändern? Das gespeicherte Token wird gelöscht.",
+            old.as_str(),
+            new.as_str()
+        ),
+    });
     text
 }
 
@@ -249,26 +289,47 @@ const CA_LISTED: usize = 5;
 
 /// §10.3: the text of the custom-CA dialog: the bundle fingerprint, then for each certificate
 /// its subject, issuer, validity and own SHA-256 (review I-5).
-pub(crate) fn ca_text(alias: &str, bundle: &CaBundle) -> String {
+pub(crate) fn ca_text(lang: Lang, alias: &str, bundle: &CaBundle) -> String {
     let n = bundle.certs.len();
-    let mut text = format!(
-        "Trust the custom CA for \"{alias}\"? {n} certificate{}, bundle SHA-256 {}.",
-        if n == 1 { "" } else { "s" },
-        bundle.fingerprint
-    );
+    let mut text = match lang {
+        Lang::En => format!(
+            "Trust the custom CA for \"{alias}\"? {n} certificate{}, bundle SHA-256 {}.",
+            if n == 1 { "" } else { "s" },
+            bundle.fingerprint
+        ),
+        Lang::De => format!(
+            "Der eigenen CA für \"{alias}\" vertrauen? {n} {}, Bündel-SHA-256 {}.",
+            if n == 1 { "Zertifikat" } else { "Zertifikate" },
+            bundle.fingerprint
+        ),
+    };
     for (i, c) in bundle.certs.iter().take(CA_LISTED).enumerate() {
-        text.push_str(&format!(
-            "\nCertificate {} of {n}\n  Subject: {}\n  Issuer: {}\n  Valid: {} to {}\n  SHA-256: {}",
-            i + 1,
-            shown(&c.subject),
-            shown(&c.issuer),
-            c.not_before,
-            c.not_after,
-            c.sha256
-        ));
+        text.push_str(&match lang {
+            Lang::En => format!(
+                "\nCertificate {} of {n}\n  Subject: {}\n  Issuer: {}\n  Valid: {} to {}\n  SHA-256: {}",
+                i + 1,
+                shown(&c.subject),
+                shown(&c.issuer),
+                c.not_before,
+                c.not_after,
+                c.sha256
+            ),
+            Lang::De => format!(
+                "\nZertifikat {} von {n}\n  Inhaber: {}\n  Aussteller: {}\n  Gültig: {} bis {}\n  SHA-256: {}",
+                i + 1,
+                shown(&c.subject),
+                shown(&c.issuer),
+                c.not_before,
+                c.not_after,
+                c.sha256
+            ),
+        });
     }
     if n > CA_LISTED {
-        text.push_str(&format!("\n... and {} more certificates.", n - CA_LISTED));
+        text.push_str(&match lang {
+            Lang::En => format!("\n... and {} more certificates.", n - CA_LISTED),
+            Lang::De => format!("\n... und {} weitere Zertifikate.", n - CA_LISTED),
+        });
     }
     text
 }
@@ -345,8 +406,12 @@ impl CoreInstances {
     }
 
     /// Applies a setting unless the audit settings already say so (an unchanged value is
-    /// `AuditError::Invalid` in the store); `text` is the confirmation dialog shown for it.
-    fn apply(&self, change: SettingChange, text: Option<&str>) -> Result<(), AdminError> {
+    /// `AuditError::Invalid` in the store); `text` is the confirmation dialog shown for it, with the language it was built in.
+    fn apply(
+        &self,
+        change: SettingChange,
+        text: Option<(crate::Lang, &str)>,
+    ) -> Result<(), AdminError> {
         let settings = self.settings();
         let (id, current, new) = match &change {
             SettingChange::InstanceOrigin {
@@ -387,7 +452,7 @@ impl CoreInstances {
         }
         self.engine
             .port()
-            .apply_setting(change, text.map(confirmed))
+            .apply_setting(change, text.map(|(lang, t)| confirmed(lang, t)))
             .map(|_| ())
             .map_err(AdminError::Audit)
     }
@@ -527,14 +592,15 @@ impl CoreInstances {
         if stored.as_deref() == Some(bundle.fingerprint.as_str()) {
             return Ok(());
         }
-        let text = ca_text(&rt.alias, &bundle);
+        let lang = self.engine.confirmer().lang();
+        let text = ca_text(lang, &rt.alias, &bundle);
         self.confirm(&text)?;
         self.apply(
             SettingChange::InstanceCaFingerprint {
                 instance_id: id.to_owned(),
                 fingerprint: Some(bundle.fingerprint),
             },
-            Some(&text),
+            Some((lang, &text)),
         )
     }
 
@@ -553,7 +619,8 @@ impl CoreInstances {
         if old == new {
             return Ok(());
         }
-        let text = change_text(&rt.alias, &old, &new);
+        let lang = self.engine.confirmer().lang();
+        let text = change_text(lang, &rt.alias, &old, &new);
         self.confirm(&text)?;
         if let Some(url) = file_url {
             let path = self.path()?;
@@ -568,7 +635,7 @@ impl CoreInstances {
                 instance_id: id.clone(),
                 origin: Some(new.as_str()),
             },
-            Some(&text),
+            Some((lang, &text)),
         )?;
         // The origin is committed from here on: the runtime follows it whatever else fails
         // (review I-4), and the first error is reported afterwards.
@@ -741,11 +808,12 @@ impl InstanceAdmin for CoreInstances {
     fn add(&self, req: AddInstance) -> Result<InstanceView, AdminError> {
         let _job = self.enter()?;
         let (origin, path, ca) = self.validate_add(&req)?;
-        let text = add_text(req.product, &req.alias, &origin);
+        let lang = self.engine.confirmer().lang();
+        let text = add_text(lang, req.product, &req.alias, &origin);
         self.confirm(&text)?;
         let ca_dialog = match &ca {
             Some((bundle, _)) => {
-                let t = ca_text(&req.alias, bundle);
+                let t = ca_text(lang, &req.alias, bundle);
                 self.confirm(&t)?;
                 Some(t)
             }
@@ -771,7 +839,7 @@ impl InstanceAdmin for CoreInstances {
                 instance_id: id.clone(),
                 origin: Some(origin.as_str()),
             },
-            Some(&text),
+            Some((lang, &text)),
         )?;
         if let (Some((bundle, _)), Some(t)) = (&ca, &ca_dialog) {
             self.apply(
@@ -779,7 +847,7 @@ impl InstanceAdmin for CoreInstances {
                     instance_id: id.clone(),
                     fingerprint: Some(bundle.fingerprint.clone()),
                 },
-                Some(t),
+                Some((lang, t.as_str())),
             )?;
         }
         if req.proxy != ProxySetting::Os {
@@ -821,14 +889,15 @@ impl InstanceAdmin for CoreInstances {
         let (Some(id), Some(origin)) = (rt.id.clone(), rt.base.clone()) else {
             return Err(AdminError::ConfigReadOnly);
         };
-        let text = add_text(rt.product, &rt.alias, &origin);
+        let lang = self.engine.confirmer().lang();
+        let text = add_text(lang, rt.product, &rt.alias, &origin);
         self.confirm(&text)?;
         self.apply(
             SettingChange::InstanceOrigin {
                 instance_id: id.clone(),
                 origin: Some(origin.as_str()),
             },
-            Some(&text),
+            Some((lang, &text)),
         )?;
         // The origin is committed: the table follows it even when the CA dialog is cancelled
         // (the unconfirmed CA then stays untrusted, review I-4).
@@ -915,9 +984,12 @@ impl InstanceAdmin for CoreInstances {
             .is_some_and(|o| o.identity.atlassian_user_key != tested.user_key);
         if let (true, Some(o)) = (other_user, &old) {
             // Both names come from servers: escaped like any text an approver reads (I-6).
+            let lang = self.engine.confirmer().lang();
             let text = format!(
-                "{TOKEN_OWNER_CHANGE}{}, previously {}",
+                "{}{}, {} {}",
+                lang.pick(TOKEN_OWNER_CHANGE, TOKEN_OWNER_CHANGE_DE),
                 shown(&tested.user),
+                lang.pick("previously", "zuvor"),
                 shown(&o.identity.atlassian_user)
             );
             let confirmer = self.engine.confirmer().clone();
@@ -1145,6 +1217,40 @@ mod tests {
         assert_eq!(local_date(now, Some(60)), day + chrono::Days::new(1));
     }
 
+    /// M15 T10b: the instance dialogs in German.
+    #[test]
+    fn instance_dialogs_in_german() {
+        let url = |s: &str| {
+            crate::instances::state::normalize_origin(s, false).unwrap_or_else(|e| panic!("{e:?}"))
+        };
+        assert_eq!(
+            add_text(
+                Lang::De,
+                Product::Jira,
+                "work",
+                &url("https://jira.example/jira")
+            ),
+            "Jira-Instanz \"work\" unter https://jira.example/jira hinzufügen?"
+        );
+        let local = add_text(
+            Lang::De,
+            Product::Confluence,
+            "w",
+            &url("https://localhost/wiki"),
+        );
+        assert!(
+            local.starts_with("Warnung: localhost ist eine Loopback-Adresse.\n"),
+            "{local}"
+        );
+        let change = change_text(
+            Lang::De,
+            "work",
+            &url("https://a.example/jira"),
+            &url("https://b.example/jira"),
+        );
+        assert!(change.starts_with("Warnung: Der Host ändert sich von a.example zu b.example.\n"));
+        assert!(change.ends_with("Das gespeicherte Token wird gelöscht."));
+    }
     #[test]
     fn dialog_names_are_escaped_capped_and_flagged() {
         assert_eq!(shown("alice"), "alice");
@@ -1192,7 +1298,7 @@ mod tests {
             certs: (0..7).map(|i| cert(&format!("CN=Root {i}"))).collect(),
             fingerprint: "cd".repeat(32),
         };
-        let text = ca_text("corp", &bundle);
+        let text = ca_text(Lang::En, "corp", &bundle);
         assert!(text.starts_with("Trust the custom CA for \"corp\"? 7 certificates"));
         assert!(text.contains(&"cd".repeat(32)));
         assert!(text.contains("Subject: CN=Root 0") && text.contains("Subject: CN=Root 4"));
@@ -1203,7 +1309,7 @@ mod tests {
             certs: vec![cert("CN=x\nSubject: CN=Trusted Corp")],
             fingerprint: "cd".repeat(32),
         };
-        let text = ca_text("corp", &hostile);
+        let text = ca_text(Lang::En, "corp", &hostile);
         let lines = text
             .lines()
             .filter(|l| l.trim_start().starts_with("Subject:"));

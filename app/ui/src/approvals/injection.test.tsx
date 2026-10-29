@@ -67,6 +67,8 @@ const DISCRIMINANTS = new Set([
   // page sends back with "Forget"; a `free` run keeps it valid so the list, the buttons and the
   // `forgotten` answer are reached. The per-path pass poisons it, and `all` poisons it with everything.
   'install_id',
+  // M15 T3: the UI language preference and the language it resolves to (closed words).
+  'pref', 'lang',
 ]);
 
 /** The one discriminator path a `free` run poisons as well (the per-path prototype pass), or null. */
@@ -420,7 +422,7 @@ async function emit(name: string, payload: Json): Promise<void> {
  * Every event a window listened for, sent with a poisoned payload too (M6 T31 M-3): a payload that is
  * the string, one that is a record with the string in every field, and a record holding the
  * prototype keys. Most listeners take the event as a trigger and never read it; the ones that do
- * (udit_job, window_focus) check it first, and what they do not accept must change nothing.
+ * (audit_job, window_focus) check it first, and what they do not accept must change nothing.
  */
 async function poisonedEvents(): Promise<void> {
   // Discriminators valid (a `free` pass keeps them), so a record that skips its own check reaches the bar.

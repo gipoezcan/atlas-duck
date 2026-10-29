@@ -3,6 +3,8 @@
 // these types and the validators honest against them. Later tasks widen them
 // when the Rust DTOs change.
 
+import type { Lang, LangPref } from '../i18n';
+
 export interface CandidateRev {
   counter: number;
   candidate_hash: string;
@@ -26,7 +28,11 @@ export interface QueueItem {
   reason_excerpt: string | null;
   /** Hex SHA-256 of the session key (PD-86); the key itself never reaches the UI. */
   session_id: string;
-  /** "<agent> · <cwd>": agent-supplied text, display-escaped. */
+  /** The session's agent name, display-escaped; `null` when the agent sent none (the UI words that). */
+  session_agent_name: string | null;
+  /** The session's cwd basename, display-escaped. */
+  session_cwd: string;
+  /** The English "<agent> · <cwd>", kept for older readers; the UI composes its own from the two above. */
   session_label: string;
   similar_to: string | null;
   stale: boolean;
@@ -295,6 +301,10 @@ export type AttentionMode = 'show_without_activating' | 'badge_only' | 'show_and
 export interface ConfigBanner {
   kind: 'read_only' | 'unreadable';
   text: string;
+  /** M15 T10: the facts `text` is built from: the writer's `vX` (`null`: a newer atlas-duck) and
+   * whether the file was parsed at all. */
+  version?: string | null;
+  parsed?: boolean;
 }
 
 /** The eight §9.4 script limits (M8 Δ6, PD-139), the values in force. */
@@ -382,6 +392,14 @@ export interface SettingsGet {
    * tell where it is installed.
    */
   cli_dir_on_path: boolean | null;
+  /** M15 T3: the desktop language preference and the language it resolves to (app-side). */
+  ui_lang: UiLang;
+}
+
+/** `ui_lang_get`'s answer and `lang_changed`'s payload (M15 T3, PD-294). */
+export interface UiLang {
+  pref: LangPref;
+  lang: Lang;
 }
 
 /** One `settings_apply` change, in core's closed `{key, value}` form (`SettingChangeReq`). */
@@ -395,7 +413,9 @@ export type SettingChange =
   | { key: 'legal_hold'; value: boolean }
   /** The keys to change only; the others stay (Rust confirms a raise natively). */
   | { key: 'script_limits'; value: Partial<ScriptLimits> }
-  | { key: 'allow_degraded_scripts'; value: boolean };
+  | { key: 'allow_degraded_scripts'; value: boolean }
+  /** M15 T3 (PD-294): the app's own language preference; Rust never hands it to core. */
+  | { key: 'ui_lang'; value: LangPref };
 
 /** `instance_add`: no CA bytes or path ever (`use_custom_ca` makes Rust open its own file dialog). */
 export interface InstanceAddArgs {

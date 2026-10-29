@@ -16,7 +16,8 @@ import {
 } from '../shared/ipc/invoke';
 import type { Preview, QueueItem, RecentItem, StatusLine } from '../shared/ipc/types';
 import { App } from './App';
-import { Queue } from './Queue';
+import { Queue, sessionLabel } from './Queue';
+import { de, en } from '../shared/i18n/dict';
 
 vi.mock('../shared/ipc/invoke', () => ({
   queueList: vi.fn(),
@@ -45,7 +46,8 @@ describe('Queue', () => {
           item({
             agent_name: hostile,
             reason_excerpt: '<b>why</b>',
-            session_label: 'x · <i>dir</i>',
+            session_agent_name: 'x',
+            session_cwd: '<i>dir</i>',
             possible_duplicate_of: null,
           }),
         ]}
@@ -75,7 +77,8 @@ describe('Queue', () => {
     const other = item({
       request_id: 'req_abcdefghij0123456789',
       session_id: SESSION_B,
-      session_label: 'other-agent · elsewhere',
+      session_agent_name: 'other-agent',
+      session_cwd: 'elsewhere',
       possible_duplicate_of: null,
     });
     const flagged = item({ similar_to: 'req_zzzzzzzzzzzzzzzzzzzz' });
@@ -167,8 +170,8 @@ describe('Queue', () => {
     render(
       <Queue
         items={[
-          item({ session_id: SESSION_A, session_label: 'agent-a', possible_duplicate_of: null }),
-          item({ request_id: 'req_otherotherotherother', session_id: SESSION_B, session_label: 'agent-b', possible_duplicate_of: null }),
+          item({ session_id: SESSION_A, session_agent_name: 'agent-a', possible_duplicate_of: null }),
+          item({ request_id: 'req_otherotherotherother', session_id: SESSION_B, session_agent_name: 'agent-b', possible_duplicate_of: null }),
         ]}
       />,
     );
@@ -197,6 +200,13 @@ describe('Queue', () => {
   it('empty_queue_says_so', () => {
     render(<Queue items={[]} />);
     expect(screen.getByText('No pending requests')).toBeTruthy();
+  });
+
+  it('a_nameless_session_is_worded_by_the_ui_in_its_language', () => {
+    const nameless = item({ session_agent_name: null, session_cwd: 'dir' });
+    expect(sessionLabel(nameless, en)).toBe('(no agent name) · dir');
+    expect(sessionLabel(nameless, de)).toBe('(kein Agentenname) · dir');
+    expect(sessionLabel(item({ session_agent_name: 'bot', session_cwd: 'dir' }), de)).toBe('bot · dir');
   });
 });
 

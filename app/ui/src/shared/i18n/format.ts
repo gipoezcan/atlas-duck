@@ -1,0 +1,90 @@
+import type { Lang } from './index';
+
+const LOCALE: Record<Lang, string> = { en: 'en-US', de: 'de-DE' };
+
+const DE_DATE_TIME = new Intl.DateTimeFormat('de-DE', {
+  timeZone: 'UTC',
+  day: '2-digit',
+  month: '2-digit',
+  year: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+  hourCycle: 'h23',
+});
+
+const DE_DATE_TIME_SECONDS = new Intl.DateTimeFormat('de-DE', {
+  timeZone: 'UTC',
+  day: '2-digit',
+  month: '2-digit',
+  year: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hourCycle: 'h23',
+});
+
+/** `precise` keeps the seconds (and a fractional part the source has): for a forensic view. */
+export interface TimeOptions {
+  precise?: boolean;
+}
+
+/**
+ * A Unix time in seconds as UTC date and time with the suffix " UTC" (PD-298):
+ * `1970-01-01 00:00 UTC` in English, `01.01.1970, 00:00 UTC` in German. With
+ * `precise` the seconds are shown too (`00:00:00`).
+ */
+export function formatDateTime(lang: Lang, secs: number, options: TimeOptions = {}): string {
+  const date = new Date(secs * 1000);
+  const precise = options.precise === true;
+  if (lang === 'de') return `${(precise ? DE_DATE_TIME_SECONDS : DE_DATE_TIME).format(date)} UTC`;
+  return `${date.toISOString().replace('T', ' ').slice(0, precise ? 19 : 16)} UTC`;
+}
+
+/**
+ * An RFC 3339 timestamp as UTC date and time (see formatDateTime); text that is not one is returned
+ * as it is. With `precise` a fractional second of the source is kept (`00:00:00.125`).
+ */
+export function formatTimestamp(lang: Lang, rfc3339: string, options: TimeOptions = {}): string {
+  const ms = Date.parse(rfc3339);
+  if (Number.isNaN(ms)) return rfc3339;
+  const text = formatDateTime(lang, Math.floor(ms / 1000), options);
+  const fraction = options.precise === true ? /:\d{2}\.(\d+)(?:Z|[+-]\d{2}:\d{2})$/.exec(rfc3339)?.[1] : undefined;
+  return fraction === undefined ? text : text.replace(/ UTC$/, `.${fraction} UTC`);
+}
+
+/** A `YYYY-MM-DD` date as a window shows it: German `DD.MM.YYYY`; English and anything else as written. */
+export function formatIsoDate(lang: Lang, date: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+  return lang === 'de' && m !== null ? `${m[3]}.${m[2]}.${m[1]}` : date;
+}
+
+export function formatNumber(lang: Lang, n: number): string {
+  return new Intl.NumberFormat(LOCALE[lang]).format(n);
+}
+
+/** `table`: a column of sizes: a unit always shows one decimal ("1.0 KiB") and bytes below 1 KiB are not grouped. */
+export interface BytesOptions {
+  table?: boolean;
+}
+
+/**
+ * A byte count with a 1024-based unit (B, KiB, MiB, GiB, TiB) and at most one
+ * decimal. The unit is chosen after rounding: 1048575 B is "1 MiB", never
+ * "1,024 KiB".
+ */
+export function formatBytes(lang: Lang, n: number, options: BytesOptions = {}): string {
+  const table = options.table === true;
+  const format = new Intl.NumberFormat(LOCALE[lang], {
+    maximumFractionDigits: 1,
+    ...(table ? { minimumFractionDigits: 1 } : {}),
+  });
+  if (n < 1024) return `${table ? String(n) : format.format(n)} B`;
+  const units = ['KiB', 'MiB', 'GiB', 'TiB'];
+  let value = n / 1024;
+  let unit = 0;
+  while (Math.round(value * 10) >= 10240 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${format.format(value)} ${units[unit]}`;
+}

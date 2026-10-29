@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use atlas_duck_audit::Store;
+use atlas_duck_core::Lang;
 use atlas_duck_core::decision::DecisionApi;
 use atlas_duck_core::decision::audit_wire::{
     self, AuditPayloadArgs, AuditQueryArgs, AuditReadError, AuditStatusArgs, AuditTrailArgs,
@@ -159,7 +160,13 @@ fn json<T: Serialize>(v: T) -> Result<Value, CmdError> {
 }
 
 /// Runs one command (blocking: `DecisionApi` is synchronous, PD-13).
-pub fn dispatch(d: &dyn DecisionApi, cmd: &str, body: &Value) -> Result<Value, CmdError> {
+/// M15 T10b: `lang` is the reader's language for the preview document's own text.
+pub fn dispatch(
+    d: &dyn DecisionApi,
+    cmd: &str,
+    body: &Value,
+    lang: Lang,
+) -> Result<Value, CmdError> {
     match cmd {
         "queue_list" => {
             let QueueListArgs {} = args(body)?;
@@ -229,7 +236,7 @@ pub fn dispatch(d: &dyn DecisionApi, cmd: &str, body: &Value) -> Result<Value, C
             let delivery = d
                 .preview_fetch(request_id.as_str(), candidate_rev.map(|r| r.0))
                 .map_err(CmdError::from_candidate_read)?;
-            json(preview_fetch_response(delivery))
+            json(preview_fetch_response(delivery, lang))
         }
         "raw_page" => {
             let RawPageArgs {
@@ -252,7 +259,12 @@ pub fn dispatch(d: &dyn DecisionApi, cmd: &str, body: &Value) -> Result<Value, C
 
 /// One audit read of the user's own store (M14 T16), the desktop's DTOs (`core::decision::
 /// audit_wire`). The payload document is built for the web (`Platform::current()` of the server).
-pub fn dispatch_audit(store: &Store, cmd: &str, body: &Value) -> Result<Value, CmdError> {
+pub fn dispatch_audit(
+    store: &Store,
+    cmd: &str,
+    body: &Value,
+    lang: Lang,
+) -> Result<Value, CmdError> {
     match cmd {
         "audit_query" => {
             let a: AuditQueryArgs = args(body)?;
@@ -269,6 +281,7 @@ pub fn dispatch_audit(store: &Store, cmd: &str, body: &Value) -> Result<Value, C
                 seq,
                 page.unwrap_or(0),
                 Platform::current(),
+                lang,
             )?)
         }
         "audit_status" => {
@@ -280,21 +293,31 @@ pub fn dispatch_audit(store: &Store, cmd: &str, body: &Value) -> Result<Value, C
 }
 
 /// [`dispatch_audit`] on the blocking pool.
-pub async fn run_audit(store: Store, cmd: String, body: Value) -> Result<Value, CmdError> {
+pub async fn run_audit(
+    store: Store,
+    cmd: String,
+    body: Value,
+    lang: Lang,
+) -> Result<Value, CmdError> {
     if !AUDIT_COMMANDS.contains(&cmd.as_str()) {
         return Err(CmdError::UnknownCommand);
     }
-    tokio::task::spawn_blocking(move || dispatch_audit(&store, &cmd, &body))
+    tokio::task::spawn_blocking(move || dispatch_audit(&store, &cmd, &body, lang))
         .await
         .unwrap_or(Err(CmdError::Internal))
 }
 
 /// [`dispatch`] on the blocking pool.
-pub async fn run(d: Arc<dyn DecisionApi>, cmd: String, body: Value) -> Result<Value, CmdError> {
+pub async fn run(
+    d: Arc<dyn DecisionApi>,
+    cmd: String,
+    body: Value,
+    lang: Lang,
+) -> Result<Value, CmdError> {
     if !SERVER_COMMANDS.contains(&cmd.as_str()) {
         return Err(CmdError::UnknownCommand);
     }
-    tokio::task::spawn_blocking(move || dispatch(d.as_ref(), &cmd, &body))
+    tokio::task::spawn_blocking(move || dispatch(d.as_ref(), &cmd, &body, lang))
         .await
         .unwrap_or(Err(CmdError::Internal))
 }

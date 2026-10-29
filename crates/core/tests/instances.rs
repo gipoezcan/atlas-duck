@@ -540,6 +540,7 @@ async fn install(
         },
         Some(Confirmed {
             dialog_text_sha256: [1; 32],
+            dialog_lang: None,
         }),
     )?;
     let creds = Arc::new(KeychainCredentials::new(keys.clone()));
@@ -1457,6 +1458,7 @@ async fn start_fails_closed_when_the_derivation_panics() -> TestResult {
         },
         Some(Confirmed {
             dialog_text_sha256: [1; 32],
+            dialog_lang: None,
         }),
     )?;
     let creds: Arc<dyn CredentialProvider> = Arc::new(PanickingCreds);

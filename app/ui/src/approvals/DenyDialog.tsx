@@ -2,21 +2,24 @@ import { useEffect, useId, useRef, useState, type KeyboardEvent } from 'react';
 
 import type { DenyDetails } from '../shared/ipc/invoke';
 import type { DenyOffer, DenyOfferKind } from '../shared/ipc/types';
-import { DENY_TEXT } from '../shared/strings';
+import { useText } from '../shared/i18n/context';
+import type { Dict } from '../shared/i18n';
 
 /** plan text (PD-66): a reason is at most 1 000 characters; Rust re-validates. */
 const REASON_MAX = 1_000;
 
 /** The label of each offer and of its optional part (PD-70). */
-const OFFER_TEXT: Record<DenyOfferKind, { label: string; detail: string | null }> = {
-  upstream_http: { label: DENY_TEXT.upstream_http, detail: DENY_TEXT.upstream_http_detail },
-  outcome_hint: { label: DENY_TEXT.outcome_hint, detail: null },
+function offerText(t: Dict): Record<DenyOfferKind, { label: string; detail: string | null }> {
+  return {
+  upstream_http: { label: t.approvals.deny.upstream_http, detail: t.approvals.deny.upstream_http_detail },
+  outcome_hint: { label: t.approvals.deny.outcome_hint, detail: null },
   resolution_failed: {
-    label: DENY_TEXT.resolution_failed,
-    detail: DENY_TEXT.resolution_failed_detail,
+    label: t.approvals.deny.resolution_failed,
+    detail: t.approvals.deny.resolution_failed_detail,
   },
-  missing_fields: { label: DENY_TEXT.missing_fields, detail: DENY_TEXT.missing_fields_detail },
-};
+  missing_fields: { label: t.approvals.deny.missing_fields, detail: t.approvals.deny.missing_fields_detail },
+  };
+}
 
 /** The `deny_details` wire value of an offer kind, its optional part ticked or not. */
 export function denyDetailsOf(kind: DenyOfferKind, withDetail: boolean): DenyDetails {
@@ -55,6 +58,8 @@ export function DenyDialog({ offers, prefill, busy, focusToken, onSubmit, onCanc
   const [withDetail, setWithDetail] = useState(false);
   const field = useRef<HTMLInputElement>(null);
   const ids = useId();
+  const t = useText();
+  const OFFER_TEXT = offerText(t);
 
   useEffect(() => {
     field.current?.focus();
@@ -88,8 +93,8 @@ export function DenyDialog({ offers, prefill, busy, focusToken, onSubmit, onCanc
   };
 
   return (
-    <div className="deny-dialog" role="group" aria-label={DENY_TEXT.label}>
-      <label htmlFor={`${ids}-reason`}>{DENY_TEXT.reason}</label>
+    <div className="deny-dialog" role="group" aria-label={t.approvals.deny.label}>
+      <label htmlFor={`${ids}-reason`}>{t.approvals.deny.reason}</label>
       <input
         id={`${ids}-reason`}
         ref={field}
@@ -101,13 +106,13 @@ export function DenyDialog({ offers, prefill, busy, focusToken, onSubmit, onCanc
         onKeyDown={onKeyDown}
       />
       <span id={`${ids}-keys`} className="deny-keys">
-        {DENY_TEXT.keys}
+        {t.approvals.deny.keys}
       </span>
       {offers.length === 0 ? null : (
         <fieldset className="deny-offers" aria-describedby={`${ids}-one`}>
-          <legend>{DENY_TEXT.offers}</legend>
+          <legend>{t.approvals.deny.offers}</legend>
           <span id={`${ids}-one`} className="deny-keys">
-            {DENY_TEXT.offers_one}
+            {t.approvals.deny.offers_one}
           </span>
           {offers.map((offer) => {
             const text = OFFER_TEXT[offer.kind];
@@ -139,10 +144,10 @@ export function DenyDialog({ offers, prefill, busy, focusToken, onSubmit, onCanc
         </fieldset>
       )}
       <button type="button" disabled={busy} onClick={submit}>
-        {DENY_TEXT.submit}
+        {t.approvals.deny.submit}
       </button>
       <button type="button" onClick={onCancel}>
-        {DENY_TEXT.cancel}
+        {t.approvals.deny.cancel}
       </button>
     </div>
   );

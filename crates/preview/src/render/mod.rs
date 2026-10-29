@@ -41,6 +41,7 @@ pub use audit::{
 pub use raw::{RawDisplay, raw_display, raw_display_last};
 
 use crate::invisible;
+use crate::lang::Lang;
 use crate::model::{ItemCount, Preview};
 use crate::sanitize::{Platform, iframe_document, sanitize_html};
 use crate::warning::{Level, Warning, WarningId};
@@ -76,35 +77,53 @@ pub const DOC_SCRIPT_STDERR_BYTES: usize = 128 << 10;
 
 /// plan text (PD-67): "N more rows / lines not shown here; see Structured or Raw", with the unit
 /// of what was left out.
-pub fn more_not_shown(n: u64, unit: &str) -> String {
-    format!("{n} more {unit} not shown here; see Structured or Raw")
+pub fn more_not_shown(lang: Lang, n: u64, unit: &str) -> String {
+    match lang {
+        Lang::En => format!("{n} more {unit} not shown here; see Structured or Raw"),
+        Lang::De => format!(
+            "{} weitere {} werden hier nicht angezeigt; siehe Strukturiert oder Roh",
+            lang.count(n),
+            lang.unit(unit)
+        ),
+    }
 }
 
 /// [`more_not_shown`] for a script's own sections (T18 review I-2): the source, Host calls, logs
 /// and stderr are in no other tab, the audit record has them.
-pub fn more_in_audit_record(n: u64, unit: &str) -> String {
-    format!("{n} more {unit} not shown here; the audit record keeps the full text")
+pub fn more_in_audit_record(lang: Lang, n: u64, unit: &str) -> String {
+    match lang {
+        Lang::En => format!("{n} more {unit} not shown here; the audit record keeps the full text"),
+        Lang::De => format!(
+            "{} weitere {} werden hier nicht angezeigt; der Audit-Datensatz enthält den vollständigen Text",
+            lang.count(n),
+            lang.unit(unit)
+        ),
+    }
 }
 
 /// The whole `srcdoc` document for `p` (Δ5).
-pub fn document(p: &Preview, platform: Platform) -> String {
-    let mut body = Doc::default();
+pub fn document(lang: Lang, p: &Preview, platform: Platform) -> String {
+    let mut body = Doc::default().in_lang(lang);
     body::body(&mut body, &p.body);
     // The header's own caps (a list past its row cap, a text past the budget) count too: its
     // "hidden in preview" value is written once the header is done.
-    let mut head = Doc::default();
+    let mut head = Doc::default().in_lang(lang);
     let hidden_at = header(&mut head, p);
     let hidden = p
         .header
         .hidden_in_preview_bytes
         .saturating_add(body.cut)
         .saturating_add(head.cut);
-    head.out.insert_str(hidden_at, &format!("{hidden} bytes"));
+    let hidden_text = match lang {
+        Lang::En => format!("{hidden} bytes"),
+        Lang::De => format!("{} Bytes", lang.count(hidden)),
+    };
+    head.out.insert_str(hidden_at, &hidden_text);
     head.out.push_str(&body.out);
     let cut_text = body.cut_text.saturating_add(head.cut_text);
     if cut_text > 0 {
         head.open("p");
-        head.fixed(&more_not_shown(cut_text, "bytes"));
+        head.fixed(&more_not_shown(lang, cut_text, "bytes"));
         head.close("p");
     }
     iframe_document(&head.out, platform)
@@ -130,6 +149,8 @@ pub(crate) struct Doc {
     /// Inside a section of the document (a script item's candidate view): headings one level
     /// down.
     nested: bool,
+    /// M15 T10b: the language of the preview's own text.
+    pub(crate) lang: Lang,
 }
 
 impl Default for Doc {
@@ -166,7 +187,19 @@ impl Doc {
             exhausted: false,
             record: false,
             nested: false,
+            lang: Lang::En,
         }
+    }
+
+    /// This part in `lang`.
+    pub(crate) fn in_lang(mut self, lang: Lang) -> Self {
+        self.lang = lang;
+        self
+    }
+
+    /// `en` or `de` by this document's language.
+    pub(crate) fn t(&self, en: &'static str, de: &'static str) -> &'static str {
+        self.lang.pick(en, de)
     }
 
     /// A script's own section (source, Host calls, atlas.log, stderr) with its share `limit` of
@@ -198,9 +231,9 @@ impl Doc {
     /// The PD-67 note for `n` `unit` left out here.
     pub(crate) fn more(&self, n: u64, unit: &str) -> String {
         if self.record {
-            more_in_audit_record(n, unit)
+            more_in_audit_record(self.lang, n, unit)
         } else {
-            more_not_shown(n, unit)
+            more_not_shown(self.lang, n, unit)
         }
     }
 
@@ -495,17 +528,24 @@ fn mark_text(out: &mut String, text: &str) {
 
 /// plan text (PD-67): the Caution strip's label (§6.2: a text-labelled "Caution" strip).
 pub const CAUTION_LABEL: &str = "Caution";
+/// [`CAUTION_LABEL`] in German.
+pub const CAUTION_LABEL_DE: &str = "Vorsicht";
 /// plan text (PD-67): the Info line's label.
 pub const INFO_LABEL: &str = "Info:";
+/// [`INFO_LABEL`] in German.
+pub const INFO_LABEL_DE: &str = "Hinweis:";
 /// plan text (PD-67): the "agent receives" value of a write with an empty receipt.
 pub const NO_RECEIPT_FIELDS: &str = "no receipt fields";
 
 /// "N of total", or "N shown, more available" when the server reports no total (§6.1).
-pub fn item_count_text(c: &ItemCount) -> String {
-    match (c.total, c.more_available) {
-        (Some(total), _) => format!("{} of {total}", c.shown),
-        (None, true) => format!("{} shown, more available", c.shown),
-        (None, false) => format!("{} shown", c.shown),
+pub fn item_count_text(lang: Lang, c: &ItemCount) -> String {
+    match (lang, c.total, c.more_available) {
+        (Lang::En, Some(total), _) => format!("{} of {total}", c.shown),
+        (Lang::En, None, true) => format!("{} shown, more available", c.shown),
+        (Lang::En, None, false) => format!("{} shown", c.shown),
+        (Lang::De, Some(total), _) => format!("{} von {}", lang.count(c.shown), lang.count(total)),
+        (Lang::De, None, true) => format!("{} angezeigt, weitere verfügbar", lang.count(c.shown)),
+        (Lang::De, None, false) => format!("{} angezeigt", lang.count(c.shown)),
     }
 }
 
@@ -524,19 +564,16 @@ fn caution_lines(p: &Preview) -> Vec<CautionLine<'_>> {
         .iter()
         .filter(|w| w.level == Level::Caution)
         .partition(|w| w.id == WarningId::CouldNotRecheck);
-    lines.extend(
-        lead.into_iter()
-            .chain(rest)
-            .map(|w| CautionLine::Text(&w.text)),
-    );
+    lines.extend(lead.into_iter().chain(rest).map(CautionLine::Text));
     lines
 }
 
 enum CautionLine<'a> {
     /// App-generated (core's constant).
     Fixed(&'static str),
-    /// A warning text (display-escaped by core where it carries server or agent text).
-    Text(&'a str),
+    /// A warning (its text display-escaped by core where it carries server or agent text; shown
+    /// in the document's language, M15 T10b).
+    Text(&'a Warning),
 }
 
 /// Writes the header; returns where its "hidden in preview" value goes ([`document`] writes it
@@ -547,13 +584,13 @@ fn header(doc: &mut Doc, p: &Preview) -> usize {
     let cautions = caution_lines(p);
     if !cautions.is_empty() {
         doc.open("section");
-        doc.el("h2", CAUTION_LABEL);
+        doc.el("h2", doc.t(CAUTION_LABEL, CAUTION_LABEL_DE));
         doc.open("ul");
         for line in &cautions {
             doc.open("li");
             match line {
                 CautionLine::Fixed(text) => doc.fixed(text),
-                CautionLine::Text(text) => doc.text(text),
+                CautionLine::Text(w) => doc.text(&crate::warning::shown(doc.lang, w)),
             }
             doc.close("li");
         }
@@ -563,37 +600,62 @@ fn header(doc: &mut Doc, p: &Preview) -> usize {
 
     doc.open("table");
     doc.open("tbody");
-    row_text(doc, "instance", &h.instance_alias);
-    row_text(doc, "operation", &h.op_id);
-    row_text(doc, "class", &h.class);
+    let lang = doc.lang;
+    row_text(doc, doc.t("instance", "Instanz"), &h.instance_alias);
+    row_text(doc, doc.t("operation", "Vorgang"), &h.op_id);
+    row_text(doc, doc.t("class", "Klasse"), &h.class);
     if let Some(c) = &h.item_count {
-        row_fixed(doc, "items", &item_count_text(c));
+        row_fixed(doc, doc.t("items", "Einträge"), &item_count_text(lang, c));
     }
-    row_fixed(doc, "size", &format!("{} bytes", h.byte_size));
+    let size = match lang {
+        Lang::En => format!("{} bytes", h.byte_size),
+        Lang::De => format!("{} Bytes", lang.count(h.byte_size)),
+    };
+    row_fixed(doc, doc.t("size", "Größe"), &size);
     if !h.fields_included.is_empty() {
-        row_list(doc, "fields included", &h.fields_included);
+        row_list(
+            doc,
+            doc.t("fields included", "enthaltene Felder"),
+            &h.fields_included,
+        );
     }
     // §6.1 / §6.2 "hidden in preview: N bytes" (label and `N bytes` form); the row is the
     // header's, its value is inserted once the body is rendered.
     doc.open("tr");
-    doc.el("th", "hidden in preview");
+    doc.el(
+        "th",
+        doc.t("hidden in preview", "in der Vorschau verborgen"),
+    );
     doc.open("td");
     let hidden_at = doc.out.len();
     doc.close("td");
     doc.close("tr");
-    row_fixed(doc, "bidi controls", &h.bidi_controls.to_string());
-    row_fixed(doc, "other invisible", &h.other_invisible.to_string());
+    row_fixed(
+        doc,
+        doc.t("bidi controls", "Bidi-Steuerzeichen"),
+        &lang.count(h.bidi_controls),
+    );
+    row_fixed(
+        doc,
+        doc.t("other invisible", "andere unsichtbare Zeichen"),
+        &lang.count(h.other_invisible),
+    );
     if let Some(user) = &h.executes_as {
-        row_text(doc, "executes as", user);
+        row_text(doc, doc.t("executes as", "ausgeführt als"), user);
     }
+    let receives = doc.t("agent receives", "Agent erhält");
     if !h.receipt_fields.is_empty() {
-        row_list(doc, "agent receives", &h.receipt_fields);
+        row_list(doc, receives, &h.receipt_fields);
     } else if h.class == "write" {
-        row_fixed(doc, "agent receives", NO_RECEIPT_FIELDS);
+        row_fixed(
+            doc,
+            receives,
+            doc.t(NO_RECEIPT_FIELDS, "keine Empfangsfelder"),
+        );
     }
     if let Some(q) = &h.query {
         doc.open("tr");
-        doc.el("th", "query");
+        doc.el("th", doc.t("query", "Abfrage"));
         doc.open("td");
         doc.code_text(q);
         doc.close("td");
@@ -609,10 +671,10 @@ fn header(doc: &mut Doc, p: &Preview) -> usize {
         .collect();
     if !infos.is_empty() {
         doc.open("div");
-        doc.el("strong", INFO_LABEL);
+        doc.el("strong", doc.t(INFO_LABEL, INFO_LABEL_DE));
         for (i, w) in infos.iter().enumerate() {
             doc.fixed(if i == 0 { " " } else { "; " });
-            doc.text(&w.text);
+            doc.text(&crate::warning::shown(doc.lang, w));
         }
         doc.close("div");
     }
@@ -654,7 +716,7 @@ fn row_list(doc: &mut Doc, label: &str, items: &[String]) {
         doc.hide(rest.iter().map(|s| len_u64(s.len())).sum());
         doc.fixed(&format!(
             ", {}",
-            more_not_shown(len_u64(rest.len()), "entries")
+            more_not_shown(doc.lang, len_u64(rest.len()), "entries")
         ));
     }
     doc.close("td");

@@ -4,10 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { header } from '../../audit/testing';
 import { setPageTransport } from '../../shared/ipc/transport';
 import { loadSession, type SessionInfo } from '../../shared/ipc/transport-http';
-import { EXPORT_TEXT } from '../export/ExportPanel';
+import { en } from '../../shared/i18n/dict';
 import { RequireSession } from '../shell/RequireSession';
-import { USER_AUDIT_TEXT } from './UserAudit';
-import { AUDITOR_TEXT, AuditorPage } from './Users';
+import { AuditorPage } from './Users';
+
+const EXPORT_TEXT = en.admin.export;
+const AUDITOR_TEXT = en.admin.auditor;
 
 vi.mock('../../shared/ipc/transport-http', async (orig) => ({
   ...(await orig<typeof import('../../shared/ipc/transport-http')>()),
@@ -94,7 +96,7 @@ describe('Auditor page', () => {
     page();
     fireEvent.click(await screen.findByRole('button', { name: 'alice' }));
     await flush();
-    expect(screen.getByRole('note', { name: 'Recorded view' }).textContent).toBe(USER_AUDIT_TEXT.banner('alice'));
+    expect(screen.getByRole('note', { name: 'Recorded view' }).textContent).toBe(AUDITOR_TEXT.banner('alice'));
     await waitFor(() =>
       expect(fetchMock.mock.calls.map((c) => c[0])).toContain(`/api/auditor/users/${ALICE}/audit_query`),
     );

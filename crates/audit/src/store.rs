@@ -1212,6 +1212,9 @@ impl Store {
         let mut payload = verify::verify_payload(scope, findings, &detected_at, unanchored_tail);
         if let Some(c) = confirmed {
             payload["dialog_text_sha256"] = json!(hex::encode(c.dialog_text_sha256));
+            if let Some(lang) = c.dialog_lang {
+                payload["dialog_lang"] = json!(lang.as_str());
+            }
         }
         let mut p = PreparedEvent::system(EventType::VERIFY, &payload)?;
         p.incident = IncidentDraft::of(findings, &detected_at);

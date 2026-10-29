@@ -24,7 +24,7 @@ describe('RawPager', () => {
   it('raw_pager_requests_pages_on_demand_and_shows_display', async () => {
     const { container } = render(<RawPager requestId="req_x" candidateRev={rev} />);
     // Only the first page is requested; the next one is not prefetched.
-    await screen.findByText('page 1 of 2, 262150 bytes');
+    await screen.findByText('page 1 of 2, 262,150 bytes');
     expect(mockedRaw.mock.calls).toEqual([['req_x', rev, 0]]);
     // The Rust display projection is shown as text; the base64 bytes never reach the DOM.
     expect(container.querySelector('pre')?.textContent).toBe((pages[0] as RawPage).display);
@@ -32,7 +32,7 @@ describe('RawPager', () => {
     expect((screen.getByRole('button', { name: 'Previous page' }) as HTMLButtonElement).disabled).toBe(true);
 
     fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
-    await screen.findByText('page 2 of 2, 262150 bytes');
+    await screen.findByText('page 2 of 2, 262,150 bytes');
     expect(mockedRaw.mock.calls).toEqual([
       ['req_x', rev, 0],
       ['req_x', rev, 1],

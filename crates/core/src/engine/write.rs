@@ -299,7 +299,7 @@ fn returned_warning(r: &Returned, executes_as: Option<&str>) -> Option<Warning> 
         ),
         Returned::Changed(delta) => Warning::new(
             WarningId::ChangedSinceReview,
-            format!("{}: {delta}", warning::TEXT_CHANGED_SINCE_REVIEW),
+            warning::changed_since_review(&delta.to_string()),
         ),
         Returned::RecheckFailed => {
             Warning::new(WarningId::CouldNotRecheck, warning::TEXT_COULD_NOT_RECHECK)

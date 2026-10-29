@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+import { useText } from '../../shared/i18n/context';
 import { api } from '../http';
 
 /**
@@ -11,33 +12,6 @@ import { api } from '../http';
  * row it forced), not the chain's current head, which moves on. Nothing is kept in browser
  * storage.
  */
-
-export const EXPORT_TEXT = {
-  title: 'Export',
-  intro:
-    'Exports the audit chain as a tar archive that anyone can verify offline with atlas-duck verify-export.',
-  range_all: 'All records',
-  range_from: 'From date (UTC)',
-  start: 'Start export',
-  starting: 'Starting…',
-  running: (done: number, total: number) =>
-    total > 0 ? `Exporting… ${done} of ${total} records` : 'Exporting…',
-  done: 'The export is ready. It can be downloaded once.',
-  download: 'Download',
-  manifest: 'Manifest SHA-256',
-  anchor: 'Anchor head',
-  verify: 'Verify with',
-  copy: 'Copy',
-  copied: 'Copied.',
-  copy_failed: 'Copying failed; select the text instead.',
-  out_of_band:
-    'Give the recipient the manifest SHA-256 and the anchor head by another channel than the archive.',
-  busy: 'An export is already running. Start again when it has finished.',
-  expired: 'This export is no longer available. Start a new one.',
-  failed: 'The export failed. Start a new one.',
-  start_failed: 'The export could not be started. Try again.',
-  bad_date: 'Enter a date, or choose all records.',
-} as const;
 
 /** Browser pieces (replaced in tests). */
 export const exportBrowser = {
@@ -85,6 +59,7 @@ type View =
   | { kind: 'done'; job: ExportJob };
 
 function CopyRow({ label, value }: { label: string; value: string }) {
+  const t = useText();
   const [note, setNote] = useState<string | null>(null);
   return (
     <div className="export-copy">
@@ -93,15 +68,15 @@ function CopyRow({ label, value }: { label: string; value: string }) {
         <code>{value}</code>{' '}
         <button
           type="button"
-          aria-label={`${EXPORT_TEXT.copy} ${label}`}
+          aria-label={t.admin.export.copy_label(label)}
           onClick={() => {
             exportBrowser.copy(value).then(
-              () => setNote(EXPORT_TEXT.copied),
-              () => setNote(EXPORT_TEXT.copy_failed),
+              () => setNote(t.admin.export.copied),
+              () => setNote(t.admin.export.copy_failed),
             );
           }}
         >
-          {EXPORT_TEXT.copy}
+          {t.admin.export.copy}
         </button>
         {note !== null ? <span role="status"> {note}</span> : null}
       </dd>
@@ -110,6 +85,7 @@ function CopyRow({ label, value }: { label: string; value: string }) {
 }
 
 export function ExportPanel({ base }: { base: string }) {
+  const t = useText();
   const [view, setView] = useState<View>({ kind: 'idle' });
   const [notice, setNotice] = useState<string | null>(null);
   const [all, setAll] = useState(true);
@@ -132,7 +108,7 @@ export function ExportPanel({ base }: { base: string }) {
         void api('GET', `${base}/${jobId}`, isExportJob).then((r) => {
           if (!r.ok) {
             setView({ kind: 'idle' });
-            setNotice(r.status === 410 ? EXPORT_TEXT.expired : EXPORT_TEXT.failed);
+            setNotice(r.status === 410 ? t.admin.export.expired : t.admin.export.failed);
             return;
           }
           const job = r.value;
@@ -143,12 +119,12 @@ export function ExportPanel({ base }: { base: string }) {
             setView({ kind: 'done', job });
           } else {
             setView({ kind: 'idle' });
-            setNotice(job.state === 'failed' ? EXPORT_TEXT.failed : EXPORT_TEXT.expired);
+            setNotice(job.state === 'failed' ? t.admin.export.failed : t.admin.export.expired);
           }
         });
       }, exportBrowser.pollMs);
     },
-    [base, stop],
+    [base, stop, t],
   );
 
   // Polling stops while the page is hidden and resumes when it is shown again.
@@ -168,7 +144,7 @@ export function ExportPanel({ base }: { base: string }) {
     let body: Record<string, string> = {};
     if (!all) {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(from)) {
-        setNotice(EXPORT_TEXT.bad_date);
+        setNotice(t.admin.export.bad_date);
         return;
       }
       body = { from_utc: `${from}T00:00:00.000Z` };
@@ -177,7 +153,7 @@ export function ExportPanel({ base }: { base: string }) {
     const r = await api('POST', base, isExportJob, body);
     if (!r.ok) {
       setView({ kind: 'idle' });
-      setNotice(r.status === 409 ? EXPORT_TEXT.busy : EXPORT_TEXT.start_failed);
+      setNotice(r.status === 409 ? t.admin.export.busy : t.admin.export.start_failed);
       return;
     }
     setView({ kind: 'running', job: r.value });
@@ -186,28 +162,28 @@ export function ExportPanel({ base }: { base: string }) {
 
   const busy = view.kind === 'starting' || view.kind === 'running';
   return (
-    <section aria-label={EXPORT_TEXT.title} className="export-panel">
-      <h2>{EXPORT_TEXT.title}</h2>
-      <p>{EXPORT_TEXT.intro}</p>
+    <section aria-label={t.admin.export.title} className="export-panel">
+      <h2>{t.admin.export.title}</h2>
+      <p>{t.admin.export.intro}</p>
       <fieldset disabled={busy}>
         <label>
           <input type="radio" name="export-range" checked={all} onChange={() => setAll(true)} />{' '}
-          {EXPORT_TEXT.range_all}
+          {t.admin.export.range_all}
         </label>
         <label>
           <input type="radio" name="export-range" checked={!all} onChange={() => setAll(false)} />{' '}
-          {EXPORT_TEXT.range_from}
+          {t.admin.export.range_from}
         </label>
         {!all ? (
           <input
             type="date"
-            aria-label={EXPORT_TEXT.range_from}
+            aria-label={t.admin.export.range_from}
             value={from}
             onChange={(e) => setFrom(e.target.value)}
           />
         ) : null}
         <button type="button" onClick={() => void start()}>
-          {view.kind === 'starting' ? EXPORT_TEXT.starting : EXPORT_TEXT.start}
+          {view.kind === 'starting' ? t.admin.export.starting : t.admin.export.start}
         </button>
       </fieldset>
       {notice !== null ? (
@@ -217,32 +193,32 @@ export function ExportPanel({ base }: { base: string }) {
       ) : null}
       {view.kind === 'running' ? (
         <p role="status">
-          {EXPORT_TEXT.running(view.job.progress?.done ?? 0, view.job.progress?.total ?? 0)}
+          {t.admin.export.running(view.job.progress?.done ?? 0, view.job.progress?.total ?? 0)}
         </p>
       ) : null}
       {view.kind === 'done' ? (
         <div>
-          <p role="status">{EXPORT_TEXT.done}</p>
+          <p role="status">{t.admin.export.done}</p>
           <p>
             <a href={`${base}/${view.job.job_id}/download`} download>
-              {EXPORT_TEXT.download}
+              {t.admin.export.download}
             </a>
           </p>
           <dl>
             {view.job.manifest_sha256 !== undefined ? (
-              <CopyRow label={EXPORT_TEXT.manifest} value={view.job.manifest_sha256} />
+              <CopyRow label={t.admin.export.manifest} value={view.job.manifest_sha256} />
             ) : null}
             {view.job.anchor_head !== undefined ? (
               <CopyRow
-                label={EXPORT_TEXT.anchor}
+                label={t.admin.export.anchor}
                 value={`${view.job.anchor_head.seq}:${view.job.anchor_head.hash}`}
               />
             ) : null}
             {view.job.verify_command !== undefined ? (
-              <CopyRow label={EXPORT_TEXT.verify} value={view.job.verify_command} />
+              <CopyRow label={t.admin.export.verify} value={view.job.verify_command} />
             ) : null}
           </dl>
-          <p className="muted">{EXPORT_TEXT.out_of_band}</p>
+          <p className="muted">{t.admin.export.out_of_band}</p>
         </div>
       ) : null}
     </section>

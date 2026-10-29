@@ -8,6 +8,26 @@
   align-items: center;
 }
 
+/* The language select (M15 T4 review): label and control in one row, on the shared control look. */
+.server-header .server-lang {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.server-header .server-lang select {
+  width: auto;
+  font-size: var(--text-sm);
+}
+
+/* A save is in flight: the control shows the chosen value and a progress cursor. */
+.server-header .server-lang[aria-busy="true"] select {
+  cursor: progress;
+  border-color: var(--accent);
+}
+
 .server-header .server-user {
   margin-left: auto;
 }

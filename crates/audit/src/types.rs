@@ -288,6 +288,40 @@ impl MissingAnchor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Confirmed {
     pub dialog_text_sha256: [u8; 32],
+    /// M15: the language of the text the hash is of, recorded as `dialog_lang` next to
+    /// `dialog_text_sha256`. `None` (no field) for a proof without a dialog text of a language
+    /// (tests, the server's admin confirmation) and in every record written before M15.
+    pub dialog_lang: Option<DialogLang>,
+}
+
+/// The language of a confirmed dialog text (M15): a verifier recomputes the hash from the text
+/// in this language. A record without `dialog_lang` was confirmed in English.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogLang {
+    En,
+    De,
+}
+
+impl DialogLang {
+    /// The recorded value: `en` or `de`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DialogLang::En => "en",
+            DialogLang::De => "de",
+        }
+    }
+}
+
+impl Confirmed {
+    /// The proof as a record's payload object: `{dialog_text_sha256, dialog_lang?}`.
+    pub fn payload(&self) -> serde_json::Value {
+        let mut v =
+            serde_json::json!({ "dialog_text_sha256": hex::encode(self.dialog_text_sha256) });
+        if let Some(lang) = self.dialog_lang {
+            v["dialog_lang"] = lang.as_str().into();
+        }
+        v
+    }
 }
 
 /// The UTC time range of a compliance export, both ends inclusive (PD-160). The store resolves

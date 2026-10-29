@@ -40,6 +40,7 @@ use secrecy::SecretString;
 use tauri::{AppHandle, Runtime};
 
 use crate::commands::{CommandError, RestoreFailure};
+use crate::i18n::{Lang, T, count};
 use crate::serve::{AuditJobKind, StoreCall, UnlockFailure};
 use crate::ui_sink::{EventOut, emit_audit_changed, emit_audit_job};
 
@@ -47,18 +48,43 @@ use crate::ui_sink::{EventOut, emit_audit_changed, emit_audit_job};
 /// or store call. True for both entry points and for a data dir without a log (T13 review I-2):
 /// the current log is moved aside only if there is one, its open incidents stay with it, and this
 /// computer's tokens are deleted.
-pub const RESTORE_CONFIRM_TEXT: &str = "Restore a backup? The current audit log, if there is \
-     one, is moved to the archived folder of the data directory (never deleted), and the backup's \
-     log continues as a new segment. Open integrity incidents of the current log stay with its \
-     archived copy. You need the backup's recovery passphrase, which becomes this log's recovery \
-     passphrase. This computer's stored tokens are deleted and none are restored: every instance \
-     needs its token again. Requests wait while the restore runs.";
+pub const RESTORE_CONFIRM_TEXT: &str = RESTORE_CONFIRM.en;
+/// [`RESTORE_CONFIRM_TEXT`] in both languages (M15 T10).
+pub const RESTORE_CONFIRM: T = T::new(
+    "Restore a backup? The current audit log, if there is one, is moved to the archived folder of the data directory (never deleted), and the backup's log continues as a new segment. Open integrity incidents of the current log stay with its archived copy. You need the backup's recovery passphrase, which becomes this log's recovery passphrase. This computer's stored tokens are deleted and none are restored: every instance needs its token again. Requests wait while the restore runs.",
+    "Ein Backup wiederherstellen? Das aktuelle Audit-Protokoll wird, falls es eines gibt, in den Archivordner des Datenverzeichnisses verschoben (nie gelöscht), und das Protokoll des Backups wird als neues Segment fortgeführt. Offene Integritätsvorfälle des aktuellen Protokolls bleiben bei seiner archivierten Kopie. Sie brauchen die Wiederherstellungs-Passphrase des Backups; sie wird zur Wiederherstellungs-Passphrase dieses Protokolls. Die gespeicherten Token dieses Computers werden gelöscht und keine wiederhergestellt: Jede Instanz braucht ihr Token erneut. Anfragen warten, während die Wiederherstellung läuft.",
+);
+/// The title of the source dialog.
+const SOURCE_DIALOG_TITLE: T = T::new(
+    "Choose the atlas-duck backup to restore (its manifest.json, or an archived .db file)",
+    "Wählen Sie das Backup von atlas-duck zum Wiederherstellen (seine manifest.json oder eine archivierte .db-Datei)",
+);
+const SOURCE_FILTER: T = T::new("atlas-duck backup", "Backup von atlas-duck");
 
+/// The texts of this module, for [`crate::i18n::all`].
+pub const TEXTS: &[&T] = &[&RESTORE_CONFIRM, &SOURCE_DIALOG_TITLE, &SOURCE_FILTER];
 /// plan text (§8.11 step 4): the native confirmation of a same-machine rollback, with the number
 /// of records it gives up. The store counts from the current log file and from this install's
 /// keychain head anchor, whichever reaches further (T13 review I-2): records beyond what the file
 /// holds (no file, or one cut short) are in no archived copy, so the text promises none for them.
-pub fn rollback_text(records_lost: u64) -> String {
+pub fn rollback_text(lang: Lang, records_lost: u64) -> String {
+    if lang == Lang::De {
+        let n = count(lang, records_lost);
+        let records = if records_lost == 1 {
+            "Datensatz"
+        } else {
+            "Datensätze"
+        };
+        return format!(
+            "Dieses Backup ist älter als das Audit-Protokoll dieses Computers: Wenn Sie es \
+             wiederherstellen, geben Sie die letzten {n} {records} des Protokolls auf. Die Zahl \
+             stammt aus der aktuellen Protokolldatei und aus dem neuesten Datensatz, den sich der \
+             Schlüsselbund dieses Computers für das Protokoll merkt. Datensätze, die noch in der \
+             aktuellen Protokolldatei stehen, bleiben in ihrer archivierten Kopie; Datensätze, \
+             die diese Datei nicht enthält (weil sie fehlt oder gekürzt wurde), werden nirgends \
+             aufbewahrt. Trotzdem wiederherstellen?"
+        );
+    }
     format!(
         "This backup is older than this computer's audit log: restoring it gives up the last \
          {records_lost} records of the log. The count is taken from the current log file and from \
@@ -90,9 +116,6 @@ fn note_confirmation(report: &RestoreReport) {
 /// The file a backup bundle is chosen by (`backup.rs` `MANIFEST_FILE`): it stands for its folder.
 pub const BUNDLE_MANIFEST: &str = "manifest.json";
 
-const SOURCE_DIALOG_TITLE: &str =
-    "Choose the atlas-duck backup to restore (its manifest.json, or an archived .db file)";
-const SOURCE_FILTER: &str = "atlas-duck backup";
 const SOURCE_EXTENSIONS: &[&str] = &["json", "db"];
 
 /// How often a flow that waits for the passphrase looks at its cancel flag.
@@ -114,11 +137,12 @@ pub fn source_of(picked: PathBuf) -> PathBuf {
 /// cancelled. Blocks until the user answers: a blocking thread only.
 pub fn pick_restore_source<R: Runtime>(app: &AppHandle<R>) -> Option<RustChosenPath> {
     use tauri_plugin_dialog::DialogExt;
+    let lang = crate::windows::ui_lang(app);
     let chosen = app
         .dialog()
         .file()
-        .set_title(SOURCE_DIALOG_TITLE)
-        .add_filter(SOURCE_FILTER, SOURCE_EXTENSIONS)
+        .set_title(SOURCE_DIALOG_TITLE.get(lang))
+        .add_filter(SOURCE_FILTER.get(lang), SOURCE_EXTENSIONS)
         .blocking_pick_file()?;
     let path = match chosen.into_path() {
         Ok(p) => p,
@@ -196,15 +220,17 @@ pub(crate) struct Asked {
 /// order, PD-168). An error as soon as one is cancelled or cannot be asked, or `stop` answers
 /// true between them; nothing was changed then.
 pub(crate) fn ask_restore(
+    lang: Lang,
     confirmer: &dyn NativeConfirmer,
     pick: impl FnOnce() -> Option<RustChosenPath>,
     passphrase: impl FnOnce(&dyn Fn() -> bool) -> Result<SecretString, NotAsked>,
     stop: &dyn Fn() -> bool,
 ) -> Result<Asked, NotAsked> {
-    if confirmer.confirm(RESTORE_CONFIRM_TEXT) != Confirm::Ok {
+    let text = RESTORE_CONFIRM.get(lang);
+    if confirmer.confirm(text) != Confirm::Ok {
         return Err(NotAsked::Cancelled);
     }
-    let confirmed = crate::serve::confirmed_by(RESTORE_CONFIRM_TEXT);
+    let confirmed = crate::serve::confirmed_by(lang, text);
     if stop() {
         return Err(NotAsked::Cancelled);
     }
@@ -226,6 +252,7 @@ pub(crate) fn ask_restore(
 /// after its answer: a `restore_cancel` or Quit while the dialog was up wins over its Ok (T13
 /// review I-1).
 fn ask_rollback(
+    lang: Lang,
     confirmer: &dyn NativeConfirmer,
     records_lost: u64,
     head: &dyn Fn() -> u64,
@@ -237,7 +264,7 @@ fn ask_rollback(
             return None;
         }
         let before = head();
-        let text = rollback_text(count);
+        let text = rollback_text(lang, count);
         if confirmer.confirm(&text) != Confirm::Ok {
             return None;
         }
@@ -246,7 +273,7 @@ fn ask_rollback(
         }
         let after = head();
         if after == before {
-            return Some(crate::serve::confirmed_by(&text));
+            return Some(crate::serve::confirmed_by(lang, &text));
         }
         count = count.saturating_add(after.saturating_sub(before));
     }
@@ -271,7 +298,8 @@ pub fn run_live_restore(
 ) -> Result<RestoreReport, CommandError> {
     let job = AuditJobKind::Restore;
     let stop = || cancel.load(Ordering::SeqCst) || call.cancelled();
-    let asked = ask_restore(confirmer, pick, passphrase, &stop).map_err(|n| match n {
+    let lang = out.lang();
+    let asked = ask_restore(lang, confirmer, pick, passphrase, &stop).map_err(|n| match n {
         NotAsked::Cancelled => CommandError::Cancelled,
         NotAsked::Busy => CommandError::Busy,
         NotAsked::NoWindow => CommandError::Internal,
@@ -293,7 +321,7 @@ pub fn run_live_restore(
             {
                 // Nothing changed: until the next store call a cancel or Quit ends the flow.
                 call.reopen();
-                match ask_rollback(confirmer, records_lost, &|| store.head().0, &stop) {
+                match ask_rollback(lang, confirmer, records_lost, &|| store.head().0, &stop) {
                     Some(c) if !cancel.load(Ordering::SeqCst) && call.begin() => rollback = Some(c),
                     _ => {
                         emit_audit_job(out, job, "cancelled", None);
@@ -324,7 +352,9 @@ pub fn run_live_restore(
 /// confirmation when it asks (no store runs, so its count cannot move). `stop` (Quit) ends the
 /// wait for the passphrase, and the flow after the rollback dialog (T13 review I-1): its later Ok
 /// calls `restore_from_source` no more. Returns the running store and the report.
+#[allow(clippy::too_many_arguments)]
 pub fn restore_without_store(
+    lang: Lang,
     data: &LocalDataDir,
     lock: &InstanceLock,
     config: &dyn Fn() -> OpenConfig,
@@ -336,8 +366,8 @@ pub fn restore_without_store(
     if live_store_blocks_restore(data) {
         return Err(UnlockFailure::ArchiveFirst);
     }
-    let asked = ask_restore(confirmer, pick, passphrase, stop).map_err(not_asked_failure)?;
-    restore_asked(data, lock, config, confirmer, &asked, stop)
+    let asked = ask_restore(lang, confirmer, pick, passphrase, stop).map_err(not_asked_failure)?;
+    restore_asked(lang, data, lock, config, confirmer, &asked, stop)
 }
 
 /// The [`UnlockFailure`] of a question [`ask_restore`] got no answer to (nothing was changed).
@@ -353,6 +383,7 @@ pub(crate) fn not_asked_failure(n: NotAsked) -> UnlockFailure {
 /// restore takes its ids in between, M10 T15 fix-q): `restore_from_source` with a fresh `config()`
 /// per attempt, and the rollback confirmation when it asks.
 pub(crate) fn restore_asked(
+    lang: Lang,
     data: &LocalDataDir,
     lock: &InstanceLock,
     config: &dyn Fn() -> OpenConfig,
@@ -374,7 +405,7 @@ pub(crate) fn restore_asked(
             Err(OpenError::Restore(RestoreError::RollbackNeedsConfirmation { records_lost }))
                 if rollback.is_none() =>
             {
-                match ask_rollback(confirmer, records_lost, &|| 0, stop) {
+                match ask_rollback(lang, confirmer, records_lost, &|| 0, stop) {
                     Some(c) => rollback = Some(c),
                     None => return Err(UnlockFailure::Cancelled),
                 }
@@ -514,6 +545,7 @@ pub(crate) mod tests {
         let (_tmp, data, lock) = empty_data_dir()?;
         let confirmer = Answers::new(&[Confirm::Cancel]);
         let got = restore_without_store(
+            Lang::En,
             &data,
             &lock,
             &|| config(&r.ring, &r.install_id, &r.faults),
@@ -587,14 +619,14 @@ pub(crate) mod tests {
             texts,
             [
                 RESTORE_CONFIRM_TEXT.to_owned(),
-                rollback_text(lost - 1),
-                rollback_text(lost),
+                rollback_text(Lang::En, lost - 1),
+                rollback_text(Lang::En, lost),
             ]
         );
         assert_eq!(newest(&r.store, EventType::RESTORE)?["records_lost"], lost);
         assert_eq!(
             newest(&r.store, EventType::CONFIG_CHANGED)?["rollback_dialog_text_sha256"],
-            sha256_hex(rollback_text(lost).as_bytes())
+            sha256_hex(rollback_text(Lang::En, lost).as_bytes())
         );
         Ok(())
     }
@@ -687,6 +719,7 @@ pub(crate) mod tests {
         let during = || frozen.store(true, Ordering::SeqCst);
         let confirmer = DuringRollback::new(&during);
         let got = restore_without_store(
+            Lang::En,
             &l.data,
             &l.lock,
             &|| config(&l.ring, &l.install_id, &l.faults),
@@ -782,6 +815,7 @@ pub(crate) mod tests {
         l.faults.fail(FaultPoint::RestoreConfirmationAppend, 1);
         let (got, log) = diag_lines(|| {
             restore_without_store(
+                Lang::En,
                 &l.data,
                 &l.lock,
                 &|| config(&l.ring, &l.install_id, &l.faults),
@@ -854,6 +888,7 @@ pub(crate) mod tests {
             (NotAsked::NoWindow, UnlockFailure::Io),
         ] {
             let got = restore_without_store(
+                Lang::En,
                 &data,
                 &lock,
                 &|| config(&r.ring, &r.install_id, &r.faults),
@@ -992,7 +1027,7 @@ pub(crate) mod tests {
             texts,
             [
                 RESTORE_CONFIRM_TEXT.to_owned(),
-                rollback_text(report.records_lost)
+                rollback_text(Lang::En, report.records_lost)
             ]
         );
         let seq = report.confirmation_seq.ok_or("no confirmation record")?;
@@ -1004,6 +1039,8 @@ pub(crate) mod tests {
                 "key": "restore_backup",
                 "dialog_text_sha256": sha256_hex(RESTORE_CONFIRM_TEXT.as_bytes()),
                 "rollback_dialog_text_sha256": sha256_hex(texts[1].as_bytes()),
+                "dialog_lang": "en",
+                "rollback_dialog_lang": "en",
             })
         );
         Ok(())
@@ -1130,6 +1167,7 @@ pub(crate) mod tests {
         l.ring.wipe_install(&l.install_id);
         let confirmer = Answers::new(&[Confirm::Ok]);
         let (store, report) = restore_without_store(
+            Lang::En,
             &l.data,
             &l.lock,
             &|| config(&l.ring, &l.install_id, &l.faults),
@@ -1167,6 +1205,7 @@ pub(crate) mod tests {
         let confirmer = Answers::new(&[Confirm::Ok]);
         let asked = Asked::default();
         let got = restore_without_store(
+            Lang::En,
             &data,
             &lock,
             &|| config(&r.ring, &r.install_id, &r.faults),

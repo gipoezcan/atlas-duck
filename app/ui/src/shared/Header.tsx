@@ -1,13 +1,8 @@
 import { openWindow, quit, type OpenableWindow } from './ipc/invoke';
 import type { StatusLine } from './ipc/types';
-import { HEADER_TEXT } from './strings';
+import { useText } from './i18n/context';
 
-const BUTTONS: readonly { window: OpenableWindow; label: string }[] = [
-  { window: 'settings', label: HEADER_TEXT.settings },
-  { window: 'audit', label: HEADER_TEXT.audit },
-  { window: 'running_scripts', label: HEADER_TEXT.running_scripts },
-  { window: 'onboarding', label: HEADER_TEXT.onboarding },
-];
+const BUTTONS = ['settings', 'audit', 'running_scripts', 'onboarding'] as const satisfies readonly OpenableWindow[];
 
 interface HeaderProps {
   /** The `app_status` lines: app-generated text only (spec 5.6). */
@@ -20,23 +15,24 @@ interface HeaderProps {
  * A failed call is not surfaced here: the window either opens or it does not.
  */
 export function Header({ lines }: HeaderProps) {
+  const t = useText();
   return (
     <header className="app-header">
-      <nav aria-label="Windows">
-        {BUTTONS.map((b) => (
-          <button key={b.window} type="button" onClick={() => void openWindow(b.window).catch(ignore)}>
-            {b.label}
+      <nav aria-label={t.approvals.header.windows_label}>
+        {BUTTONS.map((w) => (
+          <button key={w} type="button" onClick={() => void openWindow(w).catch(ignore)}>
+            {t.approvals.header[w]}
           </button>
         ))}
         <button type="button" onClick={() => void quit().catch(ignore)}>
-          {HEADER_TEXT.quit}
+          {t.approvals.header.quit}
         </button>
       </nav>
       {lines.length > 0 ? (
-        <ul className="banner" aria-label={HEADER_TEXT.banner_label}>
+        <ul className="banner" aria-label={t.approvals.header.banner_label}>
           {lines.map((l) => (
             <li key={l.id} className={`banner-${l.level}`}>
-              <strong>{l.level === 'caution' ? HEADER_TEXT.caution_prefix : HEADER_TEXT.info_prefix}</strong>{' '}
+              <strong>{l.level === 'caution' ? t.approvals.header.caution_prefix : t.approvals.header.info_prefix}</strong>{' '}
               {l.text}
             </li>
           ))}

@@ -117,7 +117,7 @@ pub use store::{
 };
 pub use types::{
     Actor, AuditCursor, AuditFilter, AuditPage, AuditTrail, Committed, Confirmed, DecisionColumn,
-    DeliverySummary, EventFlags, EventHeader, EventType, ExportControl, ExportReceipt,
+    DeliverySummary, DialogLang, EventFlags, EventHeader, EventType, ExportControl, ExportReceipt,
     ExportVerdict, MAX_AUDIT_PAGE_ROWS, MissingAnchor, NewEvent, PAYLOAD_PAGE_BYTES, PayloadPage,
     QueryKind, RustChosenPath, SeqBoundRange, TimeRange, UtcInstant,
 };

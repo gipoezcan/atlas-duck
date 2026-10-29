@@ -2,7 +2,10 @@ import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { isCreatedKey, isKeyView } from '../http';
-import { ApiKeys, browser, KEY_TEXT, validateKey } from './ApiKeys';
+import { ApiKeys, browser, validateKey } from './ApiKeys';
+import { en } from '../../shared/i18n/dict';
+
+const KEY_TEXT = en.server.api_keys;
 
 vi.mock('../../shared/ipc/transport-http', () => ({ csrf: () => 'csrf-1' }));
 

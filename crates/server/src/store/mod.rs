@@ -30,6 +30,38 @@ impl fmt::Debug for Sealed {
     }
 }
 
+/// M15 T4 (PD-295): a user's UI language preference, `users.lang_pref` (schema v4). A display
+/// preference: not audited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LangPref {
+    #[default]
+    Auto,
+    En,
+    De,
+}
+
+impl LangPref {
+    /// The word in the column and on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LangPref::Auto => "auto",
+            LangPref::En => "en",
+            LangPref::De => "de",
+        }
+    }
+
+    /// The inverse of [`LangPref::as_str`]; anything else is `None`.
+    pub fn parse(word: &str) -> Option<LangPref> {
+        match word {
+            "auto" => Some(LangPref::Auto),
+            "en" => Some(LangPref::En),
+            "de" => Some(LangPref::De),
+            _ => None,
+        }
+    }
+}
+
 /// One user (PD-199, PD-208): `data_key_wrapped` is the `WrappedKey` JSON.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserRecord {
@@ -356,6 +388,11 @@ pub trait ServerStore: Send + Sync {
     fn users_all(&self) -> StoreResult<Vec<(UserRecord, UserState)>>;
     fn user_state(&self, user_id: &str) -> StoreResult<Option<UserState>>;
     fn user_set_last_login(&self, user_id: &str, at: i64) -> StoreResult<()>;
+    /// M15 T4 (PD-295): the user's language preference; `Auto` for an unknown user or a value
+    /// the column should never hold.
+    fn user_lang_pref(&self, user_id: &str) -> StoreResult<LangPref>;
+    /// Sets the user's language preference; an unknown user changes nothing.
+    fn set_user_lang_pref(&self, user_id: &str, pref: LangPref) -> StoreResult<()>;
     /// Retention (M13 T8), one transaction: the user's keystore entries, PATs, sessions, API
     /// keys, OAuth grants with their codes and tokens, consent requests and export jobs (M14) go, the wrapped data key is wiped and `chain_deleted_at` set. The row stays.
     fn user_purge(&self, user_id: &str, at: i64) -> StoreResult<()>;

@@ -420,7 +420,7 @@ describe('Detail', () => {
     ]) {
       expect(screen.getByText(label).tagName).toBe('DT');
     }
-    expect(screen.getByText('2026-10-14T09:30:00.000Z')).toBeTruthy();
+    expect(screen.getByText('2026-10-14 09:30 UTC')).toBeTruthy();
     expect(screen.getByText('4242')).toBeTruthy();
     expect(mockedPreview).not.toHaveBeenCalled();
   });

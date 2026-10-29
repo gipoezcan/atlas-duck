@@ -26,6 +26,7 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 use crate::credential::{CredentialState, Purpose};
 use crate::early_argv::{EarlyMode, classify_argv};
+use crate::i18n::{Lang, T, localize};
 use crate::serve;
 use crate::startup::crash::webview_data_dir;
 use crate::startup::hardening::DEVTOOLS_ALLOWED;
@@ -63,11 +64,74 @@ pub const CREDENTIAL_DATA_DIR: &str = "webview-credential";
 /// Title of the native dialogs this module shows.
 const DIALOG_TITLE: &str = "atlas-duck";
 /// Buttons of the no-store error window (§2.5 "with a Quit button"; plan text).
-pub const ERROR_DIALOG_QUIT: &str = "Quit";
-pub const ERROR_DIALOG_CLOSE: &str = "Close";
+pub const ERROR_DIALOG_QUIT: T = T::new("Quit", "Beenden");
+pub const ERROR_DIALOG_CLOSE: T = T::new("Close", "Schließen");
 /// The one-time no-tray-host hint (§2.5: it names the GNOME "AppIndicator and KStatusNotifierItem
 /// Support" extension, verbatim; the rest is plan text).
-pub const MSG_NO_TRAY_HOST: &str = "No system tray was found, so the atlas-duck tray menu is not shown. On GNOME, install the \"AppIndicator and KStatusNotifierItem Support\" extension. Until then, start atlas-duck again from the app menu: it opens the Approvals window, whose header reaches every other window and Quit.";
+pub const MSG_NO_TRAY_HOST: T = T::new(
+    "No system tray was found, so the atlas-duck tray menu is not shown. On GNOME, install the \"AppIndicator and KStatusNotifierItem Support\" extension. Until then, start atlas-duck again from the app menu: it opens the Approvals window, whose header reaches every other window and Quit.",
+    "Es wurde kein System-Tray gefunden, daher wird das Tray-Menü von atlas-duck nicht angezeigt. Installieren Sie unter GNOME die Erweiterung \"AppIndicator and KStatusNotifierItem Support\". Starten Sie atlas-duck bis dahin erneut über das App-Menü: Es öffnet das Fenster Freigaben, dessen Kopfzeile jedes andere Fenster und Beenden erreicht.",
+);
+/// M15 T10: the window titles (plan text, T6), by [`Label`].
+const TITLES: [(Label, T); 7] = [
+    (
+        Label::Approvals,
+        T::new("atlas-duck: Approvals", "atlas-duck: Freigaben"),
+    ),
+    (
+        Label::Settings,
+        T::new("atlas-duck: Settings", "atlas-duck: Einstellungen"),
+    ),
+    (
+        Label::Audit,
+        T::new("atlas-duck: Audit", "atlas-duck: Audit-Protokoll"),
+    ),
+    (
+        Label::RunningScripts,
+        T::new(
+            "atlas-duck: Running scripts",
+            "atlas-duck: Laufende Skripte",
+        ),
+    ),
+    (
+        Label::Onboarding,
+        T::new("atlas-duck: Onboarding", "atlas-duck: Einführung"),
+    ),
+    (
+        Label::Credential,
+        T::new("atlas-duck: Credentials", "atlas-duck: Anmeldedaten"),
+    ),
+    (
+        Label::Setup,
+        T::new("atlas-duck: Setup", "atlas-duck: Einrichtung"),
+    ),
+];
+/// The core gate messages a no-store error window shows (`GateState::envelope`, core's English;
+/// `keyring_not_local` is the wizard's [`crate::wizard::TEXT_KEYRING_NOT_LOCAL`]).
+pub const GATE_STORE_NEWER: T = T::new(
+    "the audit store was written by a newer atlas-duck; upgrade atlas-duck",
+    "Der Audit-Speicher wurde von einem neueren atlas-duck geschrieben; aktualisieren Sie atlas-duck",
+);
+pub const GATE_NOT_CONFIGURED: T = T::new(
+    "atlas-duck is not configured (<reason>)",
+    "atlas-duck ist nicht eingerichtet (<reason>)",
+);
+
+/// The texts of this module, for [`crate::i18n::all`].
+pub const TEXTS: &[&T] = &[
+    &ERROR_DIALOG_QUIT,
+    &ERROR_DIALOG_CLOSE,
+    &MSG_NO_TRAY_HOST,
+    &TITLES[0].1,
+    &TITLES[1].1,
+    &TITLES[2].1,
+    &TITLES[3].1,
+    &TITLES[4].1,
+    &TITLES[5].1,
+    &TITLES[6].1,
+    &GATE_STORE_NEWER,
+    &GATE_NOT_CONFIGURED,
+];
 
 /// The seven window labels (C.10 + Δ1, PD-72); one capability file each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -120,15 +184,15 @@ impl Label {
 
     /// The title bar text (plan text, T6; app-generated, §5.6).
     pub fn title(self) -> &'static str {
-        match self {
-            Label::Approvals => "atlas-duck: Approvals",
-            Label::Settings => "atlas-duck: Settings",
-            Label::Audit => "atlas-duck: Audit",
-            Label::RunningScripts => "atlas-duck: Running scripts",
-            Label::Onboarding => "atlas-duck: Onboarding",
-            Label::Credential => "atlas-duck: Credentials",
-            Label::Setup => "atlas-duck: Setup",
-        }
+        self.title_in(Lang::En)
+    }
+
+    /// [`Label::title`] in `lang` (M15 T10).
+    pub fn title_in(self, lang: Lang) -> &'static str {
+        TITLES
+            .iter()
+            .find(|(l, _)| *l == self)
+            .map_or("atlas-duck", |(_, t)| t.get(lang))
     }
 
     /// Initial inner size in logical pixels.
@@ -401,7 +465,7 @@ fn route_open(state: &AppSnapshot) -> Relaunch {
         // The `StoreFailed` gate serves with `store_failed` set, so `serving_snapshot` reports
         // `StoreUnavailable` first; the arm keeps the routing total (M9 Δ4).
         AppSnapshot::StoreUnavailable | AppSnapshot::Gate(GateState::StoreFailed) => {
-            Relaunch::ShowErrorDialog(MSG_STORE_UNAVAILABLE.into())
+            Relaunch::ShowErrorDialog(MSG_STORE_UNAVAILABLE.en.into())
         }
         AppSnapshot::Gate(GateState::ShuttingDown) | AppSnapshot::ShuttingDown => Relaunch::Nothing,
     }
@@ -614,7 +678,7 @@ fn build<R: Runtime>(
         label.as_str(),
         WebviewUrl::App(PathBuf::from(spec.entry)),
     )
-    .title(spec.title)
+    .title(label.title_in(ui_lang(app)))
     .inner_size(spec.size.0, spec.size.1)
     .devtools(spec.devtools)
     .incognito(spec.incognito)
@@ -711,7 +775,11 @@ pub fn snapshot<R: Runtime>(app: &AppHandle<R>) -> AppSnapshot {
         | StartupSummary::DataDirNotLocal
         | StartupSummary::DataDirUnusable
         | StartupSummary::PinnedUnreadable => {
-            AppSnapshot::StartupError(state.startup_text().unwrap_or_default().to_owned())
+            // Stored in English; shown in the current UI language (M15 T10 review M2).
+            AppSnapshot::StartupError(localize(
+                state.lang(),
+                state.startup_text().unwrap_or_default(),
+            ))
         }
     }
 }
@@ -812,6 +880,22 @@ pub fn startup_completed<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
+/// The UI language of the app (English without an `AppState`).
+pub fn ui_lang<R: Runtime>(app: &AppHandle<R>) -> Lang {
+    app.try_state::<AppState>()
+        .map(|s| s.lang())
+        .unwrap_or_default()
+}
+
+/// Sets every open window's title in `lang` (a language change, M15 T10).
+pub fn retitle<R: Runtime>(app: &AppHandle<R>, lang: Lang) {
+    for label in Label::ALL {
+        if let Some(w) = app.get_webview_window(label.as_str()) {
+            let _ = w.set_title(label.title_in(lang));
+        }
+    }
+}
+
 /// A no-store state's error window (§2.5, PD-85): app-generated `text` and a Quit button that
 /// runs the shutdown path. One at a time; closing it changes nothing.
 pub fn show_error_dialog<R: Runtime>(app: &AppHandle<R>, text: &str) {
@@ -823,13 +907,16 @@ pub fn show_error_dialog<R: Runtime>(app: &AppHandle<R>, text: &str) {
         return;
     }
     let handle = app.clone();
+    // M15 T10: the window's texts in the UI language (an English text of this app or core's gate
+    // text maps to its German form; anything else is shown as it is).
+    let lang = ui_lang(app);
     app.dialog()
-        .message(text)
+        .message(localize(lang, text))
         .title(DIALOG_TITLE)
         .kind(MessageDialogKind::Error)
         .buttons(MessageDialogButtons::OkCancelCustom(
-            ERROR_DIALOG_QUIT.into(),
-            ERROR_DIALOG_CLOSE.into(),
+            ERROR_DIALOG_QUIT.get(lang).into(),
+            ERROR_DIALOG_CLOSE.get(lang).into(),
         ))
         .show(move |quit| {
             open.store(false, Ordering::SeqCst);
@@ -847,7 +934,7 @@ pub fn show_no_tray_host_hint<R: Runtime>(app: &AppHandle<R>) {
         .is_some_and(|s| s.claim_tray_hint());
     if claimed {
         app.dialog()
-            .message(MSG_NO_TRAY_HOST)
+            .message(MSG_NO_TRAY_HOST.get(ui_lang(app)))
             .title(DIALOG_TITLE)
             .kind(MessageDialogKind::Info)
             .buttons(MessageDialogButtons::Ok)
@@ -860,6 +947,39 @@ mod tests {
     use super::*;
     use atlas_duck_ipc::paths::{DataDirResolution, check_data_dir};
 
+    /// M15 T10: the window titles and the no-store window's texts in German; core's gate texts
+    /// map to their German form, any other text stays as it is.
+    #[test]
+    fn titles_and_error_window_in_german() {
+        for label in Label::ALL {
+            assert_eq!(label.title(), label.title_in(Lang::En));
+            assert!(
+                label.title_in(Lang::De).starts_with("atlas-duck: "),
+                "{label:?}"
+            );
+            assert_ne!(
+                label.title_in(Lang::De),
+                label.title_in(Lang::En),
+                "{label:?}"
+            );
+        }
+        assert_eq!(Label::Approvals.title_in(Lang::De), "atlas-duck: Freigaben");
+        let gate = |s: GateState| localize(Lang::De, &gate_text(s));
+        assert_eq!(gate(GateState::StoreNewer), GATE_STORE_NEWER.de);
+        assert_eq!(
+            gate(GateState::NotConfigured("data_dir_missing")),
+            "atlas-duck ist nicht eingerichtet (data_dir_missing)"
+        );
+        assert_eq!(
+            gate(GateState::Locked(LockedReason::KeyringNotLocal)),
+            crate::wizard::TEXT_KEYRING_NOT_LOCAL.de
+        );
+        assert_eq!(
+            gate_text(GateState::StoreNewer),
+            GATE_STORE_NEWER.en,
+            "core's text is the table's English"
+        );
+    }
     const ISO_MAC: &str = "isolation-0b9e1d2c-3f4a-4b5c-8d6e-7f8091a2b3c4://localhost";
     const ISO_WIN: &str = "http://isolation-0b9e1d2c-3f4a-4b5c-8d6e-7f8091a2b3c4.localhost";
 
@@ -1284,8 +1404,10 @@ mod tests {
 
     #[test]
     fn hint_names_the_gnome_extension_verbatim() {
-        assert!(MSG_NO_TRAY_HOST.contains("\"AppIndicator and KStatusNotifierItem Support\""));
-        assert!(MSG_NO_TRAY_HOST.contains("GNOME"));
+        for text in [MSG_NO_TRAY_HOST.en, MSG_NO_TRAY_HOST.de] {
+            assert!(text.contains("\"AppIndicator and KStatusNotifierItem Support\""));
+            assert!(text.contains("GNOME"));
+        }
     }
 
     // `open` and the run loop under the mock runtime: `tests/windows_registry.rs` (the lib's

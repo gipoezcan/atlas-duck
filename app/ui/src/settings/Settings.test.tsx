@@ -304,8 +304,11 @@ describe('Settings', () => {
       const name = c.textContent ?? '';
       // The degraded toggle is audit-authoritative, not a config.toml key: it stays on (PD-141).
       const degraded = c.closest('label')?.textContent === 'Allow scripts with degraded confinement';
+      // M15 T3: the UI language is app-side (`ui-lang`), not a config.toml key: it stays on.
+      const language = c.closest('section')?.getAttribute('aria-label') === 'Language';
       const stays =
         degraded ||
+        language ||
         /token|Re-test|Prune backlog|CLI|full backup|Export the audit log|Back up now|Restore backup|recovery passphrase|anchor directory|Re-anchor|Forget/.test(
           name,
         );

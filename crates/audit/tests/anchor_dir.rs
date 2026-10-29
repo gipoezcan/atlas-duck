@@ -29,6 +29,7 @@ const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/anch
 fn confirmed() -> Confirmed {
     Confirmed {
         dialog_text_sha256: [9; 32],
+        dialog_lang: None,
     }
 }
 

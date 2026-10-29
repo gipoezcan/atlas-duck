@@ -69,7 +69,7 @@ async function queueChanged(queue: QueueItem[]) {
   await flush();
 }
 
-/** The text of the element el's ria-describedby points at. */
+/** The text of the element el's aria-describedby points at. */
 function describedBy(el: Element | null | undefined): string | undefined {
   const id = el?.getAttribute('aria-describedby');
   return id == null ? undefined : (document.getElementById(id)?.textContent ?? undefined);

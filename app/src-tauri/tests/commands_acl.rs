@@ -1184,7 +1184,7 @@ mod approvals_commands {
                 "{kind} recorded without a preview"
             );
 
-            let fetched = preview_fetch_dto(&*d, id, Some(rev))?;
+            let fetched = preview_fetch_dto(&*d, id, Some(rev), atlas_duck_preview::Lang::En)?;
             assert_eq!(fetched.preview.candidate_rev, rev);
             // The rendered document is the isolated one: doctype first, its own CSP meta.
             assert!(
@@ -1284,7 +1284,7 @@ mod approvals_commands {
         let ops = json!({"redactions": [{"preset": "status_only"}]});
 
         let rev1 = queue_get_dto(&*d, &id)?.candidate_rev;
-        let shown = preview_fetch_dto(&*d, &id, Some(rev1))?;
+        let shown = preview_fetch_dto(&*d, &id, Some(rev1), atlas_duck_preview::Lang::En)?;
         assert!(matches!(
             shown.preview.body,
             PreviewBody::UpstreamError { status: 404, .. }
@@ -1312,7 +1312,7 @@ mod approvals_commands {
             ),
             "{unopened:?}"
         );
-        preview_fetch_dto(&*d, &id, Some(rev2))?;
+        preview_fetch_dto(&*d, &id, Some(rev2), atlas_duck_preview::Lang::En)?;
         let out = decide_dto(&*d, decide_args(&id, "release_redacted", rev2, ops)?)?;
         assert_eq!(out.status, Status::Failed);
 
@@ -1358,7 +1358,7 @@ mod approvals_commands {
             ),
             "{unopened:?}"
         );
-        preview_fetch_dto(&*d, &id, Some(rev))?;
+        preview_fetch_dto(&*d, &id, Some(rev), atlas_duck_preview::Lang::En)?;
         let events_before = h.events(&id).await?.len();
         let report = redaction_preview_dto(&*d, &args(mask)?)?;
         assert!(report.blocked.is_empty(), "{report:?}");
@@ -1482,7 +1482,7 @@ mod approvals_commands {
             if evict {
                 h.evict_candidate(&id);
             }
-            let shown = preview_fetch_dto(&*d, &id, Some(rev))?;
+            let shown = preview_fetch_dto(&*d, &id, Some(rev), atlas_duck_preview::Lang::En)?;
             assert!(!shown.preview.approvable);
             assert_eq!(
                 shown.preview.header.release_blocked,
@@ -1495,7 +1495,7 @@ mod approvals_commands {
         let rev = queue_get_dto(&*d, &id)?.candidate_rev;
         let events = h.event_count().await?;
         assert_eq!(
-            preview_fetch_dto(&*d, &id, Some(rev)).err(),
+            preview_fetch_dto(&*d, &id, Some(rev), atlas_duck_preview::Lang::En).err(),
             Some(CommandError::ReleaseBlocked)
         );
         assert_eq!(
@@ -1607,7 +1607,7 @@ mod approvals_commands {
         let mut items = Vec::new();
         for id in [&read, &write] {
             let rev = queue_get_dto(&*d, id)?.candidate_rev;
-            preview_fetch_dto(&*d, id, Some(rev))?;
+            preview_fetch_dto(&*d, id, Some(rev), atlas_duck_preview::Lang::En)?;
             items.push(json!({"request_id": id, "candidate_rev": rev_wire(rev)}));
         }
         let batch: BatchItems = {
@@ -1902,7 +1902,7 @@ fn shell_commands_granted_to_their_windows_only() -> TestResult {
         .map(|label| window(&app, label).map(|w| (label, w)))
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
-    let table: [(&str, Value, &[&str]); 4] = [
+    let table: [(&str, Value, &[&str]); 5] = [
         ("verify_now", json!({}), &["audit"]),
         ("running_list", json!({}), &["running_scripts"]),
         (
@@ -1911,6 +1911,19 @@ fn shell_commands_granted_to_their_windows_only() -> TestResult {
             &["running_scripts"],
         ),
         ("onboarding_text", json!({}), &["onboarding", "setup"]),
+        // M15 T3 (PD-294): every React window, without a serving core.
+        (
+            "ui_lang_get",
+            json!({}),
+            &[
+                "approvals",
+                "settings",
+                "audit",
+                "running_scripts",
+                "onboarding",
+                "setup",
+            ],
+        ),
     ];
     for (cmd, body, granted) in &table {
         assert!(COMMANDS.contains(cmd), "{cmd} is not in COMMANDS");
@@ -1918,6 +1931,14 @@ fn shell_commands_granted_to_their_windows_only() -> TestResult {
             let r = invoke(w, cmd, body.clone());
             if !granted.contains(label) {
                 assert!(acl_refused(&r), "{label}: {cmd} {r:?}");
+            } else if *cmd == "ui_lang_get" {
+                // No AppState here: `auto`, resolved against this machine's locale.
+                let v = r.as_ref().map_err(|e| format!("{label}: {e:?}"))?;
+                assert_eq!(v["pref"], "auto", "{label}");
+                let want =
+                    atlas_duck_app_lib::state::UiLang::of(atlas_duck_app_lib::i18n::LangPref::Auto);
+                assert_eq!(v["lang"], serde_json::to_value(want.lang)?, "{label}: {v}");
+                assert_eq!(v.as_object().map(|o| o.len()), Some(2), "{label}: {v}");
             } else if *cmd == "onboarding_text" {
                 let sections = r
                     .as_ref()
@@ -2153,12 +2174,15 @@ mod settings_commands {
     use atlas_duck_app_lib::commands::settings::{
         CliState, ConfinementDto, InstanceAcceptUrlChangeArgs, InstanceAddArgs,
         InstanceChangeUrlArgs, InstanceConfirmConfigArgs, RetestOutcome, RetestTokenArgs,
-        SettingChanges, cli_install_dto, cli_state_of, cli_uninstall_dto, conclude_instance_call,
-        instance_accept_url_change_dto, instance_add_dto, instance_change_url_dto,
-        instance_confirm_config_dto, instance_set_proxy_dto, pat_open_error, prune_backlog_now_dto,
-        retest_token_dto, settings_apply_dto, settings_get_dto,
+        SettingChanges, apply_ui_lang, cli_install_dto, cli_state_of, cli_uninstall_dto,
+        conclude_instance_call, instance_accept_url_change_dto, instance_add_dto,
+        instance_change_url_dto, instance_confirm_config_dto, instance_set_proxy_dto,
+        pat_open_error, prune_backlog_now_dto, retest_token_dto, settings_apply_dto,
+        settings_get_dto,
     };
     use atlas_duck_app_lib::credential::{PatOpenError, open_for_pat};
+    use atlas_duck_app_lib::i18n::{Lang, LangPref};
+    use atlas_duck_app_lib::state::UiLang;
     use atlas_duck_atlassian::testing::{
         MockDc, TEST_USER, TEST_USER_KEY, XAuser, generate_ca_pem,
     };
@@ -2213,6 +2237,174 @@ mod settings_commands {
         Err(CommandError::Internal)
     }
 
+    /// Core's settings admin, with every call recorded by name.
+    struct Recording {
+        inner: std::sync::Arc<dyn atlas_duck_core::SettingsAdmin>,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl Recording {
+        fn note(&self, name: &'static str) {
+            if let Ok(mut c) = self.calls.lock() {
+                c.push(name);
+            }
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().map(|c| c.clone()).unwrap_or_default()
+        }
+    }
+
+    impl atlas_duck_core::SettingsAdmin for Recording {
+        fn view(&self) -> atlas_duck_core::SettingsView {
+            self.note("view");
+            self.inner.view()
+        }
+        fn apply(
+            &self,
+            changes: Vec<atlas_duck_core::SettingChangeReq>,
+        ) -> Result<atlas_duck_core::SettingsView, SettingsError> {
+            self.note("apply");
+            self.inner.apply(changes)
+        }
+        fn prune_backlog_now(&self) -> Result<atlas_duck_core::PruneReport, SettingsError> {
+            self.note("prune_backlog_now");
+            self.inner.prune_backlog_now()
+        }
+        fn verify_now(&self) -> atlas_duck_core::VerifyNow {
+            self.note("verify_now");
+            self.inner.verify_now()
+        }
+        fn record_app_change(
+            &self,
+            key: &str,
+            old: Value,
+            new: Value,
+        ) -> Result<(), SettingsError> {
+            self.note("record_app_change");
+            self.inner.record_app_change(key, old, new)
+        }
+    }
+
+    /// `settings_apply_dto` over a serving core, for the requests that carry core changes.
+    fn core_apply(
+        s: &dyn atlas_duck_core::SettingsAdmin,
+        c: SettingChanges,
+    ) -> Result<atlas_duck_core::SettingsView, CommandError> {
+        settings_apply_dto(Some(s), None, c).and_then(|a| a.view.ok_or(CommandError::Internal))
+    }
+
+    fn ui(pref: LangPref, lang: Lang) -> UiLang {
+        UiLang { pref, lang }
+    }
+
+    /// M15 T3 (PD-294): the language change is the app's. Alone, core is only read (no `apply`, no
+    /// `record_app_change`, no audit record, config.toml untouched); with core changes, core gets
+    /// exactly those. The preference lands in the `ui-lang` file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn apply_ui_lang_does_not_touch_core() -> TestResult {
+        let h = rig(vec![]).await?;
+        let rec = std::sync::Arc::new(Recording {
+            inner: h.core().settings(),
+            calls: std::sync::Mutex::default(),
+        });
+        let before_file = std::fs::read_to_string(h.config_path())?;
+        let events = h.event_count().await?;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().to_path_buf();
+
+        let c = changes(json!([{"key": "ui_lang", "value": "de"}]))?;
+        assert_eq!((c.core.len(), c.ui_lang), (0, Some(LangPref::De)));
+        let (r, d) = (rec.clone(), path.clone());
+        let applied = blocking(move || settings_apply_dto(Some(&*r), Some(&d), c)).await??;
+        assert_eq!(applied.view, Some(h.core().settings().view()));
+        assert_eq!(applied.ui_lang, Some(ui(LangPref::De, Lang::De)));
+        assert_eq!(std::fs::read_to_string(path.join("ui-lang"))?, "de");
+        assert_eq!(rec.calls(), vec!["view"]);
+        assert_eq!(
+            h.event_count().await?,
+            events,
+            "no audit record of any type"
+        );
+        assert_eq!(std::fs::read_to_string(h.config_path())?, before_file);
+
+        // Together with a core change, core sees only its own, and the language follows.
+        let c = changes(json!([
+            {"key": "ui_lang", "value": "en"},
+            {"key": "jira_comments_cap", "value": 40},
+        ]))?;
+        let (r, d) = (rec.clone(), path.clone());
+        let applied = blocking(move || settings_apply_dto(Some(&*r), Some(&d), c)).await??;
+        assert_eq!(applied.view.map(|v| v.limits.jira_comments_cap), Some(40));
+        assert_eq!(applied.ui_lang, Some(ui(LangPref::En, Lang::En)));
+        assert_eq!(std::fs::read_to_string(path.join("ui-lang"))?, "en");
+        assert_eq!(rec.calls(), vec!["view", "apply"]);
+
+        // No folder (a state that stores nothing): refused.
+        assert_eq!(
+            apply_ui_lang(None, LangPref::De),
+            Err(CommandError::Internal)
+        );
+        Ok(())
+    }
+
+    /// Review I-2: core runs first. A refused or cancelled core part leaves the language as it was
+    /// (no file write, no new language in the answer).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_core_refusal_leaves_the_language_unchanged() -> TestResult {
+        let h = rig(vec![Confirm::Cancel]).await?;
+        let s = h.core().settings();
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().to_path_buf();
+        atlas_duck_app_lib::ui_lang::store(&path, LangPref::En)?;
+
+        // A raise needs core's native confirmation: Cancel.
+        let c = changes(json!([
+            {"key": "ui_lang", "value": "de"},
+            {"key": "jira_comments_cap", "value": 500},
+        ]))?;
+        let (s2, d) = (s.clone(), path.clone());
+        let res = blocking(move || settings_apply_dto(Some(&*s2), Some(&d), c)).await?;
+        assert_eq!(
+            res.err(),
+            Some(CommandError::Settings(SettingsError::Cancelled))
+        );
+        assert_eq!(std::fs::read_to_string(path.join("ui-lang"))?, "en");
+
+        // Core refuses a value (`Invalid`): the same.
+        let c = changes(json!([
+            {"key": "ui_lang", "value": "de"},
+            {"key": "retention_days", "value": 0},
+        ]))?;
+        let (s2, d) = (s.clone(), path.clone());
+        let res = blocking(move || settings_apply_dto(Some(&*s2), Some(&d), c)).await?;
+        assert!(matches!(res, Err(CommandError::Settings(_))), "{res:?}");
+        assert_eq!(std::fs::read_to_string(path.join("ui-lang"))?, "en");
+        Ok(())
+    }
+
+    /// Review I-2: a language-only request needs no serving core: it is stored and answered without
+    /// a view. A request with core changes and no core is `not_ready`, and the language stays.
+    #[test]
+    fn language_only_apply_succeeds_without_a_serving_core() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let c = changes(json!([{"key": "ui_lang", "value": "de"}]))?;
+        let applied = settings_apply_dto(None, Some(dir.path()), c)?;
+        assert_eq!(applied.view, None);
+        assert_eq!(applied.ui_lang, Some(ui(LangPref::De, Lang::De)));
+        assert_eq!(std::fs::read_to_string(dir.path().join("ui-lang"))?, "de");
+
+        let c = changes(json!([
+            {"key": "ui_lang", "value": "en"},
+            {"key": "legal_hold", "value": true},
+        ]))?;
+        assert_eq!(
+            settings_apply_dto(None, Some(dir.path()), c),
+            Err(CommandError::NotReady)
+        );
+        assert_eq!(std::fs::read_to_string(dir.path().join("ui-lang"))?, "de");
+        Ok(())
+    }
     /// I-31 through the commands: a new instance, a URL change, a limit raise and the backlog prune
     /// each need the native confirmation core draws itself; a `Cancel` is `Cancelled` with nothing
     /// logged or written, an `Ok` applies and logs.
@@ -2286,7 +2478,7 @@ mod settings_commands {
             s.clone(),
             changes(json!([{"key": "jira_comments_cap", "value": 500}]))?,
         );
-        let res = blocking(move || settings_apply_dto(&*s2, c)).await?;
+        let res = blocking(move || core_apply(&*s2, c)).await?;
         assert_eq!(
             res.err(),
             Some(CommandError::Settings(SettingsError::Cancelled))
@@ -2297,7 +2489,7 @@ mod settings_commands {
             s.clone(),
             changes(json!([{"key": "jira_comments_cap", "value": 500}]))?,
         );
-        let view = blocking(move || settings_apply_dto(&*s2, c)).await??;
+        let view = blocking(move || core_apply(&*s2, c)).await??;
         assert_eq!(view.limits.jira_comments_cap, 500);
         assert_eq!(config_records(&h).await?, records + 1);
 
@@ -2338,7 +2530,7 @@ mod settings_commands {
             json!({"kind": "admin", "error": {"kind": "insecure_scheme"}})
         );
         // (The hint's text is the page's: `the_https_hint_is_the_spec_sentence_and_the_pages_copy`
-        // ties it to the spec and to `shared/strings.ts`.)
+        // ties it to the spec and to `shared/i18n/en/settings.ts`.)
         // A URL change to http is refused the same way; the hint is for both entry points.
         let a = admin.clone();
         let change = parse::<InstanceChangeUrlArgs>(
@@ -2549,7 +2741,7 @@ mod settings_commands {
         );
         let s = h.core().settings();
         let c = changes(json!([{"key": "retention_days", "value": 400}]))?;
-        let res = blocking(move || settings_apply_dto(&*s, c)).await?;
+        let res = blocking(move || core_apply(&*s, c)).await?;
         assert_eq!(
             res.err(),
             Some(CommandError::Settings(SettingsError::ShuttingDown))
@@ -2782,13 +2974,15 @@ mod settings_commands {
             names(&cap)?[1..],
             [settings_changed.clone(), status_banner.clone()]
         );
-        let err = Err(CommandError::Settings(SettingsError::ConfigWrite));
+        let err: Result<atlas_duck_core::SettingsView, CommandError> =
+            Err(CommandError::Settings(SettingsError::ConfigWrite));
         assert_eq!(
             conclude_settings_apply(app.handle(), err.clone(), true),
             err
         );
         assert_eq!(names(&cap)?[3..], [settings_changed.clone(), status_banner]);
-        let err = Err(CommandError::Settings(SettingsError::Cancelled));
+        let err: Result<atlas_duck_core::SettingsView, CommandError> =
+            Err(CommandError::Settings(SettingsError::Cancelled));
         assert_eq!(
             conclude_settings_apply(app.handle(), err.clone(), false),
             err
@@ -2881,6 +3075,7 @@ mod settings_commands {
                 &*i,
                 ConfinementDto::pending(),
                 cli_state(false, true, None),
+                UiLang::of(LangPref::Auto),
             )
         })
         .await?;
@@ -2919,6 +3114,7 @@ mod settings_commands {
                 &*i,
                 ConfinementDto::pending(),
                 cli_state(true, false, Some(false)),
+                UiLang::of(LangPref::Auto),
             )
         })
         .await?;
@@ -3047,7 +3243,13 @@ mod settings_commands {
             let confinement = ConfinementDto::of_probe(state.probe_report(), allowed);
             let (s, i) = (h.core().settings(), h.instances());
             let got = blocking(move || {
-                settings_get_dto(&*s, &*i, confinement, cli_state(false, true, None))
+                settings_get_dto(
+                    &*s,
+                    &*i,
+                    confinement,
+                    cli_state(false, true, None),
+                    UiLang::of(LangPref::Auto),
+                )
             })
             .await?;
             // The core started and answers while the probe says the memory read got through.
@@ -3397,7 +3599,15 @@ mod settings_commands {
         st: &RemovalState,
         pat_window: bool,
     ) -> Result<RemovalDto, CommandError> {
-        removal::begin(st, h.instances(), h.confirmer().clone(), || pat_window, RET).await
+        removal::begin(
+            st,
+            h.instances(),
+            h.confirmer().clone(),
+            || pat_window,
+            RET,
+            atlas_duck_app_lib::i18n::Lang::En,
+        )
+        .await
     }
 
     async fn finish_with(
@@ -3416,6 +3626,7 @@ mod settings_commands {
             Ok(m.layout.clone()),
             None,
             || pat_window,
+            atlas_duck_app_lib::i18n::Lang::En,
         )
         .await
     }
@@ -3945,6 +4156,7 @@ mod settings_commands {
             layout,
             fallback,
             || false,
+            atlas_duck_app_lib::i18n::Lang::En,
         )
         .await
         .map_err(|e| format!("{e:?}"))?;
@@ -4512,6 +4724,7 @@ mod settings_commands {
             h.confirmer().clone(),
             held_after_dialog(),
             RET,
+            atlas_duck_app_lib::i18n::Lang::En,
         )
         .await;
         assert_eq!(res.err(), Some(CommandError::Busy));
@@ -4535,6 +4748,7 @@ mod settings_commands {
             Ok(m.layout.clone()),
             None,
             held_after_dialog(),
+            atlas_duck_app_lib::i18n::Lang::En,
         )
         .await;
         assert_eq!(res.err(), Some(CommandError::Busy));
@@ -5113,6 +5327,8 @@ const S09_GRANTS: [(&str, &[&str]); 7] = [
             "open_window",
             "quit",
             "app_status",
+            // M15 T3 (PD-294): the UI language, in every React window.
+            "ui_lang_get",
         ],
     ),
     (
@@ -5150,6 +5366,7 @@ const S09_GRANTS: [(&str, &[&str]); 7] = [
             "re_anchor",
             "orphan_installs",
             "forget_install",
+            "ui_lang_get",
         ],
     ),
     (
@@ -5166,10 +5383,14 @@ const S09_GRANTS: [(&str, &[&str]); 7] = [
             "export_trigger",
             "export_cancel",
             "backup_trigger",
+            "ui_lang_get",
         ],
     ),
-    ("running_scripts", &["running_list", "running_kill"]),
-    ("onboarding", &["onboarding_text"]),
+    (
+        "running_scripts",
+        &["running_list", "running_kill", "ui_lang_get"],
+    ),
+    ("onboarding", &["onboarding_text", "ui_lang_get"]),
     (
         "credential",
         &[
@@ -5205,6 +5426,7 @@ const S09_GRANTS: [(&str, &[&str]); 7] = [
             "cli_install",
             "onboarding_text",
             "quit",
+            "ui_lang_get",
         ],
     ),
 ];
@@ -5344,6 +5566,7 @@ fn s09_running_scripts_grants_unchanged() -> TestResult {
         [
             "allow-running-kill",
             "allow-running-list",
+            "allow-ui-lang-get",
             "core:event:allow-listen",
             "core:event:allow-unlisten",
         ]
@@ -6022,6 +6245,7 @@ fn s09_cases() -> Vec<S09Case> {
             ),
         ),
         case("settings_get", "settings", json!({}), whole(), pad()),
+        case("ui_lang_get", "settings", json!({}), whole(), pad()),
         case(
             "submit_secret",
             "credential",

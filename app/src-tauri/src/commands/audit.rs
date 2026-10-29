@@ -41,22 +41,38 @@ use tauri::{AppHandle, Manager, Runtime};
 
 use super::dto::{Args, refuse};
 use super::{AuditReadFailure, CommandError, ExportFailure, blocking, core, finish};
+use crate::i18n::{Lang, T};
 use crate::removal::{self, BackupAnswer, RemovalState};
 use crate::serve::{AuditJobKind, JobRefused, ServeState};
 use crate::state::ServeSlot;
 use crate::ui_sink::{EventOut, emit_audit_changed, emit_audit_job, emit_status_changed};
 
 /// plan text (PD-161): the native warning before the export's folder dialog.
-pub const EXPORT_WARNING_TEXT: &str = "The export contains decrypted audit payloads. Any program \
-     running as your user can read these files. Exports and backups are outside retention and \
-     crypto-shredding: you are responsible for keeping and deleting them.";
+pub const EXPORT_WARNING_TEXT: &str = EXPORT_WARNING.en;
+/// [`EXPORT_WARNING_TEXT`] in both languages (M15 T10).
+pub const EXPORT_WARNING: T = T::new(
+    "The export contains decrypted audit payloads. Any program running as your user can read these files. Exports and backups are outside retention and crypto-shredding: you are responsible for keeping and deleting them.",
+    "Der Export enthält entschlüsselte Audit-Nutzdaten. Jedes Programm, das unter Ihrem Benutzer läuft, kann diese Dateien lesen. Exporte und Backups liegen außerhalb von Aufbewahrung und Crypto-Shredding: Sie sind dafür verantwortlich, sie aufzubewahren und zu löschen.",
+);
 /// The title of the export's folder dialog.
-const EXPORT_DIALOG_TITLE: &str = "Choose the folder for the atlas-duck export";
+const EXPORT_DIALOG_TITLE: T = T::new(
+    "Choose the folder for the atlas-duck export",
+    "Wählen Sie den Ordner für den Export von atlas-duck",
+);
+
+/// The texts of this module, for [`crate::i18n::all`].
+pub const TEXTS: &[&T] = &[&EXPORT_WARNING, &EXPORT_DIALOG_TITLE];
 /// PD-180: an acknowledgement's note is at most 1 000 characters.
 pub const NOTE_MAX_CHARS: usize = 1_000;
 
 /// PD-180 (plan text): the acknowledgement's native confirmation, from the record's facts.
-pub fn acknowledge_text(verify_seq: u64, result: &str, detected_at: &str) -> String {
+pub fn acknowledge_text(lang: Lang, verify_seq: u64, result: &str, detected_at: &str) -> String {
+    if lang == Lang::De {
+        return format!(
+            "Integritätsvorfall {verify_seq} ({result}, erkannt {detected_at}) zur Kenntnis \
+             nehmen? Das rote Banner verschwindet für diesen Vorfall."
+        );
+    }
     format!(
         "Acknowledge integrity incident {verify_seq} ({result}, detected {detected_at})? The red \
          banner is cleared for this incident."
@@ -196,8 +212,9 @@ pub fn payload_dto(
     seq: u64,
     page: u32,
     platform: Platform,
+    lang: atlas_duck_preview::Lang,
 ) -> Result<AuditPayloadDto, CommandError> {
-    audit_wire::payload(store, seq, page, platform).map_err(wire_error)
+    audit_wire::payload(store, seq, page, platform, lang).map_err(wire_error)
 }
 
 /// The result and detected-at time of the `VERIFY` record `seq` (fail closed: `unreadable`).
@@ -226,7 +243,13 @@ pub fn acknowledge_dto(
         return Err(CommandError::NotFound);
     }
     let (result, detected_at) = incident_facts(store, verify_seq)?;
-    if confirmer.confirm(&acknowledge_text(verify_seq, &result, &detected_at)) != Confirm::Ok {
+    if confirmer.confirm(&acknowledge_text(
+        out.lang(),
+        verify_seq,
+        &result,
+        &detected_at,
+    )) != Confirm::Ok
+    {
         return Err(CommandError::Cancelled);
     }
     match store.acknowledge_incident(verify_seq, os_user, note) {
@@ -259,7 +282,7 @@ pub fn run_export(
 ) -> Result<ExportDoneDto, CommandError> {
     use std::sync::atomic::Ordering;
     let job = AuditJobKind::Export;
-    if confirmer.confirm(EXPORT_WARNING_TEXT) != Confirm::Ok {
+    if confirmer.confirm(EXPORT_WARNING.get(out.lang())) != Confirm::Ok {
         return Err(CommandError::Cancelled);
     }
     if cancel.load(Ordering::SeqCst) {
@@ -365,7 +388,7 @@ pub(crate) fn pick_export_folder<R: Runtime>(app: &AppHandle<R>) -> Option<RustC
     let chosen = app
         .dialog()
         .file()
-        .set_title(EXPORT_DIALOG_TITLE)
+        .set_title(EXPORT_DIALOG_TITLE.get(crate::windows::ui_lang(app)))
         .blocking_pick_folder()?;
     let path = chosen.into_path().ok()?;
     Some(RustChosenPath::from_native_dialog(path))
@@ -461,9 +484,11 @@ pub async fn audit_payload<R: Runtime>(
     args: Args<AuditPayloadArgs>,
 ) -> Result<AuditPayloadDto, CommandError> {
     let Args(AuditPayloadArgs { seq, page }) = args;
+    let lang = crate::windows::ui_lang(&app).into();
     let response = match open_store(&app) {
         Ok(store) => {
-            blocking(move || payload_dto(&store, seq, page.unwrap_or(0), Platform::current())).await
+            blocking(move || payload_dto(&store, seq, page.unwrap_or(0), Platform::current(), lang))
+                .await
         }
         Err(e) => Err(e),
     };
@@ -1213,7 +1238,13 @@ pub(crate) mod tests {
         assert_eq!(trail.deliveries.count, 0);
         assert!(!trail.deliveries.to_other_peer);
 
-        let p = payload_dto(&r.store, row.seq, 0, Platform::MacOsLinux)?;
+        let p = payload_dto(
+            &r.store,
+            row.seq,
+            0,
+            Platform::MacOsLinux,
+            atlas_duck_preview::Lang::En,
+        )?;
         assert_eq!((p.page, p.page_count), (0, 1));
         assert!(p.srcdoc.starts_with("<!doctype html>"), "{}", p.srcdoc);
         assert!(
@@ -1228,11 +1259,23 @@ pub(crate) mod tests {
             p.display
         );
         assert_eq!(
-            payload_dto(&r.store, row.seq, 1, Platform::MacOsLinux),
+            payload_dto(
+                &r.store,
+                row.seq,
+                1,
+                Platform::MacOsLinux,
+                atlas_duck_preview::Lang::En
+            ),
             Err(CommandError::InvalidArgument { field: "page" })
         );
         assert_eq!(
-            payload_dto(&r.store, 999, 0, Platform::MacOsLinux),
+            payload_dto(
+                &r.store,
+                999,
+                0,
+                Platform::MacOsLinux,
+                atlas_duck_preview::Lang::En
+            ),
             Err(CommandError::NotFound)
         );
         Ok(())
@@ -1259,8 +1302,20 @@ pub(crate) mod tests {
             flags: EventFlags::default(),
             payload: json!({ "s": text }),
         })?;
-        let first = payload_dto(&r.store, c.seq, 0, Platform::MacOsLinux)?;
-        let second = payload_dto(&r.store, c.seq, 1, Platform::MacOsLinux)?;
+        let first = payload_dto(
+            &r.store,
+            c.seq,
+            0,
+            Platform::MacOsLinux,
+            atlas_duck_preview::Lang::En,
+        )?;
+        let second = payload_dto(
+            &r.store,
+            c.seq,
+            1,
+            Platform::MacOsLinux,
+            atlas_duck_preview::Lang::En,
+        )?;
         assert_eq!(first.page_count, 2);
         assert!(
             !first.display.contains('⟨'),
@@ -1327,7 +1382,13 @@ pub(crate) mod tests {
         ] {
             let c = append(event_type, change.clone())?;
             let reads = r.store.testing_payload_reads();
-            let p = payload_dto(&r.store, c.seq, 0, Platform::MacOsLinux)?;
+            let p = payload_dto(
+                &r.store,
+                c.seq,
+                0,
+                Platform::MacOsLinux,
+                atlas_duck_preview::Lang::En,
+            )?;
             assert_eq!(p.credential_change, want, "{event_type:?} {change}");
             // The view's own read, plus one more only for a `CREDENTIAL_CHANGED` record: the kind
             // comes from the header row, so no other record is decrypted a second time.
@@ -1339,10 +1400,22 @@ pub(crate) mod tests {
             );
         }
         let c = append(credential, json!("delete_failed"))?;
-        let wire = serde_json::to_value(payload_dto(&r.store, c.seq, 0, Platform::MacOsLinux)?)?;
+        let wire = serde_json::to_value(payload_dto(
+            &r.store,
+            c.seq,
+            0,
+            Platform::MacOsLinux,
+            atlas_duck_preview::Lang::En,
+        )?)?;
         assert_eq!(wire["credential_change"], json!("delete_failed"));
         let c = append(EventType::READ_FETCHED, json!("x"))?;
-        let wire = serde_json::to_value(payload_dto(&r.store, c.seq, 0, Platform::MacOsLinux)?)?;
+        let wire = serde_json::to_value(payload_dto(
+            &r.store,
+            c.seq,
+            0,
+            Platform::MacOsLinux,
+            atlas_duck_preview::Lang::En,
+        )?)?;
         assert_eq!(wire["credential_change"], Value::Null);
         Ok(())
     }
@@ -1368,7 +1441,13 @@ pub(crate) mod tests {
             }),
         })?;
         for page in 0..2 {
-            let p = payload_dto(&r.store, c.seq, page, Platform::MacOsLinux)?;
+            let p = payload_dto(
+                &r.store,
+                c.seq,
+                page,
+                Platform::MacOsLinux,
+                atlas_duck_preview::Lang::En,
+            )?;
             assert_eq!(p.page_count, 2);
             assert_eq!(
                 p.credential_change,

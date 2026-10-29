@@ -10,6 +10,7 @@ use atlas_duck_audit::{
     AuditCursor, AuditError, AuditFilter, AuditPage, AuditTrail, DecisionColumn, EventFlags,
     EventHeader, EventType, MAX_AUDIT_PAGE_ROWS, MAX_FILTER_TEXT_BYTES, Store, UtcInstant,
 };
+use atlas_duck_preview::Lang;
 pub use atlas_duck_preview::Platform;
 use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::render::{self, raw::incomplete_tail};
@@ -447,6 +448,7 @@ pub fn payload(
     seq: u64,
     page: u32,
     platform: Platform,
+    lang: Lang,
 ) -> Result<AuditPayloadDto, AuditReadError> {
     let view = |p: u32| match store.payload_view(seq, p) {
         Err(AuditError::Invalid(_)) => Err(AuditReadError::InvalidArgument { field: "page" }),
@@ -465,9 +467,9 @@ pub fn payload(
     }
     .text;
     let srcdoc = if current.page_count == 1 {
-        render::audit_payload_document(&current.bytes, platform)
+        render::audit_payload_document(lang, &current.bytes, platform)
     } else {
-        render::audit_payload_page_document(&display, platform)
+        render::audit_payload_page_document(lang, &display, platform)
     };
     Ok(AuditPayloadDto {
         srcdoc,
@@ -504,8 +506,7 @@ fn credential_failure(store: &Store, seq: u64) -> Option<CredentialChangeFailure
 pub fn incident_facts(store: &Store, seq: u64) -> Result<(String, String), AuditReadError> {
     let unreadable = AuditReadError::Unreadable { seq };
     let bytes = store.read_payload(seq).map_err(read_error)?;
-    let payload: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|_| unreadable)?;
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| unreadable)?;
     let key = |k: &str| payload.get(k).and_then(serde_json::Value::as_str);
     let (Some(result), Some(detected_at)) = (key("result"), key("detected_at")) else {
         return Err(unreadable);

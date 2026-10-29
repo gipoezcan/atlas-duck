@@ -1,6 +1,8 @@
 import { createContext, type ReactNode, useContext, useEffect, useState } from 'react';
 
+import { useText } from '../../shared/i18n/context';
 import { loadSession, type SessionInfo } from '../../shared/ipc/transport-http';
+import { useServerLangPref } from './ServerLangRoot';
 
 const SessionContext = createContext<SessionInfo | null>(null);
 
@@ -27,6 +29,8 @@ export const nav = {
  */
 export function RequireSession({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<SessionInfo | null>(null);
+  const t = useText();
+  const setPref = useServerLangPref()?.setPref;
   useEffect(() => {
     let live = true;
     void loadSession().then(
@@ -35,6 +39,8 @@ export function RequireSession({ children }: { children: ReactNode }) {
         if (s === null) {
           nav.assign(loginUrl(window.location.pathname + window.location.search));
         } else {
+          // M15 T4: the stored language preference (`auto` from an older server).
+          setPref?.(s.lang_pref ?? 'auto');
           setSession(s);
         }
       },
@@ -45,7 +51,7 @@ export function RequireSession({ children }: { children: ReactNode }) {
     return () => {
       live = false;
     };
-  }, []);
-  if (session === null) return <p role="status" className="window muted">Loading…</p>;
+  }, [setPref]);
+  if (session === null) return <p role="status" className="window muted">{t.server.header.loading}</p>;
   return <SessionContext.Provider value={session}>{children}</SessionContext.Provider>;
 }

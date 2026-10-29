@@ -92,3 +92,20 @@ test('no credential page and no credential entry fails', () => {
     'no credential entry found (manifest or built credential pages)',
   ]);
 });
+
+// M15 T7 (PD-71, PD-297): the credential page's own language table lives in its chunk. A chunk with
+// both languages and Intl number formatting passes; each way of reading the browser's language
+// fails.
+test('credential_chunk_never_reads_the_browser_language', () => {
+  const table = 'const de={titles:{unlock:"Gesperrt"}};new Intl.NumberFormat("de-DE").format(1234)';
+  assert.deepEqual(checkBundle(clean(), files({ 'assets/main.js': table })), []);
+  for (const probe of [
+    'navigator.language',
+    'navigator.languages[0]',
+    'navigator["language"]',
+    'Intl.DateTimeFormat().resolvedOptions().locale',
+  ]) {
+    const read = files({ 'assets/main.js': `${table};const l=${probe}` });
+    assert.ok(checkBundle(clean(), read).length > 0, probe);
+  }
+});

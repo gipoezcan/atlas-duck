@@ -1,4 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useText } from '../shared/i18n/context';
+import type { Dict } from '../shared/i18n';
+import { en } from '../shared/i18n/dict';
 
 import { on } from '../shared/ipc/events';
 import {
@@ -15,13 +18,11 @@ import {
   wizardUseDefaultDir,
 } from '../shared/ipc/invoke';
 import type { CliInstallAnswer, WizardError, WizardState, WizardStep } from '../shared/ipc/types';
-import { SETTINGS_TEXT, WINDOW_TITLES } from '../shared/strings';
 import { InstanceForm } from '../settings/InstanceForm';
 import { OnboardingText, WIZARD_SECTION_IDS } from '../onboarding/OnboardingText';
 import { Cfg, own } from '../settings/text';
 import { useAction, useWindowBusy, WindowBusyContext } from '../settings/useAction';
 import { SetupInstances } from './SetupInstances';
-import { SETUP_TEXT as T } from './text';
 
 /** `wizard_changed` fires on every refused request: bursts are coalesced into one re-read. */
 export const REREAD_DEBOUNCE_MS = 150;
@@ -54,6 +55,7 @@ export function Wizard() {
 }
 
 function WizardWindow() {
+  const t = useText();
   const [state, setState] = useState<WizardState | null>(null);
   const [failed, setFailed] = useState(false);
   const [nonce, setNonce] = useState(0);
@@ -160,16 +162,16 @@ function WizardWindow() {
   if (state === null) {
     return (
       <main className="window window-setup">
-        <h1>{WINDOW_TITLES.setup}</h1>
+        <h1>{t.approvals.window_titles.setup}</h1>
         {failed ? (
           <p role="alert">
-            {T.load_failed}{' '}
+            {t.setup.load_failed}{' '}
             <button type="button" onClick={retry}>
-              {T.retry}
+              {t.setup.retry}
             </button>
           </p>
         ) : (
-          <p role="status">{T.loading}</p>
+          <p role="status">{t.setup.loading}</p>
         )}
         <Quit />
       </main>
@@ -180,23 +182,23 @@ function WizardWindow() {
     <>
       <main className="window window-setup">
         <header className="page-header">
-          <h1>{WINDOW_TITLES.setup}</h1>
+          <h1>{t.approvals.window_titles.setup}</h1>
           {state.refused_count === null ? null : (
             <p role="status" className="notice notice-info">
-              {T.required(state.refused_count)}
+              {t.setup.required(state.refused_count)}
             </p>
           )}
         </header>
         {failed ? (
           <p role="alert">
-            {T.load_failed}{' '}
+            {t.setup.load_failed}{' '}
             <button type="button" onClick={retry}>
-              {T.retry}
+              {t.setup.retry}
             </button>
           </p>
         ) : null}
         <p className="visually-hidden" aria-live="polite">
-          {T.step_announce(headingOf(state))}
+          {t.setup.step_announce(headingOf(state, t))}
         </p>
         {/* Rust's fixed text once GENESIS recorded a previous chain (PD-167), as a plain text node. */}
         {state.notice === null ? null : <p role="status">{state.notice}</p>}
@@ -216,34 +218,34 @@ type Step = (
 ) => void;
 
 /** The heading of the step's panel. */
-function headingOf(state: WizardState): string {
+function headingOf(state: WizardState, t: Dict = en): string {
   switch (state.step) {
     case 'data_dir':
-      return T.data_dir_heading;
+      return t.setup.data_dir_heading;
     case 'existing_store':
-      return T.existing_heading;
+      return t.setup.existing_heading;
     case 'anchor_dir':
-      return T.anchor_heading;
+      return t.setup.anchor_heading;
     case 'restore':
-      return T.restore_heading;
+      return t.setup.restore_heading;
     case 'passphrase':
-      return T.passphrase_heading;
+      return t.setup.passphrase_heading;
     case 'genesis':
-      return T.genesis_heading;
+      return t.setup.genesis_heading;
     case 'pin_retry':
-      return T.pin_heading;
+      return t.setup.pin_heading;
     case 'recovery_note':
-      return T.note_heading;
+      return t.setup.note_heading;
     case 'instances':
-      return T.instances_heading;
+      return t.setup.instances_heading;
     case 'cli':
-      return T.cli_heading;
+      return t.setup.cli_heading;
     case 'onboarding':
-      return T.onboarding_heading;
+      return t.setup.onboarding_heading;
     case 'done':
-      return T.done_heading;
+      return t.setup.done_heading;
     case 'stopped':
-      return T.stopped_heading;
+      return t.setup.stopped_heading;
   }
 }
 
@@ -259,14 +261,15 @@ function Panel({
   pending: boolean;
   onChanged: () => void;
 }) {
+  const t = useText();
   switch (state.step) {
     case 'data_dir':
       return (
-        <section aria-label={T.data_dir_heading}>
-          <h2 tabIndex={-1}>{T.data_dir_heading}</h2>
-          <p>{T.data_dir_intro}</p>
+        <section aria-label={t.setup.data_dir_heading}>
+          <h2 tabIndex={-1}>{t.setup.data_dir_heading}</h2>
+          <p>{t.setup.data_dir_intro}</p>
           <p>
-            {T.data_dir_default}: <Cfg value={state.default_dir} />
+            {t.setup.data_dir_default}: <Cfg value={state.default_dir} />
           </p>
           <StepError error={state.error} />
           <button
@@ -275,135 +278,135 @@ function Panel({
             disabled={pending}
             onClick={() => step(() => wizardUseDefaultDir(), { destroysWindow: true })}
           >
-            {T.data_dir_use_default}
+            {t.setup.data_dir_use_default}
           </button>{' '}
           <button
             type="button"
             disabled={pending}
             onClick={() => step(() => wizardChooseDir(), { destroysWindow: true })}
           >
-            {T.data_dir_choose}
+            {t.setup.data_dir_choose}
           </button>
-          <p>{T.data_dir_choose_note}</p>
+          <p>{t.setup.data_dir_choose_note}</p>
         </section>
       );
     case 'existing_store':
       return (
-        <section aria-label={T.existing_heading}>
-          <h2 tabIndex={-1}>{T.existing_heading}</h2>
-          <p>{T.existing_intro}</p>
+        <section aria-label={t.setup.existing_heading}>
+          <h2 tabIndex={-1}>{t.setup.existing_heading}</h2>
+          <p>{t.setup.existing_intro}</p>
           {state.data_dir === null ? null : (
             <p>
-              {T.existing_data_dir}: <Cfg value={state.data_dir} />
+              {t.setup.existing_data_dir}: <Cfg value={state.data_dir} />
             </p>
           )}
           <StepError error={state.error} />
           <button type="button" className="primary" disabled={pending} onClick={() => step(() => wizardBegin())}>
-            {T.existing_continue}
+            {t.setup.existing_continue}
           </button>
         </section>
       );
     // (1b) before GENESIS: the optional anchor directory, then the passphrase; or a restore instead.
     case 'anchor_dir':
       return (
-        <section aria-label={T.anchor_heading}>
-          <h2 tabIndex={-1}>{T.anchor_heading}</h2>
-          <p>{T.anchor_intro}</p>
+        <section aria-label={t.setup.anchor_heading}>
+          <h2 tabIndex={-1}>{t.setup.anchor_heading}</h2>
+          <p>{t.setup.anchor_intro}</p>
           {/* The path as Rust escaped it, shown as text; no confirmation: nothing is weakened here. */}
           <p>
             {state.anchor_dir === null ? (
-              T.anchor_none
+              t.setup.anchor_none
             ) : (
               <>
-                {T.anchor_dir}: <Cfg value={state.anchor_dir} />
+                {t.setup.anchor_dir}: <Cfg value={state.anchor_dir} />
               </>
             )}
           </p>
           <StepError error={state.error} />
           <button type="button" disabled={pending} onClick={() => step(() => wizardAnchorDir())}>
-            {T.anchor_choose}
+            {t.setup.anchor_choose}
           </button>{' '}
           {state.anchor_dir === null ? null : (
             <button type="button" disabled={pending} onClick={() => step(() => wizardAnchorDirClear())}>
-              {T.anchor_clear}
+              {t.setup.anchor_clear}
             </button>
           )}
           <p>
             {/* The cooldown keeps a double click off the passphrase step's own Begin button. */}
             <button type="button" className="primary" disabled={pending} onClick={() => step(() => wizardBegin(), { settle: true })}>
-              {T.anchor_continue}
+              {t.setup.anchor_continue}
             </button>
           </p>
-          <p>{T.restore_intro}</p>
+          <p>{t.setup.restore_intro}</p>
           <button type="button" disabled={pending} onClick={() => step(() => wizardRestore())}>
-            {T.restore_offer}
+            {t.setup.restore_offer}
           </button>
         </section>
       );
     case 'restore':
       return (
-        <section aria-label={T.restore_heading}>
-          <h2 tabIndex={-1}>{T.restore_heading}</h2>
-          <p role="status">{T.restore_working}</p>
-          <p>{T.restore_cancel_hint}</p>
+        <section aria-label={t.setup.restore_heading}>
+          <h2 tabIndex={-1}>{t.setup.restore_heading}</h2>
+          <p role="status">{t.setup.restore_working}</p>
+          <p>{t.setup.restore_cancel_hint}</p>
         </section>
       );
     case 'pin_retry':
       return (
-        <section aria-label={T.pin_heading}>
-          <h2 tabIndex={-1}>{T.pin_heading}</h2>
+        <section aria-label={t.setup.pin_heading}>
+          <h2 tabIndex={-1}>{t.setup.pin_heading}</h2>
           {/* Rust's fixed text, shown as a plain text node. */}
-          <p role="alert">{state.step_text ?? T.errors.other}</p>
+          <p role="alert">{state.step_text ?? t.setup.errors.other}</p>
           {/* A failed retry (`pinned_write`) says so: it does not look like the first failure. */}
           <StepError error={state.error} />
           <button type="button" className="primary" disabled={pending} onClick={() => step(() => wizardBegin())}>
-            {T.pin_retry}
+            {t.setup.pin_retry}
           </button>
         </section>
       );
     case 'passphrase':
       return (
-        <section aria-label={T.passphrase_heading}>
-          <h2 tabIndex={-1}>{T.passphrase_heading}</h2>
-          <p>{T.passphrase_intro}</p>
+        <section aria-label={t.setup.passphrase_heading}>
+          <h2 tabIndex={-1}>{t.setup.passphrase_heading}</h2>
+          <p>{t.setup.passphrase_intro}</p>
           <StepError error={state.error} />
           {state.passphrase_window ? (
-            <p role="status">{T.passphrase_waiting}</p>
+            <p role="status">{t.setup.passphrase_waiting}</p>
           ) : (
             <button type="button" className="primary" disabled={pending} onClick={() => step(() => wizardBegin())}>
-              {T.passphrase_begin}
+              {t.setup.passphrase_begin}
             </button>
           )}
         </section>
       );
     case 'genesis':
       return (
-        <section aria-label={T.genesis_heading}>
-          <h2 tabIndex={-1}>{T.genesis_heading}</h2>
-          <p role="status">{T.genesis_working}</p>
+        <section aria-label={t.setup.genesis_heading}>
+          <h2 tabIndex={-1}>{t.setup.genesis_heading}</h2>
+          <p role="status">{t.setup.genesis_working}</p>
         </section>
       );
     case 'recovery_note':
       return (
-        <section aria-label={T.note_heading}>
-          <h2 tabIndex={-1}>{T.note_heading}</h2>
-          <p>{T.note_intro}</p>
+        <section aria-label={t.setup.note_heading}>
+          <h2 tabIndex={-1}>{t.setup.note_heading}</h2>
+          <p>{t.setup.note_intro}</p>
           <button type="button" className="primary" disabled={pending} onClick={() => step((rendered) => wizardFinish(rendered), { settle: true })}>
-            {T.continue}
+            {t.setup.continue}
           </button>
         </section>
       );
     case 'instances':
       return (
-        <section aria-label={T.instances_heading}>
-          <h2 tabIndex={-1}>{T.instances_heading}</h2>
-          <p>{T.instances_intro}</p>
+        <section aria-label={t.setup.instances_heading}>
+          <h2 tabIndex={-1}>{t.setup.instances_heading}</h2>
+          <p>{t.setup.instances_intro}</p>
           <SetupInstances instances={state.instances} onChanged={onChanged} />
           <InstanceForm
             onAdded={onChanged}
             readOnly={false}
             headingLevel={3}
-            addedNeedsToken={T.instance_added}
+            addedNeedsToken={t.setup.instance_added}
           />
           <button
             type="button"
@@ -411,7 +414,7 @@ function Panel({
             disabled={pending}
             onClick={() => step((rendered) => wizardSkipInstances(rendered), { settle: true })}
           >
-            {state.instances.length === 0 ? T.instances_skip : T.instances_continue}
+            {state.instances.length === 0 ? t.setup.instances_skip : t.setup.instances_continue}
           </button>
         </section>
       );
@@ -419,39 +422,40 @@ function Panel({
       return <CliStep pending={pending} step={step} />;
     case 'onboarding':
       return (
-        <section aria-label={T.onboarding_heading}>
-          <h2 tabIndex={-1}>{T.onboarding_heading}</h2>
+        <section aria-label={t.setup.onboarding_heading}>
+          <h2 tabIndex={-1}>{t.setup.onboarding_heading}</h2>
           <OnboardingText only={WIZARD_SECTION_IDS} level={3} />
           <button type="button" className="primary" disabled={pending} onClick={() => step((rendered) => wizardFinish(rendered), { settle: true })}>
-            {T.onboarding_finish}
+            {t.setup.onboarding_finish}
           </button>
         </section>
       );
     case 'done':
       return (
-        <section aria-label={T.done_heading}>
-          <h2 tabIndex={-1}>{T.done_heading}</h2>
-          <p role="status">{T.done_text}</p>
+        <section aria-label={t.setup.done_heading}>
+          <h2 tabIndex={-1}>{t.setup.done_heading}</h2>
+          <p role="status">{t.setup.done_text}</p>
         </section>
       );
     case 'stopped':
       return (
-        <section aria-label={T.stopped_heading}>
-          <h2 tabIndex={-1}>{T.stopped_heading}</h2>
+        <section aria-label={t.setup.stopped_heading}>
+          <h2 tabIndex={-1}>{t.setup.stopped_heading}</h2>
           {/* Rust's fixed text (spec 8.6 for the keyring), shown as a plain text node. */}
-          <p role="alert">{state.stopped_text ?? T.errors.other}</p>
+          <p role="alert">{state.stopped_text ?? t.setup.errors.other}</p>
         </section>
       );
   }
 }
 
 function CliStep({ pending, step }: { pending: boolean; step: Step }) {
+  const t = useText();
   const install = useAction();
   const [outcome, setOutcome] = useState<CliInstallAnswer['outcome'] | null>(null);
   return (
-    <section aria-label={T.cli_heading}>
-      <h2 tabIndex={-1}>{T.cli_heading}</h2>
-      <p>{T.cli_intro}</p>
+    <section aria-label={t.setup.cli_heading}>
+      <h2 tabIndex={-1}>{t.setup.cli_heading}</h2>
+      <p>{t.setup.cli_intro}</p>
       <button
         type="button"
         disabled={pending || install.pending}
@@ -461,10 +465,10 @@ function CliStep({ pending, step }: { pending: boolean; step: Step }) {
           })
         }
       >
-        {T.cli_install}
+        {t.setup.cli_install}
       </button>
       {install.error === null ? null : <p role="alert">{install.error}</p>}
-      {outcome === null ? null : <p role="status">{SETTINGS_TEXT.cli_outcomes[outcome]}</p>}
+      {outcome === null ? null : <p role="status">{t.settings.cli_outcomes[outcome]}</p>}
       <p>
         <button
           type="button"
@@ -472,7 +476,7 @@ function CliStep({ pending, step }: { pending: boolean; step: Step }) {
           disabled={pending || install.pending}
           onClick={() => step((rendered) => wizardFinish(rendered), { settle: true })}
         >
-          {T.cli_continue}
+          {t.setup.cli_continue}
         </button>
       </p>
     </section>
@@ -481,8 +485,9 @@ function CliStep({ pending, step }: { pending: boolean; step: Step }) {
 
 /** The last refused step: a fixed sentence by class (an unknown class is never echoed) and Rust's own text. */
 function StepError({ error }: { error: WizardError | null }) {
+  const t = useText();
   if (error === null) return null;
-  const known = own(T.errors, error.class) ?? T.errors.other;
+  const known = own(t.setup.errors, error.class) ?? t.setup.errors.other;
   return (
     <p role="alert">
       {known}
@@ -497,11 +502,12 @@ function StepError({ error }: { error: WizardError | null }) {
 }
 
 function Quit() {
+  const t = useText();
   const action = useAction();
   return (
     <footer>
       <button type="button" disabled={action.pending} onClick={() => void action.run(() => quit())}>
-        {T.quit}
+        {t.setup.quit}
       </button>
       {action.error === null ? null : <p role="alert">{action.error}</p>}
     </footer>

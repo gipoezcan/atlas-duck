@@ -104,7 +104,55 @@ impl ReplyOnce {
 }
 
 #[cfg(target_os = "macos")]
+pub use self::locale::preferred_language;
+#[cfg(target_os = "macos")]
 pub use self::runtime::{install, reply_terminate, reply_terminate_on_main_queue};
+
+/// M15 T3 (PD-291): the user's first preferred language (`CFLocaleCopyPreferredLanguages`), the
+/// locale `auto` follows. Same `extern "C"` pattern as [`runtime`]: no CoreFoundation crate.
+#[cfg(target_os = "macos")]
+mod locale {
+    use std::ffi::{CStr, c_char, c_void};
+
+    type CFTypeRef = *const c_void;
+    type CFIndex = isize;
+    /// `kCFStringEncodingUTF8`.
+    const UTF8: u32 = 0x0800_0100;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFLocaleCopyPreferredLanguages() -> CFTypeRef;
+        fn CFArrayGetCount(array: CFTypeRef) -> CFIndex;
+        fn CFArrayGetValueAtIndex(array: CFTypeRef, idx: CFIndex) -> CFTypeRef;
+        fn CFStringGetCString(s: CFTypeRef, buf: *mut c_char, size: CFIndex, enc: u32) -> u8;
+        fn CFRelease(cf: CFTypeRef);
+    }
+
+    /// The first entry of the user's preferred languages (`de-DE`, `en-US`), or `None`.
+    pub fn preferred_language() -> Option<String> {
+        // SAFETY: a Copy function: the array is ours and released below; it may be null.
+        let langs = unsafe { CFLocaleCopyPreferredLanguages() };
+        if langs.is_null() {
+            return None;
+        }
+        let mut buf = [0 as c_char; 128];
+        // SAFETY: `langs` is a valid CFArray of CFStrings; index 0 is read only when it exists
+        // (Get rule: not retained, alive while `langs` is); `buf` is writable for its length.
+        let tag = unsafe {
+            if CFArrayGetCount(langs) > 0 {
+                let first = CFArrayGetValueAtIndex(langs, 0);
+                (!first.is_null()
+                    && CFStringGetCString(first, buf.as_mut_ptr(), buf.len() as CFIndex, UTF8) != 0)
+                    .then(|| CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        };
+        // SAFETY: released once, after its last use.
+        unsafe { CFRelease(langs) };
+        tag
+    }
+}
 
 #[cfg(target_os = "macos")]
 mod runtime {

@@ -2,7 +2,10 @@ import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { nav } from '../shell/RequireSession';
-import { LOGIN_TEXT, Login, loginError, safeNext } from './Login';
+import { en } from '../../shared/i18n/dict';
+import { Login, loginError, safeNext } from './Login';
+
+const LOGIN_TEXT = en.server.login;
 
 const PW = 'pw-canary-7f3a9c';
 

@@ -66,6 +66,17 @@ pub const ALLOW_DEGRADED_TEXT: &str = "Allow scripts with degraded confinement? 
 /// plan text (PD-76, L37).
 pub const PRUNE_BACKLOG_TEXT: &str =
     "Prune the backlog now? Records beyond the retention period are deleted in one run.";
+
+// M15 T10b: the dialog texts in German (the app's language, `NativeConfirmer::lang`).
+const RAISE_TAIL_DE: &str =
+    "Höhere Grenzen erlauben Agenten, mehr Daten abzurufen, bevor Sie sie prüfen.";
+/// [`LIFT_HOLD_TEXT`] in German.
+pub const LIFT_HOLD_TEXT_DE: &str =
+    "Legal Hold aufheben? Bereinigung und Schlüsselvernichtung laufen wieder.";
+/// [`ALLOW_DEGRADED_TEXT`] in German.
+pub const ALLOW_DEGRADED_TEXT_DE: &str = "Skripte mit eingeschränkter Isolierung erlauben? Ein kompromittierter Skript-Worker könnte dann als Ihr Benutzer handeln.";
+/// [`PRUNE_BACKLOG_TEXT`] in German.
+pub const PRUNE_BACKLOG_TEXT_DE: &str = "Den Rückstand jetzt bereinigen? Datensätze außerhalb der Aufbewahrungsfrist werden in einem Durchlauf gelöscht.";
 /// plan text (PD-82).
 pub const VERIFIED_TEXT: &str = "verified";
 /// plan text (PD-82).
@@ -204,16 +215,34 @@ impl ScriptLimitsReq {
 }
 
 /// The dialog name of a script limit in its `raise_text` line.
-fn script_label(key: &str) -> &'static str {
+fn script_label(lang: crate::Lang, key: &str) -> &'static str {
     match key {
-        "timeout_s" => "the script timeout (s)",
-        "heap_mb" => "the script heap limit (MiB)",
-        "process_mb" => "the script process limit (MiB)",
-        "max_calls" => "the script call limit",
-        "max_fetch_mb" => "the script fetch limit (MiB)",
-        "max_call_result_mb" => "the script call result limit (MiB)",
-        "max_result_mb" => "the script result limit (MiB)",
-        _ => "the script concurrent calls limit",
+        "timeout_s" => lang.pick("the script timeout (s)", "das Skript-Zeitlimit (s)"),
+        "heap_mb" => lang.pick(
+            "the script heap limit (MiB)",
+            "die Heap-Grenze für Skripte (MiB)",
+        ),
+        "process_mb" => lang.pick(
+            "the script process limit (MiB)",
+            "die Prozessgrenze für Skripte (MiB)",
+        ),
+        "max_calls" => lang.pick("the script call limit", "die Aufrufgrenze für Skripte"),
+        "max_fetch_mb" => lang.pick(
+            "the script fetch limit (MiB)",
+            "die Abrufgrenze für Skripte (MiB)",
+        ),
+        "max_call_result_mb" => lang.pick(
+            "the script call result limit (MiB)",
+            "die Grenze für Aufrufergebnisse von Skripten (MiB)",
+        ),
+        "max_result_mb" => lang.pick(
+            "the script result limit (MiB)",
+            "die Ergebnisgrenze für Skripte (MiB)",
+        ),
+        _ => lang.pick(
+            "the script concurrent calls limit",
+            "die Grenze für gleichzeitige Skript-Aufrufe",
+        ),
     }
 }
 
@@ -297,6 +326,12 @@ pub struct LimitsView {
 pub struct ConfigBanner {
     pub kind: &'static str,
     pub text: String,
+    /// M15 T10: the facts `text` is built from, so a UI can word it in its own language: the
+    /// writer's version as `text` names it (`vX`), `None` when `text` says "a newer atlas-duck",
+    /// and whether the file could be parsed at all (`false`: the "could not be read; settings
+    /// unavailable" text).
+    pub version: Option<String>,
+    pub parsed: bool,
 }
 
 /// The store health Settings and the tray show (§8.1, §8.5, §8.8). No error text: an
@@ -578,27 +613,29 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn confirmed(text: &str) -> Confirmed {
+fn confirmed(lang: crate::Lang, text: &str) -> Confirmed {
     Confirmed {
         dialog_text_sha256: Sha256::digest(text.as_bytes()).into(),
+        dialog_lang: Some(crate::dialog_lang(lang)),
     }
 }
 
 /// The version a banner names: only the characters of a version string, at most 32 (the file is
 /// writable by any same-user process, the banner text is app-generated).
 fn shown_version(info: &ConfigReadOnly) -> String {
+    banner_version(info).unwrap_or_else(|| "a newer atlas-duck".to_owned())
+}
+
+/// The `vX` a banner names, when the file's `written_by` is a plain version string.
+fn banner_version(info: &ConfigReadOnly) -> Option<String> {
     let ok = info.written_by.as_deref().filter(|v| {
         !v.is_empty()
             && v.len() <= 32
             && v.chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
     });
-    match ok {
-        Some(v) => format!("v{}", v.strip_prefix('v').unwrap_or(v)),
-        None => "a newer atlas-duck".to_owned(),
-    }
+    ok.map(|v| format!("v{}", v.strip_prefix('v').unwrap_or(v)))
 }
-
 /// The config banner. §7.7 (verbatim, with `vX` from `written_by`): the read-only text and the
 /// newer-schema "could not be read; upgrade atlas-duck" text. Plan text (L82, PD-90
 /// `config_unreadable`), in no spec sentence: "config could not be read; settings unavailable until
@@ -611,6 +648,8 @@ fn banner(cfg: &ConfigState) -> Option<ConfigBanner> {
                 "config written by {}; settings read-only until you upgrade",
                 shown_version(info)
             ),
+            version: banner_version(info),
+            parsed: true,
         }),
         // No schema and not parsed: the file could not be read at all (an I/O error, or no
         // structure to read a version from); "a newer atlas-duck" would be wrong for it.
@@ -618,6 +657,8 @@ fn banner(cfg: &ConfigState) -> Option<ConfigBanner> {
             Some(ConfigBanner {
                 kind: "unreadable",
                 text: "config could not be read; settings unavailable until it can be".to_owned(),
+                version: None,
+                parsed: false,
             })
         }
         ConfigState::Unreadable { info } => Some(ConfigBanner {
@@ -626,6 +667,8 @@ fn banner(cfg: &ConfigState) -> Option<ConfigBanner> {
                 "config written by {} could not be read; upgrade atlas-duck",
                 shown_version(info)
             ),
+            version: banner_version(info),
+            parsed: true,
         }),
         ConfigState::Absent | ConfigState::Writable(_) => None,
     }
@@ -662,16 +705,23 @@ struct Planned {
     dialog: Option<String>,
 }
 
-fn opt_mb(v: Option<u64>) -> String {
-    v.map_or_else(|| "no cap".to_owned(), |n| n.to_string())
+fn opt_mb(lang: crate::Lang, v: Option<u64>) -> String {
+    v.map_or_else(
+        || lang.pick("no cap", "keine Grenze").to_owned(),
+        |n| lang.count(n),
+    )
 }
 
-fn raise_text(name: &str, old: &str, new: &str) -> String {
-    format!("Raise {name} from {old} to {new}? {RAISE_TAIL}")
+fn raise_text(lang: crate::Lang, name: &str, old: &str, new: &str) -> String {
+    match lang {
+        crate::Lang::En => format!("Raise {name} from {old} to {new}? {RAISE_TAIL}"),
+        crate::Lang::De => format!("{name} von {old} auf {new} erhöhen? {RAISE_TAIL_DE}"),
+    }
 }
 
 /// What `req` changes, or `None` when the setting already has the value.
-fn plan(req: SettingChangeReq, cur: &Current) -> Option<Planned> {
+fn plan(lang: crate::Lang, req: SettingChangeReq, cur: &Current) -> Option<Planned> {
+    let num = |v: u64| lang.count(v);
     let p = |old: Value, new: Value, dialog: Option<String>| {
         Some(Planned {
             req: req.clone(),
@@ -686,8 +736,17 @@ fn plan(req: SettingChangeReq, cur: &Current) -> Option<Planned> {
             if *n == old {
                 return None;
             }
-            let d = (*n > old)
-                .then(|| raise_text("the Jira comments cap", &old.to_string(), &n.to_string()));
+            let d = (*n > old).then(|| {
+                raise_text(
+                    lang,
+                    lang.pick(
+                        "the Jira comments cap",
+                        "die Obergrenze für Jira-Kommentare",
+                    ),
+                    &num(u64::from(old)),
+                    &num(u64::from(*n)),
+                )
+            });
             p(json!(old), json!(n), d)
         }
         SettingChangeReq::CandidateCacheMb(n) => {
@@ -697,9 +756,10 @@ fn plan(req: SettingChangeReq, cur: &Current) -> Option<Planned> {
             }
             let d = (*n > old).then(|| {
                 raise_text(
-                    "the candidate cache (MiB)",
-                    &old.to_string(),
-                    &n.to_string(),
+                    lang,
+                    lang.pick("the candidate cache (MiB)", "den Kandidaten-Cache (MiB)"),
+                    &num(old),
+                    &num(*n),
                 )
             });
             p(json!(old), json!(n), d)
@@ -715,8 +775,17 @@ fn plan(req: SettingChangeReq, cur: &Current) -> Option<Planned> {
                 (None, Some(_)) => false,
                 (Some(o), Some(n)) => *n > o,
             };
-            let d =
-                raise.then(|| raise_text("the pending-bytes cap (MiB)", &opt_mb(old), &opt_mb(*n)));
+            let d = raise.then(|| {
+                raise_text(
+                    lang,
+                    lang.pick(
+                        "the pending-bytes cap (MiB)",
+                        "die Obergrenze für ausstehende Bytes (MiB)",
+                    ),
+                    &opt_mb(lang, old),
+                    &opt_mb(lang, *n),
+                )
+            });
             p(json!(old), json!(n), d)
         }
         SettingChangeReq::ExpiryHours(h) => {
@@ -726,9 +795,13 @@ fn plan(req: SettingChangeReq, cur: &Current) -> Option<Planned> {
             }
             let d = (*h > old).then(|| {
                 raise_text(
-                    "the request expiry (hours)",
-                    &old.to_string(),
-                    &h.to_string(),
+                    lang,
+                    lang.pick(
+                        "the request expiry (hours)",
+                        "den Ablauf von Anfragen (Stunden)",
+                    ),
+                    &num(u64::from(old)),
+                    &num(u64::from(*h)),
                 )
             });
             p(json!(old), json!(h), d)
@@ -746,10 +819,16 @@ fn plan(req: SettingChangeReq, cur: &Current) -> Option<Planned> {
             if *d == old {
                 return None;
             }
-            let dialog = (*d < old).then(|| {
-                format!(
+            let dialog = (*d < old).then(|| match lang {
+                crate::Lang::En => format!(
                     "Lower audit retention from {old} to {d} days? Records older than {d} days will be pruned."
-                )
+                ),
+                crate::Lang::De => format!(
+                    "Die Aufbewahrung des Audit-Protokolls von {} auf {} Tage senken? Datensätze, die älter als {} Tage sind, werden bereinigt.",
+                    num(u64::from(old)),
+                    num(u64::from(*d)),
+                    num(u64::from(*d))
+                ),
             });
             p(json!(old), json!(d), dialog)
         }
@@ -757,7 +836,7 @@ fn plan(req: SettingChangeReq, cur: &Current) -> Option<Planned> {
             if *on == cur.legal_hold {
                 return None;
             }
-            let dialog = (!on).then(|| LIFT_HOLD_TEXT.to_owned());
+            let dialog = (!on).then(|| lang.pick(LIFT_HOLD_TEXT, LIFT_HOLD_TEXT_DE).to_owned());
             p(json!(cur.legal_hold), json!(on), dialog)
         }
         SettingChangeReq::AllowDegradedScripts(on) => {
@@ -765,7 +844,10 @@ fn plan(req: SettingChangeReq, cur: &Current) -> Option<Planned> {
                 return None;
             }
             // §10.3 "enable degraded script confinement"; turning it off is stricter.
-            let dialog = on.then(|| ALLOW_DEGRADED_TEXT.to_owned());
+            let dialog = on.then(|| {
+                lang.pick(ALLOW_DEGRADED_TEXT, ALLOW_DEGRADED_TEXT_DE)
+                    .to_owned()
+            });
             p(json!(cur.allow_degraded_scripts), json!(on), dialog)
         }
         SettingChangeReq::ScriptLimits(r) => {
@@ -788,9 +870,10 @@ fn plan(req: SettingChangeReq, cur: &Current) -> Option<Planned> {
                 // §10.3 "raise limits": one line per raised key, in §9.4 key order.
                 if n > o {
                     lines.push(raise_text(
-                        script_label(key),
-                        &o.to_string(),
-                        &n.to_string(),
+                        lang,
+                        script_label(lang, key),
+                        &num(u64::from(o)),
+                        &num(u64::from(n)),
                     ));
                 }
             }
@@ -876,10 +959,7 @@ fn record(p: &Planned, confirmed: Option<&Confirmed>, applied: bool) -> NewEvent
         }
         o.insert(
             "confirmed".into(),
-            confirmed.map_or(
-                Value::Null,
-                |c| json!({ "dialog_text_sha256": hex::encode(c.dialog_text_sha256) }),
-            ),
+            confirmed.map_or(Value::Null, Confirmed::payload),
         );
     }
     ev
@@ -949,9 +1029,10 @@ impl CoreSettings {
 
     /// The native dialog on the caller's (blocking-pool) thread, no lock held (PD-13); an OK
     /// given after the shutdown began changes nothing.
-    fn confirm(&self, text: &str) -> Result<Confirmed, SettingsError> {
+    /// `lang` is the language `text` was built in (recorded with the proof, M15).
+    fn confirm(&self, lang: crate::Lang, text: &str) -> Result<Confirmed, SettingsError> {
         match self.engine.confirmer().confirm(text) {
-            Confirm::Ok => self.still_running().map(|()| confirmed(text)),
+            Confirm::Ok => self.still_running().map(|()| confirmed(lang, text)),
             Confirm::Cancel => Err(SettingsError::Cancelled),
         }
     }
@@ -1208,7 +1289,11 @@ impl SettingsAdmin for CoreSettings {
         let asked_scripts = changes
             .iter()
             .any(|c| matches!(c, SettingChangeReq::ScriptLimits(_)));
-        let planned: Vec<Planned> = changes.into_iter().filter_map(|c| plan(c, &cur)).collect();
+        let lang = self.engine.confirmer().lang();
+        let planned: Vec<Planned> = changes
+            .into_iter()
+            .filter_map(|c| plan(lang, c, &cur))
+            .collect();
         // Setting what is in force still clears a `[scripts]` table that differs from it
         // (a pending hand edit, or one that does not load): the file is what the next start reads.
         let repair_scripts = asked_scripts
@@ -1220,7 +1305,7 @@ impl SettingsAdmin for CoreSettings {
         let mut confirmations = Vec::with_capacity(planned.len());
         for p in &planned {
             confirmations.push(match &p.dialog {
-                Some(text) => Some(self.confirm(text)?),
+                Some(text) => Some(self.confirm(lang, text)?),
                 None => None,
             });
         }
@@ -1238,7 +1323,8 @@ impl SettingsAdmin for CoreSettings {
 
     fn prune_backlog_now(&self) -> Result<PruneReport, SettingsError> {
         let _job = self.enter()?;
-        let c = self.confirm(PRUNE_BACKLOG_TEXT)?;
+        let lang = self.engine.confirmer().lang();
+        let c = self.confirm(lang, lang.pick(PRUNE_BACKLOG_TEXT, PRUNE_BACKLOG_TEXT_DE))?;
         self.store
             .prune(Some(c))
             .map(PruneReport::from)
@@ -1470,7 +1556,7 @@ mod tests {
             script: ScriptLimits::default(),
             script_file_stale: false,
         };
-        let dialog = |r| plan(r, &cur).and_then(|p| p.dialog);
+        let dialog = |r| plan(crate::Lang::En, r, &cur).and_then(|p| p.dialog);
         assert_eq!(
             dialog(SettingChangeReq::MaxPendingBytesMb(None)).as_deref(),
             Some(
@@ -1487,6 +1573,13 @@ mod tests {
         );
         assert_eq!(dialog(SettingChangeReq::RetentionDays(200)), None);
         // An unchanged value plans nothing.
-        assert!(plan(SettingChangeReq::JiraCommentsCap(100), &cur).is_none());
+        assert!(
+            plan(
+                crate::Lang::En,
+                SettingChangeReq::JiraCommentsCap(100),
+                &cur
+            )
+            .is_none()
+        );
     }
 }
