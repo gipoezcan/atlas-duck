@@ -56,7 +56,7 @@
 </ol>
 <p>atlas-duck shows the key once: &quot;This key is shown only now.&quot; Use &quot;Copy&quot;, paste it into the settings of your agent, and choose &quot;Done&quot;. atlas-duck cannot show it again. If you lose it, create a new one.</p>
 <p>The agent sends the key as <code>Authorization: Bearer adk_…</code>. The list shows for each key the Name, the Prefix (the first characters, to recognise it), the Scopes, when it Expires and was Last used, and its State: Active, Revoked or Expired. You can have at most 25 active keys.</p>
-<p>&quot;Revoke&quot; stops a key: &quot;Revoke the key &quot;name&quot;? Agents using it stop working at once.&quot; Revoke every key that you no longer use, and every key that may have leaked.</p>
+<p>&quot;Revoke&quot; stops a key. atlas-duck asks first: agents using it stop working at once. Revoke every key that you no longer use, and every key that may have leaked.</p>
 <h2 id="scopes">Scopes</h2>
 <p>A scope says what a key, or an app, may ask for. Pick the smallest set that the agent needs.</p>
 <table>
@@ -71,7 +71,7 @@
 <p>&quot;Connected apps&quot; lists the apps that you allowed to use atlas-duck over MCP with OAuth. An app never approves anything either.</p>
 <p>The table shows the App, &quot;Returns to&quot; (the address that the app returns to after you answered), the Scopes, when you Allowed it, when it was Last used and when it Expires, and its State: Active, Revoked or Expired.</p>
 <p>&quot;Revoke&quot; cuts an app off: &quot;The app loses access at once.&quot; The app has to ask for your permission again if it wants to return.</p>
-<p>OAuth is available when your organisation has it enabled. If the page or the flow is missing, ask your administrator; API keys keep working.</p>
+<p>OAuth is on by default. Your operator can switch it off; the server then no longer offers the flow and answers &quot;OAuth is not enabled on this server.&quot; If you cannot use OAuth, ask your administrator; API keys keep working.</p>
 <h2 id="oauth-consent">Authorising an app</h2>
 <p>When you add atlas-duck to an MCP client that supports OAuth, the client opens your browser on the page &quot;Allow an app to use atlas-duck?&quot;. Sign in first if atlas-duck asks. The page shows:</p>
 <ul>

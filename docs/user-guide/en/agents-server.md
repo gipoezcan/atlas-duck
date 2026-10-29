@@ -20,7 +20,7 @@ atlas-duck shows the key once: "This key is shown only now." Use "Copy", paste i
 
 The agent sends the key as `Authorization: Bearer adk_…`. The list shows for each key the Name, the Prefix (the first characters, to recognise it), the Scopes, when it Expires and was Last used, and its State: Active, Revoked or Expired. You can have at most 25 active keys.
 
-"Revoke" stops a key: "Revoke the key "name"? Agents using it stop working at once." Revoke every key that you no longer use, and every key that may have leaked.
+"Revoke" stops a key. atlas-duck asks first: agents using it stop working at once. Revoke every key that you no longer use, and every key that may have leaked.
 
 ## Scopes {#scopes}
 
@@ -42,7 +42,7 @@ The table shows the App, "Returns to" (the address that the app returns to after
 
 "Revoke" cuts an app off: "The app loses access at once." The app has to ask for your permission again if it wants to return.
 
-OAuth is available when your organisation has it enabled. If the page or the flow is missing, ask your administrator; API keys keep working.
+OAuth is on by default. Your operator can switch it off; the server then no longer offers the flow and answers "OAuth is not enabled on this server." If you cannot use OAuth, ask your administrator; API keys keep working.
 
 ## Authorising an app {#oauth-consent}
 

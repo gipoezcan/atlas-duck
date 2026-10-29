@@ -77,7 +77,7 @@
 <li>Requested limits (scripts only);</li>
 <li>Submitted and Age;</li>
 <li>Connection, Client kind, Agent name, Agent name source and <code>cwd_basename</code>;</li>
-<li>Connection id and the peer details: Peer pid, Peer exe, origin exe and Peer chain.</li>
+<li>Connection id.</li>
 </ul>
 <p>The agent name is chosen by the agent. Treat it as a label, not as proof of who is asking.</p>
 <h2 id="approve-or-deny">Approve, release or deny</h2>
@@ -88,7 +88,8 @@
 <tr><td>Write</td><td>&quot;Approve&quot;</td><td>atlas-duck executes the change.</td></tr>
 <tr><td>Read</td><td>&quot;Release&quot;</td><td>The data the instance returned is handed to the agent.</td></tr>
 <tr><td>Script</td><td>&quot;Release&quot;</td><td>The final result of the script is handed to the agent.</td></tr>
-<tr><td>Failed read</td><td>&quot;Release outcome&quot; or &quot;Release status only&quot;</td><td>The agent receives <code>failed</code> (exit 6) with the HTTP status, with or without the text of the message.</td></tr>
+<tr><td>Read that failed with an HTTP error</td><td>&quot;Release&quot; or &quot;Release status only&quot;</td><td>The agent receives <code>failed</code> (exit 6) with the HTTP status, with the text of the error (&quot;Release&quot;) or without it (&quot;Release status only&quot;).</td></tr>
+<tr><td>Read that failed without an HTTP answer, or was too large</td><td>&quot;Release outcome&quot;</td><td>The agent receives <code>failed</code> (exit 6) with the outcome class (<code>result_too_large</code>, <code>upstream_network</code> or <code>upstream_unavailable</code>) and a fixed message; no HTTP status and no size.</td></tr>
 <tr><td>Any</td><td>&quot;Deny&quot;</td><td>The agent receives <code>denied</code> (exit 3) and your reason.</td></tr>
 </tbody></table>
 <p>Under the buttons the pane states in one line what the agent will receive.</p>
@@ -111,8 +112,8 @@
 <table>
 <thead><tr><th>Message</th><th>Meaning and what to do</th></tr></thead>
 <tbody>
-<tr><td>a masked text still occurs</td><td>The text is still present, for example in another field. Mask it there too, or drop the field.</td></tr>
-<tr><td>a value still changes after 3 decoding rounds</td><td>A value is encoded in layers that cannot be checked reliably. Drop the item or the field.</td></tr>
+<tr><td>a masked text still occurs</td><td>The text is still present, for example in another field, or in a place that cannot be rewritten such as a field name or a number. Mask it elsewhere, or drop the item or the field.</td></tr>
+<tr><td>a value still changes after 3 decoding rounds</td><td>A value is encoded in layers that cannot be checked reliably, or it is too large to check. Drop the item or the field.</td></tr>
 <tr><td>a match could not be masked cleanly</td><td>The text sits inside an encoded value. Drop the item or the field instead.</td></tr>
 <tr><td>a mirrored entry has no counterpart</td><td>Two lists in the result belong together and one entry has no partner. Use &quot;Drop the flagged items&quot;.</td></tr>
 <tr><td>mirrored entries cannot be matched</td><td>The same, but atlas-duck cannot tell which entries belong together. Use &quot;Drop the flagged items&quot;.</td></tr>
@@ -135,7 +136,7 @@
 <p>To say no in bulk, use &quot;Deny selected&quot; or &quot;Deny all pending from this session&quot;. Both ask for a reason for the agent and send it with &quot;Send deny&quot;.</p>
 <h2 id="needs-attention">Needs attention</h2>
 <p>Below the queue, &quot;Recently decided (24 h)&quot; lists what was decided in the last day. Entries under &quot;Needs attention&quot; are approved writes that did not end well: the write failed, ended with an unknown outcome, or met a version conflict. &quot;check target&quot; tells you to look at the Jira or Confluence object yourself, because for an unknown outcome atlas-duck cannot tell whether the change happened.</p>
-<p>Use &quot;Acknowledge&quot; to take an entry off the list, or &quot;Acknowledge all&quot;. When nothing was decided, the list says &quot;Nothing decided in the last 24 hours&quot;.</p>
+<p>A write that was sent back to the queue because the request changed before it ran (&quot;returned for re-review&quot;) is pinned there as well. Use &quot;Acknowledge&quot; to take an entry off the list, or &quot;Acknowledge all&quot;. Acknowledging is not saved: after atlas-duck restarts, the entries can appear again. When nothing was decided, the list says &quot;Nothing decided in the last 24 hours&quot;.</p>
 <p>The status labels you will meet are: pending, executing, succeeded, released, denied, expired, cancelled, failed, abandoned, outcome unknown and &quot;returned for re-review&quot;.</p>
 <h2 id="unverified-text">Unverified text</h2>
 <p>Everything an agent writes is untrusted: the reason, the agent name and the parameters. atlas-duck therefore marks what it could not check.</p>

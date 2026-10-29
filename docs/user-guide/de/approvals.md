@@ -52,7 +52,13 @@ Die Registerkarte „Anfrage“ nennt:
 - Angeforderte Grenzen (nur bei Skripten);
 - Eingereicht und Alter;
 - Verbindung, Client-Art, Agentenname, Quelle des Agentennamens und `cwd_basename`;
-- Verbindungs-ID und die Angaben zum Peer: Peer-PID, Peer-Programm, Ursprungsprogramm des Peers und Peer-Kette.
+- Verbindungs-ID.
+
+::: desktop
+
+Auf dem Desktop zeigt die Registerkarte außerdem die Angaben zum Peer: Peer-PID, Peer-Programm, Ursprungsprogramm des Peers und Peer-Kette.
+
+:::
 
 Den Agentennamen wählt der Agent selbst. Betrachten Sie ihn als Beschriftung, nicht als Beleg dafür, wer anfragt.
 
@@ -65,7 +71,8 @@ Welche Schaltflächen erscheinen, hängt von der Klasse der Anfrage ab:
 | Schreiben | „Freigeben“ | atlas-duck führt die Änderung aus. |
 | Lesen | „Übergeben“ | Die Daten, die die Instanz geliefert hat, gehen an den Agenten. |
 | Skript | „Übergeben“ | Das Endergebnis des Skripts geht an den Agenten. |
-| Fehlgeschlagenes Lesen | „Ergebnis übergeben“ oder „Nur Status übergeben“ | Der Agent erhält `failed` (Exit 6) mit dem HTTP-Status, mit oder ohne den Text der Meldung. |
+| Lesen, das mit einem HTTP-Fehler fehlgeschlagen ist | „Übergeben“ oder „Nur Status übergeben“ | Der Agent erhält `failed` (Exit 6) mit dem HTTP-Status, mit dem Text des Fehlers („Übergeben“) oder ohne ihn („Nur Status übergeben“). |
+| Lesen, das ohne HTTP-Antwort fehlgeschlagen oder zu groß war | „Ergebnis übergeben“ | Der Agent erhält `failed` (Exit 6) mit der Ergebnisklasse (`result_too_large`, `upstream_network` oder `upstream_unavailable`) und einer festen Meldung; kein HTTP-Status und keine Größe. |
 | Jede | „Ablehnen“ | Der Agent erhält `denied` (Exit 3) und Ihre Begründung. |
 
 Unter den Schaltflächen steht in einer Zeile, was der Agent erhalten wird.
@@ -84,7 +91,7 @@ Sie können ändern, was ausgeführt wird, oder Teile dessen zurückhalten, was 
 
 - „Eintrag entfernen“: einen Eintrag einer Liste weglassen;
 - „Feld entfernen (dieser Eintrag)“ oder „Feld entfernen (alle Einträge)“: ein Feld weglassen;
-- „Text maskieren“: einen Text durch `[REDACTED]` ersetzen. Geben Sie den „Zu maskierenden Text“ ein oder verwenden Sie den ausgewählten Text. „Nur dieses Vorkommen“ maskiert nur eine Stelle;
+- „Text maskieren“: einen Text durch `[REDACTED]` ersetzen. Geben Sie den Text im Feld „Zu maskierender Text“ ein oder verwenden Sie den ausgewählten Text. „Nur dieses Vorkommen“ maskiert nur eine Stelle;
 - eine Voreinstellung wählen: „Nur Status übergeben“ oder „Nur Fehlerklasse behalten“;
 - mit „Alle Schwärzungen entfernen“ von vorn beginnen.
 
@@ -96,8 +103,8 @@ Kommt der Text, den Sie maskieren wollen, auch an anderer Stelle vor, sagt atlas
 
 | Meldung | Bedeutung und was zu tun ist |
 | --- | --- |
-| ein maskierter Text kommt weiterhin vor | Der Text steht noch da, zum Beispiel in einem anderen Feld. Maskieren Sie ihn auch dort oder entfernen Sie das Feld. |
-| ein Wert ändert sich nach 3 Dekodierungsrunden weiterhin | Ein Wert ist in Schichten kodiert, die sich nicht zuverlässig prüfen lassen. Entfernen Sie den Eintrag oder das Feld. |
+| ein maskierter Text kommt weiterhin vor | Der Text steht noch da, zum Beispiel in einem anderen Feld oder an einer Stelle, die sich nicht umschreiben lässt, etwa einem Feldnamen oder einer Zahl. Maskieren Sie ihn anderswo oder entfernen Sie den Eintrag oder das Feld. |
+| ein Wert ändert sich nach 3 Dekodierungsrunden weiterhin | Ein Wert ist in Schichten kodiert, die sich nicht zuverlässig prüfen lassen, oder er ist zu groß für die Prüfung. Entfernen Sie den Eintrag oder das Feld. |
 | ein Treffer ließ sich nicht sauber maskieren | Der Text steckt in einem kodierten Wert. Entfernen Sie stattdessen den Eintrag oder das Feld. |
 | ein gespiegelter Eintrag hat keine Entsprechung | Zwei Listen im Ergebnis gehören zusammen, und ein Eintrag hat keinen Partner. Verwenden Sie „Markierte Einträge entfernen“. |
 | gespiegelte Einträge lassen sich nicht zuordnen | Dasselbe, nur kann atlas-duck nicht erkennen, welche Einträge zusammengehören. Verwenden Sie „Markierte Einträge entfernen“. |
@@ -127,7 +134,7 @@ Um gesammelt abzulehnen, verwenden Sie „Ausgewählte ablehnen“ oder „Alle 
 
 Unter der Warteschlange listet „Zuletzt entschieden (24 Std.)“ auf, was in den letzten 24 Stunden entschieden wurde. Einträge unter „Braucht Aufmerksamkeit“ sind freigegebene Schreibzugriffe, die nicht gut ausgegangen sind: Der Schreibzugriff ist fehlgeschlagen, endete mit unbekanntem Ergebnis oder traf auf einen Versionskonflikt. „Ziel prüfen“ heißt: Sehen Sie sich das Jira- oder Confluence-Objekt selbst an, denn bei unbekanntem Ergebnis kann atlas-duck nicht sagen, ob die Änderung stattgefunden hat.
 
-Mit „Zur Kenntnis nehmen“ nehmen Sie einen Eintrag aus der Liste, mit „Alle zur Kenntnis nehmen“ alle. Wurde nichts entschieden, steht in der Liste „In den letzten 24 Stunden wurde nichts entschieden“.
+Auch ein Schreibzugriff, der in die Warteschlange zurückgegeben wurde, weil sich die Anfrage vor der Ausführung geändert hat („zur erneuten Prüfung zurückgegeben“), steht dort. Mit „Zur Kenntnis nehmen“ nehmen Sie einen Eintrag aus der Liste, mit „Alle zur Kenntnis nehmen“ alle. Die Kenntnisnahme wird nicht gespeichert: Nach einem Neustart von atlas-duck können die Einträge wieder erscheinen. Wurde nichts entschieden, steht in der Liste „In den letzten 24 Stunden wurde nichts entschieden“.
 
 Die Statusbezeichnungen, denen Sie begegnen, sind: ausstehend, wird ausgeführt, erfolgreich, übergeben, abgelehnt, abgelaufen, storniert, fehlgeschlagen, abgebrochen, Ergebnis unbekannt und „zur erneuten Prüfung zurückgegeben“.
 

@@ -20,7 +20,7 @@ atlas-duck zeigt den Schlüssel nur einmal: „Dieser Schlüssel wird nur jetzt 
 
 Der Agent sendet den Schlüssel als `Authorization: Bearer adk_…`. Die Liste zeigt je Schlüssel den Namen, das Präfix (die ersten Zeichen, an denen Sie ihn erkennen), die Berechtigungen, wann er abläuft und zuletzt verwendet wurde sowie seinen Status: Aktiv, Widerrufen oder Abgelaufen. Sie können höchstens 25 aktive Schlüssel haben.
 
-„Widerrufen“ stoppt einen Schlüssel: „Den Schlüssel „Name“ widerrufen? Agents, die ihn verwenden, funktionieren sofort nicht mehr.“ Widerrufen Sie jeden Schlüssel, den Sie nicht mehr brauchen, und jeden, der durchgesickert sein könnte.
+„Widerrufen“ stoppt einen Schlüssel. atlas-duck fragt vorher nach: Agents, die ihn verwenden, funktionieren danach sofort nicht mehr. Widerrufen Sie jeden Schlüssel, den Sie nicht mehr brauchen, und jeden, der durchgesickert sein könnte.
 
 ## Berechtigungen {#scopes}
 
@@ -42,7 +42,7 @@ Die Tabelle zeigt die App, „Rückkehr zu“ (die Adresse, zu der die App nach 
 
 „Widerrufen“ schneidet eine App ab: „Die App verliert sofort den Zugriff.“ Will sie zurückkehren, muss sie erneut um Ihre Erlaubnis bitten.
 
-OAuth steht zur Verfügung, wenn Ihre Organisation es aktiviert hat. Fehlt die Seite oder der Ablauf, fragen Sie Ihren Administrator; API-Schlüssel funktionieren weiterhin.
+OAuth ist standardmäßig eingeschaltet. Ihr Betreiber kann es abschalten; der Server bietet den Ablauf dann nicht mehr an und antwortet „OAuth ist auf diesem Server nicht aktiviert.“ Können Sie OAuth nicht verwenden, fragen Sie Ihren Administrator; API-Schlüssel funktionieren weiterhin.
 
 ## Eine App autorisieren {#oauth-consent}
 

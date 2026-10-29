@@ -52,7 +52,13 @@ The "Request" tab lists:
 - Requested limits (scripts only);
 - Submitted and Age;
 - Connection, Client kind, Agent name, Agent name source and `cwd_basename`;
-- Connection id and the peer details: Peer pid, Peer exe, origin exe and Peer chain.
+- Connection id.
+
+::: desktop
+
+On the desktop the tab also shows the peer details: Peer pid, Peer exe, origin exe and Peer chain.
+
+:::
 
 The agent name is chosen by the agent. Treat it as a label, not as proof of who is asking.
 
@@ -65,7 +71,8 @@ The buttons depend on the class of the request:
 | Write | "Approve" | atlas-duck executes the change. |
 | Read | "Release" | The data the instance returned is handed to the agent. |
 | Script | "Release" | The final result of the script is handed to the agent. |
-| Failed read | "Release outcome" or "Release status only" | The agent receives `failed` (exit 6) with the HTTP status, with or without the text of the message. |
+| Read that failed with an HTTP error | "Release" or "Release status only" | The agent receives `failed` (exit 6) with the HTTP status, with the text of the error ("Release") or without it ("Release status only"). |
+| Read that failed without an HTTP answer, or was too large | "Release outcome" | The agent receives `failed` (exit 6) with the outcome class (`result_too_large`, `upstream_network` or `upstream_unavailable`) and a fixed message; no HTTP status and no size. |
 | Any | "Deny" | The agent receives `denied` (exit 3) and your reason. |
 
 Under the buttons the pane states in one line what the agent will receive.
@@ -96,8 +103,8 @@ If the text you want to mask also appears elsewhere, atlas-duck tells you where.
 
 | Message | Meaning and what to do |
 | --- | --- |
-| a masked text still occurs | The text is still present, for example in another field. Mask it there too, or drop the field. |
-| a value still changes after 3 decoding rounds | A value is encoded in layers that cannot be checked reliably. Drop the item or the field. |
+| a masked text still occurs | The text is still present, for example in another field, or in a place that cannot be rewritten such as a field name or a number. Mask it elsewhere, or drop the item or the field. |
+| a value still changes after 3 decoding rounds | A value is encoded in layers that cannot be checked reliably, or it is too large to check. Drop the item or the field. |
 | a match could not be masked cleanly | The text sits inside an encoded value. Drop the item or the field instead. |
 | a mirrored entry has no counterpart | Two lists in the result belong together and one entry has no partner. Use "Drop the flagged items". |
 | mirrored entries cannot be matched | The same, but atlas-duck cannot tell which entries belong together. Use "Drop the flagged items". |
@@ -127,7 +134,7 @@ To say no in bulk, use "Deny selected" or "Deny all pending from this session". 
 
 Below the queue, "Recently decided (24 h)" lists what was decided in the last day. Entries under "Needs attention" are approved writes that did not end well: the write failed, ended with an unknown outcome, or met a version conflict. "check target" tells you to look at the Jira or Confluence object yourself, because for an unknown outcome atlas-duck cannot tell whether the change happened.
 
-Use "Acknowledge" to take an entry off the list, or "Acknowledge all". When nothing was decided, the list says "Nothing decided in the last 24 hours".
+A write that was sent back to the queue because the request changed before it ran ("returned for re-review") is pinned there as well. Use "Acknowledge" to take an entry off the list, or "Acknowledge all". Acknowledging is not saved: after atlas-duck restarts, the entries can appear again. When nothing was decided, the list says "Nothing decided in the last 24 hours".
 
 The status labels you will meet are: pending, executing, succeeded, released, denied, expired, cancelled, failed, abandoned, outcome unknown and "returned for re-review".
 

@@ -58,7 +58,7 @@ Zwei Arten von Kopien schützen den Kopf der Kette. atlas-duck hält eine im Sch
 
 ::: server
 
-Der Server prüft Ketten nicht auf den Webseiten. Der Betreiber prüft sie mit `admin anchor verify`. Neben der Kette jedes Benutzers führt der Server eine **Ankerkette**, die sich mindestens alle 15 Minuten auf den Kopf der Kette jedes Benutzers festlegt. Sie macht sichtbar, wenn eine Kette nachträglich verändert oder gekürzt wurde. Auch die Ankerkette schreibt der Server selbst; sie schützt also vor Fehlern einzelner Benutzer und vor Teilschäden, aber nicht vor jemandem, der den Server und seine Schlüssel kontrolliert.
+Der Server prüft Ketten nicht auf den Webseiten. Neben der Kette jedes Benutzers führt der Server eine **Ankerkette**, die den Kopf der Kette jedes Benutzers festhält, in Abständen von höchstens 15 Minuten. Der Betreiber kann `admin anchor verify` ausführen: Der Befehl berechnet die Ankerkette neu und vergleicht den zuletzt verankerten Kopf jedes Benutzers mit dessen Protokoll. Er meldet eine gekürzte Kette, einen ersetzten Kopfdatensatz oder ein fehlendes Protokoll. Er prüft nicht die ganze Kette eines Benutzers und nicht die Nutzdaten, und er kann keine Änderung finden, die vor dem verankerten Kopf liegt. Nichts wird von selbst erkannt: Ein Befund erscheint nur, wenn der Betreiber den Befehl ausführt. Auch die Ankerkette schreibt der Server selbst; sie schützt also vor Fehlern einzelner Benutzer und vor Teilschäden, aber nicht vor jemandem, der den Server und seine Schlüssel kontrolliert.
 
 :::
 
@@ -68,7 +68,7 @@ Ein Export kopiert die Datensätze eines Zeitraums samt entschlüsselten Nutzdat
 
 ::: desktop
 
-Im Fenster Audit-Protokoll hat „Compliance-Export“ unter „Export und Backup“ die Felder „Export von (UTC)“ und „Export bis (UTC)“. Lassen Sie beide leer, um das ganze Protokoll zu exportieren. Wählen Sie „Exportieren…“. atlas-duck zeigt eine Warnung und fragt in eigenen Dialogen nach dem Ordner. Es schreibt den Export in einen neuen Ordner und gibt ihm seinen endgültigen Namen erst, wenn alles geschrieben ist. Ein Ordner, dessen Name noch auf „.partial“ endet, ist unfertig und darf nicht weitergegeben werden.
+Im Fenster Audit-Protokoll hat „Compliance-Export“ unter „Export und Backup“ die Felder „Export von (UTC)“ und „Export bis (UTC)“. Lassen Sie beide leer, um das ganze Protokoll zu exportieren. Wählen Sie „Exportieren…“. atlas-duck zeigt eine Warnung und fragt in eigenen Dialogen nach dem Ordner. Es schreibt den Export in einen neuen Ordner und gibt ihm seinen endgültigen Namen erst, wenn alles geschrieben ist. Ein Ordner, dessen Name noch auf „.partial“ endet, ist unfertig und darf nicht weitergegeben werden. Meldet atlas-duck, dass der Export abgeschlossen ist, der Ordner aber seinen Namen behalten hat, entfernen Sie „.partial“ am Ende des Namens selbst, bevor Sie ihn weitergeben, und exportieren Sie nicht erneut.
 
 Ist der Export fertig, zeigt atlas-duck ein SHA-256 des Manifests, den Fingerabdruck, der die Dateien zusammenbindet. Geben Sie es dem Empfänger **über einen anderen Kanal** als die Dateien. Ohne es kann der Empfänger nicht sicher sein, dass die Dateien die sind, die Sie erstellt haben.
 
@@ -91,13 +91,15 @@ Auditoren können das Protokoll jedes Benutzers auf dieselbe Weise exportieren, 
 Der Empfänger prüft einen Export mit dem Befehl `atlas-duck verify-export`. Er braucht dafür keinen Zugriff auf Ihren Computer oder Server und arbeitet offline.
 
 ```
-atlas-duck verify-export <Ordner> --manifest-sha256 <hex> [--anchor-dir <Ordner>]
+atlas-duck verify-export <Ordner> [--manifest-sha256 <hex>] [--anchor-dir <Ordner>]
 ```
 
 Er berechnet jeden Datensatz-Fingerabdruck und die Kette neu, prüft, dass die entschlüsselten Nutzdaten zu ihren Fingerabdrücken passen, und vergleicht das Ergebnis mit dem, was Sie ihm als **Vertrauensanker** geben:
 
 - `--manifest-sha256` ist der Fingerabdruck, den Sie getrennt weitergegeben haben. Er belegt, dass die Dateien die exportierten sind.
 - `--anchor-dir` ist eine Kopie des Anker-Verzeichnisses. Sie zeigt, dass die Historie zu dem passt, was dort früher geschrieben wurde.
+
+Beide sind optional, aber ohne einen Vertrauensanker kann das Ergebnis nur „in sich stimmig“ lauten (Exit 20).
 
 ::: server
 
@@ -112,7 +114,7 @@ Der Exit-Code sagt Ihnen, wie weit Sie dem Ergebnis trauen können:
 | 0 | Verifiziert gegen einen Vertrauensanker, der den ganzen Export abdeckt. |
 | 20 | In sich stimmig, aber kein Vertrauensanker deckt alles ab. Der Befehl meldet „internally consistent; trust root NOT verified“. Behandeln Sie das als nicht verifiziert. |
 | 21 | Manipulation oder eine Verzweigung: zwei Exporte, die denselben Anfang haben und dann auseinanderlaufen. |
-| 22 | Der Befehl konnte nicht laufen: falsche Verwendung, nicht lesbare Dateien oder ein unfertiger Ordner mit „.partial“. |
+| 22 | Der Befehl konnte nicht laufen: falsche Verwendung (zum Beispiel `--anchor-dir` zusammen mit `--anchor-chain`), nicht lesbare Dateien, ein unfertiger Ordner mit „.partial“ oder die App atlas-duck wurde nicht gefunden. |
 
 Eine Verzweigung ist nicht zwingend ein Angriff. Sie entsteht, wenn ein Protokoll aus einem Backup wiederhergestellt wurde, während die alte Installation weiterlief. Die alte Installation sollte außer Betrieb genommen werden.
 
@@ -134,7 +136,7 @@ Die Aufbewahrung erreicht keine Backups, keine Exporte und keine Kopien Ihrer Da
 
 ::: server
 
-Auf dem Server legt der Betreiber die Aufbewahrungsfrist fest, nicht der einzelne Benutzer. Diese Anleitung beschreibt, was der Server tut, wenn ein Benutzer deaktiviert wird, zum Beispiel weil er die Organisation verlassen hat: Sein Protokoll bleibt für Auditoren standardmäßig 365 Tage lang verfügbar. Danach löscht der Server es samt den Schlüsseln des Benutzers und hält die Löschung in der Ankerkette fest. Ein Auditor, der ein Protokoll länger braucht, muss es vorher exportieren. Backups bleiben davon unberührt: Ein früher erstelltes Backup enthält das gelöschte Protokoll weiterhin, der Betreiber muss also auch alte Backups entfernen.
+Auf dem Server legt der Betreiber die Aufbewahrungsfrist fest, nicht der einzelne Benutzer, und das Protokoll eines aktiven Benutzers bleibt erhalten. Diese Anleitung beschreibt, was der Server tut, wenn ein Benutzer deaktiviert wird, zum Beispiel weil er die Organisation verlassen hat: Sein Protokoll bleibt für Auditoren standardmäßig 365 Tage lang verfügbar. Danach löscht der Server es samt den Schlüsseln des Benutzers und hält die Löschung in der Ankerkette fest. Ein Auditor, der ein Protokoll länger braucht, muss es vorher exportieren. Backups bleiben davon unberührt: Ein früher erstelltes Backup enthält das gelöschte Protokoll weiterhin, der Betreiber muss also auch alte Backups entfernen.
 
 :::
 
@@ -161,6 +163,6 @@ Melden die Einstellungen, dass ein Anker-Eintrag im Schlüsselbund fehlt, schrei
 
 ::: server
 
-Der Server zeigt Vorfälle nicht auf den Webseiten. Der Betreiber findet sie mit `admin anchor verify`; der Befehl nennt den Benutzer und den Datensatz, der nicht passt, und endet mit einem Fehler. Wenn Sie vermuten, dass Ihr Protokoll betroffen ist, wenden Sie sich an Ihren Administrator.
+Integritätsvorfälle mit Banner und Kenntnisnahme gibt es nur in der Desktop-App. Der Server zeigt sie nicht auf den Webseiten. Führt der Betreiber `admin anchor verify` aus, meldet der Befehl Befunde, die den Benutzer und die Sequenznummer nennen, und endet mit einem Fehler. Wenn Sie vermuten, dass Ihr Protokoll betroffen ist, wenden Sie sich an Ihren Administrator.
 
 :::

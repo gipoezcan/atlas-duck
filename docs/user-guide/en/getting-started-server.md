@@ -36,7 +36,7 @@ How to create the token, what the states mean and what the errors say is in [Ins
 An agent reaches atlas-duck over MCP in one of two ways:
 
 - With an **API key** that you create under "API keys". A key has scopes (read, propose_write, scripts), expires after 1 to 90 days and can be revoked. See [Agents (server)](agents-server#api-keys).
-- Through **OAuth**, if your organisation enables it: an MCP client that supports it sends you to atlas-duck to allow it. You answer on the consent page and can revoke the app later under "Connected apps". See [Agents (server)](agents-server#oauth-consent).
+- Through **OAuth**, unless your operator has switched it off: an MCP client that supports it sends you to atlas-duck to allow it. You answer on the consent page and can revoke the app later under "Connected apps". See [Agents (server)](agents-server#oauth-consent).
 
 Neither an API key nor a connected app can approve anything. You decide on the "Approvals" page: see [Approvals](approvals). To be alerted when something waits for you, choose "Enable notifications" there ([Settings](settings#notifications)).
 

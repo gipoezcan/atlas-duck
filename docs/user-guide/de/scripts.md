@@ -9,7 +9,7 @@ order: 60
 
 Mit einem Skript erledigt ein Agent viele Lesezugriffe in einer Anfrage. Es ist JavaScript: der Rumpf von `async function main(args, atlas)`. Darin ruft es Lesevorgänge mit `atlas.<product>.<op>(params)` oder `atlas.call` auf, blättert mit `atlas.all` durch Ergebnisse und kann mit `atlas.ops()` und `atlas.instances()` abfragen, was es gibt. `atlas.log` schreibt eine Notiz.
 
-Ein Skript kann nur lesen. Es kann keine Schreibvorgänge aufrufen, keine Module importieren, keine Dateien öffnen und das Netzwerk nicht nutzen. Es läuft in einer Sandbox, einem eigenen Prozess, den das Betriebssystem einschränkt, und seine Uhr geht nach UTC.
+Ein Skript kann nur lesen. Es kann keine Schreibvorgänge aufrufen, keine Module importieren, keine Dateien öffnen und das Netzwerk nicht nutzen. Es läuft in einer Sandbox, einem eigenen Prozess, den das Betriebssystem einschränkt, und unter Linux und macOS (also auch auf dem Server) geht seine Uhr nach UTC. Unter Windows folgen die Datumsfunktionen für die Ortszeit der Zeitzone des Systems; ein Skript sollte die UTC-Funktionen wie `getUTCHours` oder `toISOString` verwenden.
 
 Ein Skript sendet nie von selbst etwas an den Agenten. Wenn es endet, wartet sein Endergebnis als Anfrage der Klasse „Skript“ in der Warteschlange. Sie sehen es sich an, schwärzen es bei Bedarf und übergeben es, genau wie ein Lesen. Siehe [Freigaben](approvals#approve-or-deny).
 
@@ -73,7 +73,7 @@ Der Server führt Skripte mit den folgenden Standardwerten aus. Sie sind fest; a
 | Skript-Ergebnislimit (MiB) | 16 |
 | Gleichzeitige Skript-Aufrufe | 4 |
 
-Auf dem Desktop darf ein Agent mit `--limits` niedrigere Limits anfordern, nie höhere. Ein Skript, das ein Limit überschreitet, endet mit `script_limit` (Exit 8).
+Ein Agent darf niedrigere Limits anfordern (mit `--limits` in der Befehlszeile oder dem Parameter `limits` von `script_run`), nie höhere. Ein Skript, das ein Limit überschreitet, endet mit `script_limit` (Exit 8).
 
 Zwei echte Skripte und zwei Probeläufe können gleichzeitig laufen. Weitere warten. Der Server wendet dieselben Zahlen je Benutzer an.
 
@@ -83,13 +83,13 @@ Das Heap-Limit muss mindestens das 15-Fache des Limits je Aufrufergebnis betrage
 
 ::: desktop
 
-Die Einstellungen zeigen das Ergebnis unter „Skript-Isolierung“: „erfüllt: Skripte dürfen laufen“, „nicht erfüllt: Skripte sind aus“ oder „die Prüfung beim Start ist noch nicht abgeschlossen“. Ist die Isolierung nicht erfüllt, sind Skripte aus, und ein Agent erhält `sandbox_unavailable` (Exit 8). Sie können Skripte trotzdem mit „Skripte mit eingeschränkter Isolierung erlauben“ zulassen; atlas-duck bittet Sie um eine Bestätigung. Danach steht in den Einstellungen „nicht erfüllt: Skripte laufen nur, weil eingeschränkte Isolierung erlaubt ist“, und das Banner zeigt „Vorsicht: Skripte laufen mit eingeschränkter Isolierung“. Wählen Sie das nur auf einem Rechner, dem Sie vertrauen.
+Die Einstellungen zeigen das Ergebnis unter „Skript-Isolierung“: „erfüllt: Skripte dürfen laufen“, „nicht erfüllt: Skripte sind aus“ oder „die Prüfung beim Start ist noch nicht abgeschlossen“. Ist die Isolierung nicht erfüllt, sind Skripte aus, und ein Agent erhält `sandbox_unavailable` (Exit 8). Sie können Skripte trotzdem mit „Skripte mit eingeschränkter Isolierung erlauben“ zulassen; atlas-duck bittet Sie um eine Bestätigung. Danach steht in den Einstellungen „nicht erfüllt: Skripte laufen nur, weil eingeschränkte Isolierung erlaubt ist“, und das Banner zeigt „Vorsicht: Skripte laufen mit eingeschränkter Isolierung“. Bei eingeschränkter Isolierung könnte ein Fehler im Skript-Worker ein Skript als Ihren Benutzer handeln lassen. Wählen Sie das nur auf einem Rechner, dem Sie vertrauen, und nur so lange, wie Sie es brauchen.
 
 :::
 
 ::: server
 
-Auf dem Server gibt es keinen eingeschränkten Modus: Ist die Isolierung nicht erfüllt, sind Skripte aus, und Agents erhalten `sandbox_unavailable`.
+Auf dem Server gibt es keinen eingeschränkten Modus: Ist die Isolierung nicht erfüllt, sind Skripte aus, und Agents erhalten `sandbox_unavailable`. Denselben Fehler erhalten Agents, wenn der Betreiber Skripte abgeschaltet hat. Brauchen Sie Skripte und erhalten diesen Fehler, fragen Sie Ihren Administrator.
 
 :::
 
@@ -99,7 +99,7 @@ Auf dem Server gibt es keinen eingeschränkten Modus: Ist die Isolierung nicht e
 
 Um ein Skript zu beenden, verwenden Sie „Beenden“ in „Laufende Skripte“. Die Schaltfläche wechselt zu „Wird beendet…“, und das Fenster antwortet „Beenden angefordert“. Ist das Skript schon zu Ende, sehen Sie „Dieses Skript läuft nicht mehr.“; wird es bereits beendet, „Dieses Skript wird bereits beendet.“
 
-Ein beendetes Skript verschwindet nicht. Sein Kandidat, das bis dahin Gesammelte, wird zu einer Anfrage in der Warteschlange. Sie können ihn übergeben, schwärzen oder ablehnen wie jede andere Anfrage.
+Ein beendetes Skript verschwindet nicht spurlos. Es endet als fehlgeschlagen mit einem Fehler, der besagt, dass der Lauf vom Benutzer beendet wurde, und dieser Fehler wartet als Ergebnis in der Warteschlange. Er enthält keine Daten, die das Skript bis dahin gesammelt hatte. Sie können ihn übergeben, schwärzen oder ablehnen wie jede andere Anfrage.
 
 :::
 

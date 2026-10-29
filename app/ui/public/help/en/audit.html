@@ -72,18 +72,19 @@
 <p>Two kinds of copies protect the head of the chain. atlas-duck keeps one in the system keychain of your computer. That detects a log that was cut short, but anyone who controls your account can change the keychain too. For more, set an <strong>anchor directory</strong> in Settings (&quot;External anchor directory&quot;, &quot;Set anchor directory…&quot;): atlas-duck then writes copies of the log head into a folder, once a day and after important changes such as retention or legal hold changes. This protects against a rewritten history only if you cannot rewrite the folder yourself, for example a share that someone else administers and that only accepts appends. atlas-duck asks you to confirm every change of the anchor directory in its own dialog, because changing or removing it weakens the protection. &quot;Anchor directory&quot; in the Audit window tells you if writing to it fails; the lines then wait and are retried.</p>
 <h2 id="export">Export the log</h2>
 <p>An export copies records of a time range, with their decrypted payloads, so that someone else can check them, for example an auditor or the compliance owner. The files are readable by anyone who can open them. Keep them as safe as the original data.</p>
-<p>In the Audit window, &quot;Compliance export&quot; under &quot;Export and backup&quot; has the fields &quot;Export from (UTC)&quot; and &quot;Export to (UTC)&quot;. Leave both empty for the whole log. Choose &quot;Export…&quot;. atlas-duck shows a warning and asks for the folder in its own dialogs. It writes the export into a new folder and gives it its final name only when everything has been written. A folder whose name still ends in &quot;.partial&quot; is unfinished and must not be handed over.</p>
+<p>In the Audit window, &quot;Compliance export&quot; under &quot;Export and backup&quot; has the fields &quot;Export from (UTC)&quot; and &quot;Export to (UTC)&quot;. Leave both empty for the whole log. Choose &quot;Export…&quot;. atlas-duck shows a warning and asks for the folder in its own dialogs. It writes the export into a new folder and gives it its final name only when everything has been written. A folder whose name still ends in &quot;.partial&quot; is unfinished and must not be handed over. If atlas-duck says that the export is complete but the folder kept its name, remove &quot;.partial&quot; from the end of the name yourself before you hand it over, and do not export again.</p>
 <p>When the export is done, atlas-duck shows a SHA-256 of the manifest, the fingerprint that binds the files together. Give it to the recipient <strong>by another channel</strong> than the files. Without it the recipient cannot be sure that the files are the ones you made.</p>
 <p>&quot;Full backup&quot; with &quot;Back up now…&quot; is something else: it saves the whole log with its recovery data, so that you can restore it. A backup never contains stored tokens, so after a restore every instance needs its token again. Backups and exports are outside retention; keeping and deleting them is up to you.</p>
 <h2 id="verify-export">Check an export with verify-export</h2>
 <p>The recipient checks an export with the command <code>atlas-duck verify-export</code>. It needs no access to your computer or server, and it works offline.</p>
-<pre><code>atlas-duck verify-export &lt;dir&gt; --manifest-sha256 &lt;hex&gt; [--anchor-dir &lt;dir&gt;]
+<pre><code>atlas-duck verify-export &lt;dir&gt; [--manifest-sha256 &lt;hex&gt;] [--anchor-dir &lt;dir&gt;]
 </code></pre>
 <p>It recomputes every record fingerprint and the chain, checks that the decrypted payloads match their fingerprints, and compares the result with what you give it as a <strong>trust root</strong>:</p>
 <ul>
 <li><code>--manifest-sha256</code> is the fingerprint that you passed on separately. It proves that the files are those that were exported.</li>
 <li><code>--anchor-dir</code> is a copy of the anchor directory. It shows that the history matches what was written there earlier.</li>
 </ul>
+<p>Both are optional, but without any trust root the result can only be &quot;consistent in itself&quot; (exit 20).</p>
 <p>The exit code tells you how far to trust the result:</p>
 <table>
 <thead><tr><th>Exit code</th><th>Meaning</th></tr></thead>
@@ -91,7 +92,7 @@
 <tr><td>0</td><td>Verified against a trust root that covers the whole export.</td></tr>
 <tr><td>20</td><td>Consistent in itself, but no trust root covers all of it. The command says &quot;internally consistent; trust root NOT verified&quot;. Treat this as not verified.</td></tr>
 <tr><td>21</td><td>Tampering, or a fork: two exports that share a start but diverge.</td></tr>
-<tr><td>22</td><td>The command could not run: wrong usage, unreadable files, or an unfinished <code>.partial</code> folder.</td></tr>
+<tr><td>22</td><td>The command could not run: wrong usage (for example <code>--anchor-dir</code> together with <code>--anchor-chain</code>), unreadable files, an unfinished <code>.partial</code> folder, or the atlas-duck app was not found.</td></tr>
 </tbody></table>
 <p>A fork is not necessarily an attack. It happens when a log was restored from a backup while the old installation kept running. The old installation should be shut down.</p>
 <h2 id="retention">Retention and legal hold</h2>

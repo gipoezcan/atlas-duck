@@ -11,7 +11,7 @@ An agent reaches atlas-duck through the `atlas-duck` command. It does not need a
 
 If the app is not running, the command starts it and waits for up to 20 seconds. That needs a desktop session and an installed app; without them the command fails with `launch_timeout` or `unreachable`.
 
-The "Onboarding" window ("Einführung" in German) gives you ready-made instructions for the agent. Copy them into the `CLAUDE.md` or `AGENTS.md` file of your project. The rules in them are these:
+The "Onboarding" window ("Einführung" in German) gives you ready-made instructions for the agent. Copy them into the `CLAUDE.md` or `AGENTS.md` file of your project. They are rules that the agent follows (the list speaks to the agent, you do not have to run anything):
 
 - Set the name of the agent with `ATLAS_DUCK_AGENT`, for example `<tool>-<repo>`, and always pass `--reason` so that you can see why the agent asks.
 - Set `--timeout` at least 10 seconds below the time after which the agent's tool is killed. Or use `--timeout 0` to submit and return at once, and fetch the answer later with `await`.
@@ -97,7 +97,7 @@ The exit code of the command summarises the outcome:
 
 | Exit code | Meaning |
 | --- | --- |
-| 0 | `succeeded` or `released`. |
+| 0 | `succeeded` or `released`; but a result that carries a script error exits with 8, even when you released it. |
 | 1 | `failed` or an internal error. |
 | 2 | Wrong use or invalid input. |
 | 3 | `denied`. |

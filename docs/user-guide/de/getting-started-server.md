@@ -36,7 +36,7 @@ Wie Sie das Token erstellen, was die Status bedeuten und was die Fehlermeldungen
 Ein Agent erreicht atlas-duck über MCP auf einem von zwei Wegen:
 
 - Mit einem **API-Schlüssel**, den Sie unter "API-Schlüssel" erstellen. Ein Schlüssel hat Berechtigungen (read, propose_write, scripts), läuft nach 1 bis 90 Tagen ab und lässt sich widerrufen. Siehe [Agents (Server)](agents-server#api-keys).
-- Über **OAuth**, wenn Ihre Organisation es aktiviert: Ein MCP-Client, der es unterstützt, schickt Sie zu atlas-duck, damit Sie ihn zulassen. Sie antworten auf der Zustimmungsseite und können die App später unter "Verbundene Apps" widerrufen. Siehe [Agents (Server)](agents-server#oauth-consent).
+- Über **OAuth**, sofern Ihr Betreiber es nicht abgeschaltet hat: Ein MCP-Client, der es unterstützt, schickt Sie zu atlas-duck, damit Sie ihn zulassen. Sie antworten auf der Zustimmungsseite und können die App später unter "Verbundene Apps" widerrufen. Siehe [Agents (Server)](agents-server#oauth-consent).
 
 Weder ein API-Schlüssel noch eine verbundene App kann etwas freigeben. Sie entscheiden auf der Seite "Freigaben": siehe [Freigaben](approvals). Damit Sie benachrichtigt werden, wenn etwas auf Sie wartet, wählen Sie dort "Benachrichtigungen aktivieren" ([Einstellungen](settings#notifications)).
 

@@ -46,7 +46,7 @@
 <h1>Skripte</h1>
 <h2 id="what-are-scripts">Was Skripte sind</h2>
 <p>Mit einem Skript erledigt ein Agent viele Lesezugriffe in einer Anfrage. Es ist JavaScript: der Rumpf von <code>async function main(args, atlas)</code>. Darin ruft es Lesevorgänge mit <code>atlas.&lt;product&gt;.&lt;op&gt;(params)</code> oder <code>atlas.call</code> auf, blättert mit <code>atlas.all</code> durch Ergebnisse und kann mit <code>atlas.ops()</code> und <code>atlas.instances()</code> abfragen, was es gibt. <code>atlas.log</code> schreibt eine Notiz.</p>
-<p>Ein Skript kann nur lesen. Es kann keine Schreibvorgänge aufrufen, keine Module importieren, keine Dateien öffnen und das Netzwerk nicht nutzen. Es läuft in einer Sandbox, einem eigenen Prozess, den das Betriebssystem einschränkt, und seine Uhr geht nach UTC.</p>
+<p>Ein Skript kann nur lesen. Es kann keine Schreibvorgänge aufrufen, keine Module importieren, keine Dateien öffnen und das Netzwerk nicht nutzen. Es läuft in einer Sandbox, einem eigenen Prozess, den das Betriebssystem einschränkt, und unter Linux und macOS (also auch auf dem Server) geht seine Uhr nach UTC. Unter Windows folgen die Datumsfunktionen für die Ortszeit der Zeitzone des Systems; ein Skript sollte die UTC-Funktionen wie <code>getUTCHours</code> oder <code>toISOString</code> verwenden.</p>
 <p>Ein Skript sendet nie von selbst etwas an den Agenten. Wenn es endet, wartet sein Endergebnis als Anfrage der Klasse „Skript“ in der Warteschlange. Sie sehen es sich an, schwärzen es bei Bedarf und übergeben es, genau wie ein Lesen. Siehe <a href="/docs/de/approvals#approve-or-deny">Freigaben</a>.</p>
 <p>Skripte sind in der Größe begrenzt: Der Quelltext darf bis zu 256 KiB groß sein, die Argumente bis zu 1 MiB. atlas-duck übersetzt den Quelltext, sobald der Agent ihn einreicht. Ein Syntaxfehler wird sofort mit <code>script_syntax</code> (Exit 8) beantwortet, und es läuft nichts.</p>
 <h2 id="running-scripts">Skripte ausführen</h2>
@@ -68,11 +68,11 @@
 <tr><td>Skript-Ergebnislimit (MiB)</td><td>16</td></tr>
 <tr><td>Gleichzeitige Skript-Aufrufe</td><td>4</td></tr>
 </tbody></table>
-<p>Auf dem Desktop darf ein Agent mit <code>--limits</code> niedrigere Limits anfordern, nie höhere. Ein Skript, das ein Limit überschreitet, endet mit <code>script_limit</code> (Exit 8).</p>
+<p>Ein Agent darf niedrigere Limits anfordern (mit <code>--limits</code> in der Befehlszeile oder dem Parameter <code>limits</code> von <code>script_run</code>), nie höhere. Ein Skript, das ein Limit überschreitet, endet mit <code>script_limit</code> (Exit 8).</p>
 <p>Zwei echte Skripte und zwei Probeläufe können gleichzeitig laufen. Weitere warten. Der Server wendet dieselben Zahlen je Benutzer an.</p>
 <p>Das Heap-Limit muss mindestens das 15-Fache des Limits je Aufrufergebnis betragen und das Prozesslimit mindestens das Heap-Limit plus 88 MiB. Die Einstellungen weisen Werte zurück, die das verletzen.</p>
 <p><strong>Isolierung.</strong> Die Sandbox zählt nur, wenn das Betriebssystem sie durchsetzen kann. Beim Start prüft atlas-duck das.</p>
-<p>Auf dem Server gibt es keinen eingeschränkten Modus: Ist die Isolierung nicht erfüllt, sind Skripte aus, und Agents erhalten <code>sandbox_unavailable</code>.</p>
+<p>Auf dem Server gibt es keinen eingeschränkten Modus: Ist die Isolierung nicht erfüllt, sind Skripte aus, und Agents erhalten <code>sandbox_unavailable</code>. Denselben Fehler erhalten Agents, wenn der Betreiber Skripte abgeschaltet hat. Brauchen Sie Skripte und erhalten diesen Fehler, fragen Sie Ihren Administrator.</p>
 <h2 id="stopping">Ein Skript beenden</h2>
 <p>Die Serverseiten haben keine Schaltfläche „Beenden“. Ein Skript endet, wenn es fertig ist, sein Zeitlimit erreicht oder seine Anfrage storniert wird oder abläuft. Kommt sein Ergebnis in die Warteschlange, können Sie es ablehnen.</p>
 <p>Storniert der Agent eine Anfrage selbst (<code>atlas-duck cancel &lt;id&gt;</code>), endet sie als <code>cancelled</code>, und ihr Ergebnis erreicht die Warteschlange nie.</p>

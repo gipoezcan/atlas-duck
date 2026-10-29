@@ -27,4 +27,4 @@ An auditor can export any user's log as a tar archive, for example for the compl
 
 The page shows what the recipient needs to verify the export: the "Manifest SHA-256" and the "Anchor head". Use "Copy" to copy them. "Give the recipient the manifest SHA-256 and the anchor head by another channel than the archive." Without them the recipient cannot be sure that the archive is the real one.
 
-The recipient verifies the archive offline with the command shown under "Verify with". The steps and the exit codes are in [Check an export with verify-export](audit#verify-export). Note that the archive contains decrypted payloads and an excerpt of the anchor chain; the excerpt shows the hashes of other users' log heads and how many users were anchored, but no names and no content.
+The recipient verifies the archive offline with the command shown under "Verify with". The steps and the exit codes are in [Check an export with verify-export](audit#verify-export). Note that the archive contains decrypted payloads and an excerpt of the anchor chain; the excerpt shows the fingerprints of other users' log heads and how many users were anchored, but no names and no content.

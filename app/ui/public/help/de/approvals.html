@@ -75,8 +75,9 @@
 <li>Angeforderte Grenzen (nur bei Skripten);</li>
 <li>Eingereicht und Alter;</li>
 <li>Verbindung, Client-Art, Agentenname, Quelle des Agentennamens und <code>cwd_basename</code>;</li>
-<li>Verbindungs-ID und die Angaben zum Peer: Peer-PID, Peer-Programm, Ursprungsprogramm des Peers und Peer-Kette.</li>
+<li>Verbindungs-ID.</li>
 </ul>
+<p>Auf dem Desktop zeigt die Registerkarte außerdem die Angaben zum Peer: Peer-PID, Peer-Programm, Ursprungsprogramm des Peers und Peer-Kette.</p>
 <p>Den Agentennamen wählt der Agent selbst. Betrachten Sie ihn als Beschriftung, nicht als Beleg dafür, wer anfragt.</p>
 <h2 id="approve-or-deny">Freigeben, übergeben oder ablehnen</h2>
 <p>Welche Schaltflächen erscheinen, hängt von der Klasse der Anfrage ab:</p>
@@ -86,7 +87,8 @@
 <tr><td>Schreiben</td><td>„Freigeben“</td><td>atlas-duck führt die Änderung aus.</td></tr>
 <tr><td>Lesen</td><td>„Übergeben“</td><td>Die Daten, die die Instanz geliefert hat, gehen an den Agenten.</td></tr>
 <tr><td>Skript</td><td>„Übergeben“</td><td>Das Endergebnis des Skripts geht an den Agenten.</td></tr>
-<tr><td>Fehlgeschlagenes Lesen</td><td>„Ergebnis übergeben“ oder „Nur Status übergeben“</td><td>Der Agent erhält <code>failed</code> (Exit 6) mit dem HTTP-Status, mit oder ohne den Text der Meldung.</td></tr>
+<tr><td>Lesen, das mit einem HTTP-Fehler fehlgeschlagen ist</td><td>„Übergeben“ oder „Nur Status übergeben“</td><td>Der Agent erhält <code>failed</code> (Exit 6) mit dem HTTP-Status, mit dem Text des Fehlers („Übergeben“) oder ohne ihn („Nur Status übergeben“).</td></tr>
+<tr><td>Lesen, das ohne HTTP-Antwort fehlgeschlagen oder zu groß war</td><td>„Ergebnis übergeben“</td><td>Der Agent erhält <code>failed</code> (Exit 6) mit der Ergebnisklasse (<code>result_too_large</code>, <code>upstream_network</code> oder <code>upstream_unavailable</code>) und einer festen Meldung; kein HTTP-Status und keine Größe.</td></tr>
 <tr><td>Jede</td><td>„Ablehnen“</td><td>Der Agent erhält <code>denied</code> (Exit 3) und Ihre Begründung.</td></tr>
 </tbody></table>
 <p>Unter den Schaltflächen steht in einer Zeile, was der Agent erhalten wird.</p>
@@ -99,7 +101,7 @@
 <ul>
 <li>„Eintrag entfernen“: einen Eintrag einer Liste weglassen;</li>
 <li>„Feld entfernen (dieser Eintrag)“ oder „Feld entfernen (alle Einträge)“: ein Feld weglassen;</li>
-<li>„Text maskieren“: einen Text durch <code>[REDACTED]</code> ersetzen. Geben Sie den „Zu maskierenden Text“ ein oder verwenden Sie den ausgewählten Text. „Nur dieses Vorkommen“ maskiert nur eine Stelle;</li>
+<li>„Text maskieren“: einen Text durch <code>[REDACTED]</code> ersetzen. Geben Sie den Text im Feld „Zu maskierender Text“ ein oder verwenden Sie den ausgewählten Text. „Nur dieses Vorkommen“ maskiert nur eine Stelle;</li>
 <li>eine Voreinstellung wählen: „Nur Status übergeben“ oder „Nur Fehlerklasse behalten“;</li>
 <li>mit „Alle Schwärzungen entfernen“ von vorn beginnen.</li>
 </ul>
@@ -109,8 +111,8 @@
 <table>
 <thead><tr><th>Meldung</th><th>Bedeutung und was zu tun ist</th></tr></thead>
 <tbody>
-<tr><td>ein maskierter Text kommt weiterhin vor</td><td>Der Text steht noch da, zum Beispiel in einem anderen Feld. Maskieren Sie ihn auch dort oder entfernen Sie das Feld.</td></tr>
-<tr><td>ein Wert ändert sich nach 3 Dekodierungsrunden weiterhin</td><td>Ein Wert ist in Schichten kodiert, die sich nicht zuverlässig prüfen lassen. Entfernen Sie den Eintrag oder das Feld.</td></tr>
+<tr><td>ein maskierter Text kommt weiterhin vor</td><td>Der Text steht noch da, zum Beispiel in einem anderen Feld oder an einer Stelle, die sich nicht umschreiben lässt, etwa einem Feldnamen oder einer Zahl. Maskieren Sie ihn anderswo oder entfernen Sie den Eintrag oder das Feld.</td></tr>
+<tr><td>ein Wert ändert sich nach 3 Dekodierungsrunden weiterhin</td><td>Ein Wert ist in Schichten kodiert, die sich nicht zuverlässig prüfen lassen, oder er ist zu groß für die Prüfung. Entfernen Sie den Eintrag oder das Feld.</td></tr>
 <tr><td>ein Treffer ließ sich nicht sauber maskieren</td><td>Der Text steckt in einem kodierten Wert. Entfernen Sie stattdessen den Eintrag oder das Feld.</td></tr>
 <tr><td>ein gespiegelter Eintrag hat keine Entsprechung</td><td>Zwei Listen im Ergebnis gehören zusammen, und ein Eintrag hat keinen Partner. Verwenden Sie „Markierte Einträge entfernen“.</td></tr>
 <tr><td>gespiegelte Einträge lassen sich nicht zuordnen</td><td>Dasselbe, nur kann atlas-duck nicht erkennen, welche Einträge zusammengehören. Verwenden Sie „Markierte Einträge entfernen“.</td></tr>
@@ -133,7 +135,7 @@
 <p>Um gesammelt abzulehnen, verwenden Sie „Ausgewählte ablehnen“ oder „Alle ausstehenden dieser Sitzung ablehnen“. Beide verlangen eine Begründung für den Agenten und senden sie mit „Ablehnung senden“.</p>
 <h2 id="needs-attention">Braucht Aufmerksamkeit</h2>
 <p>Unter der Warteschlange listet „Zuletzt entschieden (24 Std.)“ auf, was in den letzten 24 Stunden entschieden wurde. Einträge unter „Braucht Aufmerksamkeit“ sind freigegebene Schreibzugriffe, die nicht gut ausgegangen sind: Der Schreibzugriff ist fehlgeschlagen, endete mit unbekanntem Ergebnis oder traf auf einen Versionskonflikt. „Ziel prüfen“ heißt: Sehen Sie sich das Jira- oder Confluence-Objekt selbst an, denn bei unbekanntem Ergebnis kann atlas-duck nicht sagen, ob die Änderung stattgefunden hat.</p>
-<p>Mit „Zur Kenntnis nehmen“ nehmen Sie einen Eintrag aus der Liste, mit „Alle zur Kenntnis nehmen“ alle. Wurde nichts entschieden, steht in der Liste „In den letzten 24 Stunden wurde nichts entschieden“.</p>
+<p>Auch ein Schreibzugriff, der in die Warteschlange zurückgegeben wurde, weil sich die Anfrage vor der Ausführung geändert hat („zur erneuten Prüfung zurückgegeben“), steht dort. Mit „Zur Kenntnis nehmen“ nehmen Sie einen Eintrag aus der Liste, mit „Alle zur Kenntnis nehmen“ alle. Die Kenntnisnahme wird nicht gespeichert: Nach einem Neustart von atlas-duck können die Einträge wieder erscheinen. Wurde nichts entschieden, steht in der Liste „In den letzten 24 Stunden wurde nichts entschieden“.</p>
 <p>Die Statusbezeichnungen, denen Sie begegnen, sind: ausstehend, wird ausgeführt, erfolgreich, übergeben, abgelehnt, abgelaufen, storniert, fehlgeschlagen, abgebrochen, Ergebnis unbekannt und „zur erneuten Prüfung zurückgegeben“.</p>
 <h2 id="unverified-text">Ungeprüfter Text</h2>
 <p>Alles, was ein Agent schreibt, ist nicht vertrauenswürdig: die Begründung, der Agentenname und die Parameter. atlas-duck kennzeichnet deshalb, was es nicht prüfen konnte.</p>

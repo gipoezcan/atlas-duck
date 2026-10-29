@@ -46,7 +46,7 @@
 <h1>Scripts</h1>
 <h2 id="what-are-scripts">What scripts are</h2>
 <p>A script lets an agent do many reads in one request. It is JavaScript: the body of <code>async function main(args, atlas)</code>. Inside, it calls read operations with <code>atlas.&lt;product&gt;.&lt;op&gt;(params)</code>, <code>atlas.call</code>, pages through results with <code>atlas.all</code>, and can ask <code>atlas.ops()</code> and <code>atlas.instances()</code> what exists. <code>atlas.log</code> writes a note.</p>
-<p>A script can only read. It cannot call write operations, import modules, open files or use the network. It runs in a sandbox, a separate process that the operating system confines, and its clock is UTC.</p>
+<p>A script can only read. It cannot call write operations, import modules, open files or use the network. It runs in a sandbox, a separate process that the operating system confines, and on Linux and macOS (and so on the server) its clock is UTC. On Windows, local-time date functions follow the system time zone; a script should use the UTC functions such as <code>getUTCHours</code> or <code>toISOString</code>.</p>
 <p>A script never sends anything to the agent by itself. When it ends, its final result waits in the queue as a &quot;Script&quot; request. You look at it, redact it if needed, and &quot;Release&quot; it, just like a read. See <a href="/docs/en/approvals#approve-or-deny">Approvals</a>.</p>
 <p>Scripts are limited in size: the source may be up to 256 KiB and the arguments up to 1 MiB. atlas-duck compiles the source when the agent submits it. A syntax error is answered at once with <code>script_syntax</code> (exit 8) and nothing runs.</p>
 <h2 id="running-scripts">Running scripts</h2>
@@ -68,11 +68,11 @@
 <tr><td>Script result limit (MiB)</td><td>16</td></tr>
 <tr><td>Script concurrent calls</td><td>4</td></tr>
 </tbody></table>
-<p>On the desktop an agent may ask for lower limits with <code>--limits</code>, never for higher ones. A script that exceeds a limit stops with <code>script_limit</code> (exit 8).</p>
+<p>An agent may ask for lower limits (with <code>--limits</code> on the command line, or the <code>limits</code> parameter of <code>script_run</code>), never for higher ones. A script that exceeds a limit stops with <code>script_limit</code> (exit 8).</p>
 <p>Two real scripts and two dry runs can run at once. More wait in line. The server applies the same numbers for each user.</p>
 <p>The heap limit must be at least 15 times the call result limit, and the process limit at least the heap limit plus 88 MiB. Settings refuses values that break this.</p>
 <p><strong>Confinement.</strong> The sandbox only counts when the operating system can enforce it. On start, atlas-duck tests this.</p>
-<p>On the server there is no degraded mode: when the confinement is not met, scripts are off and agents receive <code>sandbox_unavailable</code>.</p>
+<p>On the server there is no degraded mode: when the confinement is not met, scripts are off and agents receive <code>sandbox_unavailable</code>. Agents receive the same error when the operator has switched scripts off. If you need scripts and get this error, ask your administrator.</p>
 <h2 id="stopping">Stop a script</h2>
 <p>The server pages have no &quot;Kill&quot; button. A script ends when it finishes, when it reaches its timeout, or when its request is cancelled or expires. When its result arrives in the queue, you can deny it.</p>
 <p>When the agent cancels a request itself (<code>atlas-duck cancel &lt;id&gt;</code>), the request ends as <code>cancelled</code> and its result never reaches the queue.</p>

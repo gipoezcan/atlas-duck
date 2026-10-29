@@ -58,7 +58,7 @@ Two kinds of copies protect the head of the chain. atlas-duck keeps one in the s
 
 ::: server
 
-The server does not verify chains in the web pages. The operator checks them with `admin anchor verify`. Besides each user's chain, the server keeps an **anchor chain** that commits to the head of every user's chain at least every 15 minutes. It makes it visible when a chain was changed or cut afterwards. The anchor chain is also written by the server, so it protects against a user's mistakes and against partial damage, but not against someone who controls the server and its keys.
+The server does not verify chains in the web pages. Besides each user's chain, the server keeps an **anchor chain** that records the head of every user's chain, at intervals of 15 minutes at most. The operator can run `admin anchor verify`: it recomputes the anchor chain and compares each user's latest anchored head with that user's log. It reports a chain that was cut short, a replaced head record or a missing log. It does not check a user's whole chain or the payloads, and it cannot find a change made before the anchored head. Nothing is detected by itself: a finding appears only when the operator runs the command. The anchor chain is also written by the server, so it protects against a user's mistakes and against partial damage, but not against someone who controls the server and its keys.
 
 :::
 
@@ -68,7 +68,7 @@ An export copies records of a time range, with their decrypted payloads, so that
 
 ::: desktop
 
-In the Audit window, "Compliance export" under "Export and backup" has the fields "Export from (UTC)" and "Export to (UTC)". Leave both empty for the whole log. Choose "Export…". atlas-duck shows a warning and asks for the folder in its own dialogs. It writes the export into a new folder and gives it its final name only when everything has been written. A folder whose name still ends in ".partial" is unfinished and must not be handed over.
+In the Audit window, "Compliance export" under "Export and backup" has the fields "Export from (UTC)" and "Export to (UTC)". Leave both empty for the whole log. Choose "Export…". atlas-duck shows a warning and asks for the folder in its own dialogs. It writes the export into a new folder and gives it its final name only when everything has been written. A folder whose name still ends in ".partial" is unfinished and must not be handed over. If atlas-duck says that the export is complete but the folder kept its name, remove ".partial" from the end of the name yourself before you hand it over, and do not export again.
 
 When the export is done, atlas-duck shows a SHA-256 of the manifest, the fingerprint that binds the files together. Give it to the recipient **by another channel** than the files. Without it the recipient cannot be sure that the files are the ones you made.
 
@@ -91,13 +91,15 @@ Auditors can export any user's log in the same way, see [Exports](auditor#audito
 The recipient checks an export with the command `atlas-duck verify-export`. It needs no access to your computer or server, and it works offline.
 
 ```
-atlas-duck verify-export <dir> --manifest-sha256 <hex> [--anchor-dir <dir>]
+atlas-duck verify-export <dir> [--manifest-sha256 <hex>] [--anchor-dir <dir>]
 ```
 
 It recomputes every record fingerprint and the chain, checks that the decrypted payloads match their fingerprints, and compares the result with what you give it as a **trust root**:
 
 - `--manifest-sha256` is the fingerprint that you passed on separately. It proves that the files are those that were exported.
 - `--anchor-dir` is a copy of the anchor directory. It shows that the history matches what was written there earlier.
+
+Both are optional, but without any trust root the result can only be "consistent in itself" (exit 20).
 
 ::: server
 
@@ -112,7 +114,7 @@ The exit code tells you how far to trust the result:
 | 0 | Verified against a trust root that covers the whole export. |
 | 20 | Consistent in itself, but no trust root covers all of it. The command says "internally consistent; trust root NOT verified". Treat this as not verified. |
 | 21 | Tampering, or a fork: two exports that share a start but diverge. |
-| 22 | The command could not run: wrong usage, unreadable files, or an unfinished `.partial` folder. |
+| 22 | The command could not run: wrong usage (for example `--anchor-dir` together with `--anchor-chain`), unreadable files, an unfinished `.partial` folder, or the atlas-duck app was not found. |
 
 A fork is not necessarily an attack. It happens when a log was restored from a backup while the old installation kept running. The old installation should be shut down.
 
@@ -134,7 +136,7 @@ Retention does not reach backups, exports, or copies of your data that the opera
 
 ::: server
 
-On the server, the operator sets the retention period, not the individual user. This guide describes what the server does when a user is deactivated, for example because they left the organisation: their log stays available to auditors for 365 days by default. After that period the server deletes it, including the user's keys, and records the deletion in the anchor chain. An auditor who needs a log for longer must export it before then. Backups are not touched by this: a backup taken earlier still contains the deleted log, so the operator has to remove old backups too.
+On the server, the operator sets the retention period, not the individual user, and the log of an active user is kept. This guide describes what the server does when a user is deactivated, for example because they left the organisation: their log stays available to auditors for 365 days by default. After that period the server deletes it, including the user's keys, and records the deletion in the anchor chain. An auditor who needs a log for longer must export it before then. Backups are not touched by this: a backup taken earlier still contains the deleted log, so the operator has to remove old backups too.
 
 :::
 
@@ -161,6 +163,6 @@ If Settings reports that an anchor entry is missing in the keychain, "Re-anchor�
 
 ::: server
 
-The server does not show incidents on the web pages. The operator finds them with `admin anchor verify`, which names the user and the record that does not match, and exits with an error. If you think that your log is affected, tell your administrator.
+Integrity incidents, with a banner and an acknowledgement, exist only in the desktop app. The server does not show them on the web pages. When the operator runs `admin anchor verify`, it reports findings that name the user and the sequence number, and exits with an error. If you think that your log is affected, tell your administrator.
 
 :::

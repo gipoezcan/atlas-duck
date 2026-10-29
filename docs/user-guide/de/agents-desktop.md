@@ -11,10 +11,10 @@ Ein Agent erreicht atlas-duck über den Befehl `atlas-duck`. Er braucht dafür k
 
 Läuft die App nicht, startet der Befehl sie und wartet bis zu 20 Sekunden. Dafür braucht es eine Desktop-Sitzung und eine installierte App; fehlt eines davon, scheitert der Befehl mit `launch_timeout` oder `unreachable`.
 
-Das Fenster „Einführung“ liefert Ihnen fertige Anweisungen für den Agenten. Kopieren Sie sie in die Datei `CLAUDE.md` oder `AGENTS.md` Ihres Projekts. Die Regeln darin lauten:
+Das Fenster „Einführung“ liefert Ihnen fertige Anweisungen für den Agenten. Kopieren Sie sie in die Datei `CLAUDE.md` oder `AGENTS.md` Ihres Projekts. Es sind Regeln, die der Agent befolgt (die Liste richtet sich an den Agenten, Sie müssen nichts ausführen):
 
-- Setzen Sie den Namen des Agenten mit `ATLAS_DUCK_AGENT`, zum Beispiel `<Werkzeug>-<Repository>`, und geben Sie immer `--reason` an, damit Sie sehen, warum der Agent anfragt.
-- Setzen Sie `--timeout` mindestens 10 Sekunden unter die Zeit, nach der das Werkzeug des Agenten abgebrochen wird. Oder verwenden Sie `--timeout 0`, um die Anfrage einzureichen und sofort zurückzukehren, und holen Sie die Antwort später mit `await` ab.
+- Setzen Sie den Namen des Agenten mit `ATLAS_DUCK_AGENT`, zum Beispiel `<Tool>-<Repository>`, und geben Sie immer `--reason` an, damit Sie sehen, warum der Agent anfragt.
+- Setzen Sie `--timeout` mindestens 10 Sekunden unter die Zeit, nach der das Tool des Agenten abgebrochen wird. Oder verwenden Sie `--timeout 0`, um die Anfrage einzureichen und sofort zurückzukehren, und holen Sie die Antwort später mit `await` ab.
 - Reichen Sie eine ausstehende Anfrage nie erneut ein. Ihre ID finden Sie mit `requests list`; warten Sie dann auf sie.
 - Prüfen Sie `redacted`, `edited` und `meta` in der Antwort. Sie haben möglicherweise geändert, was der Agent erhält.
 - Entscheiden Sie anhand von `status`, `error.code` und `error.retryable`. Bei Exit-Code 9 versuchen Sie es nicht in einer Schleife erneut: Sie müssen zuerst die App entsperren oder ein Token hinzufügen.
@@ -97,7 +97,7 @@ Der Exit-Code des Befehls fasst das Ergebnis zusammen:
 
 | Exit-Code | Bedeutung |
 | --- | --- |
-| 0 | `succeeded` oder `released`. |
+| 0 | `succeeded` oder `released`; ein Ergebnis mit einem Skriptfehler endet jedoch mit 8, auch wenn Sie es übergeben haben. |
 | 1 | `failed` oder ein interner Fehler. |
 | 2 | Falsche Verwendung oder ungültige Eingabe. |
 | 3 | `denied`. |
