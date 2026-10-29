@@ -9,7 +9,7 @@ order: 110
 
 Symptoms: agents get `unreachable`, `upstream_network` or `upstream_unavailable`; a token check says that the instance cannot be reached (`pat/instance_unreachable` on the server).
 
-First separate two cases. If the error is `unreachable` with the reason `not_running` or `launch_timeout`, the app is not reachable, not the instance. See [`unreachable`](error-reference#err-unreachable). Otherwise the instance is the problem:
+First separate two cases. Every `unreachable` error concerns the app, not the instance: the command line cannot reach the app. See the reasons in [`unreachable`](error-reference#err-unreachable). Only `upstream_network`, `upstream_unavailable` and `pat/instance_unreachable` point at the instance. Then the instance is the problem:
 
 1. Open the address of the instance in a browser on the same computer. If it does not load, the cause is the network, the VPN or the instance itself. atlas-duck cannot do more than your browser can.
 2. Check the state of the instance. On the desktop, Settings lists it under "Instances". The states "unconfirmed", "needs token" and "insecure scheme (http)" say what to do, see [Instances and tokens](instances-and-tokens).
@@ -38,7 +38,7 @@ A request waits until you decide. It is not stuck, it waits for you. Check:
 2. If nothing is listed, the request may have expired, been denied or cancelled. Look under "Recently decided (24 h)".
 3. If the agent does not see your decision, it may have stopped waiting. An agent that submitted with a short `--timeout` gets `pending` and has to fetch the result with `await <id>`. It must never submit the request again.
 4. If the agent lost the id, it can find the request with `requests list`.
-5. A request can also wait because the app was restarted: requests that were pending then become `abandoned`.
+5. After a restart of the app, a request that was pending is no longer pending: it became `abandoned`, see [`abandoned`](error-reference#err-abandoned).
 
 A write that you approved can show "executing" for a while. If it ends as `outcome_unknown`, check the target yourself, see [`upstream_unknown_outcome`](error-reference#err-upstream-unknown-outcome).
 

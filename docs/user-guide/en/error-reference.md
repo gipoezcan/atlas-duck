@@ -27,7 +27,7 @@ The request was well formed but did not pass validation, for example a missing o
 
 ### `markdown_placeholders` {#err-markdown-placeholders}
 
-The text contains placeholders that cannot be sent as written. When an agent writes a Confluence page or comment in Markdown, atlas-duck refuses a text that still contains placeholders that it put there when the agent read a page as Markdown (for example for macros or mentions). Written back, they would not mean what they stood for. Nothing was queued. Exit 2, not retryable. The agent should replace the placeholders with real content, or leave that part of the page out.
+The text contains placeholders that cannot be sent as written. When an agent writes a Confluence page or comment in Markdown, atlas-duck refuses a text that still contains placeholders that it put there when the agent read a page as Markdown (for example for macros or mentions). Written back, they would not mean what they stood for. Nothing was queued. Exit 2, not retryable. The agent should fetch the page again with `--format storage` and submit its change with `body_format=storage`. The storage format keeps macros and mentions as they are. Replacing the placeholders by hand, or leaving that part out, would lose them.
 
 ### `op_unsupported_by_instance` {#err-op-unsupported-by-instance}
 
@@ -35,7 +35,7 @@ This instance does not support the operation, for example because its version is
 
 ### `internal` {#err-internal}
 
-An internal error occurred in atlas-duck, or in the server. Not retryable. Try again later. If it keeps happening, tell your administrator, and give them the request id and the time.
+An internal error occurred in atlas-duck, or in the server. Not retryable: agents must not retry on their own. You can try the action again later. If it keeps happening, tell your administrator, and give them the request id and the time.
 
 ### `audit_failure` {#err-audit-failure}
 
@@ -47,11 +47,11 @@ The storage for the audit log is almost full. atlas-duck refuses new requests so
 
 ### `busy` {#err-busy}
 
-Another operation is running. Nothing was queued. Exit 11, retryable. Wait for the time that `retry_after_s` names and try again.
+atlas-duck limits how many connections and open requests it accepts, in total, per program and per agent session, so that no single agent can flood the queue. One of these limits is reached. Nothing was queued. Exit 11, retryable after the time that `retry_after_s` names. Waiting does not help when the limit on pending requests is the cause: decide or deny the pending requests first, for example with "Deny all pending from this session". Then try again.
 
 ### `unreachable` {#err-unreachable}
 
-The command line could not reach the app, so nothing was queued. Exit 5. The `details.reason` says why:
+The command line could not reach the app. Except for `connection_lost`, nothing was queued and the exit code is 5. The `details.reason` says why:
 
 | Reason | What to do |
 | --- | --- |
@@ -63,9 +63,9 @@ The command line could not reach the app, so nothing was queued. Exit 5. The `de
 | `app_shutting_down` | The app is closing. Start it again. |
 | `store_newer` | The audit data was written by a newer atlas-duck. Install that version or a newer one. |
 | `store_unavailable` | The audit store could not be opened. Restart atlas-duck. Not retryable. |
-| `connection_lost` | The connection dropped after the request was sent. The request exists; wait for it with `await <id>`, it may be `abandoned`. |
+| `connection_lost` | The connection dropped after the request was sent. The request exists, with status `pending`, exit 4, not retryable. Wait for it with `await <id>`; it may be `abandoned`. |
 
-Except for `store_unavailable`, the error is retryable.
+Except for `store_unavailable` and `connection_lost`, the error is retryable.
 
 ### `server_identity` {#err-server-identity}
 
@@ -105,7 +105,7 @@ The app is locked: it cannot open its audit log or its keys. Exit 9. The `detail
 
 ### `not_configured` {#err-not-configured}
 
-This instance, or the app, is not set up yet. Exit 9. The `details.reason` names the gap: the first-run wizard is not finished, no instance exists for the product, an instance uses `http://` instead of `https://`, an instance is not confirmed, the data directory is missing or not on a local drive, or the settings file cannot be read. Finish the setup.
+This instance, or the app, is not set up yet. Exit 9. The `details.reason` names the gap: the first-run wizard is not finished, no instance exists for the product, an instance uses `http://` instead of `https://`, an instance is not confirmed, the data directory is missing or not on a local drive, or the settings file cannot be read. For the first reasons, finish the setup. If the settings file cannot be read, it may have been written by a newer atlas-duck: update atlas-duck. If the paths or the data directory are unusable, fix the directory or its permissions.
 
 ::: desktop
 
@@ -127,7 +127,7 @@ The script sandbox is not available, so scripts cannot run. Exit 8, not retryabl
 
 ### `result_evicted` {#err-result-evicted}
 
-The outcome is known, but the result is no longer stored. Exit 10. For reads and scripts the agent can submit the request again; for a write do not repeat it, because the change was already made.
+The outcome is known, but the result is no longer stored. Exit 10. For reads and scripts the agent can submit the request again. Do not simply repeat a write: its outcome was already decided, and it may have failed. Check the target in Jira or Confluence first.
 
 ### `denied` {#err-denied}
 
@@ -145,6 +145,8 @@ Nobody decided the request in time. Exit 7, not retryable. Submit again only if 
 
 The request was cancelled: by the agent (`cancel`, not retryable), because the app was quit or the system shut down (retryable). Exit 7. Nothing was executed, and a cancelled result never reaches your queue.
 
+In the Approvals window the same code means "The decision was cancelled": you cancelled the confirmation of a batch decision. Nothing was decided, and the requests are as they were.
+
 ### `abandoned` {#err-abandoned}
 
 The request was still pending when the app crashed or was killed. Exit 7, retryable. Submit it again. A write that was already approved becomes `outcome_unknown` instead, see [upstream_unknown_outcome](error-reference#err-upstream-unknown-outcome).
@@ -159,7 +161,7 @@ The app and the command line tool could not agree on a message. Exit 1, not retr
 
 ## Errors when deciding {#errors-decision}
 
-These errors appear in the Approvals window when a decision cannot be applied. In every case nothing was decided, and the request is as it was.
+These errors appear in the Approvals window when a decision cannot be applied. In every case nothing was decided, and the request is as it was. The error `cancelled` is described [above](error-reference#err-cancelled).
 
 ### `stale` {#err-stale}
 
@@ -195,7 +197,7 @@ The request is no longer pending. It was decided, expired or cancelled in the me
 
 ### `target_param_edit` {#err-target-param-edit}
 
-The target of the request cannot be edited. Decide it individually, or deny it so that the agent asks again with the right target.
+An edit tried to change the target of the request, which is not allowed. Deny the request so that the agent asks again with the right target.
 
 ### `not_opened` {#err-not-opened}
 
@@ -203,7 +205,7 @@ The preview of the request was not opened. Open the preview of every selected re
 
 ### `not_approvable` {#err-not-approvable}
 
-The request cannot be approved as it is, for example because required fields are missing. Decide it individually.
+The request cannot be approved as it is, for example because required fields are missing, a redaction is blocked or the request cannot be rebuilt. Deciding it individually does not change that. Fix the missing fields or the blocked redaction, or deny the request.
 
 ### `batch_item_flagged` {#err-batch-item-flagged}
 
@@ -225,7 +227,7 @@ The request, or the thing that it names, does not exist any more. Reload the pag
 
 ### `release_blocked` {#err-release-blocked}
 
-This request cannot be released. The redactions that you made, or the data itself, would let through something that should have been held back. The page names the reason. See "When a release is blocked" in [Editing and redacting](approvals#edit-and-redact).
+This request cannot be released. The redactions that you made, or the data itself, would let through something that should have been held back, or the result could not be built exactly. The page names the reason. Deny the request, or drop the flagged items. See "When a release is blocked" in [Editing and redacting](approvals#edit-and-redact).
 
 ### `unknown_command` {#err-unknown-command}
 
@@ -237,7 +239,7 @@ Your store is not ready yet, for example right after a restart. Try again in a m
 
 ### `audit_unreadable` {#err-audit-unreadable}
 
-An audit entry could not be read. The rest of the log is not affected. If it keeps happening, tell your administrator.
+An audit entry could not be read, which can mean that it is damaged. Tell your administrator the first time it happens, and ask them to verify the audit log, see [Verify the chain](audit#verify).
 
 ### `audit_failed` {#err-audit-failed}
 

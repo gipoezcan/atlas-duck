@@ -45,7 +45,7 @@
 <h1>Troubleshooting</h1>
 <h2 id="cannot-connect">An instance cannot be reached</h2>
 <p>Symptoms: agents get <code>unreachable</code>, <code>upstream_network</code> or <code>upstream_unavailable</code>; a token check says that the instance cannot be reached (<code>pat/instance_unreachable</code> on the server).</p>
-<p>First separate two cases. If the error is <code>unreachable</code> with the reason <code>not_running</code> or <code>launch_timeout</code>, the app is not reachable, not the instance. See <a href="error-reference.html#err-unreachable"><code>unreachable</code></a>. Otherwise the instance is the problem:</p>
+<p>First separate two cases. Every <code>unreachable</code> error concerns the app, not the instance: the command line cannot reach the app. See the reasons in <a href="error-reference.html#err-unreachable"><code>unreachable</code></a>. Only <code>upstream_network</code>, <code>upstream_unavailable</code> and <code>pat/instance_unreachable</code> point at the instance. Then the instance is the problem:</p>
 <ol>
 <li>Open the address of the instance in a browser on the same computer. If it does not load, the cause is the network, the VPN or the instance itself. atlas-duck cannot do more than your browser can.</li>
 <li>Check the state of the instance. On the desktop, Settings lists it under &quot;Instances&quot;. The states &quot;unconfirmed&quot;, &quot;needs token&quot; and &quot;insecure scheme (http)&quot; say what to do, see <a href="instances-and-tokens.html">Instances and tokens</a>.</li>
@@ -70,7 +70,7 @@
 <li>If nothing is listed, the request may have expired, been denied or cancelled. Look under &quot;Recently decided (24 h)&quot;.</li>
 <li>If the agent does not see your decision, it may have stopped waiting. An agent that submitted with a short <code>--timeout</code> gets <code>pending</code> and has to fetch the result with <code>await &lt;id&gt;</code>. It must never submit the request again.</li>
 <li>If the agent lost the id, it can find the request with <code>requests list</code>.</li>
-<li>A request can also wait because the app was restarted: requests that were pending then become <code>abandoned</code>.</li>
+<li>After a restart of the app, a request that was pending is no longer pending: it became <code>abandoned</code>, see <a href="error-reference.html#err-abandoned"><code>abandoned</code></a>.</li>
 </ol>
 <p>A write that you approved can show &quot;executing&quot; for a while. If it ends as <code>outcome_unknown</code>, check the target yourself, see <a href="error-reference.html#err-upstream-unknown-outcome"><code>upstream_unknown_outcome</code></a>.</p>
 <h2 id="locked">The app is locked</h2>

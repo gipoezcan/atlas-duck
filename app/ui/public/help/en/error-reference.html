@@ -50,19 +50,19 @@
 <h3 id="err-validation"><code>validation</code></h3>
 <p>The request was well formed but did not pass validation, for example a missing or wrong parameter of an operation. Nothing was queued. Exit 2, not retryable. Look up the operation with <code>ops describe &lt;op-id&gt;</code> and correct the parameters.</p>
 <h3 id="err-markdown-placeholders"><code>markdown_placeholders</code></h3>
-<p>The text contains placeholders that cannot be sent as written. When an agent writes a Confluence page or comment in Markdown, atlas-duck refuses a text that still contains placeholders that it put there when the agent read a page as Markdown (for example for macros or mentions). Written back, they would not mean what they stood for. Nothing was queued. Exit 2, not retryable. The agent should replace the placeholders with real content, or leave that part of the page out.</p>
+<p>The text contains placeholders that cannot be sent as written. When an agent writes a Confluence page or comment in Markdown, atlas-duck refuses a text that still contains placeholders that it put there when the agent read a page as Markdown (for example for macros or mentions). Written back, they would not mean what they stood for. Nothing was queued. Exit 2, not retryable. The agent should fetch the page again with <code>--format storage</code> and submit its change with <code>body_format=storage</code>. The storage format keeps macros and mentions as they are. Replacing the placeholders by hand, or leaving that part out, would lose them.</p>
 <h3 id="err-op-unsupported-by-instance"><code>op_unsupported_by_instance</code></h3>
 <p>This instance does not support the operation, for example because its version is too old. Exit 2, not retryable. Use another operation or another instance, or ask the administrator of the instance.</p>
 <h3 id="err-internal"><code>internal</code></h3>
-<p>An internal error occurred in atlas-duck, or in the server. Not retryable. Try again later. If it keeps happening, tell your administrator, and give them the request id and the time.</p>
+<p>An internal error occurred in atlas-duck, or in the server. Not retryable: agents must not retry on their own. You can try the action again later. If it keeps happening, tell your administrator, and give them the request id and the time.</p>
 <h3 id="err-audit-failure"><code>audit_failure</code></h3>
 <p>The audit log could not be written, so nothing was done. atlas-duck never acts without recording it. Exit 1. For reads and scripts the agent may try again; for writes it is not retryable, because the write has to be decided again. Check that the disk of the audit log is not full, see <a href="troubleshooting.html#audit-storage">The audit storage is low</a>.</p>
 <h3 id="err-audit-storage-low"><code>audit_storage_low</code></h3>
 <p>The storage for the audit log is almost full. atlas-duck refuses new requests so that the log can always be written. Nothing was queued. Exit 1, retryable. Free disk space on the drive that holds the audit log, then try again. See <a href="troubleshooting.html#audit-storage">The audit storage is low</a>.</p>
 <h3 id="err-busy"><code>busy</code></h3>
-<p>Another operation is running. Nothing was queued. Exit 11, retryable. Wait for the time that <code>retry_after_s</code> names and try again.</p>
+<p>atlas-duck limits how many connections and open requests it accepts, in total, per program and per agent session, so that no single agent can flood the queue. One of these limits is reached. Nothing was queued. Exit 11, retryable after the time that <code>retry_after_s</code> names. Waiting does not help when the limit on pending requests is the cause: decide or deny the pending requests first, for example with &quot;Deny all pending from this session&quot;. Then try again.</p>
 <h3 id="err-unreachable"><code>unreachable</code></h3>
-<p>The command line could not reach the app, so nothing was queued. Exit 5. The <code>details.reason</code> says why:</p>
+<p>The command line could not reach the app. Except for <code>connection_lost</code>, nothing was queued and the exit code is 5. The <code>details.reason</code> says why:</p>
 <table>
 <thead><tr><th>Reason</th><th>What to do</th></tr></thead>
 <tbody>
@@ -74,9 +74,9 @@
 <tr><td><code>app_shutting_down</code></td><td>The app is closing. Start it again.</td></tr>
 <tr><td><code>store_newer</code></td><td>The audit data was written by a newer atlas-duck. Install that version or a newer one.</td></tr>
 <tr><td><code>store_unavailable</code></td><td>The audit store could not be opened. Restart atlas-duck. Not retryable.</td></tr>
-<tr><td><code>connection_lost</code></td><td>The connection dropped after the request was sent. The request exists; wait for it with <code>await &lt;id&gt;</code>, it may be <code>abandoned</code>.</td></tr>
+<tr><td><code>connection_lost</code></td><td>The connection dropped after the request was sent. The request exists, with status <code>pending</code>, exit 4, not retryable. Wait for it with <code>await &lt;id&gt;</code>; it may be <code>abandoned</code>.</td></tr>
 </tbody></table>
-<p>Except for <code>store_unavailable</code>, the error is retryable.</p>
+<p>Except for <code>store_unavailable</code> and <code>connection_lost</code>, the error is retryable.</p>
 <h3 id="err-server-identity"><code>server_identity</code></h3>
 <p>The program that answered is not the app that belongs to your user. atlas-duck refuses to talk to it. Exit 5, not retryable. This is a safety check. Make sure that no other program uses the app's connection and restart atlas-duck. If it persists, tell your administrator.</p>
 <h3 id="err-protocol-mismatch"><code>protocol_mismatch</code></h3>
@@ -96,7 +96,7 @@
 <h3 id="err-locked"><code>locked</code></h3>
 <p>The app is locked: it cannot open its audit log or its keys. Exit 9. The <code>details.reason</code> says why, for example that the keychain is not available yet, that it was lost, or that the keyring lies on a network drive. Follow <a href="troubleshooting.html#locked">The app is locked</a>.</p>
 <h3 id="err-not-configured"><code>not_configured</code></h3>
-<p>This instance, or the app, is not set up yet. Exit 9. The <code>details.reason</code> names the gap: the first-run wizard is not finished, no instance exists for the product, an instance uses <code>http://</code> instead of <code>https://</code>, an instance is not confirmed, the data directory is missing or not on a local drive, or the settings file cannot be read. Finish the setup.</p>
+<p>This instance, or the app, is not set up yet. Exit 9. The <code>details.reason</code> names the gap: the first-run wizard is not finished, no instance exists for the product, an instance uses <code>http://</code> instead of <code>https://</code>, an instance is not confirmed, the data directory is missing or not on a local drive, or the settings file cannot be read. For the first reasons, finish the setup. If the settings file cannot be read, it may have been written by a newer atlas-duck: update atlas-duck. If the paths or the data directory are unusable, fix the directory or its permissions.</p>
 <p>See <a href="getting-started-desktop.html">Getting started</a>.</p>
 <h3 id="err-script-syntax"><code>script_syntax</code></h3>
 <p>The script has a syntax error. atlas-duck compiles every script on submission and refuses a faulty one. Exit 8, not retryable. Fix the script. See <a href="scripts.html#what-are-scripts">Scripts</a>.</p>
@@ -105,7 +105,7 @@
 <h3 id="err-sandbox-unavailable"><code>sandbox_unavailable</code></h3>
 <p>The script sandbox is not available, so scripts cannot run. Exit 8, not retryable. If the reason is <code>app_upgraded</code>, restart the app and try again. Otherwise the operating system does not allow the confinement, see <a href="scripts.html#limits">Limits and confinement</a>.</p>
 <h3 id="err-result-evicted"><code>result_evicted</code></h3>
-<p>The outcome is known, but the result is no longer stored. Exit 10. For reads and scripts the agent can submit the request again; for a write do not repeat it, because the change was already made.</p>
+<p>The outcome is known, but the result is no longer stored. Exit 10. For reads and scripts the agent can submit the request again. Do not simply repeat a write: its outcome was already decided, and it may have failed. Check the target in Jira or Confluence first.</p>
 <h3 id="err-denied"><code>denied</code></h3>
 <p>You denied the request. The message holds your reason. Exit 3, not retryable. The agent should resubmit only when the reason asks for a change. See <a href="approvals.html#approve-or-deny">Approve, release or deny</a>.</p>
 <h3 id="err-resolution-failed"><code>resolution_failed</code></h3>
@@ -114,6 +114,7 @@
 <p>Nobody decided the request in time. Exit 7, not retryable. Submit again only if you want that.</p>
 <h3 id="err-cancelled"><code>cancelled</code></h3>
 <p>The request was cancelled: by the agent (<code>cancel</code>, not retryable), because the app was quit or the system shut down (retryable). Exit 7. Nothing was executed, and a cancelled result never reaches your queue.</p>
+<p>In the Approvals window the same code means &quot;The decision was cancelled&quot;: you cancelled the confirmation of a batch decision. Nothing was decided, and the requests are as they were.</p>
 <h3 id="err-abandoned"><code>abandoned</code></h3>
 <p>The request was still pending when the app crashed or was killed. Exit 7, retryable. Submit it again. A write that was already approved becomes <code>outcome_unknown</code> instead, see <a href="error-reference.html#err-upstream-unknown-outcome">upstream_unknown_outcome</a>.</p>
 <h3 id="err-unknown-request"><code>unknown_request</code></h3>
@@ -121,7 +122,7 @@
 <h3 id="err-protocol-error"><code>protocol_error</code></h3>
 <p>The app and the command line tool could not agree on a message. Exit 1, not retryable. This usually means that they have different versions. Update both and restart the app.</p>
 <h2 id="errors-decision">Errors when deciding</h2>
-<p>These errors appear in the Approvals window when a decision cannot be applied. In every case nothing was decided, and the request is as it was.</p>
+<p>These errors appear in the Approvals window when a decision cannot be applied. In every case nothing was decided, and the request is as it was. The error <code>cancelled</code> is described <a href="error-reference.html#err-cancelled">above</a>.</p>
 <h3 id="err-stale"><code>stale</code></h3>
 <p>The request changed in the meantime, for example it received a new revision. Re-read the queue, open the request again and decide on what you see.</p>
 <h3 id="err-invalid"><code>invalid</code></h3>
@@ -139,11 +140,11 @@
 <h3 id="err-not-pending"><code>not_pending</code></h3>
 <p>The request is no longer pending. It was decided, expired or cancelled in the meantime.</p>
 <h3 id="err-target-param-edit"><code>target_param_edit</code></h3>
-<p>The target of the request cannot be edited. Decide it individually, or deny it so that the agent asks again with the right target.</p>
+<p>An edit tried to change the target of the request, which is not allowed. Deny the request so that the agent asks again with the right target.</p>
 <h3 id="err-not-opened"><code>not_opened</code></h3>
 <p>The preview of the request was not opened. Open the preview of every selected request before you decide as a batch.</p>
 <h3 id="err-not-approvable"><code>not_approvable</code></h3>
-<p>The request cannot be approved as it is, for example because required fields are missing. Decide it individually.</p>
+<p>The request cannot be approved as it is, for example because required fields are missing, a redaction is blocked or the request cannot be rebuilt. Deciding it individually does not change that. Fix the missing fields or the blocked redaction, or deny the request.</p>
 <h3 id="err-batch-item-flagged"><code>batch_item_flagged</code></h3>
 <p>The request is flagged as a possible duplicate or as a similar request. Look at it and approve it individually.</p>
 </main>

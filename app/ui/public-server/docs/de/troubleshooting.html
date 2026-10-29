@@ -47,7 +47,7 @@
 <h1>Fehlerbehebung</h1>
 <h2 id="cannot-connect">Eine Instanz ist nicht erreichbar</h2>
 <p>Anzeichen: Agents erhalten <code>unreachable</code>, <code>upstream_network</code> oder <code>upstream_unavailable</code>; eine Token-Prüfung meldet, dass die Instanz nicht erreichbar ist (<code>pat/instance_unreachable</code> auf dem Server).</p>
-<p>Unterscheiden Sie zuerst zwei Fälle. Lautet der Fehler <code>unreachable</code> mit dem Grund <code>not_running</code> oder <code>launch_timeout</code>, ist die App nicht erreichbar, nicht die Instanz. Siehe <a href="/docs/de/error-reference#err-unreachable"><code>unreachable</code></a>. Sonst liegt es an der Instanz:</p>
+<p>Unterscheiden Sie zuerst zwei Fälle. Jeder Fehler <code>unreachable</code> betrifft die App, nicht die Instanz: Die Befehlszeile erreicht die App nicht. Die Gründe stehen unter <a href="/docs/de/error-reference#err-unreachable"><code>unreachable</code></a>. Nur <code>upstream_network</code>, <code>upstream_unavailable</code> und <code>pat/instance_unreachable</code> weisen auf die Instanz. Dann liegt es an der Instanz:</p>
 <ol>
 <li>Öffnen Sie die Adresse der Instanz in einem Browser auf demselben Computer. Lädt sie nicht, liegt die Ursache beim Netzwerk, beim VPN oder bei der Instanz selbst. atlas-duck kann nicht mehr als Ihr Browser.</li>
 <li>Prüfen Sie den Status der Instanz. Auf dem Desktop listen die Einstellungen ihn unter „Instanzen“ auf. Die Status „unbestätigt“, „braucht Token“ und „unsicheres Schema (http)“ sagen, was zu tun ist, siehe <a href="/docs/de/instances-and-tokens">Instanzen und Tokens</a>.</li>
@@ -72,7 +72,7 @@
 <li>Ist nichts aufgelistet, ist die Anfrage möglicherweise abgelaufen, abgelehnt oder storniert worden. Sehen Sie unter „Zuletzt entschieden (24 Std.)“ nach.</li>
 <li>Sieht der Agent Ihre Entscheidung nicht, hat er möglicherweise aufgehört zu warten. Ein Agent, der mit einem kurzen <code>--timeout</code> eingereicht hat, erhält <code>pending</code> und muss das Ergebnis mit <code>await &lt;id&gt;</code> holen. Er darf die Anfrage nie erneut einreichen.</li>
 <li>Hat der Agent die ID verloren, findet er die Anfrage mit <code>requests list</code>.</li>
-<li>Eine Anfrage kann auch warten, weil die App neu gestartet wurde: Anfragen, die dann ausstanden, werden <code>abandoned</code>.</li>
+<li>Nach einem Neustart der App steht eine zuvor ausstehende Anfrage nicht mehr aus: Sie wurde <code>abandoned</code>, siehe <a href="/docs/de/error-reference#err-abandoned"><code>abandoned</code></a>.</li>
 </ol>
 <p>Ein Schreibzugriff, den Sie freigegeben haben, kann eine Weile „wird ausgeführt“ zeigen. Endet er als <code>outcome_unknown</code>, prüfen Sie das Ziel selbst, siehe <a href="/docs/de/error-reference#err-upstream-unknown-outcome"><code>upstream_unknown_outcome</code></a>.</p>
 <h2 id="locked">Die App ist gesperrt</h2>

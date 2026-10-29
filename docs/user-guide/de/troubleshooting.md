@@ -9,7 +9,7 @@ order: 110
 
 Anzeichen: Agents erhalten `unreachable`, `upstream_network` oder `upstream_unavailable`; eine Token-Prüfung meldet, dass die Instanz nicht erreichbar ist (`pat/instance_unreachable` auf dem Server).
 
-Unterscheiden Sie zuerst zwei Fälle. Lautet der Fehler `unreachable` mit dem Grund `not_running` oder `launch_timeout`, ist die App nicht erreichbar, nicht die Instanz. Siehe [`unreachable`](error-reference#err-unreachable). Sonst liegt es an der Instanz:
+Unterscheiden Sie zuerst zwei Fälle. Jeder Fehler `unreachable` betrifft die App, nicht die Instanz: Die Befehlszeile erreicht die App nicht. Die Gründe stehen unter [`unreachable`](error-reference#err-unreachable). Nur `upstream_network`, `upstream_unavailable` und `pat/instance_unreachable` weisen auf die Instanz. Dann liegt es an der Instanz:
 
 1. Öffnen Sie die Adresse der Instanz in einem Browser auf demselben Computer. Lädt sie nicht, liegt die Ursache beim Netzwerk, beim VPN oder bei der Instanz selbst. atlas-duck kann nicht mehr als Ihr Browser.
 2. Prüfen Sie den Status der Instanz. Auf dem Desktop listen die Einstellungen ihn unter „Instanzen“ auf. Die Status „unbestätigt“, „braucht Token“ und „unsicheres Schema (http)“ sagen, was zu tun ist, siehe [Instanzen und Tokens](instances-and-tokens).
@@ -38,7 +38,7 @@ Eine Anfrage wartet, bis Sie entscheiden. Sie hängt nicht, sie wartet auf Sie. 
 2. Ist nichts aufgelistet, ist die Anfrage möglicherweise abgelaufen, abgelehnt oder storniert worden. Sehen Sie unter „Zuletzt entschieden (24 Std.)“ nach.
 3. Sieht der Agent Ihre Entscheidung nicht, hat er möglicherweise aufgehört zu warten. Ein Agent, der mit einem kurzen `--timeout` eingereicht hat, erhält `pending` und muss das Ergebnis mit `await <id>` holen. Er darf die Anfrage nie erneut einreichen.
 4. Hat der Agent die ID verloren, findet er die Anfrage mit `requests list`.
-5. Eine Anfrage kann auch warten, weil die App neu gestartet wurde: Anfragen, die dann ausstanden, werden `abandoned`.
+5. Nach einem Neustart der App steht eine zuvor ausstehende Anfrage nicht mehr aus: Sie wurde `abandoned`, siehe [`abandoned`](error-reference#err-abandoned).
 
 Ein Schreibzugriff, den Sie freigegeben haben, kann eine Weile „wird ausgeführt“ zeigen. Endet er als `outcome_unknown`, prüfen Sie das Ziel selbst, siehe [`upstream_unknown_outcome`](error-reference#err-upstream-unknown-outcome).
 

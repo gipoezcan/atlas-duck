@@ -27,7 +27,7 @@ Die Anfrage war wohlgeformt, hat aber die Prüfung nicht bestanden, zum Beispiel
 
 ### `markdown_placeholders` {#err-markdown-placeholders}
 
-Schreibt ein Agent eine Confluence-Seite oder einen Kommentar in Markdown, weist atlas-duck einen Text zurück, der noch Platzhalter enthält, die atlas-duck eingesetzt hat, als der Agent eine Seite als Markdown las (zum Beispiel für Makros oder Erwähnungen). Zurückgeschrieben würden sie nicht mehr bedeuten, wofür sie standen. Es wurde nichts eingereiht. Exit 2, nicht wiederholbar. Der Agent sollte die Platzhalter durch echten Inhalt ersetzen oder diesen Teil der Seite weglassen.
+Schreibt ein Agent eine Confluence-Seite oder einen Kommentar in Markdown, weist atlas-duck einen Text zurück, der noch Platzhalter enthält, die atlas-duck eingesetzt hat, als der Agent eine Seite als Markdown las (zum Beispiel für Makros oder Erwähnungen). Zurückgeschrieben würden sie nicht mehr bedeuten, wofür sie standen. Es wurde nichts eingereiht. Exit 2, nicht wiederholbar. Der Agent sollte die Seite erneut mit `--format storage` abrufen und seine Änderung mit `body_format=storage` einreichen. Das Storage-Format behält Makros und Erwähnungen unverändert bei. Wer die Platzhalter von Hand ersetzt oder den Teil weglässt, verliert sie.
 
 ### `op_unsupported_by_instance` {#err-op-unsupported-by-instance}
 
@@ -35,7 +35,7 @@ Diese Instanz unterstützt den Vorgang nicht, zum Beispiel weil ihre Version zu 
 
 ### `internal` {#err-internal}
 
-In atlas-duck oder im Server ist ein interner Fehler aufgetreten. Nicht wiederholbar. Versuchen Sie es später erneut. Tritt er weiter auf, informieren Sie Ihren Administrator und nennen Sie ihm die Anfrage-ID und die Uhrzeit.
+In atlas-duck oder im Server ist ein interner Fehler aufgetreten. Nicht wiederholbar: Agents dürfen nicht selbstständig wiederholen. Sie selbst können die Aktion später erneut versuchen. Tritt er weiter auf, informieren Sie Ihren Administrator und nennen Sie ihm die Anfrage-ID und die Uhrzeit.
 
 ### `audit_failure` {#err-audit-failure}
 
@@ -47,11 +47,11 @@ Der Speicher für das Audit-Protokoll ist fast voll. atlas-duck weist neue Anfra
 
 ### `busy` {#err-busy}
 
-Ein anderer Vorgang läuft. Es wurde nichts eingereiht. Exit 11, wiederholbar. Warten Sie die Zeit ab, die `retry_after_s` nennt, und versuchen Sie es erneut.
+atlas-duck begrenzt, wie viele Verbindungen und offene Anfragen es annimmt, insgesamt, je Programm und je Agent-Sitzung, damit ein einzelner Agent die Warteschlange nicht überflutet. Eine dieser Grenzen ist erreicht. Es wurde nichts eingereiht. Exit 11, wiederholbar nach der Zeit, die `retry_after_s` nennt. Warten hilft nicht, wenn die Grenze für ausstehende Anfragen die Ursache ist: Entscheiden oder lehnen Sie zuerst die ausstehenden Anfragen ab, zum Beispiel mit „Alle ausstehenden dieser Sitzung ablehnen“. Versuchen Sie es dann erneut.
 
 ### `unreachable` {#err-unreachable}
 
-Die Befehlszeile konnte die App nicht erreichen, daher wurde nichts eingereiht. Exit 5. `details.reason` nennt den Grund:
+Die Befehlszeile konnte die App nicht erreichen. Außer bei `connection_lost` wurde nichts eingereiht, und der Exit-Code ist 5. `details.reason` nennt den Grund:
 
 | Grund | Was zu tun ist |
 | --- | --- |
@@ -63,9 +63,9 @@ Die Befehlszeile konnte die App nicht erreichen, daher wurde nichts eingereiht. 
 | `app_shutting_down` | Die App wird beendet. Starten Sie sie erneut. |
 | `store_newer` | Die Audit-Daten wurden von einem neueren atlas-duck geschrieben. Installieren Sie diese oder eine neuere Version. |
 | `store_unavailable` | Der Audit-Speicher ließ sich nicht öffnen. Starten Sie atlas-duck neu. Nicht wiederholbar. |
-| `connection_lost` | Die Verbindung brach ab, nachdem die Anfrage gesendet war. Die Anfrage existiert; warten Sie mit `await <id>` auf sie, sie kann `abandoned` sein. |
+| `connection_lost` | Die Verbindung brach ab, nachdem die Anfrage gesendet war. Die Anfrage existiert, mit Status `pending`, Exit 4, nicht wiederholbar. Warten Sie mit `await <id>` auf sie; sie kann `abandoned` sein. |
 
-Außer bei `store_unavailable` ist der Fehler wiederholbar.
+Außer bei `store_unavailable` und `connection_lost` ist der Fehler wiederholbar.
 
 ### `server_identity` {#err-server-identity}
 
@@ -105,7 +105,7 @@ Die App ist gesperrt: Sie kann ihr Audit-Protokoll oder ihre Schlüssel nicht ö
 
 ### `not_configured` {#err-not-configured}
 
-Diese Instanz oder die App ist noch nicht eingerichtet. Exit 9. `details.reason` nennt die Lücke: Der Einrichtungsassistent ist nicht abgeschlossen, für das Produkt gibt es keine Instanz, eine Instanz verwendet `http://` statt `https://`, eine Instanz ist nicht bestätigt, das Datenverzeichnis fehlt oder liegt nicht auf einem lokalen Laufwerk, oder die Einstellungsdatei lässt sich nicht lesen. Schließen Sie die Einrichtung ab.
+Diese Instanz oder die App ist noch nicht eingerichtet. Exit 9. `details.reason` nennt die Lücke: Der Einrichtungsassistent ist nicht abgeschlossen, für das Produkt gibt es keine Instanz, eine Instanz verwendet `http://` statt `https://`, eine Instanz ist nicht bestätigt, das Datenverzeichnis fehlt oder liegt nicht auf einem lokalen Laufwerk, oder die Einstellungsdatei lässt sich nicht lesen. Bei den ersten Gründen schließen Sie die Einrichtung ab. Lässt sich die Einstellungsdatei nicht lesen, wurde sie möglicherweise von einem neueren atlas-duck geschrieben: Aktualisieren Sie atlas-duck. Sind die Pfade oder das Datenverzeichnis unbrauchbar, korrigieren Sie das Verzeichnis oder seine Berechtigungen.
 
 ::: desktop
 
@@ -127,7 +127,7 @@ Die Skript-Sandbox ist nicht verfügbar, daher können keine Skripte laufen. Exi
 
 ### `result_evicted` {#err-result-evicted}
 
-Das Ergebnis ist bekannt, aber nicht mehr gespeichert. Exit 10. Bei Lesezugriffen und Skripten kann der Agent die Anfrage erneut einreichen; einen Schreibzugriff wiederholen Sie nicht, denn die Änderung wurde bereits ausgeführt.
+Das Ergebnis ist bekannt, aber nicht mehr gespeichert. Exit 10. Bei Lesezugriffen und Skripten kann der Agent die Anfrage erneut einreichen; einen Schreibzugriff wiederholen Sie nicht einfach: Sein Ergebnis ist bereits entschieden und kann ein Fehlschlag gewesen sein. Prüfen Sie zuerst das Ziel in Jira oder Confluence.
 
 ### `denied` {#err-denied}
 
@@ -145,6 +145,8 @@ Niemand hat die Anfrage rechtzeitig entschieden. Exit 7, nicht wiederholbar. Rei
 
 Die Anfrage wurde storniert: durch den Agenten (`cancel`, nicht wiederholbar) oder weil die App beendet oder das System heruntergefahren wurde (wiederholbar). Exit 7. Es wurde nichts ausgeführt, und ein storniertes Ergebnis erreicht Ihre Warteschlange nie.
 
+Im Fenster „Freigaben“ bedeutet derselbe Code „Die Entscheidung wurde abgebrochen“: Sie haben die Bestätigung einer Sammelentscheidung abgebrochen. Es wurde nichts entschieden, und die Anfragen sind wie zuvor.
+
 ### `abandoned` {#err-abandoned}
 
 Die Anfrage war noch ausstehend, als die App abstürzte oder beendet wurde. Exit 7, wiederholbar. Reichen Sie sie erneut ein. Ein Schreibzugriff, der schon freigegeben war, wird stattdessen `outcome_unknown`, siehe [upstream_unknown_outcome](error-reference#err-upstream-unknown-outcome).
@@ -159,7 +161,7 @@ Die App und das Kommandozeilenwerkzeug haben sich nicht verstanden. Exit 1, nich
 
 ## Fehler beim Entscheiden {#errors-decision}
 
-Diese Fehler erscheinen im Fenster „Freigaben“, wenn sich eine Entscheidung nicht anwenden lässt. In jedem Fall wurde nichts entschieden, und die Anfrage ist wie zuvor.
+Diese Fehler erscheinen im Fenster „Freigaben“, wenn sich eine Entscheidung nicht anwenden lässt. In jedem Fall wurde nichts entschieden, und die Anfrage ist wie zuvor. Den Fehler `cancelled` beschreibt [der Abschnitt oben](error-reference#err-cancelled).
 
 ### `stale` {#err-stale}
 
@@ -195,7 +197,7 @@ Die Anfrage steht nicht mehr aus. Sie wurde inzwischen entschieden, ist abgelauf
 
 ### `target_param_edit` {#err-target-param-edit}
 
-Das Ziel der Anfrage lässt sich nicht bearbeiten. Entscheiden Sie sie einzeln oder lehnen Sie sie ab, damit der Agent mit dem richtigen Ziel neu anfragt.
+Eine Bearbeitung wollte das Ziel der Anfrage ändern, was nicht erlaubt ist. Lehnen Sie die Anfrage ab, damit der Agent mit dem richtigen Ziel neu anfragt.
 
 ### `not_opened` {#err-not-opened}
 
@@ -203,7 +205,7 @@ Die Vorschau der Anfrage wurde nicht geöffnet. Öffnen Sie die Vorschau jeder a
 
 ### `not_approvable` {#err-not-approvable}
 
-Die Anfrage lässt sich so nicht freigeben, zum Beispiel weil Pflichtfelder fehlen. Entscheiden Sie sie einzeln.
+Die Anfrage lässt sich so nicht freigeben, zum Beispiel weil Pflichtfelder fehlen, eine Schwärzung blockiert ist oder sich die Anfrage nicht neu aufbauen lässt. Einzeln entscheiden ändert daran nichts. Ergänzen Sie die fehlenden Felder oder beheben Sie die blockierte Schwärzung, oder lehnen Sie die Anfrage ab.
 
 ### `batch_item_flagged` {#err-batch-item-flagged}
 
@@ -225,7 +227,7 @@ Die Anfrage oder das, was sie nennt, gibt es nicht mehr. Laden Sie die Seite neu
 
 ### `release_blocked` {#err-release-blocked}
 
-Diese Anfrage kann nicht übergeben werden. Die Schwärzungen, die Sie vorgenommen haben, oder die Daten selbst würden etwas durchlassen, das zurückgehalten werden sollte. Die Seite nennt den Grund. Siehe „Wenn eine Übergabe blockiert ist“ unter [Bearbeiten und schwärzen](approvals#edit-and-redact).
+Diese Anfrage kann nicht übergeben werden. Die Schwärzungen, die Sie vorgenommen haben, oder die Daten selbst würden etwas durchlassen, das zurückgehalten werden sollte, oder das Ergebnis ließ sich nicht exakt aufbauen. Die Seite nennt den Grund. Lehnen Sie die Anfrage ab oder nehmen Sie die markierten Einträge heraus. Siehe „Wenn eine Übergabe blockiert ist“ unter [Bearbeiten und schwärzen](approvals#edit-and-redact).
 
 ### `unknown_command` {#err-unknown-command}
 
@@ -237,7 +239,7 @@ Ihr Speicher ist noch nicht bereit, zum Beispiel direkt nach einem Neustart. Ver
 
 ### `audit_unreadable` {#err-audit-unreadable}
 
-Ein Audit-Eintrag konnte nicht gelesen werden. Der Rest des Protokolls ist nicht betroffen. Tritt es weiter auf, informieren Sie Ihren Administrator.
+Ein Audit-Eintrag konnte nicht gelesen werden, was bedeuten kann, dass er beschädigt ist. Informieren Sie Ihren Administrator schon beim ersten Mal und bitten Sie ihn, das Audit-Protokoll zu prüfen, siehe [Die Kette prüfen](audit#verify).
 
 ### `audit_failed` {#err-audit-failed}
 
@@ -301,7 +303,7 @@ HTTP 403. Dem Schlüssel fehlt die Berechtigung, die dafür nötig ist. Erstelle
 
 ### `api/bad_request` {#err-api-bad-request}
 
-HTTP 400. Die Anfrage ist fehlerhaft aufgebaut. Verwenden Sie die Webseiten, laden Sie sie neu. Sendet ein eigenes Programm sie, prüfen Sie den Anfragetext.
+HTTP 400. Die Anfrage ist fehlerhaft aufgebaut. Wenn Sie die Webseiten verwenden, laden Sie sie neu. Sendet ein eigenes Programm sie, prüfen Sie den Anfragetext.
 
 ### `api/not_found` {#err-api-not-found}
 
