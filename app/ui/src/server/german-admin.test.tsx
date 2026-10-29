@@ -6,7 +6,7 @@ import { LangProvider } from '../shared/i18n/context';
 import { de, en } from '../shared/i18n/dict';
 import { setPageTransport } from '../shared/ipc/transport';
 import { loadSession, type SessionInfo } from '../shared/ipc/transport-http';
-import { adminError, Instances } from './admin/Instances';
+import { adminError, dialogs, Instances } from './admin/Instances';
 import { AuditorPage } from './auditor/Users';
 import { ExportPanel, exportBrowser } from './export/ExportPanel';
 import { RequireSession } from './shell/RequireSession';
@@ -153,8 +153,74 @@ describe('the server admin, auditor and export pages in German (M15 T9)', () => 
     expect(link.getAttribute('href')).toBe(`${BASE}/${JOB}/download`);
     // No file name is set by the page: the server's (ISO) name is kept.
     expect(link.getAttribute('download')).toBe('');
-    expect(screen.getByRole('button', { name: 'Kopieren SHA-256 des Manifests' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'SHA-256 des Manifests kopieren' })).toBeTruthy();
     expect(de.admin.export.running(3, 9)).toBe('Export läuft… 3 von 9 Datensätzen');
     expect(de.admin.export.running(1200, 3400)).toBe('Export läuft… 1.200 von 3.400 Datensätzen');
+  });
+
+  it('remove_confirm_is_asked_in_german', async () => {
+    vi.mocked(loadSession).mockResolvedValue(session(['user', 'admin']));
+    fetchMock.mockResolvedValue(
+      json(200, [
+        { alias: 'work', product: 'jira', base_url: 'https://jira.example.test', proxy: null, ca_ref: null, is_default: false },
+      ]),
+    );
+    const confirm = vi.spyOn(dialogs, 'confirm').mockReturnValue(false);
+    german(
+      <RequireSession>
+        <Instances />
+      </RequireSession>,
+    );
+    await flush();
+    fireEvent.click(screen.getByRole('button', { name: 'Entfernen' }));
+    expect(confirm).toHaveBeenCalledWith(
+      'Die Instanz work entfernen? Die Tokens aller Benutzer für diese Instanz werden gelöscht.',
+    );
+  });
+
+  it('the_instance_error_for_invalid_input_reads_as_sentences', () => {
+    expect(adminError('instance/invalid', de)).toBe(
+      'Die Instanz ist nicht gültig: Prüfen Sie den Alias (Buchstaben, Ziffern, - und _), das Produkt, eine Basis-URL mit https:// und den Proxy. Außerdem darf ein Produkt nur eine Standardinstanz haben.',
+    );
+  });
+
+  it('a_non_auditor_gets_the_german_gate_text', async () => {
+    vi.mocked(loadSession).mockResolvedValue(session(['user']));
+    german(
+      <RequireSession>
+        <AuditorPage />
+      </RequireSession>,
+    );
+    await flush();
+    expect(screen.getByRole('alert').textContent).toBe('Nur für Auditoren.');
+  });
+
+  it('the_auditor_list_says_load_failed_and_none_in_german', async () => {
+    vi.mocked(loadSession).mockResolvedValue(session(['user', 'auditor']));
+    fetchMock.mockResolvedValue(json(500, { error: { code: 'api/internal', message: 'x' } }));
+    german(
+      <RequireSession>
+        <AuditorPage />
+      </RequireSession>,
+    );
+    await flush();
+    expect(screen.getByRole('alert').textContent).toBe('Die Benutzer konnten nicht geladen werden.');
+    cleanup();
+    fetchMock.mockResolvedValue(json(200, []));
+    german(
+      <RequireSession>
+        <AuditorPage />
+      </RequireSession>,
+    );
+    await screen.findByText('Kein Benutzer passt.');
+  });
+
+  it('the_export_running_line_is_german_with_german_numbers', async () => {
+    fetchMock
+      .mockResolvedValueOnce(json(202, { job_id: JOB, state: 'running', progress: { done: 1200, total: 3400 } }))
+      .mockReturnValue(new Promise(() => undefined));
+    german(<ExportPanel base={BASE} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Export starten' }));
+    expect((await screen.findByRole('status')).textContent).toBe('Export läuft… 1.200 von 3.400 Datensätzen');
   });
 });

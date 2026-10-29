@@ -74,6 +74,7 @@ export const admin = {
     anchor: 'Anchor head',
     verify: 'Verify with',
     copy: 'Copy',
+    copy_label: (what: string) => `Copy ${what}`,
     copied: 'Copied.',
     copy_failed: 'Copying failed; select the text instead.',
     out_of_band:

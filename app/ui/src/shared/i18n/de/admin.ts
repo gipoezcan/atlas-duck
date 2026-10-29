@@ -32,7 +32,7 @@ export const admin: Dict['admin'] = {
     no: 'nein',
     errors: {
       invalid:
-        'Die Instanz ist nicht gültig: Prüfen Sie den Alias (Buchstaben, Ziffern, - und _), das Produkt, eine Basis-URL mit https://, den Proxy und dass das Produkt nur eine Standardinstanz hat.',
+        'Die Instanz ist nicht gültig: Prüfen Sie den Alias (Buchstaben, Ziffern, - und _), das Produkt, eine Basis-URL mit https:// und den Proxy. Außerdem darf ein Produkt nur eine Standardinstanz haben.',
       exists: 'Eine Instanz mit diesem Alias gibt es bereits.',
       unknown: 'Diese Instanz gibt es nicht mehr.',
       role: 'Nur für Administratoren.',
@@ -76,6 +76,7 @@ export const admin: Dict['admin'] = {
     anchor: 'Anker-Kopf',
     verify: 'Prüfen mit',
     copy: 'Kopieren',
+    copy_label: (what) => `${what} kopieren`,
     copied: 'Kopiert.',
     copy_failed: 'Das Kopieren ist fehlgeschlagen; markieren Sie stattdessen den Text.',
     out_of_band:

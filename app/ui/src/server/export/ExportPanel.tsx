@@ -68,7 +68,7 @@ function CopyRow({ label, value }: { label: string; value: string }) {
         <code>{value}</code>{' '}
         <button
           type="button"
-          aria-label={`${t.admin.export.copy} ${label}`}
+          aria-label={t.admin.export.copy_label(label)}
           onClick={() => {
             exportBrowser.copy(value).then(
               () => setNote(t.admin.export.copied),
