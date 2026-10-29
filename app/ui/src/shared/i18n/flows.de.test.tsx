@@ -12,7 +12,6 @@ import { ApiKeys } from '../../server/api_keys/ApiKeys';
 import { Consent } from '../../server/oauth/Consent';
 import { nav } from '../../server/shell/RequireSession';
 import { on } from '../ipc/events';
-import queueFixture from '../ipc/fixtures/queue_item.json';
 import settingsFixture from '../ipc/fixtures/settings_get.json';
 import { decide, orphanInstalls, removalState, settingsApply, settingsGet, uiLangGet } from '../ipc/invoke';
 import type { SettingsGet, UiLang } from '../ipc/types';
@@ -86,15 +85,13 @@ const ATTRIBUTES = ['aria-label', 'title', 'placeholder', 'alt'];
 
 /**
  * The text of the page: what is shown and the attributes that carry text for assistive technology
- * and tooltips. The session label of a queue row is composed by Rust ("(no agent name) · dir"), a
- * residual of M15 T10: it is left out until the label is built from the UI's own texts (delete this
- * strip together with `the_fixture_session_label_is_still_rust_english`).
+ * and tooltips.
  */
 function pageText(): string {
   const attributes = [...document.body.querySelectorAll(ATTRIBUTES.map((a) => `[${a}]`).join(','))].flatMap((el) =>
     ATTRIBUTES.map((a) => el.getAttribute(a)).filter((v): v is string => v !== null),
   );
-  return [document.body.textContent ?? '', ...attributes].join('\n').replaceAll('no agent name', '');
+  return [document.body.textContent ?? '', ...attributes].join('\n');
 }
 
 const german = (ui: React.ReactNode) => render(<LangProvider lang="de">{ui}</LangProvider>);
@@ -153,13 +150,6 @@ describe('the leftover detector', () => {
     // `queue.heading` is the aria-label of the list: attributes count.
     expect(found).toContain('approvals.queue.heading');
     expect(found.length).toBeGreaterThan(5);
-  });
-
-  // Delete this test and the strip in `pageText` together once Rust sends the session label as a
-  // kind and the UI words it (M15 T10).
-  it('the_fixture_session_label_is_still_rust_english', () => {
-    const rows = queueFixture as unknown as { agent_name: string | null; session_label: string }[];
-    expect(rows.find((r) => r.agent_name === null)?.session_label).toContain('(no agent name)');
   });
 });
 

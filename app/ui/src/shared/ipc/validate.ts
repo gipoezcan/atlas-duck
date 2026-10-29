@@ -116,6 +116,8 @@ export const isQueueItem = (v: unknown): v is QueueItem =>
     possible_duplicate_of: strOrNull,
     reason_excerpt: strOrNull,
     session_id: isStr,
+    session_agent_name: strOrNull,
+    session_cwd: isStr,
     session_label: isStr,
     similar_to: strOrNull,
     stale: isBool,

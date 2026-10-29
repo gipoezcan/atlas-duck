@@ -19,7 +19,7 @@ function rowHeightPx(): number {
 }
 
 type Row =
-  | { kind: 'group'; sessionId: string; label: string; unusual: boolean; ids: string[] }
+  | { kind: 'group'; sessionId: string; head: QueueItem; unusual: boolean; ids: string[] }
   | { kind: 'item'; item: QueueItem };
 
 /**
@@ -44,7 +44,7 @@ export function buildRows(items: readonly QueueItem[]): Row[] {
       {
         kind: 'group' as const,
         sessionId: head.session_id,
-        label: head.session_label,
+        head,
         // `unusual` is about an agent's name or reason, not the label: a group may be flagged for
         // another member's text. That over-flags, which is harmless.
         unusual: members.some((i) => i.unusual),
@@ -53,6 +53,11 @@ export function buildRows(items: readonly QueueItem[]): Row[] {
       ...sorted.map((item) => ({ kind: 'item' as const, item })),
     ];
   });
+}
+
+/** A session as the queue shows it: the agent's name (the UI's words when it sent none) and the cwd. */
+export function sessionLabel(item: QueueItem, t: Dict = en): string {
+  return `${item.session_agent_name ?? t.approvals.queue.no_agent_name} · ${item.session_cwd}`;
 }
 
 /** The request ids in the order the queue shows them (next/prev follows it). */
@@ -180,7 +185,7 @@ function GroupRow({
       />
       <span id={selectId}>{t.approvals.queue.select_session}</span>{' '}
       <span id={labelId}>
-        <AgentText value={row.label} unusual={row.unusual} />
+        <AgentText value={sessionLabel(row.head, t)} unusual={row.unusual} />
       </span>
     </div>
   );
@@ -246,7 +251,7 @@ function ItemRow({
             {other === undefined ? null : (
               <>
                 {' '}
-                {t.approvals.queue.of_session} <AgentText value={other.session_label} unusual={other.unusual} />
+                {t.approvals.queue.of_session} <AgentText value={sessionLabel(other, t)} unusual={other.unusual} />
               </>
             )}
           </span>

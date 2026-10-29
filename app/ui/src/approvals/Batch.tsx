@@ -5,6 +5,7 @@ import { decideBatch, denyBatch, denySession } from '../shared/ipc/invoke';
 import type { BatchItem } from '../shared/ipc/invoke';
 import type { QueueItem } from '../shared/ipc/types';
 import { AgentText } from '../shared/text/AgentText';
+import { sessionLabel } from './Queue';
 import { useInert } from './inert';
 import { useText } from '../shared/i18n/context';
 import { en } from '../shared/i18n/dict';
@@ -292,10 +293,10 @@ export function Batch({ items, selectedIds, unsentId = null, onEngagedChange }: 
     const seen = new Map<string, { label: string; unusual: boolean }>();
     for (const i of selected) {
       const s = seen.get(i.session_id);
-      seen.set(i.session_id, { label: i.session_label, unusual: (s?.unusual ?? false) || i.unusual });
+      seen.set(i.session_id, { label: sessionLabel(i, t), unusual: (s?.unusual ?? false) || i.unusual });
     }
     return [...seen.entries()];
-  }, [selected]);
+  }, [selected, t]);
 
   const reviewDisabled = !canBatch || busy || inert.approveInert;
   const confirmDisabled = busy || inert.approveInert;

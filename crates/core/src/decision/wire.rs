@@ -916,6 +916,8 @@ pub mod golden {
             similar_to: None,
             session_id: session.id(),
             session_label: session.label(),
+            session_agent_name: session.shown_agent_name(),
+            session_cwd: session.shown_cwd(),
             session,
             opened: false,
             approvable: true,

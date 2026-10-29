@@ -28,7 +28,11 @@ export interface QueueItem {
   reason_excerpt: string | null;
   /** Hex SHA-256 of the session key (PD-86); the key itself never reaches the UI. */
   session_id: string;
-  /** "<agent> · <cwd>": agent-supplied text, display-escaped. */
+  /** The session's agent name, display-escaped; `null` when the agent sent none (the UI words that). */
+  session_agent_name: string | null;
+  /** The session's cwd basename, display-escaped. */
+  session_cwd: string;
+  /** The English "<agent> · <cwd>", kept for older readers; the UI composes its own from the two above. */
   session_label: string;
   similar_to: string | null;
   stale: boolean;
