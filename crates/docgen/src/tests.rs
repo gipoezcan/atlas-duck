@@ -480,6 +480,38 @@ fn out_dirs_must_not_overlap_the_sources_or_each_other() {
     assert!(crate::check_disjoint(&src, &base.join("x/../a"), &base.join("a/new")).is_err());
 }
 
+/// Windows paths are case-insensitive: a differently cased, not yet existing tail still overlaps.
+#[cfg(windows)]
+#[test]
+fn out_dir_overlap_ignores_case_on_windows() {
+    let src = guide_dir();
+    let base = std::env::temp_dir().join(format!("atlas-duck-docgen-case-{}", std::process::id()));
+    let (a, b) = (base.join("Out"), base.join("b"));
+    assert!(crate::check_disjoint(&src, &a, &b).is_ok());
+    assert!(crate::check_disjoint(&src, &a, &base.join("OUT").join("new")).is_err());
+    assert!(crate::check_disjoint(&src, &a, &base.join("out")).is_err());
+}
+
+/// `--check` sees a leftover empty directory (write mode removes it), but not the root itself.
+#[test]
+fn check_reports_stale_empty_directories() {
+    let dir = std::env::temp_dir().join(format!("atlas-duck-docgen-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let files = site::generate(&fixture(), Set::Desktop).unwrap();
+    crate::write_tree(&dir, &files).unwrap();
+    assert!(crate::drift(&dir, &files).unwrap().is_empty());
+    std::fs::create_dir_all(dir.join("old/deep")).unwrap();
+    let found = crate::drift(&dir, &files).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].contains("old") && found[0].contains("empty directory"),
+        "{found:?}"
+    );
+    crate::write_tree(&dir, &files).unwrap();
+    assert!(crate::drift(&dir, &files).unwrap().is_empty());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// A link (symlink, or a junction on Windows) inside an out dir is neither followed nor deleted
 /// through: the files it points at survive a write.
 #[test]

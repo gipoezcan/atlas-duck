@@ -122,7 +122,39 @@ fn drift(dir: &Path, files: &Files) -> Result<Vec<String>, String> {
             dir.join(name).display()
         ));
     }
+    if dir.is_dir() {
+        let mut empty = Vec::new();
+        empty_dirs(dir, dir, &mut empty)?;
+        for d in empty {
+            out.push(format!("{}: stale empty directory", d.display()));
+        }
+    }
     Ok(out)
+}
+
+/// The topmost directories below `root` that hold no file and no link (write mode prunes them).
+/// Returns whether `dir` itself is such a directory.
+fn empty_dirs(dir: &Path, root: &Path, out: &mut Vec<PathBuf>) -> Result<bool, String> {
+    let io = |e: std::io::Error| format!("{}: {e}", dir.display());
+    let mut all_empty = true;
+    let mut found = Vec::new();
+    for entry in fs::read_dir(dir).map_err(io)? {
+        let entry = entry.map_err(io)?;
+        let kind = entry.file_type().map_err(io)?;
+        if kind.is_dir() && !kind.is_symlink() {
+            if !empty_dirs(&entry.path(), root, &mut found)? {
+                all_empty = false;
+            }
+        } else {
+            all_empty = false;
+        }
+    }
+    if all_empty && dir != root {
+        out.push(dir.to_path_buf());
+        return Ok(true);
+    }
+    out.append(&mut found);
+    Ok(all_empty)
 }
 
 /// Removes empty directories below `dir` (not `dir` itself); links are not entered.
@@ -168,6 +200,16 @@ fn resolve(path: &Path) -> Result<PathBuf, String> {
     Ok(out)
 }
 
+/// Windows paths are case-insensitive, so overlap is judged on lower-cased paths there (an out dir
+/// that does not exist yet keeps whatever case it was typed in).
+fn fold_case(path: &Path) -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(path.to_string_lossy().to_lowercase())
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// The generator deletes whatever it did not generate below an out dir, so an out dir that is, holds
 /// or lies inside the sources (or the other out dir) is refused.
 fn check_disjoint(src: &Path, desktop: &Path, server: &Path) -> Result<(), String> {
@@ -178,7 +220,8 @@ fn check_disjoint(src: &Path, desktop: &Path, server: &Path) -> Result<(), Strin
     ];
     for (i, (a_name, a)) in dirs.iter().enumerate() {
         for (b_name, b) in &dirs[i + 1..] {
-            if a.starts_with(b) || b.starts_with(a) {
+            let (fa, fb) = (fold_case(a), fold_case(b));
+            if fa.starts_with(&fb) || fb.starts_with(&fa) {
                 return Err(format!(
                     "{a_name} ({}) and {b_name} ({}) overlap",
                     a.display(),
