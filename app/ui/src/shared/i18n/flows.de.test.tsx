@@ -12,6 +12,7 @@ import { ApiKeys } from '../../server/api_keys/ApiKeys';
 import { Consent } from '../../server/oauth/Consent';
 import { nav } from '../../server/shell/RequireSession';
 import { on } from '../ipc/events';
+import queueFixture from '../ipc/fixtures/queue_item.json';
 import settingsFixture from '../ipc/fixtures/settings_get.json';
 import { decide, orphanInstalls, removalState, settingsApply, settingsGet, uiLangGet } from '../ipc/invoke';
 import type { SettingsGet, UiLang } from '../ipc/types';
@@ -51,24 +52,49 @@ function leaves(node: unknown, path = ''): [string, string][] {
 
 const EN_LEAVES = leaves(en);
 const DE_LEAVES = new Map(leaves(de));
-const DE_TEXT = [...DE_LEAVES.values()].join('\n');
-/** The shortest English sentence the page checks look for. */
-const MIN = 13;
+/** The shortest English text the page checks look for. */
+const MIN = 6;
+/** English texts that may stand on a German page, by the path of the English text, each with its reason. */
+const ENGLISH_IN_GERMAN: Record<string, string> = {};
+
+const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /**
- * The page text. The session label of a queue row is composed by Rust ("(no agent name) · dir"), a
- * residual of M15 T10: it is left out until the label is built from the UI's own texts.
+ * The paths of the English texts (at least `MIN` characters, with a German text that differs) that
+ * stand in `text` as whole words, except those in `allowed`.
  */
-const pageText = (): string => (document.body.textContent ?? '').replaceAll('no agent name', '');
+function findLeftovers(
+  text: string,
+  enLeaves: [string, string][],
+  deLeaves: Map<string, string>,
+  allowed: Record<string, string> = {},
+): string[] {
+  return enLeaves
+    .filter(
+      ([path, s]) =>
+        s.length >= MIN &&
+        deLeaves.get(path) !== s &&
+        !Object.hasOwn(allowed, path) &&
+        new RegExp(`(?<![\\p{L}\\p{N}])${escapeRegExp(s)}(?![\\p{L}\\p{N}])`, 'u').test(text),
+    )
+    .map(([path]) => path);
+}
+
+const leftovers = (text: string): string[] => findLeftovers(text, EN_LEAVES, DE_LEAVES, ENGLISH_IN_GERMAN);
+
+const ATTRIBUTES = ['aria-label', 'title', 'placeholder', 'alt'];
 
 /**
- * The English sentences (longer than `MIN` characters, with a German text that differs) that appear
- * in `text`. A sentence that a German text contains (a technical term kept as is) does not count.
+ * The text of the page: what is shown and the attributes that carry text for assistive technology
+ * and tooltips. The session label of a queue row is composed by Rust ("(no agent name) · dir"), a
+ * residual of M15 T10: it is left out until the label is built from the UI's own texts (delete this
+ * strip together with `the_fixture_session_label_is_still_rust_english`).
  */
-function leftovers(text: string): string[] {
-  return EN_LEAVES.filter(
-    ([path, s]) => s.length >= MIN && DE_LEAVES.get(path) !== s && !DE_TEXT.includes(s) && text.includes(s),
-  ).map(([path]) => path);
+function pageText(): string {
+  const attributes = [...document.body.querySelectorAll(ATTRIBUTES.map((a) => `[${a}]`).join(','))].flatMap((el) =>
+    ATTRIBUTES.map((a) => el.getAttribute(a)).filter((v): v is string => v !== null),
+  );
+  return [document.body.textContent ?? '', ...attributes].join('\n').replaceAll('no agent name', '');
 }
 
 const german = (ui: React.ReactNode) => render(<LangProvider lang="de">{ui}</LangProvider>);
@@ -87,16 +113,74 @@ afterEach(() => {
   document.documentElement.lang = '';
 });
 
+describe('the leftover detector', () => {
+  const en2: [string, string][] = [
+    ['a.save', 'Save changes'],
+    ['a.same', 'Token value'],
+    ['a.short', 'No'],
+  ];
+  const de2 = new Map([
+    ['a.save', 'Änderungen speichern'],
+    ['a.same', 'Token value'],
+    ['a.short', 'Nein'],
+  ]);
+
+  it('finds an English text, as a whole word, in the text and in nothing else', () => {
+    expect(findLeftovers('Save changes', en2, de2)).toEqual(['a.save']);
+    expect(findLeftovers('Änderungen speichern', en2, de2)).toEqual([]);
+    expect(findLeftovers('Save changesX and ASave changes', en2, de2)).toEqual([]);
+    // A German text equal to the English one is a shared word; a text below `MIN` is not looked for.
+    expect(findLeftovers('Token value No', en2, de2)).toEqual([]);
+  });
+
+  it('a German text replaced by its English one is flagged, an explicit allowance is not', () => {
+    const mutated = new Map(de2).set('a.save', 'Save changes!');
+    expect(findLeftovers('Save changes', en2, mutated)).toEqual(['a.save']);
+    expect(findLeftovers('Save changes', en2, de2, { 'a.save': 'a reason' })).toEqual([]);
+  });
+
+  it('sees an English window, in its text and its attributes', async () => {
+    vi.useFakeTimers();
+    vi.resetAllMocks();
+    mockWindow();
+    render(
+      <LangProvider lang="en">
+        <App />
+      </LangProvider>,
+    );
+    await flushApprovals();
+    const found = leftovers(pageText());
+    // `queue.heading` is the aria-label of the list: attributes count.
+    expect(found).toContain('approvals.queue.heading');
+    expect(found.length).toBeGreaterThan(5);
+  });
+
+  // Delete this test and the strip in `pageText` together once Rust sends the session label as a
+  // kind and the UI words it (M15 T10).
+  it('the_fixture_session_label_is_still_rust_english', () => {
+    const rows = queueFixture as unknown as { agent_name: string | null; session_label: string }[];
+    expect(rows.find((r) => r.agent_name === null)?.session_label).toContain('(no agent name)');
+  });
+});
+
 describe('German flows of the approvals window', () => {
   beforeEach(() => {
     vi.resetAllMocks();
     vi.useFakeTimers();
     mockWindow();
+    vi.mocked(uiLangGet).mockResolvedValue({ pref: 'de', lang: 'de' });
   });
 
+  /** The window as the app mounts it: the language comes from Rust's `ui_lang_get`. */
   const openWrite = async () => {
-    german(<App />);
+    render(
+      <DesktopLangRoot>
+        <App />
+      </DesktopLangRoot>,
+    );
     await flushApprovals();
+    expect(document.documentElement.lang).toBe('de');
+    expect(leftovers(pageText())).toEqual([]);
     fireEvent.click(
       screen.getByRole('button', {
         name: `${de.approvals.queue.open} ${WRITE.op_id} ${WRITE.target_display}`,
@@ -105,36 +189,30 @@ describe('German flows of the approvals window', () => {
     await flushApprovals();
   };
 
-  it('the_leftover_check_sees_an_english_page', async () => {
-    render(
-      <LangProvider lang="en">
-        <App />
-      </LangProvider>,
-    );
-    await flushApprovals();
-    expect(leftovers(pageText())).toContain('approvals.detail.select_prompt');
-  });
-
   it('de_approve_write_flow', async () => {
     await openWrite();
     expect(screen.getByRole('heading', { name: de.approvals.detail.heading })).toBeTruthy();
+    // The detail view with its inert period, before and after it.
+    expect(leftovers(pageText())).toEqual([]);
     advance(INERT_MS);
     const approve = screen.getByRole('button', { name: de.approvals.detail.approve }) as HTMLButtonElement;
     expect(approve.disabled).toBe(false);
+    expect(leftovers(pageText())).toEqual([]);
     fireEvent.click(approve);
     await flushApprovals();
     expect(decide).toHaveBeenCalledTimes(1);
     expect(vi.mocked(decide).mock.calls[0]?.[0]).toMatchObject({ request_id: WRITE.request_id });
-    // Every part of the window is German: no English sentence of the dictionary is on the page.
     expect(leftovers(pageText())).toEqual([]);
-    expect(document.documentElement.lang).toBe('de');
   });
 
   it('de_deny_with_reason_flow', async () => {
     await openWrite();
+    expect(leftovers(pageText())).toEqual([]);
     fireEvent.click(screen.getByRole('button', { name: de.approvals.detail.deny }));
     const group = screen.getByRole('group', { name: de.approvals.deny.label });
     expect(within(group).getByText(de.approvals.deny.keys)).toBeTruthy();
+    // The deny form is open.
+    expect(leftovers(pageText())).toEqual([]);
     fireEvent.change(within(group).getByRole('textbox', { name: de.approvals.deny.reason }), {
       target: { value: 'Bitte später erneut versuchen' },
     });
@@ -148,7 +226,6 @@ describe('German flows of the approvals window', () => {
     expect(leftovers(pageText())).toEqual([]);
   });
 });
-
 describe('the settings window switches back to English', () => {
   const [FULL] = settingsFixture as unknown as [SettingsGet];
   let named = new Map<string, ((payload: unknown) => void)[]>();
@@ -259,15 +336,13 @@ describe('German flows of the server pages', () => {
     fireEvent.change(screen.getByLabelText(de.server.api_keys.name), { target: { value: 'laptop' } });
     fireEvent.click(screen.getByRole('button', { name: de.server.api_keys.create }));
     await flush();
-    expect(screen.getByText('Dieser Schlüssel wird nur jetzt angezeigt.')).toBeTruthy();
+    expect(screen.getByText(de.server.api_keys.created)).toBeTruthy();
     expect((screen.getByLabelText('laptop') as HTMLInputElement).value).toBe(KEY);
     fireEvent.click(screen.getByRole('button', { name: de.server.api_keys.done }));
     fireEvent.change(screen.getByLabelText(de.server.api_keys.name), { target: { value: 'second' } });
     fireEvent.click(screen.getByRole('button', { name: de.server.api_keys.create }));
     await flush();
-    expect(screen.getByRole('alert').textContent).toBe(
-      'Sie haben die Höchstzahl von 25 aktiven Schlüsseln erreicht. Widerrufen Sie zuerst einen.',
-    );
+    expect(screen.getByRole('alert').textContent).toBe(de.errors.server['api_key/limit_reached']);
     expect(leftovers(pageText())).toEqual([]);
   });
 
