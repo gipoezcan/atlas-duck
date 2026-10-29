@@ -124,6 +124,19 @@ describe('server shell', () => {
     expect(q.getAttribute('href')).toBe('/docs/en/instances-and-tokens#credentials-page');
   });
 
+  it('header_question_mark_ignores_a_trailing_slash', async () => {
+    vi.mocked(loadSession).mockResolvedValue(session(['user']));
+    window.history.replaceState(null, '', '/credentials/');
+    render(
+      <RequireSession>
+        <ServerHeader />
+      </RequireSession>,
+    );
+    await flush();
+    const q = screen.getByRole('link', { name: `Help: ${SHELL_TEXT.credentials}` });
+    expect(q.getAttribute('href')).toBe('/docs/en/instances-and-tokens#credentials-page');
+  });
+
   it('header_has_no_question_mark_on_an_unlisted_path', async () => {
     vi.mocked(loadSession).mockResolvedValue(session(['user']));
     window.history.replaceState(null, '', '/somewhere-else');

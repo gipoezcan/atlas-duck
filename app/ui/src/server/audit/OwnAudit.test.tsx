@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { flush, header, status } from '../../audit/testing';
 import { on } from '../../shared/ipc/events';
 import { auditQuery, auditStatus, backupTrigger, exportTrigger, verifyNow } from '../../shared/ipc/invoke';
+import { ServerLangRoot } from '../shell/ServerLangRoot';
 import { OwnAudit } from './OwnAudit';
 
 vi.mock('../../shared/ipc/invoke', () => ({
@@ -27,6 +28,23 @@ beforeEach(() => {
 });
 
 describe('OwnAudit (server mode)', () => {
+  // The shared Audit component has desktop help controls (they call `help_open`): they appear in
+  // a desktop root and are absent under the server root.
+  it('the desktop help controls are absent under the server root only', async () => {
+    const { unmount } = render(<OwnAudit exportPanel={null} />);
+    await flush();
+    expect(screen.getByRole('button', { name: 'Help' })).toBeTruthy();
+    unmount();
+    render(
+      <ServerLangRoot>
+        <OwnAudit exportPanel={null} />
+      </ServerLangRoot>,
+    );
+    await flush();
+    expect(screen.queryByRole('button', { name: 'Help' })).toBeNull();
+    expect(screen.queryByRole('link', { name: /^Help: / })).toBeNull();
+  });
+
   it('shows the records and hides every desktop-only control', async () => {
     render(<OwnAudit exportPanel={<p>export panel slot</p>} />);
     await flush();

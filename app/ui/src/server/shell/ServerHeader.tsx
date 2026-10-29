@@ -87,7 +87,8 @@ export function ServerHeader() {
     '/audit': h.my_audit,
     '/auditor': h.auditor,
   };
-  const path = window.location.pathname;
+  // `/credentials/` is the same page as `/credentials`.
+  const path = window.location.pathname.replace(/(.)\/+$/, '$1');
   const here = serverTarget(path) === undefined ? undefined : (path as ServerPath);
   const admin = session?.roles.includes('admin') ?? false;
   const auditor = session?.roles.includes('auditor') ?? false;

@@ -1,5 +1,4 @@
-import { useLang } from '../../shared/i18n/context';
-import { useText } from '../../shared/i18n/context';
+import { useLang, useText } from '../../shared/i18n/context';
 import type { Lang } from '../../shared/i18n';
 import uiLinks from '../../../../../docs/user-guide/ui-links.json';
 
