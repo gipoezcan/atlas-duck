@@ -50,7 +50,7 @@ pub const PASSPHRASE_PURPOSE: &str = "Unlocks and restores the audit log (after 
 
 /// M15 T7 (PD-297): the German purpose line; the page's own table (`credential/i18n.ts`) holds
 /// the same literal.
-pub const PASSPHRASE_PURPOSE_DE: &str = "Entsperrt und stellt das Audit-Protokoll wieder her (nach einem Verlust des Schlüsselbunds, aus einem Backup oder auf einem neuen Computer). Gespeicherte Token werden nie wiederhergestellt (weder aus einem Backup noch nach einem Verlust des Schlüsselbunds); Sie geben sie erneut ein. Sie ist nicht Ihr Atlassian-Passwort. Bewahren Sie sie so auf, dass Ihr Compliance-Verantwortlicher sie abrufen kann.";
+pub const PASSPHRASE_PURPOSE_DE: &str = "Die Passphrase entsperrt das Audit-Protokoll und stellt es wieder her (nach einem Verlust des Schlüsselbunds, aus einem Backup oder auf einem neuen Computer). Gespeicherte Token werden nie wiederhergestellt (weder aus einem Backup noch nach einem Verlust des Schlüsselbunds); Sie geben sie erneut ein. Die Passphrase ist nicht Ihr Atlassian-Passwort. Bewahren Sie sie so auf, dass Ihr Compliance-Verantwortlicher sie abrufen kann.";
 
 /// The purpose line in `lang`.
 pub fn passphrase_purpose(lang: Lang) -> &'static str {
@@ -952,8 +952,36 @@ mod tests {
     fn passphrase_purpose_texts_pinned() {
         assert_eq!(passphrase_purpose(Lang::En), PASSPHRASE_PURPOSE);
         assert_eq!(passphrase_purpose(Lang::De), PASSPHRASE_PURPOSE_DE);
-        assert!(PASSPHRASE_PURPOSE_DE.starts_with("Entsperrt und stellt das Audit-Protokoll"));
+        assert!(PASSPHRASE_PURPOSE_DE.starts_with("Die Passphrase entsperrt das Audit-Protokoll"));
         assert_ne!(PASSPHRASE_PURPOSE, PASSPHRASE_PURPOSE_DE);
+    }
+
+    /// M15 T7 review m-5: the note's steps name the page's buttons and titles. Each of the three in
+    /// both languages is one literal in the page's table and is quoted verbatim in the note.
+    #[test]
+    fn note_steps_name_the_pages_labels_in_both_languages() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/src/credential/i18n.ts");
+        let page = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(!page.is_empty(), "{}", path.display());
+        let labels = [
+            ("Recover this log", "Dieses Protokoll wiederherstellen"),
+            ("Finish restore", "Wiederherstellung abschließen"),
+            (
+                "Archive old DB and start fresh",
+                "Alte DB archivieren und neu beginnen",
+            ),
+        ];
+        for (en, de) in labels {
+            for label in [en, de] {
+                assert!(
+                    page.contains(&format!("'{label}'")),
+                    "the page has no {label:?}"
+                );
+            }
+            assert!(NOTE_STEPS.contains(&format!("\"{en}\"")), "{en}");
+            assert!(NOTE_STEPS_DE.contains(&format!("„{de}“")), "{de}");
+        }
     }
 
     /// M15 T7: the credential page's table holds each purpose line as one literal, verbatim (PD-71:

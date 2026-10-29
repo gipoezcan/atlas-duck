@@ -132,7 +132,7 @@ export type CredentialText = Widen<typeof en>;
 const de: CredentialText = {
   /** §8.6 (Rust: `passphrase_purpose(De)`). */
   // prettier-ignore
-  purpose_line: 'Entsperrt und stellt das Audit-Protokoll wieder her (nach einem Verlust des Schlüsselbunds, aus einem Backup oder auf einem neuen Computer). Gespeicherte Token werden nie wiederhergestellt (weder aus einem Backup noch nach einem Verlust des Schlüsselbunds); Sie geben sie erneut ein. Sie ist nicht Ihr Atlassian-Passwort. Bewahren Sie sie so auf, dass Ihr Compliance-Verantwortlicher sie abrufen kann.',
+  purpose_line: 'Die Passphrase entsperrt das Audit-Protokoll und stellt es wieder her (nach einem Verlust des Schlüsselbunds, aus einem Backup oder auf einem neuen Computer). Gespeicherte Token werden nie wiederhergestellt (weder aus einem Backup noch nach einem Verlust des Schlüsselbunds); Sie geben sie erneut ein. Die Passphrase ist nicht Ihr Atlassian-Passwort. Bewahren Sie sie so auf, dass Ihr Compliance-Verantwortlicher sie abrufen kann.',
   restore_line: 'Backup wiederherstellen: Geben Sie die Wiederherstellungs-Passphrase des Backups ein.',
   titles: {
     add_pat: 'Token hinzufügen',

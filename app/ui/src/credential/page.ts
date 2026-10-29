@@ -58,6 +58,9 @@ const PURPOSES: readonly Purpose[] = [
 
 /** The submit buttons with a label of their own; a PAT window says "Test and store", any other "Unlock". */
 const OWN_SUBMIT = ['recovery_passphrase', 'change_recovery_passphrase', 'restore_backup'] as const;
+/** A message in whatever language the page shows when it is rendered. */
+type Msg = (t: CredentialText) => string;
+
 const REJECTIONS = new Set(['invalid_argument', 'not_ready', 'admin']);
 
 function el<K extends keyof HTMLElementTagNameMap>(
@@ -139,13 +142,14 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
   let busy = false;
   // Bumped whenever the context is replaced: an answer for an older generation is dropped.
   let generation = 0;
-  let result: { text: string; ok: boolean; extra: string[] } | null = null;
+  // A result is kept as what it says, not as rendered text, so a language switch re-renders it.
+  let result: { text: Msg; ok: boolean; extra: Msg[] } | null = null;
   let done = false;
   // The recovery note was saved: the passphrase went to the wizard, so the window may be closed.
   let noteSaved = false;
   // A failed restore whose answer came while Rust still showed `restore_backup`: it is shown when
   // the window is back at its locked purpose (Rust sets it back right before it answers).
-  let carried: { text: string } | null = null;
+  let carried: { text: Msg } | null = null;
   let secretField: HTMLInputElement | null = null;
   let confirmField: HTMLInputElement | null = null;
   let dateField: HTMLInputElement | null = null;
@@ -253,7 +257,7 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     });
   }
 
-  function showResult(text: string, ok: boolean, extra: string[] = []): void {
+  function showResult(text: Msg, ok: boolean, extra: Msg[] = []): void {
     result = { text, ok, extra };
     render();
   }
@@ -268,16 +272,15 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     }
   }
 
-  function rejectionText(e: unknown): string {
+  function rejectionText(e: unknown): Msg {
     const kind = e instanceof Error ? e.message : 'error';
-    return kind === 'not_ready' ? tx().failures.not_ready : tx().not_completed;
-
+    return kind === 'not_ready' ? (t) => t.failures.not_ready : (t) => t.not_completed;
   }
 
   /** Reads the outcome shapes of submit_secret. */
   function showOutcome(outcome: unknown): void {
     if (!isRecord(outcome)) {
-      showResult(tx().not_completed, false);
+      showResult((t) => t.not_completed, false);
       return;
     }
     if (isRecord(outcome.ok)) {
@@ -290,11 +293,11 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
         ? outcome.ok.warnings.filter((w): w is string => typeof w === 'string')
         : [];
       done = true;
-      const extra = warnings.map((w) => describe(w, true).shown);
+      const extra: Msg[] = warnings.map((w) => () => describe(w, true).shown);
       if (user.unusual || version.unusual) {
-        extra.push(tx().escapes_user_version);
+        extra.push((t) => t.escapes_user_version);
       }
-      showResult(tx().connected(user.shown, name, version.shown), true, extra);
+      showResult((t) => t.connected(user.shown, name, version.shown), true, extra);
 
       return;
     }
@@ -303,10 +306,10 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
       const purpose = ctx?.purpose;
       showResult(
         purpose === 'change_recovery_passphrase'
-          ? tx().passphrase_changed
+          ? (t) => t.passphrase_changed
           : purpose === 'restore_backup'
-            ? tx().restore_running
-            : tx().passphrase_accepted,
+            ? (t) => t.restore_running
+            : (t) => t.passphrase_accepted,
         true,
       );
       void reload();
@@ -314,17 +317,18 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     }
     if (isRecord(outcome.unlocked)) {
       done = true;
-      showResult(tx().unlocked, true);
+      showResult((t) => t.unlocked, true);
       return;
     }
     if (isRecord(outcome.failed)) {
       const cls = str(outcome.failed.class) ?? 'unknown';
       const conn = str(outcome.failed.conn);
-      const extra = conn !== null ? [tx().detail(describe(conn, true).shown.slice(0, 64))] : [];
-      showResult(failureText(tx(), cls), false, extra);
+      const shown = conn !== null ? describe(conn, true).shown.slice(0, 64) : null;
+      const extra: Msg[] = shown !== null ? [(t) => t.detail(shown)] : [];
+      showResult((t) => failureText(t, cls), false, extra);
       return;
     }
-    showResult(tx().not_completed, false);
+    showResult((t) => t.not_completed, false);
   }
 
   async function submit(): Promise<void> {
@@ -360,20 +364,21 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
       const outcome = await call(cmd);
       if (mine !== generation) return;
       if (isRecord(outcome) && isRecord(outcome.failed)) {
-        showResult(failureText(tx(), str(outcome.failed.class) ?? 'unknown'), false);
+        const cls = str(outcome.failed.class) ?? 'unknown';
+        showResult((t) => failureText(t, cls), false);
       } else if (isRecord(outcome) && isRecord(outcome.archived)) {
         done = true;
-        showResult(tx().archived, true);
+        showResult((t) => t.archived, true);
       } else if (isRecord(outcome) && typeof outcome.saved === 'boolean') {
         if (outcome.saved) {
           noteSaved = true;
-          showResult(tx().note_saved, true);
-        } else showResult(tx().note_not_saved, false);
+          showResult((t) => t.note_saved, true);
+        } else showResult((t) => t.note_not_saved, false);
       } else if (isRecord(outcome) && typeof outcome.started === 'boolean') {
-        if (outcome.started) showResult(tx().keychain_retry, true);
-        else showResult(tx().keychain_retry_running, false);
+        if (outcome.started) showResult((t) => t.keychain_retry, true);
+        else showResult((t) => t.keychain_retry_running, false);
       } else {
-        showResult(tx().not_completed, false);
+        showResult((t) => t.not_completed, false);
       }
     } catch (e) {
       if (mine === generation) showResult(rejectionText(e), false);
@@ -396,22 +401,23 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     busy = true;
     const mine = generation;
     refreshControls();
-    let text: string | null = null;
+    let text: Msg | null = null;
     let unlocked = false;
     try {
       const outcome = await call('restore_from_backup');
       if (isRecord(outcome) && isRecord(outcome.unlocked)) unlocked = true;
       else if (isRecord(outcome) && isRecord(outcome.failed)) {
-        text = restoreFailureText(tx(), str(outcome.failed.class) ?? 'unknown');
-      } else text = tx().not_completed;
+        const cls = str(outcome.failed.class) ?? 'unknown';
+        text = (t) => restoreFailureText(t, cls);
+      } else text = (t) => t.not_completed;
     } catch (e) {
       text = rejectionText(e);
     }
     if (mine === generation) {
       if (unlocked) {
         done = true;
-        showResult(tx().unlocked, true);
-      } else showResult(text ?? '', false);
+        showResult((t) => t.unlocked, true);
+      } else showResult(text ?? (() => ''), false);
       busy = false;
       refreshControls();
       return;
@@ -419,11 +425,11 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     // The context moved on: the busy flag belongs to the newer generation.
     if (unlocked) {
       done = true;
-      showResult(tx().unlocked, true);
+      showResult((t) => t.unlocked, true);
     } else if (ctx !== null && isLocked(ctx.purpose)) {
-      showResult(text ?? '', false);
+      showResult(text ?? (() => ''), false);
     } else {
-      carried = { text: text ?? '' };
+      carried = { text: text ?? (() => '') };
     }
   }
 
@@ -581,8 +587,8 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     if (result) {
       const box = el('div', result.ok ? 'result ok' : 'result failed');
       box.setAttribute('role', result.ok ? 'status' : 'alert');
-      box.append(el('p', undefined, result.text));
-      for (const line of result.extra) box.append(el('p', 'hint', line));
+      box.append(el('p', undefined, result.text(tx())));
+      for (const line of result.extra) box.append(el('p', 'hint', line(tx())));
       root.append(box);
     }
     root.append(bar);
@@ -619,6 +625,8 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     const secret = secretField?.value ?? '';
     const confirm = confirmField?.value ?? '';
     const date = dateField?.value ?? '';
+    // The old fields are emptied before they are dropped: a secret never stays in a detached node.
+    clearSecrets();
     ctx = next;
     render();
     if (secretField) secretField.value = secret;

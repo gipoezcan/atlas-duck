@@ -123,6 +123,9 @@ describe('credential page in German (M15 T7)', () => {
     expect(root.querySelector('h1')?.textContent).toBe(de.titles.replace_pat);
     const [token2, date2] = [...root.querySelectorAll('input')] as HTMLInputElement[];
     expect(token2?.value).toBe('typed-token');
+    // Review I-2: the old, detached field was emptied when its value moved.
+    expect(token2).not.toBe(token);
+    expect(token.value).toBe('');
     expect(date2?.value).toBe('2027-01-31');
     // The secret is in the field only, never in the page text.
     expect(root.textContent).not.toContain('typed-token');
@@ -132,11 +135,27 @@ describe('credential page in German (M15 T7)', () => {
 
   // The Rust side (credential::tests::passphrase_purpose_matches_the_page_in_both_languages) reads
   // i18n.ts and finds each line there as one literal: here, each is one sentence block per language.
+  // Review m-4: a shown result follows the switch: it is kept as what it says, not as text.
+  it('a_shown_result_is_rendered_again_in_the_new_language', async () => {
+    const { root } = await mount(
+      { ...LOCKED, purpose: 'recovery_passphrase', refused_count: null, note_available: true, lang: 'en' },
+      { save_recovery_note: { saved: true } },
+    );
+    const save = [...root.querySelectorAll('button')].find((b) => b.textContent === en.save_note);
+    save?.click();
+    await flush();
+    expect(root.querySelector('[role="status"]')?.textContent).toBe(en.note_saved);
+    ctxNow = { ...LOCKED, purpose: 'recovery_passphrase', refused_count: null, note_available: true, lang: 'de' };
+    listener?.();
+    await flush();
+    expect(root.querySelector('[role="status"]')?.textContent).toBe(de.note_saved);
+  });
+
   it('passphrase_purpose_is_one_literal_per_language', () => {
     for (const lang of ['en', 'de'] as const) {
       const line = pageText(lang).purpose_line;
       expect(line.includes("'"), lang).toBe(false);
-      expect(line.startsWith(lang === 'en' ? 'Unlocks and restores' : 'Entsperrt und stellt'), lang).toBe(true);
+      expect(line.startsWith(lang === 'en' ? 'Unlocks and restores' : 'Die Passphrase entsperrt'), lang).toBe(true);
     }
   });
   it('every_german_leaf_differs_from_english_and_is_not_empty', () => {
