@@ -241,23 +241,42 @@ pub fn menu_entries(
 
 /// The tooltip: the status lines when there are any (Linux shows no tooltip, so the status items
 /// carry them there), then the pending count (§5.6 "The tray badge/tooltip always shows the
-/// pending count"); a last line says while Presentation mode is on.
+/// pending count"); a last line says while Presentation mode is on. Windows cuts a tooltip at
+/// [`TOOLTIP_MAX_UTF16`] units, so the whole text is capped there: the status lines are shortened
+/// (ending in "…") and the count and Presentation lines are never cut (M15 T10 review M1).
 pub fn tooltip_text(lang: Lang, status: &[String], pending: u32, presentation: bool) -> String {
-    let count = TOOLTIP_PENDING
+    let mut tail = TOOLTIP_PENDING
         .get(lang)
         .replace("<n>", &count(lang, u64::from(pending)));
-    let mut text = String::new();
-    for line in status {
-        text.push_str(line);
-        text.push('\n');
-    }
-    text.push_str(&count);
     if presentation {
-        text.push('\n');
-        text.push_str(TOOLTIP_PRESENTATION.get(lang));
+        tail.push('\n');
+        tail.push_str(TOOLTIP_PRESENTATION.get(lang));
     }
-    text
+    let mut head = String::new();
+    for line in status {
+        head.push_str(line);
+        head.push('\n');
+    }
+    let budget = TOOLTIP_MAX_UTF16.saturating_sub(tail.encode_utf16().count());
+    if head.encode_utf16().count() > budget {
+        // Room for "…" and the newline before the tail.
+        let keep = budget.saturating_sub(2);
+        let mut used = 0;
+        let cut = head
+            .char_indices()
+            .find(|(_, c)| {
+                used += c.len_utf16();
+                used > keep
+            })
+            .map_or(head.len(), |(i, _)| i);
+        head.truncate(cut);
+        head.push_str("…\n");
+    }
+    head + &tail
 }
+
+/// Windows cuts a tray tooltip (`NOTIFYICONDATAW.szTip`) at 127 UTF-16 units.
+pub const TOOLTIP_MAX_UTF16: usize = 127;
 
 /// The macOS menu-bar title next to the tray icon (PD-173): the pending count, or none at 0. The
 /// app is an `Accessory` app with no Dock tile, so this is its badge. Digits only: the text is
@@ -603,6 +622,18 @@ mod tests {
                 "{} > 127: {one}",
                 one.encode_utf16().count()
             );
+        }
+        // M15 T10 review M1: the whole tooltip, every line at once, is capped and keeps the count.
+        let all = tooltip_text(Lang::De, &lines, 99_999, true);
+        assert!(all.encode_utf16().count() <= TOOLTIP_MAX_UTF16, "{all}");
+        assert!(all.contains("99.999"), "{all}");
+        assert!(all.ends_with(TOOLTIP_PRESENTATION.de), "{all}");
+        let long = vec!["x".repeat(200), "y".repeat(200)];
+        for lang in [Lang::En, Lang::De] {
+            let capped = tooltip_text(lang, &long, 7, false);
+            assert_eq!(capped.encode_utf16().count(), TOOLTIP_MAX_UTF16, "{capped}");
+            let count = TOOLTIP_PENDING.get(lang).replace("<n>", "7");
+            assert!(capped.ends_with(&format!("…\n{count}")), "{capped}");
         }
         for t in TEXTS {
             assert!(t.de.encode_utf16().count() <= 127, "{t:?}");
@@ -1011,12 +1042,17 @@ mod tests {
                 "{state:?}"
             );
         }
-        // The menu has room for four status items; the tooltip carries every line.
+        // The menu has room for four status items; the tooltip carries the lines up to the
+        // Windows cap (shortened with "…", M15 T10 review M1) and always the count.
         let menu = menu_entries(Lang::En, &AppSnapshot::Serving, 0, &lines, false);
         assert_eq!(menu.iter().filter(|e| !e.enabled).count(), 4);
-        for line in &lines {
-            assert!(tooltip_text(Lang::En, &lines, 0, false).contains(line.as_str()));
-        }
+        let tip = tooltip_text(Lang::En, &lines, 0, false);
+        assert!(tip.encode_utf16().count() <= TOOLTIP_MAX_UTF16, "{tip}");
+        assert!(tip.starts_with(lines[0].as_str()), "{tip}");
+        assert!(
+            tip.ends_with(&TOOLTIP_PENDING.en.replace("<n>", "0")),
+            "{tip}"
+        );
     }
 
     #[test]
@@ -1093,6 +1129,14 @@ mod tests {
                 startup_message(Lang::En, state),
                 "{state:?}: startup_message is the only text source (§5.6)"
             );
+            // M15 T10 review M2: the stored English text maps to the German one where shown.
+            let de = tray_status_text(Lang::De, state);
+            assert_eq!(
+                text.as_deref().map(|t| crate::i18n::localize(Lang::De, t)),
+                de,
+                "{state:?}"
+            );
+            assert_ne!(text, de, "{state:?}");
         }
         assert_eq!(
             tray_status_text(Lang::En, &states[0]).as_deref(),

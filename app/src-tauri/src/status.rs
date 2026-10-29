@@ -69,7 +69,7 @@ pub const TEXT_KEYCHAIN_PROMPT: T = T::new(
 /// plan text (PD-90): `storage_low`, after §8.1 "new agent requests are refused".
 pub const TEXT_STORAGE_LOW: T = T::new(
     "audit storage is low: new requests are refused",
-    "Der Speicher für das Audit-Protokoll wird knapp: Neue Anfragen werden abgewiesen",
+    "Der Speicher für das Audit-Protokoll wird knapp: Neue Anfragen werden zurückgewiesen",
 );
 /// plan text (PD-90): `anchor_write_failing`, after §8.5/§8.8/§8.11 (retried, never an incident).
 pub const TEXT_ANCHOR_WRITE_FAILING: T = T::new(
@@ -309,7 +309,7 @@ fn refused_text(lang: Lang, setup: bool, n: u64) -> String {
             if setup { "Setup required" } else { "Locked" }
         ),
         Lang::De => format!(
-            "{} — {} {} abgewiesen",
+            "{} — {} {} zurückgewiesen",
             if setup {
                 "Einrichtung erforderlich"
             } else {
@@ -1132,7 +1132,7 @@ mod tests {
         };
         assert_eq!(
             text("locked_refused"),
-            "Gesperrt — 1.234 Anfragen abgewiesen"
+            "Gesperrt — 1.234 Anfragen zurückgewiesen"
         );
         assert_eq!(text("needs_attention"), "1 braucht Aufmerksamkeit");
         assert_eq!(
@@ -1164,7 +1164,7 @@ mod tests {
         i.refused = 1;
         assert_eq!(
             lines(&i)[0].text,
-            "Einrichtung erforderlich — 1 Anfrage abgewiesen"
+            "Einrichtung erforderlich — 1 Anfrage zurückgewiesen"
         );
     }
     /// Order follows [`IDS`] whatever mix is set.

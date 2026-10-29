@@ -78,13 +78,13 @@ describe('credential page in German (M15 T7)', () => {
     const { root } = await mount(LOCKED);
     const text = root.textContent ?? '';
     expect(text).toContain(de.purpose_line);
-    expect(text).toContain('Gesperrt — 1.234 Anfragen abgewiesen');
+    expect(text).toContain('Gesperrt — 1.234 Anfragen zurückgewiesen');
     expect(text).toContain(de.meter(0, MIN_PASSPHRASE_CHARS));
     expect(buttons(root)).toContain(de.archive);
     expect(buttons(root)).toContain(de.restore_instead);
     document.body.replaceChildren();
     const first = await mount(FIRST_RUN);
-    expect(first.root.textContent).toContain('Einrichtung erforderlich — 1 Anfrage abgewiesen');
+    expect(first.root.textContent).toContain('Einrichtung erforderlich — 1 Anfrage zurückgewiesen');
   });
 
   it('failures_are_german', async () => {

@@ -67,6 +67,10 @@ pub fn localize_static(lang: Lang, text: &str) -> Option<&'static str> {
 /// An English text this app rendered (a [`T`], or a [`T`] with one placeholder filled) in
 /// `lang`: the placeholder's value is taken from `text` and put into the other language's form.
 /// Any other text comes back unchanged (it is not ours, or it is already in `lang`).
+///
+/// Only texts this app rendered itself may be passed: never agent-supplied, Jira/Confluence or
+/// peer text. The placeholder match takes any middle between a form's prefix and suffix, so it is
+/// safe only because those callers' values are our own (the value is kept verbatim either way).
 pub fn localize(lang: Lang, text: &str) -> String {
     if lang == Lang::En {
         return text.to_owned();

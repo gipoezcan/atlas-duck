@@ -217,7 +217,7 @@ const de: CredentialText = {
   escapes_warning:
     'Einige Zeichen oben sind ungewöhnlich und werden als Escape-Folgen angezeigt. Prüfen Sie die Adresse, bevor Sie fortfahren.',
   locked_line: (setup, n) =>
-    `${setup ? 'Einrichtung erforderlich' : 'Gesperrt'} — ${n} ${n === '1' ? 'Anfrage' : 'Anfragen'} abgewiesen`,
+    `${setup ? 'Einrichtung erforderlich' : 'Gesperrt'} — ${n} ${n === '1' ? 'Anfrage' : 'Anfragen'} zurückgewiesen`,
   retry_keychain: 'Schlüsselbund erneut versuchen',
   save_note: 'Wiederherstellungsnotiz speichern',
   archive: 'Alte DB archivieren und neu beginnen',

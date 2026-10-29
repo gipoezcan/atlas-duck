@@ -12,7 +12,7 @@ export const onboarding: Dict['onboarding'] = {
   copy_failed: 'Das Kopieren ist fehlgeschlagen. Markieren Sie den Text und kopieren Sie ihn selbst.',
   section_titles: {
     commands: 'Befehle',
-    envelope: 'Der Envelope',
+    envelope: 'Das Antwortformat',
     exit_matrix: 'Exit-Codes',
     timeouts: 'Zeitlimits und Warten',
     sessions: 'Sitzungen',

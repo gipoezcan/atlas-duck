@@ -227,8 +227,10 @@ pub fn run_gui(background: bool) -> ! {
                 diag.extend_allowed_fields(fields);
             }
             os_hooks::install(app.handle());
-            // The tray text, taken before the `Ready` arm below moves the state.
-            let tray_status = tray::tray_status_text(startup_lang, &state);
+            // The tray text, taken before the `Ready` arm below moves the state. It is kept in
+            // English and put into the UI language where it is shown (`localize`), so it follows
+            // a language switch (M15 T10 review M2).
+            let tray_status = tray::tray_status_text(i18n::Lang::En, &state);
 
             // Linux tray-host check (bounded by TRAY_HOST_TIMEOUT); the allowlist must know the
             // field before the line is written.

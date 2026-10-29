@@ -102,6 +102,7 @@ never translated. A German leaf equal to its English one needs an allowlist entr
 | sign in / sign out | anmelden / abmelden | |
 | admin (link in the header) | Administration | the role itself stays "Administrator" |
 | manifest (export) | Manifest | "SHA-256 des Manifests" |
-| anchor head | Anker-Kopf | |
+| anchor head | Kopf-Anker | the one term; not "Anker-Kopf" |
+| envelope (the CLI/MCP answer) | Antwortformat | the onboarding title "Das Antwortformat"; the wire field names stay |
 | organisation CA | Organisations-CA | "CA-Bundle der Organisation" in the long form |
 | default (instance) | Standard | "Standardinstanz" |

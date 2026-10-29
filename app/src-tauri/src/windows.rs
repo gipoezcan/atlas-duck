@@ -775,7 +775,11 @@ pub fn snapshot<R: Runtime>(app: &AppHandle<R>) -> AppSnapshot {
         | StartupSummary::DataDirNotLocal
         | StartupSummary::DataDirUnusable
         | StartupSummary::PinnedUnreadable => {
-            AppSnapshot::StartupError(state.startup_text().unwrap_or_default().to_owned())
+            // Stored in English; shown in the current UI language (M15 T10 review M2).
+            AppSnapshot::StartupError(localize(
+                state.lang(),
+                state.startup_text().unwrap_or_default(),
+            ))
         }
     }
 }
