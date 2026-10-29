@@ -492,7 +492,7 @@ test("M-4: removing the answer test before a real helper call fails the check", 
 test("M10 T13: the restore's confirmations and source dialog are load-bearing on the real file", () => {
   for (const [from, to, flagged] of [
     // The "Restore backup" answer (PD-168, L54) ignored.
-    ["confirmer.confirm(RESTORE_CONFIRM_TEXT) != Confirm::Ok", "false", /restore_flow\.rs:\d+: proof helper confirmed_by called from fn ask_restore/],
+    ["confirmer.confirm(text) != Confirm::Ok", "false", /restore_flow\.rs:\d+: proof helper confirmed_by called from fn ask_restore/],
     // The rollback answer (§8.11 step 4) ignored.
     ["confirmer.confirm(&text) != Confirm::Ok", "false", /restore_flow\.rs:\d+: proof helper confirmed_by called from fn ask_rollback/],
     // A source path that no dialog returned.
@@ -573,7 +573,11 @@ test("rule 5: removing the acknowledgement's dialog test in the real caller fail
   const r = withSliceCopy(
     (rel, t) =>
       rel === ACK
-        ? replaceOnce(t, "confirmer.confirm(&acknowledge_text(verify_seq, &result, &detected_at)) != Confirm::Ok", "false")
+        ? replaceOnce(
+            t,
+            "confirmer.confirm(&acknowledge_text(\n        out.lang(),\n        verify_seq,\n        &result,\n        &detected_at,\n    )) != Confirm::Ok",
+            "false",
+          )
         : t,
     cli,
   );
