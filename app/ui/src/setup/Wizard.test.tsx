@@ -21,8 +21,11 @@ import {
 } from '../shared/ipc/invoke';
 import wizardFixture from '../shared/ipc/fixtures/wizard_state.json';
 import type { InstanceView, WizardState, WizardStep } from '../shared/ipc/types';
-import { SETUP_TEXT as T } from './text';
+import { en } from '../shared/i18n/dict';
 import { REREAD_DEBOUNCE_MS, STEP0_ERROR_DELAY_MS, STEP_COOLDOWN_MS, Wizard } from './Wizard';
+
+const T = en.setup;
+const ERRORS: Readonly<Record<string, string>> = T.errors;
 
 vi.mock('../shared/ipc/invoke', () => ({
   cliInstall: vi.fn(),
@@ -602,9 +605,9 @@ describe('Wizard (1b)', () => {
       answer(wizardRestore, anchorAt(null, { error: { class: cls, text: null } }));
       await click(T.restore_offer);
       const alert = screen.getByRole('alert').textContent ?? '';
-      expect(alert, cls).toBe(T.errors[cls]);
+      expect(alert, cls).toBe(ERRORS[cls]);
       expect(alert, cls).not.toBe(T.errors['other']);
-      expect(T.errors[cls], cls).toBeTruthy();
+      expect(ERRORS[cls], cls).toBeTruthy();
       // No instruction the step has no control for (archiving is not reachable here).
       expect(alert, cls).not.toMatch(/archive it/i);
       expect(screen.getByRole('button', { name: T.restore_offer })).toBeTruthy();

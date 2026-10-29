@@ -31,6 +31,17 @@ export const I18N_SAME_ALLOWLIST = {
   "common.lang_en": "a language is named in its own language, in both dictionaries",
   "approvals.request.params_sha256": "the name of a field of the request, shown as it is on the wire",
   "approvals.request.cwd_basename": "the name of a field of the request, shown as it is on the wire",
+  "audit.field.client_kind": "a column name that is the same word in German (the kind of MCP client)",
+  "running.col_agent": "Agent is the German term for the AI program (CONTEXT.md)",
+  "settings.col_alias": "Alias is the German word for the instance name",
+  "settings.add_alias": "Alias is the German word for the instance name",
+  "setup.col_alias": "Alias is the German word for the instance name",
+  "settings.col_origin": "Origin is the term of the instance's confirmed origin (scheme, host, port), used as is in German texts",
+  "setup.col_origin": "Origin is the term of the instance's confirmed origin (scheme, host, port), used as is in German texts",
+  "settings.col_proxy": "Proxy is the German word",
+  "settings.product.jira": "a product name",
+  "settings.product.confluence": "a product name",
+  "settings.limits": "Limits is the usual German IT word",
 };
 
 /** Dotted key paths of fixed-width texts (buttons, tray tooltip parts); German <= 1.5 x English + 4. */
@@ -51,6 +62,24 @@ export const SHORT_KEYS = [
   "approvals.edit.reset",
   "approvals.queue.open",
   "approvals.recent.acknowledge",
+  // The buttons of the other windows (M15 T6).
+  "settings.confirm",
+  "settings.retest",
+  "settings.replace_token",
+  "settings.add_token",
+  "settings.apply",
+  "settings.proxy_apply",
+  "settings.removal_done",
+  "settings.removal_undo",
+  "audit.verify",
+  "audit.apply",
+  "audit.clear",
+  "audit.list_more",
+  "audit.ack_close",
+  "running.kill",
+  "onboarding.copy_button",
+  "setup.continue",
+  "setup.quit",
 ];
 
 /** `CmdError` variants that are not UI error kinds: the decision errors have their own map (`errors.decision`). */

@@ -1,8 +1,8 @@
 import { useState } from 'react';
+import { useText } from '../shared/i18n/context';
 
 import { pruneBacklogNow, settingsApply } from '../shared/ipc/invoke';
 import type { AttentionMode, PruneReport, SettingChange, SettingsView } from '../shared/ipc/types';
-import { SETTINGS_TEXT as T } from '../shared/strings';
 import { parseWhole } from './Limits';
 import { Guard } from './Guard';
 import { Cfg, own } from './text';
@@ -24,6 +24,7 @@ interface RetentionProps {
  * config turns the config-writing controls off; the prune button is core's call.
  */
 export function Retention({ view, onChanged, readOnly }: RetentionProps) {
+  const t = useText();
   const [days, setDays] = useState<string | null>(null);
   const [local, setLocal] = useState<string | null>(null);
   const retention = useAction();
@@ -36,7 +37,7 @@ export function Retention({ view, onChanged, readOnly }: RetentionProps) {
     if (days === null) return;
     const n = parseWhole(days);
     if (n === null) {
-      setLocal(T.not_a_number);
+      setLocal(t.settings.not_a_number);
       return;
     }
     setLocal(null);
@@ -62,12 +63,12 @@ export function Retention({ view, onChanged, readOnly }: RetentionProps) {
 
   const backlog = view.health.prune_backlog;
   return (
-    <section aria-label={T.retention}>
-      <h2>{T.retention}</h2>
+    <section aria-label={t.settings.retention}>
+      <h2>{t.settings.retention}</h2>
       <Guard disabled={readOnly}>
       <div className="field">
         <label>
-          {T.retention_days}
+          {t.settings.retention_days}
           <input
             type="text"
             inputMode="numeric"
@@ -76,7 +77,7 @@ export function Retention({ view, onChanged, readOnly }: RetentionProps) {
           />
         </label>
         <button type="button" className="primary" disabled={retention.pending || days === null} onClick={applyDays}>
-          {T.apply}
+          {t.settings.apply}
         </button>
         {local === null ? null : <p role="alert">{local}</p>}
         {retention.error === null ? null : <p role="alert">{retention.error}</p>}
@@ -89,13 +90,13 @@ export function Retention({ view, onChanged, readOnly }: RetentionProps) {
             disabled={hold.pending}
             onChange={(e) => setHold(e.target.checked)}
           />
-          {T.legal_hold}
+          {t.settings.legal_hold}
         </label>
         {hold.error === null ? null : <p role="alert">{hold.error}</p>}
       </div>
       <div className="field">
         <label>
-          {T.attention}
+          {t.settings.attention}
           <select
             value={view.attention_mode}
             disabled={mode.pending}
@@ -103,18 +104,18 @@ export function Retention({ view, onChanged, readOnly }: RetentionProps) {
           >
             {MODES.map((m) => (
               <option key={m} value={m}>
-                {T.attention_modes[m]}
+                {t.settings.attention_modes[m]}
               </option>
             ))}
           </select>
         </label>
-        <p>{T.presentation_note}</p>
+        <p>{t.settings.presentation_note}</p>
         {mode.error === null ? null : <p role="alert">{mode.error}</p>}
       </div>
       </Guard>
-      <section aria-label={T.prune}>
-        <h3>{T.prune}</h3>
-        {view.health.last_prune_failed ? <p>{T.prune_failed_last}</p> : null}
+      <section aria-label={t.settings.prune}>
+        <h3>{t.settings.prune}</h3>
+        {view.health.last_prune_failed ? <p>{t.settings.prune_failed_last}</p> : null}
         {backlog === null ? null : (
           <>
             <p>
@@ -132,7 +133,7 @@ export function Retention({ view, onChanged, readOnly }: RetentionProps) {
                 })
               }
             >
-              {T.prune_button}
+              {t.settings.prune_button}
             </button>
           </>
         )}
@@ -144,18 +145,19 @@ export function Retention({ view, onChanged, readOnly }: RetentionProps) {
 }
 
 function PruneResult({ report }: { report: PruneReport }) {
+  const t = useText();
   if (report.result === 'pruned') {
     return (
       <p role="status">
-        {T.pruned(report.count, report.cutoff)}
-        {report.clamped ? ` ${T.pruned_clamped}` : ''}
+        {t.settings.pruned(report.count, report.cutoff)}
+        {report.clamped ? ` ${t.settings.pruned_clamped}` : ''}
       </p>
     );
   }
-  const known = own(T.prune_reasons, report.reason);
+  const known = own(t.settings.prune_reasons, report.reason);
   return (
     <p role="status">
-      {T.prune_skipped}: {known ?? <Cfg value={report.reason} />}
+      {t.settings.prune_skipped}: {known ?? <Cfg value={report.reason} />}
     </p>
   );
 }

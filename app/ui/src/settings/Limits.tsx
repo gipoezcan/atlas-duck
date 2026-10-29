@@ -1,8 +1,8 @@
 import { useState } from 'react';
+import { useText } from '../shared/i18n/context';
 
 import { settingsApply } from '../shared/ipc/invoke';
 import type { SettingChange, SettingsView } from '../shared/ipc/types';
-import { SETTINGS_TEXT as T } from '../shared/strings';
 import { Guard } from './Guard';
 import { useAction } from './useAction';
 
@@ -45,6 +45,7 @@ interface LimitsProps {
  * `settings_changed` event must not overwrite typing); a field not edited follows the view.
  */
 export function Limits({ view, onChanged, readOnly }: LimitsProps) {
+  const t = useText();
   const [draft, setDraft] = useState<Partial<Record<LimitKey, string>>>({});
   const [local, setLocal] = useState<string | null>(null);
   const [applied, setApplied] = useState(false);
@@ -61,7 +62,7 @@ export function Limits({ view, onChanged, readOnly }: LimitsProps) {
       }
       const n = parseWhole(text);
       if (n === null) {
-        setLocal(T.not_a_number);
+        setLocal(t.settings.not_a_number);
         return;
       }
       changes.push({ key, value: n });
@@ -78,13 +79,13 @@ export function Limits({ view, onChanged, readOnly }: LimitsProps) {
   };
 
   return (
-    <section aria-label={T.limits}>
-      <h2>{T.limits}</h2>
+    <section aria-label={t.settings.limits}>
+      <h2>{t.settings.limits}</h2>
       <Guard disabled={readOnly}>
       {KEYS.map((key) => (
         <div key={key} className="field">
           <label>
-            {T.limit_labels[key]}
+            {t.settings.limit_labels[key]}
             <input
               type="text"
               inputMode="numeric"
@@ -93,19 +94,19 @@ export function Limits({ view, onChanged, readOnly }: LimitsProps) {
             />
           </label>
           {NEXT_START.has(key) || view.restart_pending.includes(key) ? (
-            <span className="restart-marker"> ({T.restart_marker})</span>
+            <span className="restart-marker"> ({t.settings.restart_marker})</span>
           ) : null}
           {view.restart_pending.includes(key) ? (
-            <span className="restart-waiting"> {T.restart_waiting}</span>
+            <span className="restart-waiting"> {t.settings.restart_waiting}</span>
           ) : null}
         </div>
       ))}
       <button type="button" className="primary" disabled={action.pending} onClick={submit}>
-        {T.apply}
+        {t.settings.apply}
       </button>
       {local === null ? null : <p role="alert">{local}</p>}
       {action.error === null ? null : <p role="alert">{action.error}</p>}
-      {applied ? <p role="status">{T.applied}</p> : null}
+      {applied ? <p role="status">{t.settings.applied}</p> : null}
       </Guard>
     </section>
   );

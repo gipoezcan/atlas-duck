@@ -1,7 +1,7 @@
 import { useState } from 'react';
+import { useText } from '../shared/i18n/context';
 
 import { instanceAdd } from '../shared/ipc/invoke';
-import { SETTINGS_TEXT as T } from '../shared/strings';
 import { Guard } from './Guard';
 import { useAction } from './useAction';
 
@@ -31,8 +31,9 @@ export function InstanceForm({
   onAdded,
   readOnly,
   headingLevel = 2,
-  addedNeedsToken = T.add_done_token,
+  addedNeedsToken,
 }: InstanceFormProps) {
+  const t = useText();
   const Heading = headingLevel === 3 ? 'h3' : 'h2';
   const [alias, setAlias] = useState('');
   const [product, setProduct] = useState<'jira' | 'confluence'>('jira');
@@ -59,7 +60,7 @@ export function InstanceForm({
       .then((v) => {
         if (v === undefined) return;
         // dd confirmed the origin in its own dialog: an instance without a token is next.
-        setAdded(v.state === 'needs_token' ? addedNeedsToken : T.add_done);
+        setAdded(v.state === 'needs_token' ? (addedNeedsToken ?? t.settings.add_done_token) : t.settings.add_done);
         setAlias('');
         setBaseUrl('');
         setProxy('');
@@ -70,38 +71,38 @@ export function InstanceForm({
   };
 
   return (
-    <section aria-label={T.add_heading}>
-      <Heading>{T.add_heading}</Heading>
+    <section aria-label={t.settings.add_heading}>
+      <Heading>{t.settings.add_heading}</Heading>
       <Guard disabled={readOnly}>
       <label>
-        {T.add_alias}
+        {t.settings.add_alias}
         <input type="text" value={alias} onChange={(e) => setAlias(e.target.value)} />
       </label>
       <label>
-        {T.add_product}
+        {t.settings.add_product}
         <select value={product} onChange={(e) => setProduct(e.target.value === 'confluence' ? 'confluence' : 'jira')}>
-          <option value="jira">{T.product.jira}</option>
-          <option value="confluence">{T.product.confluence}</option>
+          <option value="jira">{t.settings.product.jira}</option>
+          <option value="confluence">{t.settings.product.confluence}</option>
         </select>
       </label>
       <label>
-        {T.add_url}
+        {t.settings.add_url}
         <input type="text" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} />
       </label>
       <label>
-        {T.add_proxy}
+        {t.settings.add_proxy}
         <input type="text" value={proxy} onChange={(e) => setProxy(e.target.value)} />
       </label>
       <label>
         <input type="checkbox" checked={ca} onChange={(e) => setCa(e.target.checked)} />
-        {T.add_ca}
+        {t.settings.add_ca}
       </label>
       <label>
         <input type="checkbox" checked={isDefault} onChange={(e) => setIsDefault(e.target.checked)} />
-        {T.add_default}
+        {t.settings.add_default}
       </label>
       <button type="button" className="primary" disabled={action.pending} onClick={submit}>
-        {T.add_submit}
+        {t.settings.add_submit}
       </button>
       </Guard>
       {action.error === null ? null : <p role="alert">{action.error}</p>}

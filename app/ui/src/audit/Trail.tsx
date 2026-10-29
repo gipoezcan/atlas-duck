@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react';
+import { useText } from '../shared/i18n/context';
+import type { Dict } from '../shared/i18n';
+import { en } from '../shared/i18n/dict';
 
 import { auditTrail } from '../shared/ipc/invoke';
 import type { AuditTrail, EventHeader } from '../shared/ipc/types';
-import { AUDIT_TEXT as T } from '../shared/strings';
 import { Badge } from '../shared/text/Badge';
 import { Flags } from './EventList';
 import { Val } from './text';
@@ -14,14 +16,14 @@ interface Props {
 }
 
 /** Why the trail is not shown: an unreadable record of the request names its seq (T10 decision 3). */
-function failureText(e: unknown): string {
+function failureText(e: unknown, t: Dict = en): string {
   if (typeof e === 'object' && e !== null) {
     const r = e as { kind?: unknown; error?: { kind?: unknown; seq?: unknown } };
     if (r.kind === 'audit' && r.error?.kind === 'unreadable' && typeof r.error.seq === 'number') {
-      return T.trail_unreadable(r.error.seq);
+      return t.audit.trail_unreadable(r.error.seq);
     }
   }
-  return T.trail_failed;
+  return t.audit.trail_failed;
 }
 
 /**
@@ -31,6 +33,7 @@ function failureText(e: unknown): string {
  * never colour alone. The records are text; each can be opened in the detail.
  */
 export function Trail({ requestId, onOpen }: Props) {
+  const t = useText();
   const [trail, setTrail] = useState<AuditTrail | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
   // False until the read is asked for: the status region is in the page empty first, then filled.
@@ -46,7 +49,7 @@ export function Trail({ requestId, onOpen }: Props) {
         if (live) setTrail(t);
       },
       (e: unknown) => {
-        if (live) setFailed(failureText(e));
+        if (live) setFailed(failureText(e, t));
       },
     );
     return () => {
@@ -56,27 +59,27 @@ export function Trail({ requestId, onOpen }: Props) {
 
   const marked = trail !== null && (trail.deliveries.count > 1 || trail.deliveries.to_other_peer);
   return (
-    <section className="audit-trail" aria-label={T.trail}>
-      <h3>{T.trail}</h3>
-      <p role="status">{asked && trail === null && failed === null ? T.trail_loading : null}</p>
+    <section className="audit-trail" aria-label={t.audit.trail}>
+      <h3>{t.audit.trail}</h3>
+      <p role="status">{asked && trail === null && failed === null ? t.audit.trail_loading : null}</p>
       {failed === null ? null : <p role="alert">{failed}</p>}
       {trail === null ? null : (
         <>
           <p>
-            <span>{T.deliveries(trail.deliveries.count)}</span>{' '}
-            {trail.deliveries.count > 1 ? <Badge label={T.delivered_more_than_once} tone="caution" /> : null}
+            <span>{t.audit.deliveries(trail.deliveries.count)}</span>{' '}
+            {trail.deliveries.count > 1 ? <Badge label={t.audit.delivered_more_than_once} tone="caution" /> : null}
             {trail.deliveries.to_other_peer ? (
-              <Badge label={T.delivered_to_other_program} tone="caution" />
+              <Badge label={t.audit.delivered_to_other_program} tone="caution" />
             ) : null}
           </p>
-          {marked ? <p>{T.deliveries_advisory}</p> : null}
+          {marked ? <p>{t.audit.deliveries_advisory}</p> : null}
           <ol>
             {trail.headers.map((h) => (
               <li key={h.seq}>
                 <button type="button" onClick={() => onOpen(h)}>
-                  {T.open_record(h.seq)}
+                  {t.audit.open_record(h.seq)}
                 </button>{' '}
-                <Val value={h.ts_utc} />{' '}
+                <Val value={h.ts_utc} time />{' '}
                 <code>
                   <Val value={h.event_type} />
                 </code>
@@ -90,7 +93,7 @@ export function Trail({ requestId, onOpen }: Props) {
                 {h.peer_origin_exe === null ? null : (
                   <>
                     {' '}
-                    {T.field.peer_origin_exe}: <Val value={h.peer_origin_exe} />
+                    {t.audit.field.peer_origin_exe}: <Val value={h.peer_origin_exe} />
                   </>
                 )}
               </li>

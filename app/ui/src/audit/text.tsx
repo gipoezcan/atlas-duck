@@ -1,7 +1,10 @@
 import type { ReactNode } from 'react';
+import { useLang, useText } from '../shared/i18n/context';
+import type { Dict } from '../shared/i18n';
+import { en } from '../shared/i18n/dict';
+import { displayTimestamp } from '../shared/i18n/format';
 
 import type { ExportDone } from '../shared/ipc/types';
-import { AUDIT_TEXT as T, UNUSUAL_CHARACTERS } from '../shared/strings';
 import { Badge } from '../shared/text/Badge';
 import { own } from '../shared/text/own';
 import { unusual } from '../shared/text/unusual';
@@ -11,13 +14,16 @@ import { unusual } from '../shared/text/unusual';
  * are still untrusted): a bidi-isolated text node with the "unusual characters" flag, never markup.
  * `null` is the fixed "none". Agent strings go through `AgentText` instead.
  */
-export function Val({ value }: { value: string | number | null }) {
-  if (value === null) return <>{T.no_value}</>;
-  const text = String(value);
+export function Val({ value, time = false }: { value: string | number | null; time?: boolean }) {
+  const t = useText();
+  const lang = useLang();
+  if (value === null) return <>{t.audit.no_value}</>;
+  // A time column (	s_utc, detected_at) is shown as German UTC text; the other columns are as Rust wrote them.
+  const text = time ? displayTimestamp(lang, String(value)) : String(value);
   return (
     <>
       <bdi>{text}</bdi>
-      {unusual(text) ? <Badge label={UNUSUAL_CHARACTERS} tone="caution" /> : null}
+      {unusual(text) ? <Badge label={t.approvals.unusual_characters} tone="caution" /> : null}
     </>
   );
 }
@@ -51,14 +57,14 @@ export function Announce({ said, className }: { said: Said | null; className?: s
 export const say = (role: Said['role'], body: ReactNode): Said => ({ role, body });
 
 /** How an export ended, as a window says it: complete (also when only the rename failed), or a sentence. */
-export function exportResult(done: ExportDone, renamed: boolean): Said {
+export function exportResult(done: ExportDone, renamed: boolean, t: Dict = en): Said {
   const { manifest_sha256: hex, dir_name: name, rows } = done;
   return {
     role: renamed ? 'status' : 'alert',
     body: (
       <div className="audit-export-result">
-        <p>{renamed ? T.export_done(name, rows) : T.export_not_renamed(name, rows)}</p>
-        <p>{T.export_recipient(hex)}</p>
+        <p>{renamed ? t.audit.export_done(name, rows) : t.audit.export_not_renamed(name, rows)}</p>
+        <p>{t.audit.export_recipient(hex)}</p>
         <p>
           <code>{hex}</code>
         </p>
@@ -68,18 +74,18 @@ export function exportResult(done: ExportDone, renamed: boolean): Said {
 }
 
 /** What a refused or failed export said: a cancel, a named leftover, the `not_renamed` result or a fixed sentence. */
-export function exportRefusal(e: unknown): Said {
+export function exportRefusal(e: unknown, t: Dict = en): Said {
   const { kind, inner } = kinds(e);
-  if (kind === 'cancelled') return say('status', T.export_cancelled);
+  if (kind === 'cancelled') return say('status', t.audit.export_cancelled);
   if (kind === 'export' && typeof e === 'object' && e !== null) {
     const error = (e as { error: Record<string, unknown> }).error;
     const name = typeof error['dir_name'] === 'string' ? error['dir_name'] : '';
-    if (inner === 'leftover') return say('alert', T.export_leftover(name));
+    if (inner === 'leftover') return say('alert', t.audit.export_leftover(name));
     if (inner === 'not_renamed' && typeof error['manifest_sha256'] === 'string' && typeof error['rows'] === 'number') {
-      return exportResult({ manifest_sha256: error['manifest_sha256'], dir_name: name, rows: error['rows'] }, false);
+      return exportResult({ manifest_sha256: error['manifest_sha256'], dir_name: name, rows: error['rows'] }, false, t);
     }
   }
-  return say('alert', errorText(e));
+  return say('alert', errorText(e, t));
 }
 
 const LOCAL_TIME =/^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/;
@@ -120,19 +126,19 @@ export function kinds(e: unknown): { kind: string; inner: string; field: string 
  * sentence (through `own`, so a wire name never reaches `Object.prototype`); nothing a server, an
  * agent or the log wrote is part of it.
  */
-export function errorText(e: unknown): string {
+export function errorText(e: unknown, t: Dict = en): string {
   const { kind, inner, field } = kinds(e);
-  const other = T.errors['other'] ?? '';
+  const other = t.audit.errors['other'] ?? '';
   switch (kind) {
     case 'invalid_argument':
-      return own(T.errors, field) ?? own(T.export_errors, field) ?? own(T.ack_errors, field) ?? other;
+      return own(t.audit.errors, field) ?? own(t.audit.export_errors, field) ?? own(t.audit.ack_errors, field) ?? other;
     case 'export':
-      return own(T.export_errors, inner) ?? T.export_errors['failed'] ?? other;
+      return own(t.audit.export_errors, inner) ?? t.audit.export_errors['failed'] ?? other;
     case 'backup':
-      return T.backup_failed;
+      return t.audit.backup_failed;
     case 'removal':
-      return inner === 'running' ? T.backup_removal_running : other;
+      return inner === 'running' ? t.audit.backup_removal_running : other;
     default:
-      return own(T.errors, kind) ?? other;
+      return own(t.audit.errors, kind) ?? other;
   }
 }

@@ -70,3 +70,22 @@ never translated. A German leaf equal to its English one needs an allowlist entr
 | setup | Einrichtung | |
 | cancel (button) | Abbrechen | the action of leaving a dialog |
 | close / save / retry | Schließen / Speichern / Erneut versuchen | |
+| integrity incident | Integritätsvorfall | "Integritätsvorfall zur Kenntnis nehmen" |
+| verify (the log) | prüfen | "Jetzt prüfen"; result "verifiziert" |
+| record (audit) | Datensatz | plural "Datensätze" |
+| payload | Nutzdaten | "entschlüsselte Nutzdaten" |
+| export / backup | Export / Backup | "Vollbackup", "Compliance-Export"; verb "sichern" only on the button "Jetzt sichern…" |
+| restore | Wiederherstellung / wiederherstellen | |
+| recovery passphrase | Wiederherstellungs-Passphrase | |
+| anchor | Anker | "Anker-Verzeichnis", "Kopf-Anker", "neu verankern" |
+| keychain | Schlüsselbund | |
+| retention | Aufbewahrung | "Aufbewahrungsfrist" |
+| legal hold | Legal Hold | kept in English (the term of art) |
+| prune | bereinigen | "Bereinigung" |
+| confinement (scripts) | Isolierung | "eingeschränkte Isolierung" for degraded |
+| command line (CLI) | Befehlszeile | the button says "CLI im PATH installieren"; PATH stays |
+| kill (a running script) | beenden | "Beenden angefordert" |
+| flag (audit) | Markierung | |
+| old installs (orphans) | alte Installationen | "vergessen" for forget |
+| host call | Host-Aufruf | |
+| elapsed | Dauer | |

@@ -1,17 +1,19 @@
 import { useEffect, useState } from 'react';
+import { useText } from '../shared/i18n/context';
+import type { Dict } from '../shared/i18n';
+import { en } from '../shared/i18n/dict';
 
 import { PreviewFrame } from '../approvals/PreviewFrame';
 import { auditPayload } from '../shared/ipc/invoke';
 import type { AuditPayload } from '../shared/ipc/types';
-import { AUDIT_TEXT as T } from '../shared/strings';
 import { kinds } from './text';
 
-function failureText(e: unknown): string {
+function failureText(e: unknown, t: Dict = en): string {
   const { kind, inner, field } = kinds(e);
-  if (kind === 'audit' && inner === 'unreadable') return T.payload_unreadable;
-  if (kind === 'not_found') return T.payload_gone;
-  if (kind === 'invalid_argument' && field === 'page') return T.errors['page'] ?? T.payload_failed;
-  return T.payload_failed;
+  if (kind === 'audit' && inner === 'unreadable') return t.audit.payload_unreadable;
+  if (kind === 'not_found') return t.audit.payload_gone;
+  if (kind === 'invalid_argument' && field === 'page') return t.audit.errors['page'] ?? t.audit.payload_failed;
+  return t.audit.payload_failed;
 }
 
 /**
@@ -24,6 +26,7 @@ function failureText(e: unknown): string {
  * the payload.
  */
 export function PayloadView({ seq }: { seq: number }) {
+  const t = useText();
   const [page, setPage] = useState(0);
   const [data, setData] = useState<AuditPayload | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
@@ -36,7 +39,7 @@ export function PayloadView({ seq }: { seq: number }) {
         if (live) setData(p);
       },
       (e: unknown) => {
-        if (live) setFailed(failureText(e));
+        if (live) setFailed(failureText(e, t));
       },
     );
     return () => {
@@ -49,29 +52,29 @@ export function PayloadView({ seq }: { seq: number }) {
   // L126: Rust's closed word for a failed keychain step, shown as the plan's fixed line.
   const credential = loaded?.credential_change ?? null;
   return (
-    <section className="audit-payload" aria-label={T.payload}>
-      <h4>{T.payload}</h4>
+    <section className="audit-payload" aria-label={t.audit.payload}>
+      <h4>{t.audit.payload}</h4>
       {credential === null ? null : (
         <p className="audit-credential-line">
-          <strong>{T.credential_change[credential]}</strong>
+          <strong>{t.audit.credential_change[credential]}</strong>
         </p>
       )}
       <div className="raw-nav">
         <button type="button" disabled={page <= 0} onClick={() => setPage((p) => Math.max(0, p - 1))}>
-          {T.payload_previous}
+          {t.audit.payload_previous}
         </button>
-        <span role="status">{data === null ? null : T.payload_page(data.page + 1, count, data.total_bytes)}</span>
+        <span role="status">{data === null ? null : t.audit.payload_page(data.page + 1, count, data.total_bytes)}</span>
         <button type="button" disabled={data === null || page + 1 >= count} onClick={() => setPage((p) => p + 1)}>
-          {T.payload_next}
+          {t.audit.payload_next}
         </button>
       </div>
       {failed === null ? null : <p role="alert">{failed}</p>}
       {loaded === null ? (
         failed === null ? (
-          <p>{T.loading}</p>
+          <p>{t.audit.loading}</p>
         ) : null
       ) : (
-        <PreviewFrame srcdoc={loaded.srcdoc} title={T.payload_title(seq)} />
+        <PreviewFrame srcdoc={loaded.srcdoc} title={t.audit.payload_title(seq)} />
       )}
     </section>
   );

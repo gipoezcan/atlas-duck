@@ -1,4 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useText } from '../shared/i18n/context';
+import type { Dict } from '../shared/i18n';
+import { en } from '../shared/i18n/dict';
 
 import { Announce, kinds, type Said, say } from '../audit/text';
 import {
@@ -10,7 +13,6 @@ import {
   restoreCancel,
 } from '../shared/ipc/invoke';
 import type { OrphanInstall, RestoreDone } from '../shared/ipc/types';
-import { RECOVERY_TEXT as T, SETTINGS_TEXT } from '../shared/strings';
 import { Cfg, errorText } from './text';
 import { useAction } from './useAction';
 import { running, useAuditJob } from './useAuditJob';
@@ -29,6 +31,7 @@ import { running, useAuditJob } from './useAuditJob';
  * restart too.
  */
 export function Recovery({ onChanged }: { onChanged: () => void }) {
+  const t = useText();
   const action = useAction();
   const job = useAuditJob();
   const [said, setSaid] = useState<Said | null>(null);
@@ -58,14 +61,14 @@ export function Recovery({ onChanged }: { onChanged: () => void }) {
     }
   });
 
-  const failure = (e: unknown) => setSaid(say('alert', errorText(e)));
+  const failure = (e: unknown) => setSaid(say('alert', errorText(e, t)));
 
   const backup = () => {
     setSaid(null);
     setBackingUp(true);
     void action.run(() => backupTrigger(), failure).then((a) => {
       if (live.current) setBackingUp(false);
-      if (a !== undefined) setSaid(say('status', a.saved ? T.backup_saved : T.backup_not_saved));
+      if (a !== undefined) setSaid(say('status', a.saved ? t.settings.recovery.backup_saved : t.settings.recovery.backup_not_saved));
     });
   };
 
@@ -93,56 +96,56 @@ export function Recovery({ onChanged }: { onChanged: () => void }) {
 
   const cancelRestore = () =>
     restoreCancel().then(
-      (a) => setSaid(say('status', a.cancelled ? T.restore_cancel_requested : T.restore_cancel_none)),
-      (e: unknown) => setSaid(say('alert', kinds(e).kind === 'busy' ? T.restore_cancel_too_late : errorText(e))),
+      (a) => setSaid(say('status', a.cancelled ? t.settings.recovery.restore_cancel_requested : t.settings.recovery.restore_cancel_none)),
+      (e: unknown) => setSaid(say('alert', kinds(e).kind === 'busy' ? t.settings.recovery.restore_cancel_too_late : errorText(e, t))),
     );
 
   const changePassphrase = () => {
     setSaid(null);
     void action.run(() => recoveryPassphraseChange(), failure).then((r) => {
-      if (r !== undefined) setSaid(say('status', T.passphrase_opened));
+      if (r !== undefined) setSaid(say('status', t.settings.recovery.passphrase_opened));
     });
   };
 
   const waiting = restoring && running(job, 'restore');
   return (
-    <section aria-label={T.recovery}>
-      <h2>{T.recovery}</h2>
-      <p>{T.backup_tokens}</p>
-      <p>{T.backup_retention}</p>
-      <p>{T.upgrade_backup}</p>
+    <section aria-label={t.settings.recovery.recovery}>
+      <h2>{t.settings.recovery.recovery}</h2>
+      <p>{t.settings.recovery.backup_tokens}</p>
+      <p>{t.settings.recovery.backup_retention}</p>
+      <p>{t.settings.recovery.upgrade_backup}</p>
       <button type="button" disabled={action.pending} onClick={backup}>
-        {T.backup_start}
+        {t.settings.recovery.backup_start}
       </button>
       {backingUp ? (
         <div>
-          <span id="recovery-backup-running">{T.backup_running}</span>{' '}
+          <span id="recovery-backup-running">{t.settings.recovery.backup_running}</span>{' '}
           <progress aria-labelledby="recovery-backup-running" />
         </div>
       ) : null}
-      <p>{T.restore_note}</p>
+      <p>{t.settings.recovery.restore_note}</p>
       <button
         type="button"
         ref={restoreButton}
         disabled={action.pending || restartNeeded}
         onClick={restore}
       >
-        {T.restore_start}
+        {t.settings.recovery.restore_start}
       </button>
       {restoring ? (
         <div>
-          <span id="recovery-restore-running">{waiting ? T.restore_running : T.restore_starting}</span>{' '}
+          <span id="recovery-restore-running">{waiting ? t.settings.recovery.restore_running : t.settings.recovery.restore_starting}</span>{' '}
           <progress aria-labelledby="recovery-restore-running" />{' '}
           <button type="button" ref={cancelButton} onClick={() => void cancelRestore()}>
-            {T.restore_cancel}
+            {t.settings.recovery.restore_cancel}
           </button>
         </div>
       ) : null}
       {/* In the page from the start and empty until the restore job starts, so the banner is announced. */}
-      <p role="status">{waiting ? T.restore_wait : null}</p>
-      <p>{T.passphrase_note}</p>
+      <p role="status">{waiting ? t.settings.recovery.restore_wait : null}</p>
+      <p>{t.settings.recovery.passphrase_note}</p>
       <button type="button" disabled={action.pending} onClick={changePassphrase}>
-        {T.passphrase_change}
+        {t.settings.recovery.passphrase_change}
       </button>
       <Announce said={said} />
     </section>
@@ -151,13 +154,14 @@ export function Recovery({ onChanged }: { onChanged: () => void }) {
 
 /** What a completed restore says: counts only (Rust sends no text), the restart prompt, the passphrase offer. */
 function Restored({ done }: { done: RestoreDone }) {
+  const t = useText();
   return (
     <>
-      <p>{T.restore_done}</p>
-      <p>{T.restore_records_lost(done.records_lost)}</p>
-      <p>{T.restore_tokens(done.tokens_deleted)}</p>
-      {done.after_restore_failed ? <p>{T.restore_follow_up_failed}</p> : null}
-      {done.offer_passphrase_change ? <p>{T.restore_passphrase_offer}</p> : null}
+      <p>{t.settings.recovery.restore_done}</p>
+      <p>{t.settings.recovery.restore_records_lost(done.records_lost)}</p>
+      <p>{t.settings.recovery.restore_tokens(done.tokens_deleted)}</p>
+      {done.after_restore_failed ? <p>{t.settings.recovery.restore_follow_up_failed}</p> : null}
+      {done.offer_passphrase_change ? <p>{t.settings.recovery.restore_passphrase_offer}</p> : null}
     </>
   );
 }
@@ -171,6 +175,7 @@ function Restored({ done }: { done: RestoreDone }) {
  * display-escaped text and is shown as data.
  */
 export function OldInstalls() {
+  const t = useText();
   const action = useAction();
   const [list, setList] = useState<OrphanInstall[] | null>(null);
   const [failed, setFailed] = useState(false);
@@ -205,13 +210,13 @@ export function OldInstalls() {
       .run(
         () => forgetInstall(id),
         (e) => {
-          setSaid(forgetRefusal(e));
+          setSaid(forgetRefusal(e, t));
           load();
         },
       )
       .then((done) => {
         if (done === undefined) return;
-        setSaid(say('status', T.forgotten(done.keys_deleted)));
+        setSaid(say('status', t.settings.recovery.forgotten(done.keys_deleted)));
         load();
         // The row is gone: the focus stays in the section.
         heading.current?.focus();
@@ -219,37 +224,37 @@ export function OldInstalls() {
   };
 
   return (
-    <section aria-label={T.orphans}>
+    <section aria-label={t.settings.recovery.orphans}>
       <h2 tabIndex={-1} ref={heading}>
-        {T.orphans}
+        {t.settings.recovery.orphans}
       </h2>
-      <p>{T.orphans_intro}</p>
+      <p>{t.settings.recovery.orphans_intro}</p>
       {failed ? (
         <p role="alert">
-          {T.orphans_load_failed}{' '}
+          {t.settings.recovery.orphans_load_failed}{' '}
           <button type="button" onClick={load}>
-            {SETTINGS_TEXT.retry}
+            {t.settings.retry}
           </button>
         </p>
       ) : list === null ? null : list.length === 0 ? (
-        <p>{T.orphans_none}</p>
+        <p>{t.settings.recovery.orphans_none}</p>
       ) : (
         <ul>
           {list.map((o) => (
             <li key={o.install_id}>
               <p>
-                {T.orphan_install}: <Cfg value={o.install_id} />
+                {t.settings.recovery.orphan_install}: <Cfg value={o.install_id} />
               </p>
-              <Names label={T.orphan_files} names={o.archived_files} />
-              <Names label={T.orphan_entries} names={o.entries} />
+              <Names label={t.settings.recovery.orphan_files} names={o.archived_files} />
+              <Names label={t.settings.recovery.orphan_entries} names={o.entries} />
               <button
                 type="button"
                 className="danger"
-                aria-label={T.orphan_forget_label(o.install_id)}
+                aria-label={t.settings.recovery.orphan_forget_label(o.install_id)}
                 disabled={action.pending}
                 onClick={() => forget(o.install_id)}
               >
-                {T.orphan_forget}
+                {t.settings.recovery.orphan_forget}
               </button>
             </li>
           ))}
@@ -277,8 +282,8 @@ function Names({ label, names }: { label: string; names: string[] }) {
 }
 
 /** A refused forget: the fixed text, and for a partial keychain failure the names deleted and kept. */
-function forgetRefusal(e: unknown): Said {
-  const text = errorText(e);
+function forgetRefusal(e: unknown, t: Dict = en): Said {
+  const text = errorText(e, t);
   const { kind, inner } = kinds(e);
   const error = typeof e === 'object' && e !== null ? (e as { error?: Record<string, unknown> }).error : undefined;
   const strings = (v: unknown): string[] =>
@@ -290,8 +295,8 @@ function forgetRefusal(e: unknown): Said {
     'alert',
     <>
       <p>{text}</p>
-      <Names label={T.forget_deleted} names={deleted} />
-      <Names label={T.forget_not_deleted} names={kept} />
+      <Names label={t.settings.recovery.forget_deleted} names={deleted} />
+      <Names label={t.settings.recovery.forget_not_deleted} names={kept} />
     </>,
   );
 }

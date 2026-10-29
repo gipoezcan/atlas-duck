@@ -1,8 +1,8 @@
 import { useState } from 'react';
+import { useText } from '../shared/i18n/context';
 
 import { settingsApply } from '../shared/ipc/invoke';
 import type { Confinement, ScriptLimits, SettingsView } from '../shared/ipc/types';
-import { SETTINGS_TEXT as T } from '../shared/strings';
 import { Guard } from './Guard';
 import { parseWhole } from './Limits';
 import { useAction } from './useAction';
@@ -50,6 +50,7 @@ interface ScriptLimitsProps {
  * field the user edited keeps its text across re-reads (as in `Limits`).
  */
 export function ScriptLimitsForm({ view, onChanged, readOnly }: ScriptLimitsProps) {
+  const t = useText();
   const [draft, setDraft] = useState<Partial<Record<ScriptKey, string>>>({});
   const [local, setLocal] = useState<string | null>(null);
   const [applied, setApplied] = useState(false);
@@ -63,7 +64,7 @@ export function ScriptLimitsForm({ view, onChanged, readOnly }: ScriptLimitsProp
       if (text === undefined || text === shown(key)) continue;
       const n = parseWhole(text);
       if (n === null) {
-        setLocal(T.not_a_number);
+        setLocal(t.settings.not_a_number);
         return;
       }
       changed[key] = n;
@@ -80,13 +81,13 @@ export function ScriptLimitsForm({ view, onChanged, readOnly }: ScriptLimitsProp
   };
 
   return (
-    <section aria-label={T.script_limits}>
-      <h2>{T.script_limits}</h2>
+    <section aria-label={t.settings.script_limits}>
+      <h2>{t.settings.script_limits}</h2>
       <Guard disabled={readOnly}>
         {KEYS.map((key) => (
           <div key={key} className="field">
             <label>
-              {T.script_limit_labels[key]}
+              {t.settings.script_limit_labels[key]}
               <input
                 type="text"
                 inputMode="numeric"
@@ -97,20 +98,20 @@ export function ScriptLimitsForm({ view, onChanged, readOnly }: ScriptLimitsProp
             </label>
             <span id={`script-default-${key}`} className="default-hint">
               {' '}
-              ({T.script_default(DEFAULTS[key])})
+              ({t.settings.script_default(DEFAULTS[key])})
             </span>
           </div>
         ))}
         {view.restart_pending.includes(KEY_SCRIPT_LIMITS) ? (
-          <p className="restart-waiting">{T.restart_waiting}</p>
+          <p className="restart-waiting">{t.settings.restart_waiting}</p>
         ) : null}
-        <p>{T.script_limits_note}</p>
+        <p>{t.settings.script_limits_note}</p>
         <button type="button" className="primary" disabled={action.pending} onClick={submit}>
-          {T.apply}
+          {t.settings.apply}
         </button>
         {local === null ? null : <p role="alert">{local}</p>}
         {action.error === null ? null : <p role="alert">{action.error}</p>}
-        {applied ? <p role="status">{T.applied}</p> : null}
+        {applied ? <p role="status">{t.settings.applied}</p> : null}
       </Guard>
     </section>
   );
@@ -130,6 +131,7 @@ interface DegradedToggleProps {
  * does not turn it off.
  */
 export function DegradedToggle({ view, confinement, onChanged }: DegradedToggleProps) {
+  const t = useText();
   const action = useAction();
   const set = (value: boolean) => {
     void action.run(() => settingsApply([{ key: 'allow_degraded_scripts', value }])).then((v) => {
@@ -145,16 +147,16 @@ export function DegradedToggle({ view, confinement, onChanged }: DegradedToggleP
           disabled={action.pending}
           onChange={(e) => set(e.target.checked)}
         />
-        {T.degraded_toggle}
+        {t.settings.degraded_toggle}
       </label>
-      <p>{T.degraded_note}</p>
+      <p>{t.settings.degraded_note}</p>
       {confinement.scripts === 'degraded' ? (
         <p role="status" className="caution-strip">
-          {T.scripts_degraded_caution}
+          {t.settings.scripts_degraded_caution}
         </p>
       ) : null}
       {view.allow_degraded_scripts && confinement.scripts === 'enabled' ? (
-        <p>{T.degraded_inactive}</p>
+        <p>{t.settings.degraded_inactive}</p>
       ) : null}
       {action.error === null ? null : <p role="alert">{action.error}</p>}
     </div>

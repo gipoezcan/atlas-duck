@@ -1,10 +1,11 @@
 import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
+import { useText } from '../shared/i18n/context';
+import { en } from '../shared/i18n/dict';
 
 import { on } from '../shared/ipc/events';
 import { auditStatus, verifyNow } from '../shared/ipc/invoke';
 import type { AuditFilter, AuditJobEvent, AuditStatus, EventHeader } from '../shared/ipc/types';
 import { isAuditJobEvent } from '../shared/ipc/validate';
-import { AUDIT_TEXT as T, WINDOW_TITLES } from '../shared/strings';
 import { AgentText } from '../shared/text/AgentText';
 import { unusual } from '../shared/text/unusual';
 import { EventList, Flags } from './EventList';
@@ -15,7 +16,7 @@ import { PayloadView } from './PayloadView';
 import { Announce, Val } from './text';
 import { Trail } from './Trail';
 
-type Result = keyof typeof T.results | 'refused';
+type Result = keyof typeof en.audit.results | 'refused';
 
 /**
  * The Audit window (spec 8.7, 8.10; M6 shell PD-82, M10 T20): the open integrity incidents and
@@ -33,6 +34,7 @@ type Result = keyof typeof T.results | 'refused';
 export type AuditMode = 'desktop' | 'server';
 
 export function Audit({ mode = 'desktop', exportPanel = null }: { mode?: AuditMode; exportPanel?: ReactNode } = {}) {
+  const t = useText();
   const desktop = mode === 'desktop';
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<Result | null>(null);
@@ -138,7 +140,7 @@ export function Audit({ mode = 'desktop', exportPanel = null }: { mode?: AuditMo
   const closed = useRef<number | null>(null);
   useEffect(() => {
     if (record !== null || closed.current === null) return;
-    const name = T.open_record(closed.current);
+    const name = t.audit.open_record(closed.current);
     closed.current = null;
     const row = [...(records.current?.querySelectorAll('button') ?? [])].find((b) => b.textContent === name);
     (row ?? recordsHeading.current)?.focus();
@@ -150,15 +152,15 @@ export function Audit({ mode = 'desktop', exportPanel = null }: { mode?: AuditMo
 
   return (
     <main className="audit window window-audit">
-      <h1>{WINDOW_TITLES.audit}</h1>
+      <h1>{t.approvals.window_titles.audit}</h1>
       {desktop ? (
         <Incidents status={status} failed={statusFailed} onRetry={readStatus} onChanged={readStatus} />
       ) : null}
       {desktop ? (
-        <section aria-label={T.verification}>
-          <h2>{T.verification}</h2>
+        <section aria-label={t.audit.verification}>
+          <h2>{t.audit.verification}</h2>
           <button type="button" disabled={running} onClick={verify}>
-            {running ? T.verifying : T.verify}
+            {running ? t.audit.verifying : t.audit.verify}
           </button>
           {/* The end-to-end flows read the result here: the window says "integrity incident" and "unverified" elsewhere. */}
           <div data-testid="verification-result">
@@ -168,7 +170,7 @@ export function Audit({ mode = 'desktop', exportPanel = null }: { mode?: AuditMo
                   ? null
                   : {
                       role: result === 'verified' ? 'status' : 'alert',
-                      body: result === 'refused' ? T.refused : T.results[result],
+                      body: result === 'refused' ? t.audit.refused : t.audit.results[result],
                     }
               }
             />
@@ -176,9 +178,9 @@ export function Audit({ mode = 'desktop', exportPanel = null }: { mode?: AuditMo
         </section>
       ) : null}
       {desktop ? <ExportBackup job={job} /> : exportPanel}
-      <section aria-label={T.records} ref={records}>
+      <section aria-label={t.audit.records} ref={records}>
         <h2 ref={recordsHeading} tabIndex={-1}>
-          {T.records}
+          {t.audit.records}
         </h2>
         <Filters onApply={apply} />
         <EventList key={listKey} filter={filter} selected={record?.seq ?? null} onOpen={setRecord} />
@@ -228,6 +230,7 @@ function RecordDetail({
   onOpen: (header: EventHeader) => void;
   onClose: () => void;
 }) {
+  const t = useText();
   const [payload, setPayload] = useState(false);
   const heading = useRef<HTMLHeadingElement>(null);
 
@@ -236,40 +239,40 @@ function RecordDetail({
   }, []);
 
   return (
-    <section className="audit-record" aria-label={T.record(h.seq)}>
+    <section className="audit-record" aria-label={t.audit.record(h.seq)}>
       <h3 ref={heading} tabIndex={-1}>
-        {T.record(h.seq)}
+        {t.audit.record(h.seq)}
       </h3>
       <dl>
         {FIELDS.map((key) => (
           <div key={key}>
-            <dt>{T.field[key]}</dt>
+            <dt>{t.audit.field[key]}</dt>
             <dd>
-              <Val value={h[key]} />
+              <Val value={h[key]} time={key === 'ts_utc'} />
             </dd>
           </div>
         ))}
         <div>
-          <dt>{T.field.agent_name}</dt>
+          <dt>{t.audit.field.agent_name}</dt>
           <dd>
-            {h.agent_name === null ? T.no_value : <AgentText value={h.agent_name} unusual={unusual(h.agent_name)} />}
+            {h.agent_name === null ? t.audit.no_value : <AgentText value={h.agent_name} unusual={unusual(h.agent_name)} />}
           </dd>
         </div>
         <div>
-          <dt>{T.field.flags}</dt>
-          <dd>{h.flags.length === 0 ? T.no_value : <Flags flags={h.flags} />}</dd>
+          <dt>{t.audit.field.flags}</dt>
+          <dd>{h.flags.length === 0 ? t.audit.no_value : <Flags flags={h.flags} />}</dd>
         </div>
       </dl>
       {payload ? (
         <PayloadView seq={h.seq} />
       ) : (
         <button type="button" onClick={() => setPayload(true)}>
-          {T.payload_show}
+          {t.audit.payload_show}
         </button>
       )}
       {h.request_id === null ? null : <Trail key={h.request_id} requestId={h.request_id} onOpen={onOpen} />}
       <button type="button" onClick={onClose}>
-        {T.record_close}
+        {t.audit.record_close}
       </button>
     </section>
   );

@@ -1,8 +1,8 @@
 import { useState } from 'react';
+import { useText } from '../shared/i18n/context';
 
 import { cliInstall, cliUninstall } from '../shared/ipc/invoke';
 import type { CliInstallAnswer } from '../shared/ipc/types';
-import { SETTINGS_TEXT as T } from '../shared/strings';
 import { useAction } from './useAction';
 
 /**
@@ -25,6 +25,7 @@ export function Cli({
   dirOnPath: boolean | null;
   onChanged: () => void;
 }) {
+  const t = useText();
   const action = useAction();
   const [outcome, setOutcome] = useState<CliInstallAnswer['outcome'] | null>(null);
   const click = () =>
@@ -40,25 +41,25 @@ export function Cli({
   // The status line is path-aware: an installed CLI whose folder this app's PATH lacks is not
   // called "on your PATH", and a folder already on the PATH is not called "not on your PATH".
   const status = packaged
-    ? T.cli_outcomes.already_on_path
+    ? t.settings.cli_outcomes.already_on_path
     : installed
       ? dirOnPath === false
-        ? T.cli_installed_dir_not_on_path
-        : T.cli_installed
+        ? t.settings.cli_installed_dir_not_on_path
+        : t.settings.cli_installed
       : dirOnPath === true
-        ? T.cli_not_installed_dir_on_path
-        : T.cli_not_installed;
+        ? t.settings.cli_not_installed_dir_on_path
+        : t.settings.cli_not_installed;
   return (
-    <section aria-label={T.cli}>
-      <h2>{T.cli}</h2>
+    <section aria-label={t.settings.cli}>
+      <h2>{t.settings.cli}</h2>
       <p>{status}</p>
       {packaged ? null : (
         <button type="button" disabled={action.pending} onClick={click}>
-          {installed ? T.cli_uninstall : T.cli_install}
+          {installed ? t.settings.cli_uninstall : t.settings.cli_install}
         </button>
       )}
       {action.error === null ? null : <p role="alert">{action.error}</p>}
-      {outcome === null ? null : <p role="status">{T.cli_outcomes[outcome]}</p>}
+      {outcome === null ? null : <p role="status">{t.settings.cli_outcomes[outcome]}</p>}
     </section>
   );
 }
