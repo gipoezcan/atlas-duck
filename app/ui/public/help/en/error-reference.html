@@ -42,93 +42,110 @@
 <main>
 <h1>Error reference</h1>
 <h2 id="errors-envelope">Errors of the command line and agents</h2>
-<p>TODO</p>
+<p>Every failed request of an agent carries an <code>error</code> object with a <code>code</code>, a <code>retryable</code> flag and a message. The code tells you what went wrong. The flag tells the agent whether sending the same request again can work. Agents should decide on <code>status</code>, <code>error.code</code> and <code>error.retryable</code> together, not on the exit code alone.</p>
+<p>The command line also sets an exit code, see <a href="agents-desktop.html#envelope">The response format</a>.</p>
+<p>Many of these errors reach you only through the agent. If you see one in the app, for example in &quot;Recently decided (24 h)&quot;, the entry says what to do.</p>
 <h3 id="err-usage"><code>usage</code></h3>
-<p>TODO</p>
+<p>The request was not valid: a command, an option or a combination of options that atlas-duck does not know. Nothing was queued. Exit 2, not retryable. Check the command with <code>--help</code>.</p>
 <h3 id="err-validation"><code>validation</code></h3>
-<p>TODO</p>
+<p>The request was well formed but did not pass validation, for example a missing or wrong parameter of an operation. Nothing was queued. Exit 2, not retryable. Look up the operation with <code>ops describe &lt;op-id&gt;</code> and correct the parameters.</p>
 <h3 id="err-markdown-placeholders"><code>markdown_placeholders</code></h3>
-<p>TODO</p>
+<p>The text contains placeholders that cannot be sent as written. When an agent writes a Confluence page or comment in Markdown, atlas-duck refuses a text that still contains placeholders that it put there when the agent read a page as Markdown (for example for macros or mentions). Written back, they would not mean what they stood for. Nothing was queued. Exit 2, not retryable. The agent should replace the placeholders with real content, or leave that part of the page out.</p>
 <h3 id="err-op-unsupported-by-instance"><code>op_unsupported_by_instance</code></h3>
-<p>TODO</p>
+<p>This instance does not support the operation, for example because its version is too old. Exit 2, not retryable. Use another operation or another instance, or ask the administrator of the instance.</p>
 <h3 id="err-internal"><code>internal</code></h3>
-<p>TODO</p>
+<p>An internal error occurred in atlas-duck, or in the server. Not retryable. Try again later. If it keeps happening, tell your administrator, and give them the request id and the time.</p>
 <h3 id="err-audit-failure"><code>audit_failure</code></h3>
-<p>TODO</p>
+<p>The audit log could not be written, so nothing was done. atlas-duck never acts without recording it. Exit 1. For reads and scripts the agent may try again; for writes it is not retryable, because the write has to be decided again. Check that the disk of the audit log is not full, see <a href="troubleshooting.html#audit-storage">The audit storage is low</a>.</p>
 <h3 id="err-audit-storage-low"><code>audit_storage_low</code></h3>
-<p>TODO</p>
+<p>The storage for the audit log is almost full. atlas-duck refuses new requests so that the log can always be written. Nothing was queued. Exit 1, retryable. Free disk space on the drive that holds the audit log, then try again. See <a href="troubleshooting.html#audit-storage">The audit storage is low</a>.</p>
 <h3 id="err-busy"><code>busy</code></h3>
-<p>TODO</p>
+<p>Another operation is running. Nothing was queued. Exit 11, retryable. Wait for the time that <code>retry_after_s</code> names and try again.</p>
 <h3 id="err-unreachable"><code>unreachable</code></h3>
-<p>TODO</p>
+<p>The command line could not reach the app, so nothing was queued. Exit 5. The <code>details.reason</code> says why:</p>
+<table>
+<thead><tr><th>Reason</th><th>What to do</th></tr></thead>
+<tbody>
+<tr><td><code>not_running</code></td><td>The app is not running. Start it.</td></tr>
+<tr><td><code>launch_timeout</code></td><td>The app did not start in time, or the <code>--timeout</code> ran out before submission. Start the app yourself and try again.</td></tr>
+<tr><td><code>no_gui_session</code></td><td>There is no desktop session to start the app in. Start it in a desktop session.</td></tr>
+<tr><td><code>launch_blocked_by_job</code></td><td>On Windows, the app could not be started from the agent's process. Start the app yourself.</td></tr>
+<tr><td><code>app_upgraded</code></td><td>The command line is newer than the running app. Restart the app.</td></tr>
+<tr><td><code>app_shutting_down</code></td><td>The app is closing. Start it again.</td></tr>
+<tr><td><code>store_newer</code></td><td>The audit data was written by a newer atlas-duck. Install that version or a newer one.</td></tr>
+<tr><td><code>store_unavailable</code></td><td>The audit store could not be opened. Restart atlas-duck. Not retryable.</td></tr>
+<tr><td><code>connection_lost</code></td><td>The connection dropped after the request was sent. The request exists; wait for it with <code>await &lt;id&gt;</code>, it may be <code>abandoned</code>.</td></tr>
+</tbody></table>
+<p>Except for <code>store_unavailable</code>, the error is retryable.</p>
 <h3 id="err-server-identity"><code>server_identity</code></h3>
-<p>TODO</p>
+<p>The program that answered is not the app that belongs to your user. atlas-duck refuses to talk to it. Exit 5, not retryable. This is a safety check. Make sure that no other program uses the app's connection and restart atlas-duck. If it persists, tell your administrator.</p>
 <h3 id="err-protocol-mismatch"><code>protocol_mismatch</code></h3>
-<p>TODO</p>
+<p>The command line and the app speak versions of the protocol that do not fit. Exit 5. Update both to the same version and restart the app. Restart the MCP server of the agent as well.</p>
 <h3 id="err-upstream-http"><code>upstream_http</code></h3>
-<p>TODO</p>
+<p>The Jira or Confluence server answered with an error. This code appears when a write failed after you approved it, when you released the error of a read, or when you denied a request and attached the HTTP status as a hint. Exit 6 or 3, not retryable. The <code>details</code> carry the HTTP status and the error messages of the instance. Read them: usually a permission, a value that the instance rejects, or a deleted object.</p>
 <h3 id="err-upstream-network"><code>upstream_network</code></h3>
-<p>TODO</p>
+<p>The connection to the instance failed. Exit 6. When it happened before the request was sent, it is retryable. When it came out of a read and you released it, it is a fixed message without data and not retryable. Check that the instance can be reached, see <a href="troubleshooting.html#cannot-connect">An instance cannot be reached</a>.</p>
 <h3 id="err-upstream-unavailable"><code>upstream_unavailable</code></h3>
-<p>TODO</p>
+<p>The instance is not available right now. Exit 6. Reads can be retried later. If the reason is <code>identity_header_missing</code> or <code>identity_header_mismatch</code>, a proxy in front of Jira changes the user header, so a retry does not help; ask the administrator of the instance. See <a href="instances-and-tokens.html">Instances and tokens</a>.</p>
 <h3 id="err-upstream-unknown-outcome"><code>upstream_unknown_outcome</code></h3>
-<p>TODO</p>
+<p>A write was sent, but atlas-duck does not know whether the instance carried it out, for example after a timeout, a server error or a crash. Status <code>outcome_unknown</code>, exit 6, not retryable. <strong>Check the target in Jira or Confluence before you do anything else.</strong> Only when the change is missing should it be requested again. The entry is under &quot;Needs attention&quot; with &quot;check target&quot;, see <a href="approvals.html#needs-attention">Needs attention</a>.</p>
 <h3 id="err-result-too-large"><code>result_too_large</code></h3>
-<p>TODO</p>
+<p>The result is too large to return. Exit 6, not retryable. The agent should ask for less: a smaller page, fewer fields, or a narrower search.</p>
 <h3 id="err-needs-token"><code>needs_token</code></h3>
-<p>TODO</p>
+<p>A token is needed for this instance. The token is missing, or the instance has refused it. Exit 9. Add or replace the token, see <a href="instances-and-tokens.html">Instances and tokens</a> and <a href="troubleshooting.html#token-rejected">A token is rejected</a>. Agents should not retry in a loop.</p>
 <h3 id="err-locked"><code>locked</code></h3>
-<p>TODO</p>
+<p>The app is locked: it cannot open its audit log or its keys. Exit 9. The <code>details.reason</code> says why, for example that the keychain is not available yet, that it was lost, or that the keyring lies on a network drive. Follow <a href="troubleshooting.html#locked">The app is locked</a>.</p>
 <h3 id="err-not-configured"><code>not_configured</code></h3>
-<p>TODO</p>
+<p>This instance, or the app, is not set up yet. Exit 9. The <code>details.reason</code> names the gap: the first-run wizard is not finished, no instance exists for the product, an instance uses <code>http://</code> instead of <code>https://</code>, an instance is not confirmed, the data directory is missing or not on a local drive, or the settings file cannot be read. Finish the setup.</p>
+<p>See <a href="getting-started-desktop.html">Getting started</a>.</p>
 <h3 id="err-script-syntax"><code>script_syntax</code></h3>
-<p>TODO</p>
+<p>The script has a syntax error. atlas-duck compiles every script on submission and refuses a faulty one. Exit 8, not retryable. Fix the script. See <a href="scripts.html#what-are-scripts">Scripts</a>.</p>
 <h3 id="err-script-limit"><code>script_limit</code></h3>
-<p>TODO</p>
+<p>The script hit a limit and was stopped: time, memory, number of calls, data fetched or size of the result. Exit 8, not retryable. Make the script do less, or raise the limit in Settings, see <a href="scripts.html#limits">Limits and confinement</a>.</p>
 <h3 id="err-sandbox-unavailable"><code>sandbox_unavailable</code></h3>
-<p>TODO</p>
+<p>The script sandbox is not available, so scripts cannot run. Exit 8, not retryable. If the reason is <code>app_upgraded</code>, restart the app and try again. Otherwise the operating system does not allow the confinement, see <a href="scripts.html#limits">Limits and confinement</a>.</p>
 <h3 id="err-result-evicted"><code>result_evicted</code></h3>
-<p>TODO</p>
+<p>The outcome is known, but the result is no longer stored. Exit 10. For reads and scripts the agent can submit the request again; for a write do not repeat it, because the change was already made.</p>
 <h3 id="err-denied"><code>denied</code></h3>
-<p>TODO</p>
+<p>You denied the request. The message holds your reason. Exit 3, not retryable. The agent should resubmit only when the reason asks for a change. See <a href="approvals.html#approve-or-deny">Approve, release or deny</a>.</p>
 <h3 id="err-resolution-failed"><code>resolution_failed</code></h3>
-<p>TODO</p>
+<p>A name in the request could not be resolved, for example a user, a field or a project that does not exist under that name. Exit 3 when you attached it as a hint to a deny. The <code>details</code> name the parameter and may list candidates. The agent should fix the named parameter.</p>
 <h3 id="err-expired"><code>expired</code></h3>
-<p>TODO</p>
+<p>Nobody decided the request in time. Exit 7, not retryable. Submit again only if you want that.</p>
 <h3 id="err-cancelled"><code>cancelled</code></h3>
-<p>TODO</p>
+<p>The request was cancelled: by the agent (<code>cancel</code>, not retryable), because the app was quit or the system shut down (retryable). Exit 7. Nothing was executed, and a cancelled result never reaches your queue.</p>
 <h3 id="err-abandoned"><code>abandoned</code></h3>
-<p>TODO</p>
+<p>The request was still pending when the app crashed or was killed. Exit 7, retryable. Submit it again. A write that was already approved becomes <code>outcome_unknown</code> instead, see <a href="error-reference.html#err-upstream-unknown-outcome">upstream_unknown_outcome</a>.</p>
 <h3 id="err-unknown-request"><code>unknown_request</code></h3>
-<p>TODO</p>
+<p>There is no request with this id. Exit 2. Check the id, or find it with <code>requests list</code>.</p>
 <h3 id="err-protocol-error"><code>protocol_error</code></h3>
-<p>TODO</p>
+<p>The app and the command line tool could not agree on a message. Exit 1, not retryable. This usually means that they have different versions. Update both and restart the app.</p>
 <h2 id="errors-decision">Errors when deciding</h2>
-<p>TODO</p>
+<p>These errors appear in the Approvals window when a decision cannot be applied. In every case nothing was decided, and the request is as it was.</p>
 <h3 id="err-stale"><code>stale</code></h3>
-<p>TODO</p>
+<p>The request changed in the meantime, for example it received a new revision. Re-read the queue, open the request again and decide on what you see.</p>
 <h3 id="err-invalid"><code>invalid</code></h3>
-<p>TODO</p>
+<p>The decision is not allowed for this request, for example approving something that cannot be approved, or releasing with a preview that you have not opened. Open the preview first, or decide individually.</p>
 <h3 id="err-edit-rejected"><code>edit_rejected</code></h3>
-<p>TODO</p>
+<p>The edit was refused, for example because it changes the target, is not valid, or is too large. The message names the reason. Correct the field, or deny the request. See <a href="approvals.html#edit-and-redact">Editing and redacting</a>.</p>
 <h3 id="err-audit"><code>audit</code></h3>
-<p>TODO</p>
+<p>The decision could not be recorded in the audit log, so nothing was done. Check the free space of the audit log, then try again. See <a href="troubleshooting.html#audit-storage">The audit storage is low</a>.</p>
 <h3 id="err-batch-rejected"><code>batch_rejected</code></h3>
-<p>TODO</p>
+<p>The batch was rejected and nothing was decided. At least one request did not qualify. The reasons are listed per request, see below and <a href="approvals.html#batch-decisions">Batch decisions</a>.</p>
 <h3 id="err-not-decidable"><code>not_decidable</code></h3>
-<p>TODO</p>
+<p>The request is not waiting for a decision. Someone else decided it, it expired, or it was cancelled. Re-read the queue.</p>
 <h2 id="errors-batch">Errors in batch decisions</h2>
-<p>TODO</p>
+<p>A batch lists these reasons per request. Remove the request from the batch or decide it individually.</p>
 <h3 id="err-not-pending"><code>not_pending</code></h3>
-<p>TODO</p>
+<p>The request is no longer pending. It was decided, expired or cancelled in the meantime.</p>
 <h3 id="err-target-param-edit"><code>target_param_edit</code></h3>
-<p>TODO</p>
+<p>The target of the request cannot be edited. Decide it individually, or deny it so that the agent asks again with the right target.</p>
 <h3 id="err-not-opened"><code>not_opened</code></h3>
-<p>TODO</p>
+<p>The preview of the request was not opened. Open the preview of every selected request before you decide as a batch.</p>
 <h3 id="err-not-approvable"><code>not_approvable</code></h3>
-<p>TODO</p>
+<p>The request cannot be approved as it is, for example because required fields are missing. Decide it individually.</p>
 <h3 id="err-batch-item-flagged"><code>batch_item_flagged</code></h3>
-<p>TODO</p>
+<p>The request is flagged as a possible duplicate or as a similar request. Look at it and approve it individually.</p>
 </main>
 </div>
 </body>

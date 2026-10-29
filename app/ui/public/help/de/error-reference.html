@@ -32,8 +32,8 @@
 <li><a href="troubleshooting.html">Fehlerbehebung</a></li>
 <li><a href="error-reference.html" aria-current="page">Fehlerreferenz</a>
 <ul>
-<li><a href="#errors-envelope">Fehler von Befehlszeile und Agents</a></li>
-<li><a href="#errors-decision">Fehler bei Entscheidungen</a></li>
+<li><a href="#errors-envelope">Fehler der Befehlszeile und der Agents</a></li>
+<li><a href="#errors-decision">Fehler beim Entscheiden</a></li>
 <li><a href="#errors-batch">Fehler bei Sammelentscheidungen</a></li>
 </ul>
 </li>
@@ -41,94 +41,111 @@
 </nav>
 <main>
 <h1>Fehlerreferenz</h1>
-<h2 id="errors-envelope">Fehler von Befehlszeile und Agents</h2>
-<p>TODO</p>
+<h2 id="errors-envelope">Fehler der Befehlszeile und der Agents</h2>
+<p>Jede fehlgeschlagene Anfrage eines Agenten enthält ein Objekt <code>error</code> mit einem <code>code</code>, einem Kennzeichen <code>retryable</code> und einer Meldung. Der Code sagt, was schiefgegangen ist. Das Kennzeichen sagt dem Agenten, ob es helfen kann, dieselbe Anfrage erneut zu senden. Agents sollten anhand von <code>status</code>, <code>error.code</code> und <code>error.retryable</code> zusammen entscheiden, nicht allein anhand des Exit-Codes.</p>
+<p>Die Befehlszeile setzt außerdem einen Exit-Code, siehe <a href="agents-desktop.html#envelope">Das Antwortformat</a>.</p>
+<p>Viele dieser Fehler erreichen Sie nur über den Agenten. Sehen Sie einen in der App, zum Beispiel unter „Zuletzt entschieden (24 Std.)“, sagt der Eintrag, was zu tun ist.</p>
 <h3 id="err-usage"><code>usage</code></h3>
-<p>TODO</p>
+<p>Die Anfrage war nicht gültig: ein Befehl, eine Option oder eine Kombination von Optionen, die atlas-duck nicht kennt. Es wurde nichts eingereiht. Exit 2, nicht wiederholbar. Prüfen Sie den Befehl mit <code>--help</code>.</p>
 <h3 id="err-validation"><code>validation</code></h3>
-<p>TODO</p>
+<p>Die Anfrage war wohlgeformt, hat aber die Prüfung nicht bestanden, zum Beispiel wegen eines fehlenden oder falschen Parameters eines Vorgangs. Es wurde nichts eingereiht. Exit 2, nicht wiederholbar. Schlagen Sie den Vorgang mit <code>ops describe &lt;op-id&gt;</code> nach und korrigieren Sie die Parameter.</p>
 <h3 id="err-markdown-placeholders"><code>markdown_placeholders</code></h3>
-<p>TODO</p>
+<p>Schreibt ein Agent eine Confluence-Seite oder einen Kommentar in Markdown, weist atlas-duck einen Text zurück, der noch Platzhalter enthält, die atlas-duck eingesetzt hat, als der Agent eine Seite als Markdown las (zum Beispiel für Makros oder Erwähnungen). Zurückgeschrieben würden sie nicht mehr bedeuten, wofür sie standen. Es wurde nichts eingereiht. Exit 2, nicht wiederholbar. Der Agent sollte die Platzhalter durch echten Inhalt ersetzen oder diesen Teil der Seite weglassen.</p>
 <h3 id="err-op-unsupported-by-instance"><code>op_unsupported_by_instance</code></h3>
-<p>TODO</p>
+<p>Diese Instanz unterstützt den Vorgang nicht, zum Beispiel weil ihre Version zu alt ist. Exit 2, nicht wiederholbar. Verwenden Sie einen anderen Vorgang oder eine andere Instanz, oder fragen Sie den Administrator der Instanz.</p>
 <h3 id="err-internal"><code>internal</code></h3>
-<p>TODO</p>
+<p>In atlas-duck oder im Server ist ein interner Fehler aufgetreten. Nicht wiederholbar. Versuchen Sie es später erneut. Tritt er weiter auf, informieren Sie Ihren Administrator und nennen Sie ihm die Anfrage-ID und die Uhrzeit.</p>
 <h3 id="err-audit-failure"><code>audit_failure</code></h3>
-<p>TODO</p>
+<p>Das Audit-Protokoll konnte nicht geschrieben werden, daher wurde nichts ausgeführt. atlas-duck handelt nie, ohne es festzuhalten. Exit 1. Bei Lesezugriffen und Skripten darf der Agent es erneut versuchen; bei Schreibzugriffen ist es nicht wiederholbar, denn der Schreibzugriff muss neu entschieden werden. Prüfen Sie, dass der Datenträger des Audit-Protokolls nicht voll ist, siehe <a href="troubleshooting.html#audit-storage">Der Speicher für das Audit-Protokoll ist knapp</a>.</p>
 <h3 id="err-audit-storage-low"><code>audit_storage_low</code></h3>
-<p>TODO</p>
+<p>Der Speicher für das Audit-Protokoll ist fast voll. atlas-duck weist neue Anfragen zurück, damit das Protokoll immer geschrieben werden kann. Es wurde nichts eingereiht. Exit 1, wiederholbar. Schaffen Sie auf dem Laufwerk mit dem Audit-Protokoll Platz und versuchen Sie es dann erneut. Siehe <a href="troubleshooting.html#audit-storage">Der Speicher für das Audit-Protokoll ist knapp</a>.</p>
 <h3 id="err-busy"><code>busy</code></h3>
-<p>TODO</p>
+<p>Ein anderer Vorgang läuft. Es wurde nichts eingereiht. Exit 11, wiederholbar. Warten Sie die Zeit ab, die <code>retry_after_s</code> nennt, und versuchen Sie es erneut.</p>
 <h3 id="err-unreachable"><code>unreachable</code></h3>
-<p>TODO</p>
+<p>Die Befehlszeile konnte die App nicht erreichen, daher wurde nichts eingereiht. Exit 5. <code>details.reason</code> nennt den Grund:</p>
+<table>
+<thead><tr><th>Grund</th><th>Was zu tun ist</th></tr></thead>
+<tbody>
+<tr><td><code>not_running</code></td><td>Die App läuft nicht. Starten Sie sie.</td></tr>
+<tr><td><code>launch_timeout</code></td><td>Die App ist nicht rechtzeitig gestartet, oder das <code>--timeout</code> ist vor dem Einreichen abgelaufen. Starten Sie die App selbst und versuchen Sie es erneut.</td></tr>
+<tr><td><code>no_gui_session</code></td><td>Es gibt keine Desktop-Sitzung, in der die App starten könnte. Starten Sie sie in einer Desktop-Sitzung.</td></tr>
+<tr><td><code>launch_blocked_by_job</code></td><td>Unter Windows ließ sich die App nicht aus dem Prozess des Agenten starten. Starten Sie die App selbst.</td></tr>
+<tr><td><code>app_upgraded</code></td><td>Die Befehlszeile ist neuer als die laufende App. Starten Sie die App neu.</td></tr>
+<tr><td><code>app_shutting_down</code></td><td>Die App wird beendet. Starten Sie sie erneut.</td></tr>
+<tr><td><code>store_newer</code></td><td>Die Audit-Daten wurden von einem neueren atlas-duck geschrieben. Installieren Sie diese oder eine neuere Version.</td></tr>
+<tr><td><code>store_unavailable</code></td><td>Der Audit-Speicher ließ sich nicht öffnen. Starten Sie atlas-duck neu. Nicht wiederholbar.</td></tr>
+<tr><td><code>connection_lost</code></td><td>Die Verbindung brach ab, nachdem die Anfrage gesendet war. Die Anfrage existiert; warten Sie mit <code>await &lt;id&gt;</code> auf sie, sie kann <code>abandoned</code> sein.</td></tr>
+</tbody></table>
+<p>Außer bei <code>store_unavailable</code> ist der Fehler wiederholbar.</p>
 <h3 id="err-server-identity"><code>server_identity</code></h3>
-<p>TODO</p>
+<p>Das Programm, das geantwortet hat, ist nicht die App Ihres Benutzers. atlas-duck weigert sich, mit ihm zu sprechen. Exit 5, nicht wiederholbar. Das ist eine Sicherheitsprüfung. Stellen Sie sicher, dass kein anderes Programm die Verbindung der App verwendet, und starten Sie atlas-duck neu. Bleibt es bestehen, informieren Sie Ihren Administrator.</p>
 <h3 id="err-protocol-mismatch"><code>protocol_mismatch</code></h3>
-<p>TODO</p>
+<p>Die Befehlszeile und die App sprechen Protokollversionen, die nicht zusammenpassen. Exit 5. Aktualisieren Sie beide auf dieselbe Version und starten Sie die App neu. Starten Sie auch den MCP-Server des Agenten neu.</p>
 <h3 id="err-upstream-http"><code>upstream_http</code></h3>
-<p>TODO</p>
+<p>Der Jira- oder Confluence-Server hat mit einem Fehler geantwortet. Dieser Code erscheint, wenn ein Schreibzugriff nach Ihrer Freigabe fehlgeschlagen ist, wenn Sie den Fehler eines Lesezugriffs übergeben haben oder wenn Sie eine Anfrage abgelehnt und den HTTP-Status als Tipp angehängt haben. Exit 6 oder 3, nicht wiederholbar. <code>details</code> enthält den HTTP-Status und die Fehlermeldungen der Instanz. Lesen Sie sie: Meist geht es um eine Berechtigung, um einen Wert, den die Instanz zurückweist, oder um ein gelöschtes Objekt.</p>
 <h3 id="err-upstream-network"><code>upstream_network</code></h3>
-<p>TODO</p>
+<p>Die Verbindung zur Instanz ist fehlgeschlagen. Exit 6. Geschah das, bevor die Anfrage gesendet wurde, ist es wiederholbar. Stammt es aus einem Lesezugriff, den Sie übergeben haben, ist es eine feste Meldung ohne Daten und nicht wiederholbar. Prüfen Sie, ob die Instanz erreichbar ist, siehe <a href="troubleshooting.html#cannot-connect">Eine Instanz ist nicht erreichbar</a>.</p>
 <h3 id="err-upstream-unavailable"><code>upstream_unavailable</code></h3>
-<p>TODO</p>
+<p>Die Instanz ist gerade nicht verfügbar. Exit 6. Lesezugriffe lassen sich später wiederholen. Lautet der Grund <code>identity_header_missing</code> oder <code>identity_header_mismatch</code>, verändert ein Proxy vor Jira den Benutzer-Header, und eine Wiederholung hilft nicht; fragen Sie den Administrator der Instanz. Siehe <a href="instances-and-tokens.html">Instanzen und Tokens</a>.</p>
 <h3 id="err-upstream-unknown-outcome"><code>upstream_unknown_outcome</code></h3>
-<p>TODO</p>
+<p>Ein Schreibzugriff wurde gesendet, aber atlas-duck weiß nicht, ob die Instanz ihn ausgeführt hat, zum Beispiel nach einem Zeitlimit, einem Serverfehler oder einem Absturz. Status <code>outcome_unknown</code>, Exit 6, nicht wiederholbar. <strong>Prüfen Sie das Ziel in Jira oder Confluence, bevor Sie etwas anderes tun.</strong> Nur wenn die Änderung fehlt, sollte sie erneut angefordert werden. Der Eintrag steht unter „Braucht Aufmerksamkeit“ mit „Ziel prüfen“, siehe <a href="approvals.html#needs-attention">Braucht Aufmerksamkeit</a>.</p>
 <h3 id="err-result-too-large"><code>result_too_large</code></h3>
-<p>TODO</p>
+<p>Das Ergebnis ist zu groß, um es zurückzugeben. Exit 6, nicht wiederholbar. Der Agent sollte weniger anfordern: eine kleinere Seite, weniger Felder oder eine engere Suche.</p>
 <h3 id="err-needs-token"><code>needs_token</code></h3>
-<p>TODO</p>
+<p>Für diese Instanz wird ein Token benötigt. Das Token fehlt, oder die Instanz hat es zurückgewiesen. Exit 9. Fügen Sie das Token hinzu oder ersetzen Sie es, siehe <a href="instances-and-tokens.html">Instanzen und Tokens</a> und <a href="troubleshooting.html#token-rejected">Ein Token wird zurückgewiesen</a>. Agents sollten nicht in einer Schleife wiederholen.</p>
 <h3 id="err-locked"><code>locked</code></h3>
-<p>TODO</p>
+<p>Die App ist gesperrt: Sie kann ihr Audit-Protokoll oder ihre Schlüssel nicht öffnen. Exit 9. <code>details.reason</code> nennt den Grund, zum Beispiel dass der Schlüsselbund noch nicht verfügbar ist, dass er verloren ging oder dass der Schlüsselbund auf einem Netzlaufwerk liegt. Folgen Sie <a href="troubleshooting.html#locked">Die App ist gesperrt</a>.</p>
 <h3 id="err-not-configured"><code>not_configured</code></h3>
-<p>TODO</p>
+<p>Diese Instanz oder die App ist noch nicht eingerichtet. Exit 9. <code>details.reason</code> nennt die Lücke: Der Einrichtungsassistent ist nicht abgeschlossen, für das Produkt gibt es keine Instanz, eine Instanz verwendet <code>http://</code> statt <code>https://</code>, eine Instanz ist nicht bestätigt, das Datenverzeichnis fehlt oder liegt nicht auf einem lokalen Laufwerk, oder die Einstellungsdatei lässt sich nicht lesen. Schließen Sie die Einrichtung ab.</p>
+<p>Siehe <a href="getting-started-desktop.html">Erste Schritte</a>.</p>
 <h3 id="err-script-syntax"><code>script_syntax</code></h3>
-<p>TODO</p>
+<p>Das Skript hat einen Syntaxfehler. atlas-duck übersetzt jedes Skript beim Einreichen und weist ein fehlerhaftes zurück. Exit 8, nicht wiederholbar. Korrigieren Sie das Skript. Siehe <a href="scripts.html#what-are-scripts">Skripte</a>.</p>
 <h3 id="err-script-limit"><code>script_limit</code></h3>
-<p>TODO</p>
+<p>Das Skript hat ein Limit erreicht und wurde gestoppt: Zeit, Speicher, Zahl der Aufrufe, abgerufene Daten oder Größe des Ergebnisses. Exit 8, nicht wiederholbar. Lassen Sie das Skript weniger tun oder erhöhen Sie das Limit in den Einstellungen, siehe <a href="scripts.html#limits">Limits und Isolierung</a>.</p>
 <h3 id="err-sandbox-unavailable"><code>sandbox_unavailable</code></h3>
-<p>TODO</p>
+<p>Die Skript-Sandbox ist nicht verfügbar, daher können keine Skripte laufen. Exit 8, nicht wiederholbar. Lautet der Grund <code>app_upgraded</code>, starten Sie die App neu und versuchen Sie es erneut. Sonst erlaubt das Betriebssystem die Isolierung nicht, siehe <a href="scripts.html#limits">Limits und Isolierung</a>.</p>
 <h3 id="err-result-evicted"><code>result_evicted</code></h3>
-<p>TODO</p>
+<p>Das Ergebnis ist bekannt, aber nicht mehr gespeichert. Exit 10. Bei Lesezugriffen und Skripten kann der Agent die Anfrage erneut einreichen; einen Schreibzugriff wiederholen Sie nicht, denn die Änderung wurde bereits ausgeführt.</p>
 <h3 id="err-denied"><code>denied</code></h3>
-<p>TODO</p>
+<p>Sie haben die Anfrage abgelehnt. Die Meldung enthält Ihre Begründung. Exit 3, nicht wiederholbar. Der Agent sollte nur erneut einreichen, wenn die Begründung um eine Änderung bittet. Siehe <a href="approvals.html#approve-or-deny">Freigeben, übergeben oder ablehnen</a>.</p>
 <h3 id="err-resolution-failed"><code>resolution_failed</code></h3>
-<p>TODO</p>
+<p>Ein Name in der Anfrage ließ sich nicht auflösen, zum Beispiel ein Benutzer, ein Feld oder ein Projekt, das es unter diesem Namen nicht gibt. Exit 3, wenn Sie es als Tipp an eine Ablehnung angehängt haben. <code>details</code> nennt den Parameter und kann Kandidaten auflisten. Der Agent sollte den genannten Parameter korrigieren.</p>
 <h3 id="err-expired"><code>expired</code></h3>
-<p>TODO</p>
+<p>Niemand hat die Anfrage rechtzeitig entschieden. Exit 7, nicht wiederholbar. Reichen Sie sie nur erneut ein, wenn Sie das wünschen.</p>
 <h3 id="err-cancelled"><code>cancelled</code></h3>
-<p>TODO</p>
+<p>Die Anfrage wurde storniert: durch den Agenten (<code>cancel</code>, nicht wiederholbar) oder weil die App beendet oder das System heruntergefahren wurde (wiederholbar). Exit 7. Es wurde nichts ausgeführt, und ein storniertes Ergebnis erreicht Ihre Warteschlange nie.</p>
 <h3 id="err-abandoned"><code>abandoned</code></h3>
-<p>TODO</p>
+<p>Die Anfrage war noch ausstehend, als die App abstürzte oder beendet wurde. Exit 7, wiederholbar. Reichen Sie sie erneut ein. Ein Schreibzugriff, der schon freigegeben war, wird stattdessen <code>outcome_unknown</code>, siehe <a href="error-reference.html#err-upstream-unknown-outcome">upstream_unknown_outcome</a>.</p>
 <h3 id="err-unknown-request"><code>unknown_request</code></h3>
-<p>TODO</p>
+<p>Es gibt keine Anfrage mit dieser ID. Exit 2. Prüfen Sie die ID oder finden Sie sie mit <code>requests list</code>.</p>
 <h3 id="err-protocol-error"><code>protocol_error</code></h3>
-<p>TODO</p>
-<h2 id="errors-decision">Fehler bei Entscheidungen</h2>
-<p>TODO</p>
+<p>Die App und das Kommandozeilenwerkzeug haben sich nicht verstanden. Exit 1, nicht wiederholbar. Meist heißt das, dass sie verschiedene Versionen haben. Aktualisieren Sie beide und starten Sie die App neu.</p>
+<h2 id="errors-decision">Fehler beim Entscheiden</h2>
+<p>Diese Fehler erscheinen im Fenster „Freigaben“, wenn sich eine Entscheidung nicht anwenden lässt. In jedem Fall wurde nichts entschieden, und die Anfrage ist wie zuvor.</p>
 <h3 id="err-stale"><code>stale</code></h3>
-<p>TODO</p>
+<p>Die Anfrage hat sich inzwischen geändert, zum Beispiel hat sie eine neue Revision erhalten. Lesen Sie die Warteschlange neu ein, öffnen Sie die Anfrage erneut und entscheiden Sie über das, was Sie sehen.</p>
 <h3 id="err-invalid"><code>invalid</code></h3>
-<p>TODO</p>
+<p>Die Entscheidung ist für diese Anfrage nicht zulässig, zum Beispiel eine Freigabe für etwas, das sich nicht freigeben lässt, oder eine Übergabe, deren Vorschau Sie nicht geöffnet haben. Öffnen Sie zuerst die Vorschau oder entscheiden Sie einzeln.</p>
 <h3 id="err-edit-rejected"><code>edit_rejected</code></h3>
-<p>TODO</p>
+<p>Die Bearbeitung wurde zurückgewiesen, zum Beispiel weil sie das Ziel ändert, nicht gültig oder zu groß ist. Die Meldung nennt den Grund. Korrigieren Sie das Feld oder lehnen Sie die Anfrage ab. Siehe <a href="approvals.html#edit-and-redact">Bearbeiten und schwärzen</a>.</p>
 <h3 id="err-audit"><code>audit</code></h3>
-<p>TODO</p>
+<p>Die Entscheidung konnte nicht im Audit-Protokoll festgehalten werden, daher wurde nichts ausgeführt. Prüfen Sie den freien Platz des Audit-Protokolls und versuchen Sie es erneut. Siehe <a href="troubleshooting.html#audit-storage">Der Speicher für das Audit-Protokoll ist knapp</a>.</p>
 <h3 id="err-batch-rejected"><code>batch_rejected</code></h3>
-<p>TODO</p>
+<p>Die Sammelentscheidung wurde zurückgewiesen, und es wurde nichts entschieden. Mindestens eine Anfrage kam nicht infrage. Die Gründe stehen je Anfrage dabei, siehe unten und <a href="approvals.html#batch-decisions">Sammelentscheidungen</a>.</p>
 <h3 id="err-not-decidable"><code>not_decidable</code></h3>
-<p>TODO</p>
+<p>Die Anfrage wartet nicht auf eine Entscheidung. Jemand anderes hat sie entschieden, sie ist abgelaufen oder wurde storniert. Lesen Sie die Warteschlange neu ein.</p>
 <h2 id="errors-batch">Fehler bei Sammelentscheidungen</h2>
-<p>TODO</p>
+<p>Eine Sammelentscheidung nennt diese Gründe je Anfrage. Nehmen Sie die Anfrage aus der Sammelentscheidung heraus oder entscheiden Sie sie einzeln.</p>
 <h3 id="err-not-pending"><code>not_pending</code></h3>
-<p>TODO</p>
+<p>Die Anfrage steht nicht mehr aus. Sie wurde inzwischen entschieden, ist abgelaufen oder wurde storniert.</p>
 <h3 id="err-target-param-edit"><code>target_param_edit</code></h3>
-<p>TODO</p>
+<p>Das Ziel der Anfrage lässt sich nicht bearbeiten. Entscheiden Sie sie einzeln oder lehnen Sie sie ab, damit der Agent mit dem richtigen Ziel neu anfragt.</p>
 <h3 id="err-not-opened"><code>not_opened</code></h3>
-<p>TODO</p>
+<p>Die Vorschau der Anfrage wurde nicht geöffnet. Öffnen Sie die Vorschau jeder ausgewählten Anfrage, bevor Sie gesammelt entscheiden.</p>
 <h3 id="err-not-approvable"><code>not_approvable</code></h3>
-<p>TODO</p>
+<p>Die Anfrage lässt sich so nicht freigeben, zum Beispiel weil Pflichtfelder fehlen. Entscheiden Sie sie einzeln.</p>
 <h3 id="err-batch-item-flagged"><code>batch_item_flagged</code></h3>
-<p>TODO</p>
+<p>Die Anfrage ist als mögliches Duplikat oder als ähnliche Anfrage markiert. Sehen Sie sie sich an und geben Sie sie einzeln frei.</p>
 </main>
 </div>
 </body>
