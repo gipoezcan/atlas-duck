@@ -509,9 +509,10 @@ test("help_capability_has_no_app_permission", () => {
 });
 
 test("help_open_granted_to_all_other_labels", () => {
+  // The credential window keeps the smallest surface (secrets only): no help_open there (T5 review).
   assert.deepEqual(
     LABELS.filter((l) => WINDOW_COMMANDS[l].includes("help_open")),
-    LABELS.filter((l) => l !== "help"),
+    LABELS.filter((l) => l !== "help" && l !== "credential"),
   );
   const commands = [...COMMANDS, "help_open"].sort();
   const base = { commands, handlerLists: [[...commands]], allowed: [...commands, "plugin:event|listen", "plugin:event|unlisten"] };
@@ -519,4 +520,7 @@ test("help_open_granted_to_all_other_labels", () => {
   const caps = capsFor(commands);
   caps.setup.permissions = caps.setup.permissions.filter((p) => p !== "allow-help-open");
   assertFails(errorsOf(surface({ ...base, caps })), /help_open is missing from capabilities\/setup\.json/);
+  const caps2 = capsFor(commands);
+  caps2.credential.permissions.push("allow-help-open");
+  assertFails(errorsOf(surface({ ...base, caps: caps2 })), /help_open is granted to credential, outside its Δ1 windows/);
 });

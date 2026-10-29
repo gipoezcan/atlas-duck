@@ -118,7 +118,6 @@ export const WINDOW_COMMANDS = {
     "quit",
     // M10 T13 (Δ-M10-3, L201, PD-168): "Restore a backup instead" in the `keychain_lost` state.
     "restore_from_backup",
-    "help_open",
   ],
   setup: [
     "wizard_state",
@@ -143,7 +142,8 @@ export const WINDOW_COMMANDS = {
     "help_open",
   ],
   // M16 PD-328: the Help window runs static pages and holds no app permission at all; only
-  // `help_open` (granted to the other seven windows) opens it.
+  // `help_open` (granted to the other windows but `credential`, which keeps its secrets-only
+  // surface) opens it.
   help: [],
 };
 

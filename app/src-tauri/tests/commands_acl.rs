@@ -5411,7 +5411,6 @@ const S09_GRANTS: [(&str, &[&str]); 8] = [
             "quit",
             // M10 T13 (Δ-M10-3, L201): "Restore a backup instead" in `keychain_lost`.
             "restore_from_backup",
-            "help_open",
         ],
     ),
     (

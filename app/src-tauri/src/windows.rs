@@ -392,12 +392,12 @@ pub fn nav_allowed(url: &Url, frame: Frame, policy: &NavPolicy) -> bool {
     }
 }
 
-/// [`nav_allowed`] for the window `label`: the Help window's main frame also stays under
-/// `/help/` (M16, PD-328), so its pages cannot navigate into the app's own windows.
+/// [`nav_allowed`] for the window `label`: the Help window may load only `/help/` of the app
+/// origin (M16, PD-328), so its pages cannot navigate into the app's own windows. The rule does
+/// not look at the frame: macOS and Linux do not report it (`Frame::Unreported`).
 pub fn nav_allowed_for(label: Label, url: &Url, frame: Frame, policy: &NavPolicy) -> bool {
     nav_allowed(url, frame, policy)
         && (label != Label::Help
-            || frame != Frame::Main
             || origin_of(url).as_deref() != Some(policy.app_origin)
             || url.path().starts_with(HELP_PATH_PREFIX))
 }
@@ -1167,34 +1167,50 @@ mod tests {
     fn help_window_navigation_stays_under_help() {
         let mac = NavPolicy::new(ISO_MAC.into(), false);
         let win = NavPolicy::new(ISO_WIN.into(), true);
-        for (p, origin) in [
-            (&mac, "tauri://localhost"),
-            (&win, "http://tauri.localhost"),
-        ] {
-            for ok in [
-                "/help/en/index.html",
-                "/help/de/approvals.html#queue",
-                "/help/de/",
+        // macOS and Linux do not report the frame (`Unreported`, see `RUNTIME_FRAME`): the rule
+        // holds for every kind of frame.
+        for frame in [Frame::Main, Frame::Unreported, Frame::Sub] {
+            for (p, origin) in [
+                (&mac, "tauri://localhost"),
+                (&win, "http://tauri.localhost"),
             ] {
-                let u = url(&format!("{origin}{ok}"));
-                assert!(nav_allowed_for(Label::Help, &u, Frame::Main, p), "{u}");
+                for ok in [
+                    "/help/en/index.html",
+                    "/help/de/approvals.html#queue",
+                    "/help/de/",
+                ] {
+                    let u = url(&format!("{origin}{ok}"));
+                    assert!(nav_allowed_for(Label::Help, &u, frame, p), "{u} {frame:?}");
+                }
+                for bad in [
+                    "/",
+                    "/approvals.html",
+                    "/settings.html",
+                    "/helpx/a.html",
+                    "/assets/x.js",
+                    "/help/../approvals.html",
+                    "/help/%2e%2e/approvals.html",
+                ] {
+                    let u = url(&format!("{origin}{bad}"));
+                    assert!(!nav_allowed_for(Label::Help, &u, frame, p), "{u} {frame:?}");
+                    // Every other window keeps the app-origin rule.
+                    assert!(
+                        nav_allowed_for(Label::Settings, &u, frame, p),
+                        "{u} {frame:?}"
+                    );
+                }
+                // Remote pages stay refused, as everywhere.
+                let remote = url("https://example.com/help/en/index.html");
+                assert!(!nav_allowed_for(Label::Help, &remote, frame, p));
             }
-            for bad in [
-                "/",
-                "/approvals.html",
-                "/settings.html",
-                "/helpx/a.html",
-                "/assets/x.js",
-            ] {
-                let u = url(&format!("{origin}{bad}"));
-                assert!(!nav_allowed_for(Label::Help, &u, Frame::Main, p), "{u}");
-                // Every other window keeps the app-origin rule.
-                assert!(nav_allowed_for(Label::Settings, &u, Frame::Main, p), "{u}");
-            }
-            // Remote pages stay refused, as everywhere.
-            let remote = url("https://example.com/help/en/index.html");
-            assert!(!nav_allowed_for(Label::Help, &remote, Frame::Main, p));
         }
+        // The isolation origin and `about:srcdoc` of a subframe are not the app's own pages.
+        assert!(nav_allowed_for(
+            Label::Help,
+            &url(ABOUT_SRCDOC),
+            Frame::Sub,
+            &mac
+        ));
     }
 
     #[test]

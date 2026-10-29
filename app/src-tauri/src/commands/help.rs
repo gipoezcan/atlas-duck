@@ -1,9 +1,12 @@
 //! `help_open` (M16, PD-328): opens the Help window at a page of the bundled user guide.
 //!
-//! Granted to every window except `help` itself, which holds no app permission. The page and the
+//! Granted to the windows that carry a "Help" link (not `help` itself, which holds no app
+//! permission, and not `credential`, which keeps its secrets-only surface). The page and the
 //! anchor are checked against the bundled desktop manifest (the same file the guide's pages are
 //! generated with), so the window can only be pointed at a page that exists; the language is the
 //! resolved UI language, never an argument.
+
+use std::sync::LazyLock;
 
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
@@ -16,6 +19,12 @@ use crate::windows;
 
 /// The desktop guide's manifest. The two languages carry the same pages and anchors.
 const MANIFEST_EN: &str = include_str!("../../../ui/public/help/en/manifest.json");
+#[cfg(test)]
+const MANIFEST_DE: &str = include_str!("../../../ui/public/help/de/manifest.json");
+
+/// [`MANIFEST_EN`], parsed once.
+static EN: LazyLock<Value> =
+    LazyLock::new(|| serde_json::from_str(MANIFEST_EN).unwrap_or(Value::Null));
 
 /// `page`: a page id of the bundled manifest; anything else is refused with `field: "page"`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,7 +33,7 @@ pub struct HelpPage(String);
 impl<'de> Deserialize<'de> for HelpPage {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d).map_err(|_| refuse::<D::Error>("page"))?;
-        validate_in(MANIFEST_EN, &s, None).map_err(refuse::<D::Error>)?;
+        validate_in(&EN, &s, None).map_err(refuse::<D::Error>)?;
         Ok(HelpPage(s))
     }
 }
@@ -64,7 +73,7 @@ impl HelpOpenArgs {
     /// Refuses an anchor the page does not have (`field: "anchor"`).
     pub fn check_anchor(&self) -> Result<(), CommandError> {
         let anchor = self.anchor.as_ref().map(|a| a.0.as_str());
-        validate_in(MANIFEST_EN, &self.page.0, anchor)
+        validate_in(&EN, &self.page.0, anchor)
             .map_err(|field| CommandError::InvalidArgument { field })
     }
 
@@ -87,8 +96,7 @@ pub fn help_url(lang: Lang, page: &str, anchor: Option<&str>) -> String {
 }
 
 /// The field a page or anchor the manifest does not list is refused with.
-fn validate_in(manifest: &str, page: &str, anchor: Option<&str>) -> Result<(), &'static str> {
-    let doc: Value = serde_json::from_str(manifest).map_err(|_| "page")?;
+fn validate_in(doc: &Value, page: &str, anchor: Option<&str>) -> Result<(), &'static str> {
     let entry = doc
         .get("pages")
         .and_then(Value::as_array)
@@ -198,10 +206,45 @@ mod tests {
             let id = p["id"].as_str().ok_or(CommandError::Internal)?;
             for a in p["anchors"].as_array().ok_or(CommandError::Internal)? {
                 let a = a.as_str().ok_or(CommandError::Internal)?;
-                validate_in(MANIFEST_EN, id, Some(a))
+                validate_in(&EN, id, Some(a))
                     .map_err(|field| CommandError::InvalidArgument { field })?;
             }
         }
+        Ok(())
+    }
+
+    /// The window validates against `en` only; the two languages must list the same pages and
+    /// anchors, or a `de` page would open at the wrong place.
+    #[test]
+    fn de_manifest_matches_en() -> Result<(), CommandError> {
+        let de: Value = serde_json::from_str(MANIFEST_DE).map_err(|_| CommandError::Internal)?;
+        let shape = |doc: &Value| -> Vec<(String, Vec<String>)> {
+            let strings = |v: &Value| -> Vec<String> {
+                v.as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|s| s.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            doc["pages"]
+                .as_array()
+                .map(|pages| {
+                    pages
+                        .iter()
+                        .map(|p| {
+                            (
+                                p["id"].as_str().unwrap_or_default().to_owned(),
+                                strings(&p["anchors"]),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert!(!shape(&EN).is_empty());
+        assert_eq!(shape(&EN), shape(&de));
         Ok(())
     }
 
