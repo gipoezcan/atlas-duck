@@ -168,7 +168,7 @@ impl TestServer {
             sessions,
             login,
             registry: registry.clone(),
-            web: WebDir(web),
+            web: WebDir::new(web),
             health: Arc::new(Health::new(store.clone(), directory, true)),
             api_keys: Arc::new(
                 ApiKeys::new(store.clone(), clock.clone(), ApiKeyParams::TEST).unwrap(),
