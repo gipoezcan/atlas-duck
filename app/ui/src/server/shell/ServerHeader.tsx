@@ -4,6 +4,7 @@ import { LANG_PREFS, type LangPref } from '../../shared/i18n';
 import { useText } from '../../shared/i18n/context';
 import { csrf, loadSession } from '../../shared/ipc/transport-http';
 import { nav, useSession } from './RequireSession';
+import { ServerHelpIndex, ServerHelpLink, type ServerPath, serverTarget } from './ServerHelp';
 import { saveLangPref, useServerLangPref } from './ServerLangRoot';
 
 /** `POST /api/logout` (cookie + CSRF + Origin), then the login page. */
@@ -73,6 +74,8 @@ export function ServerHeader() {
       if (mine === latest.current) setPending(null);
     });
   };
+  const path = window.location.pathname;
+  const here = serverTarget(path) === undefined ? undefined : (path as ServerPath);
   const admin = session?.roles.includes('admin') ?? false;
   const auditor = session?.roles.includes('auditor') ?? false;
   return (
@@ -103,6 +106,8 @@ export function ServerHeader() {
             </select>
           </label>
         )}
+        <ServerHelpIndex />
+        {here === undefined ? null : <ServerHelpLink path={here} />}
         <span className="server-user">{session?.user ?? ''}</span>
         <button
           type="button"

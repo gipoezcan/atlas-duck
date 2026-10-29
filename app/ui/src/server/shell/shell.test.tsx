@@ -106,4 +106,34 @@ describe('server shell', () => {
     expect((init.headers as Record<string, string>)['X-CSRF-Token']).toBe('csrf-1');
     expect(assign).toHaveBeenCalledWith('/login');
   });
+
+  it('header_has_help_and_a_page_question_mark', async () => {
+    vi.mocked(loadSession).mockResolvedValue(session(['user']));
+    window.history.replaceState(null, '', '/credentials');
+    render(
+      <RequireSession>
+        <ServerHeader />
+      </RequireSession>,
+    );
+    await flush();
+    const help = screen.getByRole('link', { name: SHELL_TEXT.help });
+    expect(help.getAttribute('href')).toBe('/docs/en/');
+    expect(help.getAttribute('target')).toBe('_blank');
+    expect(help.getAttribute('rel')).toBe('noreferrer');
+    const q = screen.getByRole('link', { name: SHELL_TEXT.help_page });
+    expect(q.getAttribute('href')).toBe('/docs/en/instances-and-tokens#credentials-page');
+  });
+
+  it('header_has_no_question_mark_on_an_unlisted_path', async () => {
+    vi.mocked(loadSession).mockResolvedValue(session(['user']));
+    window.history.replaceState(null, '', '/somewhere-else');
+    render(
+      <RequireSession>
+        <ServerHeader />
+      </RequireSession>,
+    );
+    await flush();
+    expect(screen.getByRole('link', { name: SHELL_TEXT.help })).toBeTruthy();
+    expect(screen.queryByRole('link', { name: SHELL_TEXT.help_page })).toBeNull();
+  });
 });

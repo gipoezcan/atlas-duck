@@ -6,6 +6,7 @@ import { en } from '../../shared/i18n/dict';
 import { own } from '../../shared/text/own';
 import { api, type ConsentDetails, isConsentDetails, isConsentRedirect } from '../http';
 import { nav } from '../shell/RequireSession';
+import { ServerHelpLink } from '../shell/ServerHelp';
 
 /** The fixed text for an `?error=<code>` of the error page (never the code itself). */
 export function errorText(code: string, t: Dict = en): string {
@@ -59,6 +60,7 @@ export function ConsentError({ code }: { code: string }) {
   return (
     <main className="window window-consent">
       <h1>{t.server.consent.title}</h1>
+      <ServerHelpLink path="/oauth/consent" />
       <p role="alert" className="notice notice-danger">
         {errorText(code, t)}
       </p>
@@ -122,6 +124,7 @@ export function Consent({ req }: { req: string }) {
   return (
     <main className="window window-consent">
       <h1>{t.server.consent.title}</h1>
+      <ServerHelpLink path="/oauth/consent" />
       {errorKey !== null ? (
         <p role="alert" className="notice notice-danger">
           {t.server.consent.errors[errorKey]}
