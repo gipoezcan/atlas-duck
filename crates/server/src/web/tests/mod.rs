@@ -184,6 +184,29 @@ impl H {
         );
         let _ = std::fs::write(web.join("assets").join("app-1a2b.js"), "console.log(1)");
         let _ = std::fs::write(dir.path().join("secret.txt"), "not served");
+        // M16: a two-page guide in each language, as docgen writes it.
+        for lang in ["en", "de"] {
+            let docs = web.join("docs").join(lang);
+            let _ = std::fs::create_dir_all(docs.join("assets"));
+            let _ = std::fs::write(
+                docs.join("manifest.json"),
+                r#"{"lang":"x","set":"server","pages":[{"id":"index","title":"Overview","file":"index.html","anchors":[]},{"id":"approvals","title":"Approvals","file":"approvals.html","anchors":["queue"]},{"id":"ghost","title":"Ghost","file":"ghost.html","anchors":[]}]}"#,
+            );
+            let _ = std::fs::write(
+                docs.join("index.html"),
+                format!("<title>index {lang}</title>"),
+            );
+            let _ = std::fs::write(
+                docs.join("approvals.html"),
+                format!("<title>approvals {lang}</title>"),
+            );
+            let _ = std::fs::write(docs.join("assets").join("help.css"), "body{}");
+            let _ = std::fs::write(docs.join("assets").join(".hidden"), "x");
+        }
+        let _ = std::fs::write(
+            web.join("docs").join("en").join("not-in-manifest.html"),
+            "x",
+        );
         let registry = Arc::new(crate::runtime::Registry::new(
             crate::runtime::RuntimeDeps {
                 data_dir: dir.path().join("data"),
@@ -211,7 +234,7 @@ impl H {
             sessions,
             login,
             registry: registry.clone(),
-            web: crate::static_files::WebDir(web),
+            web: crate::static_files::WebDir::new(web),
             health: Arc::new(crate::health::Health::new(
                 store.clone(),
                 stub.clone(),
@@ -942,6 +965,184 @@ async fn static_routes_never_escape_the_web_dir() {
     ] {
         assert_eq!(get(&h, uri).await.status(), StatusCode::NOT_FOUND, "{uri}");
     }
+}
+
+// ---- M16 T6: the user guide under /docs -----------------------------------------------------------
+
+async fn get_with(h: &H, uri: &str, headers: &[(&str, &str)]) -> Response {
+    let mut b = Request::builder().uri(uri);
+    for (k, v) in headers {
+        b = b.header(*k, *v);
+    }
+    h.send(b.body(Body::empty()).unwrap()).await
+}
+
+async fn text_body(res: Response) -> String {
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn docs_page_served_without_session() {
+    let h = H::new();
+    for (uri, want) in [
+        ("/docs/en/", "index en"),
+        ("/docs/de/", "index de"),
+        ("/docs/en/index", "index en"),
+        ("/docs/de/approvals", "approvals de"),
+    ] {
+        let res = get(&h, uri).await;
+        assert_eq!(res.status(), StatusCode::OK, "{uri}");
+        assert!(
+            res.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        assert!(text_body(res).await.contains(want), "{uri}");
+    }
+    // The asset is served, and HEAD answers like GET without a body.
+    let css = get(&h, "/docs/en/assets/help.css").await;
+    assert_eq!(css.status(), StatusCode::OK);
+    assert!(
+        css.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/css")
+    );
+    let head = h
+        .send(
+            Request::builder()
+                .method(Method::HEAD)
+                .uri("/docs/en/approvals")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(head.status(), StatusCode::OK);
+    // Read-only: a state-changing method is refused, with or without an Origin.
+    for method in [Method::POST, Method::PUT, Method::DELETE] {
+        let res = h
+            .send(
+                Request::builder()
+                    .method(method)
+                    .uri("/docs/en/approvals")
+                    .header(header::ORIGIN, ORIGIN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+}
+
+#[tokio::test]
+async fn docs_headers() {
+    let h = H::new();
+    for uri in [
+        "/docs/en/",
+        "/docs/en/approvals",
+        "/docs/de/assets/help.css",
+    ] {
+        let res = get(&h, uri).await;
+        let hd = res.headers();
+        assert_eq!(
+            hd[header::CONTENT_SECURITY_POLICY],
+            crate::static_files::CSP,
+            "{uri}"
+        );
+        assert_eq!(hd[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{uri}");
+        assert_eq!(hd[header::REFERRER_POLICY], "no-referrer", "{uri}");
+        assert_eq!(hd[header::CACHE_CONTROL], "no-cache", "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn docs_rejects_traversal_and_unknown_lang() {
+    let h = H::new();
+    for uri in [
+        "/docs/fr/index",
+        "/docs/fr/",
+        "/docs/EN/index",
+        "/docs/en/..%2fadmin",
+        "/docs/en/%2e%2e%2fadmin",
+        "/docs/en/%2e%2e",
+        "/docs/en/a%5cb",
+        "/docs/en/a%2fb",
+        "/docs/en/index.html",
+        "/docs/en/ghost",
+        "/docs/en/missing",
+        "/docs/en/not-in-manifest",
+        "/docs/en/manifest.json",
+        "/docs/en/assets/..%2fmanifest.json",
+        "/docs/en/assets/.hidden",
+        "/docs/en/assets/missing.css",
+        "/docs/fr/assets/help.css",
+        "/docs/../secret.txt",
+    ] {
+        assert_eq!(get(&h, uri).await.status(), StatusCode::NOT_FOUND, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn docs_root_redirects_to_lang() {
+    let h = H::new();
+    for (accept, want) in [
+        (None, "/docs/en/"),
+        (Some("de-DE,de;q=0.9,en;q=0.8"), "/docs/de/"),
+        (Some("de"), "/docs/de/"),
+        (Some("en-US,en;q=0.9"), "/docs/en/"),
+        (Some("fr-FR,fr;q=0.9"), "/docs/en/"),
+        (Some("fr, de;q=0.5"), "/docs/de/"),
+        (Some("*"), "/docs/en/"),
+    ] {
+        for uri in ["/docs", "/docs/"] {
+            let headers: Vec<(&str, &str)> =
+                accept.map(|a| ("accept-language", a)).into_iter().collect();
+            let res = get_with(&h, uri, &headers).await;
+            assert_eq!(res.status(), StatusCode::FOUND, "{uri} {accept:?}");
+            assert_eq!(res.headers()[header::LOCATION], want, "{uri} {accept:?}");
+            assert_eq!(res.headers()[header::VARY], "Accept-Language");
+        }
+    }
+    // A language without the slash is sent to its root; an unknown one is not.
+    let res = get(&h, "/docs/de").await;
+    assert_eq!(res.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(res.headers()[header::LOCATION], "/docs/de/");
+    assert_eq!(get(&h, "/docs/fr").await.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn docs_assets_validated() {
+    let h = H::new();
+    assert_eq!(
+        get(&h, "/docs/en/assets/help.css").await.status(),
+        StatusCode::OK
+    );
+    for uri in [
+        "/docs/en/assets/%2e%2e%2fapprovals.html",
+        "/docs/en/assets/a%5cb",
+        "/docs/en/assets/a%00b",
+        "/docs/en/assets/h%C3%A9.css",
+        "/docs/en/assets/..",
+    ] {
+        assert_eq!(get(&h, uri).await.status(), StatusCode::NOT_FOUND, "{uri}");
+    }
+}
+
+/// A missing docs directory (an older build) does not stop the server: every `/docs/...` is 404.
+#[test]
+fn docs_index_without_a_docs_dir_is_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let web = crate::static_files::WebDir::new(tmp.path().to_path_buf());
+    assert!(web.1.file("en", "index").is_none());
+    let res = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(crate::static_files::docs_page(&web, "en", None));
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

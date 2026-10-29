@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import react from '@vitejs/plugin-react';
 import { defineConfig } from 'vite';
 
@@ -10,7 +11,9 @@ const PAGES = ['index', 'login', 'approvals', 'credentials', 'api-keys', 'admin'
 
 export default defineConfig({
   root: 'web',
-  publicDir: false,
+  // `root` is `web/`, so the public dir is an absolute path (M16, PD-323). It holds the generated
+  // user guide (`public-server/docs/<lang>/`, crates/docgen) and is copied into `dist-server/`.
+  publicDir: fileURLToPath(new URL('./public-server', import.meta.url)),
   plugins: [react()],
   define: {
     'import.meta.env.VITE_ATLAS_DUCK_TRANSPORT': JSON.stringify('http'),
