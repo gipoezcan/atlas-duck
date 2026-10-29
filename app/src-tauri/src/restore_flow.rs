@@ -230,7 +230,7 @@ pub(crate) fn ask_restore(
     if confirmer.confirm(text) != Confirm::Ok {
         return Err(NotAsked::Cancelled);
     }
-    let confirmed = crate::serve::confirmed_by(text);
+    let confirmed = crate::serve::confirmed_by(lang, text);
     if stop() {
         return Err(NotAsked::Cancelled);
     }
@@ -273,7 +273,7 @@ fn ask_rollback(
         }
         let after = head();
         if after == before {
-            return Some(crate::serve::confirmed_by(&text));
+            return Some(crate::serve::confirmed_by(lang, &text));
         }
         count = count.saturating_add(after.saturating_sub(before));
     }
@@ -1039,6 +1039,8 @@ pub(crate) mod tests {
                 "key": "restore_backup",
                 "dialog_text_sha256": sha256_hex(RESTORE_CONFIRM_TEXT.as_bytes()),
                 "rollback_dialog_text_sha256": sha256_hex(texts[1].as_bytes()),
+                "dialog_lang": "en",
+                "rollback_dialog_lang": "en",
             })
         );
         Ok(())

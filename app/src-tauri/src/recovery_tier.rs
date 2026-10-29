@@ -435,8 +435,9 @@ pub fn set_anchor_dir(
     if same_dir(Some(Path::new(path)), current.as_deref().map(Path::new)) {
         return Err(CommandError::AnchorDir(AnchorDirFailure::Unchanged));
     }
+    let lang = out.lang();
     let set_text = anchor_dir_set_text(
-        out.lang(),
+        lang,
         &one_line(path),
         current.as_deref().map(one_line).as_deref(),
         &one_line(&file_name(chain_id)),
@@ -444,7 +445,7 @@ pub fn set_anchor_dir(
     if confirmer.confirm(&set_text) != Confirm::Ok {
         return Err(CommandError::Cancelled);
     }
-    let confirmed = crate::serve::confirmed_by(&set_text);
+    let confirmed = crate::serve::confirmed_by(lang, &set_text);
     if stop() {
         return Err(CommandError::NotReady);
     }
@@ -471,11 +472,12 @@ pub fn remove_anchor_dir(
     let Some(current) = facts.0.as_deref() else {
         return Err(CommandError::AnchorDir(AnchorDirFailure::NotSet));
     };
-    let remove_text = anchor_dir_remove_text(out.lang(), &one_line(current));
+    let lang = out.lang();
+    let remove_text = anchor_dir_remove_text(lang, &one_line(current));
     if confirmer.confirm(&remove_text) != Confirm::Ok {
         return Err(CommandError::Cancelled);
     }
-    let confirmed = crate::serve::confirmed_by(&remove_text);
+    let confirmed = crate::serve::confirmed_by(lang, &remove_text);
     if stop() {
         return Err(CommandError::NotReady);
     }
@@ -528,11 +530,12 @@ pub fn re_anchor(
     out: &dyn EventOut,
 ) -> Result<ReAnchoredDto, CommandError> {
     let missing = re_anchor_gate(store)?;
-    let re_text = re_anchor_text(out.lang(), missing);
+    let lang = out.lang();
+    let re_text = re_anchor_text(lang, missing);
     if confirmer.confirm(&re_text) != Confirm::Ok {
         return Err(CommandError::Cancelled);
     }
-    let confirmed = crate::serve::confirmed_by(&re_text);
+    let confirmed = crate::serve::confirmed_by(lang, &re_text);
     if stop() {
         return Err(CommandError::NotReady);
     }
@@ -589,7 +592,7 @@ fn ask_keys(
 ) -> (String, Option<atlas_duck_audit::Confirmed>) {
     let text = forget_keys_text(lang, install_id, &shown(key_entries));
     let confirmed = if confirmer.confirm(&text) == Confirm::Ok {
-        Some(crate::serve::confirmed_by(&text))
+        Some(crate::serve::confirmed_by(lang, &text))
     } else {
         None
     };
@@ -646,8 +649,9 @@ pub fn forget(
     let id = orphan.install_id().to_owned();
     let (key_entries, others) = split_keys(&orphan);
     let tokens: Vec<String> = others.iter().filter(|e| *e != "canary").cloned().collect();
+    let lang = out.lang();
     let first_text = forget_text(
-        out.lang(),
+        lang,
         &ForgetFacts {
             install_id: &id,
             archived_files: &shown(orphan.archived_files()),
@@ -659,14 +663,14 @@ pub fn forget(
     if confirmer.confirm(&first_text) != Confirm::Ok {
         return Err(CommandError::Cancelled);
     }
-    let confirmed = crate::serve::confirmed_by(&first_text);
+    let confirmed = crate::serve::confirmed_by(lang, &first_text);
     if stop() {
         return Err(CommandError::NotReady);
     }
     // The second dialog only while keys are left; its Cancel keeps them (not a cancel of the call).
     let keys_asked = !key_entries.is_empty();
     let (keys_text, keys_confirmed) = if keys_asked {
-        let (t, c) = ask_keys(out.lang(), confirmer, &id, &key_entries);
+        let (t, c) = ask_keys(lang, confirmer, &id, &key_entries);
         (Some(t), c)
     } else {
         (None, None)
@@ -699,16 +703,21 @@ pub fn forget(
         "entries": orphan.entries(),
         "archived_files": orphan.archived_files(),
     });
-    let new = json!({
+    let mut new = json!({
         "install_id": id,
         "delete": delete,
         "keys": with_keys,
         "keys_asked": keys_asked,
         "dialog_text_sha256": sha256_hex(first_text.as_bytes()),
+        "dialog_lang": atlas_duck_audit::DialogLang::from(lang).as_str(),
         "keys_dialog_text_sha256": keys_text
             .filter(|_| with_keys)
             .map(|t| sha256_hex(t.as_bytes())),
     });
+    // M15: the keys dialog was shown in the same language; its field only with its hash.
+    if with_keys {
+        new["keys_dialog_lang"] = json!(atlas_duck_audit::DialogLang::from(lang).as_str());
+    }
     // Audit before effect: a record that cannot be written deletes nothing.
     record(KEY_FORGET_INSTALL, old, new.clone()).map_err(CommandError::Settings)?;
     emit_audit_changed(out);
@@ -902,6 +911,7 @@ mod tests {
     fn confirmed_test() -> atlas_duck_audit::Confirmed {
         atlas_duck_audit::Confirmed {
             dialog_text_sha256: [2; 32],
+            dialog_lang: None,
         }
     }
 
@@ -1784,6 +1794,7 @@ mod tests {
             &r.lock,
             atlas_duck_audit::Confirmed {
                 dialog_text_sha256: [1; 32],
+                dialog_lang: None,
             },
         )?;
         let (b_id, b_chain) = new_ids()?;

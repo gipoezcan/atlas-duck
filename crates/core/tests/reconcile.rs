@@ -538,6 +538,7 @@ fn restore_own_backup(h: &Harness) -> Result<RestoreReport, TestError> {
         .bundle_dir;
     let confirmed = Confirmed {
         dialog_text_sha256: [1; 32],
+        dialog_lang: None,
     };
     let report = store
         .restore(

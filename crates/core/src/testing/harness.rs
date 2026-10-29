@@ -490,6 +490,7 @@ fn seed_settings(
 ) -> Result<(), TestError> {
     let confirmed = Confirmed {
         dialog_text_sha256: Sha256::digest(b"harness seed").into(),
+        dialog_lang: None,
     };
     let audit = store.store();
     for (i, id) in instances.iter().zip(ids) {

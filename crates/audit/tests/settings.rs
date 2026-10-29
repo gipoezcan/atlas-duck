@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 fn confirmed() -> Confirmed {
     Confirmed {
         dialog_text_sha256: [7; 32],
+        dialog_lang: None,
     }
 }
 

@@ -38,6 +38,7 @@ fn chosen(p: &Path) -> RustChosenPath {
 fn confirmed(b: u8) -> Confirmed {
     Confirmed {
         dialog_text_sha256: [b; 32],
+        dialog_lang: None,
     }
 }
 

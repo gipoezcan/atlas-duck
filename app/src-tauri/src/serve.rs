@@ -1164,7 +1164,8 @@ pub async fn archive_and_start_fresh(state: &Arc<ServeState>) -> Result<Archived
     if state.keychain_lost().is_none() {
         return failed(UnlockFailure::NotLocked);
     }
-    let text = archive_confirm_text((state.hooks.lang)(), &restart.opener.data);
+    let lang = (state.hooks.lang)();
+    let text = archive_confirm_text(lang, &restart.opener.data);
     let confirmer = restart.starter.confirmer.clone();
     // The dialog blocks until the user answers: never on the async runtime or the main thread.
     // The guard goes into that thread and comes back out of it, so a dropped caller leaves the
@@ -1177,7 +1178,7 @@ pub async fn archive_and_start_fresh(state: &Arc<ServeState>) -> Result<Archived
     if answer != Confirm::Ok {
         return failed(UnlockFailure::Cancelled);
     }
-    let confirmed = confirmed_by(&text);
+    let confirmed = confirmed_by(lang, &text);
     let (st, opener) = (state.clone(), restart.opener.clone());
     let done = state.spawn_unlock_work(async move {
         let _one_archive_at_a_time = one;
@@ -1290,7 +1291,8 @@ pub async fn restore_from_backup(
 
 /// The audit store's proof of a native confirmation: the SHA-256 of the dialog text. Every caller
 /// draws that dialog first and calls this on its Ok path (`ci/check-dialog-proofs.mjs` rule 3).
-pub(crate) fn confirmed_by(text: &str) -> Confirmed {
+/// `lang` is the language `text` was built in (M15: recorded as `dialog_lang`).
+pub(crate) fn confirmed_by(lang: Lang, text: &str) -> Confirmed {
     let hex = atlas_duck_core::payloads::sha256_hex(text.as_bytes());
     let mut digest = [0u8; 32];
     for (i, b) in digest.iter_mut().enumerate() {
@@ -1301,6 +1303,7 @@ pub(crate) fn confirmed_by(text: &str) -> Confirmed {
     }
     Confirmed {
         dialog_text_sha256: digest,
+        dialog_lang: Some(lang.into()),
     }
 }
 

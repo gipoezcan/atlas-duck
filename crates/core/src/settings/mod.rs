@@ -613,9 +613,10 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn confirmed(text: &str) -> Confirmed {
+fn confirmed(lang: crate::Lang, text: &str) -> Confirmed {
     Confirmed {
         dialog_text_sha256: Sha256::digest(text.as_bytes()).into(),
+        dialog_lang: Some(crate::dialog_lang(lang)),
     }
 }
 
@@ -958,10 +959,7 @@ fn record(p: &Planned, confirmed: Option<&Confirmed>, applied: bool) -> NewEvent
         }
         o.insert(
             "confirmed".into(),
-            confirmed.map_or(
-                Value::Null,
-                |c| json!({ "dialog_text_sha256": hex::encode(c.dialog_text_sha256) }),
-            ),
+            confirmed.map_or(Value::Null, Confirmed::payload),
         );
     }
     ev
@@ -1031,9 +1029,10 @@ impl CoreSettings {
 
     /// The native dialog on the caller's (blocking-pool) thread, no lock held (PD-13); an OK
     /// given after the shutdown began changes nothing.
-    fn confirm(&self, text: &str) -> Result<Confirmed, SettingsError> {
+    /// `lang` is the language `text` was built in (recorded with the proof, M15).
+    fn confirm(&self, lang: crate::Lang, text: &str) -> Result<Confirmed, SettingsError> {
         match self.engine.confirmer().confirm(text) {
-            Confirm::Ok => self.still_running().map(|()| confirmed(text)),
+            Confirm::Ok => self.still_running().map(|()| confirmed(lang, text)),
             Confirm::Cancel => Err(SettingsError::Cancelled),
         }
     }
@@ -1306,7 +1305,7 @@ impl SettingsAdmin for CoreSettings {
         let mut confirmations = Vec::with_capacity(planned.len());
         for p in &planned {
             confirmations.push(match &p.dialog {
-                Some(text) => Some(self.confirm(text)?),
+                Some(text) => Some(self.confirm(lang, text)?),
                 None => None,
             });
         }
@@ -1325,7 +1324,7 @@ impl SettingsAdmin for CoreSettings {
     fn prune_backlog_now(&self) -> Result<PruneReport, SettingsError> {
         let _job = self.enter()?;
         let lang = self.engine.confirmer().lang();
-        let c = self.confirm(lang.pick(PRUNE_BACKLOG_TEXT, PRUNE_BACKLOG_TEXT_DE))?;
+        let c = self.confirm(lang, lang.pick(PRUNE_BACKLOG_TEXT, PRUNE_BACKLOG_TEXT_DE))?;
         self.store
             .prune(Some(c))
             .map(PruneReport::from)

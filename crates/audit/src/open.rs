@@ -876,18 +876,18 @@ fn first_run_records(
         .transpose()
         .map_err(audit_err)?;
     let archive_confirmation = match (&input.archive_confirmed, archived) {
-        (Some(c), Some(a)) => Some(
-            PreparedEvent::system(
-                EventType::CONFIG_CHANGED,
-                &json!({
-                    "source": "app",
-                    "key": "archive_and_start_fresh",
-                    "archived_db_file": a.file,
-                    "dialog_text_sha256": hex::encode(c.dialog_text_sha256),
-                }),
-            )
-            .map_err(audit_err)?,
-        ),
+        (Some(c), Some(a)) => {
+            let mut payload = json!({
+                "source": "app",
+                "key": "archive_and_start_fresh",
+                "archived_db_file": a.file,
+                "dialog_text_sha256": hex::encode(c.dialog_text_sha256),
+            });
+            if let Some(lang) = c.dialog_lang {
+                payload["dialog_lang"] = json!(lang.as_str());
+            }
+            Some(PreparedEvent::system(EventType::CONFIG_CHANGED, &payload).map_err(audit_err)?)
+        }
         _ => None,
     };
     let archived_db = archived.map_or(Value::Null, |a| {

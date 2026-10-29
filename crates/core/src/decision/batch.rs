@@ -171,7 +171,7 @@ fn cautions(lang: crate::Lang, warnings: &[atlas_duck_preview::warning::Warning]
 
 /// Checks one item against the current state (the rules of step 1 and step 3) and gathers what
 /// its decision and its dialog line need.
-async fn check(engine: &Arc<Engine>, item: &BatchItem) -> Result<Checked, Fail> {
+async fn check(engine: &Arc<Engine>, lang: crate::Lang, item: &BatchItem) -> Result<Checked, Fail> {
     let Some(entry) = engine.entry(&item.request_id) else {
         return Err(Fail::Item(BatchFailure::NotPending));
     };
@@ -283,7 +283,7 @@ async fn check(engine: &Arc<Engine>, item: &BatchItem) -> Result<Checked, Fail> 
         op_id: entry.head.op_id.clone(),
         target: shown(&entry.target_display),
         alias,
-        cautions: cautions(engine.confirmer().lang(), &warnings),
+        cautions: cautions(lang, &warnings),
     };
     Ok(Checked {
         entry,
@@ -297,12 +297,13 @@ async fn check(engine: &Arc<Engine>, item: &BatchItem) -> Result<Checked, Fail> 
 /// Checks every item; all failures are logged (one record each), then reported together.
 async fn check_all(
     engine: &Arc<Engine>,
+    lang: crate::Lang,
     items: &[BatchItem],
 ) -> Result<Vec<Checked>, DecisionError> {
     let mut ok = Vec::with_capacity(items.len());
     let mut bad = Vec::new();
     for it in items {
-        match check(engine, it).await {
+        match check(engine, lang, it).await {
             Ok(c) => ok.push(c),
             Err(Fail::Item(f)) => bad.push((it.request_id.clone(), f)),
             Err(Fail::Audit(e)) => return Err(DecisionError::Audit(e)),
@@ -470,13 +471,15 @@ pub(super) async fn decide_batch(
         return Err(DecisionError::BatchRejected { failed: Vec::new() });
     }
     // 1. Pre-check, nothing held afterwards.
-    let lines: Vec<Line> = check_all(&engine, &items)
+    // m-2: the language is read once; the cautions and the frame are in it, and the record says it.
+    let lang = engine.confirmer().lang();
+    let lines: Vec<Line> = check_all(&engine, lang, &items)
         .await?
         .into_iter()
         .map(|c| c.line)
         .collect();
     // 2. The dialog.
-    let text = dialog_text(engine.confirmer().lang(), &lines);
+    let text = dialog_text(lang, &lines);
     let text_sha256: [u8; 32] = Sha256::digest(text.as_bytes()).into();
     if confirm(&engine, text).await == Confirm::Cancel {
         return Err(DecisionError::Cancelled);
@@ -501,7 +504,7 @@ pub(super) async fn decide_batch(
         return Err(DecisionError::BatchRejected { failed: gone });
     }
     let gates = Engine::lock_gates(&entries).await;
-    let checked = check_all(&engine, &items).await?;
+    let checked = check_all(&engine, lang, &items).await?;
     // 4. One append: `BATCH_CONFIRMED` first, then every item's decision.
     let batch_id = BatchId::new()
         .map_err(|_| DecisionError::Audit(AuditError::AppendFailed("no batch id".into())))?;
@@ -510,8 +513,13 @@ pub(super) async fn decide_batch(
         .map(|c| (c.entry.head.request_id.clone(), c.rev))
         .collect();
     // The approver's identity columns are those of every other human decision record.
-    let lead =
-        payloads::batch_confirmed(&Actor::default(), batch_id.as_str(), &listed, &text_sha256);
+    let lead = payloads::batch_confirmed(
+        &Actor::default(),
+        batch_id.as_str(),
+        &listed,
+        &text_sha256,
+        crate::dialog_lang(lang),
+    );
     let steps = checked
         .iter()
         .map(|c| step_of(c, batch_id.as_str()))

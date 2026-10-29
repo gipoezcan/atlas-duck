@@ -730,6 +730,45 @@ async fn batch_happy_path_reads_and_writes() -> TestResult {
     Ok(())
 }
 
+/// M15 T10b fix I-1/m-2: a German batch dialog is one language read; `BATCH_CONFIRMED` records
+/// `dialog_lang: "de"` and the hash of exactly the German text shown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn german_batch_records_its_language_and_the_german_hash() -> TestResult {
+    let h = Harness::builder()
+        .jira("jira-main")
+        .confirm(vec![Confirm::Ok])
+        .start()
+        .await?;
+    h.confirmer().set_lang(atlas_duck_core::Lang::De);
+    let r1 = read_item(&h, "ABC-1").await?;
+    let r2 = read_item(&h, "ABC-2").await?;
+    for id in [&r1, &r2] {
+        h.approver().open(id).map_err(de)?;
+    }
+    h.plan().record_appends(true);
+    h.decisions()
+        .decide_batch(items(&h, &[&r1, &r2])?)
+        .map_err(de)?;
+    h.plan().record_appends(false);
+    let texts = h.confirmer().texts();
+    let text = texts.first().ok_or("no dialog")?;
+    assert!(text.starts_with("Sammelentscheidung"), "{text}");
+    let calls = h.plan().appends();
+    let lead = calls
+        .iter()
+        .find_map(|c| {
+            c.first()
+                .filter(|e| e.event_type == EventType::BATCH_CONFIRMED)
+                .map(|e| e.payload.clone())
+        })
+        .ok_or("no BATCH_CONFIRMED")?;
+    assert_eq!(lead["dialog_lang"], "de");
+    assert_eq!(
+        lead["dialog_text_sha256"],
+        atlas_duck_core::payloads::sha256_hex(text.as_bytes())
+    );
+    Ok(())
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dialog_text_has_targets_and_cautions() -> TestResult {
     let h = Harness::jira().await?;

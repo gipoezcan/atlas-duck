@@ -72,9 +72,10 @@ fn config_write_error(e: ConfigWriteError) -> AdminError {
     }
 }
 
-fn confirmed(text: &str) -> Confirmed {
+fn confirmed(lang: crate::Lang, text: &str) -> Confirmed {
     Confirmed {
         dialog_text_sha256: Sha256::digest(text.as_bytes()).into(),
+        dialog_lang: Some(crate::dialog_lang(lang)),
     }
 }
 
@@ -405,8 +406,12 @@ impl CoreInstances {
     }
 
     /// Applies a setting unless the audit settings already say so (an unchanged value is
-    /// `AuditError::Invalid` in the store); `text` is the confirmation dialog shown for it.
-    fn apply(&self, change: SettingChange, text: Option<&str>) -> Result<(), AdminError> {
+    /// `AuditError::Invalid` in the store); `text` is the confirmation dialog shown for it, with the language it was built in.
+    fn apply(
+        &self,
+        change: SettingChange,
+        text: Option<(crate::Lang, &str)>,
+    ) -> Result<(), AdminError> {
         let settings = self.settings();
         let (id, current, new) = match &change {
             SettingChange::InstanceOrigin {
@@ -447,7 +452,7 @@ impl CoreInstances {
         }
         self.engine
             .port()
-            .apply_setting(change, text.map(confirmed))
+            .apply_setting(change, text.map(|(lang, t)| confirmed(lang, t)))
             .map(|_| ())
             .map_err(AdminError::Audit)
     }
@@ -587,14 +592,15 @@ impl CoreInstances {
         if stored.as_deref() == Some(bundle.fingerprint.as_str()) {
             return Ok(());
         }
-        let text = ca_text(self.engine.confirmer().lang(), &rt.alias, &bundle);
+        let lang = self.engine.confirmer().lang();
+        let text = ca_text(lang, &rt.alias, &bundle);
         self.confirm(&text)?;
         self.apply(
             SettingChange::InstanceCaFingerprint {
                 instance_id: id.to_owned(),
                 fingerprint: Some(bundle.fingerprint),
             },
-            Some(&text),
+            Some((lang, &text)),
         )
     }
 
@@ -613,7 +619,8 @@ impl CoreInstances {
         if old == new {
             return Ok(());
         }
-        let text = change_text(self.engine.confirmer().lang(), &rt.alias, &old, &new);
+        let lang = self.engine.confirmer().lang();
+        let text = change_text(lang, &rt.alias, &old, &new);
         self.confirm(&text)?;
         if let Some(url) = file_url {
             let path = self.path()?;
@@ -628,7 +635,7 @@ impl CoreInstances {
                 instance_id: id.clone(),
                 origin: Some(new.as_str()),
             },
-            Some(&text),
+            Some((lang, &text)),
         )?;
         // The origin is committed from here on: the runtime follows it whatever else fails
         // (review I-4), and the first error is reported afterwards.
@@ -801,16 +808,12 @@ impl InstanceAdmin for CoreInstances {
     fn add(&self, req: AddInstance) -> Result<InstanceView, AdminError> {
         let _job = self.enter()?;
         let (origin, path, ca) = self.validate_add(&req)?;
-        let text = add_text(
-            self.engine.confirmer().lang(),
-            req.product,
-            &req.alias,
-            &origin,
-        );
+        let lang = self.engine.confirmer().lang();
+        let text = add_text(lang, req.product, &req.alias, &origin);
         self.confirm(&text)?;
         let ca_dialog = match &ca {
             Some((bundle, _)) => {
-                let t = ca_text(self.engine.confirmer().lang(), &req.alias, bundle);
+                let t = ca_text(lang, &req.alias, bundle);
                 self.confirm(&t)?;
                 Some(t)
             }
@@ -836,7 +839,7 @@ impl InstanceAdmin for CoreInstances {
                 instance_id: id.clone(),
                 origin: Some(origin.as_str()),
             },
-            Some(&text),
+            Some((lang, &text)),
         )?;
         if let (Some((bundle, _)), Some(t)) = (&ca, &ca_dialog) {
             self.apply(
@@ -844,7 +847,7 @@ impl InstanceAdmin for CoreInstances {
                     instance_id: id.clone(),
                     fingerprint: Some(bundle.fingerprint.clone()),
                 },
-                Some(t),
+                Some((lang, t.as_str())),
             )?;
         }
         if req.proxy != ProxySetting::Os {
@@ -886,19 +889,15 @@ impl InstanceAdmin for CoreInstances {
         let (Some(id), Some(origin)) = (rt.id.clone(), rt.base.clone()) else {
             return Err(AdminError::ConfigReadOnly);
         };
-        let text = add_text(
-            self.engine.confirmer().lang(),
-            rt.product,
-            &rt.alias,
-            &origin,
-        );
+        let lang = self.engine.confirmer().lang();
+        let text = add_text(lang, rt.product, &rt.alias, &origin);
         self.confirm(&text)?;
         self.apply(
             SettingChange::InstanceOrigin {
                 instance_id: id.clone(),
                 origin: Some(origin.as_str()),
             },
-            Some(&text),
+            Some((lang, &text)),
         )?;
         // The origin is committed: the table follows it even when the CA dialog is cancelled
         // (the unconfirmed CA then stays untrusted, review I-4).

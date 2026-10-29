@@ -116,6 +116,7 @@ fn chosen(p: &Path) -> RustChosenPath {
 fn confirmed() -> Confirmed {
     Confirmed {
         dialog_text_sha256: [7; 32],
+        dialog_lang: None,
     }
 }
 
@@ -472,6 +473,31 @@ fn s03_verify_pass_tamper_no_trust_root() {
     assert!(last(&v).starts_with("TAMPERED: "), "{:?}", v.report());
 }
 
+/// M15 T10b fix I-1: `dialog_lang` is an additive payload field. A record with it and one
+/// without it (as every record before M15) verify alike, and the export shows it where present.
+#[test]
+fn dialog_lang_is_additive_and_shown_in_the_export() {
+    let anchor = tempfile::tempdir().expect("anchor dir");
+    let (store, _f) = new_store(fake_clock(START), MemKeyring::new());
+    store
+        .change_anchor_dir(Some(chosen(anchor.path())), confirmed())
+        .expect("anchor dir without a language");
+    store
+        .change_anchor_dir(
+            None,
+            Confirmed {
+                dialog_text_sha256: [9; 32],
+                dialog_lang: Some(atlas_duck_audit::DialogLang::De),
+            },
+        )
+        .expect("anchor dir removed, confirmed in German");
+    let ex = export_all(&store);
+    let v = verify_export(&ex.dir, None, Some(ex.hash));
+    expect(&v, 0, "both records verify");
+    let text = std::fs::read_to_string(ex.dir.join("events.jsonl")).expect("events");
+    assert!(text.contains(r#""dialog_lang":"de""#), "{text}");
+    assert_eq!(text.matches("dialog_lang").count(), 1, "{text}");
+}
 #[test]
 fn export_fixture_kinds_verify_as_documented() {
     for kind in [

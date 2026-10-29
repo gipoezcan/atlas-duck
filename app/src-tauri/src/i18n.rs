@@ -148,6 +148,16 @@ impl From<Lang> for atlas_duck_preview::Lang {
     }
 }
 
+impl From<Lang> for atlas_duck_audit::DialogLang {
+    /// M15 T10b fix I-1: the language a confirmed dialog text was built in (`dialog_lang`).
+    fn from(l: Lang) -> Self {
+        match l {
+            Lang::En => atlas_duck_audit::DialogLang::En,
+            Lang::De => atlas_duck_audit::DialogLang::De,
+        }
+    }
+}
+
 impl LangPref {
     /// The word on the wire and in the `ui-lang` file.
     pub fn as_str(self) -> &'static str {

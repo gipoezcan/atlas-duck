@@ -324,6 +324,7 @@ fn write_cover_only_after_write_approved_commits() -> TestResult {
         batch.as_str(),
         &[(id.to_owned(), rev5)],
         &[1; 32],
+        atlas_duck_audit::DialogLang::En,
     );
     let c = commit_records(
         &port,
@@ -721,6 +722,7 @@ fn builders_append_with_their_columns() -> TestResult {
                 batch.as_str(),
                 &[("req_all".to_owned(), rev)],
                 &[9; 32],
+                atlas_duck_audit::DialogLang::En,
             ),
             None,
             EventFlags::default(),

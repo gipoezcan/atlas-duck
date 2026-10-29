@@ -102,6 +102,9 @@ async fn german_confirmation_hash_is_of_the_german_text() -> TestResult {
     let cap = config_changed(&h, "jira_comments_cap").await?;
     let last = cap.last().ok_or("no jira_comments_cap record")?;
     assert_eq!(last["confirmed"]["dialog_text_sha256"], sha_hex(&texts[1]));
+    // T10b fix I-1: the record says which language's text the hash is of.
+    assert_eq!(lifted["confirmed"]["dialog_lang"], "de");
+    assert_eq!(last["confirmed"]["dialog_lang"], "de");
     Ok(())
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1253,7 +1256,7 @@ async fn degraded_toggle_needs_native_confirmation_and_logs_config_changed() -> 
         json!({
             "source": "app", "key": "allow_degraded_scripts", "old": false, "requested": true,
             "new": true, "applied": true,
-            "confirmed": {"dialog_text_sha256": sha_hex(ALLOW_DEGRADED_TEXT)},
+            "confirmed": {"dialog_text_sha256": sha_hex(ALLOW_DEGRADED_TEXT), "dialog_lang": "en"},
         })
     );
     // Audit-authoritative (L32): the store's view holds it, nothing else.
