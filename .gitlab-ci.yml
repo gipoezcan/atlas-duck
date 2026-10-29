@@ -137,8 +137,8 @@ node:ci-checks:
     - node ci/check-workspace.mjs
     - node ci/check-csp.mjs
     - node ci/check-commands.mjs
-    # M16 T3 (--allow-todo is for the M16 branch only; M16 T12 removes it).
-    - node ci/check-user-guide.mjs --allow-todo
+    # M16 T3: user guide consistency.
+    - node ci/check-user-guide.mjs
     - node ci/check-dialog-proofs.mjs
     - node --test app/isolation/hook.test.mjs
     - node --test "ci/*.test.mjs"

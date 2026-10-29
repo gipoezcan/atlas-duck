@@ -204,7 +204,20 @@ test("todo_placeholder_fails", () => {
   };
   const e = run(todo);
   assert.deepEqual(e, ["docs/user-guide/de/audit.md:3: TODO placeholder"]);
-  assert.deepEqual(run(todo, { allowTodo: true }), []);
+});
+
+test("todo_marker_anywhere_in_a_line_fails", () => {
+  const marked = (i) => {
+    i.sources.push({
+      path: "docs/user-guide/en/nested/x.md",
+      text: "ok\n<!-- TODO -->\nText that is TBD.\nMore FIXME text\nTodoist and todo are fine\n",
+    });
+  };
+  assert.deepEqual(run(marked), [
+    "docs/user-guide/en/nested/x.md:2: TODO placeholder",
+    "docs/user-guide/en/nested/x.md:3: TODO placeholder",
+    "docs/user-guide/en/nested/x.md:4: TODO placeholder",
+  ]);
 });
 
 // ---------- the real tree ----------
@@ -215,16 +228,15 @@ test("parseServerPages reads PAGES", () => {
   assert.ok(pagesList.length >= 10);
 });
 
-test("the committed guide passes (TODO placeholders allowed until the content tasks land)", () => {
-  // T12 removes --allow-todo from CI; flip `allowTodo` here with it.
-  assert.deepEqual(checkUserGuide(loadInputs(REPO), { allowTodo: true }), []);
+test("the committed guide passes", () => {
+  assert.deepEqual(checkUserGuide(loadInputs(REPO)), []);
 });
 
-test("main exits 0 on the committed guide with --allow-todo", () => {
+test("main exits 0 on the committed guide", () => {
   const log = console.log;
   console.log = () => {};
   try {
-    assert.equal(main(["--allow-todo"], REPO), 0);
+    assert.equal(main([], REPO), 0);
   } finally {
     console.log = log;
   }

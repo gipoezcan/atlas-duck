@@ -2056,9 +2056,8 @@ jobs:
           node ci/check-control-bytes.mjs
 
       # M16 T3: both languages, error reference, UI links and internal links of the user guide.
-      # --allow-todo is for the M16 branch only (M16 T12 removes it).
       - name: User guide consistency (M16, PD-321, PD-327)
-        run: node ci/check-user-guide.mjs --allow-todo
+        run: node ci/check-user-guide.mjs
 
       - name: Isolation hook tests (payload allowlist, 2 MiB cap)
         run: node --test app/isolation/hook.test.mjs

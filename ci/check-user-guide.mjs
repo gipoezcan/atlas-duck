@@ -12,9 +12,9 @@
 //   - ui-links.json maps every desktop window label and every server page to an existing
 //     `page#anchor` of the right set, and names nothing else,
 //   - every internal link of the generated pages resolves,
-//   - no `TODO` placeholder is left in a source (unless --allow-todo, used on the M16 branch only).
+//   - no `TODO`, `TBD` or `FIXME` marker is left anywhere in a source (nested directories included).
 //
-// Usage: node ci/check-user-guide.mjs [--allow-todo]
+// Usage: node ci/check-user-guide.mjs
 // Exit 0 = ok. Exit 1 = findings, one per line. No npm dependencies.
 
 import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
@@ -178,23 +178,25 @@ function checkLinks(inp, errors) {
   }
 }
 
-function checkTodo(inp, errors, allowTodo) {
-  if (allowTodo) return;
+/** An unfinished-text marker anywhere in a line (also inside an HTML comment or at the end of prose). */
+const PLACEHOLDER = /\b(TODO|TBD|FIXME)\b/;
+
+function checkTodo(inp, errors) {
   for (const s of inp.sources) {
     s.text.split("\n").forEach((line, i) => {
-      if (/^\s*TODO\b/.test(line)) errors.push(`${s.path}:${i + 1}: TODO placeholder`);
+      if (PLACEHOLDER.test(line)) errors.push(`${s.path}:${i + 1}: TODO placeholder`);
     });
   }
 }
 
 /** All findings for `inp` (see `loadInputs` for its shape). */
-export function checkUserGuide(inp, { allowTodo = false } = {}) {
+export function checkUserGuide(inp) {
   const errors = [];
   checkParity(inp, errors);
   checkErrorCodes(inp, errors);
   checkUiLinks(inp, errors);
   checkLinks(inp, errors);
-  checkTodo(inp, errors, allowTodo);
+  checkTodo(inp, errors);
   return errors;
 }
 
@@ -204,6 +206,17 @@ export function parseServerPages(src) {
   if (start < 0) return [];
   const end = src.indexOf("];", start);
   return [...src.slice(start, end).matchAll(/\(\s*"(\/[^"]*)"\s*,\s*"[^"]+\.html"\s*\)/g)].map((m) => m[1]);
+}
+
+/** Every `.md` under `abs`, as sorted paths relative to it (nested directories included). */
+function markdownFiles(abs, rel) {
+  const out = [];
+  for (const e of readdirSync(join(abs, rel), { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : 1))) {
+    const p = rel === "" ? e.name : `${rel}/${e.name}`;
+    if (e.isDirectory()) out.push(...markdownFiles(abs, p));
+    else if (e.name.endsWith(".md")) out.push(p);
+  }
+  return out;
 }
 
 export function loadInputs(repo = REPO) {
@@ -234,9 +247,7 @@ export function loadInputs(repo = REPO) {
   const sources = [];
   for (const lang of LANGS) {
     const dir = `docs/user-guide/${lang}`;
-    for (const f of readdirSync(join(repo, dir)).filter((n) => n.endsWith(".md")).sort()) {
-      sources.push({ path: `${dir}/${f}`, text: read(`${dir}/${f}`) });
-    }
+    for (const f of markdownFiles(join(repo, dir), "")) sources.push({ path: `${dir}/${f}`, text: read(`${dir}/${f}`) });
   }
   return {
     manifests,
@@ -250,7 +261,6 @@ export function loadInputs(repo = REPO) {
 }
 
 export function main(argv = process.argv.slice(2), repo = REPO) {
-  const allowTodo = argv.includes("--allow-todo");
   let inp;
   try {
     inp = loadInputs(repo);
@@ -266,9 +276,9 @@ export function main(argv = process.argv.slice(2), repo = REPO) {
   ]) {
     if (list.length === 0) errors.push(`no ${name} found (parser out of date?)`);
   }
-  errors.push(...checkUserGuide(inp, { allowTodo }));
+  errors.push(...checkUserGuide(inp));
   for (const e of errors) console.log(e);
-  if (errors.length === 0) console.log(`check-user-guide: ok${allowTodo ? " (TODO placeholders allowed)" : ""}`);
+  if (errors.length === 0) console.log("check-user-guide: ok");
   return errors.length === 0 ? 0 : 1;
 }
 
