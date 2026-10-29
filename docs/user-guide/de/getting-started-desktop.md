@@ -18,7 +18,7 @@ atlas-duck installiert drei Programme nebeneinander: `atlas-duck-app` (die Tray-
 
 - **Windows:** Der Installer bietet eine Installation pro Benutzer und eine pro Computer an. Die Installation pro Computer (Programme) wird empfohlen, weil normale Benutzer die Programmdateien dann nicht ändern können. Führen Sie atlas-duck nicht als Administrator aus. Läuft die App mit erhöhten Rechten und das Terminal des Agents nicht, verweigert die Befehlszeile das Gespräch mit ihr; starten Sie beide mit denselben Rechten.
 - **macOS:** Öffnen Sie die `.dmg` und ziehen Sie die App in den Ordner Programme.
-- **Linux:** atlas-duck legt seine Schlüssel und Ihre Tokens im Schlüsselbund des Betriebssystems ab. Dafür brauchen Sie einen Secret-Service-Anbieter mit einer nutzbaren Standardsammlung, zum Beispiel GNOME Keyring oder KWallet. Ohne ihn bricht der erste Start ab und meldet: "atlas-duck needs a system keyring (Secret Service, e.g. GNOME Keyring or KWallet). Install or unlock one, then restart atlas-duck." (Diese Meldung erscheint auf Englisch.)
+- **Linux:** atlas-duck legt seine Schlüssel und Ihre Tokens im Schlüsselbund des Betriebssystems ab. Dafür brauchen Sie einen Secret-Service-Anbieter mit einer nutzbaren Standardsammlung, zum Beispiel GNOME Keyring oder KWallet. Ohne ihn bricht der erste Start ab und meldet: "atlas-duck braucht einen Schlüsselbund des Systems (Secret Service, z. B. GNOME Keyring oder KWallet). Installieren oder entsperren Sie einen und starten Sie atlas-duck dann neu."
 
 Der Befehl `atlas-duck` liegt nach der Installation nicht in Ihrem PATH, außer bei den Linux-Paketen `.deb` und `.rpm`. Siehe [Befehlszeile installieren](settings#cli-install).
 
