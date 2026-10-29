@@ -1125,6 +1125,10 @@ jobs:
       - name: Command surface check (C.10, PD-66)
         run: node ci/check-commands.mjs
 
+      # M16 T2: the committed help sets are what the generator makes of docs/user-guide.
+      - name: User guide output is current (M16, PD-326)
+        run: cargo run -p atlas-duck-docgen --locked -- --src docs/user-guide --desktop-out app/ui/public/help --server-out app/ui/public-server/docs --check
+
       - name: Native-dialog proofs (L54, 10.3)
         run: node ci/check-dialog-proofs.mjs
 
@@ -2050,6 +2054,11 @@ jobs:
           set -euo pipefail
           node ci/check-i18n.mjs
           node ci/check-control-bytes.mjs
+
+      # M16 T3: both languages, error reference, UI links and internal links of the user guide.
+      # --allow-todo is for the M16 branch only (M16 T12 removes it).
+      - name: User guide consistency (M16, PD-321, PD-327)
+        run: node ci/check-user-guide.mjs --allow-todo
 
       - name: Isolation hook tests (payload allowlist, 2 MiB cap)
         run: node --test app/isolation/hook.test.mjs
