@@ -1,0 +1,16 @@
+[package]
+name = "atlas-duck-docgen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# M16 PD-326: renders `docs/user-guide` into the committed static help sets (desktop `help/`,
+# server `docs/`). A development tool, never linked into a shipped binary.
+
+[dependencies]
+pulldown-cmark = { workspace = true }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
