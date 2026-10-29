@@ -19,6 +19,7 @@
     "allow-wizard-skip-instances",
     "allow-wizard-state",
     "allow-wizard-use-default-dir",
+    "allow-help-open",
     "allow-ui-lang-get",
     "core:event:allow-listen",
     "core:event:allow-unlisten"

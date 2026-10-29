@@ -36,6 +36,8 @@ pub const MENU_ID_UNLOCK: &str = "unlock";
 pub const MENU_ID_PRESENTATION_MODE: &str = "presentation_mode";
 /// Menu id of "Retry keychain" (`keychain_unavailable` only; Task 22 wires it, PD-89).
 pub const MENU_ID_RETRY_KEYCHAIN: &str = "retry_keychain";
+/// M16 (PD-328): opens the user guide in the Help window, in every state.
+pub const MENU_ID_HELP: &str = "help";
 /// Label of the Quit item (app-generated constant, §5.6).
 pub const MENU_LABEL_QUIT: T = T::new("Quit", "Beenden");
 /// §2.5 (verbatim): "Open approvals (N)"; `<n>` is the pending count.
@@ -46,6 +48,7 @@ pub const MENU_LABEL_UNLOCK: T = T::new("Unlock…", "Entsperren…");
 pub const MENU_LABEL_PRESENTATION_MODE: T = T::new("Presentation mode", "Präsentationsmodus");
 /// plan text (PD-89).
 pub const MENU_LABEL_RETRY_KEYCHAIN: T = T::new("Retry keychain", "Schlüsselbund erneut versuchen");
+pub const MENU_LABEL_HELP: T = T::new("Help", "Hilfe");
 /// plan text (T6): the tooltip outside the error states; `<n>` is the pending count.
 pub const TOOLTIP_PENDING: T = T::new("atlas-duck: <n> pending", "atlas-duck: <n> ausstehend");
 /// plan text (T19): the tooltip's second line while Presentation mode is on (badge only, until the
@@ -68,6 +71,7 @@ pub const TEXTS: &[&T] = &[
     &MENU_LABEL_UNLOCK,
     &MENU_LABEL_PRESENTATION_MODE,
     &MENU_LABEL_RETRY_KEYCHAIN,
+    &MENU_LABEL_HELP,
     &TOOLTIP_PENDING,
     &TOOLTIP_PRESENTATION,
     &MSG_STORE_UNAVAILABLE,
@@ -102,6 +106,8 @@ pub enum TrayAction {
     PresentationMode,
     /// Task 22: one more keychain attempt (PD-89).
     RetryKeychain,
+    /// M16: the Help window at the guide's index.
+    Help,
     /// The §2.5 shutdown path, then `app.exit(0)` (`serve::shutdown_then_exit`).
     Quit,
 }
@@ -195,7 +201,7 @@ fn unlockable(state: &AppSnapshot) -> bool {
 /// The tray menu for `state` with `pending` requests, in menu order (§2.5): the disabled status
 /// items (`status`: [`status_lines`]), "Open approvals (N)" (always: it takes the GUI relaunch
 /// path), "Unlock…" (locked), "Retry keychain" (`keychain_unavailable`; disabled while a retry
-/// runs, `keychain_retrying`), "Presentation mode" (while `Core` serves), Quit.
+/// runs, `keychain_retrying`), "Presentation mode" (while `Core` serves), "Help" (always), Quit.
 pub fn menu_entries(
     lang: Lang,
     state: &AppSnapshot,
@@ -235,6 +241,7 @@ pub fn menu_entries(
             MENU_LABEL_PRESENTATION_MODE.get(lang),
         ));
     }
+    entries.push(MenuEntry::item(MENU_ID_HELP, MENU_LABEL_HELP.get(lang)));
     entries.push(MenuEntry::item(MENU_ID_QUIT, MENU_LABEL_QUIT.get(lang)));
     entries
 }
@@ -308,6 +315,7 @@ pub fn action_for_menu_id(id: &str) -> Option<TrayAction> {
         MENU_ID_UNLOCK => Some(TrayAction::Unlock),
         MENU_ID_PRESENTATION_MODE => Some(TrayAction::PresentationMode),
         MENU_ID_RETRY_KEYCHAIN => Some(TrayAction::RetryKeychain),
+        MENU_ID_HELP => Some(TrayAction::Help),
         MENU_ID_QUIT => Some(TrayAction::Quit),
         _ => None,
     }
@@ -512,6 +520,8 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
         Some(TrayAction::PresentationMode) => attention::toggle_presentation(app),
         // PD-89: one more keystore + `open`; the watcher hears how it ended.
         Some(TrayAction::RetryKeychain) => retry_keychain(app),
+        // A window build waits for the main thread, so it runs on the blocking pool.
+        Some(TrayAction::Help) => windows::spawn_open_help(app),
         None => {}
     }
 }
@@ -649,7 +659,12 @@ mod tests {
         let labels: Vec<&str> = menu.iter().map(|e| e.label.as_str()).collect();
         assert_eq!(
             labels,
-            ["Freigaben öffnen (1.234)", "Präsentationsmodus", "Beenden"]
+            [
+                "Freigaben öffnen (1.234)",
+                "Präsentationsmodus",
+                "Hilfe",
+                "Beenden"
+            ]
         );
         assert_eq!(
             tooltip_text(Lang::De, &[], 3, true),
@@ -686,6 +701,8 @@ mod tests {
         use atlas_duck_audit::RecoveryOffer;
         assert_eq!(TRAY_ID, "main");
         assert_eq!(MENU_LABEL_QUIT.en, "Quit");
+        assert_eq!(MENU_LABEL_HELP.en, "Help");
+        assert_eq!(MENU_LABEL_HELP.de, "Hilfe");
         assert_eq!(MENU_LABEL_UNLOCK.en, "Unlock\u{2026}");
         assert_eq!(MENU_LABEL_PRESENTATION_MODE.en, "Presentation mode");
 
@@ -693,7 +710,7 @@ mod tests {
         let serving = menu_entries(Lang::En, &AppSnapshot::Serving, 3, &[], false);
         assert_eq!(
             ids(&serving),
-            ["open_approvals", "presentation_mode", "quit"]
+            ["open_approvals", "presentation_mode", "help", "quit"]
         );
         assert_eq!(serving[0].label, "Open approvals (3)");
         assert!(serving.iter().all(|e| e.enabled));
@@ -716,7 +733,7 @@ mod tests {
         );
         assert_eq!(
             ids(&unavailable),
-            ["open_approvals", "unlock", "retry_keychain", "quit"]
+            ["open_approvals", "unlock", "retry_keychain", "help", "quit"]
         );
         assert_eq!(unavailable[1].label, "Unlock\u{2026}");
         assert_eq!(unavailable[2].label, "Retry keychain");
@@ -741,7 +758,7 @@ mod tests {
                     &[],
                     false
                 )),
-                ["open_approvals", "unlock", "quit"]
+                ["open_approvals", "unlock", "help", "quit"]
             );
         }
         // Nothing to unlock: no "Unlock…" (§8.7).
@@ -753,7 +770,7 @@ mod tests {
                 &[],
                 false
             )),
-            ["open_approvals", "quit"]
+            ["open_approvals", "help", "quit"]
         );
 
         // The error states: a disabled status item above the rest.
@@ -765,7 +782,7 @@ mod tests {
             &status_lines(&state, &StatusInputs::default()),
             false,
         );
-        assert_eq!(ids(&error), ["status", "open_approvals", "quit"]);
+        assert_eq!(ids(&error), ["status", "open_approvals", "help", "quit"]);
         assert_eq!(error[0].label, "data directory /d not found");
         assert!(!error[0].enabled);
         let state = AppSnapshot::StoreUnavailable;
@@ -776,7 +793,7 @@ mod tests {
             &status_lines(&state, &StatusInputs::default()),
             false,
         );
-        assert_eq!(ids(&failed), ["status", "open_approvals", "quit"]);
+        assert_eq!(ids(&failed), ["status", "open_approvals", "help", "quit"]);
         assert_eq!(failed[0].label, MSG_STORE_UNAVAILABLE.en);
 
         // More lines than the four status items are dropped from the menu (the tooltip has all).
@@ -791,6 +808,7 @@ mod tests {
                 "status_4",
                 "open_approvals",
                 "presentation_mode",
+                "help",
                 "quit"
             ]
         );
@@ -808,7 +826,7 @@ mod tests {
         ] {
             assert_eq!(
                 ids(&menu_entries(Lang::En, &state, 0, &[], false)),
-                ["open_approvals", "quit"],
+                ["open_approvals", "help", "quit"],
                 "{state:?}"
             );
         }
@@ -1058,6 +1076,7 @@ mod tests {
     #[test]
     fn menu_ids_map_to_actions() {
         assert_eq!(action_for_menu_id("quit"), Some(TrayAction::Quit));
+        assert_eq!(action_for_menu_id("help"), Some(TrayAction::Help));
         assert_eq!(
             action_for_menu_id("open_approvals"),
             Some(TrayAction::OpenApprovals)

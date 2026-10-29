@@ -157,7 +157,7 @@ test("arg_exemption_list_stays_empty", () => {
   assert.deepEqual(ARG_EXEMPTIONS, []);
 });
 
-test("delta1_table_covers_seven_windows_and_listeners_are_labels", () => {
+test("delta1_table_covers_eight_windows_and_listeners_are_labels", () => {
   assert.deepEqual(Object.keys(WINDOW_COMMANDS).sort(), [...LABELS].sort());
   for (const l of LISTENING_WINDOWS) assert.ok(LABELS.includes(l), l);
   // Decision commands only in approvals, secret commands only in credential (§10.3).
@@ -257,7 +257,7 @@ test("capability_shape_is_strict", () => {
   }
 });
 
-test("security_capabilities_must_list_the_seven", () => {
+test("security_capabilities_must_list_the_eight", () => {
   for (const list of [[], undefined, LABELS.slice(1), [...LABELS, "extra"], [...LABELS.slice(1), "approvals", "approvals"]]) {
     assertFails(errorsOf(surface({ securityCapabilities: list })), /app\.security\.capabilities must be exactly/);
   }
@@ -491,4 +491,32 @@ test("acl_mutators_are_banned_outside_tests", () => {
     assertFails(checkAclMutators({ "app/src-tauri/src/lib.rs": `fn f() { ${call} }` }), /widens the capability files/);
   }
   assert.deepEqual(checkAclMutators({ "app/src-tauri/src/lib.rs": "#[cfg(test)]\nmod tests { fn f() { app.add_capability(C); } }\n// add_capability(x)" }), []);
+});
+// ---------- M16 T5 (PD-328): the Help window ----------
+
+test("help_capability_has_no_app_permission", () => {
+  assert.deepEqual(WINDOW_COMMANDS.help, []);
+  assert.deepEqual(capsFor(COMMANDS).help.permissions, []);
+  const caps = capsFor(COMMANDS);
+  caps.help.permissions.push("allow-app-status");
+  assertFails(errorsOf(surface({ caps })), /app_status is granted to help, outside its Δ1 windows/);
+  const caps2 = capsFor(COMMANDS);
+  caps2.help.permissions.push("core:default");
+  assertFails(errorsOf(surface({ caps: caps2 })), /permission core:default is not/);
+  const caps3 = capsFor(COMMANDS);
+  caps3.help.permissions.push("core:event:allow-listen");
+  assertFails(errorsOf(surface({ caps: caps3 })), /help\.json: this window listens to no event/);
+});
+
+test("help_open_granted_to_all_other_labels", () => {
+  assert.deepEqual(
+    LABELS.filter((l) => WINDOW_COMMANDS[l].includes("help_open")),
+    LABELS.filter((l) => l !== "help"),
+  );
+  const commands = [...COMMANDS, "help_open"].sort();
+  const base = { commands, handlerLists: [[...commands]], allowed: [...commands, "plugin:event|listen", "plugin:event|unlisten"] };
+  assert.deepEqual(errorsOf(surface({ ...base, caps: capsFor(commands) })), []);
+  const caps = capsFor(commands);
+  caps.setup.permissions = caps.setup.permissions.filter((p) => p !== "allow-help-open");
+  assertFails(errorsOf(surface({ ...base, caps })), /help_open is missing from capabilities\/setup\.json/);
 });

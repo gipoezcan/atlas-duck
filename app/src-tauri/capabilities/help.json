@@ -1,0 +1,6 @@
+{
+  "identifier": "help",
+  "description": "the Help window (M16, PD-328): static guide pages from the app bundle; no app permission and no event grant",
+  "windows": ["help"],
+  "permissions": []
+}

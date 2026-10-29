@@ -14,7 +14,7 @@ use atlas_duck_app_lib::state::DataDirHold;
 use atlas_duck_app_lib::tray::on_run_event;
 use atlas_duck_app_lib::windows::{
     Label, NavPolicy, Relaunch, Show, StartupRoute, Unlock, WindowError, WindowRegistry, open,
-    open_credential,
+    open_credential, open_help,
 };
 use atlas_duck_audit::lock::InstanceLock;
 use atlas_duck_ipc::paths::{DataDirResolution, LocalDataDir, check_data_dir};
@@ -234,5 +234,30 @@ fn close_hides_never_exits_under_the_run_loop() -> TestResult {
 
     let (trace, _) = close_under_the_run_loop("credential")?;
     assert_eq!(trace, ["ready", "close_requested", "exit_requested"]);
+    Ok(())
+}
+
+/// M16 (PD-328): the Help window is built once under its own label; a second request navigates
+/// and shows the window that exists instead of building another.
+#[test]
+fn help_window_reuses_existing() -> TestResult {
+    let app = app()?;
+    let handle = app.handle();
+    assert_eq!(
+        open_help(handle, "help/en/index.html"),
+        Err(WindowError::NotRegistered)
+    );
+    app.manage(WindowRegistry::new(
+        NavPolicy::for_this_platform(None),
+        StartupRoute::completed(),
+    ));
+    assert_eq!(open_help(handle, "help/en/index.html"), Ok(()));
+    let first = handle.get_webview_window("help").ok_or("no help window")?;
+    assert!(first.url()?.path().ends_with("/help/en/index.html"));
+    assert_eq!(open_help(handle, "help/de/approvals.html#queue"), Ok(()));
+    assert_eq!(handle.webview_windows().len(), 1, "built once");
+    let again = handle.get_webview_window("help").ok_or("no help window")?;
+    assert_eq!(again.url()?.path(), "/help/de/approvals.html");
+    assert_eq!(again.url()?.fragment(), Some("queue"));
     Ok(())
 }

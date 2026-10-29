@@ -5,6 +5,7 @@
   "permissions": [
     "allow-running-kill",
     "allow-running-list",
+    "allow-help-open",
     "allow-ui-lang-get",
     "core:event:allow-listen",
     "core:event:allow-unlisten"

@@ -46,8 +46,8 @@ fn main_binary_is_atlas_duck_app() {
     assert_eq!(conf()["mainBinaryName"], "atlas-duck-app");
 }
 
-/// The seven window labels (C.10 + Δ1, PD-72), one capability file each (§10.3).
-const WINDOW_LABELS: [&str; 7] = [
+/// The eight window labels (C.10 + Δ1, PD-72, M16 PD-328), one capability file each (§10.3).
+const WINDOW_LABELS: [&str; 8] = [
     "approvals",
     "settings",
     "audit",
@@ -55,6 +55,7 @@ const WINDOW_LABELS: [&str; 7] = [
     "onboarding",
     "credential",
     "setup",
+    "help",
 ];
 
 /// M6 T4 (§2.4, §6.4, §10.3): Rust builds every window (T6), so the config declares none; the

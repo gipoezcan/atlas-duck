@@ -30,6 +30,7 @@ pub const COMMANDS: &[&str] = &[
     "export_cancel",
     "export_trigger",
     "forget_install",
+    "help_open",
     "instance_accept_url_change",
     "instance_add",
     "instance_change_url",

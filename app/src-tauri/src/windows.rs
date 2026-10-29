@@ -73,7 +73,7 @@ pub const MSG_NO_TRAY_HOST: T = T::new(
     "Es wurde kein System-Tray gefunden, daher wird das Tray-Menü von atlas-duck nicht angezeigt. Installieren Sie unter GNOME die Erweiterung \"AppIndicator and KStatusNotifierItem Support\". Starten Sie atlas-duck bis dahin erneut über das App-Menü: Es öffnet das Fenster Freigaben, dessen Kopfzeile jedes andere Fenster und Beenden erreicht.",
 );
 /// M15 T10: the window titles (plan text, T6), by [`Label`].
-const TITLES: [(Label, T); 7] = [
+const TITLES: [(Label, T); 8] = [
     (
         Label::Approvals,
         T::new("atlas-duck: Approvals", "atlas-duck: Freigaben"),
@@ -105,6 +105,7 @@ const TITLES: [(Label, T); 7] = [
         Label::Setup,
         T::new("atlas-duck: Setup", "atlas-duck: Einrichtung"),
     ),
+    (Label::Help, T::new("atlas-duck: Help", "atlas-duck: Hilfe")),
 ];
 /// The core gate messages a no-store error window shows (`GateState::envelope`, core's English;
 /// `keyring_not_local` is the wizard's [`crate::wizard::TEXT_KEYRING_NOT_LOCAL`]).
@@ -129,11 +130,12 @@ pub const TEXTS: &[&T] = &[
     &TITLES[4].1,
     &TITLES[5].1,
     &TITLES[6].1,
+    &TITLES[7].1,
     &GATE_STORE_NEWER,
     &GATE_NOT_CONFIGURED,
 ];
 
-/// The seven window labels (C.10 + Δ1, PD-72); one capability file each.
+/// The eight window labels (C.10 + Δ1, PD-72, M16 PD-328); one capability file each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Label {
     Approvals,
@@ -143,10 +145,12 @@ pub enum Label {
     Onboarding,
     Credential,
     Setup,
+    /// M16 (PD-328): the user guide; static pages, no app permission.
+    Help,
 }
 
 impl Label {
-    pub const ALL: [Label; 7] = [
+    pub const ALL: [Label; 8] = [
         Label::Approvals,
         Label::Settings,
         Label::Audit,
@@ -154,6 +158,7 @@ impl Label {
         Label::Onboarding,
         Label::Credential,
         Label::Setup,
+        Label::Help,
     ];
 
     /// The window label, which is also its capability file's identifier and `windows` entry.
@@ -166,6 +171,7 @@ impl Label {
             Label::Onboarding => "onboarding",
             Label::Credential => "credential",
             Label::Setup => "setup",
+            Label::Help => "help",
         }
     }
 
@@ -179,6 +185,8 @@ impl Label {
             Label::Onboarding => "onboarding.html",
             Label::Credential => "credential.html",
             Label::Setup => "setup.html",
+            // The entry is the guide's index; `open_help` builds it at the page asked for.
+            Label::Help => "help/en/index.html",
         }
     }
 
@@ -203,6 +211,7 @@ impl Label {
             Label::Audit | Label::RunningScripts => (760.0, 540.0),
             Label::Onboarding | Label::Setup => (780.0, 660.0),
             Label::Credential => (560.0, 600.0),
+            Label::Help => (940.0, 720.0),
         }
     }
 
@@ -382,6 +391,19 @@ pub fn nav_allowed(url: &Url, frame: Frame, policy: &NavPolicy) -> bool {
         }
     }
 }
+
+/// [`nav_allowed`] for the window `label`: the Help window's main frame also stays under
+/// `/help/` (M16, PD-328), so its pages cannot navigate into the app's own windows.
+pub fn nav_allowed_for(label: Label, url: &Url, frame: Frame, policy: &NavPolicy) -> bool {
+    nav_allowed(url, frame, policy)
+        && (label != Label::Help
+            || frame != Frame::Main
+            || origin_of(url).as_deref() != Some(policy.app_origin)
+            || url.path().starts_with(HELP_PATH_PREFIX))
+}
+
+/// Where the guide's pages sit in the app's assets (`app/ui/public/help`).
+const HELP_PATH_PREFIX: &str = "/help/";
 
 // ---------- GUI relaunch ----------
 
@@ -671,35 +693,33 @@ fn build<R: Runtime>(
     app: &AppHandle<R>,
     spec: &WindowSpec,
     nav: NavPolicy,
+    entry: &str,
 ) -> Result<WebviewWindow<R>, WindowError> {
     let label = spec.label;
-    let mut builder = WebviewWindowBuilder::new(
-        app,
-        label.as_str(),
-        WebviewUrl::App(PathBuf::from(spec.entry)),
-    )
-    .title(label.title_in(ui_lang(app)))
-    .inner_size(spec.size.0, spec.size.1)
-    .devtools(spec.devtools)
-    .incognito(spec.incognito)
-    .focused(spec.focused)
-    .on_navigation(move |url| {
-        let allowed = nav_allowed(url, RUNTIME_FRAME, &nav);
-        if !allowed {
-            tracing::warn!(
-                event = LOG_EVENT_NAVIGATION_BLOCKED,
-                window = label.as_str()
-            );
-        }
-        allowed
-    })
-    .on_new_window(move |_url, _features| {
-        tracing::warn!(
-            event = LOG_EVENT_NEW_WINDOW_BLOCKED,
-            window = label.as_str()
-        );
-        NewWindowResponse::Deny
-    });
+    let mut builder =
+        WebviewWindowBuilder::new(app, label.as_str(), WebviewUrl::App(PathBuf::from(entry)))
+            .title(label.title_in(ui_lang(app)))
+            .inner_size(spec.size.0, spec.size.1)
+            .devtools(spec.devtools)
+            .incognito(spec.incognito)
+            .focused(spec.focused)
+            .on_navigation(move |url| {
+                let allowed = nav_allowed_for(label, url, RUNTIME_FRAME, &nav);
+                if !allowed {
+                    tracing::warn!(
+                        event = LOG_EVENT_NAVIGATION_BLOCKED,
+                        window = label.as_str()
+                    );
+                }
+                allowed
+            })
+            .on_new_window(move |_url, _features| {
+                tracing::warn!(
+                    event = LOG_EVENT_NEW_WINDOW_BLOCKED,
+                    window = label.as_str()
+                );
+                NewWindowResponse::Deny
+            });
     if let Some(dir) = &spec.data_directory {
         builder = builder.data_directory(dir.clone());
     }
@@ -736,7 +756,7 @@ pub(crate) fn open_with<R: Runtime>(
         Ok(None) => {
             let data = app.try_state::<DataDirHold>().map(|h| h.data().clone());
             window_spec(label, how, data.as_ref(), cfg!(windows))
-                .and_then(|spec| build(app, &spec, registry.nav.clone()))
+                .and_then(|spec| build(app, &spec, registry.nav.clone(), spec.entry))
                 .inspect(|_| crate::attention::apply_overlay_to_new_window(app, label))
                 .and_then(|w| match how {
                     Show::Focus | Show::FocusUnrequested => bring_up(&w, how),
@@ -749,6 +769,57 @@ pub(crate) fn open_with<R: Runtime>(
         Err(e) => log_open_failed(label, e.as_str()),
     }
     result
+}
+
+/// Opens the Help window at `path` (`help/<lang>/<page>.html[#anchor]`, validated by
+/// `commands::help`): builds it the first time, otherwise navigates the open one and brings it up
+/// (M16, PD-328). Never on the main thread (see the module docs).
+pub fn open_help<R: Runtime>(app: &AppHandle<R>, path: &str) -> Result<(), WindowError> {
+    let label = Label::Help;
+    let registry = app
+        .try_state::<WindowRegistry>()
+        .ok_or(WindowError::NotRegistered)?;
+    let _one_at_a_time = lock(&registry.opening);
+    let result = match app.get_webview_window(label.as_str()) {
+        Some(w) => w
+            .url()
+            .map_err(|_| WindowError::Show)
+            .and_then(|current| {
+                current
+                    .join(&format!("/{path}"))
+                    .map_err(|_| WindowError::Show)
+            })
+            .and_then(|url| w.navigate(url).map_err(|_| WindowError::Show))
+            .and_then(|()| bring_up(&w, Show::Focus)),
+        None => {
+            let data = app.try_state::<DataDirHold>().map(|h| h.data().clone());
+            window_spec(label, Show::Focus, data.as_ref(), cfg!(windows))
+                .and_then(|spec| build(app, &spec, registry.nav.clone(), path))
+                .and_then(|w| bring_up(&w, Show::Focus))
+        }
+    };
+    match &result {
+        Ok(()) => tracing::info!(event = LOG_EVENT_WINDOW_OPENED, window = label.as_str()),
+        Err(e) => log_open_failed(label, e.as_str()),
+    }
+    result
+}
+
+/// Opens the guide's index (the tray's "Help") in the UI language, off the main thread.
+pub fn spawn_open_help<R: Runtime>(app: &AppHandle<R>) {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = format!("help/{}/index.html", ui_lang_dir(ui_lang(&app)));
+        let _ = open_help(&app, &path);
+    });
+}
+
+/// The guide's folder of `lang`: `help/<this>/...`.
+pub fn ui_lang_dir(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => "en",
+        Lang::De => "de",
+    }
 }
 
 /// Opens the credential window for `unlock`; the purpose is fixed by Rust, under the window's
@@ -1093,6 +1164,40 @@ mod tests {
     /// The navigation policy of the shipped config takes this build's isolation origin from the
     /// generated context's pattern.
     #[test]
+    fn help_window_navigation_stays_under_help() {
+        let mac = NavPolicy::new(ISO_MAC.into(), false);
+        let win = NavPolicy::new(ISO_WIN.into(), true);
+        for (p, origin) in [
+            (&mac, "tauri://localhost"),
+            (&win, "http://tauri.localhost"),
+        ] {
+            for ok in [
+                "/help/en/index.html",
+                "/help/de/approvals.html#queue",
+                "/help/de/",
+            ] {
+                let u = url(&format!("{origin}{ok}"));
+                assert!(nav_allowed_for(Label::Help, &u, Frame::Main, p), "{u}");
+            }
+            for bad in [
+                "/",
+                "/approvals.html",
+                "/settings.html",
+                "/helpx/a.html",
+                "/assets/x.js",
+            ] {
+                let u = url(&format!("{origin}{bad}"));
+                assert!(!nav_allowed_for(Label::Help, &u, Frame::Main, p), "{u}");
+                // Every other window keeps the app-origin rule.
+                assert!(nav_allowed_for(Label::Settings, &u, Frame::Main, p), "{u}");
+            }
+            // Remote pages stay refused, as everywhere.
+            let remote = url("https://example.com/help/en/index.html");
+            assert!(!nav_allowed_for(Label::Help, &remote, Frame::Main, p));
+        }
+    }
+
+    #[test]
     fn nav_policy_uses_this_builds_isolation_origin() {
         let context: tauri::Context<tauri::test::MockRuntime> =
             tauri::generate_context!(assets = tauri::test::noop_assets(), test = true);
@@ -1392,9 +1497,15 @@ mod tests {
             assert_eq!(json["identifier"], l.as_str());
             assert_eq!(json["windows"], serde_json::json!([l.as_str()]));
             assert_eq!(Label::from_label(l.as_str()), Some(l));
-            assert_eq!(l.entry(), format!("{}.html", l.as_str()));
+            // The Help window's entry is a static guide page (M16), not a Vite input.
+            let (entry, root) = if l == Label::Help {
+                (l.entry().to_owned(), "../ui/public")
+            } else {
+                (format!("{}.html", l.as_str()), "../ui")
+            };
+            assert_eq!(l.entry(), entry);
             let ui = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../ui")
+                .join(root)
                 .join(l.entry());
             assert!(ui.is_file(), "{} has no UI entry", l.as_str());
         }
