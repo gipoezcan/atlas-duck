@@ -2218,7 +2218,9 @@ jobs:
           Write-Output "::notice::e2e cargo exit code $rc"
           if ($rc -ne 0) {
             # The job log needs a login; the tail as annotations shows the failure on the public API.
-            Get-Content $log -Tail 40 | Where-Object { $_.Trim() } | ForEach-Object { Write-Output "::error::$($_ -replace '::', ':')" }
+            # GitHub keeps 10 error annotations per step: failure lines first, then the tail.
+            $hits = @(Select-String -Path $log -Pattern 'FAILED|panicked|^failures:|^    [a-z_:0-9]+$|test result' | ForEach-Object { $_.Line })
+            @($hits + @(Get-Content $log -Tail 20)) | Where-Object { $_.Trim() } | Select-Object -First 10 | ForEach-Object { Write-Output "::error::$($_ -replace '::', ':')" }
             exit $rc
           }
           cargo @a -- --list 2>$null | Set-Content -Path $list -Encoding utf8
