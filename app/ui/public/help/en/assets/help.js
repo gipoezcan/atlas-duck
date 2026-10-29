@@ -24,7 +24,13 @@
   // A target that sits under the sticky bar, or appears after layout, is scrolled into view.
   var toTarget = function () {
     if (!location.hash) return;
-    var el = document.getElementById(decodeURIComponent(location.hash.slice(1)));
+    var id;
+    try {
+      id = decodeURIComponent(location.hash.slice(1));
+    } catch (e) {
+      return; // a malformed hash (`#%E0%A4%A`) must not stop the search from starting
+    }
+    var el = document.getElementById(id);
     if (el) el.scrollIntoView();
   };
   window.addEventListener('hashchange', toTarget);

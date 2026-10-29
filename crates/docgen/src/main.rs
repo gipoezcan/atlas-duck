@@ -20,7 +20,7 @@ mod tests;
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
 use render::Set;
@@ -65,10 +65,16 @@ fn read_tree(dir: &Path) -> Result<Files, String> {
     fn walk(root: &Path, dir: &Path, out: &mut Files) -> Result<(), String> {
         let io = |e: std::io::Error| format!("{}: {e}", dir.display());
         for entry in fs::read_dir(dir).map_err(io)? {
-            let path = entry.map_err(io)?.path();
-            if path.is_dir() {
+            let entry = entry.map_err(io)?;
+            let path = entry.path();
+            let kind = entry.file_type().map_err(io)?;
+            if kind.is_symlink() {
+                // A link (symlink or junction) is never followed: what it points at is not ours.
+                continue;
+            }
+            if kind.is_dir() {
                 walk(root, &path, out)?;
-            } else {
+            } else if kind.is_file() {
                 let rel = path.strip_prefix(root).map_err(|e| e.to_string())?;
                 let name = rel
                     .components()
@@ -119,11 +125,79 @@ fn drift(dir: &Path, files: &Files) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// Removes empty directories below `dir` (not `dir` itself); links are not entered.
+fn prune_empty(dir: &Path, root: &Path) -> Result<(), String> {
+    let io = |e: std::io::Error| format!("{}: {e}", dir.display());
+    for entry in fs::read_dir(dir).map_err(io)? {
+        let entry = entry.map_err(io)?;
+        if entry.file_type().map_err(io)?.is_dir() {
+            prune_empty(&entry.path(), root)?;
+        }
+    }
+    if dir != root && fs::read_dir(dir).map_err(io)?.next().is_none() {
+        fs::remove_dir(dir).map_err(io)?;
+    }
+    Ok(())
+}
+
+/// `path` made absolute, `..` collapsed, and its longest existing prefix canonicalized (an out dir
+/// need not exist yet).
+fn resolve(path: &Path) -> Result<PathBuf, String> {
+    let abs = std::path::absolute(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut norm = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::ParentDir => {
+                norm.pop();
+            }
+            Component::CurDir => {}
+            c => norm.push(c),
+        }
+    }
+    let mut rest = Vec::new();
+    let mut head = norm.as_path();
+    while !head.exists() {
+        let (Some(name), Some(parent)) = (head.file_name(), head.parent()) else {
+            break;
+        };
+        rest.push(name.to_owned());
+        head = parent;
+    }
+    let mut out = fs::canonicalize(head).map_err(|e| format!("{}: {e}", head.display()))?;
+    out.extend(rest.iter().rev());
+    Ok(out)
+}
+
+/// The generator deletes whatever it did not generate below an out dir, so an out dir that is, holds
+/// or lies inside the sources (or the other out dir) is refused.
+fn check_disjoint(src: &Path, desktop: &Path, server: &Path) -> Result<(), String> {
+    let dirs = [
+        ("--src", resolve(src)?),
+        ("--desktop-out", resolve(desktop)?),
+        ("--server-out", resolve(server)?),
+    ];
+    for (i, (a_name, a)) in dirs.iter().enumerate() {
+        for (b_name, b) in &dirs[i + 1..] {
+            if a.starts_with(b) || b.starts_with(a) {
+                return Err(format!(
+                    "{a_name} ({}) and {b_name} ({}) overlap",
+                    a.display(),
+                    b.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn write_tree(dir: &Path, files: &Files) -> Result<(), String> {
     let disk = read_tree(dir)?;
     for name in disk.keys().filter(|n| !files.contains_key(*n)) {
         let path = dir.join(name);
         fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    if dir.is_dir() {
+        prune_empty(dir, dir)?;
     }
     for (name, bytes) in files {
         if disk.get(name) == Some(bytes) {
@@ -140,6 +214,7 @@ fn write_tree(dir: &Path, files: &Files) -> Result<(), String> {
 
 fn run() -> Result<ExitCode, String> {
     let args = parse_args(std::env::args().skip(1))?;
+    check_disjoint(&args.src, &args.desktop_out, &args.server_out)?;
     let sources = site::load(&args.src)?;
     let mut problems = Vec::new();
     for (set, out) in [

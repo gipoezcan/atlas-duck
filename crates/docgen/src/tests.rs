@@ -463,3 +463,59 @@ fn check_reports_drift_and_write_repairs_it() {
     assert!(crate::drift(&dir, &files).unwrap().is_empty());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn out_dirs_must_not_overlap_the_sources_or_each_other() {
+    let src = guide_dir();
+    let base =
+        std::env::temp_dir().join(format!("atlas-duck-docgen-overlap-{}", std::process::id()));
+    let (a, b) = (base.join("a"), base.join("b"));
+    assert!(crate::check_disjoint(&src, &a, &b).is_ok());
+    assert!(crate::check_disjoint(&src, &src, &b).is_err());
+    assert!(crate::check_disjoint(&src, &src.join("en"), &b).is_err());
+    assert!(crate::check_disjoint(&src, &a, &src.join("..")).is_err());
+    assert!(crate::check_disjoint(&src, &a, &a.join("sub")).is_err());
+    assert!(crate::check_disjoint(&src, &a, &a).is_err());
+    // Lexical `..` and a not yet existing out dir are resolved.
+    assert!(crate::check_disjoint(&src, &base.join("x/../a"), &base.join("a/new")).is_err());
+}
+
+/// A link (symlink, or a junction on Windows) inside an out dir is neither followed nor deleted
+/// through: the files it points at survive a write.
+#[test]
+fn write_tree_does_not_follow_links() {
+    let base = std::env::temp_dir().join(format!("atlas-duck-docgen-link-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (out, outside) = (base.join("out"), base.join("outside"));
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep.txt"), "keep").unwrap();
+    let link = out.join("link");
+    #[cfg(windows)]
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(&outside)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(&outside, &link).is_ok();
+    assert!(made, "could not create a link for the test");
+
+    let files = site::generate(&fixture(), Set::Desktop).unwrap();
+    crate::write_tree(&out, &files).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(outside.join("keep.txt")).unwrap(),
+        "keep"
+    );
+    assert!(crate::drift(&out, &files).unwrap().is_empty());
+    // Stale empty directories are removed too.
+    std::fs::create_dir_all(out.join("old/deep")).unwrap();
+    std::fs::write(out.join("old/deep/x.html"), "x").unwrap();
+    crate::write_tree(&out, &files).unwrap();
+    assert!(!out.join("old").exists());
+    // remove_dir on a junction removes the link only; remove_dir_all could follow it.
+    let _ = std::fs::remove_dir(&link);
+    std::fs::remove_dir_all(&base).unwrap();
+}
