@@ -689,6 +689,8 @@ fn command_errors() -> Vec<CommandError> {
         CommandError::Settings(SettingsError::ConfigReadOnly(ConfigBanner {
             kind: "read_only",
             text: "config written by v9.9.0; settings read-only until you upgrade".into(),
+            version: Some("v9.9.0".into()),
+            parsed: true,
         })),
         CommandError::Settings(SettingsError::NoConfigFile),
         CommandError::Settings(SettingsError::Conflict),
@@ -1402,6 +1404,8 @@ fn settings_views() -> Vec<SettingsView> {
             config_read_only: Some(ConfigBanner {
                 kind: "read_only",
                 text: "config written by v9.9.0; settings read-only until you upgrade".into(),
+                version: Some("v9.9.0".into()),
+                parsed: true,
             }),
             restart_pending: vec!["candidate_cache_mb"],
         },

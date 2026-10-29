@@ -14,6 +14,7 @@ use tauri::{AppHandle, Manager, RunEvent, Runtime, WindowEvent, Wry};
 
 use crate::attention;
 use crate::early_argv::FLAG_BACKGROUND;
+use crate::i18n::{Lang, T, count};
 use crate::os_hooks;
 use crate::serve;
 use crate::startup::{StartupState, startup_message};
@@ -36,23 +37,41 @@ pub const MENU_ID_PRESENTATION_MODE: &str = "presentation_mode";
 /// Menu id of "Retry keychain" (`keychain_unavailable` only; Task 22 wires it, PD-89).
 pub const MENU_ID_RETRY_KEYCHAIN: &str = "retry_keychain";
 /// Label of the Quit item (app-generated constant, §5.6).
-pub const MENU_LABEL_QUIT: &str = "Quit";
+pub const MENU_LABEL_QUIT: T = T::new("Quit", "Beenden");
 /// §2.5 (verbatim): "Open approvals (N)"; `<n>` is the pending count.
-pub const MENU_LABEL_OPEN_APPROVALS: &str = "Open approvals (<n>)";
+pub const MENU_LABEL_OPEN_APPROVALS: T = T::new("Open approvals (<n>)", "Freigaben öffnen (<n>)");
 /// §2.5 (verbatim).
-pub const MENU_LABEL_UNLOCK: &str = "Unlock…";
+pub const MENU_LABEL_UNLOCK: T = T::new("Unlock…", "Entsperren…");
 /// §5.6 (verbatim): switches to "badge only" without confirmation (T19).
-pub const MENU_LABEL_PRESENTATION_MODE: &str = "Presentation mode";
+pub const MENU_LABEL_PRESENTATION_MODE: T = T::new("Presentation mode", "Präsentationsmodus");
 /// plan text (PD-89).
-pub const MENU_LABEL_RETRY_KEYCHAIN: &str = "Retry keychain";
+pub const MENU_LABEL_RETRY_KEYCHAIN: T = T::new("Retry keychain", "Schlüsselbund erneut versuchen");
 /// plan text (T6): the tooltip outside the error states; `<n>` is the pending count.
-pub const TOOLTIP_PENDING: &str = "atlas-duck: <n> pending";
+pub const TOOLTIP_PENDING: T = T::new("atlas-duck: <n> pending", "atlas-duck: <n> ausstehend");
 /// plan text (T19): the tooltip's second line while Presentation mode is on (badge only, until the
 /// same menu item switches it off).
-pub const TOOLTIP_PRESENTATION: &str = "Presentation mode: badge only";
+pub const TOOLTIP_PRESENTATION: T = T::new(
+    "Presentation mode: badge only",
+    "Präsentationsmodus: nur Kennzeichen",
+);
 /// PD-06: the tray status text when the audit store could not be opened (plan text; no path,
 /// no error text).
-pub const MSG_STORE_UNAVAILABLE: &str = "audit store could not be opened";
+pub const MSG_STORE_UNAVAILABLE: T = T::new(
+    "audit store could not be opened",
+    "Der Audit-Speicher konnte nicht geöffnet werden",
+);
+
+/// The texts of this module, for [`crate::i18n::all`].
+pub const TEXTS: &[&T] = &[
+    &MENU_LABEL_QUIT,
+    &MENU_LABEL_OPEN_APPROVALS,
+    &MENU_LABEL_UNLOCK,
+    &MENU_LABEL_PRESENTATION_MODE,
+    &MENU_LABEL_RETRY_KEYCHAIN,
+    &TOOLTIP_PENDING,
+    &TOOLTIP_PRESENTATION,
+    &MSG_STORE_UNAVAILABLE,
+];
 
 /// Log event when the tray icon cannot be created (startup continues).
 pub const LOG_EVENT_TRAY_BUILD_FAILED: &str = "tray_build_failed";
@@ -146,9 +165,10 @@ pub const MENU_ID_STATUS_LINES: [&str; 4] = [MENU_ID_STATUS, "status_2", "status
 /// from `inputs` ("Locked — N requests refused", "Setup required — N requests refused",
 /// "Waiting for keyring", the keychain prompt hint, the endpoint that is not accepting).
 pub fn status_lines(state: &AppSnapshot, inputs: &StatusInputs) -> Vec<String> {
+    let lang = inputs.lang;
     match state {
         AppSnapshot::StartupError(text) => vec![text.clone()],
-        AppSnapshot::StoreUnavailable => vec![MSG_STORE_UNAVAILABLE.to_owned()],
+        AppSnapshot::StoreUnavailable => vec![MSG_STORE_UNAVAILABLE.get(lang).to_owned()],
         _ => {
             let serving = state == &AppSnapshot::Serving;
             status::lines(inputs)
@@ -177,6 +197,7 @@ fn unlockable(state: &AppSnapshot) -> bool {
 /// path), "Unlock…" (locked), "Retry keychain" (`keychain_unavailable`; disabled while a retry
 /// runs, `keychain_retrying`), "Presentation mode" (while `Core` serves), Quit.
 pub fn menu_entries(
+    lang: Lang,
     state: &AppSnapshot,
     pending: u32,
     status: &[String],
@@ -192,35 +213,39 @@ pub fn menu_entries(
     }
     entries.push(MenuEntry::item(
         MENU_ID_OPEN_APPROVALS,
-        MENU_LABEL_OPEN_APPROVALS.replace("<n>", &pending.to_string()),
+        MENU_LABEL_OPEN_APPROVALS
+            .get(lang)
+            .replace("<n>", &count(lang, u64::from(pending))),
     ));
     if unlockable(state) {
-        entries.push(MenuEntry::item(MENU_ID_UNLOCK, MENU_LABEL_UNLOCK));
+        entries.push(MenuEntry::item(MENU_ID_UNLOCK, MENU_LABEL_UNLOCK.get(lang)));
     }
     if state == &AppSnapshot::Gate(GateState::Locked(LockedReason::KeychainUnavailable)) {
         // PD-89: a retry the user may start is the one after the automatic schedule; while a retry
         // runs the entry is listed but disabled (a click would be a silent no-op).
         entries.push(MenuEntry {
             id: MENU_ID_RETRY_KEYCHAIN,
-            label: MENU_LABEL_RETRY_KEYCHAIN.to_owned(),
+            label: MENU_LABEL_RETRY_KEYCHAIN.get(lang).to_owned(),
             enabled: !keychain_retrying,
         });
     }
     if state == &AppSnapshot::Serving {
         entries.push(MenuEntry::item(
             MENU_ID_PRESENTATION_MODE,
-            MENU_LABEL_PRESENTATION_MODE,
+            MENU_LABEL_PRESENTATION_MODE.get(lang),
         ));
     }
-    entries.push(MenuEntry::item(MENU_ID_QUIT, MENU_LABEL_QUIT));
+    entries.push(MenuEntry::item(MENU_ID_QUIT, MENU_LABEL_QUIT.get(lang)));
     entries
 }
 
 /// The tooltip: the status lines when there are any (Linux shows no tooltip, so the status items
 /// carry them there), then the pending count (§5.6 "The tray badge/tooltip always shows the
 /// pending count"); a last line says while Presentation mode is on.
-pub fn tooltip_text(status: &[String], pending: u32, presentation: bool) -> String {
-    let count = TOOLTIP_PENDING.replace("<n>", &pending.to_string());
+pub fn tooltip_text(lang: Lang, status: &[String], pending: u32, presentation: bool) -> String {
+    let count = TOOLTIP_PENDING
+        .get(lang)
+        .replace("<n>", &count(lang, u64::from(pending)));
     let mut text = String::new();
     for line in status {
         text.push_str(line);
@@ -229,7 +254,7 @@ pub fn tooltip_text(status: &[String], pending: u32, presentation: bool) -> Stri
     text.push_str(&count);
     if presentation {
         text.push('\n');
-        text.push_str(TOOLTIP_PRESENTATION);
+        text.push_str(TOOLTIP_PRESENTATION.get(lang));
     }
     text
 }
@@ -245,12 +270,12 @@ pub fn tray_title(pending: u32) -> Option<String> {
 /// states (§7.7 "shows the error in the tray and a window"), `None` otherwise. It is the
 /// same app-generated text the dialog shows, never agent- or file-supplied text (§5.6).
 /// `AlreadyRunning` exits before any tray exists, so it has no tray text.
-pub fn tray_status_text(state: &StartupState) -> Option<String> {
+pub fn tray_status_text(lang: Lang, state: &StartupState) -> Option<String> {
     match state {
         StartupState::DataDirMissing { .. }
         | StartupState::DataDirNotLocal { .. }
         | StartupState::DataDirUnusable { .. }
-        | StartupState::PinnedUnreadable { .. } => startup_message(state),
+        | StartupState::PinnedUnreadable { .. } => startup_message(lang, state),
         StartupState::BeforeFirstRun
         | StartupState::Ready { .. }
         | StartupState::AlreadyRunning { .. } => None,
@@ -362,8 +387,19 @@ fn tray_view(app: &AppHandle) -> (Vec<MenuEntry>, String) {
     let inputs = status::gather_gate(app);
     let status = status_lines(&state, &inputs);
     (
-        menu_entries(&state, pending, &status, inputs.keychain_retrying),
-        tooltip_text(&status, pending, attention::presentation_on(app)),
+        menu_entries(
+            inputs.lang,
+            &state,
+            pending,
+            &status,
+            inputs.keychain_retrying,
+        ),
+        tooltip_text(
+            inputs.lang,
+            &status,
+            pending,
+            attention::presentation_on(app),
+        ),
     )
 }
 
@@ -544,6 +580,57 @@ pub fn register_plugins<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M15 T10 (Review Focus 1): Windows cuts a tray tooltip at 127 UTF-16 units. The German
+    /// tooltip of the longest tray state still fits: the longest gate line, the pending count of a
+    /// full queue and the Presentation-mode line.
+    #[test]
+    fn tray_tooltip_de_fits_127_utf16() {
+        let gate = StatusInputs {
+            gate: Some(GateState::Locked(LockedReason::KeychainUnavailable)),
+            refused: 99_999,
+            keychain_retrying: true,
+            keychain_prompt: true,
+            lang: Lang::De,
+            ..StatusInputs::default()
+        };
+        let lines = status_lines(&locked(LockedReason::KeychainUnavailable), &gate);
+        assert!(lines.len() >= 2, "{lines:?}");
+        for line in &lines {
+            let one = tooltip_text(Lang::De, std::slice::from_ref(line), 99_999, true);
+            assert!(
+                one.encode_utf16().count() <= 127,
+                "{} > 127: {one}",
+                one.encode_utf16().count()
+            );
+        }
+        for t in TEXTS {
+            assert!(t.de.encode_utf16().count() <= 127, "{t:?}");
+        }
+        for t in crate::status::TEXTS {
+            assert!(t.de.encode_utf16().count() <= 127, "{t:?}");
+        }
+    }
+
+    #[test]
+    fn menu_and_tooltip_in_german() {
+        let menu = menu_entries(Lang::De, &AppSnapshot::Serving, 1234, &[], false);
+        let labels: Vec<&str> = menu.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["Freigaben öffnen (1.234)", "Präsentationsmodus", "Beenden"]
+        );
+        assert_eq!(
+            tooltip_text(Lang::De, &[], 3, true),
+            "atlas-duck: 3 ausstehend\nPräsentationsmodus: nur Kennzeichen"
+        );
+        let ids_en: Vec<&str> = menu_entries(Lang::En, &AppSnapshot::Serving, 1, &[], false)
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        let ids_de: Vec<&str> = menu.iter().map(|e| e.id).collect();
+        assert_eq!(ids_en, ids_de, "the ids do not depend on the language");
+    }
     use atlas_duck_audit::lock::InstanceLock;
     use atlas_duck_ipc::paths::{DataDirResolution, NotLocalKind, check_data_dir};
     use std::path::PathBuf;
@@ -551,8 +638,8 @@ mod tests {
     #[test]
     fn store_unavailable_text_is_the_plan_constant() {
         // PD-06: constant text, no path and no error text.
-        assert_eq!(MSG_STORE_UNAVAILABLE, "audit store could not be opened");
-        assert!(!MSG_STORE_UNAVAILABLE.contains('<'));
+        assert_eq!(MSG_STORE_UNAVAILABLE.en, "audit store could not be opened");
+        assert!(!MSG_STORE_UNAVAILABLE.en.contains('<'));
     }
 
     fn ids(entries: &[MenuEntry]) -> Vec<&'static str> {
@@ -567,12 +654,12 @@ mod tests {
     fn tray_menu_items_per_state() {
         use atlas_duck_audit::RecoveryOffer;
         assert_eq!(TRAY_ID, "main");
-        assert_eq!(MENU_LABEL_QUIT, "Quit");
-        assert_eq!(MENU_LABEL_UNLOCK, "Unlock\u{2026}");
-        assert_eq!(MENU_LABEL_PRESENTATION_MODE, "Presentation mode");
+        assert_eq!(MENU_LABEL_QUIT.en, "Quit");
+        assert_eq!(MENU_LABEL_UNLOCK.en, "Unlock\u{2026}");
+        assert_eq!(MENU_LABEL_PRESENTATION_MODE.en, "Presentation mode");
 
         // Serving: the count, presentation mode, Quit.
-        let serving = menu_entries(&AppSnapshot::Serving, 3, &[], false);
+        let serving = menu_entries(Lang::En, &AppSnapshot::Serving, 3, &[], false);
         assert_eq!(
             ids(&serving),
             ["open_approvals", "presentation_mode", "quit"]
@@ -580,16 +667,22 @@ mod tests {
         assert_eq!(serving[0].label, "Open approvals (3)");
         assert!(serving.iter().all(|e| e.enabled));
         assert_eq!(
-            menu_entries(&AppSnapshot::Serving, 0, &[], false)[0].label,
+            menu_entries(Lang::En, &AppSnapshot::Serving, 0, &[], false)[0].label,
             "Open approvals (0)"
         );
         assert_eq!(
-            menu_entries(&AppSnapshot::Serving, 1234, &[], false)[0].label,
+            menu_entries(Lang::En, &AppSnapshot::Serving, 1234, &[], false)[0].label,
             "Open approvals (1234)"
         );
 
         // Locked: "Unlock…"; "Retry keychain" only while the keychain is unavailable.
-        let unavailable = menu_entries(&locked(LockedReason::KeychainUnavailable), 6, &[], false);
+        let unavailable = menu_entries(
+            Lang::En,
+            &locked(LockedReason::KeychainUnavailable),
+            6,
+            &[],
+            false,
+        );
         assert_eq!(
             ids(&unavailable),
             ["open_approvals", "unlock", "retry_keychain", "quit"]
@@ -598,13 +691,20 @@ mod tests {
         assert_eq!(unavailable[2].label, "Retry keychain");
         assert!(unavailable[2].enabled);
         // While a retry runs the entry stays listed, disabled (PD-89: after the schedule).
-        let running = menu_entries(&locked(LockedReason::KeychainUnavailable), 6, &[], true);
+        let running = menu_entries(
+            Lang::En,
+            &locked(LockedReason::KeychainUnavailable),
+            6,
+            &[],
+            true,
+        );
         assert_eq!(ids(&running), ids(&unavailable));
         assert!(!running[2].enabled);
         assert!(running[1].enabled, "Unlock stays usable");
         for offer in [RecoveryOffer::RecoverThisLog, RecoveryOffer::FinishRestore] {
             assert_eq!(
                 ids(&menu_entries(
+                    Lang::En,
                     &locked(LockedReason::KeychainLost { offer }),
                     0,
                     &[],
@@ -616,6 +716,7 @@ mod tests {
         // Nothing to unlock: no "Unlock…" (§8.7).
         assert_eq!(
             ids(&menu_entries(
+                Lang::En,
                 &locked(LockedReason::KeyringNotLocal),
                 0,
                 &[],
@@ -627,6 +728,7 @@ mod tests {
         // The error states: a disabled status item above the rest.
         let state = AppSnapshot::StartupError("data directory /d not found".into());
         let error = menu_entries(
+            Lang::En,
             &state,
             0,
             &status_lines(&state, &StatusInputs::default()),
@@ -637,17 +739,18 @@ mod tests {
         assert!(!error[0].enabled);
         let state = AppSnapshot::StoreUnavailable;
         let failed = menu_entries(
+            Lang::En,
             &state,
             0,
             &status_lines(&state, &StatusInputs::default()),
             false,
         );
         assert_eq!(ids(&failed), ["status", "open_approvals", "quit"]);
-        assert_eq!(failed[0].label, MSG_STORE_UNAVAILABLE);
+        assert_eq!(failed[0].label, MSG_STORE_UNAVAILABLE.en);
 
         // More lines than the four status items are dropped from the menu (the tooltip has all).
         let many: Vec<String> = (1..=6).map(|n| format!("line {n}")).collect();
-        let crowded = menu_entries(&AppSnapshot::Serving, 0, &many, false);
+        let crowded = menu_entries(Lang::En, &AppSnapshot::Serving, 0, &many, false);
         assert_eq!(
             ids(&crowded),
             [
@@ -673,7 +776,7 @@ mod tests {
             AppSnapshot::Gate(GateState::StoreNewer),
         ] {
             assert_eq!(
-                ids(&menu_entries(&state, 0, &[], false)),
+                ids(&menu_entries(Lang::En, &state, 0, &[], false)),
                 ["open_approvals", "quit"],
                 "{state:?}"
             );
@@ -682,19 +785,27 @@ mod tests {
 
     #[test]
     fn tooltip_shows_the_pending_count() {
-        assert_eq!(tooltip_text(&[], 3, false), "atlas-duck: 3 pending");
         assert_eq!(
-            tooltip_text(&["audit store could not be opened".to_owned()], 0, false),
+            tooltip_text(Lang::En, &[], 3, false),
+            "atlas-duck: 3 pending"
+        );
+        assert_eq!(
+            tooltip_text(
+                Lang::En,
+                &["audit store could not be opened".to_owned()],
+                0,
+                false
+            ),
             "audit store could not be opened\natlas-duck: 0 pending"
         );
         // Presentation mode adds one fixed line, after the count.
         assert_eq!(
-            tooltip_text(&[], 2, true),
+            tooltip_text(Lang::En, &[], 2, true),
             "atlas-duck: 2 pending\nPresentation mode: badge only"
         );
         // Every status line, in order, above the count.
         assert_eq!(
-            tooltip_text(&["a".to_owned(), "b".to_owned()], 1, false),
+            tooltip_text(Lang::En, &["a".to_owned(), "b".to_owned()], 1, false),
             "a\nb\natlas-duck: 1 pending"
         );
     }
@@ -740,11 +851,14 @@ mod tests {
         // The count is in the menu and in the tooltip.
         let inputs = gate_inputs(GateState::Locked(LockedReason::KeychainUnavailable), 6);
         let lines = status_lines(&state, &inputs);
-        let menu = menu_entries(&state, 0, &lines, false);
+        let menu = menu_entries(Lang::En, &state, 0, &lines, false);
         assert_eq!(menu[0].id, MENU_ID_STATUS);
         assert_eq!(menu[0].label, "Locked \u{2014} 6 requests refused");
         assert!(!menu[0].enabled);
-        assert!(tooltip_text(&lines, 0, false).starts_with("Locked \u{2014} 6 requests refused\n"));
+        assert!(
+            tooltip_text(Lang::En, &lines, 0, false)
+                .starts_with("Locked \u{2014} 6 requests refused\n")
+        );
     }
 
     /// The other gate lines the tray carries (and only those): the keyring wait, the keychain
@@ -788,7 +902,7 @@ mod tests {
                 &AppSnapshot::Gate(GateState::StoreNewer),
                 &gate_inputs(GateState::StoreNewer, 0)
             ),
-            [status::TEXT_STORE_NEWER]
+            [status::TEXT_STORE_NEWER.en]
         );
         // Needs-attention, the degraded-scripts caution and the like need the core: not in the tray.
         let busy = StatusInputs {
@@ -804,12 +918,12 @@ mod tests {
         };
         assert_eq!(
             status_lines(&AppSnapshot::Serving, &updated),
-            [status::TEXT_UPDATED_RESTART]
+            [status::TEXT_UPDATED_RESTART.en]
         );
         // The error states show their own text, whatever else is set.
         assert_eq!(
             status_lines(&AppSnapshot::StoreUnavailable, &waiting),
-            [MSG_STORE_UNAVAILABLE]
+            [MSG_STORE_UNAVAILABLE.en]
         );
     }
 
@@ -898,10 +1012,10 @@ mod tests {
             );
         }
         // The menu has room for four status items; the tooltip carries every line.
-        let menu = menu_entries(&AppSnapshot::Serving, 0, &lines, false);
+        let menu = menu_entries(Lang::En, &AppSnapshot::Serving, 0, &lines, false);
         assert_eq!(menu.iter().filter(|e| !e.enabled).count(), 4);
         for line in &lines {
-            assert!(tooltip_text(&lines, 0, false).contains(line.as_str()));
+            assert!(tooltip_text(Lang::En, &lines, 0, false).contains(line.as_str()));
         }
     }
 
@@ -934,7 +1048,7 @@ mod tests {
             locked(LockedReason::KeychainUnavailable),
             AppSnapshot::StoreUnavailable,
         ] {
-            for e in menu_entries(&state, 1, &[], false)
+            for e in menu_entries(Lang::En, &state, 1, &[], false)
                 .iter()
                 .filter(|e| e.enabled)
             {
@@ -972,28 +1086,31 @@ mod tests {
             StartupState::PinnedUnreadable { path: path.clone() },
         ];
         for state in &states {
-            let text = tray_status_text(state);
+            let text = tray_status_text(Lang::En, state);
             assert!(text.is_some(), "{state:?} has no tray text");
             assert_eq!(
                 text,
-                startup_message(state),
+                startup_message(Lang::En, state),
                 "{state:?}: startup_message is the only text source (§5.6)"
             );
         }
         assert_eq!(
-            tray_status_text(&states[0]).as_deref(),
+            tray_status_text(Lang::En, &states[0]).as_deref(),
             Some("data directory /some/data not found")
         );
     }
 
     #[test]
     fn status_text_is_none_when_there_is_no_startup_error() {
-        assert_eq!(tray_status_text(&StartupState::BeforeFirstRun), None);
+        assert_eq!(
+            tray_status_text(Lang::En, &StartupState::BeforeFirstRun),
+            None
+        );
         // Exits before any tray exists, so it has no tray text even with a named host.
         let running = StartupState::AlreadyRunning {
             other_host: Some("otherhost".to_owned()),
         };
-        assert_eq!(tray_status_text(&running), None);
+        assert_eq!(tray_status_text(Lang::En, &running), None);
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let data = match check_data_dir(tmp.path()).expect("check_data_dir") {
@@ -1001,7 +1118,10 @@ mod tests {
             _ => panic!("{} is not a local data dir", tmp.path().display()),
         };
         let lock = InstanceLock::acquire(&data, "thishost").expect("lock");
-        assert_eq!(tray_status_text(&StartupState::Ready { data, lock }), None);
+        assert_eq!(
+            tray_status_text(Lang::En, &StartupState::Ready { data, lock }),
+            None
+        );
     }
 
     #[test]

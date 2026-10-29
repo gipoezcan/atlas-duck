@@ -197,10 +197,19 @@ pub fn run_gui(background: bool) -> ! {
             let (host, pinned) = startup::read_this_host_pinned();
             // T19: serving needs the pinned config dir and install id; the gate consumes `pinned`.
             let pinned_paths = pinned.as_ref().ok().cloned().flatten();
+            // M15 T10: the startup texts (the gate's dialog, the tray) come before `AppState`;
+            // they take the stored preference of the pinned data dir (`auto` without one).
+            let startup_lang = state::UiLang::of(
+                pinned_paths
+                    .as_ref()
+                    .map(|p| ui_lang::load(&p.data_dir))
+                    .unwrap_or_default(),
+            )
+            .lang;
             let state = startup::gate(pinned, &host);
             let presenter = DialogPresenter::new(app.handle().clone());
             if let StartupAction::Exit { message } =
-                startup::apply_startup_state(&state, diag, &presenter)
+                startup::apply_startup_state(startup_lang, &state, diag, &presenter)
             {
                 // §3.1: a second instance exits immediately, after showing the
                 // "running on another machine" text when the holder is on another host.
@@ -219,7 +228,7 @@ pub fn run_gui(background: bool) -> ! {
             }
             os_hooks::install(app.handle());
             // The tray text, taken before the `Ready` arm below moves the state.
-            let tray_status = tray::tray_status_text(&state);
+            let tray_status = tray::tray_status_text(startup_lang, &state);
 
             // Linux tray-host check (bounded by TRAY_HOST_TIMEOUT); the allowlist must know the
             // field before the line is written.

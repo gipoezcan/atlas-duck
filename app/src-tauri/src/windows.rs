@@ -401,7 +401,7 @@ fn route_open(state: &AppSnapshot) -> Relaunch {
         // The `StoreFailed` gate serves with `store_failed` set, so `serving_snapshot` reports
         // `StoreUnavailable` first; the arm keeps the routing total (M9 Δ4).
         AppSnapshot::StoreUnavailable | AppSnapshot::Gate(GateState::StoreFailed) => {
-            Relaunch::ShowErrorDialog(MSG_STORE_UNAVAILABLE.into())
+            Relaunch::ShowErrorDialog(MSG_STORE_UNAVAILABLE.en.into())
         }
         AppSnapshot::Gate(GateState::ShuttingDown) | AppSnapshot::ShuttingDown => Relaunch::Nothing,
     }

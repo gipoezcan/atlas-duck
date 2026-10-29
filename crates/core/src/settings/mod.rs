@@ -297,6 +297,12 @@ pub struct LimitsView {
 pub struct ConfigBanner {
     pub kind: &'static str,
     pub text: String,
+    /// M15 T10: the facts `text` is built from, so a UI can word it in its own language: the
+    /// writer's version as `text` names it (`vX`), `None` when `text` says "a newer atlas-duck",
+    /// and whether the file could be parsed at all (`false`: the "could not be read; settings
+    /// unavailable" text).
+    pub version: Option<String>,
+    pub parsed: bool,
 }
 
 /// The store health Settings and the tray show (§8.1, §8.5, §8.8). No error text: an
@@ -587,18 +593,19 @@ fn confirmed(text: &str) -> Confirmed {
 /// The version a banner names: only the characters of a version string, at most 32 (the file is
 /// writable by any same-user process, the banner text is app-generated).
 fn shown_version(info: &ConfigReadOnly) -> String {
+    banner_version(info).unwrap_or_else(|| "a newer atlas-duck".to_owned())
+}
+
+/// The `vX` a banner names, when the file's `written_by` is a plain version string.
+fn banner_version(info: &ConfigReadOnly) -> Option<String> {
     let ok = info.written_by.as_deref().filter(|v| {
         !v.is_empty()
             && v.len() <= 32
             && v.chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
     });
-    match ok {
-        Some(v) => format!("v{}", v.strip_prefix('v').unwrap_or(v)),
-        None => "a newer atlas-duck".to_owned(),
-    }
+    ok.map(|v| format!("v{}", v.strip_prefix('v').unwrap_or(v)))
 }
-
 /// The config banner. §7.7 (verbatim, with `vX` from `written_by`): the read-only text and the
 /// newer-schema "could not be read; upgrade atlas-duck" text. Plan text (L82, PD-90
 /// `config_unreadable`), in no spec sentence: "config could not be read; settings unavailable until
@@ -611,6 +618,8 @@ fn banner(cfg: &ConfigState) -> Option<ConfigBanner> {
                 "config written by {}; settings read-only until you upgrade",
                 shown_version(info)
             ),
+            version: banner_version(info),
+            parsed: true,
         }),
         // No schema and not parsed: the file could not be read at all (an I/O error, or no
         // structure to read a version from); "a newer atlas-duck" would be wrong for it.
@@ -618,6 +627,8 @@ fn banner(cfg: &ConfigState) -> Option<ConfigBanner> {
             Some(ConfigBanner {
                 kind: "unreadable",
                 text: "config could not be read; settings unavailable until it can be".to_owned(),
+                version: None,
+                parsed: false,
             })
         }
         ConfigState::Unreadable { info } => Some(ConfigBanner {
@@ -626,6 +637,8 @@ fn banner(cfg: &ConfigState) -> Option<ConfigBanner> {
                 "config written by {} could not be read; upgrade atlas-duck",
                 shown_version(info)
             ),
+            version: banner_version(info),
+            parsed: true,
         }),
         ConfigState::Absent | ConfigState::Writable(_) => None,
     }

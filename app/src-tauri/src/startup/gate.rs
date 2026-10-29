@@ -14,21 +14,45 @@ use tauri::AppHandle;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 use crate::diag::Diag;
+use crate::i18n::{Lang, T};
 use crate::startup::crash::clear_crashpad_reports;
 use crate::state::StartupSummary;
 use crate::windows::webview_data_dirs;
 
 /// §7.7 Path stability (verbatim).
-pub const MSG_DATA_DIR_NOT_FOUND: &str = "data directory <path> not found";
+pub const MSG_DATA_DIR_NOT_FOUND: T = T::new(
+    "data directory <path> not found",
+    "Datenverzeichnis <path> nicht gefunden",
+);
 /// §3.1 Single instance (verbatim).
-pub const MSG_RUNNING_ON_OTHER_HOST: &str =
-    "atlas-duck is running on another machine (<host>) with this data directory";
+pub const MSG_RUNNING_ON_OTHER_HOST: T = T::new(
+    "atlas-duck is running on another machine (<host>) with this data directory",
+    "atlas-duck läuft auf einem anderen Computer (<host>) mit diesem Datenverzeichnis",
+);
 /// §2.5 (verbatim; the same text at startup and in the wizard; text fixed in L128, spec amended).
-pub const MSG_DATA_DIR_NOT_LOCAL: &str = "data directory <path> is not on a local filesystem";
+pub const MSG_DATA_DIR_NOT_LOCAL: T = T::new(
+    "data directory <path> is not on a local filesystem",
+    "Datenverzeichnis <path> liegt nicht auf einem lokalen Dateisystem",
+);
 /// Spec silent (unreadable pinned file); plan placeholder awaiting user confirmation.
-pub const MSG_PINNED_UNREADABLE: &str = "atlas-duck path settings <path> could not be read";
+pub const MSG_PINNED_UNREADABLE: T = T::new(
+    "atlas-duck path settings <path> could not be read",
+    "Die Pfadeinstellungen von atlas-duck <path> konnten nicht gelesen werden",
+);
 /// Spec silent (I/O error while checking or locking the data dir); plan placeholder.
-pub const MSG_DATA_DIR_UNUSABLE: &str = "data directory <path> could not be opened";
+pub const MSG_DATA_DIR_UNUSABLE: T = T::new(
+    "data directory <path> could not be opened",
+    "Datenverzeichnis <path> konnte nicht geöffnet werden",
+);
+
+/// The texts of this module, for [`crate::i18n::all`].
+pub const TEXTS: &[&T] = &[
+    &MSG_DATA_DIR_NOT_FOUND,
+    &MSG_RUNNING_ON_OTHER_HOST,
+    &MSG_DATA_DIR_NOT_LOCAL,
+    &MSG_PINNED_UNREADABLE,
+    &MSG_DATA_DIR_UNUSABLE,
+];
 
 /// Diagnostic-log fields this module emits (added to the T08 allowlist).
 pub const LOG_FIELDS: &[&str] = &["startup_state"];
@@ -187,17 +211,19 @@ pub fn render_message(template: &str, value: &str) -> String {
 }
 
 /// The app-generated text for a state, if it has one.
-pub fn startup_message(state: &StartupState) -> Option<String> {
+pub fn startup_message(lang: Lang, state: &StartupState) -> Option<String> {
     let with_path =
-        |template: &str, path: &Path| render_message(template, &path.display().to_string());
+        |template: &T, path: &Path| render_message(template.get(lang), &path.display().to_string());
     match state {
-        StartupState::DataDirMissing { path } => Some(with_path(MSG_DATA_DIR_NOT_FOUND, path)),
-        StartupState::DataDirNotLocal { path, .. } => Some(with_path(MSG_DATA_DIR_NOT_LOCAL, path)),
-        StartupState::DataDirUnusable { path } => Some(with_path(MSG_DATA_DIR_UNUSABLE, path)),
-        StartupState::PinnedUnreadable { path } => Some(with_path(MSG_PINNED_UNREADABLE, path)),
+        StartupState::DataDirMissing { path } => Some(with_path(&MSG_DATA_DIR_NOT_FOUND, path)),
+        StartupState::DataDirNotLocal { path, .. } => {
+            Some(with_path(&MSG_DATA_DIR_NOT_LOCAL, path))
+        }
+        StartupState::DataDirUnusable { path } => Some(with_path(&MSG_DATA_DIR_UNUSABLE, path)),
+        StartupState::PinnedUnreadable { path } => Some(with_path(&MSG_PINNED_UNREADABLE, path)),
         StartupState::AlreadyRunning {
             other_host: Some(host),
-        } => Some(render_message(MSG_RUNNING_ON_OTHER_HOST, host)),
+        } => Some(render_message(MSG_RUNNING_ON_OTHER_HOST.get(lang), host)),
         StartupState::AlreadyRunning { other_host: None }
         | StartupState::BeforeFirstRun
         | StartupState::Ready { .. } => None,
@@ -281,6 +307,7 @@ pub(crate) fn clear_webview_crashpad(data: &LocalDataDir) {
 /// Crashpad reports. It shows each error state's text once. It asks `AlreadyRunning` to
 /// exit. Error states and `BeforeFirstRun` write nothing.
 pub fn apply_startup_state(
+    lang: Lang,
     state: &StartupState,
     diag: &Diag,
     presenter: &dyn ErrorPresenter,
@@ -297,13 +324,13 @@ pub fn apply_startup_state(
         }
         StartupState::BeforeFirstRun => StartupAction::Stay,
         StartupState::AlreadyRunning { .. } => StartupAction::Exit {
-            message: startup_message(state),
+            message: startup_message(lang, state),
         },
         StartupState::DataDirMissing { .. }
         | StartupState::DataDirNotLocal { .. }
         | StartupState::DataDirUnusable { .. }
         | StartupState::PinnedUnreadable { .. } => {
-            if let Some(text) = startup_message(state) {
+            if let Some(text) = startup_message(lang, state) {
                 presenter.show(&text);
             }
             StartupAction::Stay
@@ -317,6 +344,33 @@ mod tests {
     use crate::startup::crash::crashpad_reports_dir;
     use atlas_duck_ipc::paths::check_data_dir;
 
+    /// M15 T10: the startup texts in German, with the path or host put in.
+    #[test]
+    fn gate_text_de() {
+        let path = std::path::PathBuf::from("/mnt/x");
+        assert_eq!(
+            startup_message(
+                Lang::De,
+                &StartupState::DataDirMissing { path: path.clone() }
+            )
+            .as_deref(),
+            Some("Datenverzeichnis /mnt/x nicht gefunden")
+        );
+        assert_eq!(
+            startup_message(Lang::En, &StartupState::DataDirMissing { path }).as_deref(),
+            Some("data directory /mnt/x not found")
+        );
+        assert_eq!(
+            startup_message(
+                Lang::De,
+                &StartupState::AlreadyRunning {
+                    other_host: Some("pc-7".into())
+                }
+            )
+            .as_deref(),
+            Some("atlas-duck läuft auf einem anderen Computer (pc-7) mit diesem Datenverzeichnis")
+        );
+    }
     #[test]
     fn startup_clears_crashpad_reports_of_both_webview_folders() {
         let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));

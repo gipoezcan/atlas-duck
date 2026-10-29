@@ -126,7 +126,12 @@ impl AppState {
             health: Mutex::new(None),
             tray_refresh: OnceLock::new(),
             ui_lang_dir: None,
-            lang: RwLock::new(UiLang::of(LangPref::Auto)),
+            // English until `with_ui_lang_dir` reads the preference and the OS locale (tests and
+            // harnesses that never call it stay English whatever the machine's locale).
+            lang: RwLock::new(UiLang {
+                pref: LangPref::Auto,
+                lang: Lang::En,
+            }),
         }
     }
 

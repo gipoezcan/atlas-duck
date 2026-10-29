@@ -1026,6 +1026,11 @@ pub async fn settings_apply<R: Runtime>(
             // M15 T7 (PD-297): the credential page has no `lang_changed` grant; it re-reads its
             // context (which carries the language) on the event it already listens to.
             crate::credential::context_changed(&app);
+            // M15 T10: the tray and the header's status lines are Rust's text: rebuilt now.
+            if let Some(state) = &state {
+                state.refresh_tray();
+            }
+            emit_status_changed(&app);
         }
         applied.view
     });

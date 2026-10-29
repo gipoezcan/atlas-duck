@@ -406,6 +406,43 @@ export function checkLeaves(enRoots, deRoots, allowlist, shortKeys) {
   return errors;
 }
 
+/** The scopes of `scope_text` in crates/server/src/oauth/consent.rs: name -> the English sentence (non-empty arms). */
+export function parseConsentScopes(src) {
+  const start = src.indexOf("pub fn scope_text");
+  if (start < 0) return {};
+  const body = src.slice(start, src.indexOf("\n}\n", start));
+  const out = {};
+  for (const m of body.matchAll(/"(\w+)"\s*=>\s*"((?:[^"\\]|\\.)*)"/g)) out[m[1]] = m[2];
+  return out;
+}
+
+/**
+ * The consent page shows a scope's effect from `server.consent.scope_text` in both languages: every
+ * scope of `scope_text` needs an entry, the English text must be the Rust sentence (the meaning the
+ * server states), and no entry may be left for a scope the server no longer has.
+ */
+export function checkConsentScopes(rustScopes, enRoots, deRoots) {
+  const errors = [];
+  const names = Object.keys(rustScopes);
+  if (names.length === 0) return ["no consent scopes found in crates/server/src/oauth/consent.rs (parser out of date?)"];
+  for (const [lang, roots] of [
+    ["en", enRoots],
+    ["de", deRoots],
+  ]) {
+    const node = roots?.server?.consent?.scope_text;
+    if (node === undefined || typeof node !== "object") {
+      errors.push(`${lang}: server.consent.scope_text is missing`);
+      continue;
+    }
+    for (const n of names) if (typeof node[n] !== "string") errors.push(`${lang}: consent scope "${n}" has no text in server.consent.scope_text`);
+    for (const k of Object.keys(node)) if (!(k in rustScopes)) errors.push(`${lang}: server.consent.scope_text.${k} is not a scope of consent.rs`);
+    if (lang === "en") {
+      for (const n of names) if (typeof node[n] === "string" && node[n] !== rustScopes[n]) errors.push(`en: consent scope "${n}" differs from the sentence in consent.rs`);
+    }
+  }
+  return errors;
+}
+
 const deRootOf = (path, deRoots) => path.split(".")[0] in deRoots;
 
 // ---------- repository ----------
@@ -434,9 +471,10 @@ export function main(_argv = process.argv.slice(2), repo = REPO) {
   }
   errors.push(...checkErrorCodes(rust, read(`${I18N_DIR}/en/errors.ts`), read(`${I18N_DIR}/de/errors.ts`)));
   errors.push(...checkApprovalCodes(rust, read(`${I18N_DIR}/en/approvals.ts`), read(`${I18N_DIR}/de/approvals.ts`)));
-  errors.push(
-    ...checkLeaves(readRoots(join(repo, I18N_DIR, "en")), readRoots(join(repo, I18N_DIR, "de")), I18N_SAME_ALLOWLIST, SHORT_KEYS),
-  );
+  const enRoots = readRoots(join(repo, I18N_DIR, "en"));
+  const deRoots = readRoots(join(repo, I18N_DIR, "de"));
+  errors.push(...checkLeaves(enRoots, deRoots, I18N_SAME_ALLOWLIST, SHORT_KEYS));
+  errors.push(...checkConsentScopes(parseConsentScopes(read("crates/server/src/oauth/consent.rs")), enRoots, deRoots));
   for (const e of errors) console.log(e);
   if (errors.length === 0) console.log("check-i18n: ok");
   return errors.length === 0 ? 0 : 1;

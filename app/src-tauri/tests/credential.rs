@@ -1948,11 +1948,11 @@ async fn a_failed_retry_is_a_failed_store_the_relaunch_says_so() -> TestResult {
     assert_eq!(state.gate_state(), Some(GateState::StoreFailed));
     assert_eq!(
         status_lines(&snapshot, &StatusInputs::default()),
-        vec![MSG_STORE_UNAVAILABLE.to_owned()]
+        vec![MSG_STORE_UNAVAILABLE.en.to_owned()]
     );
     assert_eq!(
         route_relaunch(&snapshot, &[std::ffi::OsString::from("atlas-duck")]),
-        Relaunch::ShowErrorDialog(MSG_STORE_UNAVAILABLE.into())
+        Relaunch::ShowErrorDialog(MSG_STORE_UNAVAILABLE.en.into())
     );
     assert_eq!(retry_keychain_now(&state), RetryNow::NotLocked);
     stop(&state).await

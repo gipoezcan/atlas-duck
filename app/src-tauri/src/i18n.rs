@@ -1,8 +1,111 @@
 //! The UI language of the desktop app (M15, PD-291, PD-292): the two languages, the user's
 //! preference and the OS locale `auto` follows. The same rule as the UI's `resolveLang`
-//! (`app/ui/src/shared/i18n/index.ts`). The text table of the Rust-rendered texts is T10's.
+//! (`app/ui/src/shared/i18n/index.ts`).
+//!
+//! M15 T10 (PD-292): the Rust-rendered user text (tray, native dialogs, toasts, status lines) is
+//! a [`T`] pair per text, read with [`tr`] in the language of the moment. Every pair is built with
+//! [`T::new`] and listed in [`ALL`]; the tests check both. Texts with values are functions of the
+//! language next to their callers. German follows `app/ui/src/shared/i18n/GLOSSARY.md` ("Sie").
 
 use serde::{Deserialize, Serialize};
+
+/// One user-visible text in both languages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct T {
+    pub en: &'static str,
+    pub de: &'static str,
+}
+
+impl T {
+    pub const fn new(en: &'static str, de: &'static str) -> T {
+        T { en, de }
+    }
+
+    /// The text in `lang`.
+    pub const fn get(&self, lang: Lang) -> &'static str {
+        match lang {
+            Lang::En => self.en,
+            Lang::De => self.de,
+        }
+    }
+}
+
+/// [`T::get`] as a function.
+pub fn tr(lang: Lang, t: &T) -> &'static str {
+    t.get(lang)
+}
+
+/// Every [`T`] of the app, module by module (each module lists its own in `TEXTS`).
+pub fn all() -> impl Iterator<Item = &'static T> {
+    [
+        crate::tray::TEXTS,
+        crate::status::TEXTS,
+        crate::startup::TEXTS,
+        crate::wizard::TEXTS,
+    ]
+    .into_iter()
+    .flatten()
+    .copied()
+}
+
+/// The placeholders a [`T`] may carry; [`localize`] fills them from the English text.
+const PLACEHOLDERS: [&str; 3] = ["<path>", "<host>", "<n>"];
+
+/// `text` in `lang` when it is the English of one of [`all`] (`None` otherwise).
+pub fn localize_static(lang: Lang, text: &str) -> Option<&'static str> {
+    all().find(|t| t.en == text).map(|t| t.get(lang))
+}
+
+/// An English text this app rendered (a [`T`], or a [`T`] with one placeholder filled) in
+/// `lang`: the placeholder's value is taken from `text` and put into the other language's form.
+/// Any other text comes back unchanged (it is not ours, or it is already in `lang`).
+pub fn localize(lang: Lang, text: &str) -> String {
+    if lang == Lang::En {
+        return text.to_owned();
+    }
+    if let Some(s) = localize_static(lang, text) {
+        return s.to_owned();
+    }
+    for t in all() {
+        for ph in PLACEHOLDERS {
+            let Some((pre, post)) = t.en.split_once(ph) else {
+                continue;
+            };
+            if text.len() > pre.len() + post.len()
+                && text.starts_with(pre)
+                && text.ends_with(post)
+                && !post.contains(ph)
+            {
+                let value = &text[pre.len()..text.len() - post.len()];
+                return t.get(lang).replacen(ph, value, 1);
+            }
+        }
+    }
+    text.to_owned()
+}
+/// A count as the UI writes it: English digits as they are (the texts the spec fixes), German with
+/// a `.` every three digits (`12.345`), as the UI's `formatNumber('de', n)`.
+pub fn count(lang: Lang, n: u64) -> String {
+    let digits = n.to_string();
+    if lang == Lang::En || digits.len() <= 3 {
+        return digits;
+    }
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push('.');
+        }
+        out.push(c);
+    }
+    out
+}
+/// Picks the English or German form of a text with values.
+pub fn pick<S>(lang: Lang, en: S, de: S) -> S {
+    match lang {
+        Lang::En => en,
+        Lang::De => de,
+    }
+}
 
 /// A UI language.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -114,6 +217,83 @@ mod tests {
     use super::*;
 
     /// The table of the UI's `resolve_accepts_posix_and_bcp47_tags` (T1), and the explicit choices.
+    /// T10: every text has both languages; German differs from English unless the text is a
+    /// product name or a code (none so far).
+    #[test]
+    fn every_entry_has_both_languages() {
+        const SAME: &[&str] = &[];
+        let mut n = 0;
+        for t in all() {
+            n += 1;
+            assert!(!t.en.trim().is_empty() && !t.de.trim().is_empty(), "{t:?}");
+            if !SAME.contains(&t.en) {
+                assert_ne!(t.en, t.de, "de_differs_from_en_unless_allowlisted");
+            }
+            for ph in PLACEHOLDERS {
+                assert_eq!(
+                    t.en.matches(ph).count(),
+                    t.de.matches(ph).count(),
+                    "{ph} in {t:?}"
+                );
+            }
+        }
+        assert!(n > 0);
+    }
+
+    /// Every `T::new(` in the sources is listed in some module's `TEXTS` (so [`all`] sees it).
+    #[test]
+    fn every_text_is_listed() {
+        fn walk(dir: &std::path::Path, out: &mut usize) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs")
+                    && p.file_name().is_some_and(|f| f != "i18n.rs")
+                {
+                    let src = std::fs::read_to_string(&p).unwrap_or_default();
+                    *out += src.matches("T::new(").count();
+                }
+            }
+        }
+        let mut written = 0;
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut written,
+        );
+        assert_eq!(
+            all().count(),
+            written,
+            "a T::new( is missing from its module's TEXTS"
+        );
+    }
+
+    #[test]
+    fn localize_maps_our_english_texts_and_leaves_others() {
+        use crate::startup::MSG_DATA_DIR_NOT_LOCAL;
+        let en = MSG_DATA_DIR_NOT_LOCAL.en.replace("<path>", "/mnt/x");
+        assert_eq!(
+            localize(Lang::De, &en),
+            "Datenverzeichnis /mnt/x liegt nicht auf einem lokalen Dateisystem"
+        );
+        assert_eq!(localize(Lang::En, &en), en);
+        assert_eq!(localize(Lang::De, "not ours"), "not ours");
+        assert_eq!(
+            localize_static(Lang::De, crate::wizard::MSG_PIN_WRITE_FAILED),
+            Some(crate::wizard::TEXT_PIN_WRITE_FAILED.de)
+        );
+    }
+
+    #[test]
+    fn counts_group_in_german_only() {
+        assert_eq!(count(Lang::En, 1_234_567), "1234567");
+        assert_eq!(count(Lang::De, 1_234_567), "1.234.567");
+        assert_eq!(count(Lang::De, 999), "999");
+        assert_eq!(count(Lang::De, 1000), "1.000");
+    }
     #[test]
     fn resolve_matches_ts_rule() {
         for tag in [

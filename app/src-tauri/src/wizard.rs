@@ -54,6 +54,7 @@ use tokio::sync::oneshot;
 
 use crate::commands::{CommandError, blocking};
 use crate::credential::{self, FirstRunPassphrase, Purpose};
+use crate::i18n::{T, localize, localize_static};
 use crate::restore_flow::{NotAsked, wait_passphrase};
 use crate::secret_service::{SecretService, SecretServiceCheck};
 use crate::serve::{self, FirstStore, FirstStoreFailure, UnlockFailure};
@@ -67,13 +68,22 @@ use crate::windows::{self, AppSnapshot, Label, Relaunch, Show, WindowError};
 
 /// §8.6 (verbatim): the wizard stops with this text (and a Quit button) when Linux has no usable
 /// Secret Service; nothing is written and the first-run gate keeps answering.
-pub const MSG_NEEDS_SECRET_SERVICE: &str = "atlas-duck needs a system keyring (Secret Service, e.g. GNOME Keyring or KWallet). Install or unlock one, then restart atlas-duck.";
+pub const MSG_NEEDS_SECRET_SERVICE: &str = TEXT_NEEDS_SECRET_SERVICE.en;
+/// [`MSG_NEEDS_SECRET_SERVICE`] in both languages (M15 T10; the page gets it in the UI language).
+pub const TEXT_NEEDS_SECRET_SERVICE: T = T::new(
+    "atlas-duck needs a system keyring (Secret Service, e.g. GNOME Keyring or KWallet). Install or unlock one, then restart atlas-duck.",
+    "atlas-duck braucht einen Schlüsselbund des Systems (Secret Service, z. B. GNOME Keyring oder KWallet). Installieren oder entsperren Sie einen und starten Sie atlas-duck dann neu.",
+);
 
 /// §8.6 (L39): the wizard stops with this text (and a Quit button) when the keyring's backing
 /// directory is not on a local filesystem. It is the text the error window shows for the same
 /// state at a later start (§8.7, `GateState::Locked(KeyringNotLocal)`), so tray, error window and
 /// wizard say the same; a test pins the equality.
-pub const MSG_KEYRING_NOT_LOCAL: &str = "atlas-duck is locked (keyring_not_local)";
+pub const MSG_KEYRING_NOT_LOCAL: &str = TEXT_KEYRING_NOT_LOCAL.en;
+pub const TEXT_KEYRING_NOT_LOCAL: T = T::new(
+    "atlas-duck is locked (keyring_not_local)",
+    "atlas-duck ist gesperrt (keyring_not_local)",
+);
 
 /// [`WizardError::class`] of a `wizard_finish` / `wizard_skip_instances` for another step.
 pub const CLASS_WRONG_STEP: &str = "wrong_step";
@@ -96,11 +106,19 @@ pub const LOG_EVENT_STORE_ID_UNREADABLE: &str = "wizard_store_id_unreadable";
 
 /// plan text (M10 T15, PD-167): shown from the first store on when its first run recorded a
 /// `previous_chain_found` incident.
-pub const MSG_PREVIOUS_CHAIN_FOUND: &str = "The anchor directory already holds an atlas-duck log of this computer and user. This was recorded as an integrity incident; see Audit.";
+pub const MSG_PREVIOUS_CHAIN_FOUND: &str = TEXT_PREVIOUS_CHAIN_FOUND.en;
+pub const TEXT_PREVIOUS_CHAIN_FOUND: T = T::new(
+    "The anchor directory already holds an atlas-duck log of this computer and user. This was recorded as an integrity incident; see Audit.",
+    "Das Anker-Verzeichnis enthält bereits ein atlas-duck-Protokoll dieses Computers und Benutzers. Das wurde als Integritätsvorfall aufgezeichnet; siehe Audit-Protokoll.",
+);
 
 /// plan text (M10 T15, M6 final review M-9): [`WizardStep::PinRetry`]'s text; Begin writes the
 /// pinned file again.
-pub const MSG_PIN_WRITE_FAILED: &str = "Could not record this installation's id. Try again";
+pub const MSG_PIN_WRITE_FAILED: &str = TEXT_PIN_WRITE_FAILED.en;
+pub const TEXT_PIN_WRITE_FAILED: T = T::new(
+    "Could not record this installation's id. Try again",
+    "Die Kennung dieser Installation konnte nicht gespeichert werden. Versuchen Sie es erneut",
+);
 
 /// [`WizardError::class`] of a folder the anchor-dir dialog returned that is not an absolute UTF-8
 /// path (refused before anything keeps it, as the store would refuse it at `GENESIS`).
@@ -110,13 +128,30 @@ pub const CLASS_PINNED_WRITE: &str = "pinned_write";
 
 /// [`WizardError::text`] (class `anchor_dir`) of an anchor directory that is the data dir or inside
 /// it (T15 review M-11, §8.5): a log anchored in its own data dir proves nothing.
-pub const ANCHOR_DIR_IN_DATA_DIR: &str = "the anchor directory is inside the data directory";
+pub const ANCHOR_DIR_IN_DATA_DIR: &str = TEXT_ANCHOR_DIR_IN_DATA_DIR.en;
+pub const TEXT_ANCHOR_DIR_IN_DATA_DIR: T = T::new(
+    "the anchor directory is inside the data directory",
+    "Das Anker-Verzeichnis liegt im Datenverzeichnis",
+);
 
 /// The wizard stops with this text (and a Quit button) when its restore committed but did not
 /// complete (T15 review I-1): `audit.db` is the restored store, which the next start completes
 /// (the locked window's `COMMITTED_INCOMPLETE_TEXT`, with what to do now).
-pub const MSG_RESTORE_COMMITTED_INCOMPLETE: &str =
-    "Restore will be completed at the next start. Quit atlas-duck and start it again.";
+pub const MSG_RESTORE_COMMITTED_INCOMPLETE: &str = TEXT_RESTORE_COMMITTED_INCOMPLETE.en;
+pub const TEXT_RESTORE_COMMITTED_INCOMPLETE: T = T::new(
+    "Restore will be completed at the next start. Quit atlas-duck and start it again.",
+    "Die Wiederherstellung wird beim nächsten Start abgeschlossen. Beenden Sie atlas-duck und starten Sie es erneut.",
+);
+
+/// The texts of this module, for [`crate::i18n::all`].
+pub const TEXTS: &[&T] = &[
+    &TEXT_NEEDS_SECRET_SERVICE,
+    &TEXT_KEYRING_NOT_LOCAL,
+    &TEXT_PREVIOUS_CHAIN_FOUND,
+    &TEXT_PIN_WRITE_FAILED,
+    &TEXT_ANCHOR_DIR_IN_DATA_DIR,
+    &TEXT_RESTORE_COMMITTED_INCOMPLETE,
+];
 
 /// How long the move of the setup window waits for Tauri to forget the old one.
 const RELOCATE_WAIT: Duration = Duration::from_secs(2);
@@ -302,7 +337,7 @@ pub fn step_of(p: &Progress, f: &Facts<'_>) -> WizardStep {
             WizardStep::Restore
         }
         // PD-06: nothing is served; only a restart helps.
-        AppSnapshot::StoreUnavailable => WizardStep::Stopped(MSG_STORE_UNAVAILABLE),
+        AppSnapshot::StoreUnavailable => WizardStep::Stopped(MSG_STORE_UNAVAILABLE.en),
         // (1a): locked, store newer, starting; the credential window or the error window says what
         // to do (§8.7).
         _ => WizardStep::ExistingStore,
@@ -352,11 +387,11 @@ impl DirRefusal {
 
     /// The app-generated text the page shows (the §7.7 / §3.1 startup texts with the path or host).
     pub fn text(&self) -> Option<String> {
-        let path = |t: &str, p: &Path| render_message(t, &p.display().to_string());
+        let path = |t: &T, p: &Path| render_message(t.en, &p.display().to_string());
         match self {
-            DirRefusal::NotLocal(p) => Some(path(MSG_DATA_DIR_NOT_LOCAL, p)),
-            DirRefusal::Unusable(p) => Some(path(MSG_DATA_DIR_UNUSABLE, p)),
-            DirRefusal::OtherHost(h) => Some(render_message(MSG_RUNNING_ON_OTHER_HOST, h)),
+            DirRefusal::NotLocal(p) => Some(path(&MSG_DATA_DIR_NOT_LOCAL, p)),
+            DirRefusal::Unusable(p) => Some(path(&MSG_DATA_DIR_UNUSABLE, p)),
+            DirRefusal::OtherHost(h) => Some(render_message(MSG_RUNNING_ON_OTHER_HOST.en, h)),
             DirRefusal::NotAbsolute | DirRefusal::AlreadyPinned | DirRefusal::PinnedWrite => None,
         }
     }
@@ -698,13 +733,19 @@ fn state_of<R: Runtime>(
 ) -> WizardState {
     let mut p = w.progress();
     let step = current_step(app, &mut p, Some(&instances));
+    // M15 T10: Rust's texts in the UI language (English stays English: tests and no `AppState`).
+    let lang = app
+        .try_state::<crate::state::AppState>()
+        .map(|s| s.lang())
+        .unwrap_or_default();
+    let here = |text: &'static str| localize_static(lang, text).unwrap_or(text);
     let refused_count = app
         .try_state::<ServeSlot>()
         .and_then(|s| s.get().and_then(|st| st.refused()));
     WizardState {
         step: step.as_str(),
         stopped_text: match step {
-            WizardStep::Stopped(text) => Some(text),
+            WizardStep::Stopped(text) => Some(here(text)),
             _ => None,
         },
         data_dir: p
@@ -716,17 +757,20 @@ fn state_of<R: Runtime>(
         existing_store: p.existing_store,
         secret_service: p.secret_service.map_or("n/a", SecretService::as_str),
         passphrase_window: p.in_flight == Some(InFlight::Passphrase),
-        error: p.error.clone(),
+        error: p.error.clone().map(|e| WizardError {
+            text: e.text.map(|t| localize(lang, &t)),
+            ..e
+        }),
         instances,
         anchor_dir: p
             .anchor_dir
             .as_ref()
             .map(|d| crate::recovery_tier::one_line(&d.path().display().to_string())),
         step_text: match step {
-            WizardStep::PinRetry => Some(MSG_PIN_WRITE_FAILED),
+            WizardStep::PinRetry => Some(here(MSG_PIN_WRITE_FAILED)),
             _ => None,
         },
-        notice: p.previous_chain.then_some(MSG_PREVIOUS_CHAIN_FOUND),
+        notice: p.previous_chain.then_some(here(MSG_PREVIOUS_CHAIN_FOUND)),
     }
 }
 
@@ -1725,7 +1769,7 @@ mod tests {
         }
         assert_eq!(
             step_of(&existing, &facts(&AppSnapshot::StoreUnavailable)),
-            WizardStep::Stopped(MSG_STORE_UNAVAILABLE)
+            WizardStep::Stopped(MSG_STORE_UNAVAILABLE.en)
         );
 
         // Serving: the note (only after this wizard's GENESIS, while the window is open), the
