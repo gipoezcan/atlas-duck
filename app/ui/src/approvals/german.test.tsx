@@ -117,6 +117,22 @@ describe('the approvals window in German (M15 T5)', () => {
     expect(screen.getByRole('button', { name: de.approvals.detail.deny })).toBeTruthy();
   });
 
+  // M15 T10: core's one release-blocked sentence is shown in German; any other text as it came.
+  it('cores_release_blocked_sentence_is_german', async () => {
+    vi.mocked(previewFetch).mockRejectedValue({
+      kind: 'release_blocked',
+      text: en.approvals.release_blocked_internal,
+    });
+    render(
+      <LangProvider lang="de">
+        <Detail item={READ} openToken={1} />
+      </LangProvider>,
+    );
+    await flush();
+    expect(screen.getByRole('alert').textContent).toBe(
+      `${de.approvals.detail.caution_prefix} ${de.approvals.release_blocked_internal}`,
+    );
+  });
   it('the_batch_confirm_flow_is_german', async () => {
     vi.useFakeTimers();
     const row = (id: string, over: Partial<typeof READ> = {}) => ({

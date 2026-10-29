@@ -50,6 +50,31 @@ afterEach(() => {
 });
 
 describe('the settings window in German (M15 T6)', () => {
+  // M15 T10: core's banner and backlog line are worded from their facts in German; English stays
+  // core's text word for word.
+  it('config_banner_and_prune_backlog_in_german', async () => {
+    const banner = FULL.settings.config_read_only;
+    expect(banner?.parsed).toBe(true);
+    expect(en.settings.config_banner('read_only', banner?.version ?? null, true)).toBe(banner?.text);
+    expect(en.settings.prune_backlog_line(FULL.settings.health.prune_backlog_days)).toBe(
+      FULL.settings.health.prune_backlog,
+    );
+    vi.mocked(settingsGet).mockResolvedValue(FULL);
+    render(
+      <LangProvider lang="de">
+        <Settings />
+      </LangProvider>,
+    );
+    await flush();
+    const text = document.body.textContent ?? '';
+    expect(text).toContain(de.settings.config_banner('read_only', 'v9.9.0', true));
+    expect(text).toContain('Die Bereinigung ist 12 Tage im Rückstand');
+    expect(text).not.toContain(banner?.text ?? '-');
+    expect(de.settings.config_banner('unreadable', null, true)).toBe(
+      'Die Konfiguration von einer neueren atlas-duck-Version konnte nicht gelesen werden; aktualisieren Sie atlas-duck',
+    );
+    expect(de.settings.prune_backlog_line(1)).toBe('Die Bereinigung ist 1 Tag im Rückstand');
+  });
   it('settings_sections_in_german', async () => {
     render(
       <LangProvider lang="de">

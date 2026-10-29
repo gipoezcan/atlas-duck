@@ -297,6 +297,10 @@ export type AttentionMode = 'show_without_activating' | 'badge_only' | 'show_and
 export interface ConfigBanner {
   kind: 'read_only' | 'unreadable';
   text: string;
+  /** M15 T10: the facts `text` is built from: the writer's `vX` (`null`: a newer atlas-duck) and
+   * whether the file was parsed at all. */
+  version?: string | null;
+  parsed?: boolean;
 }
 
 /** The eight §9.4 script limits (M8 Δ6, PD-139), the values in force. */

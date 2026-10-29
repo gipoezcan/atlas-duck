@@ -61,7 +61,9 @@ export function Retention({ view, onChanged, readOnly }: RetentionProps) {
     });
   };
 
-  const backlog = view.health.prune_backlog;
+  // M15 T10: worded from the day count in the UI language (English is core's text).
+  const backlog =
+    view.health.prune_backlog === null ? null : t.settings.prune_backlog_line(view.health.prune_backlog_days);
   return (
     <section aria-label={t.settings.retention}>
       <h2>{t.settings.retention}</h2>

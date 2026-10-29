@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useText } from '../shared/i18n/context';
+import { useLang, useText } from '../shared/i18n/context';
 
 import { onboardingText } from '../shared/ipc/invoke';
 import type { OnboardingSection } from '../shared/ipc/types';
@@ -32,6 +32,8 @@ interface Props {
  */
 export function OnboardingText({ only, level = 2 }: Props) {
   const t = useText();
+  // M15 T10: English titles are core's own; another language takes them from its table by id.
+  const lang = useLang();
   const [sections, setSections] = useState<OnboardingSection[] | null>(null);
   const [failed, setFailed] = useState(false);
   const [copyLine, setCopyLine] = useState('');
@@ -121,10 +123,14 @@ export function OnboardingText({ only, level = 2 }: Props) {
       <p role="status">{copyLine}</p>
       {shown.map((s) => {
         const headingId = `onboarding-section-${s.id}`;
+        // M15 T10: the title by core's stable id in the UI language; the text stays core's.
+        const titles: Readonly<Record<string, string>> = t.onboarding.section_titles;
+        const title =
+          lang !== 'en' && Object.hasOwn(titles, s.id) ? (titles[s.id] ?? s.title) : s.title;
         return (
           <div key={s.id} className="onboarding-section">
-            <Heading id={headingId}>{s.title}</Heading>
-            <button type="button" aria-label={t.onboarding.copy_label(s.title)} onClick={() => copy(s)}>
+            <Heading id={headingId}>{title}</Heading>
+            <button type="button" aria-label={t.onboarding.copy_label(title)} onClick={() => copy({ ...s, title })}>
               {t.onboarding.copy_button}
             </button>
             <pre

@@ -2,6 +2,12 @@ import { formatNumber } from '../format';
 
 /** The Approvals window (and the shared header and agent-text badges): the former shared/strings.ts objects. */
 export const approvals = {
+  /**
+   * M15 T10: core's one release-blocked sentence (`RELEASE_BLOCKED_INTERNAL`), word for word; the
+   * banner shows the language's form when Rust sends exactly this text, any other text as it is.
+   */
+  release_blocked_internal:
+    'release blocked: the candidate could not be built exactly (internal); deny it, or drop the flagged items',
   /** plan text (Task 5): window titles shown by the placeholder entries. */
   window_titles: {
     approvals: 'Approvals',

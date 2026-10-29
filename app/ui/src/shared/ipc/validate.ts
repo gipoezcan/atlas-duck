@@ -302,7 +302,9 @@ export const isPreviewFetchResponse = (v: unknown): v is PreviewFetchResponse =>
   });
 
 const isConfigBanner = (v: unknown): v is ConfigBanner =>
-  fields(v, { kind: oneOf('read_only', 'unreadable'), text: isStr });
+  fields(v, { kind: oneOf('read_only', 'unreadable'), text: isStr }) &&
+  (!('version' in v) || v.version === null || isStr(v.version)) &&
+  (!('parsed' in v) || isBool(v.parsed));
 
 export const isInstanceView = (v: unknown): v is InstanceView =>
   fields(v, {

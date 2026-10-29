@@ -28,7 +28,7 @@ afterEach(() => {
 });
 
 describe('the onboarding window in German (M15 T6)', () => {
-  it('onboarding_panel_in_german: the frame is German, the generated sections are shown as they are', async () => {
+  it('onboarding_panel_in_german: the frame and the section titles are German, the section text stays as core wrote it', async () => {
     vi.mocked(onboardingText).mockResolvedValue({ sections: [{ id: 'commands', title: 'Commands', text: 'atlas-duck ops list' }] });
     render(
       <LangProvider lang="de">
@@ -40,14 +40,14 @@ describe('the onboarding window in German (M15 T6)', () => {
     expect(screen.getByRole('heading', { level: 1 }).textContent).toBe(de.approvals.window_titles.onboarding);
     expect(screen.getByText(de.onboarding.intro)).toBeTruthy();
     expect(screen.queryByText(en.onboarding.intro)).toBeNull();
-    const copy = screen.getByRole('button', { name: de.onboarding.copy_label('Commands') });
+    const copy = screen.getByRole('button', { name: de.onboarding.copy_label(de.onboarding.section_titles.commands) });
     expect(copy.textContent).toBe(de.onboarding.copy_button);
     await act(async () => {
       fireEvent.click(copy);
     });
     await flush();
     expect(writeText).toHaveBeenCalledWith('atlas-duck ops list');
-    expect(screen.getByRole('status').textContent).toBe(de.onboarding.copied('Commands'));
+    expect(screen.getByRole('status').textContent).toBe(de.onboarding.copied(de.onboarding.section_titles.commands));
   });
 
   it('load_failure_in_german', async () => {

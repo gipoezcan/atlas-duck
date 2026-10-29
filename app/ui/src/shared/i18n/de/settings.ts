@@ -30,6 +30,16 @@ export const settings: Dict['settings'] = {
   url_change_requested: 'Angeforderte URL:',
   url_change_accept: 'URL-Änderung übernehmen',
   read_only_prefix: 'Die Einstellungen sind schreibgeschützt:',
+  config_banner: (kind, version, parsed) => {
+    const by = version === null ? 'einer neueren atlas-duck-Version' : `atlas-duck ${version}`;
+    return kind === 'unreadable' && !parsed
+      ? 'Die Konfiguration konnte nicht gelesen werden; die Einstellungen sind nicht verfügbar, bis sie lesbar ist'
+      : kind === 'unreadable'
+        ? `Die Konfiguration von ${by} konnte nicht gelesen werden; aktualisieren Sie atlas-duck`
+        : `Die Konfiguration wurde von ${by} geschrieben; die Einstellungen sind schreibgeschützt, bis Sie aktualisieren`;
+  },
+  prune_backlog_line: (days) =>
+    `Die Bereinigung ist ${formatNumber('de', days)} ${days === 1 ? 'Tag' : 'Tage'} im Rückstand`,
   instances: 'Instanzen',
   no_instances: 'Es sind keine Instanzen eingerichtet',
   col_alias: 'Alias',

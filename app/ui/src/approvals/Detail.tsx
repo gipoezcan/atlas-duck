@@ -30,6 +30,7 @@ import {
 } from './redaction/state';
 import { RequestTab } from './RequestTab';
 import { useText } from '../shared/i18n/context';
+import { en } from '../shared/i18n/dict';
 
 type TabId = 'preview' | 'structured' | 'raw' | 'request';
 
@@ -206,8 +207,11 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
   );
   const inert = useInert(displayed);
 
-  const releaseBlocked =
+  const blockedRaw =
     state.kind === 'blocked' ? state.text : (shown?.preview.header.release_blocked ?? null);
+  // M15 T10: core's one release-blocked sentence in the UI language; any other text as Rust sent it.
+  const releaseBlocked =
+    blockedRaw === en.approvals.release_blocked_internal ? t.approvals.release_blocked_internal : blockedRaw;
   const card = gone || shown === null ? null : cardOf(shown.preview, t);
   const canDeny = !gone && (shown !== null || releaseBlocked !== null);
   const form = shown?.preview.edit_form ?? null;

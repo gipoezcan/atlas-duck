@@ -2,6 +2,8 @@ import { formatNumber } from '../format';
 import type { Dict } from '../index';
 
 export const approvals: Dict['approvals'] = {
+  release_blocked_internal:
+    'Freigabe blockiert: Der Kandidat konnte nicht exakt erstellt werden (intern); lehnen Sie ihn ab oder entfernen Sie die markierten Einträge',
   window_titles: {
     approvals: 'Freigaben',
     settings: 'Einstellungen',

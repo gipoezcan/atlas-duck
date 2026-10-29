@@ -35,6 +35,18 @@ export const settings = {
   url_change_accept: 'Accept the URL change',
   /** Plan text (T25): the label before Rust's §7.7 banner text (PD-76), which follows it verbatim. */
   read_only_prefix: 'Settings are read-only:',
+  /**
+   * M15 T10: the spec 7.7 config banner from its facts (`ConfigBanner.version`, `parsed`). The
+   * English is core's own text word for word; `version` is `vX`, `null` for "a newer atlas-duck".
+   */
+  config_banner: (kind: 'read_only' | 'unreadable', version: string | null, parsed: boolean) =>
+    kind === 'unreadable' && !parsed
+      ? 'config could not be read; settings unavailable until it can be'
+      : kind === 'unreadable'
+        ? `config written by ${version ?? 'a newer atlas-duck'} could not be read; upgrade atlas-duck`
+        : `config written by ${version ?? 'a newer atlas-duck'}; settings read-only until you upgrade`,
+  /** spec 8.8 (core's text word for word in English): the prune backlog line, by the day count. */
+  prune_backlog_line: (days: number) => `pruning is ${days} days behind`,
   instances: 'Instances',
   no_instances: 'No instances are configured',
   col_alias: 'Alias',

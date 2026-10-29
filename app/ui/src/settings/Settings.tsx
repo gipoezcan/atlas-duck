@@ -3,7 +3,8 @@ import { useText } from '../shared/i18n/context';
 
 import { on } from '../shared/ipc/events';
 import { settingsGet } from '../shared/ipc/invoke';
-import type { Confinement, SettingsGet, SettingsView } from '../shared/ipc/types';
+import type { Dict } from '../shared/i18n';
+import type { ConfigBanner, Confinement, SettingsGet, SettingsView } from '../shared/ipc/types';
 import { AnchorDir } from './AnchorDir';
 import { InstanceForm } from './InstanceForm';
 import { Cli } from './Cli';
@@ -101,7 +102,7 @@ export function Settings() {
       ) : null}
       {banner === null ? null : (
         <p role="alert" className="caution-strip">
-          <strong>{t.settings.read_only_prefix}</strong> <Cfg value={banner.text} />
+          <strong>{t.settings.read_only_prefix}</strong> <Cfg value={configBannerText(t, banner)} />
         </p>
       )}
       {/* A read-only config disables the controls that write config.toml (each section wraps them
@@ -185,3 +186,11 @@ function ConfinementStatus({
   );
 }
 
+/**
+ * M15 T10: the spec 7.7 banner in the UI language from its facts; a banner without them (an older
+ * core) shows core's text as it is.
+ */
+function configBannerText(t: Dict, banner: ConfigBanner): string {
+  if (typeof banner.parsed !== 'boolean') return banner.text;
+  return t.settings.config_banner(banner.kind, banner.version ?? null, banner.parsed);
+}
