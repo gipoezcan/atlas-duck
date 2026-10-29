@@ -43,13 +43,97 @@
 <main>
 <h1>Agents (desktop)</h1>
 <h2 id="launcher">Start an agent</h2>
-<p>TODO</p>
+<p>An agent reaches atlas-duck through the <code>atlas-duck</code> command. It does not need a password or a token of its own. It talks to the running desktop app on your computer, and every request lands in your approval queue.</p>
+<p>If the app is not running, the command starts it and waits for up to 20 seconds. That needs a desktop session and an installed app; without them the command fails with <code>launch_timeout</code> or <code>unreachable</code>.</p>
+<p>The &quot;Onboarding&quot; window (&quot;Einführung&quot; in German) gives you ready-made instructions for the agent. Copy them into the <code>CLAUDE.md</code> or <code>AGENTS.md</code> file of your project. The rules in them are these:</p>
+<ul>
+<li>Set the name of the agent with <code>ATLAS_DUCK_AGENT</code>, for example <code>&lt;tool&gt;-&lt;repo&gt;</code>, and always pass <code>--reason</code> so that you can see why the agent asks.</li>
+<li>Set <code>--timeout</code> at least 10 seconds below the time after which the agent's tool is killed. Or use <code>--timeout 0</code> to submit and return at once, and fetch the answer later with <code>await</code>.</li>
+<li>Never submit a pending request again. Find its id with <code>requests list</code> and wait for it.</li>
+<li>Check <code>redacted</code>, <code>edited</code> and <code>meta</code> in the answer. You may have changed what the agent receives.</li>
+<li>Decide on <code>status</code>, <code>error.code</code> and <code>error.retryable</code>. On exit code 9 do not retry in a loop: you must unlock the app or add a token first.</li>
+<li>Page through long results only with <code>meta.page.next_start</code>.</li>
+<li>For writes, name things the way a human does, so that you can read the request.</li>
+<li>Put many reads into one script, and run it as a dry run first. See <a href="scripts.html#what-are-scripts">Scripts</a>.</li>
+<li>On Windows, pass file paths. In WSL, call the Windows program <code>atlas-duck.exe</code>.</li>
+</ul>
 <h2 id="cli">The command line</h2>
-<p>TODO</p>
+<pre><code>atlas-duck [options] &lt;command&gt;
+</code></pre>
+<p>Options for every command:</p>
+<table>
+<thead><tr><th>Option</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>--agent NAME</code></td><td>The agent's name; also <code>ATLAS_DUCK_AGENT</code>.</td></tr>
+<tr><td><code>--reason TEXT</code></td><td>Why the agent asks. You read it in the queue.</td></tr>
+<tr><td><code>--timeout SECONDS</code></td><td>How long to wait for your decision. Default 100. <code>0</code> submits and returns <code>pending</code> at once.</td></tr>
+<tr><td><code>--instance ALIAS</code></td><td>Which instance to use.</td></tr>
+<tr><td><code>--output json|text</code></td><td>The format of the answer.</td></tr>
+<tr><td><code>--help</code></td><td>Help.</td></tr>
+</tbody></table>
+<p>Commands:</p>
+<table>
+<thead><tr><th>Command</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td><code>call &lt;op-id&gt; --params '&lt;json&gt;'</code></td><td>Run one operation. Use <code>--params-file &lt;path&gt;</code> or <code>-</code> instead of <code>--params</code> for a file or standard input.</td></tr>
+<tr><td><code>script run &lt;file&gt; [--args &lt;json&gt;] [--limits &lt;json&gt;] [--dry-run[=full|sparse]]</code></td><td>Run a script. See <a href="scripts.html#running-scripts">Scripts</a>.</td></tr>
+<tr><td><code>ops list</code>, <code>ops describe &lt;op-id&gt;</code></td><td>Find and describe the operations.</td></tr>
+<tr><td><code>instances</code></td><td>List your instances.</td></tr>
+<tr><td><code>await &lt;id&gt;</code></td><td>Wait for a request that is still open.</td></tr>
+<tr><td><code>status &lt;id&gt;</code></td><td>Show a request at once.</td></tr>
+<tr><td><code>cancel &lt;id&gt;</code></td><td>Withdraw a request.</td></tr>
+<tr><td><code>requests list [--agent NAME] [--state pending|recent] [--match-params-file &lt;path|-&gt;]</code></td><td>List requests; use it to find a request that is still pending.</td></tr>
+<tr><td><code>doctor</code></td><td>Check the setup.</td></tr>
+<tr><td><code>mcp</code></td><td>Start the MCP server, see below.</td></tr>
+<tr><td><code>verify-export</code></td><td>Check an exported audit file. See <a href="audit.html#verify">Audit log</a>.</td></tr>
+</tbody></table>
+<p>Writes and reads always wait for your decision. An agent that sees <code>pending</code> has to wait, not to ask again.</p>
 <h2 id="mcp">MCP clients</h2>
-<p>TODO</p>
+<p>Many agents speak MCP. Add atlas-duck to the agent's MCP settings as a program that starts over standard input and output:</p>
+<pre><code>atlas-duck mcp [--tools full|generic] [--instance ALIAS] [--agent NAME]
+</code></pre>
+<p>Only JSON-RPC messages go to standard output.</p>
+<ul>
+<li><code>--tools full</code> (the default) offers one tool for each operation, plus <code>script_run</code>, <code>request_await</code>, <code>request_status</code>, <code>request_cancel</code>, <code>request_list</code>, <code>ops_list</code>, <code>ops_describe</code> and <code>instances_list</code>.</li>
+<li><code>--tools generic</code> offers the single tool <code>call</code> plus the same eight helper tools. The agent then names the operation as a parameter.</li>
+</ul>
+<p>The agent passes <code>reason</code> in each tool call. The environment variable <code>ATLAS_DUCK_MCP_TIMEOUT</code> sets how long a tool call waits for you, in seconds. The default is 50; <code>0</code> returns <code>pending</code> at once. <code>ATLAS_DUCK_AGENT</code> sets the agent name.</p>
+<p>After you update atlas-duck, restart the MCP server in the agent, so that the agent uses the new version.</p>
 <h2 id="envelope">The response format</h2>
-<p>TODO</p>
+<p>Every command prints one JSON object on standard output, the envelope. Its keys are always the same:</p>
+<table>
+<thead><tr><th>Key</th><th>Content</th></tr></thead>
+<tbody>
+<tr><td><code>request_id</code></td><td>The id of the request.</td></tr>
+<tr><td><code>op_id</code></td><td>The operation.</td></tr>
+<tr><td><code>instance</code></td><td>The instance.</td></tr>
+<tr><td><code>status</code></td><td><code>pending</code>, <code>executing</code>, <code>succeeded</code>, <code>released</code>, <code>denied</code>, <code>expired</code>, <code>cancelled</code>, <code>failed</code>, <code>outcome_unknown</code> or <code>abandoned</code>.</td></tr>
+<tr><td><code>data</code></td><td>The result, if there is one.</td></tr>
+<tr><td><code>edited</code></td><td>Whether you changed the request before approving it.</td></tr>
+<tr><td><code>redacted</code></td><td>Whether you redacted the result.</td></tr>
+<tr><td><code>redaction_note</code></td><td>A note about the redaction.</td></tr>
+<tr><td><code>message</code></td><td>A short text.</td></tr>
+<tr><td><code>error</code></td><td><code>{code, retryable, message, details?}</code> when something went wrong.</td></tr>
+<tr><td><code>meta</code></td><td>Extra information such as paging and <code>dry_run</code>.</td></tr>
+</tbody></table>
+<p>The exit code of the command summarises the outcome:</p>
+<table>
+<thead><tr><th>Exit code</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>0</td><td><code>succeeded</code> or <code>released</code>.</td></tr>
+<tr><td>1</td><td><code>failed</code> or an internal error.</td></tr>
+<tr><td>2</td><td>Wrong use or invalid input.</td></tr>
+<tr><td>3</td><td><code>denied</code>.</td></tr>
+<tr><td>4</td><td>Still <code>pending</code> or <code>executing</code>.</td></tr>
+<tr><td>5</td><td>atlas-duck is not reachable.</td></tr>
+<tr><td>6</td><td>The instance failed, or the outcome is unknown.</td></tr>
+<tr><td>7</td><td><code>expired</code>, <code>cancelled</code> or <code>abandoned</code>.</td></tr>
+<tr><td>8</td><td>A script error or limit, or no sandbox.</td></tr>
+<tr><td>9</td><td>The app is locked, not set up, or needs a token.</td></tr>
+<tr><td>10</td><td>The result is no longer stored.</td></tr>
+<tr><td>11</td><td>atlas-duck is busy.</td></tr>
+</tbody></table>
+<p><code>status</code> exits with 0 whenever it knows the request. <code>verify-export</code> has its own codes: 0, 20, 21 and 22. For the meaning of each <code>error.code</code>, see <a href="error-reference.html">Error reference</a>.</p>
 </main>
 </div>
 </body>

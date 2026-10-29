@@ -29,7 +29,7 @@
 <li><a href="scripts.html" aria-current="page">Skripte</a>
 <ul>
 <li><a href="#what-are-scripts">Was Skripte sind</a></li>
-<li><a href="#running-scripts">Laufende Skripte</a></li>
+<li><a href="#running-scripts">Skripte ausführen</a></li>
 <li><a href="#limits">Limits und Isolierung</a></li>
 <li><a href="#stopping">Ein Skript beenden</a></li>
 </ul>
@@ -43,13 +43,50 @@
 <main>
 <h1>Skripte</h1>
 <h2 id="what-are-scripts">Was Skripte sind</h2>
-<p>TODO</p>
-<h2 id="running-scripts">Laufende Skripte</h2>
-<p>TODO</p>
+<p>Mit einem Skript erledigt ein Agent viele Lesezugriffe in einer Anfrage. Es ist JavaScript: der Rumpf von <code>async function main(args, atlas)</code>. Darin ruft es Lesevorgänge mit <code>atlas.&lt;product&gt;.&lt;op&gt;(params)</code> oder <code>atlas.call</code> auf, blättert mit <code>atlas.all</code> durch Ergebnisse und kann mit <code>atlas.ops()</code> und <code>atlas.instances()</code> abfragen, was es gibt. <code>atlas.log</code> schreibt eine Notiz.</p>
+<p>Ein Skript kann nur lesen. Es kann keine Schreibvorgänge aufrufen, keine Module importieren, keine Dateien öffnen und das Netzwerk nicht nutzen. Es läuft in einer Sandbox, einem eigenen Prozess, den das Betriebssystem einschränkt, und seine Uhr geht nach UTC.</p>
+<p>Ein Skript sendet nie von selbst etwas an den Agenten. Wenn es endet, wartet sein Endergebnis als Anfrage der Klasse „Skript“ in der Warteschlange. Sie sehen es sich an, schwärzen es bei Bedarf und übergeben es, genau wie ein Lesen. Siehe <a href="approvals.html#approve-or-deny">Freigaben</a>.</p>
+<p>Skripte sind in der Größe begrenzt: Der Quelltext darf bis zu 256 KiB groß sein, die Argumente bis zu 1 MiB. atlas-duck übersetzt den Quelltext, sobald der Agent ihn einreicht. Ein Syntaxfehler wird sofort mit <code>script_syntax</code> (Exit 8) beantwortet, und es läuft nichts.</p>
+<h2 id="running-scripts">Skripte ausführen</h2>
+<p>Ein Agent reicht ein Skript mit <code>atlas-duck script run &lt;Datei&gt;</code> ein oder mit dem Tool <code>script_run</code> des MCP-Servers. Siehe <a href="agents-desktop.html#cli">Agents (Desktop)</a>.</p>
+<p>Was gerade läuft, sehen Sie in „Laufende Skripte“ in der Kopfzeile des Fensters „Freigaben“. Läuft nichts, steht dort „Es laufen keine Skripte.“; sonst führt das Fenster je Skript eine Zeile:</p>
+<table>
+<thead><tr><th>Spalte</th><th>Inhalt</th></tr></thead>
+<tbody>
+<tr><td>Anfrage</td><td>Die Anfrage, zu der das Skript gehört.</td></tr>
+<tr><td>Agent</td><td>Der Name, den der Agent angegeben hat.</td></tr>
+<tr><td>Instanzen</td><td>Die Instanzen, die das Skript verwendet.</td></tr>
+<tr><td>Gestartet</td><td>Wann es gestartet ist.</td></tr>
+<tr><td>Dauer</td><td>Wie lange es schon läuft.</td></tr>
+<tr><td>Host-Aufrufe</td><td>Wie viele Aufrufe an die Instanz es gemacht hat.</td></tr>
+<tr><td>Abgerufene Bytes</td><td>Wie viele Daten es abgerufen hat.</td></tr>
+<tr><td>Aktionen</td><td>„Beenden“.</td></tr>
+</tbody></table>
+<p>Ein Agent sollte ein Skript zuerst als Probelauf testen (<code>--dry-run</code>, Modus <code>sparse</code> oder <code>full</code>). Ein Probelauf braucht keine Freigabe. Er berührt Ihre Instanzen nicht: Die Aufrufe werden aus den dokumentierten Beispielen des jeweiligen Vorgangs beantwortet, und die Antwort ist mit <code>meta.dry_run: true</code> gekennzeichnet. Damit prüfen Sie, ob ein Skript läuft und die richtige Form hat, nicht, um Daten zu lesen.</p>
 <h2 id="limits">Limits und Isolierung</h2>
-<p>TODO</p>
+<p>Jedes Skript läuft unter Limits, damit ein einzelnes Skript weder Ihren Rechner noch eine Instanz auslastet.</p>
+<p>Sie legen sie in den Einstellungen unter „Skript-Limits“ fest:</p>
+<table>
+<thead><tr><th>Limit</th><th>Standard</th></tr></thead>
+<tbody>
+<tr><td>Skript-Zeitlimit (s)</td><td>120</td></tr>
+<tr><td>Skript-Heap-Limit (MiB)</td><td>256</td></tr>
+<tr><td>Skript-Prozesslimit (MiB)</td><td>512</td></tr>
+<tr><td>Skript-Aufruflimit</td><td>200</td></tr>
+<tr><td>Skript-Abruflimit (MiB)</td><td>50</td></tr>
+<tr><td>Skript-Limit je Aufrufergebnis (MiB)</td><td>16</td></tr>
+<tr><td>Skript-Ergebnislimit (MiB)</td><td>16</td></tr>
+<tr><td>Gleichzeitige Skript-Aufrufe</td><td>4</td></tr>
+</tbody></table>
+<p>Auf dem Desktop darf ein Agent mit <code>--limits</code> niedrigere Limits anfordern, nie höhere. Ein Skript, das ein Limit überschreitet, endet mit <code>script_limit</code> (Exit 8).</p>
+<p>Zwei echte Skripte und zwei Probeläufe können gleichzeitig laufen. Weitere warten. Der Server wendet dieselben Zahlen je Benutzer an.</p>
+<p>Das Heap-Limit muss mindestens das 15-Fache des Limits je Aufrufergebnis betragen und das Prozesslimit mindestens das Heap-Limit plus 88 MiB. Die Einstellungen weisen Werte zurück, die das verletzen.</p>
+<p><strong>Isolierung.</strong> Die Sandbox zählt nur, wenn das Betriebssystem sie durchsetzen kann. Beim Start prüft atlas-duck das.</p>
+<p>Die Einstellungen zeigen das Ergebnis unter „Skript-Isolierung“: „erfüllt: Skripte dürfen laufen“, „nicht erfüllt: Skripte sind aus“ oder „die Prüfung beim Start ist noch nicht abgeschlossen“. Ist die Isolierung nicht erfüllt, sind Skripte aus, und ein Agent erhält <code>sandbox_unavailable</code> (Exit 8). Sie können Skripte trotzdem mit „Skripte mit eingeschränkter Isolierung erlauben“ zulassen; atlas-duck bittet Sie um eine Bestätigung. Danach steht in den Einstellungen „nicht erfüllt: Skripte laufen nur, weil eingeschränkte Isolierung erlaubt ist“, und das Banner zeigt „Vorsicht: Skripte laufen mit eingeschränkter Isolierung“. Wählen Sie das nur auf einem Rechner, dem Sie vertrauen.</p>
 <h2 id="stopping">Ein Skript beenden</h2>
-<p>TODO</p>
+<p>Um ein Skript zu beenden, verwenden Sie „Beenden“ in „Laufende Skripte“. Die Schaltfläche wechselt zu „Wird beendet…“, und das Fenster antwortet „Beenden angefordert“. Ist das Skript schon zu Ende, sehen Sie „Dieses Skript läuft nicht mehr.“; wird es bereits beendet, „Dieses Skript wird bereits beendet.“</p>
+<p>Ein beendetes Skript verschwindet nicht. Sein Kandidat, das bis dahin Gesammelte, wird zu einer Anfrage in der Warteschlange. Sie können ihn übergeben, schwärzen oder ablehnen wie jede andere Anfrage.</p>
+<p>Storniert der Agent eine Anfrage selbst (<code>atlas-duck cancel &lt;id&gt;</code>), endet sie als <code>cancelled</code>, und ihr Ergebnis erreicht die Warteschlange nie.</p>
 </main>
 </div>
 </body>

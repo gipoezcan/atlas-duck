@@ -46,15 +46,50 @@
 <main>
 <h1>Agents (Server)</h1>
 <h2 id="api-keys">API-Schlüssel</h2>
-<p>TODO</p>
+<p>Mit einem API-Schlüssel erreicht ein Agent atlas-duck in Ihrem Namen über MCP. Ein Schlüssel gibt nie etwas frei: Jede Anfrage des Agenten wartet weiterhin in Ihrer <a href="/docs/de/approvals#queue">Warteschlange</a>.</p>
+<p>Öffnen Sie „API-Schlüssel“ in der Kopfzeile. So erstellen Sie einen Schlüssel:</p>
+<ol>
+<li>Geben Sie einen „Name“ mit 1 bis 64 Zeichen ein, zum Beispiel den Namen des Agenten oder des Werkzeugs.</li>
+<li>Wählen Sie die Berechtigungen, siehe <a href="/docs/de/agents-server#scopes">Berechtigungen</a>. Wählen Sie mindestens eine.</li>
+<li>Geben Sie „Läuft ab in (Tagen, 1–90)“ ein.</li>
+<li>Wählen Sie „Schlüssel erstellen“.</li>
+</ol>
+<p>atlas-duck zeigt den Schlüssel nur einmal: „Dieser Schlüssel wird nur jetzt angezeigt.“ Verwenden Sie „Kopieren“, fügen Sie ihn in die Einstellungen Ihres Agenten ein und wählen Sie „Fertig“. atlas-duck kann ihn danach nicht erneut anzeigen. Haben Sie ihn verloren, erstellen Sie einen neuen.</p>
+<p>Der Agent sendet den Schlüssel als <code>Authorization: Bearer adk_…</code>. Die Liste zeigt je Schlüssel den Namen, das Präfix (die ersten Zeichen, an denen Sie ihn erkennen), die Berechtigungen, wann er abläuft und zuletzt verwendet wurde sowie seinen Status: Aktiv, Widerrufen oder Abgelaufen. Sie können höchstens 25 aktive Schlüssel haben.</p>
+<p>„Widerrufen“ stoppt einen Schlüssel: „Den Schlüssel „Name“ widerrufen? Agents, die ihn verwenden, funktionieren sofort nicht mehr.“ Widerrufen Sie jeden Schlüssel, den Sie nicht mehr brauchen, und jeden, der durchgesickert sein könnte.</p>
 <h2 id="scopes">Berechtigungen</h2>
-<p>TODO</p>
+<p>Eine Berechtigung (Scope) legt fest, was ein Schlüssel oder eine App anfordern darf. Wählen Sie die kleinste Menge, die der Agent braucht.</p>
+<table>
+<thead><tr><th>Berechtigung</th><th>Bedeutung</th></tr></thead>
+<tbody>
+<tr><td><code>read</code></td><td>Daten lesen und auf Ihre Entscheidungen warten.</td></tr>
+<tr><td><code>propose_write</code></td><td>Änderungen zur Freigabe durch Sie vorschlagen.</td></tr>
+<tr><td><code>scripts</code></td><td>Schreibgeschützte Skripte in der Sandbox ausführen; Sie geben jedes Endergebnis frei.</td></tr>
+</tbody></table>
+<p>Auch mit allen Berechtigungen kann ein Agent nichts entscheiden. Was er liest, erreicht ihn erst, nachdem Sie es übergeben haben, und jede Änderung braucht Ihre Freigabe. Siehe <a href="/docs/de/approvals#approve-or-deny">Freigaben</a> und <a href="/docs/de/scripts#what-are-scripts">Skripte</a>.</p>
 <h2 id="connected-apps">Verbundene Apps</h2>
-<p>TODO</p>
+<p>„Verbundene Apps“ listet die Apps auf, denen Sie erlaubt haben, atlas-duck über MCP mit OAuth zu verwenden. Auch eine App gibt nie etwas frei.</p>
+<p>Die Tabelle zeigt die App, „Rückkehr zu“ (die Adresse, zu der die App nach Ihrer Antwort zurückkehrt), die Berechtigungen, wann Sie sie erlaubt haben, wann sie zuletzt verwendet wurde und wann sie abläuft, sowie ihren Status: Aktiv, Widerrufen oder Abgelaufen.</p>
+<p>„Widerrufen“ schneidet eine App ab: „Die App verliert sofort den Zugriff.“ Will sie zurückkehren, muss sie erneut um Ihre Erlaubnis bitten.</p>
+<p>OAuth steht zur Verfügung, wenn Ihre Organisation es aktiviert hat. Fehlt die Seite oder der Ablauf, fragen Sie Ihren Administrator; API-Schlüssel funktionieren weiterhin.</p>
 <h2 id="oauth-consent">Eine App autorisieren</h2>
-<p>TODO</p>
+<p>Wenn Sie atlas-duck in einem MCP-Client hinzufügen, der OAuth unterstützt, öffnet der Client Ihren Browser auf der Seite „Einer App die Nutzung von atlas-duck erlauben?“. Melden Sie sich zuerst an, falls atlas-duck danach fragt. Die Seite zeigt:</p>
+<ul>
+<li>den Namen der App, gekennzeichnet mit „ungeprüft, von der App gewählt“: Jeder kann sich einen beliebigen Namen geben, vertrauen Sie ihm also nicht;</li>
+<li>„Nach Ihrer Antwort kehren Sie zurück zu“: die Adresse, zu der Ihr Browser als Nächstes geht. Prüfen Sie, dass Sie sie erwarten;</li>
+<li>was „Die App möchte“: <code>read</code> ist immer enthalten, <code>propose_write</code> und <code>scripts</code> erscheinen, wenn die App sie anfordert.</li>
+</ul>
+<p>Sie können Berechtigungen abwählen, aber nie hinzufügen. Wählen Sie „Erlauben“ oder „Ablehnen“. Sind Sie bei einer App unsicher, wählen Sie „Ablehnen“: Dann wird nichts erlaubt. Eine erlaubte App können Sie jederzeit unter „Verbundene Apps“ widerrufen. Jede Autorisierung fragt erneut; atlas-duck merkt sich die Antwort nicht für die nächste App.</p>
+<p>Eine App behält ihren Zugriff mit kurzlebigen Tokens, die sie selbstständig erneuert. Eine Zugriffserlaubnis gilt höchstens 90 Tage.</p>
 <h2 id="mcp-endpoint">Der MCP-Endpunkt</h2>
-<p>TODO</p>
+<p>Der MCP-Endpunkt des Servers ist seine öffentliche Adresse mit angehängtem <code>/mcp</code>, zum Beispiel <code>https://atlas-duck.example.org/mcp</code>. Die Adresse nennt Ihnen Ihr Administrator.</p>
+<p>Ein Agent oder eine App verbindet sich damit als entfernter MCP-Server:</p>
+<ul>
+<li>Mit einem API-Schlüssel setzen Sie den Header <code>Authorization: Bearer adk_…</code>.</li>
+<li>Mit OAuth findet der Client selbst heraus, wo er sich anmeldet: Er fragt <code>/mcp</code> an, liest die <code>.well-known</code>-Dokumente des Servers, registriert sich als öffentlicher Client und verwendet PKCE. Sie sehen nur die Seite „Einer App die Nutzung von atlas-duck erlauben?“.</li>
+</ul>
+<p>Die Tools sind dieselben wie auf dem Desktop: Vorgänge, <code>script_run</code> (braucht die Berechtigung <code>scripts</code>) und die Anfrage-Tools zum Abwarten, Prüfen, Stornieren und Auflisten von Anfragen. Anfragen, Status und Fehler bedeuten dasselbe wie auf dem Desktop; siehe <a href="/docs/de/error-reference">Fehlerreferenz</a>.</p>
+<p>Weder ein Schlüssel noch eine App kann die Freigabefunktionen des Servers verwenden. Entscheiden können nur Sie, angemeldet im Browser.</p>
 </main>
 </div>
 </body>

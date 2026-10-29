@@ -46,15 +46,50 @@
 <main>
 <h1>Agents (server)</h1>
 <h2 id="api-keys">API keys</h2>
-<p>TODO</p>
+<p>An API key lets an agent reach atlas-duck over MCP on your behalf. A key never approves anything: every request of the agent still waits in your <a href="/docs/en/approvals#queue">approval queue</a>.</p>
+<p>Open &quot;API keys&quot; from the header. To create a key:</p>
+<ol>
+<li>Enter a &quot;Name&quot; of 1 to 64 characters, for example the name of the agent or the tool.</li>
+<li>Select the scopes, see <a href="/docs/en/agents-server#scopes">Scopes</a>. Select at least one.</li>
+<li>Enter &quot;Expires in (days, 1–90)&quot;.</li>
+<li>Choose &quot;Create key&quot;.</li>
+</ol>
+<p>atlas-duck shows the key once: &quot;This key is shown only now.&quot; Use &quot;Copy&quot;, paste it into the settings of your agent, and choose &quot;Done&quot;. atlas-duck cannot show it again. If you lose it, create a new one.</p>
+<p>The agent sends the key as <code>Authorization: Bearer adk_…</code>. The list shows for each key the Name, the Prefix (the first characters, to recognise it), the Scopes, when it Expires and was Last used, and its State: Active, Revoked or Expired. You can have at most 25 active keys.</p>
+<p>&quot;Revoke&quot; stops a key: &quot;Revoke the key &quot;name&quot;? Agents using it stop working at once.&quot; Revoke every key that you no longer use, and every key that may have leaked.</p>
 <h2 id="scopes">Scopes</h2>
-<p>TODO</p>
+<p>A scope says what a key, or an app, may ask for. Pick the smallest set that the agent needs.</p>
+<table>
+<thead><tr><th>Scope</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>read</code></td><td>Read data and wait for your decisions.</td></tr>
+<tr><td><code>propose_write</code></td><td>Propose changes for your approval.</td></tr>
+<tr><td><code>scripts</code></td><td>Run read-only scripts in the sandbox; you approve each final result.</td></tr>
+</tbody></table>
+<p>Even with every scope, an agent cannot decide anything. What it reads reaches it only after you release it, and every change needs your approval. See <a href="/docs/en/approvals#approve-or-deny">Approvals</a> and <a href="/docs/en/scripts#what-are-scripts">Scripts</a>.</p>
 <h2 id="connected-apps">Connected apps</h2>
-<p>TODO</p>
+<p>&quot;Connected apps&quot; lists the apps that you allowed to use atlas-duck over MCP with OAuth. An app never approves anything either.</p>
+<p>The table shows the App, &quot;Returns to&quot; (the address that the app returns to after you answered), the Scopes, when you Allowed it, when it was Last used and when it Expires, and its State: Active, Revoked or Expired.</p>
+<p>&quot;Revoke&quot; cuts an app off: &quot;The app loses access at once.&quot; The app has to ask for your permission again if it wants to return.</p>
+<p>OAuth is available when your organisation has it enabled. If the page or the flow is missing, ask your administrator; API keys keep working.</p>
 <h2 id="oauth-consent">Authorising an app</h2>
-<p>TODO</p>
+<p>When you add atlas-duck to an MCP client that supports OAuth, the client opens your browser on the page &quot;Allow an app to use atlas-duck?&quot;. Sign in first if atlas-duck asks. The page shows:</p>
+<ul>
+<li>the name of the app, marked &quot;unverified, chosen by the app&quot;: anybody can pick any name, so do not trust it;</li>
+<li>&quot;After your answer you return to&quot;: the address that your browser goes to next. Check that you expect it;</li>
+<li>what &quot;It asks to&quot; do: <code>read</code> is always included, <code>propose_write</code> and <code>scripts</code> appear when the app asks for them.</li>
+</ul>
+<p>You can switch off scopes, but never add one. Choose &quot;Allow&quot; or &quot;Deny&quot;. If you are unsure about an app, choose &quot;Deny&quot;: nothing is allowed. You can revoke an allowed app at any time under &quot;Connected apps&quot;. Every authorization asks again; atlas-duck does not remember the answer for the next app.</p>
+<p>An app keeps its access with short-lived tokens that it renews by itself. An access grant lasts 90 days at most.</p>
 <h2 id="mcp-endpoint">The MCP endpoint</h2>
-<p>TODO</p>
+<p>The MCP endpoint of the server is its public address followed by <code>/mcp</code>, for example <code>https://atlas-duck.example.org/mcp</code>. Your administrator tells you the address.</p>
+<p>An agent or an app connects to it as a remote MCP server:</p>
+<ul>
+<li>With an API key, set the header <code>Authorization: Bearer adk_…</code>.</li>
+<li>With OAuth, the client finds out for itself where to sign in: it asks <code>/mcp</code>, reads the <code>.well-known</code> documents of the server, registers as a public client and uses PKCE. You only see the page &quot;Allow an app to use atlas-duck?&quot;.</li>
+</ul>
+<p>The tools are the same as on the desktop: operations, <code>script_run</code> (needs the <code>scripts</code> scope), and the request tools to await, check, cancel and list requests. Requests, statuses and errors mean the same as on the desktop; see <a href="/docs/en/error-reference">Error reference</a>.</p>
+<p>Neither a key nor an app can use the approval functions of the server. Decisions can only be made by you, signed in in the browser.</p>
 </main>
 </div>
 </body>

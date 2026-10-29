@@ -48,19 +48,103 @@
 <main>
 <h1>Freigaben</h1>
 <h2 id="queue">Die Warteschlange</h2>
-<p>TODO</p>
+<p>Nichts, was ein Agent anfordert, verlässt atlas-duck ohne Ihre Entscheidung. Jede Anfrage, die eine Entscheidung braucht, wartet in der Warteschlange unter „Ausstehende Freigaben“. Wartet nichts, steht dort „Keine ausstehenden Anfragen“.</p>
+<p>Nach der Anmeldung ist die Seite „Freigaben“ Ihre Startseite. Ihre Kopfzeile führt zu den übrigen Seiten des Servers.</p>
+<p>Die Anfragen sind nach Sitzung gruppiert, sodass Sie sehen, welcher Lauf eines Agenten was gesendet hat. Jede Zeile zeigt:</p>
+<ul>
+<li>die Klasse der Anfrage: „Lesen“, „Schreiben“ oder „Skript“;</li>
+<li>die Begründung des Agenten oder „keine Begründung angegeben“;</li>
+<li>wie lange die Anfrage schon wartet;</li>
+<li>Warnungen: „veraltet“ (die Revision hat sich geändert, nachdem Sie die Anfrage geöffnet haben; öffnen Sie sie erneut), „Vorsicht“ (siehe <a href="/docs/de/approvals#unverified-text">Ungeprüfter Text</a>), „mögliches Duplikat“ und „ähnliche Anfrage“ (eine frühere Anfrage desselben Agenten sieht gleich aus).</li>
+</ul>
+<p>Mit „Öffnen“ sehen Sie sich eine Anfrage an. Mit „auswählen“ nehmen Sie eine Zeile in eine <a href="/docs/de/approvals#batch-decisions">Sammelentscheidung</a> auf, mit „alle der Sitzung auswählen“ alle Zeilen einer Sitzung.</p>
+<p>Eine Anfrage, die niemand entscheidet, läuft ab. Der Agent erhält dann <code>expired</code>.</p>
 <h2 id="reading-a-request">Eine Anfrage lesen</h2>
-<p>TODO</p>
+<p>Das Öffnen einer Anfrage füllt den Bereich „Anfragedetails“. Zunächst bietet er nur „Vorschau öffnen“ an. Erst das Öffnen der Vorschau macht eine Entscheidung möglich: Sie entscheiden über das, was Sie gesehen haben.</p>
+<p>Der Bereich hat vier Registerkarten:</p>
+<table>
+<thead><tr><th>Registerkarte</th><th>Inhalt</th></tr></thead>
+<tbody>
+<tr><td>Vorschau</td><td>Was ausgeführt oder an den Agenten gesendet würde, in lesbarer Form.</td></tr>
+<tr><td>Strukturiert</td><td>Derselbe Inhalt als Baum; hier bearbeiten oder schwärzen Sie.</td></tr>
+<tr><td>Rohdaten</td><td>Der genaue Inhalt, Seite für Seite.</td></tr>
+<tr><td>Anfrage</td><td>Wer was angefordert hat.</td></tr>
+</tbody></table>
+<p>Die Registerkarte „Anfrage“ nennt:</p>
+<ul>
+<li>Parameter und deren Prüfsumme <code>params_sha256</code>;</li>
+<li>Begründung, Instanz, Vorgang und Ziel;</li>
+<li>Angeforderte Grenzen (nur bei Skripten);</li>
+<li>Eingereicht und Alter;</li>
+<li>Verbindung, Client-Art, Agentenname, Quelle des Agentennamens und <code>cwd_basename</code>;</li>
+<li>Verbindungs-ID und die Angaben zum Peer: Peer-PID, Peer-Programm, Ursprungsprogramm des Peers und Peer-Kette.</li>
+</ul>
+<p>Den Agentennamen wählt der Agent selbst. Betrachten Sie ihn als Beschriftung, nicht als Beleg dafür, wer anfragt.</p>
 <h2 id="approve-or-deny">Freigeben, übergeben oder ablehnen</h2>
-<p>TODO</p>
+<p>Welche Schaltflächen erscheinen, hängt von der Klasse der Anfrage ab:</p>
+<table>
+<thead><tr><th>Anfrage</th><th>Schaltflächen</th><th>Was geschieht</th></tr></thead>
+<tbody>
+<tr><td>Schreiben</td><td>„Freigeben“</td><td>atlas-duck führt die Änderung aus.</td></tr>
+<tr><td>Lesen</td><td>„Übergeben“</td><td>Die Daten, die die Instanz geliefert hat, gehen an den Agenten.</td></tr>
+<tr><td>Skript</td><td>„Übergeben“</td><td>Das Endergebnis des Skripts geht an den Agenten.</td></tr>
+<tr><td>Fehlgeschlagenes Lesen</td><td>„Ergebnis übergeben“ oder „Nur Status übergeben“</td><td>Der Agent erhält <code>failed</code> (Exit 6) mit dem HTTP-Status, mit oder ohne den Text der Meldung.</td></tr>
+<tr><td>Jede</td><td>„Ablehnen“</td><td>Der Agent erhält <code>denied</code> (Exit 3) und Ihre Begründung.</td></tr>
+</tbody></table>
+<p>Unter den Schaltflächen steht in einer Zeile, was der Agent erhalten wird.</p>
+<p>Tastenkürzel: Strg/Cmd+Umschalt+Eingabe gibt frei oder übergibt, Strg/Cmd+Umschalt+D lehnt ab, Strg/Cmd+Umschalt+Pfeil runter und Strg/Cmd+Umschalt+Pfeil hoch wechseln zur nächsten und zur vorherigen Anfrage.</p>
+<p>Zum Ablehnen öffnet „Ablehnen“ das Formular „Diese Anfrage ablehnen“. Geben Sie die „Begründung für den Agenten“ ein und drücken Sie die Eingabetaste oder wählen Sie „Ablehnung senden“; Esc bricht ab. Der Agent sieht Ihre Begründung, schreiben Sie sie also für den Agenten. Sie können auch einen „Tipp anhängen“: höchstens einen Tipp aus den angebotenen, zum Beispiel den HTTP-Status der Instanz, die Ergebnisklasse, den nicht aufgelösten Namen oder die fehlenden Pflichtfelder. Der Tipp hilft dem Agenten, es mit besserer Eingabe erneut zu versuchen.</p>
 <h2 id="edit-and-redact">Bearbeiten und schwärzen</h2>
-<p>TODO</p>
+<p>Sie können ändern, was ausgeführt wird, oder Teile dessen zurückhalten, was übergeben wird. Beides erzeugt eine neue Revision der Anfrage. atlas-duck ändert die alte Revision nie.</p>
+<p><strong>Einen Schreibzugriff bearbeiten.</strong> „Vor der Freigabe bearbeiten“ zeigt die Parameter als Felder. Felder, die das Ziel nennen, tragen den Hinweis „schreibgeschützt: zum Ändern des Ziels ablehnen“; ist das Ziel falsch, lehnen Sie ab und lassen den Agenten neu anfragen. Fehlende Pflichtfelder stehen unter „Fehlende Pflichtfelder“. „Bearbeiten und freigeben“ sendet Ihre Änderung, „Änderungen verwerfen“ verwirft sie. Eine Bearbeitung ergibt eine neue Revision: Öffnen Sie deren Vorschau, prüfen Sie sie und geben Sie sie dann in einem zweiten Schritt frei. Solange Änderungen nicht gesendet sind, bleibt „Freigeben“ deaktiviert („Ungesendete Änderungen…“).</p>
+<p><strong>Ein Lesen oder ein Skriptergebnis schwärzen.</strong> „Vor der Übergabe schwärzen“ zeigt den Kandidaten, also die Daten, die an den Agenten gingen, als Baum. Sie können:</p>
+<ul>
+<li>„Eintrag entfernen“: einen Eintrag einer Liste weglassen;</li>
+<li>„Feld entfernen (dieser Eintrag)“ oder „Feld entfernen (alle Einträge)“: ein Feld weglassen;</li>
+<li>„Text maskieren“: einen Text durch <code>[REDACTED]</code> ersetzen. Geben Sie den „Zu maskierenden Text“ ein oder verwenden Sie den ausgewählten Text. „Nur dieses Vorkommen“ maskiert nur eine Stelle;</li>
+<li>eine Voreinstellung wählen: „Nur Status übergeben“ oder „Nur Fehlerklasse behalten“;</li>
+<li>mit „Alle Schwärzungen entfernen“ von vorn beginnen.</li>
+</ul>
+<p>„Übergeben“ sendet die Schwärzungen und erzeugt eine neue Revision. Öffnen Sie sie, prüfen Sie, was der Agent erhielte („Übergebene Größe“ nennt die Zahl der Bytes), und übergeben Sie sie dann.</p>
+<p>Kommt der Text, den Sie maskieren wollen, auch an anderer Stelle vor, sagt atlas-duck Ihnen, wo. „Trotzdem übergeben: Die anderen Vorkommen bleiben in dem, was der Agent erhält“ ist Ihre ausdrückliche Entscheidung, sie stehen zu lassen.</p>
+<p><strong>Wenn eine Übergabe blockiert ist.</strong> atlas-duck verweigert eine Übergabe, die preisgeben könnte, was Sie geschwärzt haben, und nennt den Grund:</p>
+<table>
+<thead><tr><th>Meldung</th><th>Bedeutung und was zu tun ist</th></tr></thead>
+<tbody>
+<tr><td>ein maskierter Text kommt weiterhin vor</td><td>Der Text steht noch da, zum Beispiel in einem anderen Feld. Maskieren Sie ihn auch dort oder entfernen Sie das Feld.</td></tr>
+<tr><td>ein Wert ändert sich nach 3 Dekodierungsrunden weiterhin</td><td>Ein Wert ist in Schichten kodiert, die sich nicht zuverlässig prüfen lassen. Entfernen Sie den Eintrag oder das Feld.</td></tr>
+<tr><td>ein Treffer ließ sich nicht sauber maskieren</td><td>Der Text steckt in einem kodierten Wert. Entfernen Sie stattdessen den Eintrag oder das Feld.</td></tr>
+<tr><td>ein gespiegelter Eintrag hat keine Entsprechung</td><td>Zwei Listen im Ergebnis gehören zusammen, und ein Eintrag hat keinen Partner. Verwenden Sie „Markierte Einträge entfernen“.</td></tr>
+<tr><td>gespiegelte Einträge lassen sich nicht zuordnen</td><td>Dasselbe, nur kann atlas-duck nicht erkennen, welche Einträge zusammengehören. Verwenden Sie „Markierte Einträge entfernen“.</td></tr>
+<tr><td>eine Schwärzung nennt nichts im Kandidaten</td><td>Die Schwärzung passt nicht mehr zu den Daten. Entfernen Sie sie.</td></tr>
+<tr><td>der geschwärzte Kandidat überschreitet die Übergabegrenze von 16 MiB</td><td>Das Ergebnis ist zu groß für eine Übergabe. Entfernen Sie Einträge oder Felder oder lehnen Sie ab.</td></tr>
+</tbody></table>
+<p>Haben Einträge keine Entsprechung, listet der Bereich sie auf („Diese Einträge haben keine Entsprechung und blockieren die Übergabe:“). Lässt sich der Kandidat nicht exakt erstellen, ist die Übergabe ebenfalls blockiert; lehnen Sie die Anfrage ab oder entfernen Sie die markierten Einträge.</p>
 <h2 id="batch-decisions">Sammelentscheidungen</h2>
-<p>TODO</p>
+<p>Warten viele gleichartige Anfragen, entscheiden Sie sie gemeinsam. Wählen Sie die Zeilen aus oder verwenden Sie „alle der Sitzung auswählen“, dann erscheint die Leiste „Sammelentscheidung“. „N ausgewählte freigeben oder übergeben“ zeigt zuerst, was geschehen wird, zum Beispiel wie viele Lesezugriffe und Skripte übergeben und wie viele Schreibzugriffe freigegeben werden. Dann bestätigen Sie mit „Bestätigen“, und die Desktop-App fragt noch einmal mit einer nativen Bestätigung nach.</p>
+<p>Eine Sammelentscheidung gilt ganz oder gar nicht. Hat sich auch nur eine Anfrage inzwischen geändert, wird die gesamte Sammelentscheidung zurückgewiesen: „Die Sammelentscheidung wurde zurückgewiesen, und es wurde nichts entschieden“. Der Grund wird je Anfrage genannt:</p>
+<ul>
+<li>die Revision hat sich geändert (veraltet);</li>
+<li>die Vorschau wurde nicht geöffnet;</li>
+<li>die Anfrage ist nicht freigabefähig;</li>
+<li>sie ist als mögliches Duplikat oder ähnliche Anfrage markiert und muss einzeln freigegeben werden;</li>
+<li>sie ist nicht mehr ausstehend;</li>
+<li>ihr Ziel kann nicht bearbeitet werden.</li>
+</ul>
+<p>Eine Anfrage, die Sie selbst ansehen wollen, nehmen Sie aus der Sammelentscheidung heraus: Sie zeigt dann „Nicht Teil der Sammelentscheidung“, oder Sie wählen „einzeln freigeben“.</p>
+<p>Um gesammelt abzulehnen, verwenden Sie „Ausgewählte ablehnen“ oder „Alle ausstehenden dieser Sitzung ablehnen“. Beide verlangen eine Begründung für den Agenten und senden sie mit „Ablehnung senden“.</p>
 <h2 id="needs-attention">Braucht Aufmerksamkeit</h2>
-<p>TODO</p>
+<p>Unter der Warteschlange listet „Zuletzt entschieden (24 Std.)“ auf, was in den letzten 24 Stunden entschieden wurde. Einträge unter „Braucht Aufmerksamkeit“ sind freigegebene Schreibzugriffe, die nicht gut ausgegangen sind: Der Schreibzugriff ist fehlgeschlagen, endete mit unbekanntem Ergebnis oder traf auf einen Versionskonflikt. „Ziel prüfen“ heißt: Sehen Sie sich das Jira- oder Confluence-Objekt selbst an, denn bei unbekanntem Ergebnis kann atlas-duck nicht sagen, ob die Änderung stattgefunden hat.</p>
+<p>Mit „Zur Kenntnis nehmen“ nehmen Sie einen Eintrag aus der Liste, mit „Alle zur Kenntnis nehmen“ alle. Wurde nichts entschieden, steht in der Liste „In den letzten 24 Stunden wurde nichts entschieden“.</p>
+<p>Die Statusbezeichnungen, denen Sie begegnen, sind: ausstehend, wird ausgeführt, erfolgreich, übergeben, abgelehnt, abgelaufen, storniert, fehlgeschlagen, abgebrochen, Ergebnis unbekannt und „zur erneuten Prüfung zurückgegeben“.</p>
 <h2 id="unverified-text">Ungeprüfter Text</h2>
-<p>TODO</p>
+<p>Alles, was ein Agent schreibt, ist nicht vertrauenswürdig: die Begründung, der Agentenname und die Parameter. atlas-duck kennzeichnet deshalb, was es nicht prüfen konnte.</p>
+<ul>
+<li>„ungeprüft“ kennzeichnet einen Text, den der Agent geschrieben hat und der nicht geprüft wurde.</li>
+<li>„ungewöhnliche Zeichen“ kennzeichnet einen Text mit Zeichen, die unsichtbar oder leicht mit anderen zu verwechseln sind. Sie werden sichtbar gemacht, damit Sie sie erkennen.</li>
+<li>„Vorsicht:“ in einer Anfrage ist eine Warnung von atlas-duck, dass Sie die Anfrage genau lesen sollten, bevor Sie entscheiden.</li>
+</ul>
+<p>Lesen Sie gekennzeichneten Text langsam und lehnen Sie im Zweifel ab. Eine Ablehnung kostet den Agenten eine neue Anfrage; eine falsch freigegebene Anfrage kann Sie eine Änderung kosten, die sich nicht rückgängig machen lässt.</p>
 </main>
 </div>
 </body>
