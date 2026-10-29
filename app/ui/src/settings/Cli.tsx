@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { HelpLink } from '../shared/HelpLink';
 import { useText } from '../shared/i18n/context';
 
 import { cliInstall, cliUninstall } from '../shared/ipc/invoke';
@@ -52,6 +53,7 @@ export function Cli({
   return (
     <section aria-label={t.settings.cli}>
       <h2>{t.settings.cli}</h2>
+      <HelpLink section="settings/cli" />
       <p>{status}</p>
       {packaged ? null : (
         <button type="button" disabled={action.pending} onClick={click}>

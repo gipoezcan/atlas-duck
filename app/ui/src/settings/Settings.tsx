@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { HelpButton } from '../shared/HelpLink';
 import { useText } from '../shared/i18n/context';
 
 import { on } from '../shared/ipc/events';
@@ -63,6 +64,7 @@ export function Settings() {
     return (
       <main className="window window-settings">
         <h1>{t.approvals.window_titles.settings}</h1>
+        <HelpButton window="settings" />
         {failed ? (
           <p role="alert">
             {t.settings.load_failed}{' '}
@@ -92,6 +94,7 @@ export function Settings() {
     <WindowBusyContext.Provider value={busy}>
     <main className="window window-settings">
       <h1>{t.approvals.window_titles.settings}</h1>
+      <HelpButton window="settings" />
       {failed ? (
         <p role="alert">
           {t.settings.load_failed}{' '}

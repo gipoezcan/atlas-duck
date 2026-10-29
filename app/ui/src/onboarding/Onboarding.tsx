@@ -1,4 +1,5 @@
 import { OnboardingText } from './OnboardingText';
+import { HelpButton } from '../shared/HelpLink';
 import { useText } from '../shared/i18n/context';
 
 /**
@@ -10,6 +11,7 @@ export function Onboarding() {
   return (
     <main className="window window-onboarding">
       <h1>{t.approvals.window_titles.onboarding}</h1>
+      <HelpButton window="onboarding" />
       <OnboardingText />
     </main>
   );

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { HelpButton } from '../shared/HelpLink';
 import { useText } from '../shared/i18n/context';
 import type { Dict } from '../shared/i18n';
 import { en } from '../shared/i18n/dict';
@@ -163,6 +164,7 @@ function WizardWindow() {
     return (
       <main className="window window-setup">
         <h1>{t.approvals.window_titles.setup}</h1>
+        <HelpButton window="setup" />
         {failed ? (
           <p role="alert">
             {t.setup.load_failed}{' '}
@@ -183,6 +185,7 @@ function WizardWindow() {
       <main className="window window-setup">
         <header className="page-header">
           <h1>{t.approvals.window_titles.setup}</h1>
+          <HelpButton window="setup" />
           {state.refused_count === null ? null : (
             <p role="status" className="notice notice-info">
               {t.setup.required(state.refused_count)}

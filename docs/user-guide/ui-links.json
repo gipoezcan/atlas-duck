@@ -8,6 +8,12 @@
     "credential": "instances-and-tokens#credential-window",
     "setup": "getting-started-desktop#first-start"
   },
+  "desktop_sections": {
+    "settings/language": "settings#language",
+    "settings/cli": "settings#cli-install",
+    "audit/verification": "audit#verify",
+    "audit/jobs": "audit#export"
+  },
   "server": {
     "/": "index#where-to-start",
     "/login": "getting-started-server#sign-in",

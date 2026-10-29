@@ -116,20 +116,32 @@ function checkUiLinks(inp, errors) {
     }
     for (const [k, target] of Object.entries(map)) {
       if (!keys.includes(k)) errors.push(`ui-links ${set}: ${k} is not a ${set === "desktop" ? "window label" : "server page"}`);
-      const m = /^([a-z0-9-]+)#([a-z0-9-]+)$/.exec(target);
-      if (!m) {
-        errors.push(`ui-links ${set}: ${k} -> ${target} is not page#anchor`);
-        continue;
-      }
-      for (const lang of LANGS) {
-        const page = manifestPages(inp.manifests[set][lang]).get(m[1]);
-        if (!page) errors.push(`ui-links ${set}: ${k} -> ${target}: no page ${m[1]} in the ${set} set (${lang})`);
-        else if (!page.anchors.includes(m[2])) errors.push(`ui-links ${set}: ${k} -> ${target}: no anchor ${m[2]} (${lang})`);
-      }
+      checkTarget(set, set, k, target, inp, errors);
     }
+  }
+  // M16 T7: the "?" links next to sections of the desktop windows, `<window label>/<section>`.
+  for (const [k, target] of Object.entries(inp.uiLinks.desktop_sections ?? {})) {
+    const [label, section, ...rest] = k.split("/");
+    if (!label || !section || rest.length > 0 || !inp.labels.includes(label) || LABELS_WITHOUT_LINK.includes(label)) {
+      errors.push(`ui-links desktop_sections: ${k} is not <window label>/<section>`);
+    }
+    checkTarget("desktop_sections", "desktop", k, target, inp, errors);
   }
 }
 
+/** One `page#anchor` target of ui-links.json: it must exist in every language of `set`. */
+function checkTarget(name, set, k, target, inp, errors) {
+  const m = /^([a-z0-9-]+)#([a-z0-9-]+)$/.exec(target);
+  if (!m) {
+    errors.push(`ui-links ${name}: ${k} -> ${target} is not page#anchor`);
+    return;
+  }
+  for (const lang of LANGS) {
+    const page = manifestPages(inp.manifests[set][lang]).get(m[1]);
+    if (!page) errors.push(`ui-links ${name}: ${k} -> ${target}: no page ${m[1]} in the ${set} set (${lang})`);
+    else if (!page.anchors.includes(m[2])) errors.push(`ui-links ${name}: ${k} -> ${target}: no anchor ${m[2]} (${lang})`);
+  }
+}
 /** Resolves an href of a generated page to [lang, page id, anchor] or null when it is not internal. */
 function resolveHref(set, lang, id, href) {
   if (/^https?:\/\//.test(href) || href.startsWith("assets/")) return "skip";

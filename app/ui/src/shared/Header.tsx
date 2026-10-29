@@ -1,5 +1,6 @@
 import { openWindow, quit, type OpenableWindow } from './ipc/invoke';
 import type { StatusLine } from './ipc/types';
+import { HelpButton } from './HelpLink';
 import { useText } from './i18n/context';
 
 const BUTTONS = ['settings', 'audit', 'running_scripts', 'onboarding'] as const satisfies readonly OpenableWindow[];
@@ -24,6 +25,7 @@ export function Header({ lines }: HeaderProps) {
             {t.approvals.header[w]}
           </button>
         ))}
+        <HelpButton window="approvals" />
         <button type="button" onClick={() => void quit().catch(ignore)}>
           {t.approvals.header.quit}
         </button>

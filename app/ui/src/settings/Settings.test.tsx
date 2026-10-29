@@ -300,6 +300,7 @@ describe('Settings', () => {
     // Only the token, re-test, prune, CLI, removal, backup/restore, passphrase, anchor and forget
     // buttons stay on: core refuses ConfigReadOnly for what writes config.toml; the CLI install,
     // "Prepare for removal" and the M10 recovery tier act on the audit store and keychain only.
+    // The Help buttons (M16) only open the guide.
     for (const c of controls) {
       const name = c.textContent ?? '';
       // The degraded toggle is audit-authoritative, not a config.toml key: it stays on (PD-141).
@@ -309,7 +310,7 @@ describe('Settings', () => {
       const stays =
         degraded ||
         language ||
-        /token|Re-test|Prune backlog|CLI|full backup|Export the audit log|Back up now|Restore backup|recovery passphrase|anchor directory|Re-anchor|Forget/.test(
+        /token|Re-test|Prune backlog|CLI|full backup|Export the audit log|Back up now|Restore backup|recovery passphrase|anchor directory|Re-anchor|Forget|^Help$|^\?$/.test(
           name,
         );
       expect(c.matches(':disabled'), c.outerHTML).toBe(!stays);

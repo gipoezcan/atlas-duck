@@ -161,6 +161,28 @@ test("ui_page_without_link_fails", () => {
   assert.ok(has(f, "ui-links server: /nowhere is not a server page"), f.join("\n"));
 });
 
+// M16 T7: per-section "?" links of the desktop windows (`desktop_sections`, key `<label>/<section>`).
+test("ui_section_links_validated", () => {
+  const ok = run((i) => {
+    i.uiLinks.desktop_sections = { "approvals/queue": "index#intro" };
+  });
+  assert.deepEqual(ok, []);
+  const bad = run((i) => {
+    i.uiLinks.desktop_sections = {
+      "approvals/queue": "index#nope",
+      "approvals/other": "ghost#intro",
+      "nowhere/section": "index#intro",
+      approvals: "index#intro",
+      "approvals/x": "index",
+    };
+  });
+  assert.ok(has(bad, "ui-links desktop_sections: approvals/queue -> index#nope: no anchor nope"), bad.join("\n"));
+  assert.ok(has(bad, "ui-links desktop_sections: approvals/other -> ghost#intro: no page ghost in the desktop set"), bad.join("\n"));
+  assert.ok(has(bad, "ui-links desktop_sections: nowhere/section is not <window label>/<section>"), bad.join("\n"));
+  assert.ok(has(bad, "ui-links desktop_sections: approvals is not <window label>/<section>"), bad.join("\n"));
+  assert.ok(has(bad, "ui-links desktop_sections: approvals/x -> index is not page#anchor"), bad.join("\n"));
+});
+
 // ---------- links and placeholders ----------
 
 test("broken_internal_link_fails", () => {
