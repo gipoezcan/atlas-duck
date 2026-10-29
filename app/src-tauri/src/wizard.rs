@@ -143,6 +143,34 @@ pub const TEXT_RESTORE_COMMITTED_INCOMPLETE: T = T::new(
     "Die Wiederherstellung wird beim nächsten Start abgeschlossen. Beenden Sie atlas-duck und starten Sie es erneut.",
 );
 
+/// The audit store's refusals of a wizard anchor dir (`atlas_duck_audit::FIRST_RUN_ANCHOR_DIR_REFUSALS`,
+/// the store's English, shown by the page as `error.text`) in both languages (M15 T10).
+pub const ANCHOR_DIR_REFUSALS: [T; 6] = [
+    T::new(
+        "the anchor directory is not an absolute UTF-8 path",
+        "Das Anker-Verzeichnis ist kein absoluter UTF-8-Pfad",
+    ),
+    T::new(
+        "the anchor directory is not an absolute path",
+        "Das Anker-Verzeichnis ist kein absoluter Pfad",
+    ),
+    T::new(
+        "the anchor directory is not a directory",
+        "Das Anker-Verzeichnis ist kein Verzeichnis",
+    ),
+    T::new(
+        "the anchor directory cannot be read",
+        "Das Anker-Verzeichnis kann nicht gelesen werden",
+    ),
+    T::new(
+        "the anchor directory holds more chain files than a first run reads",
+        "Das Anker-Verzeichnis enthält mehr Ketten-Dateien, als eine Ersteinrichtung liest",
+    ),
+    T::new(
+        "a chain file in the anchor directory cannot be read",
+        "Eine Ketten-Datei im Anker-Verzeichnis kann nicht gelesen werden",
+    ),
+];
 /// The texts of this module, for [`crate::i18n::all`].
 pub const TEXTS: &[&T] = &[
     &TEXT_NEEDS_SECRET_SERVICE,
@@ -151,6 +179,12 @@ pub const TEXTS: &[&T] = &[
     &TEXT_PIN_WRITE_FAILED,
     &TEXT_ANCHOR_DIR_IN_DATA_DIR,
     &TEXT_RESTORE_COMMITTED_INCOMPLETE,
+    &ANCHOR_DIR_REFUSALS[0],
+    &ANCHOR_DIR_REFUSALS[1],
+    &ANCHOR_DIR_REFUSALS[2],
+    &ANCHOR_DIR_REFUSALS[3],
+    &ANCHOR_DIR_REFUSALS[4],
+    &ANCHOR_DIR_REFUSALS[5],
 ];
 
 /// How long the move of the setup window waits for Tauri to forget the old one.
@@ -590,7 +624,7 @@ pub fn pick_anchor_dir_dialog<R: Runtime>(app: &AppHandle<R>) -> Option<RustChos
     let chosen = app
         .dialog()
         .file()
-        .set_title(crate::recovery_tier::ANCHOR_DIR_DIALOG_TITLE)
+        .set_title(crate::recovery_tier::ANCHOR_DIR_DIALOG_TITLE.get(crate::windows::ui_lang(app)))
         .blocking_pick_folder()?;
     let folder = chosen.into_path().ok()?;
     Some(RustChosenPath::from_native_dialog(folder))
@@ -1680,6 +1714,16 @@ mod tests {
 
     use super::*;
 
+    /// M15 T10: the German table of the store's anchor-dir refusals is the store's own list.
+    #[test]
+    fn anchor_dir_refusals_cover_the_stores_list() {
+        let ours: Vec<&str> = ANCHOR_DIR_REFUSALS.iter().map(|t| t.en).collect();
+        assert_eq!(ours, atlas_duck_audit::FIRST_RUN_ANCHOR_DIR_REFUSALS);
+        assert_eq!(
+            crate::i18n::localize(crate::i18n::Lang::De, ANCHOR_DIR_IN_DATA_DIR),
+            TEXT_ANCHOR_DIR_IN_DATA_DIR.de
+        );
+    }
     fn facts(snapshot: &AppSnapshot) -> Facts<'_> {
         Facts {
             data_dir_known: true,

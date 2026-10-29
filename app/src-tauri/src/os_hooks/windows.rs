@@ -41,14 +41,28 @@ use std::time::{Duration, Instant};
 use atlas_duck_core::ShutdownReason;
 
 use super::{ShutdownPort, ShutdownTicket};
+use crate::i18n::T;
 
 /// plan text (M6 T29): the reason Windows shows while the app holds the shutdown back for a
 /// write on the wire.
-pub const BLOCK_REASON: &str = "atlas-duck is finishing an approved write";
+pub const BLOCK_REASON: &str = BLOCK.en;
+/// [`BLOCK_REASON`] in both languages (M15 T10).
+pub const BLOCK: T = T::new(
+    "atlas-duck is finishing an approved write",
+    "atlas-duck schließt einen freigegebenen Schreibvorgang ab",
+);
 /// The reason Windows shows while the app holds the shutdown back with no write on the wire (the
 /// rest of the path: the cancellations, `APP_STOP` and the store's shutdown). Plan text (M6 T29
 /// review wording, in no spec sentence; the lead's docs record it).
-pub const BLOCK_REASON_NO_WRITE: &str = "atlas-duck is saving its log before shutdown";
+pub const BLOCK_REASON_NO_WRITE: &str = BLOCK_NO_WRITE.en;
+/// [`BLOCK_REASON_NO_WRITE`] in both languages (M15 T10).
+pub const BLOCK_NO_WRITE: T = T::new(
+    "atlas-duck is saving its log before shutdown",
+    "atlas-duck sichert vor dem Herunterfahren sein Protokoll",
+);
+
+/// The texts of this module, for [`crate::i18n::all`].
+pub const TEXTS: &[&T] = &[&BLOCK, &BLOCK_NO_WRITE];
 /// How long a `WM_QUERYENDSESSION` answer waits for the path (below Windows' 5 s).
 pub const QUERY_WAIT: Duration = Duration::from_secs(4);
 /// How often the answer looks at the write on the wire while it waits.
@@ -89,10 +103,11 @@ pub trait ShutdownBlock {
 
 /// The block's text that is true now (see the module text).
 fn block_text(port: &dyn ShutdownPort) -> &'static str {
+    let lang = port.lang();
     if port.write_in_flight() {
-        BLOCK_REASON
+        BLOCK.get(lang)
     } else {
-        BLOCK_REASON_NO_WRITE
+        BLOCK_NO_WRITE.get(lang)
     }
 }
 

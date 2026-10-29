@@ -43,6 +43,7 @@ use crate::confirm::DialogConfirmer;
 use crate::credential::FirstRunPassphrase;
 use crate::credential::follow::AppWatcher;
 use crate::credential::raise::{RaiseGate, RaiseHandle, RaiseSink, TauriRaiseEnv};
+use crate::i18n::{Lang, T};
 use crate::os_hooks;
 use crate::script_glue::{InstanceSource, ScriptInputs};
 use crate::secret_service::{CachedSecretService, SecretServiceCheck};
@@ -136,6 +137,9 @@ pub struct ServeHooks {
     /// class that is final until a restart, unlike the I/O error of `fail_retry_open`).
     #[doc(hidden)]
     pub fail_retry_open_integrity: Option<Arc<AtomicU32>>,
+    /// M15 T10: the language of the native confirmations this state's flows show (the archive,
+    /// the restores). English by default; the app reads `AppState`.
+    pub lang: Arc<dyn Fn() -> Lang + Send + Sync>,
 }
 
 impl Default for ServeHooks {
@@ -149,6 +153,7 @@ impl Default for ServeHooks {
             fail_core_start: None,
             fail_retry_open: None,
             fail_retry_open_integrity: None,
+            lang: Arc::new(|| Lang::En),
         }
     }
 }
@@ -1118,15 +1123,25 @@ async fn run_blocking_unlock<T: Send + 'static>(
 
 /// plan text (T20, §8.7, §10.3): the native confirmation of "Archive old DB and start fresh";
 /// `<archived>` is the data dir's archive folder.
-pub const ARCHIVE_CONFIRM_TEXT: &str = "Archive this audit log and start a new one? audit.db (with its WAL) is moved to <archived> as audit-<chain_id>-<last record>-<time>.db; it is never deleted. Keep it for its remaining retention period: it can be read later only with its own recovery passphrase, through a restore. Next, a new audit log is set up with a new recovery passphrase, and every token must be entered again.";
+pub const ARCHIVE_CONFIRM_TEXT: &str = ARCHIVE_CONFIRM.en;
+/// [`ARCHIVE_CONFIRM_TEXT`] in both languages (M15 T10).
+pub const ARCHIVE_CONFIRM: T = T::new(
+    "Archive this audit log and start a new one? audit.db (with its WAL) is moved to <archived> as audit-<chain_id>-<last record>-<time>.db; it is never deleted. Keep it for its remaining retention period: it can be read later only with its own recovery passphrase, through a restore. Next, a new audit log is set up with a new recovery passphrase, and every token must be entered again.",
+    "Dieses Audit-Protokoll archivieren und ein neues beginnen? audit.db (mit seinem WAL) wird nach <archived> verschoben, als audit-<chain_id>-<letzter Datensatz>-<Zeit>.db; es wird nie gelöscht. Bewahren Sie es für seine restliche Aufbewahrungsfrist auf: Es lässt sich später nur mit seiner eigenen Wiederherstellungs-Passphrase über eine Wiederherstellung lesen. Danach wird ein neues Audit-Protokoll mit einer neuen Wiederherstellungs-Passphrase eingerichtet, und jedes Token muss erneut eingegeben werden.",
+);
+
+/// The texts of this module, for [`crate::i18n::all`].
+pub const TEXTS: &[&T] = &[&ARCHIVE_CONFIRM];
 
 /// The data-dir folder `audit::archive_and_start_fresh` moves a store into (its `ARCHIVE_DIR`).
 pub const ARCHIVED_DIR: &str = "archived";
 
 /// The archive confirmation text for `data`.
-pub fn archive_confirm_text(data: &LocalDataDir) -> String {
+pub fn archive_confirm_text(lang: Lang, data: &LocalDataDir) -> String {
     let dir = data.path().join(ARCHIVED_DIR);
-    ARCHIVE_CONFIRM_TEXT.replace("<archived>", &dir.display().to_string())
+    ARCHIVE_CONFIRM
+        .get(lang)
+        .replace("<archived>", &dir.display().to_string())
 }
 
 /// "Archive old DB and start fresh" (§8.7): a Rust-drawn native confirmation (§10.3), then the
@@ -1149,7 +1164,7 @@ pub async fn archive_and_start_fresh(state: &Arc<ServeState>) -> Result<Archived
     if state.keychain_lost().is_none() {
         return failed(UnlockFailure::NotLocked);
     }
-    let text = archive_confirm_text(&restart.opener.data);
+    let text = archive_confirm_text((state.hooks.lang)(), &restart.opener.data);
     let confirmer = restart.starter.confirmer.clone();
     // The dialog blocks until the user answers: never on the async runtime or the main thread.
     // The guard goes into that thread and comes back out of it, so a dropped caller leaves the
@@ -1231,9 +1246,10 @@ pub async fn restore_from_backup(
     let done = state.spawn_unlock_work(async move {
         let _one_restore_at_a_time = one;
         let (frozen, confirmer) = (st.clone(), starter.confirmer.clone());
+        let lang = (st.hooks.lang)();
         let restored = run_blocking_unlock(move || {
             let stop = || *lock(&frozen.frozen);
-            opener.restore_blocking(&*confirmer, pick, passphrase, &stop)
+            opener.restore_blocking(lang, &*confirmer, pick, passphrase, &stop)
         })
         .await;
         let (store, keys, report) = restored?;
@@ -1601,9 +1617,10 @@ pub async fn restore_first_store(
         restart.starter.confirmer.clone(),
         state.clone(),
     );
+    let lang = (state.hooks.lang)();
     let made = start_first_store(state, restart, one, move || {
         let stop = || *lock(&frozen.frozen);
-        opener.restore_first_blocking(&*confirmer, pick, passphrase, &stop, &pin)
+        opener.restore_first_blocking(lang, &*confirmer, pick, passphrase, &stop, &pin)
     })
     .await;
     match made {
@@ -2003,6 +2020,10 @@ pub fn start(
             .as_ref()
             .map_or_else(Arc::default, |s| s.keychain_prompt_flag()),
         scripts,
+        lang: {
+            let lang_app = app.clone();
+            Arc::new(move || crate::windows::ui_lang(&lang_app))
+        },
         ..ServeHooks::default()
     };
     let inputs = StartInputs {
@@ -2297,6 +2318,7 @@ impl Opener {
     /// and the report.
     fn restore_blocking(
         &self,
+        lang: Lang,
         confirmer: &dyn NativeConfirmer,
         pick: Box<dyn FnOnce() -> Option<RustChosenPath> + Send>,
         passphrase: AwaitPassphrase,
@@ -2318,7 +2340,7 @@ impl Opener {
             cfg
         };
         let (store, report) = crate::restore_flow::restore_without_store(
-            &self.data, &self.lock, &config, confirmer, pick, passphrase, stop,
+            lang, &self.data, &self.lock, &config, confirmer, pick, passphrase, stop,
         )?;
         Ok((store, keys, report))
     }
@@ -2390,6 +2412,7 @@ impl Opener {
     /// and after an archive `Opener::pinned_install_id` names the old store).
     fn restore_first_blocking(
         &self,
+        lang: Lang,
         confirmer: &dyn NativeConfirmer,
         pick: Box<dyn FnOnce() -> Option<RustChosenPath> + Send>,
         passphrase: AwaitPassphrase,
@@ -2400,24 +2423,25 @@ impl Opener {
         if atlas_duck_audit::live_store_blocks_restore(&self.data) {
             return Err(FirstStoreFailure::Restore(UnlockFailure::ArchiveFirst));
         }
-        let asked = ask_restore(confirmer, pick, passphrase, stop)
+        let asked = ask_restore(lang, confirmer, pick, passphrase, stop)
             .map_err(|n| FirstStoreFailure::Restore(not_asked_failure(n)))?;
         let (install_id, _chain_id, keys) = self.first_store_ids(pin)?;
         let config = || OpenConfig::new(Arc::new(SystemClock::new()), keys.clone());
-        let (store, report) =
-            match restore_asked(&self.data, &self.lock, &config, confirmer, &asked, stop) {
-                Ok(restored) => restored,
-                Err(UnlockFailure::CommittedIncomplete) => {
-                    // `audit.db` is the restored store under this install (its `RESTORE` row
-                    // names it): the pinned file names it too, so the next start cross-checks it
-                    // (PD-41) while it completes the restore (review I-1).
-                    pin_store_id(pin, &install_id);
-                    return Err(FirstStoreFailure::Restore(
-                        UnlockFailure::CommittedIncomplete,
-                    ));
-                }
-                Err(f) => return Err(FirstStoreFailure::Restore(f)),
-            };
+        let (store, report) = match restore_asked(
+            lang, &self.data, &self.lock, &config, confirmer, &asked, stop,
+        ) {
+            Ok(restored) => restored,
+            Err(UnlockFailure::CommittedIncomplete) => {
+                // `audit.db` is the restored store under this install (its `RESTORE` row
+                // names it): the pinned file names it too, so the next start cross-checks it
+                // (PD-41) while it completes the restore (review I-1).
+                pin_store_id(pin, &install_id);
+                return Err(FirstStoreFailure::Restore(
+                    UnlockFailure::CommittedIncomplete,
+                ));
+            }
+            Err(f) => return Err(FirstStoreFailure::Restore(f)),
+        };
         // The restore committed: the pinned file names the install the restored store keeps
         // (`RESTORE.install_id`, §8.11 step 3; L109).
         let first = FirstStore {

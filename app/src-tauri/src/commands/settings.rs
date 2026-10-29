@@ -44,7 +44,7 @@ use crate::cli_install::{
     self, APP_CHANGE_KEY, Artifact, Inputs, InstallError, Kind, Layout, PlatformOps, SystemOps,
 };
 use crate::credential::{self, PatOpenError};
-use crate::i18n::LangPref;
+use crate::i18n::{LangPref, T};
 use crate::recovery_tier;
 use crate::removal::{
     self, BackupAnswer, Choice, FinishAnswer, PluginAutostart, RemovalDto, RemovalError,
@@ -65,8 +65,11 @@ pub const HTTPS_REQUIRED_HINT: &str = "atlas-duck requires https; if your server
 /// few KiB); core parses it and shows every certificate before anything is trusted.
 pub const CA_MAX_BYTES: usize = 1 << 20;
 /// plan text (T25): the file dialog's title and filter.
-const CA_DIALOG_TITLE: &str = "Choose the custom CA certificate file (PEM)";
-const CA_FILTER: &str = "Certificates (PEM)";
+const CA_DIALOG_TITLE: T = T::new(
+    "Choose the custom CA certificate file (PEM)",
+    "Wählen Sie die Datei des eigenen CA-Zertifikats (PEM)",
+);
+const CA_FILTER: T = T::new("Certificates (PEM)", "Zertifikate (PEM)");
 const CA_EXTENSIONS: &[&str] = &["pem", "crt", "cer"];
 
 /// plan text (T25): a base URL is at most 2 048 bytes (core normalizes and rejects the rest).
@@ -1026,7 +1029,9 @@ pub async fn settings_apply<R: Runtime>(
             // M15 T7 (PD-297): the credential page has no `lang_changed` grant; it re-reads its
             // context (which carries the language) on the event it already listens to.
             crate::credential::context_changed(&app);
-            // M15 T10: the tray and the header's status lines are Rust's text: rebuilt now.
+            // M15 T10: the tray, the header's status lines and the window titles are Rust's text:
+            // rebuilt now.
+            crate::windows::retitle(&app, ui.lang);
             if let Some(state) = &state {
                 state.refresh_tray();
             }
@@ -1080,8 +1085,8 @@ fn pick_ca_file<R: Runtime>(app: &AppHandle<R>) -> Result<Vec<u8>, CommandError>
     let Some(chosen) = app
         .dialog()
         .file()
-        .set_title(CA_DIALOG_TITLE)
-        .add_filter(CA_FILTER, CA_EXTENSIONS)
+        .set_title(CA_DIALOG_TITLE.get(crate::windows::ui_lang(app)))
+        .add_filter(CA_FILTER.get(crate::windows::ui_lang(app)), CA_EXTENSIONS)
         .blocking_pick_file()
     else {
         return Err(CommandError::Admin(AdminError::Cancelled));
@@ -1266,7 +1271,13 @@ pub async fn prune_backlog_now<R: Runtime>(
 // ---------- "Prepare for removal" (§12.5, M6 T28) ----------
 
 /// plan text (T28): the title of the folder dialog the backup bundle is written into.
-const BACKUP_DIALOG_TITLE: &str = "Choose the folder for the atlas-duck backup";
+const BACKUP_DIALOG_TITLE: T = T::new(
+    "Choose the folder for the atlas-duck backup",
+    "Wählen Sie den Ordner für das Backup von atlas-duck",
+);
+
+/// The texts of this module, for [`crate::i18n::all`].
+pub const TEXTS: &[&T] = &[&CA_DIALOG_TITLE, &CA_FILTER, &BACKUP_DIALOG_TITLE];
 
 /// What the removal commands need of the serving core.
 struct Served {
@@ -1434,7 +1445,7 @@ pub(crate) fn pick_backup_folder<R: Runtime>(
     let Some(chosen) = app
         .dialog()
         .file()
-        .set_title(BACKUP_DIALOG_TITLE)
+        .set_title(BACKUP_DIALOG_TITLE.get(crate::windows::ui_lang(app)))
         .blocking_pick_folder()
     else {
         return Ok(None);
@@ -1465,6 +1476,7 @@ pub async fn removal_begin<R: Runtime>(
             served.confirmer,
             || removal_held_off(&app, &serving),
             retention,
+            crate::windows::ui_lang(&app),
         )
         .await
     }
@@ -1519,6 +1531,7 @@ pub async fn removal_finish<R: Runtime>(
             layout,
             fallback,
             || removal_held_off(&app, &serving),
+            crate::windows::ui_lang(&app),
         )
         .await
     }
@@ -1818,7 +1831,7 @@ fn pick_anchor_folder<R: Runtime>(
     let chosen = app
         .dialog()
         .file()
-        .set_title(recovery_tier::ANCHOR_DIR_DIALOG_TITLE)
+        .set_title(recovery_tier::ANCHOR_DIR_DIALOG_TITLE.get(crate::windows::ui_lang(app)))
         .blocking_pick_folder()?;
     let folder = chosen.into_path().ok()?;
     Some(RustChosenPath::from_native_dialog(folder))

@@ -11,6 +11,11 @@ use tauri::{AppHandle, Emitter, Runtime};
 /// The seam between the sink and Tauri: tests record instead of emitting.
 pub trait EventOut: Send + Sync {
     fn emit(&self, name: &str, payload: Value);
+    /// M15 T10: the language of the native dialogs a flow behind this sink shows (English unless
+    /// the app says otherwise; the tests' recorders stay English).
+    fn lang(&self) -> crate::i18n::Lang {
+        crate::i18n::Lang::En
+    }
 }
 
 impl<R: Runtime> EventOut for AppHandle<R> {
@@ -20,6 +25,10 @@ impl<R: Runtime> EventOut for AppHandle<R> {
         crate::commands::capture::event(self, name, &payload);
         // A failed emit (no webview, app closing) must not disturb the core.
         let _ = Emitter::emit(self, name, payload);
+    }
+
+    fn lang(&self) -> crate::i18n::Lang {
+        crate::windows::ui_lang(self)
     }
 }
 

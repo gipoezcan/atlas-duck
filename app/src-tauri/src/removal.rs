@@ -48,6 +48,7 @@ use crate::cli_install::{self, InstallError, Kind, Layout, PlatformOps};
 use crate::commands::CommandError;
 use crate::commands::audit::{ExportDoneDto, run_export};
 use crate::commands::settings::cli_uninstall_dto;
+use crate::i18n::{Lang, count};
 use crate::recovery_tier::DIALOG_LIST_MAX;
 use crate::ui_sink::EventOut;
 
@@ -751,7 +752,10 @@ pub fn export(
 /// whose token is deleted, each with whether the instance table knows the stored token's identity.
 /// Aliases are Rust-validated names (`A-Za-z0-9._-`, at most 64); no server text (no identity) is
 /// in the text. At most [`DIALOG_LIST_MAX`] are named, the rest counted (M10 T16 review M-10).
-pub fn begin_text(targets: &[(String, bool)]) -> String {
+pub fn begin_text(lang: Lang, targets: &[(String, bool)]) -> String {
+    if lang == Lang::De {
+        return begin_text_de(targets);
+    }
     let tokens = if targets.is_empty() {
         "No instance is set up, so no token is deleted.".to_owned()
     } else {
@@ -792,8 +796,60 @@ pub fn begin_text(targets: &[(String, bool)]) -> String {
     )
 }
 
+/// [`begin_text`] in German (M15 T10).
+fn begin_text_de(targets: &[(String, bool)]) -> String {
+    let tokens = if targets.is_empty() {
+        "Es ist keine Instanz eingerichtet, daher wird kein Token gelöscht.".to_owned()
+    } else {
+        let mut list = targets
+            .iter()
+            .take(DIALOG_LIST_MAX)
+            .map(|(alias, known)| {
+                if *known {
+                    alias.clone()
+                } else {
+                    format!("{alias} (Identität unbekannt)")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        if targets.len() > DIALOG_LIST_MAX {
+            list.push_str(&format!(
+                " und {} weitere",
+                count(Lang::De, (targets.len() - DIALOG_LIST_MAX) as u64)
+            ));
+        }
+        let unknown = if targets.iter().any(|(_, known)| !known) {
+            "Für eine Instanz mit \"Identität unbekannt\" ist keine Token-Identität verzeichnet: \
+             Ein für sie gespeichertes Token wird ebenfalls gelöscht, und der nächste Schritt \
+             führt sie auch auf (überspringen Sie sie dort, wenn sie nie ein Token hatte). "
+        } else {
+            ""
+        };
+        format!(
+            "Jedes für diese Instanzen gespeicherte Token wird gelöscht: {list}. {unknown}Ein \
+             gelöschtes Token bleibt auf dem Jira-/Confluence-Server gültig, bis Sie es dort \
+             widerrufen; der nächste Schritt führt jedes einzeln auf."
+        )
+    };
+    format!(
+        "atlas-duck für die Deinstallation vorbereiten?\n\n{tokens}\n\n\
+         Das Audit-Protokoll, seine Schlüssel und Anker bleiben erhalten, sodass das Protokoll \
+         prüfbar bleibt, bis seine Aufbewahrungsfrist abgelaufen ist."
+    )
+}
+
 /// plan text (M6 T28; the step is §12.5 step 3's): what `finish` asks.
-pub fn finish_text() -> String {
+pub fn finish_text(lang: Lang) -> String {
+    if lang == Lang::De {
+        return "Deinstallation abschließen?\n\n\
+                atlas-duck startet nicht mehr bei der Anmeldung, und sein Befehlszeilen-Starter \
+                wird entfernt (der PATH-Eintrag, der Link oder Wrapper, der Starter-Eintrag und \
+                cli.toml, soweit vorhanden). Ihre Antwort zu jedem Token (widerrufen oder \
+                übersprungen) wird im Audit-Protokoll aufgezeichnet.\n\n\
+                Das Audit-Protokoll, seine Schlüssel und Anker bleiben erhalten."
+            .to_owned();
+    }
     "Finish removal?\n\n\
      atlas-duck will stop starting at login, and its command-line launcher will be removed (the \
      PATH entry, link or wrapper, launcher entry and cli.toml, where they exist). Your answer for \
@@ -829,6 +885,7 @@ pub async fn begin(
     confirmer: Arc<dyn NativeConfirmer>,
     held_off: impl Fn() -> bool,
     retention: Retention,
+    lang: Lang,
 ) -> Result<RemovalDto, CommandError> {
     let _claim = state.claim()?;
     if held_off() {
@@ -860,7 +917,7 @@ pub async fn begin(
             (alias.clone(), known)
         })
         .collect();
-    confirmed(&confirmer, begin_text(&named)).await?;
+    confirmed(&confirmer, begin_text(lang, &named)).await?;
     // The dialog may have been up for minutes: a job that took the slot meanwhile holds it off.
     if held_off() {
         return Err(CommandError::Busy);
@@ -1120,6 +1177,7 @@ pub async fn finish(
     layout: Result<Layout, InstallError>,
     fallback: Option<Layout>,
     held_off: impl Fn() -> bool,
+    lang: Lang,
 ) -> Result<FinishAnswer, CommandError> {
     let _claim = state.claim()?;
     if held_off() {
@@ -1143,7 +1201,7 @@ pub async fn finish(
     // the dialog, and again after it (the user may take minutes; `begin` and the credential window
     // are held off by the claim, but a submit already under way is not).
     recheck_tokens(state, &instances).await?;
-    confirmed(&confirmer, finish_text()).await?;
+    confirmed(&confirmer, finish_text(lang)).await?;
     if held_off() {
         return Err(CommandError::Busy);
     }
@@ -1290,14 +1348,14 @@ mod tests {
 
     #[test]
     fn the_dialogs_say_what_goes_and_what_stays() {
-        let begin = begin_text(&[("a".into(), true), ("b".into(), true)]);
+        let begin = begin_text(Lang::En, &[("a".into(), true), ("b".into(), true)]);
         assert!(begin.contains("a, b"), "{begin}");
         assert!(begin.contains("stays valid"), "{begin}");
         assert!(
             begin.contains("audit log, its keys and anchors are kept"),
             "{begin}"
         );
-        let finish = finish_text();
+        let finish = finish_text(Lang::En);
         assert!(finish.contains("stop starting at login"), "{finish}");
         assert!(finish.contains("cli.toml"), "{finish}");
         assert!(
@@ -1449,7 +1507,7 @@ mod tests {
     /// does not claim a deletion. No identity (server text) is in the dialog.
     #[test]
     fn begin_dialog_names_unknown_identity() {
-        let text = begin_text(&[("ok".into(), true), ("lost".into(), false)]);
+        let text = begin_text(Lang::En, &[("ok".into(), true), ("lost".into(), false)]);
         assert!(text.contains("ok, lost (identity unknown)"), "{text}");
         assert!(
             text.contains("\"identity unknown\" has no token identity on record"),
@@ -1458,7 +1516,7 @@ mod tests {
         assert!(text.contains("the next step lists it as well"), "{text}");
         assert!(text.contains("stays valid"), "{text}");
         assert!(!text.contains('\u{201C}'), "no quoted identity: {text}");
-        let none = begin_text(&[]);
+        let none = begin_text(Lang::En, &[]);
         assert!(none.contains("No instance is set up"), "{none}");
         assert!(!none.contains("deleted:"), "{none}");
         assert!(
@@ -1477,7 +1535,7 @@ mod tests {
         if let Some(last) = targets.last_mut() {
             last.1 = false;
         }
-        let text = begin_text(&targets);
+        let text = begin_text(Lang::En, &targets);
         assert!(text.contains(&alias(DIALOG_LIST_MAX - 1)), "{text}");
         assert!(!text.contains(&alias(DIALOG_LIST_MAX)), "{text}");
         assert!(text.contains(" and 5 more."), "{text}");
@@ -1487,7 +1545,7 @@ mod tests {
             "{} characters",
             text.chars().count()
         );
-        let exactly = begin_text(&targets[..DIALOG_LIST_MAX]);
+        let exactly = begin_text(Lang::En, &targets[..DIALOG_LIST_MAX]);
         assert!(!exactly.contains("more"), "{exactly}");
     }
 

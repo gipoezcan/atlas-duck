@@ -3599,7 +3599,15 @@ mod settings_commands {
         st: &RemovalState,
         pat_window: bool,
     ) -> Result<RemovalDto, CommandError> {
-        removal::begin(st, h.instances(), h.confirmer().clone(), || pat_window, RET).await
+        removal::begin(
+            st,
+            h.instances(),
+            h.confirmer().clone(),
+            || pat_window,
+            RET,
+            atlas_duck_app_lib::i18n::Lang::En,
+        )
+        .await
     }
 
     async fn finish_with(
@@ -3618,6 +3626,7 @@ mod settings_commands {
             Ok(m.layout.clone()),
             None,
             || pat_window,
+            atlas_duck_app_lib::i18n::Lang::En,
         )
         .await
     }
@@ -4147,6 +4156,7 @@ mod settings_commands {
             layout,
             fallback,
             || false,
+            atlas_duck_app_lib::i18n::Lang::En,
         )
         .await
         .map_err(|e| format!("{e:?}"))?;
@@ -4714,6 +4724,7 @@ mod settings_commands {
             h.confirmer().clone(),
             held_after_dialog(),
             RET,
+            atlas_duck_app_lib::i18n::Lang::En,
         )
         .await;
         assert_eq!(res.err(), Some(CommandError::Busy));
@@ -4737,6 +4748,7 @@ mod settings_commands {
             Ok(m.layout.clone()),
             None,
             held_after_dialog(),
+            atlas_duck_app_lib::i18n::Lang::En,
         )
         .await;
         assert_eq!(res.err(), Some(CommandError::Busy));

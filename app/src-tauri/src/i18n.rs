@@ -42,6 +42,14 @@ pub fn all() -> impl Iterator<Item = &'static T> {
         crate::status::TEXTS,
         crate::startup::TEXTS,
         crate::wizard::TEXTS,
+        crate::windows::TEXTS,
+        crate::recovery_tier::TEXTS,
+        crate::restore_flow::TEXTS,
+        crate::commands::audit::TEXTS,
+        crate::commands::credential::TEXTS,
+        crate::commands::settings::TEXTS,
+        crate::os_hooks::windows::TEXTS,
+        crate::serve::TEXTS,
     ]
     .into_iter()
     .flatten()
@@ -49,7 +57,7 @@ pub fn all() -> impl Iterator<Item = &'static T> {
 }
 
 /// The placeholders a [`T`] may carry; [`localize`] fills them from the English text.
-const PLACEHOLDERS: [&str; 3] = ["<path>", "<host>", "<n>"];
+const PLACEHOLDERS: [&str; 4] = ["<path>", "<host>", "<n>", "<reason>"];
 
 /// `text` in `lang` when it is the English of one of [`all`] (`None` otherwise).
 pub fn localize_static(lang: Lang, text: &str) -> Option<&'static str> {
@@ -287,6 +295,37 @@ mod tests {
         );
     }
 
+    /// T10: the native confirmations in German, with values and plurals in place.
+    #[test]
+    fn dialog_texts_de() {
+        let set = crate::recovery_tier::anchor_dir_set_text(Lang::De, "D:\\anker", None, "c.jsonl");
+        assert!(set.starts_with("D:\\anker als Anker-Verzeichnis"), "{set}");
+        assert!(set.contains("c.jsonl"));
+        assert!(
+            crate::restore_flow::rollback_text(Lang::De, 1).contains("die letzten 1 Datensatz des")
+        );
+        assert!(
+            crate::restore_flow::rollback_text(Lang::De, 1234)
+                .contains("die letzten 1.234 Datensätze")
+        );
+        assert!(
+            crate::removal::begin_text(Lang::De, &[])
+                .starts_with("atlas-duck für die Deinstallation vorbereiten?")
+        );
+        assert!(crate::removal::finish_text(Lang::De).starts_with("Deinstallation abschließen?"));
+        assert_eq!(
+            crate::commands::audit::acknowledge_text(Lang::De, 7, "broken", "2026-10-29"),
+            "Integritätsvorfall 7 (broken, erkannt 2026-10-29) zur Kenntnis nehmen? Das rote \
+             Banner verschwindet für diesen Vorfall."
+        );
+        let keys: Vec<String> = (0..21).map(|i| format!("k{i}")).collect();
+        assert!(
+            crate::recovery_tier::forget_keys_text(Lang::De, "id", &keys)
+                .contains(" und 1 weitere")
+        );
+        // English is what it was.
+        assert!(crate::removal::finish_text(Lang::En).starts_with("Finish removal?"));
+    }
     #[test]
     fn counts_group_in_german_only() {
         assert_eq!(count(Lang::En, 1_234_567), "1234567");

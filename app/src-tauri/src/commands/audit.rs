@@ -41,22 +41,38 @@ use tauri::{AppHandle, Manager, Runtime};
 
 use super::dto::{Args, refuse};
 use super::{AuditReadFailure, CommandError, ExportFailure, blocking, core, finish};
+use crate::i18n::{Lang, T};
 use crate::removal::{self, BackupAnswer, RemovalState};
 use crate::serve::{AuditJobKind, JobRefused, ServeState};
 use crate::state::ServeSlot;
 use crate::ui_sink::{EventOut, emit_audit_changed, emit_audit_job, emit_status_changed};
 
 /// plan text (PD-161): the native warning before the export's folder dialog.
-pub const EXPORT_WARNING_TEXT: &str = "The export contains decrypted audit payloads. Any program \
-     running as your user can read these files. Exports and backups are outside retention and \
-     crypto-shredding: you are responsible for keeping and deleting them.";
+pub const EXPORT_WARNING_TEXT: &str = EXPORT_WARNING.en;
+/// [`EXPORT_WARNING_TEXT`] in both languages (M15 T10).
+pub const EXPORT_WARNING: T = T::new(
+    "The export contains decrypted audit payloads. Any program running as your user can read these files. Exports and backups are outside retention and crypto-shredding: you are responsible for keeping and deleting them.",
+    "Der Export enthält entschlüsselte Audit-Nutzdaten. Jedes Programm, das unter Ihrem Benutzer läuft, kann diese Dateien lesen. Exporte und Backups liegen außerhalb von Aufbewahrung und Crypto-Shredding: Sie sind dafür verantwortlich, sie aufzubewahren und zu löschen.",
+);
 /// The title of the export's folder dialog.
-const EXPORT_DIALOG_TITLE: &str = "Choose the folder for the atlas-duck export";
+const EXPORT_DIALOG_TITLE: T = T::new(
+    "Choose the folder for the atlas-duck export",
+    "Wählen Sie den Ordner für den Export von atlas-duck",
+);
+
+/// The texts of this module, for [`crate::i18n::all`].
+pub const TEXTS: &[&T] = &[&EXPORT_WARNING, &EXPORT_DIALOG_TITLE];
 /// PD-180: an acknowledgement's note is at most 1 000 characters.
 pub const NOTE_MAX_CHARS: usize = 1_000;
 
 /// PD-180 (plan text): the acknowledgement's native confirmation, from the record's facts.
-pub fn acknowledge_text(verify_seq: u64, result: &str, detected_at: &str) -> String {
+pub fn acknowledge_text(lang: Lang, verify_seq: u64, result: &str, detected_at: &str) -> String {
+    if lang == Lang::De {
+        return format!(
+            "Integritätsvorfall {verify_seq} ({result}, erkannt {detected_at}) zur Kenntnis \
+             nehmen? Das rote Banner verschwindet für diesen Vorfall."
+        );
+    }
     format!(
         "Acknowledge integrity incident {verify_seq} ({result}, detected {detected_at})? The red \
          banner is cleared for this incident."
@@ -226,7 +242,13 @@ pub fn acknowledge_dto(
         return Err(CommandError::NotFound);
     }
     let (result, detected_at) = incident_facts(store, verify_seq)?;
-    if confirmer.confirm(&acknowledge_text(verify_seq, &result, &detected_at)) != Confirm::Ok {
+    if confirmer.confirm(&acknowledge_text(
+        out.lang(),
+        verify_seq,
+        &result,
+        &detected_at,
+    )) != Confirm::Ok
+    {
         return Err(CommandError::Cancelled);
     }
     match store.acknowledge_incident(verify_seq, os_user, note) {
@@ -259,7 +281,7 @@ pub fn run_export(
 ) -> Result<ExportDoneDto, CommandError> {
     use std::sync::atomic::Ordering;
     let job = AuditJobKind::Export;
-    if confirmer.confirm(EXPORT_WARNING_TEXT) != Confirm::Ok {
+    if confirmer.confirm(EXPORT_WARNING.get(out.lang())) != Confirm::Ok {
         return Err(CommandError::Cancelled);
     }
     if cancel.load(Ordering::SeqCst) {
@@ -365,7 +387,7 @@ pub(crate) fn pick_export_folder<R: Runtime>(app: &AppHandle<R>) -> Option<RustC
     let chosen = app
         .dialog()
         .file()
-        .set_title(EXPORT_DIALOG_TITLE)
+        .set_title(EXPORT_DIALOG_TITLE.get(crate::windows::ui_lang(app)))
         .blocking_pick_folder()?;
     let path = chosen.into_path().ok()?;
     Some(RustChosenPath::from_native_dialog(path))

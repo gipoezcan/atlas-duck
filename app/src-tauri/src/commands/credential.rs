@@ -23,7 +23,7 @@ use zeroize::Zeroize;
 use super::dto::{Args, refuse};
 use super::{CommandError, blocking, finish};
 use crate::credential::{self, FirstRunPassphrase, NoteFacts, PatTarget, Purpose};
-use crate::i18n::Lang;
+use crate::i18n::{Lang, T};
 use crate::serve::{self, ServeState, UnlockKind};
 use crate::state::{AppState, ServeSlot};
 use crate::windows::{self, Label, Show, WindowError};
@@ -596,7 +596,13 @@ pub async fn submit_secret<R: Runtime>(
 }
 
 /// plan text (T20): the save dialog's title and file-type filter.
-const NOTE_DIALOG_TITLE: &str = "Save the atlas-duck recovery note";
+const NOTE_DIALOG_TITLE: T = T::new(
+    "Save the atlas-duck recovery note",
+    "Wiederherstellungsnotiz von atlas-duck speichern",
+);
+
+/// The texts of this module, for [`crate::i18n::all`].
+pub const TEXTS: &[&T] = &[&NOTE_DIALOG_TITLE];
 const NOTE_FILTER: &str = "Text";
 
 /// `save_recovery_note {}` (§8.6, §10.3): after the first-run passphrase went to the wizard and
@@ -626,7 +632,7 @@ fn pick_note_file<R: Runtime>(
     let Some(chosen) = app
         .dialog()
         .file()
-        .set_title(NOTE_DIALOG_TITLE)
+        .set_title(NOTE_DIALOG_TITLE.get(crate::windows::ui_lang(app)))
         .set_file_name(credential::NOTE_FILE_NAME)
         .add_filter(NOTE_FILTER, &["txt"])
         .blocking_save_file()
