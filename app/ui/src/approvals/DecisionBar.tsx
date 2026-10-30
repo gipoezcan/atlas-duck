@@ -80,6 +80,18 @@ export function cardOf(preview: Preview, t: Dict = en): Card {
   };
 }
 
+/** "keys: action" with the keys in a `<kbd>`; the text (and so the accessible name) is unchanged. */
+function legendEntry(line: string): ReactNode {
+  const at = line.indexOf(': ');
+  if (at < 0) return line;
+  return (
+    <>
+      <kbd>{line.slice(0, at)}</kbd>
+      {line.slice(at)}
+    </>
+  );
+}
+
 interface DecisionBarProps {
   /** The opened revision's card; null when nothing is opened (Deny may still be offered). */
   card: Card | null;
@@ -153,9 +165,9 @@ export function DecisionBar({
       </div>
       {denyDialog}
       <ul className="keyboard-legend" aria-label={t.approvals.keyboard.legend_label}>
-        <li id={legendId}>{t.approvals.keyboard.approve}</li>
-        <li>{t.approvals.keyboard.deny}</li>
-        <li>{t.approvals.keyboard.navigate}</li>
+        <li id={legendId}>{legendEntry(t.approvals.keyboard.approve)}</li>
+        <li>{legendEntry(t.approvals.keyboard.deny)}</li>
+        <li>{legendEntry(t.approvals.keyboard.navigate)}</li>
       </ul>
     </>
   );

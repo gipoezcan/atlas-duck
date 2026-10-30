@@ -89,7 +89,7 @@ export const approvals = {
     similar_request: 'similar request',
     select_session: 'select all from session',
     select_item: 'select',
-    open: 'Open',
+    open: 'Review',
     session: 'Session',
     of_session: 'session',
     load_failed: 'Could not load the queue',

@@ -76,7 +76,7 @@ describe('the approvals window in German (M15 T5)', () => {
     expect(screen.getByRole('button', { name: de.approvals.detail.approve })).toBeTruthy();
     expect(screen.getByRole('button', { name: de.approvals.detail.deny })).toBeTruthy();
     expect(screen.queryByRole('button', { name: en.approvals.detail.approve })).toBeNull();
-    expect(screen.getByText(de.approvals.keyboard.approve)).toBeTruthy();
+    expect(screen.getByText((_, el) => el?.tagName === 'LI' && el.textContent === de.approvals.keyboard.approve)).toBeTruthy();
   });
 
   it('the_request_tab_shows_the_submitted_date_in_the_language', async () => {

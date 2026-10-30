@@ -624,7 +624,7 @@ describe('the window', () => {
   });
 
   async function open(id: string) {
-    fireEvent.click(screen.getByRole('button', { name: `Open jira.issue.get T-${id}` }));
+    fireEvent.click(screen.getByRole('button', { name: `Review jira.issue.get T-${id}` }));
     await flush();
     advance(INERT_MS);
   }

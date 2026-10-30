@@ -12,8 +12,10 @@ use axum::body::Body;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
-/// PD-220.
-pub const CSP: &str = "default-src 'self'; frame-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+/// PD-220. `style-src` also admits `preview.css` by its hash: the sandboxed `srcdoc` preview frame
+/// inherits this policy, so without it the preview document's inline stylesheet is blocked
+/// (the desktop policy carries the same hash, `ci/check-csp.mjs`).
+pub const CSP: &str = "default-src 'self'; frame-src 'self'; script-src 'self'; style-src 'self' 'sha256-QjDb0ujXyJk4o6e18x54ga50tEBTqHBD+DgAUfAsG7I='; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
 /// URL path → HTML file of the server build.
 pub const PAGES: [(&str, &str); 10] = [

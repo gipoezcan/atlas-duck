@@ -209,35 +209,27 @@ function ItemRow({
   const t = useText();
   return (
     <div className="queue-item" aria-current={current ? 'true' : undefined}>
+      <input
+        type="checkbox"
+        aria-label={`${t.approvals.queue.select_item} ${item.op_id} ${item.target_display}`}
+        checked={checked}
+        onChange={(e) => onToggle(e.currentTarget.checked)}
+      />
+      <div className="queue-lines">
       <div className="queue-line">
-        <input
-          type="checkbox"
-          aria-label={`${t.approvals.queue.select_item} ${item.op_id} ${item.target_display}`}
-          checked={checked}
-          onChange={(e) => onToggle(e.currentTarget.checked)}
-        />
-        <AgentText value={item.agent_name ?? t.approvals.queue.no_agent_name} unusual={item.unusual} />
         <span className="op-id">{item.op_id}</span>
+        <span className="class">{own(t.approvals.class_labels, item.class) ?? item.class}</span>
         <span className="alias">{item.instance_alias}</span>
         <span className="target">{item.target_display}</span>
-        <span className="class">{own(t.approvals.class_labels, item.class) ?? item.class}</span>
-        {onOpen === undefined ? null : (
-          <button
-            type="button"
-            aria-label={`${t.approvals.queue.open} ${item.op_id} ${item.target_display}`}
-            onClick={() => onOpen(item.request_id)}
-          >
-            {t.approvals.queue.open}
-          </button>
-        )}
+        <span className="age">{formatAge(item.age_s, t)}</span>
       </div>
       <div className="queue-line">
+        <AgentText value={item.agent_name ?? t.approvals.queue.no_agent_name} unusual={item.unusual} />
         {item.reason_excerpt === null || item.reason_excerpt === '' ? (
           <Badge label={t.approvals.queue.no_reason} />
         ) : (
           <AgentText value={item.reason_excerpt} unusual={item.unusual} />
         )}
-        <span className="age">{formatAge(item.age_s, t)}</span>
       </div>
       <div className="queue-line queue-flags">
         {item.stale ? <Badge label={t.approvals.queue.stale} tone="caution" /> : null}
@@ -263,6 +255,20 @@ function ItemRow({
           </span>
         )}
       </div>
+      </div>
+      {onOpen === undefined ? null : (
+        <button
+          type="button"
+          className="queue-open"
+          aria-label={`${t.approvals.queue.open} ${item.op_id} ${item.target_display}`}
+          onClick={() => onOpen(item.request_id)}
+        >
+          {t.approvals.queue.open}
+          <svg aria-hidden="true" focusable="false" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M9 6l6 6-6 6" />
+          </svg>
+        </button>
+      )}
     </div>
   );
 }

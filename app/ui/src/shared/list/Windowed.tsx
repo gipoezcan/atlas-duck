@@ -7,7 +7,7 @@ interface WindowedProps<T> {
   render: (row: T, index: number) => ReactNode;
   /** Stable identity of a row, so focus follows the row when the list changes. Defaults to the index. */
   rowKey?: (row: T, index: number) => string | number;
-  /** Viewport height in px. */
+  /** Maximum viewport height in px; a shorter list shrinks to its rows. */
   height?: number;
   /** Rows rendered beyond each edge of the viewport. */
   overscan?: number;
@@ -24,10 +24,12 @@ export function Windowed<T>({
   rowHeight,
   render,
   rowKey,
-  height = 480,
+  height: maxHeight = 480,
   overscan = 5,
   label,
 }: WindowedProps<T>) {
+  // A short list is only as tall as its rows, so a near-empty queue leaves no blank box.
+  const height = Math.min(maxHeight, Math.max(rowHeight, rows.length * rowHeight));
   const [top, setTop] = useState(0);
   const first = Math.max(0, Math.floor(top / rowHeight) - overscan);
   const last = Math.min(rows.length, Math.ceil((top + height) / rowHeight) + overscan);
