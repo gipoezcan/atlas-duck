@@ -71,8 +71,8 @@ export function InstanceForm({
   };
 
   return (
-    <section aria-label={t.settings.add_heading}>
-      <Heading>{t.settings.add_heading}</Heading>
+    <section id={headingLevel === 3 ? undefined : 'settings-add-instance'} aria-label={t.settings.add_heading}>
+      <Heading tabIndex={-1}>{t.settings.add_heading}</Heading>
       <Guard disabled={readOnly}>
       <label>
         {t.settings.add_alias}

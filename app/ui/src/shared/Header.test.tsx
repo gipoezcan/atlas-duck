@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { Header } from './Header';
@@ -21,7 +21,7 @@ describe('Header', () => {
       level: l.level === 'caution' ? 'caution' : 'info',
     }));
     render(<Header lines={lines} />);
-    const items = screen.getAllByRole('listitem');
+    const items = within(screen.getByRole('list', { name: 'Status' })).getAllByRole('listitem');
     expect(items).toHaveLength(statusLines.length);
     expect(items[0]?.textContent).toMatch(/^Caution: Locked/);
     expect(items[1]?.textContent).toBe('Info: 2 need attention');
@@ -38,7 +38,7 @@ describe('Header', () => {
     expect(line?.text).toBe(text);
     expect(line?.level).toBe('caution');
     render(<Header lines={[{ id, text, level: 'caution' }]} />);
-    expect(screen.getByRole('listitem').textContent).toBe(`Caution: ${text}`);
+    expect(within(screen.getByRole('list', { name: 'Status' })).getByRole('listitem').textContent).toBe(`Caution: ${text}`);
   });
 
   it('buttons_call_open_window_and_quit', () => {
@@ -61,5 +61,17 @@ describe('Header', () => {
     render(<Header lines={[]} />);
     fireEvent.click(screen.getByRole('button', { name: 'Help' }));
     expect(helpOpen).toHaveBeenCalledWith('approvals', 'queue');
+  });
+});
+
+describe('Header app bar (M17)', () => {
+  it('has_a_skip_link_first_and_the_nav_as_a_list', () => {
+    render(<Header lines={[]} />);
+    const skip = screen.getByRole('link', { name: 'Skip to main content' });
+    expect(skip.getAttribute('href')).toBe('#main');
+    expect(skip.className).toBe('skip-link');
+    const nav = screen.getByRole('navigation', { name: 'Windows' });
+    expect(nav.querySelectorAll('ul.nav-list > li')).toHaveLength(4);
+    expect(screen.getByRole('button', { name: 'Quit' }).closest('.app-bar-tools')).not.toBeNull();
   });
 });

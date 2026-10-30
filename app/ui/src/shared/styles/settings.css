@@ -1,7 +1,7 @@
 /* The Settings window (M11 T7). Sections are cards (layout.css). */
 @media (min-width: 64rem) {
   .window-settings {
-    max-width: 72rem;
+    max-width: 76rem;
   }
 }
 
@@ -10,12 +10,8 @@
 
 /* Instances table: not in a section, so its scroll wrapper gets the card look. The 8 columns keep a
    minimum width and scroll sideways in a narrow window instead of squeezing. */
-.window-settings > .table-scroll {
+.window-settings .table-scroll {
   margin-bottom: var(--space-4);
-  overflow-x: auto;
-  background: var(--surface);
-  border-radius: var(--radius-lg);
-  box-shadow: 0 0 0 1px var(--border);
 }
 .table-scroll > table.instances {
   min-width: 56rem;
@@ -27,7 +23,7 @@
   text-align: start;
   font-size: var(--text-lg);
   font-weight: var(--weight-bold);
-  padding: var(--space-3) var(--space-3) var(--space-2);
+  padding: var(--space-4) var(--space-4) var(--space-2);
 }
 .instances td p { margin: var(--space-1) 0 0; }
 .instances tr.url-change td { background: var(--warning-subtle); }

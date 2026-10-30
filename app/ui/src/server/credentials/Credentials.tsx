@@ -108,15 +108,16 @@ export function Credentials() {
   };
 
   return (
-    <main className="window window-credentials">
+    <main id="main" tabIndex={-1} className="window window-credentials">
       <h1>{t.server.credentials.title}</h1>
-      <p>{t.server.credentials.intro}</p>
+      <p className="page-lead">{t.server.credentials.intro}</p>
       {notice !== null ? <p role="status" className="notice notice-info">{notice}</p> : null}
       {failed ? <p role="alert" className="notice notice-danger">{t.server.credentials.load_failed}</p> : null}
       {rows === null && !failed ? <p role="status" className="notice notice-info">{t.server.credentials.loading}</p> : null}
       {rows !== null && rows.length === 0 ? <p>{t.server.credentials.none_configured}</p> : null}
       {rows !== null && rows.length > 0 ? (
-        <table>
+        <div className="table-scroll">
+<table aria-label={t.server.credentials.title}>
           <thead>
             <tr>
               <th scope="col">{t.server.credentials.col_instance}</th>
@@ -167,6 +168,7 @@ export function Credentials() {
             ))}
           </tbody>
         </table>
+</div>
       ) : null}
     </main>
   );

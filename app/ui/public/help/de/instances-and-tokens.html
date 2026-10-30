@@ -3,15 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Instanzen und Tokens - Atlas Duck Hilfe</title>
+<title>Instanzen und Tokens - atlas-duck Benutzerhandbuch</title>
 <link rel="stylesheet" href="assets/help.css">
 <script src="assets/search-index.js" defer></script>
 <script src="assets/help.js" defer></script>
 </head>
 <body>
+<a class="skip-link" href="#content">Zum Inhalt springen</a>
 <header class="bar">
-<a class="brand" href="index.html">Atlas Duck Hilfe</a>
-<div class="search" hidden>
+<a class="brand" href="index.html">atlas-duck <span class="brand-sub">Benutzerhandbuch</span></a>
+<div class="search" role="search" hidden>
 <label class="visually-hidden" for="help-search">Hilfe durchsuchen</label>
 <input id="help-search" type="search" placeholder="Hilfe durchsuchen" autocomplete="off" data-empty="Keine Treffer">
 <ul id="help-results" hidden></ul>
@@ -41,12 +42,12 @@
 <li><a href="error-reference.html">Fehlerreferenz</a></li>
 </ul>
 </nav>
-<main>
+<main id="content" tabindex="-1">
 <h1>Instanzen und Tokens</h1>
 <h2 id="instances">Instanzen</h2>
 <p>Eine Instanz ist ein Jira- oder Confluence-Data-Center-Server, mit dem atlas-duck spricht. Sie ist unter einem Alias bekannt, zum Beispiel dem Kurznamen des Servers.</p>
 <p>Im Desktopmodus legen Sie Ihre eigenen Instanzen an. Die Einstellungen listen sie unter &quot;Instanzen&quot; auf:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Spalte</th><th>Inhalt</th></tr></thead>
 <tbody>
 <tr><td>Alias</td><td>Der Name, den Sie der Instanz gegeben haben.</td></tr>
@@ -56,9 +57,9 @@
 <tr><td>Ausführung als</td><td>Der Atlassian-Benutzer, zu dem Ihr Token gehört.</td></tr>
 <tr><td>Token-Ablauf</td><td>Das Ablaufdatum, falls Sie eines eingegeben haben.</td></tr>
 <tr><td>Proxy</td><td>Der Proxy dieser Instanz oder &quot;Systemeinstellung oder keiner&quot;.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Der Status zeigt, ob die Instanz verwendbar ist:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Status</th><th>Bedeutung</th></tr></thead>
 <tbody>
 <tr><td>in Ordnung</td><td>Bereit.</td></tr>
@@ -67,7 +68,7 @@
 <tr><td>unsicheres Schema (http)</td><td>Die URL beginnt mit http. atlas-duck verlangt https. Verwendet Ihr Server eine interne CA, fügen Sie sie als eigene CA der Instanz hinzu.</td></tr>
 <tr><td>Identitäts-Header fehlt</td><td>&quot;X-AUSERNAME wurde nicht empfangen, möglicherweise von einem Reverse-Proxy vor Jira entfernt; wenden Sie sich an die Jira-Administration&quot;.</td></tr>
 <tr><td>Identitäts-Header stimmt nicht überein</td><td>Der Header X-AUSERNAME passt nicht zum Benutzer des Tokens.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <h2 id="add-instance">Instanz hinzufügen</h2>
 <p>Öffnen Sie die Einstellungen, &quot;Instanz hinzufügen&quot; (das Einrichtungsfenster hat dasselbe Formular), und füllen Sie aus:</p>
 <ul>
@@ -87,7 +88,7 @@
 <li>&quot;Gespeichertes Token erneut prüfen&quot; fragt den Server noch einmal. Die Antwort lautet &quot;Verbunden als ...&quot; oder &quot;Die erneute Prüfung ist fehlgeschlagen:&quot; mit dem Grund.</li>
 </ul>
 <p>Wenn Sie ein Token speichern, testet atlas-duck es zuerst gegen die Instanz. Das sind die Gründe für eine Ablehnung:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Grund</th><th>Was Sie tun können</th></tr></thead>
 <tbody>
 <tr><td>Der Server hat das Token zurückgewiesen (401).</td><td>Prüfen Sie, ob es ein gültiges persönliches Zugriffstoken ist, das nicht abgelaufen ist.</td></tr>
@@ -96,7 +97,7 @@
 <tr><td>Ein Proxy hat die Verbindung blockiert oder verändert.</td><td>Prüfen Sie die Proxy-Einstellungen.</td></tr>
 <tr><td>Der Server war nicht erreichbar.</td><td>Versuchen Sie es später erneut.</td></tr>
 <tr><td>Die Serverversion liegt unter dem Minimum, das atlas-duck unterstützt.</td><td>Die Instanz muss aktualisiert werden.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <h2 id="token-storage">Wo Tokens gespeichert werden</h2>
 <p>Ihre Tokens liegen im Schlüsselbund des Betriebssystems dieses Computers. atlas-duck zeigt ein gespeichertes Token nie wieder an. Backups enthalten nie Tokens: Nach einer Wiederherstellung braucht jede Instanz ihr Token erneut. &quot;Auf die Entfernung vorbereiten&quot; in den Einstellungen löscht die gespeicherten Tokens und bittet Sie dann, jedes Token auf seinem Server zu widerrufen.</p>
 <p>Tokens geben Zugriff auf Jira und Confluence in Ihrem Namen. Erneuern Sie sie regelmäßig und widerrufen Sie ein Token auf seinem Server, wenn Sie es nicht mehr brauchen.</p>

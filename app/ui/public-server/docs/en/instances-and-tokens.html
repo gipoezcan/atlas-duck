@@ -3,15 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Instances and tokens - Atlas Duck Help</title>
+<title>Instances and tokens - atlas-duck User guide</title>
 <link rel="stylesheet" href="assets/help.css">
 <script src="assets/search-index.js" defer></script>
 <script src="assets/help.js" defer></script>
 </head>
 <body>
+<a class="skip-link" href="#content">Skip to the content</a>
 <header class="bar">
-<a class="brand" href="/docs/en/">Atlas Duck Help</a>
-<div class="search" hidden>
+<a class="brand" href="/docs/en/">atlas-duck <span class="brand-sub">User guide</span></a>
+<div class="search" role="search" hidden>
 <label class="visually-hidden" for="help-search">Search help</label>
 <input id="help-search" type="search" placeholder="Search help" autocomplete="off" data-empty="No results">
 <ul id="help-results" hidden></ul>
@@ -43,7 +44,7 @@
 <li><a href="/docs/en/error-reference">Error reference</a></li>
 </ul>
 </nav>
-<main>
+<main id="content" tabindex="-1">
 <h1>Instances and tokens</h1>
 <h2 id="instances">Instances</h2>
 <p>An instance is one Jira or Confluence Data Center server that atlas-duck talks to. It is known by an alias, for example the short name of the server.</p>
@@ -54,7 +55,7 @@
 <p>atlas-duck always acts as you, with your own personal access token (PAT), never with a shared service account. Create the token in Jira or Confluence (Profile → Personal Access Tokens) and give it only the permissions your work needs. Whatever the token may not do in Jira or Confluence, an agent cannot do either.</p>
 <p>Enter the token on the <a href="#credentials-page">Credentials page</a>.</p>
 <p>When you store a token, atlas-duck first tests it against the instance. These are the reasons for a refusal:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Reason</th><th>What to do</th></tr></thead>
 <tbody>
 <tr><td>The server rejected the token (401).</td><td>Check that it is a valid personal access token that has not expired.</td></tr>
@@ -63,19 +64,19 @@
 <tr><td>A proxy blocked or changed the connection.</td><td>Check the proxy settings.</td></tr>
 <tr><td>The server could not be reached.</td><td>Try again later.</td></tr>
 <tr><td>The server version is below the minimum atlas-duck supports.</td><td>The instance has to be upgraded.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <h2 id="token-storage">Where tokens are stored</h2>
 <p>Your tokens are stored on the server, encrypted at rest with the server's master key. Operators who have access to that key can decrypt every stored token, so treat the server's key material as you would the tokens themselves. atlas-duck never shows a stored token again. Your tokens are deleted at once if your account is deactivated, and when an admin removes an instance, every user's token for it is deleted.</p>
 <p>Tokens give access to Jira and Confluence in your name. Rotate them regularly, and revoke a token on its server when you no longer need it.</p>
 <h2 id="credentials-page">The credentials page</h2>
 <p>&quot;Credentials&quot; in the header lists every instance with its product, URL and token state:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>State</th><th>Meaning</th></tr></thead>
 <tbody>
 <tr><td>No token</td><td>You have not stored one.</td></tr>
 <tr><td>Token stored</td><td>The token works. The row shows the Atlassian user, for example &quot;as jdoe&quot;.</td></tr>
 <tr><td>Token stored, not usable</td><td>The stored token does not work any more. Replace it.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Use &quot;Add token&quot; or &quot;Replace token&quot;, enter the token in &quot;Personal access token for <em>alias</em>&quot; and choose &quot;Check and save&quot;. &quot;Remove&quot; deletes your token for that instance after a confirmation. atlas-duck never shows a stored token.</p>
 <p>Errors you may see: &quot;The instance refused this token. Check it and try again.&quot;; &quot;This token belongs to another Atlassian user. Remove the stored token first.&quot;; &quot;This instance cannot be used right now. Ask an admin.&quot;; &quot;The instance cannot be reached. Try again later.&quot;; &quot;This instance no longer exists.&quot;; &quot;The token is empty or too long.&quot;</p>
 </main>

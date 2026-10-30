@@ -3,15 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Error reference - Atlas Duck Help</title>
+<title>Error reference - atlas-duck User guide</title>
 <link rel="stylesheet" href="assets/help.css">
 <script src="assets/search-index.js" defer></script>
 <script src="assets/help.js" defer></script>
 </head>
 <body>
+<a class="skip-link" href="#content">Skip to the content</a>
 <header class="bar">
-<a class="brand" href="/docs/en/">Atlas Duck Help</a>
-<div class="search" hidden>
+<a class="brand" href="/docs/en/">atlas-duck <span class="brand-sub">User guide</span></a>
+<div class="search" role="search" hidden>
 <label class="visually-hidden" for="help-search">Search help</label>
 <input id="help-search" type="search" placeholder="Search help" autocomplete="off" data-empty="No results">
 <ul id="help-results" hidden></ul>
@@ -43,7 +44,7 @@
 </li>
 </ul>
 </nav>
-<main>
+<main id="content" tabindex="-1">
 <h1>Error reference</h1>
 <h2 id="errors-envelope">Errors of the command line and agents</h2>
 <p>Every failed request of an agent carries an <code>error</code> object with a <code>code</code>, a <code>retryable</code> flag and a message. The code tells you what went wrong. The flag tells the agent whether sending the same request again can work. Agents should decide on <code>status</code>, <code>error.code</code> and <code>error.retryable</code> together, not on the exit code alone.</p>
@@ -66,7 +67,7 @@
 <p>atlas-duck limits how many connections and open requests it accepts, in total, per program and per agent session, so that no single agent can flood the queue. One of these limits is reached. Nothing was queued. Exit 11, retryable after the time that <code>retry_after_s</code> names. Waiting does not help when the limit on pending requests is the cause: decide or deny the pending requests first, for example with &quot;Deny all pending from this session&quot;. Then try again.</p>
 <h3 id="err-unreachable"><code>unreachable</code></h3>
 <p>The command line could not reach the app. Except for <code>connection_lost</code>, nothing was queued and the exit code is 5. The <code>details.reason</code> says why:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Reason</th><th>What to do</th></tr></thead>
 <tbody>
 <tr><td><code>not_running</code></td><td>The app is not running. Start it.</td></tr>
@@ -78,7 +79,7 @@
 <tr><td><code>store_newer</code></td><td>The audit data was written by a newer atlas-duck. Install that version or a newer one.</td></tr>
 <tr><td><code>store_unavailable</code></td><td>The audit store could not be opened. Restart atlas-duck. Not retryable.</td></tr>
 <tr><td><code>connection_lost</code></td><td>The connection dropped after the request was sent. The request exists, with status <code>pending</code>, exit 4, not retryable. Wait for it with <code>await &lt;id&gt;</code>; it may be <code>abandoned</code>.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Except for <code>store_unavailable</code> and <code>connection_lost</code>, the error is retryable.</p>
 <h3 id="err-server-identity"><code>server_identity</code></h3>
 <p>The program that answered is not the app that belongs to your user. atlas-duck refuses to talk to it. Exit 5, not retryable. This is a safety check. Make sure that no other program uses the app's connection and restart atlas-duck. If it persists, tell your administrator.</p>

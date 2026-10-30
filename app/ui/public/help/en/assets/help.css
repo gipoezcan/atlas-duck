@@ -1,55 +1,61 @@
-/* Atlas Duck user guide (M16). Colour and type tokens are copied from
+/* Atlas Duck user guide (M17). Colour and type tokens are copied from
    app/ui/src/shared/styles/tokens.css (the help sets are static files, so no import across the
-   build). No inline style exists in the generated pages; everything is here. */
+   build). No inline style exists in the generated pages; everything is here. System fonts only. */
 :root {
   color-scheme: light dark;
   --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Helvetica Neue", Arial, sans-serif;
   --font-mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-  --bg: #ffffff;
-  --surface: #f6f8fa;
+  --bg: #f7f7f5;
+  --surface: #ffffff;
   --surface-raised: #ffffff;
-  --surface-sunken: #eef1f4;
-  --text: #1f2328;
-  --text-muted: #57606a;
-  --border: #d0d7de;
-  --border-strong: #6e7781;
-  --accent: #0a58ca;
-  --accent-hover: #084298;
-  --accent-subtle: #e7f0fd;
-  --focus: #0a58ca;
-  --shadow-card: 0 1px 2px rgb(0 0 0 / 0.06), 0 1px 3px rgb(0 0 0 / 0.08);
+  --surface-sunken: #efefec;
+  --text: #1a1a1a;
+  --text-muted: #4a4a45;
+  --text-on-accent: #ffffff;
+  --border: #d6d6d1;
+  --border-strong: #75756e;
+  --accent: #1d4ed8;
+  --accent-hover: #1e3a8a;
+  --accent-subtle: #e8eefc;
+  --warning: #8a3a00;
+  --warning-subtle: #fff4e5;
+  --warning-border: #b45309;
+  --focus: #1d4ed8;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --shadow-card: 0 1px 2px rgb(0 0 0 / 0.5);
-    --bg: #16181d;
-    --surface: #1e2128;
-    --surface-raised: #252932;
-    --surface-sunken: #121418;
-    --text: #e6e8eb;
-    --text-muted: #a4acb6;
-    --border: #3b414c;
-    --border-strong: #808996;
-    --accent: #6eb0ff;
-    --accent-hover: #9ccaff;
-    --accent-subtle: #1b2c44;
-    --focus: #6eb0ff;
+    --bg: #141517;
+    --surface: #1c1d20;
+    --surface-raised: #232428;
+    --surface-sunken: #0f1012;
+    --text: #ececea;
+    --text-muted: #b0b0aa;
+    --text-on-accent: #0b1220;
+    --border: #3a3b40;
+    --border-strong: #8a8a84;
+    --accent: #8ab4ff;
+    --accent-hover: #b3ceff;
+    --accent-subtle: #1c2a45;
+    --warning: #f3c063;
+    --warning-subtle: #33280f;
+    --warning-border: #c99a3a;
+    --focus: #8ab4ff;
   }
 }
 *, *::before, *::after { box-sizing: border-box; }
-html { scroll-padding-top: 4.5rem; }
+html { scroll-padding-top: 5rem; }
 body {
   margin: 0;
   font-family: var(--font-sans);
-  font-size: 1rem;
-  line-height: 1.5;
+  font-size: 1.0625rem;
+  line-height: 1.55;
   color: var(--text);
   background: var(--bg);
   -webkit-text-size-adjust: 100%;
 }
 a { color: var(--accent); text-underline-offset: 2px; }
 a:hover { color: var(--accent-hover); }
-:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
 .visually-hidden {
   position: absolute;
   width: 1px;
@@ -63,6 +69,25 @@ a:hover { color: var(--accent-hover); }
 }
 [hidden] { display: none !important; }
 
+/* Skip link: first focusable element, visible only while focused. */
+.skip-link {
+  position: absolute;
+  left: 0.5rem;
+  top: -4rem;
+  z-index: 10;
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.75rem;
+  padding: 0 1rem;
+  font-weight: 600;
+  color: var(--text-on-accent);
+  background: var(--accent);
+  border-radius: 8px;
+}
+.skip-link:hover { color: var(--text-on-accent); background: var(--accent-hover); }
+.skip-link:focus { top: 0.5rem; }
+
+/* App bar. */
 .bar {
   position: sticky;
   top: 0;
@@ -70,26 +95,47 @@ a:hover { color: var(--accent-hover); }
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 0.75rem 1rem;
-  padding: 0.5rem 1rem;
+  gap: 0.5rem 1.5rem;
+  min-height: 4.25rem;
+  padding: 0.5rem 1.5rem;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
 }
-.brand { font-weight: 600; color: var(--text); text-decoration: none; }
-.search { position: relative; flex: 1 1 14rem; max-width: 28rem; margin-left: auto; }
+.brand {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.75rem;
+  font-weight: 700;
+  color: var(--text);
+  text-decoration: none;
+}
+.brand:hover { color: var(--text); }
+.brand-sub { margin-left: 0.375rem; font-weight: 400; color: var(--text-muted); }
+.search { position: relative; flex: 1 1 18rem; max-width: 26rem; }
 .search input {
   width: 100%;
-  height: 2.25rem;
-  padding: 0 0.75rem;
+  min-height: 2.75rem;
+  padding: 0.25rem 0.75rem;
   font: inherit;
   color: var(--text);
   background: var(--surface-raised);
   border: 1px solid var(--border-strong);
-  border-radius: 6px;
+  border-radius: 8px;
 }
+.lang-switch {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.75rem;
+  margin-left: auto;
+  padding: 0 1rem;
+  font-weight: 600;
+  text-decoration: none;
+  border-radius: 8px;
+}
+.lang-switch:hover { background: var(--accent-subtle); }
 #help-results {
   position: absolute;
-  top: 2.5rem;
+  top: 3rem;
   left: 0;
   right: 0;
   margin: 0;
@@ -99,47 +145,97 @@ a:hover { color: var(--accent-hover); }
   overflow: auto;
   background: var(--surface-raised);
   border: 1px solid var(--border);
-  border-radius: 6px;
-  box-shadow: var(--shadow-card);
+  border-radius: 8px;
 }
-#help-results a { display: block; padding: 0.5rem; border-radius: 4px; text-decoration: none; color: var(--text); }
+#help-results a { display: block; min-height: 2.75rem; padding: 0.5rem; border-radius: 4px; text-decoration: none; color: var(--text); }
 #help-results a:hover, #help-results a:focus { background: var(--accent-subtle); }
 #help-results strong { display: block; color: var(--accent); }
 #help-results small { display: block; color: var(--text-muted); }
 #help-results .empty { padding: 0.5rem; color: var(--text-muted); }
 
+/* Side navigation and content. */
 .layout {
   display: grid;
   grid-template-columns: 16rem minmax(0, 1fr);
-  gap: 2rem;
-  max-width: 72rem;
+  gap: 2.5rem;
+  max-width: 76rem;
   margin: 0 auto;
-  padding: 1.5rem 1rem 3rem;
+  padding: 1.5rem 1.5rem 3rem;
 }
-.toc { align-self: start; position: sticky; top: 4.5rem; font-size: 0.9375rem; }
+.toc { align-self: start; position: sticky; top: 5.5rem; font-size: 1rem; }
 .toc ul { margin: 0; padding: 0; list-style: none; }
-.toc ul ul { padding-left: 1rem; border-left: 1px solid var(--border); margin: 0.25rem 0 0.5rem 0.25rem; }
-.toc a { display: block; padding: 0.125rem 0.5rem; text-decoration: none; border-radius: 4px; }
+.toc ul ul { padding-left: 0.75rem; border-left: 1px solid var(--border); margin: 0.25rem 0 0.5rem 0.75rem; }
+.toc a {
+  display: flex;
+  align-items: center;
+  min-height: 2.5rem;
+  padding: 0 0.75rem;
+  color: var(--text);
+  text-decoration: none;
+  border-radius: 8px;
+}
 .toc a:hover { background: var(--accent-subtle); }
-.toc a[aria-current="page"] { font-weight: 600; }
-main { min-width: 0; max-width: 46rem; }
-h1, h2, h3, h4 { line-height: 1.25; font-weight: 600; margin: 1.5rem 0 0.75rem; }
-h1 { font-size: 1.75rem; margin-top: 0; }
-h2 { font-size: 1.375rem; padding-top: 0.5rem; border-top: 1px solid var(--border); }
+.toc a[aria-current="page"] { font-weight: 700; background: var(--accent-subtle); color: var(--accent); }
+main { min-width: 0; max-width: 72ch; }
+main:focus { outline: none; }
+h1, h2, h3, h4 { line-height: 1.25; font-weight: 700; margin: 1.75rem 0 0.75rem; }
+h1 { font-size: 2rem; margin-top: 0; }
+h2 { font-size: 1.375rem; padding-top: 0.75rem; border-top: 1px solid var(--border); }
 h3 { font-size: 1.125rem; }
-p, ul, ol, pre, table, blockquote { margin: 0 0 0.75rem; }
+p, ul, ol, pre, blockquote { margin: 0 0 1rem; }
 ul, ol { padding-left: 1.5rem; }
-code, pre { font-family: var(--font-mono); font-size: 0.9em; }
-code { background: var(--surface-sunken); padding: 0 0.25rem; border-radius: 4px; }
-pre { background: var(--surface-sunken); padding: 0.75rem; border-radius: 6px; overflow-x: auto; }
+li { margin-bottom: 0.25rem; }
+code, pre, kbd { font-family: var(--font-mono); font-size: 0.9em; }
+code { background: var(--surface-sunken); padding: 0.0625rem 0.3125rem; border-radius: 4px; }
+kbd {
+  padding: 0 0.375rem;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+}
+pre { background: var(--surface-sunken); border: 1px solid var(--border); padding: 0.75rem 1rem; border-radius: 8px; overflow-x: auto; }
 pre code { background: none; padding: 0; }
-blockquote { padding: 0.25rem 1rem; border-left: 4px solid var(--border-strong); color: var(--text-muted); }
-table { border-collapse: collapse; width: 100%; }
-th, td { text-align: left; padding: 0.375rem 0.625rem; border: 1px solid var(--border); vertical-align: top; }
-th { background: var(--surface); }
+pre:focus-visible { outline-offset: 0; }
+blockquote {
+  padding: 0.75rem 1rem;
+  margin-left: 0;
+  background: var(--warning-subtle);
+  border: 1px solid var(--warning-border);
+  border-radius: 10px;
+  color: var(--text);
+}
+blockquote > :last-child { margin-bottom: 0; }
+.tablebox {
+  margin: 0 0 1rem;
+  overflow-x: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+}
+table { border-collapse: collapse; width: 100%; margin: 0; }
+th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { color: var(--text-muted); font-weight: 600; background: var(--surface-sunken); }
+tbody tr:last-child td { border-bottom: 0; }
 :target { background: var(--accent-subtle); }
+main:target { background: none; }
 
 @media (max-width: 52rem) {
-  .layout { grid-template-columns: minmax(0, 1fr); gap: 1rem; }
+  .layout { grid-template-columns: minmax(0, 1fr); gap: 1rem; padding: 1rem; }
   .toc { position: static; }
+  .bar { padding: 0.5rem 1rem; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+}
+
+@media (forced-colors: active) {
+  :focus-visible { outline: 3px solid Highlight; }
+  .skip-link { color: ButtonText; background: ButtonFace; border: 1px solid ButtonText; }
+  .bar { border-bottom: 1px solid CanvasText; }
+  .toc a[aria-current="page"] { border: 2px solid Highlight; color: LinkText; }
+  .toc a:hover, .lang-switch:hover, #help-results a:hover, #help-results a:focus { outline: 1px solid Highlight; }
+  .search input, #help-results, .tablebox, pre, blockquote, kbd { border: 1px solid CanvasText; }
+  blockquote { forced-color-adjust: auto; }
+  :target { outline: 2px solid Highlight; }
 }

@@ -58,8 +58,8 @@ export function AnchorDir({ view, onChanged }: Props) {
 
   const missing = health.anchors_missing === null ? null : own(t.settings.recovery.anchors_missing, health.anchors_missing);
   return (
-    <section aria-label={t.settings.recovery.anchor_dir}>
-      <h2>{t.settings.recovery.anchor_dir}</h2>
+    <section id="settings-anchor-dir" aria-label={t.settings.recovery.anchor_dir}>
+      <h2 tabIndex={-1}>{t.settings.recovery.anchor_dir}</h2>
       <p>
         {t.settings.recovery.anchor_dir}: {view.anchor_dir === null ? t.settings.recovery.anchor_dir_none : <Cfg value={view.anchor_dir} />}
       </p>

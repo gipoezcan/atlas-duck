@@ -7,6 +7,8 @@
 .window-running table {
   font-size: var(--text-sm);
   background: var(--surface);
+}
+.window-running > table {
   border-radius: var(--radius-lg);
   box-shadow: 0 0 0 1px var(--border);
 }
@@ -17,9 +19,8 @@
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  padding: var(--space-4) var(--space-5);
+  padding: var(--space-5);
   margin: 0 0 var(--space-4);
-  box-shadow: var(--shadow-card);
 }
 .onboarding-text {
   white-space: pre-wrap;

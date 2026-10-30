@@ -3,15 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Erste Schritte (Desktop) - Atlas Duck Hilfe</title>
+<title>Erste Schritte (Desktop) - atlas-duck Benutzerhandbuch</title>
 <link rel="stylesheet" href="assets/help.css">
 <script src="assets/search-index.js" defer></script>
 <script src="assets/help.js" defer></script>
 </head>
 <body>
+<a class="skip-link" href="#content">Zum Inhalt springen</a>
 <header class="bar">
-<a class="brand" href="index.html">Atlas Duck Hilfe</a>
-<div class="search" hidden>
+<a class="brand" href="index.html">atlas-duck <span class="brand-sub">Benutzerhandbuch</span></a>
+<div class="search" role="search" hidden>
 <label class="visually-hidden" for="help-search">Hilfe durchsuchen</label>
 <input id="help-search" type="search" placeholder="Hilfe durchsuchen" autocomplete="off" data-empty="Keine Treffer">
 <ul id="help-results" hidden></ul>
@@ -40,18 +41,18 @@
 <li><a href="error-reference.html">Fehlerreferenz</a></li>
 </ul>
 </nav>
-<main>
+<main id="content" tabindex="-1">
 <h1>Erste Schritte (Desktop)</h1>
 <h2 id="install">Installation</h2>
 <p>atlas-duck installiert drei Programme nebeneinander: <code>atlas-duck-app</code> (die Tray-Anwendung mit den Freigabefenstern), <code>atlas-duck</code> (die Befehlszeile und der MCP-Server, die Agents aufrufen) und <code>atlas-duck-sandbox</code> (das Hilfsprogramm, das Agent-Skripte ausführt). Befehlszeile und MCP-Server tun von sich aus nichts. Sie fragen die laufende App, und die App fragt Sie vor jedem Schreibvorgang.</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>System</th><th>Versionen</th><th>Paket</th></tr></thead>
 <tbody>
 <tr><td>Windows</td><td>Windows 10 22H2 und neuer, Windows 11 (x86_64)</td><td>NSIS-Installer</td></tr>
 <tr><td>macOS</td><td>macOS 13 und neuer (arm64 und x86_64, je ein Build)</td><td><code>.dmg</code></td></tr>
 <tr><td>Ubuntu</td><td>22.04 und neuer</td><td><code>.deb</code>, AppImage</td></tr>
 <tr><td>Fedora</td><td>40 und neuer</td><td><code>.rpm</code>, AppImage</td></tr>
-</tbody></table>
+</tbody></table></div>
 <ul>
 <li><strong>Windows:</strong> Der Installer bietet eine Installation pro Benutzer und eine pro Computer an. Die Installation pro Computer (Program Files) wird empfohlen, weil normale Benutzer die Programmdateien dann nicht ändern können. Führen Sie atlas-duck nicht als Administrator aus. Läuft die App mit erhöhten Rechten und das Terminal des Agents nicht, verweigert die Befehlszeile das Gespräch mit ihr; starten Sie beide mit denselben Rechten.</li>
 <li><strong>macOS:</strong> Öffnen Sie die <code>.dmg</code> und ziehen Sie die App in den Ordner Programme.</li>
@@ -83,7 +84,7 @@
 <p>Felder und Token-Schritte im Einzelnen stehen unter <a href="instances-and-tokens.html">Instanzen und Tokens</a>.</p>
 <h2 id="tray">Das Tray-Menü</h2>
 <p>atlas-duck läuft im Infobereich der Taskleiste (Tray). Das Schließen eines Fensters blendet es nur aus. Der Tooltip zeigt, wie viele Anfragen ausstehen (&quot;atlas-duck: N ausstehend&quot;). Das Menü enthält diese Einträge:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Eintrag</th><th>Wirkung</th></tr></thead>
 <tbody>
 <tr><td>Freigaben öffnen (N)</td><td>Öffnet das Freigabefenster oder das Fenster, das atlas-duck stattdessen von Ihnen braucht. N ist die Zahl der ausstehenden Anfragen.</td></tr>
@@ -92,7 +93,7 @@
 <tr><td>Präsentationsmodus</td><td>Schaltet ohne Rückfrage auf &quot;Nur Kennzeichen&quot;, bis Sie ihn wieder ausschalten.</td></tr>
 <tr><td>Hilfe</td><td>Öffnet dieses Handbuch.</td></tr>
 <tr><td>Beenden</td><td>Beendet atlas-duck.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Statuszeilen über den Einträgen zeigen, warum atlas-duck nicht bedienen kann, zum Beispiel &quot;Gesperrt&quot;, &quot;Einrichtung erforderlich&quot; oder &quot;Warte auf den Schlüsselbund&quot;.</p>
 </main>
 </div>

@@ -3,15 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Audit log - Atlas Duck Help</title>
+<title>Audit log - atlas-duck User guide</title>
 <link rel="stylesheet" href="assets/help.css">
 <script src="assets/search-index.js" defer></script>
 <script src="assets/help.js" defer></script>
 </head>
 <body>
+<a class="skip-link" href="#content">Skip to the content</a>
 <header class="bar">
-<a class="brand" href="/docs/en/">Atlas Duck Help</a>
-<div class="search" hidden>
+<a class="brand" href="/docs/en/">atlas-duck <span class="brand-sub">User guide</span></a>
+<div class="search" role="search" hidden>
 <label class="visually-hidden" for="help-search">Search help</label>
 <input id="help-search" type="search" placeholder="Search help" autocomplete="off" data-empty="No results">
 <ul id="help-results" hidden></ul>
@@ -44,7 +45,7 @@
 <li><a href="/docs/en/error-reference">Error reference</a></li>
 </ul>
 </nav>
-<main>
+<main id="content" tabindex="-1">
 <h1>Audit log</h1>
 <h2 id="audit-log">What the audit log records</h2>
 <p>atlas-duck keeps a record of everything that happens around a request: that it arrived, what you saw, what you decided, what was sent to the instance and what came back, and what the agent received. The records are chained: each one contains a fingerprint of the one before, so a changed or removed record breaks the chain and can be found. The content of each record (the &quot;payload&quot;) is stored encrypted.</p>
@@ -75,14 +76,14 @@
 <p>Both are optional, but without any trust root the result can only be &quot;consistent in itself&quot; (exit 20).</p>
 <p>For a server export, the page shows the full command, including <code>--anchor-chain &lt;dir&gt;/anchor-chain.jsonl</code> and <code>--anchor-chain-head &lt;seq&gt;:&lt;hash&gt;</code>. The anchor chain in the archive is only an excerpt. Without the head you pin, it is reported as unanchored and counts for nothing, because a consistent excerpt can be made up completely. Take the head from the export page or from the operator, not from the archive. The server image also has the verifier: <code>atlas-duck-server verify-export …</code>.</p>
 <p>The exit code tells you how far to trust the result:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Exit code</th><th>Meaning</th></tr></thead>
 <tbody>
 <tr><td>0</td><td>Verified against a trust root that covers the whole export.</td></tr>
 <tr><td>20</td><td>Consistent in itself, but no trust root covers all of it. The command says &quot;internally consistent; trust root NOT verified&quot;. Treat this as not verified.</td></tr>
 <tr><td>21</td><td>Tampering, or a fork: two exports that share a start but diverge.</td></tr>
 <tr><td>22</td><td>The command could not run: wrong usage (for example <code>--anchor-dir</code> together with <code>--anchor-chain</code>), unreadable files, an unfinished <code>.partial</code> folder, or the atlas-duck app was not found.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>A fork is not necessarily an attack. It happens when a log was restored from a backup while the old installation kept running. The old installation should be shut down.</p>
 <h2 id="retention">Retention and legal hold</h2>
 <p>The audit log is not kept forever. The retention period says how long records stay.</p>

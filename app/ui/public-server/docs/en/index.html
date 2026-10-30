@@ -3,15 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Overview - Atlas Duck Help</title>
+<title>Overview - atlas-duck User guide</title>
 <link rel="stylesheet" href="assets/help.css">
 <script src="assets/search-index.js" defer></script>
 <script src="assets/help.js" defer></script>
 </head>
 <body>
+<a class="skip-link" href="#content">Skip to the content</a>
 <header class="bar">
-<a class="brand" href="/docs/en/">Atlas Duck Help</a>
-<div class="search" hidden>
+<a class="brand" href="/docs/en/">atlas-duck <span class="brand-sub">User guide</span></a>
+<div class="search" role="search" hidden>
 <label class="visually-hidden" for="help-search">Search help</label>
 <input id="help-search" type="search" placeholder="Search help" autocomplete="off" data-empty="No results">
 <ul id="help-results" hidden></ul>
@@ -41,7 +42,7 @@
 <li><a href="/docs/en/error-reference">Error reference</a></li>
 </ul>
 </nav>
-<main>
+<main id="content" tabindex="-1">
 <h1>Overview</h1>
 <p>This guide is for the people who use atlas-duck: users and, in server mode, admins and auditors.</p>
 <h2 id="what-is-atlas-duck">What atlas-duck is</h2>
@@ -52,7 +53,7 @@
 <li><strong>Server mode</strong>: your organisation hosts atlas-duck once, on its own network. It serves many users and their agents, and nothing is installed on your machine: you use it in a browser.</li>
 </ul>
 <p>Both modes work the same way for you. These terms come back on every page:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Term</th><th>Meaning</th></tr></thead>
 <tbody>
 <tr><td>Agent</td><td>An AI program that acts on your behalf through atlas-duck. It proposes writes but never approves them.</td></tr>
@@ -60,15 +61,15 @@
 <tr><td>Personal access token (PAT)</td><td>Your own Jira or Confluence token. atlas-duck always acts as you, never as a shared service account.</td></tr>
 <tr><td>Approval</td><td>Your explicit yes or no to one proposed write before it reaches an instance. Every write needs one, in both modes.</td></tr>
 <tr><td>Audit chain</td><td>Your tamper-evident record of everything atlas-duck did for you. Each user has one, in both modes.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>In server mode there are three more terms:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Term</th><th>Meaning</th></tr></thead>
 <tbody>
 <tr><td>Domain login</td><td>You sign in with your organisation's directory username and password. The password is checked against the directory and never stored.</td></tr>
 <tr><td>Role</td><td>What you may do: user, auditor or admin. Roles come from your directory groups.</td></tr>
 <tr><td>API key</td><td>A secret you create, with scopes and an expiry, that lets an agent act for you without a browser sign-in.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <h2 id="how-it-works">How a request flows</h2>
 <ol>
 <li>An agent asks atlas-duck for something, for example to read a Jira issue or to change one.</li>

@@ -3,15 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Einstellungen - Atlas Duck Hilfe</title>
+<title>Einstellungen - atlas-duck Benutzerhandbuch</title>
 <link rel="stylesheet" href="assets/help.css">
 <script src="assets/search-index.js" defer></script>
 <script src="assets/help.js" defer></script>
 </head>
 <body>
+<a class="skip-link" href="#content">Zum Inhalt springen</a>
 <header class="bar">
-<a class="brand" href="index.html">Atlas Duck Hilfe</a>
-<div class="search" hidden>
+<a class="brand" href="index.html">atlas-duck <span class="brand-sub">Benutzerhandbuch</span></a>
+<div class="search" role="search" hidden>
 <label class="visually-hidden" for="help-search">Hilfe durchsuchen</label>
 <input id="help-search" type="search" placeholder="Hilfe durchsuchen" autocomplete="off" data-empty="Keine Treffer">
 <ul id="help-results" hidden></ul>
@@ -40,7 +41,7 @@
 <li><a href="error-reference.html">Fehlerreferenz</a></li>
 </ul>
 </nav>
-<main>
+<main id="content" tabindex="-1">
 <h1>Einstellungen</h1>
 <p>Im Desktopmodus sind die Einstellungen ein eigenes Fenster. Neben den Themen dieser Seite enthalten sie Ihre Instanzen (<a href="instances-and-tokens.html">Instanzen und Tokens</a>), die Limits für Anfragen und <a href="scripts.html#limits">Skripte</a>, Aufbewahrung und Legal Hold (<a href="audit.html#retention">Audit-Protokoll</a>), die Bereinigung und &quot;Auf die Entfernung vorbereiten&quot;.</p>
 <h2 id="language">Sprache</h2>
@@ -55,24 +56,24 @@
 <p>Jede Seite dieses Handbuchs hat einen Link auf dieselbe Seite in der anderen Sprache, sodass Sie auch hier wechseln können.</p>
 <h2 id="notifications">Benachrichtigungen und Aufmerksamkeit</h2>
 <p>Der &quot;Benachrichtigungsmodus&quot; in den Einstellungen legt fest, was geschieht, wenn eine Anfrage Sie braucht:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Option</th><th>Was geschieht</th></tr></thead>
 <tbody>
 <tr><td>Fenster anzeigen, ohne den Fokus zu übernehmen</td><td>Das Freigabefenster erscheint, übernimmt aber nicht den Tastaturfokus.</td></tr>
 <tr><td>Nur Kennzeichen</td><td>Es öffnet sich kein Fenster. Nur ein Kennzeichen zeigt, dass etwas aussteht.</td></tr>
 <tr><td>Fenster anzeigen und Fokus übernehmen</td><td>Das Freigabefenster erscheint und übernimmt den Fokus.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Wählen Sie eine Option und dann &quot;Anwenden&quot;. Der &quot;Präsentationsmodus&quot; lässt sich im Tray-Menü umschalten. Er schaltet auf &quot;Nur Kennzeichen&quot; und wird in den Einstellungen nicht gespeichert.</p>
 <h2 id="cli-install">Befehlszeile installieren</h2>
 <p>Agents rufen den Befehl <code>atlas-duck</code> aus einem Terminal auf. Der Abschnitt &quot;Befehlszeile&quot; in den Einstellungen zeigt, ob er in Ihrem PATH liegt (&quot;Der Befehl atlas-duck befindet sich in Ihrem PATH.&quot; oder &quot;...befindet sich nicht in Ihrem PATH.&quot;) und hat die Schaltflächen &quot;CLI im PATH installieren&quot; und &quot;CLI aus dem PATH entfernen&quot;. Was die Installation tut, hängt vom System ab:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>System</th><th>Installation</th></tr></thead>
 <tbody>
 <tr><td>Windows</td><td>Fügt den Installationsordner Ihrem Benutzer-PATH hinzu.</td></tr>
 <tr><td>macOS</td><td>Legt den Link <code>~/.local/bin/atlas-duck</code> auf das Programm in der App an.</td></tr>
 <tr><td>Linux AppImage</td><td>Schreibt ein Wrapper-Skript <code>~/.local/bin/atlas-duck</code> und einen Starter in <code>~/.local/share/applications</code>.</td></tr>
 <tr><td>Linux <code>.deb</code> und <code>.rpm</code></td><td>Nichts zu tun: Der Befehl liegt bereits im PATH, und die Einstellungen sagen das.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Öffnen Sie nach einer Installation ein neues Terminal und starten Sie Ihre MCP-Clients neu, damit sie den Befehl finden. Liegt <code>~/.local/bin</code> nicht im PATH Ihrer Terminals, weisen die Einstellungen darauf hin, dass Sie es hinzufügen müssen. Wenn Sie die AppImage-Datei verschieben oder umbenennen, wählen Sie &quot;CLI im PATH installieren&quot; erneut: Bis dahin meldet der Wrapper, dass die AppImage nicht gefunden wurde.</p>
 <h2 id="backup">Backup und Wiederherstellung</h2>
 <p>Der Abschnitt &quot;Wiederherstellung und Backup&quot; in den Einstellungen schützt Ihr Audit-Protokoll.</p>

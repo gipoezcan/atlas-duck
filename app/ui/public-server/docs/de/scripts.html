@@ -3,15 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Skripte - Atlas Duck Hilfe</title>
+<title>Skripte - atlas-duck Benutzerhandbuch</title>
 <link rel="stylesheet" href="assets/help.css">
 <script src="assets/search-index.js" defer></script>
 <script src="assets/help.js" defer></script>
 </head>
 <body>
+<a class="skip-link" href="#content">Zum Inhalt springen</a>
 <header class="bar">
-<a class="brand" href="/docs/de/">Atlas Duck Hilfe</a>
-<div class="search" hidden>
+<a class="brand" href="/docs/de/">atlas-duck <span class="brand-sub">Benutzerhandbuch</span></a>
+<div class="search" role="search" hidden>
 <label class="visually-hidden" for="help-search">Hilfe durchsuchen</label>
 <input id="help-search" type="search" placeholder="Hilfe durchsuchen" autocomplete="off" data-empty="Keine Treffer">
 <ul id="help-results" hidden></ul>
@@ -42,7 +43,7 @@
 <li><a href="/docs/de/error-reference">Fehlerreferenz</a></li>
 </ul>
 </nav>
-<main>
+<main id="content" tabindex="-1">
 <h1>Skripte</h1>
 <h2 id="what-are-scripts">Was Skripte sind</h2>
 <p>Mit einem Skript erledigt ein Agent viele Lesezugriffe in einer Anfrage. Es ist JavaScript: der Rumpf von <code>async function main(args, atlas)</code>. Darin ruft es Lesevorgänge mit <code>atlas.&lt;product&gt;.&lt;op&gt;(params)</code> oder <code>atlas.call</code> auf, blättert mit <code>atlas.all</code> durch Ergebnisse und kann mit <code>atlas.ops()</code> und <code>atlas.instances()</code> abfragen, was es gibt. <code>atlas.log</code> schreibt eine Notiz.</p>
@@ -56,7 +57,7 @@
 <h2 id="limits">Limits und Isolierung</h2>
 <p>Jedes Skript läuft unter Limits, damit ein einzelnes Skript weder Ihren Rechner noch eine Instanz auslastet.</p>
 <p>Der Server führt Skripte mit den folgenden Standardwerten aus. Sie sind fest; auf dem Server gibt es dafür keine Einstellung.</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Limit</th><th>Standard</th></tr></thead>
 <tbody>
 <tr><td>Skript-Zeitlimit (s)</td><td>120</td></tr>
@@ -67,7 +68,7 @@
 <tr><td>Skript-Limit je Aufrufergebnis (MiB)</td><td>16</td></tr>
 <tr><td>Skript-Ergebnislimit (MiB)</td><td>16</td></tr>
 <tr><td>Gleichzeitige Skript-Aufrufe</td><td>4</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Ein Agent darf niedrigere Limits anfordern (mit <code>--limits</code> in der Befehlszeile oder dem Parameter <code>limits</code> von <code>script_run</code>), nie höhere. Ein Skript, das ein Limit überschreitet, endet mit <code>script_limit</code> (Exit 8).</p>
 <p>Zwei echte Skripte und zwei Probeläufe können gleichzeitig laufen. Weitere warten. Der Server wendet dieselben Zahlen je Benutzer an.</p>
 <p>Das Heap-Limit muss mindestens das 15-Fache des Limits je Aufrufergebnis betragen und das Prozesslimit mindestens das Heap-Limit plus 88 MiB. Die Einstellungen weisen Werte zurück, die das verletzen.</p>

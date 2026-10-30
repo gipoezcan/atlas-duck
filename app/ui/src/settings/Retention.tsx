@@ -65,8 +65,8 @@ export function Retention({ view, onChanged, readOnly }: RetentionProps) {
   const backlog =
     view.health.prune_backlog === null ? null : t.settings.prune_backlog_line(view.health.prune_backlog_days);
   return (
-    <section aria-label={t.settings.retention}>
-      <h2>{t.settings.retention}</h2>
+    <section id="settings-retention" aria-label={t.settings.retention}>
+      <h2 tabIndex={-1}>{t.settings.retention}</h2>
       <Guard disabled={readOnly}>
       <div className="field">
         <label>

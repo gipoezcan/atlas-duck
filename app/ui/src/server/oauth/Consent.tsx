@@ -58,7 +58,7 @@ function requestError(code: string | null): ConsentErrorKey {
 export function ConsentError({ code }: { code: string }) {
   const t = useText();
   return (
-    <main className="window window-consent">
+    <main id="main" tabIndex={-1} className="window window-consent">
       <h1>{t.server.consent.title}</h1>
       <ServerHelpLink path="/oauth/consent" label={t.server.consent.title} />
       <p role="alert" className="notice notice-danger">
@@ -122,7 +122,7 @@ export function Consent({ req }: { req: string }) {
     });
 
   return (
-    <main className="window window-consent">
+    <main id="main" tabIndex={-1} className="window window-consent">
       <h1>{t.server.consent.title}</h1>
       <ServerHelpLink path="/oauth/consent" label={t.server.consent.title} />
       {errorKey !== null ? (

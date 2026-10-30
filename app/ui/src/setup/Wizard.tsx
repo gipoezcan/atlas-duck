@@ -205,8 +205,14 @@ function WizardWindow() {
         </p>
         {/* Rust's fixed text once GENESIS recorded a previous chain (PD-167), as a plain text node. */}
         {state.notice === null ? null : <p role="status">{state.notice}</p>}
-        <div ref={panel} className="window-body">
-          <Panel state={state} step={step} pending={action.pending || settling} onChanged={reread} />
+        <div className="setup-layout">
+          <Progress stage={stageOf(state.step)} />
+          <div ref={panel} className="window-body">
+            {stageOf(state.step) === null ? null : (
+              <p className="step-count">{t.setup.step_count(stageOf(state.step) ?? 0, STAGE_COUNT)}</p>
+            )}
+            <Panel state={state} step={step} pending={action.pending || settling} onChanged={reread} />
+          </div>
         </div>
         {action.error === null ? null : <p role="alert">{action.error}</p>}
         <Quit />
@@ -219,6 +225,58 @@ type Step = (
   cmd: (rendered: WizardStep) => Promise<WizardState>,
   opts?: { destroysWindow?: boolean; settle?: boolean },
 ) => void;
+
+/** The five stages the progress list shows; a stage covers one or more wizard steps. */
+const STAGE_COUNT = 5;
+
+/** The 1-based stage a wizard step belongs to; `stopped` is in none. */
+export function stageOf(step: WizardStep): number | null {
+  switch (step) {
+    case 'data_dir':
+    case 'existing_store':
+    case 'anchor_dir':
+    case 'restore':
+      return 1;
+    case 'passphrase':
+    case 'genesis':
+    case 'pin_retry':
+    case 'recovery_note':
+      return 2;
+    case 'instances':
+      return 3;
+    case 'cli':
+      return 4;
+    case 'onboarding':
+    case 'done':
+      return 5;
+    case 'stopped':
+      return null;
+  }
+}
+
+/** M17: where the user is in the five stages; finished ones say so in text, the current one is `aria-current="step"`. */
+function Progress({ stage }: { stage: number | null }) {
+  const t = useText();
+  return (
+    <nav aria-label={t.setup.progress_label}>
+      <ol className="setup-progress">
+        {t.setup.stages.map((name, i) => {
+          const n = i + 1;
+          const done = stage !== null && n < stage;
+          return (
+            <li key={name} className={done ? 'step-done' : undefined} aria-current={n === stage ? 'step' : undefined}>
+              <span className="step-dot" aria-hidden="true">
+                {done ? '✓' : n}
+              </span>
+              {name}
+              {done ? <span className="visually-hidden"> {t.setup.stage_done}</span> : null}
+            </li>
+          );
+        })}
+      </ol>
+    </nav>
+  );
+}
 
 /** The heading of the step's panel. */
 function headingOf(state: WizardState, t: Dict = en): string {

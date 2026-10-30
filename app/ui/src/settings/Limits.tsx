@@ -79,8 +79,8 @@ export function Limits({ view, onChanged, readOnly }: LimitsProps) {
   };
 
   return (
-    <section aria-label={t.settings.limits}>
-      <h2>{t.settings.limits}</h2>
+    <section id="settings-limits" aria-label={t.settings.limits}>
+      <h2 tabIndex={-1}>{t.settings.limits}</h2>
       <Guard disabled={readOnly}>
       {KEYS.map((key) => (
         <div key={key} className="field">

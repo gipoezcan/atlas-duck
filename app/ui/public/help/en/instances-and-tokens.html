@@ -3,15 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Instances and tokens - Atlas Duck Help</title>
+<title>Instances and tokens - atlas-duck User guide</title>
 <link rel="stylesheet" href="assets/help.css">
 <script src="assets/search-index.js" defer></script>
 <script src="assets/help.js" defer></script>
 </head>
 <body>
+<a class="skip-link" href="#content">Skip to the content</a>
 <header class="bar">
-<a class="brand" href="index.html">Atlas Duck Help</a>
-<div class="search" hidden>
+<a class="brand" href="index.html">atlas-duck <span class="brand-sub">User guide</span></a>
+<div class="search" role="search" hidden>
 <label class="visually-hidden" for="help-search">Search help</label>
 <input id="help-search" type="search" placeholder="Search help" autocomplete="off" data-empty="No results">
 <ul id="help-results" hidden></ul>
@@ -41,12 +42,12 @@
 <li><a href="error-reference.html">Error reference</a></li>
 </ul>
 </nav>
-<main>
+<main id="content" tabindex="-1">
 <h1>Instances and tokens</h1>
 <h2 id="instances">Instances</h2>
 <p>An instance is one Jira or Confluence Data Center server that atlas-duck talks to. It is known by an alias, for example the short name of the server.</p>
 <p>In desktop mode you define your own instances. Settings lists them under &quot;Instances&quot;:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Column</th><th>Content</th></tr></thead>
 <tbody>
 <tr><td>Alias</td><td>The name you gave the instance.</td></tr>
@@ -56,9 +57,9 @@
 <tr><td>Executes as</td><td>The Atlassian user your token belongs to.</td></tr>
 <tr><td>Token expiry</td><td>The expiry date you entered, if any.</td></tr>
 <tr><td>Proxy</td><td>The proxy of this instance, or &quot;OS setting or none&quot;.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>The state tells you whether the instance can be used:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>State</th><th>Meaning</th></tr></thead>
 <tbody>
 <tr><td>ok</td><td>Ready.</td></tr>
@@ -67,7 +68,7 @@
 <tr><td>insecure scheme (http)</td><td>The URL starts with http. atlas-duck requires https. If your server uses an internal certificate authority, add it as the instance's custom CA.</td></tr>
 <tr><td>identity header missing</td><td>&quot;X-AUSERNAME not received, possibly stripped by a reverse proxy in front of Jira; ask the Jira administrator&quot;.</td></tr>
 <tr><td>identity header mismatch</td><td>The X-AUSERNAME header does not match the user of the token.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <h2 id="add-instance">Add an instance</h2>
 <p>Open Settings, &quot;Add an instance&quot; (the setup window has the same form), and fill in:</p>
 <ul>
@@ -87,7 +88,7 @@
 <li>&quot;Re-test stored token&quot; asks the server again. The answer is &quot;Connected as ...&quot;, or &quot;The re-test failed:&quot; with the reason.</li>
 </ul>
 <p>When you store a token, atlas-duck first tests it against the instance. These are the reasons for a refusal:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Reason</th><th>What to do</th></tr></thead>
 <tbody>
 <tr><td>The server rejected the token (401).</td><td>Check that it is a valid personal access token that has not expired.</td></tr>
@@ -96,7 +97,7 @@
 <tr><td>A proxy blocked or changed the connection.</td><td>Check the proxy settings.</td></tr>
 <tr><td>The server could not be reached.</td><td>Try again later.</td></tr>
 <tr><td>The server version is below the minimum atlas-duck supports.</td><td>The instance has to be upgraded.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <h2 id="token-storage">Where tokens are stored</h2>
 <p>Your tokens are kept in the operating system keychain of this computer. atlas-duck never shows a stored token again. Backups never contain tokens: after a restore, every instance needs its token again. &quot;Prepare for removal&quot; in Settings deletes the stored tokens and then asks you to revoke each token on its server.</p>
 <p>Tokens give access to Jira and Confluence in your name. Rotate them regularly, and revoke a token on its server when you no longer need it.</p>

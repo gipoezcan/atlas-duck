@@ -3,15 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Agents (Desktop) - Atlas Duck Hilfe</title>
+<title>Agents (Desktop) - atlas-duck Benutzerhandbuch</title>
 <link rel="stylesheet" href="assets/help.css">
 <script src="assets/search-index.js" defer></script>
 <script src="assets/help.js" defer></script>
 </head>
 <body>
+<a class="skip-link" href="#content">Zum Inhalt springen</a>
 <header class="bar">
-<a class="brand" href="index.html">Atlas Duck Hilfe</a>
-<div class="search" hidden>
+<a class="brand" href="index.html">atlas-duck <span class="brand-sub">Benutzerhandbuch</span></a>
+<div class="search" role="search" hidden>
 <label class="visually-hidden" for="help-search">Hilfe durchsuchen</label>
 <input id="help-search" type="search" placeholder="Hilfe durchsuchen" autocomplete="off" data-empty="Keine Treffer">
 <ul id="help-results" hidden></ul>
@@ -40,7 +41,7 @@
 <li><a href="error-reference.html">Fehlerreferenz</a></li>
 </ul>
 </nav>
-<main>
+<main id="content" tabindex="-1">
 <h1>Agents (Desktop)</h1>
 <h2 id="launcher">Einen Agenten starten</h2>
 <p>Ein Agent erreicht atlas-duck über den Befehl <code>atlas-duck</code>. Er braucht dafür kein eigenes Passwort und kein eigenes Token. Er spricht mit der laufenden Desktop-App auf Ihrem Rechner, und jede Anfrage landet in Ihrer Warteschlange.</p>
@@ -61,7 +62,7 @@
 <pre><code>atlas-duck [Optionen] &lt;Befehl&gt;
 </code></pre>
 <p>Optionen für jeden Befehl:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Option</th><th>Bedeutung</th></tr></thead>
 <tbody>
 <tr><td><code>--agent NAME</code></td><td>Der Name des Agenten; auch <code>ATLAS_DUCK_AGENT</code>.</td></tr>
@@ -70,9 +71,9 @@
 <tr><td><code>--instance ALIAS</code></td><td>Welche Instanz verwendet wird.</td></tr>
 <tr><td><code>--output json|text</code></td><td>Das Format der Antwort.</td></tr>
 <tr><td><code>--help</code></td><td>Hilfe.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Befehle:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Befehl</th><th>Zweck</th></tr></thead>
 <tbody>
 <tr><td><code>call &lt;op-id&gt; --params '&lt;json&gt;'</code></td><td>Einen Vorgang ausführen. Für eine Datei oder die Standardeingabe verwenden Sie <code>--params-file &lt;Pfad&gt;</code> oder <code>-</code> statt <code>--params</code>.</td></tr>
@@ -86,7 +87,7 @@
 <tr><td><code>doctor</code></td><td>Die Einrichtung prüfen.</td></tr>
 <tr><td><code>mcp</code></td><td>Den MCP-Server starten, siehe unten.</td></tr>
 <tr><td><code>verify-export</code></td><td>Eine exportierte Audit-Datei prüfen. Siehe <a href="audit.html#verify">Audit-Protokoll</a>.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Schreib- und Lesezugriffe warten immer auf Ihre Entscheidung. Ein Agent, der <code>pending</code> sieht, muss warten und darf nicht erneut anfragen.</p>
 <h2 id="mcp">MCP-Clients</h2>
 <p>Viele Agents sprechen MCP. Tragen Sie atlas-duck in die MCP-Einstellungen des Agenten als Programm ein, das über Standardeingabe und Standardausgabe gestartet wird:</p>
@@ -101,7 +102,7 @@
 <p>Starten Sie den MCP-Server im Agenten nach einem Update von atlas-duck neu, damit der Agent die neue Version verwendet.</p>
 <h2 id="envelope">Das Antwortformat</h2>
 <p>Jeder Befehl gibt auf der Standardausgabe ein JSON-Objekt aus, die Hülle (Envelope). Ihre Schlüssel sind immer dieselben:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Schlüssel</th><th>Inhalt</th></tr></thead>
 <tbody>
 <tr><td><code>request_id</code></td><td>Die ID der Anfrage.</td></tr>
@@ -115,9 +116,9 @@
 <tr><td><code>message</code></td><td>Ein kurzer Text.</td></tr>
 <tr><td><code>error</code></td><td><code>{code, retryable, message, details?}</code>, wenn etwas schiefging.</td></tr>
 <tr><td><code>meta</code></td><td>Zusätzliche Angaben wie Blättern und <code>dry_run</code>.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Der Exit-Code des Befehls fasst das Ergebnis zusammen:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Exit-Code</th><th>Bedeutung</th></tr></thead>
 <tbody>
 <tr><td>0</td><td><code>succeeded</code> oder <code>released</code>; ein Ergebnis mit einem Skriptfehler endet jedoch mit 8, auch wenn Sie es übergeben haben.</td></tr>
@@ -132,7 +133,7 @@
 <tr><td>9</td><td>Die App ist gesperrt, nicht eingerichtet oder braucht ein Token.</td></tr>
 <tr><td>10</td><td>Das Ergebnis ist nicht mehr gespeichert.</td></tr>
 <tr><td>11</td><td>atlas-duck ist ausgelastet.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p><code>status</code> endet mit 0, sobald es die Anfrage kennt. <code>verify-export</code> hat eigene Codes: 0, 20, 21 und 22. Was die einzelnen <code>error.code</code> bedeuten, steht in der <a href="error-reference.html">Fehlerreferenz</a>.</p>
 </main>
 </div>

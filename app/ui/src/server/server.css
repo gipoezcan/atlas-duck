@@ -1,12 +1,5 @@
-/* Server-mode pages (T20-T22): layout only, on the M11 tokens; colours, type and controls come
-   from the shared app.css (tokens.css, controls.css, layout.css). */
-
-.server-header nav {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-3);
-  align-items: center;
-}
+/* Server-mode pages (T20-T22): layout only, on the M11/M17 tokens; colours, type and controls come
+   from the shared app.css (tokens.css, controls.css, layout.css, components.css: .app-bar, .nav-list). */
 
 /* The language select (M15 T4 review): label and control in one row, on the shared control look. */
 .server-header .server-lang {
@@ -29,7 +22,8 @@
 }
 
 .server-header .server-user {
-  margin-left: auto;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
 }
 
 .server-form {
@@ -41,6 +35,7 @@
 .server-form label {
   display: grid;
   gap: var(--space-1);
+  font-weight: var(--weight-semibold);
 }
 
 /* M14 T9: the OAuth consent page. */
@@ -55,5 +50,6 @@
 
 .consent-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--space-2);
 }

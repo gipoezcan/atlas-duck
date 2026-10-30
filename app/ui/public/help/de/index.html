@@ -3,15 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Übersicht - Atlas Duck Hilfe</title>
+<title>Übersicht - atlas-duck Benutzerhandbuch</title>
 <link rel="stylesheet" href="assets/help.css">
 <script src="assets/search-index.js" defer></script>
 <script src="assets/help.js" defer></script>
 </head>
 <body>
+<a class="skip-link" href="#content">Zum Inhalt springen</a>
 <header class="bar">
-<a class="brand" href="index.html">Atlas Duck Hilfe</a>
-<div class="search" hidden>
+<a class="brand" href="index.html">atlas-duck <span class="brand-sub">Benutzerhandbuch</span></a>
+<div class="search" role="search" hidden>
 <label class="visually-hidden" for="help-search">Hilfe durchsuchen</label>
 <input id="help-search" type="search" placeholder="Hilfe durchsuchen" autocomplete="off" data-empty="Keine Treffer">
 <ul id="help-results" hidden></ul>
@@ -39,7 +40,7 @@
 <li><a href="error-reference.html">Fehlerreferenz</a></li>
 </ul>
 </nav>
-<main>
+<main id="content" tabindex="-1">
 <h1>Übersicht</h1>
 <p>Dieses Handbuch richtet sich an alle, die atlas-duck verwenden: Benutzer und im Servermodus auch Administratoren und Auditoren.</p>
 <h2 id="what-is-atlas-duck">Was atlas-duck ist</h2>
@@ -50,7 +51,7 @@
 <li><strong>Servermodus</strong>: Ihre Organisation betreibt atlas-duck einmal in ihrem eigenen Netz. Es bedient viele Benutzer und ihre Agents. Auf Ihrem Computer wird nichts installiert, Sie arbeiten im Browser.</li>
 </ul>
 <p>Für Sie funktionieren beide Modi gleich. Diese Begriffe kehren auf jeder Seite wieder:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Begriff</th><th>Bedeutung</th></tr></thead>
 <tbody>
 <tr><td>Agent</td><td>Ein KI-Programm, das über atlas-duck in Ihrem Auftrag handelt. Es schlägt Schreibvorgänge vor, gibt aber nie etwas frei.</td></tr>
@@ -58,7 +59,7 @@
 <tr><td>Persönliches Zugriffstoken (PAT)</td><td>Ihr eigenes Jira- oder Confluence-Token. atlas-duck handelt immer als Sie, nie als gemeinsames Dienstkonto.</td></tr>
 <tr><td>Freigabe</td><td>Ihr ausdrückliches Ja oder Nein zu einem vorgeschlagenen Schreibvorgang, bevor er eine Instanz erreicht. Jeder Schreibvorgang braucht eine, in beiden Modi.</td></tr>
 <tr><td>Audit-Kette</td><td>Ihr manipulationssicherer Nachweis über alles, was atlas-duck für Sie getan hat. Jeder Benutzer hat eine, in beiden Modi.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <h2 id="how-it-works">So läuft eine Anfrage ab</h2>
 <ol>
 <li>Ein Agent bittet atlas-duck um etwas, zum Beispiel ein Jira-Ticket zu lesen oder zu ändern.</li>

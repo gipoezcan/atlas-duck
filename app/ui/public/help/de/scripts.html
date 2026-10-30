@@ -3,15 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Skripte - Atlas Duck Hilfe</title>
+<title>Skripte - atlas-duck Benutzerhandbuch</title>
 <link rel="stylesheet" href="assets/help.css">
 <script src="assets/search-index.js" defer></script>
 <script src="assets/help.js" defer></script>
 </head>
 <body>
+<a class="skip-link" href="#content">Zum Inhalt springen</a>
 <header class="bar">
-<a class="brand" href="index.html">Atlas Duck Hilfe</a>
-<div class="search" hidden>
+<a class="brand" href="index.html">atlas-duck <span class="brand-sub">Benutzerhandbuch</span></a>
+<div class="search" role="search" hidden>
 <label class="visually-hidden" for="help-search">Hilfe durchsuchen</label>
 <input id="help-search" type="search" placeholder="Hilfe durchsuchen" autocomplete="off" data-empty="Keine Treffer">
 <ul id="help-results" hidden></ul>
@@ -40,7 +41,7 @@
 <li><a href="error-reference.html">Fehlerreferenz</a></li>
 </ul>
 </nav>
-<main>
+<main id="content" tabindex="-1">
 <h1>Skripte</h1>
 <h2 id="what-are-scripts">Was Skripte sind</h2>
 <p>Mit einem Skript erledigt ein Agent viele Lesezugriffe in einer Anfrage. Es ist JavaScript: der Rumpf von <code>async function main(args, atlas)</code>. Darin ruft es Lesevorgänge mit <code>atlas.&lt;product&gt;.&lt;op&gt;(params)</code> oder <code>atlas.call</code> auf, blättert mit <code>atlas.all</code> durch Ergebnisse und kann mit <code>atlas.ops()</code> und <code>atlas.instances()</code> abfragen, was es gibt. <code>atlas.log</code> schreibt eine Notiz.</p>
@@ -50,7 +51,7 @@
 <h2 id="running-scripts">Skripte ausführen</h2>
 <p>Ein Agent reicht ein Skript mit <code>atlas-duck script run &lt;Datei&gt;</code> ein oder mit dem Tool <code>script_run</code> des MCP-Servers. Siehe <a href="agents-desktop.html#cli">Agents (Desktop)</a>.</p>
 <p>Was gerade läuft, sehen Sie in „Laufende Skripte“ in der Kopfzeile des Fensters „Freigaben“. Läuft nichts, steht dort „Es laufen keine Skripte.“; sonst führt das Fenster je Skript eine Zeile:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Spalte</th><th>Inhalt</th></tr></thead>
 <tbody>
 <tr><td>Anfrage</td><td>Die Anfrage, zu der das Skript gehört.</td></tr>
@@ -61,12 +62,12 @@
 <tr><td>Host-Aufrufe</td><td>Wie viele Aufrufe an die Instanz es gemacht hat.</td></tr>
 <tr><td>Abgerufene Bytes</td><td>Wie viele Daten es abgerufen hat.</td></tr>
 <tr><td>Aktionen</td><td>„Beenden“.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Ein Agent sollte ein Skript zuerst als Probelauf testen (<code>--dry-run</code>, Modus <code>sparse</code> oder <code>full</code>). Ein Probelauf braucht keine Freigabe. Er berührt Ihre Instanzen nicht: Die Aufrufe werden aus den dokumentierten Beispielen des jeweiligen Vorgangs beantwortet, und die Antwort ist mit <code>meta.dry_run: true</code> gekennzeichnet. Damit prüfen Sie, ob ein Skript läuft und die richtige Form hat, nicht, um Daten zu lesen.</p>
 <h2 id="limits">Limits und Isolierung</h2>
 <p>Jedes Skript läuft unter Limits, damit ein einzelnes Skript weder Ihren Rechner noch eine Instanz auslastet.</p>
 <p>Sie legen sie in den Einstellungen unter „Skript-Limits“ fest:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Limit</th><th>Standard</th></tr></thead>
 <tbody>
 <tr><td>Skript-Zeitlimit (s)</td><td>120</td></tr>
@@ -77,7 +78,7 @@
 <tr><td>Skript-Limit je Aufrufergebnis (MiB)</td><td>16</td></tr>
 <tr><td>Skript-Ergebnislimit (MiB)</td><td>16</td></tr>
 <tr><td>Gleichzeitige Skript-Aufrufe</td><td>4</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Ein Agent darf niedrigere Limits anfordern (mit <code>--limits</code> in der Befehlszeile oder dem Parameter <code>limits</code> von <code>script_run</code>), nie höhere. Ein Skript, das ein Limit überschreitet, endet mit <code>script_limit</code> (Exit 8).</p>
 <p>Zwei echte Skripte und zwei Probeläufe können gleichzeitig laufen. Weitere warten. Der Server wendet dieselben Zahlen je Benutzer an.</p>
 <p>Das Heap-Limit muss mindestens das 15-Fache des Limits je Aufrufergebnis betragen und das Prozesslimit mindestens das Heap-Limit plus 88 MiB. Die Einstellungen weisen Werte zurück, die das verletzen.</p>
