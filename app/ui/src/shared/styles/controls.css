@@ -119,8 +119,8 @@ input:disabled, select:disabled, textarea:disabled {
 }
 input[type="checkbox"], input[type="radio"] {
   accent-color: var(--accent);
-  width: 1.1rem;
-  height: 1.1rem;
+  width: 1.25rem;
+  height: 1.25rem;
   margin: 0;
 }
 label:has(> input[type="checkbox"]), label:has(> input[type="radio"]) {

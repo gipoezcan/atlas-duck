@@ -5,6 +5,7 @@ import { useText } from '../../shared/i18n/context';
 import { en } from '../../shared/i18n/dict';
 import { own } from '../../shared/text/own';
 import { api, type ConsentDetails, isConsentDetails, isConsentRedirect } from '../http';
+import { BrandMark } from '../../shared/BrandMark';
 import { nav } from '../shell/RequireSession';
 import { ServerHelpLink } from '../shell/ServerHelp';
 
@@ -59,6 +60,10 @@ export function ConsentError({ code }: { code: string }) {
   const t = useText();
   return (
     <main id="main" tabIndex={-1} className="window window-consent">
+      <p className="brand auth-brand">
+        <BrandMark />
+        atlas-duck
+      </p>
       <h1>{t.server.consent.title}</h1>
       <ServerHelpLink path="/oauth/consent" label={t.server.consent.title} />
       <p role="alert" className="notice notice-danger">
@@ -123,6 +128,10 @@ export function Consent({ req }: { req: string }) {
 
   return (
     <main id="main" tabIndex={-1} className="window window-consent">
+      <p className="brand auth-brand">
+        <BrandMark />
+        atlas-duck
+      </p>
       <h1>{t.server.consent.title}</h1>
       <ServerHelpLink path="/oauth/consent" label={t.server.consent.title} />
       {errorKey !== null ? (

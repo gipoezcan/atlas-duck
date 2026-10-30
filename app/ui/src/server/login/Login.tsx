@@ -4,6 +4,7 @@ import type { Dict } from '../../shared/i18n';
 import { useLang, useText } from '../../shared/i18n/context';
 import { en } from '../../shared/i18n/dict';
 
+import { BrandMark } from '../../shared/BrandMark';
 import { nav } from '../shell/RequireSession';
 import { docsHref, serverTarget } from '../shell/ServerHelp';
 
@@ -93,7 +94,11 @@ export function Login({ next }: { next: string | null }) {
   };
 
   return (
-    <main className="window window-login">
+    <main id="main" tabIndex={-1} className="window window-login">
+      <p className="brand auth-brand">
+        <BrandMark />
+        atlas-duck
+      </p>
       <h1>{t.server.login.title}</h1>
       <form className="server-form" onSubmit={(e) => void submit(e)}>
         <label>
@@ -122,7 +127,7 @@ export function Login({ next }: { next: string | null }) {
         </button>
         {error !== null ? <p role="alert" className="notice notice-danger">{error}</p> : null}
       </form>
-      <p>
+      <p className="auth-help">
         <a href={docsHref(lang, serverTarget('/login'))} target="_blank" rel="noreferrer">
           {t.server.login.help}
         </a>

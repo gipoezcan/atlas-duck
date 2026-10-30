@@ -23,7 +23,7 @@ h3 { font-size: var(--text-lg); }
 h4, h5, h6 { font-size: var(--text-md); }
 /* The windows move focus to a heading or section (tabindex="-1") programmatically, and browsers
    count that as focus-visible: no ring on those non-interactive targets. Controls keep theirs. */
-:is(h1, h2, h3, h4, h5, h6, section)[tabindex="-1"]:focus { outline: none; }
+:is(h1, h2, h3, h4, h5, h6, section, main, div)[tabindex="-1"]:focus { outline: none; }
 p, ul, ol, dl, pre, table, fieldset {
   margin: 0 0 var(--space-3);
 }

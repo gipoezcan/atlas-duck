@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import { LANG_PREFS, type LangPref } from '../../shared/i18n';
 import { useText } from '../../shared/i18n/context';
@@ -92,6 +92,11 @@ export function ServerHeader() {
   // `/credentials/` is the same page as `/credentials`.
   const path = window.location.pathname.replace(/(.)\/+$/, '$1');
   const here = serverTarget(path) === undefined ? undefined : (path as ServerPath);
+  const title = here === undefined ? undefined : pageName[here];
+  // The tab title follows the page language (the static <title> is English).
+  useEffect(() => {
+    if (title !== undefined) document.title = `atlas-duck: ${title}`;
+  }, [title]);
   const admin = session?.roles.includes('admin') ?? false;
   const auditor = session?.roles.includes('auditor') ?? false;
   // `/` serves the approvals page; the consent step belongs to the connected apps.

@@ -235,3 +235,20 @@
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-md);
 }
+
+/* M17: the bar is two deliberate rows: product name and tools, then the navigation. */
+.app-bar {
+  padding-block: var(--space-2);
+  row-gap: var(--space-1);
+}
+.app-bar > .brand {
+  order: 1;
+}
+.app-bar > .app-bar-tools {
+  order: 2;
+  margin-inline-start: auto;
+}
+.app-bar > nav {
+  order: 3;
+  flex: 1 1 100%;
+}
