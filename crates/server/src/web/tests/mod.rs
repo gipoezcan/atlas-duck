@@ -929,8 +929,16 @@ async fn pages_carry_the_csp_and_no_store() {
     );
     assert_eq!(
         crate::static_files::CSP,
-        "default-src 'self'; frame-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+        "default-src 'self'; frame-src 'self'; script-src 'self'; style-src 'self' 'sha256-QjDb0ujXyJk4o6e18x54ga50tEBTqHBD+DgAUfAsG7I='; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
     );
+    // The preview frame inherits this policy: it must admit the hash of the embedded preview.css.
+    {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        let css = include_str!("../../../../../app/ui/public/preview.css");
+        let hash = base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(css.as_bytes()));
+        assert!(crate::static_files::CSP.contains(&format!("'sha256-{hash}'")));
+    }
     assert_eq!(hd[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
     assert_eq!(hd[header::REFERRER_POLICY], "no-referrer");
     assert_eq!(hd[header::CACHE_CONTROL], "no-store");

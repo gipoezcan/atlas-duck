@@ -65,7 +65,7 @@ function writePreview(inputs: EditInput[], over: Record<string, unknown> = {}): 
 }
 
 function openRow(item: QueueItem) {
-  fireEvent.click(screen.getByRole('button', { name: `Open ${item.op_id} ${item.target_display}` }));
+  fireEvent.click(screen.getByRole('button', { name: `Review ${item.op_id} ${item.target_display}` }));
 }
 
 /** Opens the write, waits out the inert period and shows the Structured tab. */

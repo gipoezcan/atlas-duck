@@ -94,7 +94,7 @@ async function openPanel(ctx: RedactionContext = context(), kind = 'jira_issue',
   mockedPreview.mockImplementation(() => Promise.resolve(readPreview(READ.candidate_rev, ctx, kind)));
   mockedReport.mockResolvedValue(OK);
   await renderWindow();
-  fireEvent.click(screen.getByRole('button', { name: `Open ${READ.op_id} ${READ.target_display}` }));
+  fireEvent.click(screen.getByRole('button', { name: `Review ${READ.op_id} ${READ.target_display}` }));
   await flush();
   advance(INERT_MS);
   fireEvent.click(screen.getByRole('tab', { name: 'Structured' }));
@@ -415,7 +415,7 @@ describe('read redaction panel (spec 5.3, 6.3)', () => {
     );
     mockedReport.mockResolvedValue(OK);
     await renderWindow();
-    fireEvent.click(screen.getByRole('button', { name: `Open ${script.op_id} ${script.target_display}` }));
+    fireEvent.click(screen.getByRole('button', { name: `Review ${script.op_id} ${script.target_display}` }));
     await flush();
     advance(INERT_MS);
     fireEvent.click(screen.getByRole('tab', { name: 'Structured' }));
@@ -450,7 +450,7 @@ describe('read redaction panel (spec 5.3, 6.3)', () => {
     mockedRaw.mockResolvedValue({ page: 0, page_count: 1, total_bytes: 3, bytes_b64: b64('{"a'), display: '' });
     mockedPreview.mockResolvedValue(readPreview(READ.candidate_rev));
     await renderWindow();
-    fireEvent.click(screen.getByRole('button', { name: `Open ${READ.op_id} ${READ.target_display}` }));
+    fireEvent.click(screen.getByRole('button', { name: `Review ${READ.op_id} ${READ.target_display}` }));
     await flush();
     fireEvent.click(screen.getByRole('tab', { name: 'Structured' }));
     await flush();
@@ -464,7 +464,7 @@ describe('read redaction panel (spec 5.3, 6.3)', () => {
     );
     mockedPreview.mockResolvedValue(readPreview(READ.candidate_rev));
     await renderWindow();
-    fireEvent.click(screen.getByRole('button', { name: `Open ${READ.op_id} ${READ.target_display}` }));
+    fireEvent.click(screen.getByRole('button', { name: `Review ${READ.op_id} ${READ.target_display}` }));
     await flush();
     fireEvent.click(screen.getByRole('tab', { name: 'Structured' }));
     await flush();
@@ -550,7 +550,7 @@ describe('redaction rounds on a redacted revision', () => {
       previewOf(READ, 'jira_issue', { also_appears_in: ['fields.description', 'fields.‮x'] }, context([mask])),
     );
     await renderWindow();
-    fireEvent.click(screen.getByRole('button', { name: `Open ${READ.op_id} ${READ.target_display}` }));
+    fireEvent.click(screen.getByRole('button', { name: `Review ${READ.op_id} ${READ.target_display}` }));
     await flush();
     fireEvent.click(screen.getByRole('tab', { name: 'Structured' }));
     await flush();
@@ -856,7 +856,7 @@ describe('the selected value and the candidate read', () => {
     mockedPreview.mockResolvedValue(readPreview(READ.candidate_rev));
     mockedReport.mockResolvedValue(OK);
     await renderWindow();
-    fireEvent.click(screen.getByRole('button', { name: `Open ${READ.op_id} ${READ.target_display}` }));
+    fireEvent.click(screen.getByRole('button', { name: `Review ${READ.op_id} ${READ.target_display}` }));
     await flush();
     fireEvent.click(screen.getByRole('tab', { name: 'Structured' }));
     await flush();
@@ -885,7 +885,7 @@ describe('script release items (M8 T24, spec 9.5)', () => {
     mockedPreview.mockResolvedValue(previewOf(script, 'script', { preselect }, ctx));
     mockedReport.mockImplementation(report);
     await renderWindow();
-    fireEvent.click(screen.getByRole('button', { name: `Open ${script.op_id} ${script.target_display}` }));
+    fireEvent.click(screen.getByRole('button', { name: `Review ${script.op_id} ${script.target_display}` }));
     await flush();
     advance(INERT_MS);
     fireEvent.click(screen.getByRole('tab', { name: 'Structured' }));
@@ -986,7 +986,7 @@ describe('a mirror-blocked item (M8 T24, T19c M-11, L217)', () => {
       Promise.resolve(ops.length === 0 ? { ...OK, blocked: flagged } : OK),
     );
     await renderWindow();
-    fireEvent.click(screen.getByRole('button', { name: `Open ${READ.op_id} ${READ.target_display}` }));
+    fireEvent.click(screen.getByRole('button', { name: `Review ${READ.op_id} ${READ.target_display}` }));
     await flush();
     advance(INERT_MS);
     fireEvent.click(screen.getByRole('tab', { name: 'Structured' }));
@@ -1048,7 +1048,7 @@ describe('a mirror-blocked item (M8 T24, T19c M-11, L217)', () => {
     mockedPreview.mockResolvedValue(blockedPreview([held]));
     mockedReport.mockRejectedValue({ kind: 'not_approvable' });
     await renderWindow();
-    fireEvent.click(screen.getByRole('button', { name: `Open ${READ.op_id} ${READ.target_display}` }));
+    fireEvent.click(screen.getByRole('button', { name: `Review ${READ.op_id} ${READ.target_display}` }));
     await flush();
     advance(INERT_MS);
     fireEvent.click(screen.getByRole('tab', { name: 'Structured' }));
@@ -1146,7 +1146,7 @@ describe('a mirror-blocked item (M8 T24, T19c M-11, L217)', () => {
     mockedPreview.mockResolvedValue(blockedPreview());
     mockedReport.mockRejectedValue({ kind: 'internal' });
     await renderWindow();
-    fireEvent.click(screen.getByRole('button', { name: `Open ${READ.op_id} ${READ.target_display}` }));
+    fireEvent.click(screen.getByRole('button', { name: `Review ${READ.op_id} ${READ.target_display}` }));
     await flush();
     advance(INERT_MS);
     fireEvent.click(screen.getByRole('tab', { name: 'Structured' }));
@@ -1238,7 +1238,7 @@ describe('the other release controls while redactions are unsent', () => {
     serveCandidate(DOC);
     mockedPreview.mockResolvedValue(readPreview(READ.candidate_rev, context([{ preset: 'status_only' }])));
     await renderWindow();
-    fireEvent.click(screen.getByRole('button', { name: `Open ${READ.op_id} ${READ.target_display}` }));
+    fireEvent.click(screen.getByRole('button', { name: `Review ${READ.op_id} ${READ.target_display}` }));
     await flush();
     fireEvent.click(screen.getByRole('tab', { name: 'Structured' }));
     await flush();
@@ -1257,7 +1257,7 @@ describe('the other release controls while redactions are unsent', () => {
     serveCandidate(DOC);
     mockedPreview.mockResolvedValue(previewOf(READ, 'outcome', {}, context()));
     await renderWindow();
-    fireEvent.click(screen.getByRole('button', { name: `Open ${READ.op_id} ${READ.target_display}` }));
+    fireEvent.click(screen.getByRole('button', { name: `Review ${READ.op_id} ${READ.target_display}` }));
     await flush();
     fireEvent.click(screen.getByRole('tab', { name: 'Structured' }));
     await flush();

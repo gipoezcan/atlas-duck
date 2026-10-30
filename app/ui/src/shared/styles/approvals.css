@@ -20,6 +20,7 @@
 .windowed-row { box-sizing: border-box; overflow: hidden; border-bottom: 1px solid var(--border); }
 /* An outer shadow, not a border: Windowed's height is its scroll viewport, a border would cut the last row. */
 .window-approvals > .windowed {
+  box-sizing: content-box; /* the border sits outside the rows-high viewport */
   margin-bottom: var(--space-4);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -30,10 +31,31 @@
    The flags line wraps. A row is QUEUE_ROW_REM (7.5rem) high, so the rem lines and the row scale together. */
 .queue-line { display: flex; flex-wrap: nowrap; align-items: center; gap: 0.5rem; height: 2rem; overflow: hidden; white-space: nowrap; }
 .queue-line > * { flex: none; }
-.queue-line > .agent-text, .queue-line > .target { flex: 0 1 auto; min-width: 0; }
-.queue-line > .target { overflow: hidden; text-overflow: ellipsis; }
+.queue-line > .agent-text, .queue-line > .target, .queue-line > .alias { flex: 0 1 auto; min-width: 0; }
+.queue-line > .target, .queue-line > .alias { overflow: hidden; text-overflow: ellipsis; }
 .queue-flags { flex-wrap: wrap; height: 3.5rem; row-gap: 0; align-content: center; }
-.queue-item { padding: 0 var(--space-3); }
+/* An item row: checkbox | the three lines | the Review button, both side controls centred on the
+   whole row so they keep full control height while the lines keep the row contract. */
+.queue-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  height: 100%;
+  padding: 0 var(--space-4);
+}
+.queue-item > input[type="checkbox"], .queue-group > input[type="checkbox"] { flex: none; width: 1.25rem; height: 1.25rem; margin: 0; }
+.queue-lines { flex: 1 1 auto; min-width: 0; }
+.queue-open { flex: none; gap: var(--space-1); color: var(--accent); border-color: var(--accent); }
+.queue-line > .age { margin-left: auto; padding-left: var(--space-2); color: var(--text-muted); font-size: var(--text-sm); }
+.queue-item .op-id, .detail-summary .op-id { font-family: var(--font-mono); font-weight: var(--weight-semibold); }
+.queue-item .class, .detail-summary .class {
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-size: var(--text-sm);
+}
+.queue-item .alias, .detail-summary .alias { color: var(--text-muted); font-size: var(--text-sm); }
 .queue-item:hover { background: var(--row-hover); }
 .queue-item[aria-current="true"] { background: var(--row-selected); box-shadow: inset 3px 0 0 var(--accent); }
 .queue-group {
@@ -41,10 +63,11 @@
   align-items: center;
   gap: 0.5rem;
   height: 100%;
-  padding: 0 var(--space-3);
-  font-weight: var(--weight-bold);
+  padding: 0 var(--space-4);
+  background: var(--surface-sunken);
+  font-weight: var(--weight-semibold);
   font-size: var(--text-sm);
-  color: var(--text-muted);
+  color: var(--text);
 }
 .target { font-family: var(--font-mono); font-size: var(--text-sm); }
 
@@ -60,6 +83,16 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
 }
+.detail-heading {
+  margin: 0;
+  font-size: var(--text-sm);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.detail-summary { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-2); margin: var(--space-1) 0 var(--space-3); }
+.detail-summary > .queue-item .op-id, .detail-summary .op-id { font-size: var(--text-xl); }
+.detail-summary > .target { overflow-wrap: anywhere; }
 .detail-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: var(--space-2) 0; }
 .consequences { flex-basis: 100%; margin: 0; padding-left: 1.25rem; }
 .detail [role="tablist"] {
@@ -88,7 +121,7 @@
   font-weight: var(--weight-bold);
   text-decoration: none;
 }
-.detail-panel iframe { display: block; width: 100%; height: 28rem; border: 1px solid var(--border); }
+.detail-panel iframe { display: block; width: 100%; height: 28rem; border: 1px solid var(--border); border-radius: var(--radius-md); }
 .raw-nav { display: flex; gap: 0.5rem; align-items: center; }
 .raw-text, .params-text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 28rem; overflow: auto; }
 .request-tab dt { font-weight: var(--weight-bold); }
@@ -123,9 +156,9 @@
 .keyboard-legend {
   display: flex;
   flex-wrap: wrap;
-  gap: 0 1rem;
+  gap: var(--space-1) var(--space-5);
   list-style: none;
-  margin: 0 0 0.5rem 0;
+  margin: 0 0 var(--space-4) 0;
   padding: 0;
   font-size: 0.85em;
   color: var(--text-muted);

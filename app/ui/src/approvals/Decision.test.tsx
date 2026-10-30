@@ -47,7 +47,7 @@ afterEach(() => {
 });
 
 function openRow(item: QueueItem) {
-  fireEvent.click(screen.getByRole('button', { name: `Open ${item.op_id} ${item.target_display}` }));
+  fireEvent.click(screen.getByRole('button', { name: `Review ${item.op_id} ${item.target_display}` }));
 }
 
 /** A preview answer the test resolves when it wants (`resolve`). */

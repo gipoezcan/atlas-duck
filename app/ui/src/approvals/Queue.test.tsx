@@ -250,7 +250,7 @@ describe('Approvals window', () => {
       srcdoc: '<p>x</p>',
       redaction: null,
     });
-    fireEvent.click(await screen.findByRole('button', { name: 'Open jira.issue.get PROJ-1' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Review jira.issue.get PROJ-1' }));
     await screen.findByTitle('Preview');
     expect(previewFetch).toHaveBeenCalledTimes(1);
 

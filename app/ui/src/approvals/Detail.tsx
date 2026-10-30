@@ -1,9 +1,11 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useImperativeHandle,
   useRef,
   useState,
+  type KeyboardEvent,
   type ReactNode,
   type Ref,
 } from 'react';
@@ -157,6 +159,19 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
   const [redactionApplied, setRedactionApplied] = useState(false);
   const panelRef = useRef<HTMLElement>(null);
   const heading = useRef<HTMLHeadingElement>(null);
+  const tabBase = useId();
+  // Arrow keys, Home and End move between the tabs (WAI-ARIA tabs pattern, automatic activation).
+  const onTabKey = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+    const i = TAB_IDS.indexOf(tab);
+    const n = TAB_IDS.length;
+    const next = { ArrowRight: (i + 1) % n, ArrowLeft: (i - 1 + n) % n, Home: 0, End: n - 1 }[e.key];
+    const id = next === undefined ? undefined : TAB_IDS[next];
+    if (id === undefined) return;
+    e.preventDefault();
+    setTab(id);
+    document.getElementById(`${tabBase}-${id}`)?.focus();
+  };
   const latest = useRef(0);
 
   const open = useCallback(() => {
@@ -527,13 +542,14 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
 
   return (
     <article className="detail" aria-label={t.approvals.detail.heading}>
-      <h2 ref={heading} tabIndex={-1}>
+      <h2 ref={heading} tabIndex={-1} className="detail-heading">
         {t.approvals.detail.heading}
       </h2>
       <p className="detail-summary">
-        <span className="op-id">{item.op_id}</span> <span className="alias">{item.instance_alias}</span>{' '}
-        <span className="target">{item.target_display}</span>{' '}
-        <span className="class">{own(t.approvals.class_labels, item.class) ?? item.class}</span>
+        <span className="op-id">{item.op_id}</span>{' '}
+        <span className="class">{own(t.approvals.class_labels, item.class) ?? item.class}</span>{' '}
+        <span className="alias">{item.instance_alias}</span>{' '}
+        <span className="target">{item.target_display}</span>
       </p>
       {releaseBlocked === null ? null : (
         <div className="caution-strip" role="alert">
@@ -572,20 +588,23 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
           ) : null
         }
       />
-      <div role="tablist" aria-label={t.approvals.detail.tabs_label}>
+      <div role="tablist" aria-label={t.approvals.detail.tabs_label} onKeyDown={onTabKey}>
         {TAB_IDS.map((id) => (
           <button
             key={id}
+            id={`${tabBase}-${id}`}
             type="button"
             role="tab"
             aria-selected={tab === id}
+            aria-controls={`${tabBase}-panel`}
+            tabIndex={tab === id ? 0 : -1}
             onClick={() => setTab(id)}
           >
             {t.approvals.detail[`tab_${id}`]}
           </button>
         ))}
       </div>
-      <div role="tabpanel" className="detail-panel">
+      <div role="tabpanel" tabIndex={0} id={`${tabBase}-panel`} aria-labelledby={`${tabBase}-${tab}`} className="detail-panel">
         {panel()}
       </div>
     </article>

@@ -81,7 +81,7 @@ export const approvals: Dict['approvals'] = {
     similar_request: 'ähnliche Anfrage',
     select_session: 'alle der Sitzung auswählen',
     select_item: 'auswählen',
-    open: 'Öffnen',
+    open: 'Prüfen',
     session: 'Sitzung',
     of_session: 'Sitzung',
     load_failed: 'Die Warteschlange konnte nicht geladen werden',
