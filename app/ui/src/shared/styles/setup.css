@@ -2,12 +2,18 @@
 .window-setup {
   max-width: 44rem;
 }
+@media (min-width: 64rem) {
+  .window-setup:has(.setup-layout) {
+    max-width: 64rem;
+  }
+}
 .window-setup .window-body > section > h2:first-child {
   font-size: var(--text-xl);
 }
 .window-setup .window-body > section > button {
   margin: 0 var(--space-2) var(--space-2) 0;
 }
+/* Progress list and step cards. */
 .window-setup .page-header > .notice {
   margin-bottom: 0;
 }

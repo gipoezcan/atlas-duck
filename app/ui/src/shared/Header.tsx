@@ -1,7 +1,9 @@
 import { openWindow, quit, type OpenableWindow } from './ipc/invoke';
 import type { StatusLine } from './ipc/types';
 import { HelpButton } from './HelpLink';
+import { BrandMark } from './BrandMark';
 import { useText } from './i18n/context';
+import { SkipLink } from './SkipLink';
 
 const BUTTONS = ['settings', 'audit', 'running_scripts', 'onboarding'] as const satisfies readonly OpenableWindow[];
 
@@ -18,18 +20,32 @@ interface HeaderProps {
 export function Header({ lines }: HeaderProps) {
   const t = useText();
   return (
+    <>
+    <SkipLink />
     <header className="app-header">
-      <nav aria-label={t.approvals.header.windows_label}>
-        {BUTTONS.map((w) => (
-          <button key={w} type="button" onClick={() => void openWindow(w).catch(ignore)}>
-            {t.approvals.header[w]}
+      <div className="app-bar">
+        <span className="brand">
+          <BrandMark />
+          atlas-duck
+        </span>
+        <nav aria-label={t.approvals.header.windows_label}>
+          <ul className="nav-list">
+            {BUTTONS.map((w) => (
+              <li key={w}>
+                <button type="button" onClick={() => void openWindow(w).catch(ignore)}>
+                  {t.approvals.header[w]}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </nav>
+        <div className="app-bar-tools">
+          <HelpButton window="approvals" />
+          <button type="button" onClick={() => void quit().catch(ignore)}>
+            {t.approvals.header.quit}
           </button>
-        ))}
-        <HelpButton window="approvals" />
-        <button type="button" onClick={() => void quit().catch(ignore)}>
-          {t.approvals.header.quit}
-        </button>
-      </nav>
+        </div>
+      </div>
       {lines.length > 0 ? (
         <ul className="banner" aria-label={t.approvals.header.banner_label}>
           {lines.map((l) => (
@@ -41,6 +57,7 @@ export function Header({ lines }: HeaderProps) {
         </ul>
       ) : null}
     </header>
+    </>
   );
 }
 

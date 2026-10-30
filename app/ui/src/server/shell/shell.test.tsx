@@ -149,4 +149,22 @@ describe('server shell', () => {
     expect(screen.getByRole('link', { name: SHELL_TEXT.help })).toBeTruthy();
     expect(screen.queryByRole('link', { name: /^Help: / })).toBeNull();
   });
+
+  it('marks_the_current_page_and_has_a_skip_link', async () => {
+    window.history.replaceState(null, '', '/credentials');
+    vi.mocked(loadSession).mockResolvedValue(session(['user']));
+    render(
+      <RequireSession>
+        <ServerHeader />
+      </RequireSession>,
+    );
+    await flush();
+    const skip = screen.getByRole('link', { name: 'Skip to main content' });
+    expect(skip.getAttribute('href')).toBe('#main');
+    expect(skip.compareDocumentPosition(screen.getByRole('banner')) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const current = screen.getAllByRole('link').filter((a) => a.getAttribute('aria-current') === 'page');
+    expect(current.map((a) => a.textContent)).toEqual([SHELL_TEXT.credentials]);
+    expect(screen.getByRole('link', { name: 'atlas-duck' }).getAttribute('href')).toBe('/approvals');
+    expect(screen.getByRole('navigation', { name: SHELL_TEXT.pages }).querySelectorAll('ul.nav-list > li')).toHaveLength(5);
+  });
 });

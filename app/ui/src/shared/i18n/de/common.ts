@@ -8,6 +8,7 @@ export const common: Dict['common'] = {
   save: 'Speichern',
   retry: 'Erneut versuchen',
   language: 'Sprache',
+  skip_to_main: 'Zum Hauptinhalt springen',
   lang_auto: 'Automatisch',
   lang_de: 'Deutsch',
   lang_en: 'English',

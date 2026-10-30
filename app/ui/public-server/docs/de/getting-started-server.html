@@ -3,15 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Erste Schritte (Server) - Atlas Duck Hilfe</title>
+<title>Erste Schritte (Server) - atlas-duck Benutzerhandbuch</title>
 <link rel="stylesheet" href="assets/help.css">
 <script src="assets/search-index.js" defer></script>
 <script src="assets/help.js" defer></script>
 </head>
 <body>
+<a class="skip-link" href="#content">Zum Inhalt springen</a>
 <header class="bar">
-<a class="brand" href="/docs/de/">Atlas Duck Hilfe</a>
-<div class="search" hidden>
+<a class="brand" href="/docs/de/">atlas-duck <span class="brand-sub">Benutzerhandbuch</span></a>
+<div class="search" role="search" hidden>
 <label class="visually-hidden" for="help-search">Hilfe durchsuchen</label>
 <input id="help-search" type="search" placeholder="Hilfe durchsuchen" autocomplete="off" data-empty="Keine Treffer">
 <ul id="help-results" hidden></ul>
@@ -42,11 +43,11 @@
 <li><a href="/docs/de/error-reference">Fehlerreferenz</a></li>
 </ul>
 </nav>
-<main>
+<main id="content" tabindex="-1">
 <h1>Erste Schritte (Server)</h1>
 <h2 id="sign-in">Anmelden</h2>
 <p>Öffnen Sie die Adresse von atlas-duck, die Ihnen Ihre Organisation genannt hat. Die Seite &quot;Bei atlas-duck anmelden&quot; fragt nach Benutzername und Passwort. Das sind Ihre Zugangsdaten für das Verzeichnis Ihrer Organisation (Domänenanmeldung). atlas-duck prüft das Passwort gegen das Verzeichnis und speichert es nie.</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Meldung</th><th>Bedeutung</th></tr></thead>
 <tbody>
 <tr><td>Benutzername oder Passwort ist falsch.</td><td>Das Verzeichnis hat die Zugangsdaten nicht akzeptiert.</td></tr>
@@ -54,7 +55,7 @@
 <tr><td>Das Verzeichnis ist nicht erreichbar. Versuchen Sie es später erneut.</td><td>Das Verzeichnis Ihrer Organisation antwortet nicht.</td></tr>
 <tr><td>Ihr Konto darf atlas-duck nicht verwenden.</td><td>Ihr Konto gehört zu keiner der Verzeichnisgruppen, die atlas-duck zulässt, oder es ist deaktiviert. Wenden Sie sich an Ihren Administrator.</td></tr>
 <tr><td>Die Anmeldung ist fehlgeschlagen. Versuchen Sie es erneut.</td><td>Jeder andere Fehler.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Nach der Anmeldung hält Ihr Browser eine Sitzung. Eine Sitzung ist kurzlebig: Sie endet nach einer Zeit ohne Aktivität und nach einer Höchstdauer, beides legen die Betreiber des Servers fest (standardmäßig 30 Minuten Inaktivität und insgesamt 8 Stunden). Danach melden Sie sich neu an. &quot;Abmelden&quot; in der Kopfzeile beendet die Sitzung sofort.</p>
 <p>Die Kopfzeile verweist auf die Seiten, die Sie verwenden können: Freigaben, Zugangsdaten, API-Schlüssel, Verbundene Apps, Mein Audit-Protokoll und, wenn Sie die Rolle haben, Auditor und Administration. Dort finden Sie auch die Sprachauswahl und den Eintrag Hilfe.</p>
 <h2 id="add-credentials">Tokens hinterlegen</h2>
@@ -74,13 +75,13 @@
 <p>Weder ein API-Schlüssel noch eine verbundene App kann etwas freigeben. Sie entscheiden auf der Seite &quot;Freigaben&quot;: siehe <a href="/docs/de/approvals">Freigaben</a>. Damit Sie benachrichtigt werden, wenn etwas auf Sie wartet, wählen Sie dort &quot;Benachrichtigungen aktivieren&quot; (<a href="/docs/de/settings#notifications">Einstellungen</a>).</p>
 <h2 id="roles">Rollen</h2>
 <p>Was Sie tun dürfen, hängt von Ihrer Rolle ab, und Ihre Rollen ergeben sich bei der Anmeldung aus Ihren Verzeichnisgruppen.</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Rolle</th><th>Was sie darf</th></tr></thead>
 <tbody>
 <tr><td>Benutzer</td><td>Alle, die sich anmelden können. Sie besitzen Ihre Tokens, geben die Schreibvorgänge Ihrer Agents frei und besitzen Ihre Audit-Kette.</td></tr>
 <tr><td>Auditor</td><td>Liest und exportiert die Audit-Kette jedes Benutzers. Jeder solche Lesezugriff wird in der eigenen Kette des Auditors festgehalten. Siehe <a href="/docs/de/auditor">Auditor</a>.</td></tr>
 <tr><td>Administrator</td><td>Betreibt die Installation: Instanzen, Schlüssel, Backups. Ein Administrator hat keinen Zugriff auf die Tokens oder die Audit-Inhalte der Benutzer. Siehe <a href="/docs/de/admin">Administration</a>.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Die Links &quot;Auditor&quot; und &quot;Administration&quot; erscheinen in der Kopfzeile nur, wenn Sie die Rolle haben. Wer zu keiner der eingerichteten Gruppen gehört, kann sich nicht anmelden.</p>
 </main>
 </div>

@@ -121,6 +121,12 @@ const FORBIDDEN_ATTRIBUTES = new Set([
   'ping', 'longdesc', 'cite', 'manifest', 'codebase', 'usemap',
 ]);
 
+/** M17: the skip link and the Settings "On this page" links are the app's own fixed in-page anchors, never built from a wire string. */
+function isOwnAnchor(el: Element, href: string): boolean {
+  if (el.classList.contains('skip-link')) return href === '#main';
+  return el.closest('.page-toc') !== null && /^#settings-[a-z-]+$/.test(href);
+}
+
 function scan(where: string): string[] {
   const found: string[] = [];
   const g = window as unknown as Record<string, unknown>;
@@ -142,7 +148,8 @@ function scan(where: string): string[] {
       const attr = name.toLowerCase();
       const value = el.getAttribute(name) ?? '';
       if (attr.startsWith('on')) found.push(`${where}: <${tag} ${name}>`);
-      else if (FORBIDDEN_ATTRIBUTES.has(attr)) found.push(`${where}: <${tag} ${name}>`);
+      // M17: the skip link is the app's own fixed in-page anchor, never built from a wire string.
+      else if (FORBIDDEN_ATTRIBUTES.has(attr) && !(attr === 'href' && isOwnAnchor(el, value))) found.push(`${where}: <${tag} ${name}>`);
       else if (attr === 'style' && /url\s*\(|javascript:|expression\s*\(/i.test(value)) {
         found.push(`${where}: <${tag} style=${value.slice(0, 40)}>`);
       } else if (frame && attr !== 'sandbox' && attr !== 'srcdoc' && attr !== 'title') {

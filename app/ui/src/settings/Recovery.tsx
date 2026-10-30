@@ -109,8 +109,8 @@ export function Recovery({ onChanged }: { onChanged: () => void }) {
 
   const waiting = restoring && running(job, 'restore');
   return (
-    <section aria-label={t.settings.recovery.recovery}>
-      <h2>{t.settings.recovery.recovery}</h2>
+    <section id="settings-recovery" aria-label={t.settings.recovery.recovery}>
+      <h2 tabIndex={-1}>{t.settings.recovery.recovery}</h2>
       <p>{t.settings.recovery.backup_tokens}</p>
       <p>{t.settings.recovery.backup_retention}</p>
       <p>{t.settings.recovery.upgrade_backup}</p>
@@ -224,7 +224,7 @@ export function OldInstalls() {
   };
 
   return (
-    <section aria-label={t.settings.recovery.orphans}>
+    <section id="settings-old-installs" aria-label={t.settings.recovery.orphans}>
       <h2 tabIndex={-1} ref={heading}>
         {t.settings.recovery.orphans}
       </h2>

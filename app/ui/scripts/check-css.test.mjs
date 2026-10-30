@@ -75,8 +75,8 @@ describe('check-css', () => {
 
   test('parseTokens_splits_light_and_dark', () => {
     const { light, dark } = parseTokens(BASELINE['shared/styles/tokens.css']);
-    assert.equal(light.get('bg'), '#ffffff');
-    assert.equal(dark.get('bg'), '#16181d');
+    assert.equal(light.get('bg'), '#f7f7f5');
+    assert.equal(dark.get('bg'), '#141517');
     assert.ok(!dark.has('space-1'), 'non-colour tokens live only in the light block');
   });
 
@@ -88,19 +88,19 @@ describe('check-css', () => {
   });
 
   test('missing_dark_token_fails', () => {
-    const text = tokensWith('    --row-hover: #222630;\n', '');
+    const text = tokensWith('    --row-hover: #26272b;\n', '');
     const v = violationsFor({ 'shared/styles/tokens.css': text });
     assert.ok(hasMatch(v, /--row-hover missing in the dark scheme/), v.join('\n'));
   });
 
   test('missing_light_token_fails', () => {
-    const text = tokensWith('  --row-hover: #f3f5f7;\n', '');
+    const text = tokensWith('  --row-hover: #efefec;\n', '');
     const v = violationsFor({ 'shared/styles/tokens.css': text });
     assert.ok(hasMatch(v, /--row-hover missing in the light scheme/), v.join('\n'));
   });
 
   test('credential_token_missing_in_dark_fails', () => {
-    const text = BASELINE['credential/credential.css'].replace('    --focus: #6eb0ff;\n', '');
+    const text = BASELINE['credential/credential.css'].replace('    --focus: #8ab4ff;\n', '');
     const v = violationsFor({ 'credential/credential.css': text });
     assert.ok(hasMatch(v, /credential\.css: token --focus missing in the dark scheme/), v.join('\n'));
   });
@@ -133,6 +133,11 @@ describe('check-css', () => {
     assert.ok(hasMatch(v, /removes the outline/), v.join('\n'));
   });
 
+  test('system_colour_keywords_pass_in_forced_colors_block', () => {
+    const css = '@media (forced-colors: active) { .x { outline: 2px solid Highlight; color: CanvasText; border-color: GrayText; background: Canvas; } }\n';
+    assert.deepEqual(violationsFor({ 'shared/styles/extra.css': css }), []);
+  });
+
   test('currentColor_and_var_pass', () => {
     const css = '.x { border: 1px solid currentColor; color: var(--text); background: transparent; outline-color: inherit; }\n' +
       '.y { font-family: var(--font-sans); content: "red"; }\n';
@@ -140,13 +145,13 @@ describe('check-css', () => {
   });
 
   test('low_contrast_pair_fails_with_pair_named', () => {
-    const text = tokensWith('  --text-muted: #57606a;', '  --text-muted: #b0b0b0;');
+    const text = tokensWith('  --text-muted: #4a4a45;', '  --text-muted: #b0b0b0;');
     const v = violationsFor({ 'shared/styles/tokens.css': text });
     assert.ok(hasMatch(v, /contrast --text-muted on --bg \(light\) is [0-9.]+, needs 4\.5/), v.join('\n'));
   });
 
   test('low_contrast_dark_pair_fails_with_pair_named', () => {
-    const text = tokensWith('    --focus: #6eb0ff;', '    --focus: #1e2128;');
+    const text = tokensWith('    --focus: #8ab4ff;', '    --focus: #1e2128;');
     const v = violationsFor({ 'shared/styles/tokens.css': text });
     assert.ok(hasMatch(v, /contrast --focus on --bg \(dark\) is [0-9.]+, needs 3/), v.join('\n'));
   });

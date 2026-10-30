@@ -79,8 +79,8 @@ export function Removal({ onChanged }: { onChanged: () => void }) {
 
   if (state === null) {
     return (
-      <section aria-label={t.settings.removal}>
-        <h2>{t.settings.removal}</h2>
+      <section id="settings-removal" aria-label={t.settings.removal}>
+        <h2 tabIndex={-1}>{t.settings.removal}</h2>
         {loadFailed ? (
           <p role="alert">
             {t.settings.load_failed}{' '}
@@ -172,8 +172,8 @@ export function Removal({ onChanged }: { onChanged: () => void }) {
       : null;
 
   return (
-    <section aria-label={t.settings.removal}>
-      <h2>{t.settings.removal}</h2>
+    <section id="settings-removal" aria-label={t.settings.removal}>
+      <h2 tabIndex={-1}>{t.settings.removal}</h2>
       <Announce said={said} />
       {/* Present from the start and empty until a command runs, so the line is announced. */}
       <p role="status">{action.pending ? t.settings.working : null}</p>

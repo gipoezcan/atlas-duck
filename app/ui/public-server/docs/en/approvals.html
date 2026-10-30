@@ -3,15 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Approvals - Atlas Duck Help</title>
+<title>Approvals - atlas-duck User guide</title>
 <link rel="stylesheet" href="assets/help.css">
 <script src="assets/search-index.js" defer></script>
 <script src="assets/help.js" defer></script>
 </head>
 <body>
+<a class="skip-link" href="#content">Skip to the content</a>
 <header class="bar">
-<a class="brand" href="/docs/en/">Atlas Duck Help</a>
-<div class="search" hidden>
+<a class="brand" href="/docs/en/">atlas-duck <span class="brand-sub">User guide</span></a>
+<div class="search" role="search" hidden>
 <label class="visually-hidden" for="help-search">Search help</label>
 <input id="help-search" type="search" placeholder="Search help" autocomplete="off" data-empty="No results">
 <ul id="help-results" hidden></ul>
@@ -45,7 +46,7 @@
 <li><a href="/docs/en/error-reference">Error reference</a></li>
 </ul>
 </nav>
-<main>
+<main id="content" tabindex="-1">
 <h1>Approvals</h1>
 <h2 id="queue">The approval queue</h2>
 <p>Nothing an agent asks for leaves atlas-duck without your decision. Every request that needs one waits in the queue under &quot;Pending approvals&quot;. When nothing waits, the list says &quot;No pending requests&quot;.</p>
@@ -62,14 +63,14 @@
 <h2 id="reading-a-request">Reading a request</h2>
 <p>Opening a request fills the detail pane, &quot;Request detail&quot;. At first the pane only offers &quot;Open preview&quot;. Opening the preview is what makes a decision possible: you decide on what you have seen.</p>
 <p>The pane has four tabs:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Tab</th><th>Content</th></tr></thead>
 <tbody>
 <tr><td>Preview</td><td>What would be executed or sent to the agent, in readable form.</td></tr>
 <tr><td>Structured</td><td>The same content as a tree; here you edit or redact.</td></tr>
 <tr><td>Raw</td><td>The exact content, page by page.</td></tr>
 <tr><td>Request</td><td>Who asked for what.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>The &quot;Request&quot; tab lists:</p>
 <ul>
 <li>Params and their <code>params_sha256</code> fingerprint;</li>
@@ -82,7 +83,7 @@
 <p>The agent name is chosen by the agent. Treat it as a label, not as proof of who is asking.</p>
 <h2 id="approve-or-deny">Approve, release or deny</h2>
 <p>The buttons depend on the class of the request:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Request</th><th>Buttons</th><th>What happens</th></tr></thead>
 <tbody>
 <tr><td>Write</td><td>&quot;Approve&quot;</td><td>atlas-duck executes the change.</td></tr>
@@ -91,7 +92,7 @@
 <tr><td>Read that failed with an HTTP error</td><td>&quot;Release&quot; or &quot;Release status only&quot;</td><td>The agent receives <code>failed</code> (exit 6) with the HTTP status, with the text of the error (&quot;Release&quot;) or without it (&quot;Release status only&quot;).</td></tr>
 <tr><td>Read that failed without an HTTP answer, or was too large</td><td>&quot;Release outcome&quot;</td><td>The agent receives <code>failed</code> (exit 6) with the outcome class (<code>result_too_large</code>, <code>upstream_network</code> or <code>upstream_unavailable</code>) and a fixed message; no HTTP status and no size.</td></tr>
 <tr><td>Any</td><td>&quot;Deny&quot;</td><td>The agent receives <code>denied</code> (exit 3) and your reason.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Under the buttons the pane states in one line what the agent will receive.</p>
 <p>Shortcuts: Ctrl/Cmd+Shift+Enter approves or releases, Ctrl/Cmd+Shift+D denies, Ctrl/Cmd+Shift+Down and Ctrl/Cmd+Shift+Up move to the next and previous request.</p>
 <p>To deny, &quot;Deny&quot; opens &quot;Deny this request&quot;. Type the &quot;Reason for the agent&quot; and press Enter, or use &quot;Send deny&quot;; Esc cancels. The agent sees your reason, so write it for the agent. You can also &quot;Attach a hint&quot;: at most one hint, chosen from the offered ones, for example the HTTP status of the instance, the outcome class, the name that could not be resolved, or the missing required fields. The hint helps the agent to try again with better input.</p>
@@ -109,7 +110,7 @@
 <p>Pressing &quot;Release&quot; sends the redactions and creates a new revision. Open it, check what the agent would receive (&quot;Released size&quot; shows the number of bytes), then release it.</p>
 <p>If the text you want to mask also appears elsewhere, atlas-duck tells you where. &quot;Release anyway: the other occurrences stay in what the agent receives&quot; is your explicit choice to leave them.</p>
 <p><strong>When a release is blocked.</strong> atlas-duck refuses a release that could leak what you redacted, and says why:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Message</th><th>Meaning and what to do</th></tr></thead>
 <tbody>
 <tr><td>a masked text still occurs</td><td>The text is still present, for example in another field, or in a place that cannot be rewritten such as a field name or a number. Mask it elsewhere, or drop the item or the field.</td></tr>
@@ -119,7 +120,7 @@
 <tr><td>mirrored entries cannot be matched</td><td>The same, but atlas-duck cannot tell which entries belong together. Use &quot;Drop the flagged items&quot;.</td></tr>
 <tr><td>a redaction names nothing in the candidate</td><td>The redaction no longer fits the data. Remove it.</td></tr>
 <tr><td>the redacted candidate is over the 16 MiB release cap</td><td>The result is too large to release. Drop items or fields, or deny.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>When entries have no counterpart, the pane lists them (&quot;These entries have no counterpart and block the release:&quot;). If the candidate cannot be built exactly, the release is blocked as well; deny the request or drop the flagged entries.</p>
 <h2 id="batch-decisions">Batch decisions</h2>
 <p>When many similar requests wait, decide them together. Select the rows, or use &quot;select all from session&quot;, and the &quot;Batch decision&quot; bar appears. &quot;Approve or release N selected&quot; first shows what will happen, for example how many reads and scripts are released and how many writes are approved. You then confirm with &quot;Confirm batch&quot;, and the desktop app asks once more with a native confirmation.</p>

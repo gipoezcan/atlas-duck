@@ -3,15 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Fehlerreferenz - Atlas Duck Hilfe</title>
+<title>Fehlerreferenz - atlas-duck Benutzerhandbuch</title>
 <link rel="stylesheet" href="assets/help.css">
 <script src="assets/search-index.js" defer></script>
 <script src="assets/help.js" defer></script>
 </head>
 <body>
+<a class="skip-link" href="#content">Zum Inhalt springen</a>
 <header class="bar">
-<a class="brand" href="/docs/de/">Atlas Duck Hilfe</a>
-<div class="search" hidden>
+<a class="brand" href="/docs/de/">atlas-duck <span class="brand-sub">Benutzerhandbuch</span></a>
+<div class="search" role="search" hidden>
 <label class="visually-hidden" for="help-search">Hilfe durchsuchen</label>
 <input id="help-search" type="search" placeholder="Hilfe durchsuchen" autocomplete="off" data-empty="Keine Treffer">
 <ul id="help-results" hidden></ul>
@@ -43,7 +44,7 @@
 </li>
 </ul>
 </nav>
-<main>
+<main id="content" tabindex="-1">
 <h1>Fehlerreferenz</h1>
 <h2 id="errors-envelope">Fehler der Befehlszeile und der Agents</h2>
 <p>Jede fehlgeschlagene Anfrage eines Agenten enthält ein Objekt <code>error</code> mit einem <code>code</code>, einem Kennzeichen <code>retryable</code> und einer Meldung. Der Code sagt, was schiefgegangen ist. Das Kennzeichen sagt dem Agenten, ob es helfen kann, dieselbe Anfrage erneut zu senden. Agents sollten anhand von <code>status</code>, <code>error.code</code> und <code>error.retryable</code> zusammen entscheiden, nicht allein anhand des Exit-Codes.</p>
@@ -66,7 +67,7 @@
 <p>atlas-duck begrenzt, wie viele Verbindungen und offene Anfragen es annimmt, insgesamt, je Programm und je Agent-Sitzung, damit ein einzelner Agent die Warteschlange nicht überflutet. Eine dieser Grenzen ist erreicht. Es wurde nichts eingereiht. Exit 11, wiederholbar nach der Zeit, die <code>retry_after_s</code> nennt. Warten hilft nicht, wenn die Grenze für ausstehende Anfragen die Ursache ist: Entscheiden oder lehnen Sie zuerst die ausstehenden Anfragen ab, zum Beispiel mit „Alle ausstehenden dieser Sitzung ablehnen“. Versuchen Sie es dann erneut.</p>
 <h3 id="err-unreachable"><code>unreachable</code></h3>
 <p>Die Befehlszeile konnte die App nicht erreichen. Außer bei <code>connection_lost</code> wurde nichts eingereiht, und der Exit-Code ist 5. <code>details.reason</code> nennt den Grund:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Grund</th><th>Was zu tun ist</th></tr></thead>
 <tbody>
 <tr><td><code>not_running</code></td><td>Die App läuft nicht. Starten Sie sie.</td></tr>
@@ -78,7 +79,7 @@
 <tr><td><code>store_newer</code></td><td>Die Audit-Daten wurden von einem neueren atlas-duck geschrieben. Installieren Sie diese oder eine neuere Version.</td></tr>
 <tr><td><code>store_unavailable</code></td><td>Der Audit-Speicher ließ sich nicht öffnen. Starten Sie atlas-duck neu. Nicht wiederholbar.</td></tr>
 <tr><td><code>connection_lost</code></td><td>Die Verbindung brach ab, nachdem die Anfrage gesendet war. Die Anfrage existiert, mit Status <code>pending</code>, Exit 4, nicht wiederholbar. Warten Sie mit <code>await &lt;id&gt;</code> auf sie; sie kann <code>abandoned</code> sein.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Außer bei <code>store_unavailable</code> und <code>connection_lost</code> ist der Fehler wiederholbar.</p>
 <h3 id="err-server-identity"><code>server_identity</code></h3>
 <p>Das Programm, das geantwortet hat, ist nicht die App Ihres Benutzers. atlas-duck weigert sich, mit ihm zu sprechen. Exit 5, nicht wiederholbar. Das ist eine Sicherheitsprüfung. Stellen Sie sicher, dass kein anderes Programm die Verbindung der App verwendet, und starten Sie atlas-duck neu. Bleibt es bestehen, informieren Sie Ihren Administrator.</p>

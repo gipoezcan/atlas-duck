@@ -84,13 +84,14 @@ function AdminInstances() {
 
   return (
     <>
-      <p>{t.admin.instances.intro}</p>
+      <p className="page-lead">{t.admin.instances.intro}</p>
       {notice !== null ? <p role="status" className="notice notice-info">{notice}</p> : null}
       {failed ? <p role="alert" className="notice notice-danger">{t.admin.instances.load_failed}</p> : null}
       {list === null && !failed ? <p role="status" className="notice notice-info">{t.admin.instances.loading}</p> : null}
       {list !== null && list.length === 0 ? <p>{t.admin.instances.none}</p> : null}
       {list !== null && list.length > 0 ? (
-        <table>
+        <div className="table-scroll">
+<table aria-label={t.admin.instances.title}>
           <thead>
             <tr>
               <th scope="col">{t.admin.instances.alias}</th>
@@ -120,6 +121,7 @@ function AdminInstances() {
             ))}
           </tbody>
         </table>
+</div>
       ) : null}
       <h2>{t.admin.instances.add_title}</h2>
       <form className="server-form" onSubmit={(e) => void add(e)}>
@@ -162,7 +164,7 @@ export function Instances() {
   const session = useSession();
   const admin = session?.roles.includes('admin') ?? false;
   return (
-    <main className="window window-admin">
+    <main id="main" tabIndex={-1} className="window window-admin">
       <h1>{t.admin.instances.title}</h1>
       {admin ? <AdminInstances /> : <p role="alert" className="notice notice-danger">{t.admin.instances.admins_only}</p>}
     </main>

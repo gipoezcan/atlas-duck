@@ -83,6 +83,10 @@ struct Text {
     search: &'static str,
     no_results: &'static str,
     contents: &'static str,
+    skip: &'static str,
+    /// The product name and the guide's name (the part after the product name is muted).
+    product: &'static str,
+    guide: &'static str,
     /// The name of the other language, in that language.
     other: &'static str,
 }
@@ -90,18 +94,24 @@ struct Text {
 fn text(lang: &str) -> Text {
     if lang == "de" {
         Text {
-            brand: "Atlas Duck Hilfe",
+            brand: "atlas-duck Benutzerhandbuch",
             search: "Hilfe durchsuchen",
             no_results: "Keine Treffer",
             contents: "Inhalt",
+            skip: "Zum Inhalt springen",
+            product: "atlas-duck",
+            guide: "Benutzerhandbuch",
             other: "English",
         }
     } else {
         Text {
-            brand: "Atlas Duck Help",
+            brand: "atlas-duck User guide",
             search: "Search help",
             no_results: "No results",
             contents: "Contents",
+            skip: "Skip to the content",
+            product: "atlas-duck",
+            guide: "User guide",
             other: "Deutsch",
         }
     }
@@ -136,18 +146,21 @@ fn page_html(set: Set, lang: &str, all: &[Built], current: &Built) -> String {
          <title>{title} - {brand}</title>\n\
          <link rel=\"stylesheet\" href=\"assets/help.css\">\n\
          <script src=\"assets/search-index.js\" defer></script>\n\
-         <script src=\"assets/help.js\" defer></script>\n</head>\n<body>\n",
+         <script src=\"assets/help.js\" defer></script>\n</head>\n<body>\n\
+         <a class=\"skip-link\" href=\"#content\">{skip}</a>\n",
         brand = t.brand,
+        skip = t.skip,
     );
     let _ = write!(
         h,
-        "<header class=\"bar\">\n<a class=\"brand\" href=\"{index}\">{brand}</a>\n\
-         <div class=\"search\" hidden>\n<label class=\"visually-hidden\" for=\"help-search\">{search}</label>\n\
+        "<header class=\"bar\">\n<a class=\"brand\" href=\"{index}\">{product} <span class=\"brand-sub\">{guide}</span></a>\n\
+         <div class=\"search\" role=\"search\" hidden>\n<label class=\"visually-hidden\" for=\"help-search\">{search}</label>\n\
          <input id=\"help-search\" type=\"search\" placeholder=\"{search}\" autocomplete=\"off\" data-empty=\"{empty}\">\n\
          <ul id=\"help-results\" hidden></ul>\n</div>\n\
          <a class=\"lang-switch\" lang=\"{other}\" hreflang=\"{other}\" href=\"{switch}\">{other_name}</a>\n</header>\n",
         index = page_href(set, lang, "index", None),
-        brand = t.brand,
+        product = t.product,
+        guide = t.guide,
         search = t.search,
         empty = t.no_results,
         switch = match set {
@@ -190,7 +203,7 @@ fn page_html(set: Set, lang: &str, all: &[Built], current: &Built) -> String {
     }
     let _ = write!(
         h,
-        "</ul>\n</nav>\n<main>\n<h1>{title}</h1>\n{}</main>\n</div>\n</body>\n</html>\n",
+        "</ul>\n</nav>\n<main id=\"content\" tabindex=\"-1\">\n<h1>{title}</h1>\n{}</main>\n</div>\n</body>\n</html>\n",
         current.rendered.html
     );
     h

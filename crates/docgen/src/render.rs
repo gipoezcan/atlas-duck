@@ -297,7 +297,7 @@ pub fn render_body(md: &str, ctx: &Ctx) -> Result<Rendered, String> {
                     let _ = writeln!(html, "<ol start=\"{n}\">");
                 }
                 Tag::Item => html.push_str("<li>"),
-                Tag::Table(_) => html.push_str("<table>\n"),
+                Tag::Table(_) => html.push_str("<div class=\"tablebox\"><table>\n"),
                 Tag::TableHead => {
                     in_table_head = true;
                     html.push_str("<thead><tr>");
@@ -349,7 +349,7 @@ pub fn render_body(md: &str, ctx: &Ctx) -> Result<Rendered, String> {
                     html.push_str("</li>\n");
                     plain(&mut sections, &mut heading, " ");
                 }
-                TagEnd::Table => html.push_str("</tbody></table>\n"),
+                TagEnd::Table => html.push_str("</tbody></table></div>\n"),
                 TagEnd::TableHead => {
                     in_table_head = false;
                     html.push_str("</tr></thead>\n<tbody>\n");

@@ -3,15 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Freigaben - Atlas Duck Hilfe</title>
+<title>Freigaben - atlas-duck Benutzerhandbuch</title>
 <link rel="stylesheet" href="assets/help.css">
 <script src="assets/search-index.js" defer></script>
 <script src="assets/help.js" defer></script>
 </head>
 <body>
+<a class="skip-link" href="#content">Zum Inhalt springen</a>
 <header class="bar">
-<a class="brand" href="index.html">Atlas Duck Hilfe</a>
-<div class="search" hidden>
+<a class="brand" href="index.html">atlas-duck <span class="brand-sub">Benutzerhandbuch</span></a>
+<div class="search" role="search" hidden>
 <label class="visually-hidden" for="help-search">Hilfe durchsuchen</label>
 <input id="help-search" type="search" placeholder="Hilfe durchsuchen" autocomplete="off" data-empty="Keine Treffer">
 <ul id="help-results" hidden></ul>
@@ -43,7 +44,7 @@
 <li><a href="error-reference.html">Fehlerreferenz</a></li>
 </ul>
 </nav>
-<main>
+<main id="content" tabindex="-1">
 <h1>Freigaben</h1>
 <h2 id="queue">Die Warteschlange</h2>
 <p>Nichts, was ein Agent anfordert, verlässt atlas-duck ohne Ihre Entscheidung. Jede Anfrage, die eine Entscheidung braucht, wartet in der Warteschlange unter „Ausstehende Freigaben“. Wartet nichts, steht dort „Keine ausstehenden Anfragen“.</p>
@@ -60,14 +61,14 @@
 <h2 id="reading-a-request">Eine Anfrage lesen</h2>
 <p>Das Öffnen einer Anfrage füllt den Bereich „Anfragedetails“. Zunächst bietet er nur „Vorschau öffnen“ an. Erst das Öffnen der Vorschau macht eine Entscheidung möglich: Sie entscheiden über das, was Sie gesehen haben.</p>
 <p>Der Bereich hat vier Registerkarten:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Registerkarte</th><th>Inhalt</th></tr></thead>
 <tbody>
 <tr><td>Vorschau</td><td>Was ausgeführt oder an den Agenten gesendet würde, in lesbarer Form.</td></tr>
 <tr><td>Strukturiert</td><td>Derselbe Inhalt als Baum; hier bearbeiten oder schwärzen Sie.</td></tr>
 <tr><td>Rohdaten</td><td>Der genaue Inhalt, Seite für Seite.</td></tr>
 <tr><td>Anfrage</td><td>Wer was angefordert hat.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Die Registerkarte „Anfrage“ nennt:</p>
 <ul>
 <li>Parameter und deren Prüfsumme <code>params_sha256</code>;</li>
@@ -81,7 +82,7 @@
 <p>Den Agentennamen wählt der Agent selbst. Betrachten Sie ihn als Beschriftung, nicht als Beleg dafür, wer anfragt.</p>
 <h2 id="approve-or-deny">Freigeben, übergeben oder ablehnen</h2>
 <p>Welche Schaltflächen erscheinen, hängt von der Klasse der Anfrage ab:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Anfrage</th><th>Schaltflächen</th><th>Was geschieht</th></tr></thead>
 <tbody>
 <tr><td>Schreiben</td><td>„Freigeben“</td><td>atlas-duck führt die Änderung aus.</td></tr>
@@ -90,7 +91,7 @@
 <tr><td>Lesen, das mit einem HTTP-Fehler fehlgeschlagen ist</td><td>„Übergeben“ oder „Nur Status übergeben“</td><td>Der Agent erhält <code>failed</code> (Exit 6) mit dem HTTP-Status, mit dem Text des Fehlers („Übergeben“) oder ohne ihn („Nur Status übergeben“).</td></tr>
 <tr><td>Lesen, das ohne HTTP-Antwort fehlgeschlagen oder zu groß war</td><td>„Ergebnis übergeben“</td><td>Der Agent erhält <code>failed</code> (Exit 6) mit der Ergebnisklasse (<code>result_too_large</code>, <code>upstream_network</code> oder <code>upstream_unavailable</code>) und einer festen Meldung; kein HTTP-Status und keine Größe.</td></tr>
 <tr><td>Jede</td><td>„Ablehnen“</td><td>Der Agent erhält <code>denied</code> (Exit 3) und Ihre Begründung.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Unter den Schaltflächen steht in einer Zeile, was der Agent erhalten wird.</p>
 <p>Tastenkürzel: Strg/Cmd+Umschalt+Eingabe gibt frei oder übergibt, Strg/Cmd+Umschalt+D lehnt ab, Strg/Cmd+Umschalt+Pfeil runter und Strg/Cmd+Umschalt+Pfeil hoch wechseln zur nächsten und zur vorherigen Anfrage.</p>
 <p>Zum Ablehnen öffnet „Ablehnen“ das Formular „Diese Anfrage ablehnen“. Geben Sie die „Begründung für den Agenten“ ein und drücken Sie die Eingabetaste oder wählen Sie „Ablehnung senden“; Esc bricht ab. Der Agent sieht Ihre Begründung, schreiben Sie sie also für den Agenten. Sie können auch einen „Tipp anhängen“: höchstens einen Tipp aus den angebotenen, zum Beispiel den HTTP-Status der Instanz, die Ergebnisklasse, den nicht aufgelösten Namen oder die fehlenden Pflichtfelder. Der Tipp hilft dem Agenten, es mit besserer Eingabe erneut zu versuchen.</p>
@@ -108,7 +109,7 @@
 <p>„Übergeben“ sendet die Schwärzungen und erzeugt eine neue Revision. Öffnen Sie sie, prüfen Sie, was der Agent erhielte („Übergebene Größe“ nennt die Zahl der Bytes), und übergeben Sie sie dann.</p>
 <p>Kommt der Text, den Sie maskieren wollen, auch an anderer Stelle vor, sagt atlas-duck Ihnen, wo. „Trotzdem übergeben: Die anderen Vorkommen bleiben in dem, was der Agent erhält“ ist Ihre ausdrückliche Entscheidung, sie stehen zu lassen.</p>
 <p><strong>Wenn eine Übergabe blockiert ist.</strong> atlas-duck verweigert eine Übergabe, die preisgeben könnte, was Sie geschwärzt haben, und nennt den Grund:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Meldung</th><th>Bedeutung und was zu tun ist</th></tr></thead>
 <tbody>
 <tr><td>ein maskierter Text kommt weiterhin vor</td><td>Der Text steht noch da, zum Beispiel in einem anderen Feld oder an einer Stelle, die sich nicht umschreiben lässt, etwa einem Feldnamen oder einer Zahl. Maskieren Sie ihn anderswo oder entfernen Sie den Eintrag oder das Feld.</td></tr>
@@ -118,7 +119,7 @@
 <tr><td>gespiegelte Einträge lassen sich nicht zuordnen</td><td>Dasselbe, nur kann atlas-duck nicht erkennen, welche Einträge zusammengehören. Verwenden Sie „Markierte Einträge entfernen“.</td></tr>
 <tr><td>eine Schwärzung nennt nichts im Kandidaten</td><td>Die Schwärzung passt nicht mehr zu den Daten. Entfernen Sie sie.</td></tr>
 <tr><td>der geschwärzte Kandidat überschreitet die Übergabegrenze von 16 MiB</td><td>Das Ergebnis ist zu groß für eine Übergabe. Entfernen Sie Einträge oder Felder oder lehnen Sie ab.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Haben Einträge keine Entsprechung, listet der Bereich sie auf („Diese Einträge haben keine Entsprechung und blockieren die Übergabe:“). Lässt sich der Kandidat nicht exakt erstellen, ist die Übergabe ebenfalls blockiert; lehnen Sie die Anfrage ab oder entfernen Sie die markierten Einträge.</p>
 <h2 id="batch-decisions">Sammelentscheidungen</h2>
 <p>Warten viele gleichartige Anfragen, entscheiden Sie sie gemeinsam. Wählen Sie die Zeilen aus oder verwenden Sie „alle der Sitzung auswählen“, dann erscheint die Leiste „Sammelentscheidung“. „N ausgewählte freigeben oder übergeben“ zeigt zuerst, was geschehen wird, zum Beispiel wie viele Lesezugriffe und Skripte übergeben und wie viele Schreibzugriffe freigegeben werden. Dann bestätigen Sie mit „Bestätigen“, und die Desktop-App fragt noch einmal mit einer nativen Bestätigung nach.</p>

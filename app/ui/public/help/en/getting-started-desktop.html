@@ -3,15 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Getting started (desktop) - Atlas Duck Help</title>
+<title>Getting started (desktop) - atlas-duck User guide</title>
 <link rel="stylesheet" href="assets/help.css">
 <script src="assets/search-index.js" defer></script>
 <script src="assets/help.js" defer></script>
 </head>
 <body>
+<a class="skip-link" href="#content">Skip to the content</a>
 <header class="bar">
-<a class="brand" href="index.html">Atlas Duck Help</a>
-<div class="search" hidden>
+<a class="brand" href="index.html">atlas-duck <span class="brand-sub">User guide</span></a>
+<div class="search" role="search" hidden>
 <label class="visually-hidden" for="help-search">Search help</label>
 <input id="help-search" type="search" placeholder="Search help" autocomplete="off" data-empty="No results">
 <ul id="help-results" hidden></ul>
@@ -40,18 +41,18 @@
 <li><a href="error-reference.html">Error reference</a></li>
 </ul>
 </nav>
-<main>
+<main id="content" tabindex="-1">
 <h1>Getting started (desktop)</h1>
 <h2 id="install">Install</h2>
 <p>atlas-duck installs three programs side by side: <code>atlas-duck-app</code> (the tray application with the approval windows), <code>atlas-duck</code> (the command line and the MCP server that agents call) and <code>atlas-duck-sandbox</code> (the helper that runs agent scripts). The command line and the MCP server do nothing on their own. They ask the running app, and the app asks you before any write.</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>System</th><th>Versions</th><th>Package</th></tr></thead>
 <tbody>
 <tr><td>Windows</td><td>Windows 10 22H2 and later, Windows 11 (x86_64)</td><td>NSIS installer</td></tr>
 <tr><td>macOS</td><td>macOS 13 and later (arm64 and x86_64, one build each)</td><td><code>.dmg</code></td></tr>
 <tr><td>Ubuntu</td><td>22.04 and later</td><td><code>.deb</code>, AppImage</td></tr>
 <tr><td>Fedora</td><td>40 and later</td><td><code>.rpm</code>, AppImage</td></tr>
-</tbody></table>
+</tbody></table></div>
 <ul>
 <li><strong>Windows:</strong> the installer offers a per-user and a per-machine install. The per-machine install (Program Files) is recommended, because ordinary users cannot change the program files. Do not run atlas-duck as administrator. If the app runs elevated and the agent's terminal does not, the command line refuses to talk to it; start both at the same privilege level.</li>
 <li><strong>macOS:</strong> open the <code>.dmg</code> and move the app to Applications.</li>
@@ -83,7 +84,7 @@
 <p>Details, fields and the token steps are in <a href="instances-and-tokens.html">Instances and tokens</a>.</p>
 <h2 id="tray">The tray menu</h2>
 <p>atlas-duck runs in the system tray. Closing a window only hides it. The tooltip shows how many requests are pending (&quot;atlas-duck: N pending&quot;). The menu has these entries:</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Entry</th><th>What it does</th></tr></thead>
 <tbody>
 <tr><td>Open approvals (N)</td><td>Opens the approvals window, or the window atlas-duck needs from you instead. N is the number of pending requests.</td></tr>
@@ -92,7 +93,7 @@
 <tr><td>Presentation mode</td><td>Switches to &quot;badge only&quot; without confirmation, until you switch it off again.</td></tr>
 <tr><td>Help</td><td>Opens this guide.</td></tr>
 <tr><td>Quit</td><td>Shuts atlas-duck down.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Status lines above the entries show why atlas-duck cannot serve, for example &quot;Locked&quot;, &quot;Setup required&quot; or &quot;Waiting for keyring&quot;.</p>
 </main>
 </div>

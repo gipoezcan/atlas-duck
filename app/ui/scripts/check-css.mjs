@@ -289,8 +289,8 @@ function checkFocus(rel, parsed) {
     if (!off) continue;
     if (usesFocus(rule) || rule.decls.some((d) => d.prop === 'outline' && !OUTLINE_OFF_RE.test(d.value))) continue;
     if (/:not\(\s*:focus-visible\s*\)/.test(rule.selector)) continue;
-    // Programmatic focus targets (headings and sections with tabindex="-1") are not interactive: no ring.
-    if (selectorsOf(rule).every((s) => /^:is\(\s*(?:(?:h[1-6]|section)\s*,?\s*)+\)\[tabindex="-1"\]:focus$/.test(s))) continue;
+    // Programmatic focus targets (headings, sections, main and wrapper divs with tabindex="-1") are not interactive: no ring.
+    if (selectorsOf(rule).every((s) => /^:is\(\s*(?:(?:h[1-6]|section|main|div)\s*,?\s*)+\)\[tabindex="-1"\]:focus$/.test(s))) continue;
     const ring = parsed.rules.some((other) => {
       if (!usesFocus(other)) return false;
       const bases = selectorsOf(rule).map((s) => s.replace(/:focus(?:-visible)?/g, ''));

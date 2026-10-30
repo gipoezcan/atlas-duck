@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type MouseEvent } from 'react';
 import { HelpButton } from '../shared/HelpLink';
 import { useText } from '../shared/i18n/context';
 
@@ -112,23 +112,30 @@ export function Settings() {
           in a Guard). Re-test, Add/Replace token and the prune button stay on: core refuses
           ConfigReadOnly only for config-writing operations. */}
       {/* M15 T3: app-side, not in config.toml, so a read-only config does not disable it. */}
-      <Language uiLang={uiLang} onChanged={reload} />
-      <Instances instances={instances} onChanged={reload} readOnly={readOnly} />
-      <InstanceForm onAdded={reload} readOnly={readOnly} />
-      <Limits view={settings} onChanged={reload} readOnly={readOnly} />
-      <ScriptLimitsForm view={settings} onChanged={reload} readOnly={readOnly} />
-      <Retention view={settings} onChanged={reload} readOnly={readOnly} />
-      <Recovery onChanged={reload} />
-      <AnchorDir view={settings} onChanged={reload} />
-      <OldInstalls />
-      <ConfinementStatus confinement={confinement} view={settings} onChanged={reload} />
-      <Cli
-        installed={cliInstalled}
-        removable={cliRemovable}
-        dirOnPath={cliDirOnPath}
-        onChanged={reload}
-      />
-      <Removal onChanged={reload} />
+      <div className="settings-layout">
+        <PageToc />
+        <div className="settings-sections">
+          <Language uiLang={uiLang} onChanged={reload} />
+          <div id="settings-instances" tabIndex={-1}>
+            <Instances instances={instances} onChanged={reload} readOnly={readOnly} />
+          </div>
+          <InstanceForm onAdded={reload} readOnly={readOnly} />
+          <Limits view={settings} onChanged={reload} readOnly={readOnly} />
+          <ScriptLimitsForm view={settings} onChanged={reload} readOnly={readOnly} />
+          <Retention view={settings} onChanged={reload} readOnly={readOnly} />
+          <Recovery onChanged={reload} />
+          <AnchorDir view={settings} onChanged={reload} />
+          <OldInstalls />
+          <ConfinementStatus confinement={confinement} view={settings} onChanged={reload} />
+          <Cli
+            installed={cliInstalled}
+            removable={cliRemovable}
+            dirOnPath={cliDirOnPath}
+            onChanged={reload}
+          />
+          <Removal onChanged={reload} />
+        </div>
+      </div>
     </main>
     </WindowBusyContext.Provider>
   );
@@ -153,8 +160,8 @@ function ConfinementStatus({
           : t.settings.confinement_not_met
         : t.settings.confinement_pending;
   return (
-    <section aria-label={t.settings.confinement}>
-      <h2>{t.settings.confinement}</h2>
+    <section id="settings-confinement" aria-label={t.settings.confinement}>
+      <h2 tabIndex={-1}>{t.settings.confinement}</h2>
       <p>{verdict}</p>
       <p>{t.settings.scripts_states[confinement.scripts]}</p>
       {confinement.state === 'pending' ? null : (
@@ -196,4 +203,53 @@ function ConfinementStatus({
 function configBannerText(t: Dict, banner: ConfigBanner): string {
   if (typeof banner.parsed !== 'boolean') return banner.text;
   return t.settings.config_banner(banner.kind, banner.version ?? null, banner.parsed);
+}
+
+/** The sections in page order: the id each section carries and the heading text its link shows. */
+function sections(t: Dict): { id: string; label: string }[] {
+  return [
+    { id: 'settings-language', label: t.common.language },
+    { id: 'settings-instances', label: t.settings.instances },
+    { id: 'settings-add-instance', label: t.settings.add_heading },
+    { id: 'settings-limits', label: t.settings.limits },
+    { id: 'settings-script-limits', label: t.settings.script_limits },
+    { id: 'settings-retention', label: t.settings.retention },
+    { id: 'settings-recovery', label: t.settings.recovery.recovery },
+    { id: 'settings-anchor-dir', label: t.settings.recovery.anchor_dir },
+    { id: 'settings-old-installs', label: t.settings.recovery.orphans },
+    { id: 'settings-confinement', label: t.settings.confinement },
+    { id: 'settings-cli', label: t.settings.cli },
+    { id: 'settings-removal', label: t.settings.removal },
+  ];
+}
+
+/**
+ * M17: "On this page". A link scrolls to its section and moves focus to the section's heading (a
+ * hash link alone would leave the focus where it was); the last one used is marked current.
+ */
+function PageToc() {
+  const t = useText();
+  const [current, setCurrent] = useState<string | null>(null);
+  const go = (e: MouseEvent<HTMLAnchorElement>, id: string) => {
+    const target = document.getElementById(id);
+    if (target === null) return;
+    e.preventDefault();
+    const heading = target.querySelector<HTMLElement>('h2') ?? target;
+    heading.focus({ preventScroll: true });
+    target.scrollIntoView?.({ block: 'start' });
+    setCurrent(id);
+  };
+  return (
+    <nav className="page-toc" aria-label={t.settings.toc_label}>
+      <ul>
+        {sections(t).map((s) => (
+          <li key={s.id}>
+            <a href={`#${s.id}`} aria-current={current === s.id ? 'true' : undefined} onClick={(e) => go(e, s.id)}>
+              {s.label}
+            </a>
+          </li>
+        ))}
+      </ul>
+    </nav>
+  );
 }

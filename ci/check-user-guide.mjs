@@ -144,7 +144,8 @@ function checkTarget(name, set, k, target, inp, errors) {
 }
 /** Resolves an href of a generated page to [lang, page id, anchor] or null when it is not internal. */
 function resolveHref(set, lang, id, href) {
-  if (/^https?:\/\//.test(href) || href.startsWith("assets/")) return "skip";
+  // `#content` is the skip link's target (`<main id="content">`), not a heading anchor.
+  if (/^https?:\/\//.test(href) || href.startsWith("assets/") || href === "#content") return "skip";
   const [path, anchor = null] = href.split("#");
   if (path === "") return [lang, id, anchor];
   if (set === "desktop") {

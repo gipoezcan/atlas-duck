@@ -3,15 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Agents (Server) - Atlas Duck Hilfe</title>
+<title>Agents (Server) - atlas-duck Benutzerhandbuch</title>
 <link rel="stylesheet" href="assets/help.css">
 <script src="assets/search-index.js" defer></script>
 <script src="assets/help.js" defer></script>
 </head>
 <body>
+<a class="skip-link" href="#content">Zum Inhalt springen</a>
 <header class="bar">
-<a class="brand" href="/docs/de/">Atlas Duck Hilfe</a>
-<div class="search" hidden>
+<a class="brand" href="/docs/de/">atlas-duck <span class="brand-sub">Benutzerhandbuch</span></a>
+<div class="search" role="search" hidden>
 <label class="visually-hidden" for="help-search">Hilfe durchsuchen</label>
 <input id="help-search" type="search" placeholder="Hilfe durchsuchen" autocomplete="off" data-empty="Keine Treffer">
 <ul id="help-results" hidden></ul>
@@ -43,7 +44,7 @@
 <li><a href="/docs/de/error-reference">Fehlerreferenz</a></li>
 </ul>
 </nav>
-<main>
+<main id="content" tabindex="-1">
 <h1>Agents (Server)</h1>
 <h2 id="api-keys">API-Schlüssel</h2>
 <p>Mit einem API-Schlüssel erreicht ein Agent atlas-duck in Ihrem Namen über MCP. Ein Schlüssel gibt nie etwas frei: Jede Anfrage des Agenten wartet weiterhin in Ihrer <a href="/docs/de/approvals#queue">Warteschlange</a>.</p>
@@ -59,13 +60,13 @@
 <p>„Widerrufen“ stoppt einen Schlüssel. atlas-duck fragt vorher nach: Agents, die ihn verwenden, funktionieren danach sofort nicht mehr. Widerrufen Sie jeden Schlüssel, den Sie nicht mehr brauchen, und jeden, der durchgesickert sein könnte.</p>
 <h2 id="scopes">Berechtigungen</h2>
 <p>Eine Berechtigung (Scope) legt fest, was ein Schlüssel oder eine App anfordern darf. Wählen Sie die kleinste Menge, die der Agent braucht.</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Berechtigung</th><th>Bedeutung</th></tr></thead>
 <tbody>
 <tr><td><code>read</code></td><td>Daten lesen und auf Ihre Entscheidungen warten.</td></tr>
 <tr><td><code>propose_write</code></td><td>Änderungen zur Freigabe durch Sie vorschlagen.</td></tr>
 <tr><td><code>scripts</code></td><td>Schreibgeschützte Skripte in der Sandbox ausführen; Sie geben jedes Endergebnis frei.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Auch mit allen Berechtigungen kann ein Agent nichts entscheiden. Was er liest, erreicht ihn erst, nachdem Sie es übergeben haben, und jede Änderung braucht Ihre Freigabe. Siehe <a href="/docs/de/approvals#approve-or-deny">Freigaben</a> und <a href="/docs/de/scripts#what-are-scripts">Skripte</a>.</p>
 <h2 id="connected-apps">Verbundene Apps</h2>
 <p>„Verbundene Apps“ listet die Apps auf, denen Sie erlaubt haben, atlas-duck über MCP mit OAuth zu verwenden. Auch eine App gibt nie etwas frei.</p>

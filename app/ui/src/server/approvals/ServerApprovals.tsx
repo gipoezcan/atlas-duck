@@ -52,7 +52,9 @@ function Page({ item, env }: { item: string | null; env: NotifyEnv }) {
       header={
         <>
           <ServerHeader />
-          <NotifyButton env={env} />
+          <div className="server-notify">
+            <NotifyButton env={env} />
+          </div>
         </>
       }
     />

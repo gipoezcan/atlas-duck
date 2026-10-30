@@ -9,13 +9,12 @@
 .notice,
 .caution-strip,
 .window > [role="alert"]:not(.visually-hidden, .caution-strip, .notice),
-:is(.window, .window-body) > section > [role="alert"]:not(.visually-hidden, .caution-strip, .notice),
+:is(.window, .window-body, .settings-sections) > section > [role="alert"]:not(.visually-hidden, .caution-strip, .notice),
 .window > [role="status"]:not(.visually-hidden, .caution-strip, .notice),
-:is(.window, .window-body) > section > [role="status"]:not(.visually-hidden, .caution-strip, .notice) {
+:is(.window, .window-body, .settings-sections) > section > [role="status"]:not(.visually-hidden, .caution-strip, .notice) {
   display: block;
   padding: var(--space-3) var(--space-4);
   border: 1px solid var(--border);
-  border-left-width: 4px;
   border-radius: var(--radius-md);
   background: var(--surface);
   color: var(--text);
@@ -23,22 +22,22 @@
 }
 .notice-info,
 .window > [role="status"]:not(.visually-hidden, .caution-strip, .notice),
-:is(.window, .window-body) > section > [role="status"]:not(.visually-hidden, .caution-strip, .notice) {
-  border-left-color: var(--info);
+:is(.window, .window-body, .settings-sections) > section > [role="status"]:not(.visually-hidden, .caution-strip, .notice) {
+  border-color: var(--info);
   background: var(--info-subtle);
 }
 .notice-warning, .caution-strip {
-  border-left-color: var(--warning-border);
+  border-color: var(--warning-border);
   background: var(--warning-subtle);
 }
 .notice-danger,
 .window > [role="alert"]:not(.visually-hidden, .caution-strip, .notice),
-:is(.window, .window-body) > section > [role="alert"]:not(.visually-hidden, .caution-strip, .notice) {
-  border-left-color: var(--danger);
+:is(.window, .window-body, .settings-sections) > section > [role="alert"]:not(.visually-hidden, .caution-strip, .notice) {
+  border-color: var(--danger);
   background: var(--danger-subtle);
 }
 .notice-success {
-  border-left-color: var(--success);
+  border-color: var(--success);
   background: var(--success-subtle);
 }
 .caution-strip {
@@ -61,8 +60,7 @@
   align-items: center;
   gap: var(--space-2);
   padding: var(--space-3) var(--space-4);
-  border: 1px solid var(--border);
-  border-left: 4px solid var(--info);
+  border: 1px solid var(--info);
   border-radius: var(--radius-md);
   background: var(--info-subtle);
   margin: var(--space-3) 0;
@@ -79,24 +77,102 @@
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-2);
-  padding: var(--space-2) var(--space-5);
+}
+.app-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-5);
   max-width: var(--content-max);
+  min-height: 4.25rem;
   margin: 0 auto;
+  padding: 0 var(--space-5);
+}
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-bold);
+  color: var(--text);
+  text-decoration: none;
+}
+.brand:hover {
+  color: var(--text);
+}
+.brand svg {
+  color: var(--accent);
+  flex: none;
+}
+.nav-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.nav-list > li {
+  margin: 0;
+}
+.nav-list :is(a, button) {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--control-height);
+  padding: 0 var(--space-4);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-decoration: none;
+  cursor: pointer;
+}
+.nav-list :is(a, button):hover {
+  background: var(--row-hover);
+  color: var(--text);
+}
+.nav-list [aria-current="page"] {
+  background: var(--accent-subtle);
+  color: var(--accent-hover);
+  font-weight: var(--weight-bold);
+}
+.app-bar-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin-inline-start: auto;
+}
+.nav-count {
+  display: inline-block;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+  color: var(--text-on-accent);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-bold);
+  line-height: 1.5;
 }
 .banner {
   list-style: none;
   margin: 0 auto;
-  padding: 0 var(--space-5) var(--space-2);
+  padding: 0 var(--space-5) var(--space-3);
   max-width: var(--content-max);
 }
 .banner li {
   padding: var(--space-1) 0;
 }
-.banner-caution {
-  color: var(--warning);
-  font-weight: var(--weight-bold);
+.banner .banner-caution {
+  padding: var(--space-2) var(--space-4);
+  border: 1px solid var(--warning-border);
+  border-radius: var(--radius-md);
+  background: var(--warning-subtle);
+  color: var(--text);
+  font-weight: var(--weight-semibold);
 }
-.banner-info {
+.banner .banner-info {
   color: var(--text-muted);
 }
 
@@ -106,11 +182,11 @@
   display: inline-block;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-pill);
-  background: var(--surface-raised);
+  background: var(--surface);
   color: var(--text);
   padding: 0 0.35rem;
   margin: 0 0.25rem;
-  font-size: 0.8em;
+  font-size: var(--text-sm);
   line-height: 1.4;
   white-space: nowrap;
 }
@@ -118,6 +194,18 @@
   color: var(--warning);
   border-color: var(--warning-border);
   background: var(--warning-subtle);
+  font-weight: var(--weight-bold);
+}
+.badge-success, .badge-ok {
+  color: var(--success);
+  border-color: var(--success);
+  background: var(--success-subtle);
+  font-weight: var(--weight-bold);
+}
+.badge-info {
+  color: var(--accent-hover);
+  border-color: var(--accent);
+  background: var(--accent-subtle);
   font-weight: var(--weight-bold);
 }
 .badge-fixed { flex: none; display: inline-block; min-width: 6.5em; }
@@ -133,7 +221,7 @@
   padding: var(--space-6) var(--space-4);
   text-align: center;
   color: var(--text-muted);
-  border: 1px dashed var(--border);
+  border: 1px dashed var(--border-strong);
   border-radius: var(--radius-lg);
 }
 .toast {
@@ -146,5 +234,21 @@
   color: var(--text);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-md);
-  box-shadow: var(--shadow-card);
+}
+
+/* M17: the bar is two deliberate rows: product name and tools, then the navigation. */
+.app-bar {
+  padding-block: var(--space-2);
+  row-gap: var(--space-1);
+}
+.app-bar > .brand {
+  order: 1;
+}
+.app-bar > .app-bar-tools {
+  order: 2;
+  margin-inline-start: auto;
+}
+.app-bar > nav {
+  order: 3;
+  flex: 1 1 100%;
 }

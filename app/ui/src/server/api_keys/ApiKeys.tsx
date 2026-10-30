@@ -134,16 +134,17 @@ export function ApiKeys() {
   };
 
   return (
-    <main className="window window-api-keys">
+    <main id="main" tabIndex={-1} className="window window-api-keys">
       <h1>{t.server.api_keys.title}</h1>
-      <p>{t.server.api_keys.intro}</p>
+      <p className="page-lead">{t.server.api_keys.intro}</p>
       {created !== null ? <ShownOnce created={created} onDone={() => setCreated(null)} /> : null}
       {notice !== null ? <p role="alert" className="notice notice-danger">{notice}</p> : null}
       {failed ? <p role="alert" className="notice notice-danger">{t.server.api_keys.load_failed}</p> : null}
       {keys === null && !failed ? <p role="status" className="notice notice-info">{t.server.api_keys.loading}</p> : null}
       {keys !== null && keys.length === 0 ? <p>{t.server.api_keys.none}</p> : null}
       {keys !== null && keys.length > 0 ? (
-        <table>
+        <div className="table-scroll">
+<table aria-label={t.server.api_keys.title}>
           <thead>
             <tr>
               <th scope="col">{t.server.api_keys.col_name}</th>
@@ -175,6 +176,7 @@ export function ApiKeys() {
             ))}
           </tbody>
         </table>
+</div>
       ) : null}
       <h2>{t.server.api_keys.create_title}</h2>
       <form className="server-form" onSubmit={(e) => void submit(e)} noValidate>

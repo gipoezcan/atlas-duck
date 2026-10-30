@@ -45,9 +45,9 @@ export function ConnectedApps() {
   };
 
   return (
-    <main className="window window-connected-apps">
+    <main id="main" tabIndex={-1} className="window window-connected-apps">
       <h1>{t.server.connected_apps.title}</h1>
-      <p>{t.server.connected_apps.intro}</p>
+      <p className="page-lead">{t.server.connected_apps.intro}</p>
       {notice !== null ? (
         <p role="alert" className="notice notice-danger">
           {notice}
@@ -65,7 +65,8 @@ export function ConnectedApps() {
       ) : null}
       {grants !== null && grants.length === 0 ? <p>{t.server.connected_apps.none}</p> : null}
       {grants !== null && grants.length > 0 ? (
-        <table>
+        <div className="table-scroll">
+<table aria-label={t.server.connected_apps.title}>
           <thead>
             <tr>
               <th scope="col">{t.server.connected_apps.col_app}</th>
@@ -99,6 +100,7 @@ export function ConnectedApps() {
             ))}
           </tbody>
         </table>
+</div>
       ) : null}
     </main>
   );

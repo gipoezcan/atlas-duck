@@ -10,7 +10,7 @@
    marked with an inset shadow, not a border. */
 @media (min-width: 64rem) {
   .window-approvals,
-  .app-header nav,
+  .app-bar,
   .banner {
     max-width: 80rem;
   }
@@ -21,9 +21,10 @@
 /* An outer shadow, not a border: Windowed's height is its scroll viewport, a border would cut the last row. */
 .window-approvals > .windowed {
   margin-bottom: var(--space-4);
-  box-shadow: 0 0 0 1px var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  overflow: hidden;
 }
 /* Lines 1 and 2 are one line each: shrinkable text is ellipsized, labels and badges are flex: none.
    The flags line wraps. A row is QUEUE_ROW_REM (7.5rem) high, so the rem lines and the row scale together. */
@@ -70,10 +71,11 @@
 .detail [role="tab"] {
   font: inherit;
   cursor: pointer;
-  padding: 0 var(--space-3);
+  padding: 0 var(--space-4);
   background: none;
   border: 0;
-  border-bottom: 2px solid transparent;
+  border-bottom: 3px solid transparent;
+  margin-bottom: -1px;
   border-radius: 0;
   min-height: var(--control-height);
   color: var(--text-muted);
@@ -101,7 +103,7 @@
   align-items: center;
   margin: var(--space-3) 0;
   padding: var(--space-3);
-  background: var(--surface-raised);
+  background: var(--surface-sunken);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
 }

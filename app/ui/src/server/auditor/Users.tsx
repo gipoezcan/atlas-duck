@@ -113,7 +113,7 @@ export function AuditorPage() {
   const auditor = session?.roles.includes('auditor') ?? false;
   if (!auditor) {
     return (
-      <main className="window window-auditor">
+      <main id="main" tabIndex={-1} className="window window-auditor">
         <h1>{t.admin.auditor.title}</h1>
         <p role="alert">{t.admin.auditor.only}</p>
       </main>
@@ -121,9 +121,9 @@ export function AuditorPage() {
   }
   if (picked === null) {
     return (
-      <main className="window window-auditor">
+      <main id="main" tabIndex={-1} className="window window-auditor">
         <h1>{t.admin.auditor.title}</h1>
-        <p>{t.admin.auditor.intro}</p>
+        <p className="page-lead">{t.admin.auditor.intro}</p>
         <Users onPick={setPicked} />
       </main>
     );

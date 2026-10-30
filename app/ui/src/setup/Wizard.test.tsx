@@ -22,7 +22,7 @@ import {
 import wizardFixture from '../shared/ipc/fixtures/wizard_state.json';
 import type { InstanceView, WizardState, WizardStep } from '../shared/ipc/types';
 import { en } from '../shared/i18n/dict';
-import { REREAD_DEBOUNCE_MS, STEP0_ERROR_DELAY_MS, STEP_COOLDOWN_MS, Wizard } from './Wizard';
+import { REREAD_DEBOUNCE_MS, STEP0_ERROR_DELAY_MS, STEP_COOLDOWN_MS, Wizard, stageOf } from './Wizard';
 
 const T = en.setup;
 const ERRORS: Readonly<Record<string, string>> = T.errors;
@@ -638,5 +638,45 @@ describe('Wizard (1b)', () => {
     answer(wizardBegin, at('recovery_note'));
     await click(T.pin_retry);
     expect(heading()).toBe(T.note_heading);
+  });
+});
+
+describe('Wizard progress (M17)', () => {
+  it.each<[WizardStep, number | null]>([
+    ['data_dir', 1],
+    ['existing_store', 1],
+    ['anchor_dir', 1],
+    ['restore', 1],
+    ['passphrase', 2],
+    ['genesis', 2],
+    ['pin_retry', 2],
+    ['recovery_note', 2],
+    ['instances', 3],
+    ['cli', 4],
+    ['onboarding', 5],
+    ['done', 5],
+    ['stopped', null],
+  ])('stage_of_%s', (step, stage) => {
+    expect(stageOf(step)).toBe(stage);
+  });
+
+  it('marks_the_current_stage_and_names_finished_ones_in_text', async () => {
+    await show(at('instances'));
+    const list = within(screen.getByRole('navigation', { name: T.progress_label })).getByRole('list');
+    const items = within(list).getAllByRole('listitem');
+    expect(items).toHaveLength(5);
+    expect(items.map((li) => li.getAttribute('aria-current'))).toEqual([null, null, 'step', null, null]);
+    expect(items[0]?.className).toBe('step-done');
+    expect(items[0]?.textContent).toContain(T.stage_done);
+    expect(items[1]?.textContent).toContain(T.stage_done);
+    expect(items[2]?.textContent).not.toContain(T.stage_done);
+    expect(screen.getByText(T.step_count(3, 5))).toBeTruthy();
+  });
+
+  it('stopped_has_no_current_stage_and_no_step_count', async () => {
+    await show(STOPPED);
+    const items = within(screen.getByRole('navigation', { name: T.progress_label })).getAllByRole('listitem');
+    expect(items.some((li) => li.hasAttribute('aria-current'))).toBe(false);
+    expect(screen.queryByText(/^Step \d of 5$/)).toBeNull();
   });
 });

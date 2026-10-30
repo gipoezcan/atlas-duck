@@ -24,6 +24,7 @@ export const settings: Dict['settings'] = {
     'Ihr System verwendet ein Proxy-Auto-Config-Skript, das atlas-duck nicht auswertet: Legen Sie den Proxy dieser Instanz (Host:Port oder direct) in den Einstellungen fest',
   committed_incomplete: 'Die Wiederherstellung wird beim nächsten Start abgeschlossen',
   loading: 'Einstellungen werden geladen',
+  toc_label: 'Auf dieser Seite',
   load_failed: 'Die Einstellungen konnten nicht geladen werden',
   retry: 'Erneut versuchen',
   url_change: 'config.toml fordert eine URL-Änderung an für',

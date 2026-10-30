@@ -35,6 +35,7 @@ import {
 import commandErrorFixtures from '../shared/ipc/fixtures/command_error.json';
 import settingsFixture from '../shared/ipc/fixtures/settings_get.json';
 import type { InstanceView, SettingsGet } from '../shared/ipc/types';
+import { en } from '../shared/i18n/dict';
 import { Settings } from './Settings';
 import { errorText, expiryWarningText } from './text';
 
@@ -945,7 +946,9 @@ describe('Settings', () => {
       },
     };
     const { container } = await show(data);
-    expect(container.querySelector('img, b, script, iframe, a')).toBeNull();
+    expect(container.querySelector('img, b, script, iframe')).toBeNull();
+    // The page's own "On this page" links are not wire text.
+    expect([...container.querySelectorAll('a')].filter((a) => a.closest('.page-toc') === null)).toHaveLength(0);
     expect(container.textContent).toContain(markup);
     expect(screen.getAllByText('unusual characters').length).toBeGreaterThanOrEqual(8);
     // Unverified badge in front of the server-derived texts.
@@ -1440,5 +1443,31 @@ describe('Settings recovery and backup (M10 T21)', () => {
     fireEvent.click(old.getByRole('button', { name: `Forget the install ${id}` }));
     await flush();
     expect(old.getByRole('alert').textContent).toBe('Cancelled: nothing was changed');
+  });
+});
+describe('Settings page navigation (M17)', () => {
+  it('toc_links_point_at_existing_sections', async () => {
+    await show(plain({}));
+    const toc = screen.getByRole('navigation', { name: en.settings.toc_label });
+    const links = within(toc).getAllByRole('link');
+    expect(links.length).toBeGreaterThanOrEqual(10);
+    for (const a of links) {
+      const id = (a.getAttribute('href') ?? '').slice(1);
+      expect(document.getElementById(id), id).not.toBeNull();
+    }
+    // The order of the sections is the order of the links.
+    const hrefs = links.map((a) => a.getAttribute('href'));
+    expect(hrefs[0]).toBe('#settings-language');
+    expect(hrefs.at(-1)).toBe('#settings-removal');
+  });
+
+  it('toc_click_moves_focus_to_the_section_heading', async () => {
+    await show(plain({}));
+    const toc = screen.getByRole('navigation', { name: en.settings.toc_label });
+    const link = within(toc).getByRole('link', { name: en.settings.limits });
+    fireEvent.click(link);
+    expect(document.activeElement?.tagName).toBe('H2');
+    expect(document.activeElement?.textContent).toBe(en.settings.limits);
+    expect(link.getAttribute('aria-current')).toBe('true');
   });
 });

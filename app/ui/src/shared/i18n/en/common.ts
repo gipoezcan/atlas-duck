@@ -7,6 +7,7 @@ export const common = {
   save: 'Save',
   retry: 'Retry',
   language: 'Language',
+  skip_to_main: 'Skip to main content',
   lang_auto: 'Automatic',
   lang_de: 'Deutsch',
   lang_en: 'English',

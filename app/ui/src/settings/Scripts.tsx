@@ -81,8 +81,8 @@ export function ScriptLimitsForm({ view, onChanged, readOnly }: ScriptLimitsProp
   };
 
   return (
-    <section aria-label={t.settings.script_limits}>
-      <h2>{t.settings.script_limits}</h2>
+    <section id="settings-script-limits" aria-label={t.settings.script_limits}>
+      <h2 tabIndex={-1}>{t.settings.script_limits}</h2>
       <Guard disabled={readOnly}>
         {KEYS.map((key) => (
           <div key={key} className="field">

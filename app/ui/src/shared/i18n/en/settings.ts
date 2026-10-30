@@ -27,6 +27,8 @@ export const settings = {
   /** plan text (PD-181, §8.7): what the windows say after a restore answered `committed_incomplete`. */
   committed_incomplete: 'Restore will be completed at the next start',
   loading: 'Loading the settings',
+  /** The label of the "On this page" navigation beside the sections. */
+  toc_label: 'On this page',
   load_failed: 'Could not load the settings',
   retry: 'Try again',
   /** spec 7.1 (verbatim up to the alias). */

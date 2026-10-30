@@ -17,13 +17,13 @@ h1, h2, h3, h4, h5, h6 {
   font-weight: var(--weight-bold);
   margin: 0 0 var(--space-3);
 }
-h1 { font-size: var(--text-2xl); }
+h1 { font-size: var(--text-2xl); margin-bottom: var(--space-1); }
 h2 { font-size: var(--text-xl); }
 h3 { font-size: var(--text-lg); }
 h4, h5, h6 { font-size: var(--text-md); }
 /* The windows move focus to a heading or section (tabindex="-1") programmatically, and browsers
    count that as focus-visible: no ring on those non-interactive targets. Controls keep theirs. */
-:is(h1, h2, h3, h4, h5, h6, section)[tabindex="-1"]:focus { outline: none; }
+:is(h1, h2, h3, h4, h5, h6, section, main, div)[tabindex="-1"]:focus { outline: none; }
 p, ul, ol, dl, pre, table, fieldset {
   margin: 0 0 var(--space-3);
 }
@@ -68,17 +68,57 @@ table {
 }
 th, td {
   text-align: start;
-  padding: var(--space-2) var(--space-3);
+  padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid var(--border);
   vertical-align: top;
 }
-th {
-  font-weight: var(--weight-bold);
+thead th, th[scope="col"] {
+  font-weight: var(--weight-medium);
   color: var(--text-muted);
   font-size: var(--text-sm);
 }
+tbody th, th[scope="row"] {
+  font-weight: var(--weight-semibold);
+}
+tbody tr:last-child > * {
+  border-bottom: 0;
+}
+/* A table in a bordered box that scrolls sideways when the window is narrow. */
+.table-scroll {
+  overflow-x: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  margin: 0 0 var(--space-4);
+}
+.table-scroll > table {
+  min-width: 40rem;
+  margin: 0;
+}
 .table-compact th, .table-compact td {
   padding: var(--space-1) var(--space-2);
+}
+.page-lead {
+  color: var(--text-muted);
+  max-width: 68ch;
+  margin: 0 0 var(--space-5);
+}
+/* Hidden until it gets focus, then shown top-left above everything. */
+.skip-link {
+  position: absolute;
+  inset-block-start: var(--space-2);
+  inset-inline-start: var(--space-2);
+  z-index: 1000;
+  padding: var(--space-2) var(--space-4);
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  font-weight: var(--weight-semibold);
+  transform: translateY(-300%);
+}
+.skip-link:focus {
+  transform: none;
 }
 :focus-visible {
   outline: var(--focus-width) solid var(--focus);
@@ -107,5 +147,50 @@ iframe {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
+  }
+}
+
+/* Windows High Contrast / forced colours: system colours only, borders and outlines instead of
+   fills so focus, the current item, selected rows, badges and notices stay visible. */
+@media (forced-colors: active) {
+  :focus-visible {
+    outline: var(--focus-width) solid Highlight;
+    outline-offset: var(--focus-offset);
+  }
+  .nav-list [aria-current],
+  .page-toc [aria-current],
+  .setup-progress [aria-current],
+  .queue-item[aria-current="true"],
+  .audit-row button[aria-current="true"],
+  .row-selected,
+  [role="tab"][aria-selected="true"],
+  .tree-select[aria-pressed="true"] {
+    outline: 2px solid Highlight;
+    outline-offset: -2px;
+    forced-color-adjust: none;
+    background: Canvas;
+    color: CanvasText;
+  }
+  [role="tab"][aria-selected="true"] {
+    border-bottom: 3px solid Highlight;
+  }
+  .notice, .caution-strip, .audit-ack, .audit-job, .banner .banner-caution,
+  [role="alert"], [role="status"]:not(:empty) {
+    border: 1px solid CanvasText;
+  }
+  .badge, .badge-caution, .badge-success, .badge-ok, .badge-info, .nav-count, .step-dot {
+    border: 1px solid CanvasText;
+    background: Canvas;
+    color: CanvasText;
+  }
+  .table-scroll {
+    border: 1px solid CanvasText;
+  }
+  .primary, .danger {
+    border: 1px solid ButtonText;
+  }
+  :disabled, [aria-disabled="true"] {
+    color: GrayText;
+    border-color: GrayText;
   }
 }

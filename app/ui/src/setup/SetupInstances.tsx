@@ -21,7 +21,8 @@ export function SetupInstances({
   const t = useText();
   if (instances.length === 0) return <p>{t.setup.instances_none}</p>;
   return (
-    <table className="instances">
+    <div className="table-scroll">
+<table className="instances">
       <caption>{t.setup.instances_list}</caption>
       <thead>
         <tr>
@@ -36,6 +37,7 @@ export function SetupInstances({
         ))}
       </tbody>
     </table>
+</div>
   );
 }
 

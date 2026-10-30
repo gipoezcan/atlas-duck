@@ -152,7 +152,7 @@ export function Audit({ mode = 'desktop', exportPanel = null }: { mode?: AuditMo
   };
 
   return (
-    <main className="audit window window-audit">
+    <main id="main" tabIndex={-1} className="audit window window-audit">
       <h1>{t.approvals.window_titles.audit}</h1>
       <HelpButton window="audit" />
       {desktop ? (

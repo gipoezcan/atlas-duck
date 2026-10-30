@@ -59,6 +59,11 @@ export const setup = {
   token_in_settings: 'Add its token in Settings after setup.',
   /** The live region's text when the step changes (the heading is focused as well). */
   step_announce: (heading: string) => `Step: ${heading}`,
+  /** The setup progress list: its label, the five stages, the text of a finished one and the line above the heading. */
+  progress_label: 'Setup progress',
+  stages: ['Data folder', 'Recovery', 'Instances', 'Command line', 'Finish'],
+  stage_done: '(done)',
+  step_count: (n: number, total: number) => `Step ${n} of ${total}`,
   instances_continue: 'Continue',
   instances_skip: 'Skip for now',
   instances_list: 'Instances in config.toml',

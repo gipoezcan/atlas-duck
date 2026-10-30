@@ -8,18 +8,18 @@
   justify-content: center;
   gap: var(--space-2);
   font: inherit;
-  font-weight: var(--weight-medium);
+  font-weight: var(--weight-semibold);
   min-height: var(--control-height);
-  padding: 0 var(--space-4);
+  padding: 0 var(--space-5);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-md);
-  background: var(--surface-raised);
+  background: var(--surface);
   color: var(--text);
   cursor: pointer;
   transition: background-color var(--duration), border-color var(--duration);
 }
 :where(button, input[type="button"], input[type="submit"], input[type="reset"]):where(:not(.tree-select, [role="tab"])):hover {
-  background: var(--surface);
+  background: var(--row-hover);
 }
 :where(button, input[type="button"], input[type="submit"], input[type="reset"]):where(:not(.tree-select, [role="tab"])):active {
   background: var(--surface-sunken);
@@ -46,6 +46,7 @@
   background: transparent;
   border-color: transparent;
   color: var(--accent);
+  padding-inline: var(--space-3);
 }
 .ghost:hover {
   background: var(--accent-subtle);
@@ -57,7 +58,7 @@
   cursor: not-allowed;
 }
 :where(button, input[type="button"], input[type="submit"], input[type="reset"]):disabled:hover {
-  background: var(--surface-raised);
+  background: var(--surface);
 }
 .primary:disabled:hover {
   background: var(--accent);
@@ -74,6 +75,7 @@
 .queue-line button, .audit-line button, .tree-row button, .raw-nav button {
   min-height: 0;
   padding: 0 var(--space-2);
+  font-weight: var(--weight-medium);
 }
 .tree-row .tree-toggle {
   padding: 0;
@@ -89,7 +91,7 @@ select,
 textarea {
   font: inherit;
   color: var(--text);
-  background: var(--surface-raised);
+  background: var(--surface);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-md);
   min-height: var(--control-height);
@@ -117,8 +119,8 @@ input:disabled, select:disabled, textarea:disabled {
 }
 input[type="checkbox"], input[type="radio"] {
   accent-color: var(--accent);
-  width: 1.1rem;
-  height: 1.1rem;
+  width: 1.25rem;
+  height: 1.25rem;
   margin: 0;
 }
 label:has(> input[type="checkbox"]), label:has(> input[type="radio"]) {
@@ -134,5 +136,5 @@ fieldset {
 }
 legend {
   padding: 0 var(--space-1);
-  font-weight: var(--weight-bold);
+  font-weight: var(--weight-semibold);
 }

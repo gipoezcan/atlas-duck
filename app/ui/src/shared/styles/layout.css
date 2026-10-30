@@ -30,23 +30,104 @@
 }
 
 /* Cards. */
-:is(.window, .window-body) > section, .card {
+:is(.window, .window-body, .settings-sections) > section, .card {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  padding: var(--space-4) var(--space-5);
+  padding: var(--space-5);
   margin: 0 0 var(--space-4);
-  box-shadow: var(--shadow-card);
 }
-:is(.window, .window-body) > section > h2:first-child, .card > h2:first-child {
+:is(.window, .window-body, .settings-sections) > section > h2:first-child, .card > h2:first-child {
   margin-top: 0;
   font-size: var(--text-lg);
 }
-:is(.window, .window-body) > section section {
+:is(.window, .window-body, .settings-sections) > section section {
   background: none;
   border: 0;
   padding: 0;
   box-shadow: none;
+}
+
+/* Side navigation next to the content (Settings sections, Setup progress). */
+.settings-layout, .setup-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-4) var(--space-5);
+  align-items: start;
+}
+@media (min-width: 64rem) {
+  .settings-layout, .setup-layout {
+    grid-template-columns: minmax(12rem, 15rem) minmax(0, 1fr);
+  }
+}
+.page-toc ul, .setup-progress {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.page-toc li + li, .setup-progress li + li {
+  margin-top: 2px;
+}
+.page-toc a {
+  display: block;
+  min-height: 2.5rem;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  color: var(--text);
+  text-decoration: none;
+}
+.page-toc a:hover {
+  background: var(--row-hover);
+  color: var(--text);
+}
+.page-toc a[aria-current="true"] {
+  background: var(--accent-subtle);
+  color: var(--text);
+  font-weight: var(--weight-bold);
+}
+.setup-progress li {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: 2.5rem;
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
+}
+.setup-progress li[aria-current="step"] {
+  background: var(--accent-subtle);
+  color: var(--text);
+  font-weight: var(--weight-bold);
+}
+.step-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  box-sizing: border-box;
+  width: 1.5rem;
+  height: 1.5rem;
+  border: 2px solid var(--border-strong);
+  border-radius: var(--radius-pill);
+  font-size: var(--text-xs);
+  line-height: 1;
+}
+.setup-progress li[aria-current="step"] .step-dot {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.setup-progress li.step-done {
+  color: var(--text);
+}
+.setup-progress li.step-done .step-dot {
+  border-color: var(--success);
+  color: var(--success);
+  background: var(--success-subtle);
+}
+.step-count {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  margin: 0 0 var(--space-1);
 }
 
 /* Forms: label text above the control. */

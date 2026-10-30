@@ -1,7 +1,9 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import { LANG_PREFS, type LangPref } from '../../shared/i18n';
 import { useText } from '../../shared/i18n/context';
+import { BrandMark } from '../../shared/BrandMark';
+import { SkipLink } from '../../shared/SkipLink';
 import { csrf, loadSession } from '../../shared/ipc/transport-http';
 import { nav, useSession } from './RequireSession';
 import { ServerHelpIndex, ServerHelpLink, type ServerPath, serverTarget } from './ServerHelp';
@@ -90,50 +92,81 @@ export function ServerHeader() {
   // `/credentials/` is the same page as `/credentials`.
   const path = window.location.pathname.replace(/(.)\/+$/, '$1');
   const here = serverTarget(path) === undefined ? undefined : (path as ServerPath);
+  const title = here === undefined ? undefined : pageName[here];
+  // The tab title follows the page language (the static <title> is English).
+  useEffect(() => {
+    if (title !== undefined) document.title = `atlas-duck: ${title}`;
+  }, [title]);
   const admin = session?.roles.includes('admin') ?? false;
   const auditor = session?.roles.includes('auditor') ?? false;
+  // `/` serves the approvals page; the consent step belongs to the connected apps.
+  const current = path === '/' ? '/approvals' : path === '/oauth/consent' ? '/connected-apps' : path;
+  const links: { href: ServerPath; text: string; show: boolean }[] = [
+    { href: '/approvals', text: h.approvals, show: true },
+    { href: '/credentials', text: h.credentials, show: true },
+    { href: '/api-keys', text: h.api_keys, show: true },
+    { href: '/connected-apps', text: h.connected_apps, show: true },
+    { href: '/audit', text: h.my_audit, show: true },
+    { href: '/auditor', text: h.auditor, show: auditor },
+    { href: '/admin', text: h.admin, show: admin },
+  ];
   return (
-    <header className="app-header server-header">
-      <nav aria-label={h.pages}>
-        <a href="/approvals">{h.approvals}</a>
-        <a href="/credentials">{h.credentials}</a>
-        <a href="/api-keys">{h.api_keys}</a>
-        <a href="/connected-apps">{h.connected_apps}</a>
-        <a href="/audit">{h.my_audit}</a>
-        {auditor ? <a href="/auditor">{h.auditor}</a> : null}
-        {admin ? <a href="/admin">{h.admin}</a> : null}
-        {langPref === null ? null : (
-          <label className="server-lang" aria-busy={pending !== null}>
-            {t.common.language}
-            <select
-              value={pending ?? langPref.pref}
-              onChange={(e) => {
-                const value = LANG_PREFS.find((p) => p === e.target.value);
-                if (value !== undefined) chooseLang(value);
+    <>
+      <SkipLink />
+      <header className="app-header server-header">
+        <div className="app-bar">
+          <a className="brand" href="/approvals">
+            <BrandMark />
+            atlas-duck
+          </a>
+          <nav aria-label={h.pages}>
+            <ul className="nav-list">
+              {links
+                .filter((l) => l.show)
+                .map((l) => (
+                  <li key={l.href}>
+                    <a href={l.href} aria-current={current === l.href ? 'page' : undefined}>
+                      {l.text}
+                    </a>
+                  </li>
+                ))}
+            </ul>
+          </nav>
+          <div className="app-bar-tools">
+            {langPref === null ? null : (
+              <label className="server-lang" aria-busy={pending !== null}>
+                {t.common.language}
+                <select
+                  value={pending ?? langPref.pref}
+                  onChange={(e) => {
+                    const value = LANG_PREFS.find((p) => p === e.target.value);
+                    if (value !== undefined) chooseLang(value);
+                  }}
+                >
+                  {LANG_PREFS.map((p) => (
+                    <option key={p} value={p}>
+                      {label[p]}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+            <ServerHelpIndex />
+            {here === undefined ? null : <ServerHelpLink path={here} label={pageName[here]} />}
+            <span className="server-user">{session?.user ?? ''}</span>
+            <button
+              type="button"
+              onClick={() => {
+                void signOut().then((ok) => setFailed(!ok));
               }}
             >
-              {LANG_PREFS.map((p) => (
-                <option key={p} value={p}>
-                  {label[p]}
-                </option>
-              ))}
-            </select>
-          </label>
-        )}
-        <ServerHelpIndex />
-        {here === undefined ? null : <ServerHelpLink path={here} label={pageName[here]} />}
-        <span className="server-user">{session?.user ?? ''}</span>
-        <button
-          type="button"
-          onClick={() => {
-            void signOut().then((ok) => setFailed(!ok));
-          }}
-        >
-          {h.sign_out}
-        </button>
-      </nav>
-      {failed ? <p role="alert" className="notice notice-danger">{h.sign_out_failed}</p> : null}
-      {langFailed ? <p role="alert" className="notice notice-danger">{t.common.lang_save_failed}</p> : null}
-    </header>
+              {h.sign_out}
+            </button>
+          </div>
+        </div>
+        {failed ? <p role="alert" className="notice notice-danger">{h.sign_out_failed}</p> : null}
+        {langFailed ? <p role="alert" className="notice notice-danger">{t.common.lang_save_failed}</p> : null}
+      </header>
+    </>
   );
 }

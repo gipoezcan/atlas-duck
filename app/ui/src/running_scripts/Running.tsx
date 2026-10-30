@@ -172,7 +172,8 @@ export function Running() {
       {rows.length === 0 ? (
         <p className="empty-state">{t.running.empty}</p>
       ) : (
-        <table aria-label={t.running.list_label}>
+        <div className="table-scroll">
+<table aria-label={t.running.list_label}>
           <thead>
             <tr>
               <th scope="col">{t.running.col_request}</th>
@@ -221,6 +222,7 @@ export function Running() {
             ))}
           </tbody>
         </table>
+</div>
       )}
     </main>
   );

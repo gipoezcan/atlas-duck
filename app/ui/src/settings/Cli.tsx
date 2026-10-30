@@ -51,8 +51,8 @@ export function Cli({
         ? t.settings.cli_not_installed_dir_on_path
         : t.settings.cli_not_installed;
   return (
-    <section aria-label={t.settings.cli}>
-      <h2>{t.settings.cli}</h2>
+    <section id="settings-cli" aria-label={t.settings.cli}>
+      <h2 tabIndex={-1}>{t.settings.cli}</h2>
       <HelpLink section="settings/cli" label={t.settings.cli} />
       <p>{status}</p>
       {packaged ? null : (

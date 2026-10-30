@@ -3,15 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Scripts - Atlas Duck Help</title>
+<title>Scripts - atlas-duck User guide</title>
 <link rel="stylesheet" href="assets/help.css">
 <script src="assets/search-index.js" defer></script>
 <script src="assets/help.js" defer></script>
 </head>
 <body>
+<a class="skip-link" href="#content">Skip to the content</a>
 <header class="bar">
-<a class="brand" href="/docs/en/">Atlas Duck Help</a>
-<div class="search" hidden>
+<a class="brand" href="/docs/en/">atlas-duck <span class="brand-sub">User guide</span></a>
+<div class="search" role="search" hidden>
 <label class="visually-hidden" for="help-search">Search help</label>
 <input id="help-search" type="search" placeholder="Search help" autocomplete="off" data-empty="No results">
 <ul id="help-results" hidden></ul>
@@ -42,7 +43,7 @@
 <li><a href="/docs/en/error-reference">Error reference</a></li>
 </ul>
 </nav>
-<main>
+<main id="content" tabindex="-1">
 <h1>Scripts</h1>
 <h2 id="what-are-scripts">What scripts are</h2>
 <p>A script lets an agent do many reads in one request. It is JavaScript: the body of <code>async function main(args, atlas)</code>. Inside, it calls read operations with <code>atlas.&lt;product&gt;.&lt;op&gt;(params)</code>, <code>atlas.call</code>, pages through results with <code>atlas.all</code>, and can ask <code>atlas.ops()</code> and <code>atlas.instances()</code> what exists. <code>atlas.log</code> writes a note.</p>
@@ -56,7 +57,7 @@
 <h2 id="limits">Limits and confinement</h2>
 <p>Every script runs under limits, so that one script cannot use up your machine or an instance.</p>
 <p>The server runs scripts with the defaults below. They are fixed; there is no setting for them on the server.</p>
-<table>
+<div class="tablebox"><table>
 <thead><tr><th>Limit</th><th>Default</th></tr></thead>
 <tbody>
 <tr><td>Script timeout (s)</td><td>120</td></tr>
@@ -67,7 +68,7 @@
 <tr><td>Script call result limit (MiB)</td><td>16</td></tr>
 <tr><td>Script result limit (MiB)</td><td>16</td></tr>
 <tr><td>Script concurrent calls</td><td>4</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>An agent may ask for lower limits (with <code>--limits</code> on the command line, or the <code>limits</code> parameter of <code>script_run</code>), never for higher ones. A script that exceeds a limit stops with <code>script_limit</code> (exit 8).</p>
 <p>Two real scripts and two dry runs can run at once. More wait in line. The server applies the same numbers for each user.</p>
 <p>The heap limit must be at least 15 times the call result limit, and the process limit at least the heap limit plus 88 MiB. Settings refuses values that break this.</p>
