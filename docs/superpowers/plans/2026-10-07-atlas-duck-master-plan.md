@@ -870,7 +870,7 @@ Each milestone entry lists: scope (§14, with the placements this plan makes whe
 - **Consistency:** CI requires every page in both languages with the same section anchors; the error-code reference matches the code both ways; every UI page links to its section. Search: a build-time index plus a few KB of own JavaScript (no library), else a table of contents and index page. Screenshots generated in CI in both languages if it fits the milestone. The German text has no human review (user decision).
 - **Depends on:** M15.
 - **Exit criterion:** the desktop bundles (Windows, macOS, Linux) open the guide offline; production serves it from the menu entry; the docs checks are green in CI; every UI page links to its section.
-- **Status:** not started.
+- **Status:** done 2026-10-30: plan 2026-10-29-atlas-duck-m16-user-guide.md (Tasks 1–12, PD-321..330); merged to master at 81de9ac after a final Opus review (READY); GitHub CI run 40968898592 green; GitLab pipeline 43452 deployed to production; live check: `/docs/en/`, `/docs/de/` with CSP, `/docs` redirects by Accept-Language, search assets load, login and server Help link ship. Open: screenshots (PD-330 follow-up), manual check of the desktop Help window in a real webview and of help.css visually, macOS RLIMIT_AS unverified.
 
 **Open after M13/M14** (operational, no code task):
 
