@@ -82,6 +82,8 @@ rust:test:
     # Same for the keyring dir: the container's home is an overlayfs too (§8.6 locality).
     - mkdir -p "$CI_PROJECT_DIR/.xdg" && export XDG_DATA_HOME="$CI_PROJECT_DIR/.xdg"
     - cargo clippy --workspace --all-targets --locked -- -D warnings
+    # M16 T2: the committed help sets are what the generator makes of docs/user-guide.
+    - cargo run -p atlas-duck-docgen --locked -- --src docs/user-guide --desktop-out app/ui/public/help --server-out app/ui/public-server/docs --check
     # As GitHub's test legs: the server crates have their own jobs (GitHub `server`, which sets
     # ATLAS_DUCK_SANDBOX_BIN for the real-worker test, and `server-e2e`, whose suite needs a
     # running server and exits with its usage text without one).
@@ -135,6 +137,8 @@ node:ci-checks:
     - node ci/check-workspace.mjs
     - node ci/check-csp.mjs
     - node ci/check-commands.mjs
+    # M16 T3: user guide consistency.
+    - node ci/check-user-guide.mjs
     - node ci/check-dialog-proofs.mjs
     - node --test app/isolation/hook.test.mjs
     - node --test "ci/*.test.mjs"

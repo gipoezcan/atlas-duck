@@ -8,6 +8,7 @@
 @import './styles/setup.css';
 @import './styles/audit.css';
 @import './styles/misc-windows.css';
+@import './styles/help.css';
 
 /* The Tauri isolation iframe is hidden by the inline <style> that isolation.js
    injects, which both policies admit by its sha256 hash (spec 6.4, ruling B1);

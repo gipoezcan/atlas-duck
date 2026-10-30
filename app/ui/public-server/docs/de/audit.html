@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audit-Protokoll - Atlas Duck Hilfe</title>
+<link rel="stylesheet" href="assets/help.css">
+<script src="assets/search-index.js" defer></script>
+<script src="assets/help.js" defer></script>
+</head>
+<body>
+<header class="bar">
+<a class="brand" href="/docs/de/">Atlas Duck Hilfe</a>
+<div class="search" hidden>
+<label class="visually-hidden" for="help-search">Hilfe durchsuchen</label>
+<input id="help-search" type="search" placeholder="Hilfe durchsuchen" autocomplete="off" data-empty="Keine Treffer">
+<ul id="help-results" hidden></ul>
+</div>
+<a class="lang-switch" lang="en" hreflang="en" href="/docs/en/audit">English</a>
+</header>
+<div class="layout">
+<nav class="toc" aria-label="Inhalt">
+<ul>
+<li><a href="/docs/de/">Übersicht</a></li>
+<li><a href="/docs/de/getting-started-server">Erste Schritte (Server)</a></li>
+<li><a href="/docs/de/instances-and-tokens">Instanzen und Tokens</a></li>
+<li><a href="/docs/de/agents-server">Agents (Server)</a></li>
+<li><a href="/docs/de/approvals">Freigaben</a></li>
+<li><a href="/docs/de/scripts">Skripte</a></li>
+<li><a href="/docs/de/audit" aria-current="page">Audit-Protokoll</a>
+<ul>
+<li><a href="#audit-log">Was das Audit-Protokoll festhält</a></li>
+<li><a href="#verify">Die Kette prüfen</a></li>
+<li><a href="#export">Das Protokoll exportieren</a></li>
+<li><a href="#verify-export">Einen Export mit verify-export prüfen</a></li>
+<li><a href="#retention">Aufbewahrung und Legal Hold</a></li>
+<li><a href="#integrity-incident">Integritätsvorfälle</a></li>
+</ul>
+</li>
+<li><a href="/docs/de/settings">Einstellungen</a></li>
+<li><a href="/docs/de/admin">Administration</a></li>
+<li><a href="/docs/de/auditor">Auditor</a></li>
+<li><a href="/docs/de/troubleshooting">Fehlerbehebung</a></li>
+<li><a href="/docs/de/error-reference">Fehlerreferenz</a></li>
+</ul>
+</nav>
+<main>
+<h1>Audit-Protokoll</h1>
+<h2 id="audit-log">Was das Audit-Protokoll festhält</h2>
+<p>atlas-duck hält alles fest, was rund um eine Anfrage geschieht: dass sie eingegangen ist, was Sie gesehen haben, was Sie entschieden haben, was an die Instanz gesendet wurde und was zurückkam, und was der Agent erhalten hat. Die Datensätze sind verkettet: Jeder enthält einen Fingerabdruck seines Vorgängers, sodass ein geänderter oder entfernter Datensatz die Kette bricht und sich finden lässt. Den Inhalt jedes Datensatzes (die „Nutzdaten“) speichert atlas-duck verschlüsselt.</p>
+<p>Jeder Benutzer hat ein eigenes, getrenntes Audit-Protokoll. Die Seite „Mein Audit-Protokoll“ in der Kopfzeile zeigt Ihres: die Liste der Datensätze mit Filtern, den Verlauf einer Anfrage und die Nutzdaten eines Datensatzes. Das Lesen Ihres eigenen Protokolls wird nicht festgehalten. Prüfung, Kenntnisnahme von Vorfällen, Backup und Anker-Verzeichnis gehören zur Desktop-App; auf dem Server kümmert sich der Betreiber darum. Benutzer mit der Rolle Auditor können die Protokolle anderer Benutzer lesen, siehe <a href="/docs/de/auditor#auditor-role">Die Rolle Auditor</a>.</p>
+<p><strong>Filter.</strong> Sie können nach Zeitraum („Von (UTC)“, „Bis (UTC)“), „Agent-Name“, „Vorgang“, „Klasse“, „Instanz-ID“, „Ziel (beginnt mit)“, „Entscheidung“ und „Markierungen (eine davon)“ filtern. Die Filter treffen nur auf die Klartextspalten eines Datensatzes zu; Nutzdaten werden nicht durchsucht. „Mehr laden“ setzt eine Suche fort.</p>
+<p><strong>Entscheidungen</strong> im Protokoll sind: freigegeben, freigegeben (bearbeitet), übergeben, übergeben (geschwärzt), abgelehnt, abgelaufen, storniert und zurückgewiesen. <strong>Markierungen</strong> sind: bearbeitet, geschwärzt, Sammelentscheidung, veraltet, Uhr ging zurück, Uhr sprang vor, Uhr geht nach und Integritätsvorfall. Die Uhr-Markierungen kennzeichnen Datensätze, die geschrieben wurden, als die Uhr des Computers zurückging, vorsprang oder hinter dem von den Servern gemeldeten Datum nachging. Sie sorgen dafür, dass eine falsche Uhr die Aufbewahrung nicht verkürzen kann.</p>
+<p><strong>Ein Datensatz.</strong> „Datensatz öffnen“ zeigt die Felder: Zeit (UTC), Ereignis, Anfrage, Vorgang, Klasse, Instanz-ID, Ziel, Entscheidung, Markierungen, Agent-Name und seine Herkunft, Client, Verbindung, Prozess-ID der Gegenstelle, Programm der Gegenstelle, Ursprungsprogramm, Betriebssystem-Benutzer, Atlassian-Benutzer und „Nutzdaten in Bytes“. „Entschlüsselte Nutzdaten anzeigen“ öffnet den Inhalt seitenweise.</p>
+<p><strong>Verlauf einer Anfrage.</strong> „Verlauf der Anfrage“ zeigt alle Datensätze einer Anfrage in der Reihenfolge. „N-mal zugestellt“ zählt, wie oft die Antwort übergeben wurde. „mehrfach zugestellt“ und „an ein anderes Programm zugestellt“ sind Hinweise: Sie vergleichen das Programm, das gefragt hat, mit dem Programm, das die Antwort erhalten hat, und weisen auf etwas hin, das zu prüfen ist, nicht auf einen Beweis.</p>
+<p><strong>Was das Protokoll kann und was nicht.</strong> Das Protokoll zeigt, wer wann was entschieden hat, und es macht spätere Änderungen sichtbar. Es hindert niemanden am Handeln. Es schützt nicht vor Schadsoftware, die als Ihr eigener Benutzer läuft, während Sie angemeldet sind: Solcher Code kann die Schlüssel lesen und das Protokoll umschreiben. Auch der protokollierte Benutzer selbst kann das Protokoll löschen oder zerstörerische Aktionen bestätigen. Schutz davor braucht ein Anker-Verzeichnis, das Sie nicht umschreiben können, siehe <a href="/docs/de/audit#verify">Die Kette prüfen</a>.</p>
+<p>Das Protokoll enthält personenbezogene Daten, zum Beispiel Namen und Kommentare aus Jira und Confluence. Gehen Sie mit Exporten entsprechend um.</p>
+<h2 id="verify">Die Kette prüfen</h2>
+<p>Die Prüfung stellt fest, dass die Kette vollständig und unverändert ist: Jeder Datensatz gehört zu seinem Vorgänger, die Nutzdaten passen zu ihren Fingerabdrücken, und der Protokollkopf stimmt mit den an anderer Stelle gehaltenen Kopien überein.</p>
+<p>Der Server prüft Ketten nicht auf den Webseiten. Neben der Kette jedes Benutzers führt der Server eine <strong>Ankerkette</strong>, die den Kopf der Kette jedes Benutzers festhält, in Abständen von höchstens 15 Minuten. Der Betreiber kann <code>admin anchor verify</code> ausführen: Der Befehl berechnet die Ankerkette neu und vergleicht den zuletzt verankerten Kopf jedes Benutzers mit dessen Protokoll. Er meldet eine gekürzte Kette, einen ersetzten Kopfdatensatz oder ein fehlendes Protokoll. Er prüft nicht die ganze Kette eines Benutzers und nicht die Nutzdaten, und er kann keine Änderung finden, die vor dem verankerten Kopf liegt. Nichts wird von selbst erkannt: Ein Befund erscheint nur, wenn der Betreiber den Befehl ausführt. Auch die Ankerkette schreibt der Server selbst; sie schützt also vor Fehlern einzelner Benutzer und vor Teilschäden, aber nicht vor jemandem, der den Server und seine Schlüssel kontrolliert.</p>
+<h2 id="export">Das Protokoll exportieren</h2>
+<p>Ein Export kopiert die Datensätze eines Zeitraums samt entschlüsselten Nutzdaten, damit jemand anderes sie prüfen kann, zum Beispiel ein Auditor oder der Verantwortliche für Compliance. Die Dateien kann jeder lesen, der sie öffnen kann. Schützen Sie sie so gut wie die Originaldaten.</p>
+<p>Die Exportfunktion finden Sie unter „Mein Audit-Protokoll“. Wählen Sie „Alle Datensätze“ oder „Ab Datum (UTC)“ und dann „Export starten“. Sobald „Der Export ist bereit“ erscheint, verwenden Sie „Herunterladen“. Der Download ist eine tar-Datei mit den Datensätzen, den entschlüsselten Nutzdaten und den weiteren Dateien, die das Prüfprogramm braucht. Die Seite zeigt außerdem das „SHA-256 des Manifests“ und den „Kopf-Anker“. Geben Sie beides dem Empfänger über einen anderen Kanal als das Archiv.</p>
+<p>Von demselben Protokoll läuft immer nur ein Export („Ein Export läuft bereits“). Der Server löscht Exportdateien standardmäßig nach 24 Stunden; danach heißt es „Dieser Export ist nicht mehr verfügbar. Starten Sie einen neuen.“</p>
+<p>Auditoren können das Protokoll jedes Benutzers auf dieselbe Weise exportieren, siehe <a href="/docs/de/auditor#auditor-exports">Exporte</a>.</p>
+<h2 id="verify-export">Einen Export mit verify-export prüfen</h2>
+<p>Der Empfänger prüft einen Export mit dem Befehl <code>atlas-duck verify-export</code>. Er braucht dafür keinen Zugriff auf Ihren Computer oder Server und arbeitet offline.</p>
+<pre><code>atlas-duck verify-export &lt;Ordner&gt; [--manifest-sha256 &lt;hex&gt;] [--anchor-dir &lt;Ordner&gt;]
+</code></pre>
+<p>Er berechnet jeden Datensatz-Fingerabdruck und die Kette neu, prüft, dass die entschlüsselten Nutzdaten zu ihren Fingerabdrücken passen, und vergleicht das Ergebnis mit dem, was Sie ihm als <strong>Vertrauensanker</strong> geben:</p>
+<ul>
+<li><code>--manifest-sha256</code> ist der Fingerabdruck, den Sie getrennt weitergegeben haben. Er belegt, dass die Dateien die exportierten sind.</li>
+<li><code>--anchor-dir</code> ist eine Kopie des Anker-Verzeichnisses. Sie zeigt, dass die Historie zu dem passt, was dort früher geschrieben wurde.</li>
+</ul>
+<p>Beide sind optional, aber ohne einen Vertrauensanker kann das Ergebnis nur „in sich stimmig“ lauten (Exit 20).</p>
+<p>Bei einem Server-Export zeigt die Seite den vollständigen Befehl, einschließlich <code>--anchor-chain &lt;Ordner&gt;/anchor-chain.jsonl</code> und <code>--anchor-chain-head &lt;seq&gt;:&lt;hash&gt;</code>. Die Ankerkette im Archiv ist nur ein Auszug. Ohne den Kopf, den Sie vorgeben, gilt sie als nicht verankert und zählt nichts, weil sich ein in sich stimmiger Auszug vollständig erfinden lässt. Nehmen Sie den Kopf von der Exportseite oder vom Betreiber, nicht aus dem Archiv. Das Server-Image enthält das Prüfprogramm ebenfalls: <code>atlas-duck-server verify-export …</code>.</p>
+<p>Der Exit-Code sagt Ihnen, wie weit Sie dem Ergebnis trauen können:</p>
+<table>
+<thead><tr><th>Exit-Code</th><th>Bedeutung</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>Verifiziert gegen einen Vertrauensanker, der den ganzen Export abdeckt.</td></tr>
+<tr><td>20</td><td>In sich stimmig, aber kein Vertrauensanker deckt alles ab. Der Befehl meldet „internally consistent; trust root NOT verified“. Behandeln Sie das als nicht verifiziert.</td></tr>
+<tr><td>21</td><td>Manipulation oder eine Verzweigung: zwei Exporte, die denselben Anfang haben und dann auseinanderlaufen.</td></tr>
+<tr><td>22</td><td>Der Befehl konnte nicht laufen: falsche Verwendung (zum Beispiel <code>--anchor-dir</code> zusammen mit <code>--anchor-chain</code>), nicht lesbare Dateien, ein unfertiger Ordner mit „.partial“ oder die App atlas-duck wurde nicht gefunden.</td></tr>
+</tbody></table>
+<p>Eine Verzweigung ist nicht zwingend ein Angriff. Sie entsteht, wenn ein Protokoll aus einem Backup wiederhergestellt wurde, während die alte Installation weiterlief. Die alte Installation sollte außer Betrieb genommen werden.</p>
+<h2 id="retention">Aufbewahrung und Legal Hold</h2>
+<p>Das Audit-Protokoll wird nicht ewig aufbewahrt. Die Aufbewahrungsfrist legt fest, wie lange Datensätze bleiben.</p>
+<p>Auf dem Server legt der Betreiber die Aufbewahrungsfrist fest, nicht der einzelne Benutzer, und das Protokoll eines aktiven Benutzers bleibt erhalten. Diese Anleitung beschreibt, was der Server tut, wenn ein Benutzer deaktiviert wird, zum Beispiel weil er die Organisation verlassen hat: Sein Protokoll bleibt für Auditoren standardmäßig 365 Tage lang verfügbar. Danach löscht der Server es samt den Schlüsseln des Benutzers und hält die Löschung in der Ankerkette fest. Ein Auditor, der ein Protokoll länger braucht, muss es vorher exportieren. Backups bleiben davon unberührt: Ein früher erstelltes Backup enthält das gelöschte Protokoll weiterhin, der Betreiber muss also auch alte Backups entfernen.</p>
+<h2 id="integrity-incident">Integritätsvorfälle</h2>
+<p>Ein Integritätsvorfall bedeutet, dass eine Prüfung etwas gefunden hat, das nicht sein sollte. Die Ursache kann harmlos sein, etwa die Wiederherstellung eines Backups, oder eine Manipulation. atlas-duck kann nicht unterscheiden, was es ist.</p>
+<p>Integritätsvorfälle mit Banner und Kenntnisnahme gibt es nur in der Desktop-App. Der Server zeigt sie nicht auf den Webseiten. Führt der Betreiber <code>admin anchor verify</code> aus, meldet der Befehl Befunde, die den Benutzer und die Sequenznummer nennen, und endet mit einem Fehler. Wenn Sie vermuten, dass Ihr Protokoll betroffen ist, wenden Sie sich an Ihren Administrator.</p>
+</main>
+</div>
+</body>
+</html>

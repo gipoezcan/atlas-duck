@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Approvals - Atlas Duck Help</title>
+<link rel="stylesheet" href="assets/help.css">
+<script src="assets/search-index.js" defer></script>
+<script src="assets/help.js" defer></script>
+</head>
+<body>
+<header class="bar">
+<a class="brand" href="/docs/en/">Atlas Duck Help</a>
+<div class="search" hidden>
+<label class="visually-hidden" for="help-search">Search help</label>
+<input id="help-search" type="search" placeholder="Search help" autocomplete="off" data-empty="No results">
+<ul id="help-results" hidden></ul>
+</div>
+<a class="lang-switch" lang="de" hreflang="de" href="/docs/de/approvals">Deutsch</a>
+</header>
+<div class="layout">
+<nav class="toc" aria-label="Contents">
+<ul>
+<li><a href="/docs/en/">Overview</a></li>
+<li><a href="/docs/en/getting-started-server">Getting started (server)</a></li>
+<li><a href="/docs/en/instances-and-tokens">Instances and tokens</a></li>
+<li><a href="/docs/en/agents-server">Agents (server)</a></li>
+<li><a href="/docs/en/approvals" aria-current="page">Approvals</a>
+<ul>
+<li><a href="#queue">The approval queue</a></li>
+<li><a href="#reading-a-request">Reading a request</a></li>
+<li><a href="#approve-or-deny">Approve, release or deny</a></li>
+<li><a href="#edit-and-redact">Editing and redacting</a></li>
+<li><a href="#batch-decisions">Batch decisions</a></li>
+<li><a href="#needs-attention">Needs attention</a></li>
+<li><a href="#unverified-text">Unverified text</a></li>
+</ul>
+</li>
+<li><a href="/docs/en/scripts">Scripts</a></li>
+<li><a href="/docs/en/audit">Audit log</a></li>
+<li><a href="/docs/en/settings">Settings</a></li>
+<li><a href="/docs/en/admin">Administration</a></li>
+<li><a href="/docs/en/auditor">Auditor</a></li>
+<li><a href="/docs/en/troubleshooting">Troubleshooting</a></li>
+<li><a href="/docs/en/error-reference">Error reference</a></li>
+</ul>
+</nav>
+<main>
+<h1>Approvals</h1>
+<h2 id="queue">The approval queue</h2>
+<p>Nothing an agent asks for leaves atlas-duck without your decision. Every request that needs one waits in the queue under &quot;Pending approvals&quot;. When nothing waits, the list says &quot;No pending requests&quot;.</p>
+<p>After you sign in, the Approvals page is your start page. Its header leads to the other pages of the server.</p>
+<p>Requests are grouped by session, so you see which agent run sent what. Each row shows:</p>
+<ul>
+<li>the class of the request: &quot;Read&quot;, &quot;Write&quot; or &quot;Script&quot;;</li>
+<li>the agent's reason, or &quot;no reason given&quot;;</li>
+<li>how long the request has waited;</li>
+<li>warnings: &quot;stale&quot; (its revision changed after you opened it, so open it again), &quot;caution&quot; (see <a href="/docs/en/approvals#unverified-text">Unverified text</a>), &quot;possible duplicate&quot; and &quot;similar request&quot; (an earlier request of the same agent looks alike).</li>
+</ul>
+<p>Use &quot;Open&quot; to look at a request. Use &quot;select&quot; to include a row in a <a href="/docs/en/approvals#batch-decisions">batch decision</a>, or &quot;select all from session&quot; to select all rows of one session.</p>
+<p>A request that nobody decides expires. The agent then receives <code>expired</code>.</p>
+<h2 id="reading-a-request">Reading a request</h2>
+<p>Opening a request fills the detail pane, &quot;Request detail&quot;. At first the pane only offers &quot;Open preview&quot;. Opening the preview is what makes a decision possible: you decide on what you have seen.</p>
+<p>The pane has four tabs:</p>
+<table>
+<thead><tr><th>Tab</th><th>Content</th></tr></thead>
+<tbody>
+<tr><td>Preview</td><td>What would be executed or sent to the agent, in readable form.</td></tr>
+<tr><td>Structured</td><td>The same content as a tree; here you edit or redact.</td></tr>
+<tr><td>Raw</td><td>The exact content, page by page.</td></tr>
+<tr><td>Request</td><td>Who asked for what.</td></tr>
+</tbody></table>
+<p>The &quot;Request&quot; tab lists:</p>
+<ul>
+<li>Params and their <code>params_sha256</code> fingerprint;</li>
+<li>Reason, Instance, Operation and Target;</li>
+<li>Requested limits (scripts only);</li>
+<li>Submitted and Age;</li>
+<li>Connection, Client kind, Agent name, Agent name source and <code>cwd_basename</code>;</li>
+<li>Connection id.</li>
+</ul>
+<p>The agent name is chosen by the agent. Treat it as a label, not as proof of who is asking.</p>
+<h2 id="approve-or-deny">Approve, release or deny</h2>
+<p>The buttons depend on the class of the request:</p>
+<table>
+<thead><tr><th>Request</th><th>Buttons</th><th>What happens</th></tr></thead>
+<tbody>
+<tr><td>Write</td><td>&quot;Approve&quot;</td><td>atlas-duck executes the change.</td></tr>
+<tr><td>Read</td><td>&quot;Release&quot;</td><td>The data the instance returned is handed to the agent.</td></tr>
+<tr><td>Script</td><td>&quot;Release&quot;</td><td>The final result of the script is handed to the agent.</td></tr>
+<tr><td>Read that failed with an HTTP error</td><td>&quot;Release&quot; or &quot;Release status only&quot;</td><td>The agent receives <code>failed</code> (exit 6) with the HTTP status, with the text of the error (&quot;Release&quot;) or without it (&quot;Release status only&quot;).</td></tr>
+<tr><td>Read that failed without an HTTP answer, or was too large</td><td>&quot;Release outcome&quot;</td><td>The agent receives <code>failed</code> (exit 6) with the outcome class (<code>result_too_large</code>, <code>upstream_network</code> or <code>upstream_unavailable</code>) and a fixed message; no HTTP status and no size.</td></tr>
+<tr><td>Any</td><td>&quot;Deny&quot;</td><td>The agent receives <code>denied</code> (exit 3) and your reason.</td></tr>
+</tbody></table>
+<p>Under the buttons the pane states in one line what the agent will receive.</p>
+<p>Shortcuts: Ctrl/Cmd+Shift+Enter approves or releases, Ctrl/Cmd+Shift+D denies, Ctrl/Cmd+Shift+Down and Ctrl/Cmd+Shift+Up move to the next and previous request.</p>
+<p>To deny, &quot;Deny&quot; opens &quot;Deny this request&quot;. Type the &quot;Reason for the agent&quot; and press Enter, or use &quot;Send deny&quot;; Esc cancels. The agent sees your reason, so write it for the agent. You can also &quot;Attach a hint&quot;: at most one hint, chosen from the offered ones, for example the HTTP status of the instance, the outcome class, the name that could not be resolved, or the missing required fields. The hint helps the agent to try again with better input.</p>
+<h2 id="edit-and-redact">Editing and redacting</h2>
+<p>You can change what is executed, or hold back parts of what is released. Both create a new revision of the request. atlas-duck never changes the old revision.</p>
+<p><strong>Edit a write.</strong> &quot;Edit before approving&quot; shows the parameters as fields. Fields that name the target are marked &quot;read-only: deny to retarget&quot;; if the target is wrong, deny and let the agent ask again. Missing required fields are listed under &quot;Missing required fields&quot;. &quot;Edit &amp; approve&quot; sends your edit; &quot;Reset edits&quot; discards it. An edit gives a new revision: open its preview, check it, then approve it as a second step. Edits that you have not sent keep &quot;Approve&quot; disabled (&quot;Unsent edits…&quot;).</p>
+<p><strong>Redact a read or a script result.</strong> &quot;Redact before releasing&quot; shows the candidate, the data that would go to the agent, as a tree. You can:</p>
+<ul>
+<li>&quot;Drop item&quot;: leave out one entry of a list;</li>
+<li>&quot;Drop field (this item)&quot; or &quot;Drop field (all items)&quot;: leave out a field;</li>
+<li>&quot;Mask text&quot;: replace a text with <code>[REDACTED]</code>. Enter the &quot;Text to mask&quot;, or use the selected text. &quot;Only this occurrence&quot; masks one place only;</li>
+<li>use a preset: &quot;Release status only&quot; or &quot;Keep error class only&quot;;</li>
+<li>&quot;Remove all redactions&quot; to start over.</li>
+</ul>
+<p>Pressing &quot;Release&quot; sends the redactions and creates a new revision. Open it, check what the agent would receive (&quot;Released size&quot; shows the number of bytes), then release it.</p>
+<p>If the text you want to mask also appears elsewhere, atlas-duck tells you where. &quot;Release anyway: the other occurrences stay in what the agent receives&quot; is your explicit choice to leave them.</p>
+<p><strong>When a release is blocked.</strong> atlas-duck refuses a release that could leak what you redacted, and says why:</p>
+<table>
+<thead><tr><th>Message</th><th>Meaning and what to do</th></tr></thead>
+<tbody>
+<tr><td>a masked text still occurs</td><td>The text is still present, for example in another field, or in a place that cannot be rewritten such as a field name or a number. Mask it elsewhere, or drop the item or the field.</td></tr>
+<tr><td>a value still changes after 3 decoding rounds</td><td>A value is encoded in layers that cannot be checked reliably, or it is too large to check. Drop the item or the field.</td></tr>
+<tr><td>a match could not be masked cleanly</td><td>The text sits inside an encoded value. Drop the item or the field instead.</td></tr>
+<tr><td>a mirrored entry has no counterpart</td><td>Two lists in the result belong together and one entry has no partner. Use &quot;Drop the flagged items&quot;.</td></tr>
+<tr><td>mirrored entries cannot be matched</td><td>The same, but atlas-duck cannot tell which entries belong together. Use &quot;Drop the flagged items&quot;.</td></tr>
+<tr><td>a redaction names nothing in the candidate</td><td>The redaction no longer fits the data. Remove it.</td></tr>
+<tr><td>the redacted candidate is over the 16 MiB release cap</td><td>The result is too large to release. Drop items or fields, or deny.</td></tr>
+</tbody></table>
+<p>When entries have no counterpart, the pane lists them (&quot;These entries have no counterpart and block the release:&quot;). If the candidate cannot be built exactly, the release is blocked as well; deny the request or drop the flagged entries.</p>
+<h2 id="batch-decisions">Batch decisions</h2>
+<p>When many similar requests wait, decide them together. Select the rows, or use &quot;select all from session&quot;, and the &quot;Batch decision&quot; bar appears. &quot;Approve or release N selected&quot; first shows what will happen, for example how many reads and scripts are released and how many writes are approved. You then confirm with &quot;Confirm batch&quot;, and the desktop app asks once more with a native confirmation.</p>
+<p>A batch is all or nothing. If even one request changed in the meantime, the whole batch is refused: &quot;The batch was rejected and nothing was decided&quot;. The reason is given for each request:</p>
+<ul>
+<li>its revision changed (stale);</li>
+<li>its preview was not opened;</li>
+<li>it is not approvable;</li>
+<li>it is flagged as a possible duplicate or similar request, and must be approved individually;</li>
+<li>it is no longer pending;</li>
+<li>its target cannot be edited.</li>
+</ul>
+<p>A request that you want to look at yourself can be taken out of the batch: it then shows &quot;Not part of the batch&quot;, or you choose &quot;individually&quot;.</p>
+<p>To say no in bulk, use &quot;Deny selected&quot; or &quot;Deny all pending from this session&quot;. Both ask for a reason for the agent and send it with &quot;Send deny&quot;.</p>
+<h2 id="needs-attention">Needs attention</h2>
+<p>Below the queue, &quot;Recently decided (24 h)&quot; lists what was decided in the last day. Entries under &quot;Needs attention&quot; are approved writes that did not end well: the write failed, ended with an unknown outcome, or met a version conflict. &quot;check target&quot; tells you to look at the Jira or Confluence object yourself, because for an unknown outcome atlas-duck cannot tell whether the change happened.</p>
+<p>A write that was sent back to the queue because the request changed before it ran (&quot;returned for re-review&quot;) is pinned there as well. Use &quot;Acknowledge&quot; to take an entry off the list, or &quot;Acknowledge all&quot;. Acknowledging is not saved: after atlas-duck restarts, the entries can appear again. When nothing was decided, the list says &quot;Nothing decided in the last 24 hours&quot;.</p>
+<p>The status labels you will meet are: pending, executing, succeeded, released, denied, expired, cancelled, failed, abandoned, outcome unknown and &quot;returned for re-review&quot;.</p>
+<h2 id="unverified-text">Unverified text</h2>
+<p>Everything an agent writes is untrusted: the reason, the agent name and the parameters. atlas-duck therefore marks what it could not check.</p>
+<ul>
+<li>&quot;unverified&quot; marks a text that was written by the agent and not checked.</li>
+<li>&quot;unusual characters&quot; marks a text with characters that are invisible or easy to mix up with others. They are shown in escaped form, so that you can see them.</li>
+<li>&quot;Caution:&quot; in a request is a warning from atlas-duck that you should read the request closely before you decide.</li>
+</ul>
+<p>Read marked text slowly, and deny when in doubt. Denying costs the agent one new request; approving a wrong request can cost you a change that cannot be undone.</p>
+</main>
+</div>
+</body>
+</html>

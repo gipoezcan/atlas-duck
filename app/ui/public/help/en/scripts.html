@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scripts - Atlas Duck Help</title>
+<link rel="stylesheet" href="assets/help.css">
+<script src="assets/search-index.js" defer></script>
+<script src="assets/help.js" defer></script>
+</head>
+<body>
+<header class="bar">
+<a class="brand" href="index.html">Atlas Duck Help</a>
+<div class="search" hidden>
+<label class="visually-hidden" for="help-search">Search help</label>
+<input id="help-search" type="search" placeholder="Search help" autocomplete="off" data-empty="No results">
+<ul id="help-results" hidden></ul>
+</div>
+<a class="lang-switch" lang="de" hreflang="de" href="../de/scripts.html">Deutsch</a>
+</header>
+<div class="layout">
+<nav class="toc" aria-label="Contents">
+<ul>
+<li><a href="index.html">Overview</a></li>
+<li><a href="getting-started-desktop.html">Getting started (desktop)</a></li>
+<li><a href="instances-and-tokens.html">Instances and tokens</a></li>
+<li><a href="agents-desktop.html">Agents (desktop)</a></li>
+<li><a href="approvals.html">Approvals</a></li>
+<li><a href="scripts.html" aria-current="page">Scripts</a>
+<ul>
+<li><a href="#what-are-scripts">What scripts are</a></li>
+<li><a href="#running-scripts">Running scripts</a></li>
+<li><a href="#limits">Limits and confinement</a></li>
+<li><a href="#stopping">Stop a script</a></li>
+</ul>
+</li>
+<li><a href="audit.html">Audit log</a></li>
+<li><a href="settings.html">Settings</a></li>
+<li><a href="troubleshooting.html">Troubleshooting</a></li>
+<li><a href="error-reference.html">Error reference</a></li>
+</ul>
+</nav>
+<main>
+<h1>Scripts</h1>
+<h2 id="what-are-scripts">What scripts are</h2>
+<p>A script lets an agent do many reads in one request. It is JavaScript: the body of <code>async function main(args, atlas)</code>. Inside, it calls read operations with <code>atlas.&lt;product&gt;.&lt;op&gt;(params)</code>, <code>atlas.call</code>, pages through results with <code>atlas.all</code>, and can ask <code>atlas.ops()</code> and <code>atlas.instances()</code> what exists. <code>atlas.log</code> writes a note.</p>
+<p>A script can only read. It cannot call write operations, import modules, open files or use the network. It runs in a sandbox, a separate process that the operating system confines, and on Linux and macOS (and so on the server) its clock is UTC. On Windows, local-time date functions follow the system time zone; a script should use the UTC functions such as <code>getUTCHours</code> or <code>toISOString</code>.</p>
+<p>A script never sends anything to the agent by itself. When it ends, its final result waits in the queue as a &quot;Script&quot; request. You look at it, redact it if needed, and &quot;Release&quot; it, just like a read. See <a href="approvals.html#approve-or-deny">Approvals</a>.</p>
+<p>Scripts are limited in size: the source may be up to 256 KiB and the arguments up to 1 MiB. atlas-duck compiles the source when the agent submits it. A syntax error is answered at once with <code>script_syntax</code> (exit 8) and nothing runs.</p>
+<h2 id="running-scripts">Running scripts</h2>
+<p>An agent submits a script with <code>atlas-duck script run &lt;file&gt;</code>, or with the <code>script_run</code> tool of the MCP server. See <a href="agents-desktop.html#cli">Agents (desktop)</a>.</p>
+<p>To see what is running, open &quot;Running scripts&quot; from the header of the Approvals window. The window says &quot;No scripts are running.&quot; when it is idle, and otherwise lists one row for each script:</p>
+<table>
+<thead><tr><th>Column</th><th>Content</th></tr></thead>
+<tbody>
+<tr><td>Request</td><td>The request the script belongs to.</td></tr>
+<tr><td>Agent</td><td>The name the agent gave.</td></tr>
+<tr><td>Instances</td><td>The instances the script uses.</td></tr>
+<tr><td>Started</td><td>When it started.</td></tr>
+<tr><td>Elapsed</td><td>How long it has been running.</td></tr>
+<tr><td>Host calls</td><td>How many calls to the instance it has made.</td></tr>
+<tr><td>Bytes fetched</td><td>How much data it has fetched.</td></tr>
+<tr><td>Actions</td><td>&quot;Kill&quot;.</td></tr>
+</tbody></table>
+<p>An agent should test a script first with a dry run (<code>--dry-run</code>, mode <code>sparse</code> or <code>full</code>). A dry run needs no approval. It does not touch your instances: the calls are answered from the documented examples of each operation, and the answer is marked <code>meta.dry_run: true</code>. Use it to check that a script runs and has the right shape, not to read data.</p>
+<h2 id="limits">Limits and confinement</h2>
+<p>Every script runs under limits, so that one script cannot use up your machine or an instance.</p>
+<p>You set them in Settings under &quot;Script limits&quot;:</p>
+<table>
+<thead><tr><th>Limit</th><th>Default</th></tr></thead>
+<tbody>
+<tr><td>Script timeout (s)</td><td>120</td></tr>
+<tr><td>Script heap limit (MiB)</td><td>256</td></tr>
+<tr><td>Script process limit (MiB)</td><td>512</td></tr>
+<tr><td>Script call limit</td><td>200</td></tr>
+<tr><td>Script fetch limit (MiB)</td><td>50</td></tr>
+<tr><td>Script call result limit (MiB)</td><td>16</td></tr>
+<tr><td>Script result limit (MiB)</td><td>16</td></tr>
+<tr><td>Script concurrent calls</td><td>4</td></tr>
+</tbody></table>
+<p>An agent may ask for lower limits (with <code>--limits</code> on the command line, or the <code>limits</code> parameter of <code>script_run</code>), never for higher ones. A script that exceeds a limit stops with <code>script_limit</code> (exit 8).</p>
+<p>Two real scripts and two dry runs can run at once. More wait in line. The server applies the same numbers for each user.</p>
+<p>The heap limit must be at least 15 times the call result limit, and the process limit at least the heap limit plus 88 MiB. Settings refuses values that break this.</p>
+<p><strong>Confinement.</strong> The sandbox only counts when the operating system can enforce it. On start, atlas-duck tests this.</p>
+<p>Settings shows the result under &quot;Script confinement&quot;: &quot;met: scripts may run&quot;, &quot;not met: scripts are off&quot;, or &quot;the startup probe has not finished&quot;. If confinement is not met, scripts are off and an agent receives <code>sandbox_unavailable</code> (exit 8). You can allow scripts anyway with &quot;Allow scripts with degraded confinement&quot;; atlas-duck asks you to confirm. After that Settings says &quot;not met: scripts run only because degraded confinement is allowed&quot;, and the banner shows &quot;Caution: scripts run with degraded confinement&quot;. With degraded confinement, a flaw in the script worker could let a script act as your user. Choose this only on a machine that you trust, and only for as long as you need it.</p>
+<h2 id="stopping">Stop a script</h2>
+<p>To stop a script, use &quot;Kill&quot; in &quot;Running scripts&quot;. The button changes to &quot;Stopping…&quot;, and the window answers &quot;Kill requested&quot;. If the script has already ended, you see &quot;That script is no longer running.&quot;; if it is already stopping, &quot;That script is already stopping.&quot;</p>
+<p>A script that you killed does not vanish without a trace. It ends as failed with an error that says the run was killed by the user, and that error waits in the queue as a result. It holds no data that the script had collected until then. You can release it, redact it or deny it like any other.</p>
+<p>When the agent cancels a request itself (<code>atlas-duck cancel &lt;id&gt;</code>), the request ends as <code>cancelled</code> and its result never reaches the queue.</p>
+</main>
+</div>
+</body>
+</html>

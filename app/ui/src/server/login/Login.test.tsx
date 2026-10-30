@@ -35,6 +35,14 @@ describe('Login', () => {
     vi.restoreAllMocks();
   });
 
+  it('links_to_the_sign_in_help_in_the_page_language', () => {
+    render(<Login next={null} />);
+    const a = screen.getByRole('link', { name: LOGIN_TEXT.help });
+    expect(a.getAttribute('href')).toBe('/docs/en/getting-started-server#sign-in');
+    expect(a.getAttribute('target')).toBe('_blank');
+    expect(a.getAttribute('rel')).toBe('noreferrer');
+  });
+
   it('sanitises_next', () => {
     expect(safeNext('/approvals?item=x')).toBe('/approvals?item=x');
     expect(safeNext('/credentials')).toBe('/credentials');

@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Instanzen und Tokens - Atlas Duck Hilfe</title>
+<link rel="stylesheet" href="assets/help.css">
+<script src="assets/search-index.js" defer></script>
+<script src="assets/help.js" defer></script>
+</head>
+<body>
+<header class="bar">
+<a class="brand" href="index.html">Atlas Duck Hilfe</a>
+<div class="search" hidden>
+<label class="visually-hidden" for="help-search">Hilfe durchsuchen</label>
+<input id="help-search" type="search" placeholder="Hilfe durchsuchen" autocomplete="off" data-empty="Keine Treffer">
+<ul id="help-results" hidden></ul>
+</div>
+<a class="lang-switch" lang="en" hreflang="en" href="../en/instances-and-tokens.html">English</a>
+</header>
+<div class="layout">
+<nav class="toc" aria-label="Inhalt">
+<ul>
+<li><a href="index.html">Übersicht</a></li>
+<li><a href="getting-started-desktop.html">Erste Schritte (Desktop)</a></li>
+<li><a href="instances-and-tokens.html" aria-current="page">Instanzen und Tokens</a>
+<ul>
+<li><a href="#instances">Instanzen</a></li>
+<li><a href="#add-instance">Instanz hinzufügen</a></li>
+<li><a href="#tokens">Tokens</a></li>
+<li><a href="#token-storage">Wo Tokens gespeichert werden</a></li>
+<li><a href="#credential-window">Das Anmeldedatenfenster</a></li>
+</ul>
+</li>
+<li><a href="agents-desktop.html">Agents (Desktop)</a></li>
+<li><a href="approvals.html">Freigaben</a></li>
+<li><a href="scripts.html">Skripte</a></li>
+<li><a href="audit.html">Audit-Protokoll</a></li>
+<li><a href="settings.html">Einstellungen</a></li>
+<li><a href="troubleshooting.html">Fehlerbehebung</a></li>
+<li><a href="error-reference.html">Fehlerreferenz</a></li>
+</ul>
+</nav>
+<main>
+<h1>Instanzen und Tokens</h1>
+<h2 id="instances">Instanzen</h2>
+<p>Eine Instanz ist ein Jira- oder Confluence-Data-Center-Server, mit dem atlas-duck spricht. Sie ist unter einem Alias bekannt, zum Beispiel dem Kurznamen des Servers.</p>
+<p>Im Desktopmodus legen Sie Ihre eigenen Instanzen an. Die Einstellungen listen sie unter &quot;Instanzen&quot; auf:</p>
+<table>
+<thead><tr><th>Spalte</th><th>Inhalt</th></tr></thead>
+<tbody>
+<tr><td>Alias</td><td>Der Name, den Sie der Instanz gegeben haben.</td></tr>
+<tr><td>Produkt</td><td>Jira oder Confluence.</td></tr>
+<tr><td>Origin</td><td>Die bestätigte Adresse des Servers oder &quot;(nicht bestätigt)&quot;.</td></tr>
+<tr><td>Status</td><td>Siehe unten.</td></tr>
+<tr><td>Ausführung als</td><td>Der Atlassian-Benutzer, zu dem Ihr Token gehört.</td></tr>
+<tr><td>Token-Ablauf</td><td>Das Ablaufdatum, falls Sie eines eingegeben haben.</td></tr>
+<tr><td>Proxy</td><td>Der Proxy dieser Instanz oder &quot;Systemeinstellung oder keiner&quot;.</td></tr>
+</tbody></table>
+<p>Der Status zeigt, ob die Instanz verwendbar ist:</p>
+<table>
+<thead><tr><th>Status</th><th>Bedeutung</th></tr></thead>
+<tbody>
+<tr><td>in Ordnung</td><td>Bereit.</td></tr>
+<tr><td>braucht Token</td><td>Es ist noch kein Token gespeichert. Verwenden Sie &quot;Token hinzufügen&quot;.</td></tr>
+<tr><td>unbestätigt</td><td>Sie haben die Origin noch nicht bestätigt. Verwenden Sie &quot;Instanz bestätigen&quot;.</td></tr>
+<tr><td>unsicheres Schema (http)</td><td>Die URL beginnt mit http. atlas-duck verlangt https. Verwendet Ihr Server eine interne CA, fügen Sie sie als eigene CA der Instanz hinzu.</td></tr>
+<tr><td>Identitäts-Header fehlt</td><td>&quot;X-AUSERNAME wurde nicht empfangen, möglicherweise von einem Reverse-Proxy vor Jira entfernt; wenden Sie sich an die Jira-Administration&quot;.</td></tr>
+<tr><td>Identitäts-Header stimmt nicht überein</td><td>Der Header X-AUSERNAME passt nicht zum Benutzer des Tokens.</td></tr>
+</tbody></table>
+<h2 id="add-instance">Instanz hinzufügen</h2>
+<p>Öffnen Sie die Einstellungen, &quot;Instanz hinzufügen&quot; (das Einrichtungsfenster hat dasselbe Formular), und füllen Sie aus:</p>
+<ul>
+<li><strong>Alias</strong> und <strong>Produkt</strong> (Jira oder Confluence).</li>
+<li><strong>Basis-URL (https, mit Kontextpfad)</strong>. atlas-duck verlangt https.</li>
+<li><strong>Proxy</strong> als Host:Port, <code>direct</code> oder leer für die Systemeinstellung. Verwendet Ihr System ein Proxy-Auto-Config-Skript, wertet atlas-duck es nicht aus: Legen Sie den Proxy der Instanz hier fest.</li>
+<li><strong>Eigenes CA-Zertifikat verwenden</strong>, wenn Ihr Server eine interne Zertifizierungsstelle nutzt. atlas-duck fragt nach der Datei.</li>
+<li><strong>Standardinstanz für ihr Produkt</strong>. Ein Produkt kann nur eine Standardinstanz haben.</li>
+</ul>
+<p>Wählen Sie &quot;Instanz hinzufügen&quot;. atlas-duck zeigt dann Alias und Origin in einem eigenen Dialog; bestätigen Sie sie. Danach erscheint &quot;Die Instanz wurde hinzugefügt. Fügen Sie als Nächstes ihr Token hinzu.&quot; Später bietet die Zeile auch &quot;URL ändern&quot; und &quot;Proxy anwenden&quot;.</p>
+<h2 id="tokens">Tokens</h2>
+<p>atlas-duck handelt immer als Sie, mit Ihrem eigenen persönlichen Zugriffstoken (PAT), nie mit einem gemeinsamen Dienstkonto. Erstellen Sie das Token in Jira oder Confluence (Profil → Persönliche Zugriffstoken) und geben Sie ihm nur die Berechtigungen, die Ihre Arbeit braucht. Was das Token in Jira oder Confluence nicht darf, kann auch ein Agent nicht.</p>
+<p>Geben Sie das Token im <a href="#credential-window">Anmeldedatenfenster</a> ein. Sie können auch ein Ablaufdatum angeben. atlas-duck warnt Sie dann rechtzeitig (&quot;Das Token läuft in N Tagen ab&quot;, &quot;Das Token läuft heute ab&quot;, &quot;Das Token ist am ... abgelaufen&quot;). Das ist nur eine Warnung: Ob ein Token funktioniert, entscheidet der Server.</p>
+<p>In jeder Instanzzeile der Einstellungen:</p>
+<ul>
+<li>&quot;Token hinzufügen&quot; oder &quot;Token ersetzen&quot; öffnet das Anmeldedatenfenster.</li>
+<li>&quot;Gespeichertes Token erneut prüfen&quot; fragt den Server noch einmal. Die Antwort lautet &quot;Verbunden als ...&quot; oder &quot;Die erneute Prüfung ist fehlgeschlagen:&quot; mit dem Grund.</li>
+</ul>
+<p>Wenn Sie ein Token speichern, testet atlas-duck es zuerst gegen die Instanz. Das sind die Gründe für eine Ablehnung:</p>
+<table>
+<thead><tr><th>Grund</th><th>Was Sie tun können</th></tr></thead>
+<tbody>
+<tr><td>Der Server hat das Token zurückgewiesen (401).</td><td>Prüfen Sie, ob es ein gültiges persönliches Zugriffstoken ist, das nicht abgelaufen ist.</td></tr>
+<tr><td>Das Token gehört einem anderen Benutzer.</td><td>Für die Instanz ist schon ein Token eines anderen Atlassian-Benutzers gespeichert. Entfernen Sie zuerst das gespeicherte Token.</td></tr>
+<tr><td>Das TLS-Zertifikat des Servers konnte nicht geprüft werden.</td><td>Verwendet Ihr Server eine interne CA, braucht die Instanz sie als eigene CA.</td></tr>
+<tr><td>Ein Proxy hat die Verbindung blockiert oder verändert.</td><td>Prüfen Sie die Proxy-Einstellungen.</td></tr>
+<tr><td>Der Server war nicht erreichbar.</td><td>Versuchen Sie es später erneut.</td></tr>
+<tr><td>Die Serverversion liegt unter dem Minimum, das atlas-duck unterstützt.</td><td>Die Instanz muss aktualisiert werden.</td></tr>
+</tbody></table>
+<h2 id="token-storage">Wo Tokens gespeichert werden</h2>
+<p>Ihre Tokens liegen im Schlüsselbund des Betriebssystems dieses Computers. atlas-duck zeigt ein gespeichertes Token nie wieder an. Backups enthalten nie Tokens: Nach einer Wiederherstellung braucht jede Instanz ihr Token erneut. &quot;Auf die Entfernung vorbereiten&quot; in den Einstellungen löscht die gespeicherten Tokens und bittet Sie dann, jedes Token auf seinem Server zu widerrufen.</p>
+<p>Tokens geben Zugriff auf Jira und Confluence in Ihrem Namen. Erneuern Sie sie regelmäßig und widerrufen Sie ein Token auf seinem Server, wenn Sie es nicht mehr brauchen.</p>
+<h2 id="credential-window">Das Anmeldedatenfenster</h2>
+<p>Tokens und Passphrasen geben Sie in einem eigenen Fenster ein, dem Anmeldedatenfenster, und sonst nirgends. Für ein Token trägt es den Titel &quot;Token hinzufügen&quot; oder &quot;Token ersetzen&quot;. Bevor Sie etwas eingeben, zeigt es Instanz, Produkt und Adresse, damit Sie prüfen können, dass Sie mit dem richtigen Server sprechen. Sind einzelne Zeichen der Adresse ungewöhnlich, werden sie als Escape-Folgen mit einer Warnung angezeigt: Prüfen Sie die Adresse, bevor Sie fortfahren.</p>
+<ol>
+<li>Fügen Sie das Token in &quot;Persönliches Zugriffstoken&quot; ein. Auf Wunsch füllen Sie &quot;Token läuft ab am (optional)&quot; aus.</li>
+<li>Wählen Sie &quot;Testen und speichern&quot;.</li>
+<li>Bei Erfolg meldet das Fenster &quot;Verbunden als <em>Benutzer</em>, <em>Produkt</em> <em>Version</em>. Sie können dieses Fenster schließen.&quot;</li>
+</ol>
+<p>Dasselbe Fenster fragt auch nach der Wiederherstellungs-Passphrase, um atlas-duck zu entsperren und ein Backup wiederherzustellen.</p>
+</main>
+</div>
+</body>
+</html>

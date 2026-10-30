@@ -1,4 +1,5 @@
 import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
+import { HelpButton, HelpLink } from '../shared/HelpLink';
 import { useText } from '../shared/i18n/context';
 import { en } from '../shared/i18n/dict';
 
@@ -153,12 +154,14 @@ export function Audit({ mode = 'desktop', exportPanel = null }: { mode?: AuditMo
   return (
     <main className="audit window window-audit">
       <h1>{t.approvals.window_titles.audit}</h1>
+      <HelpButton window="audit" />
       {desktop ? (
         <Incidents status={status} failed={statusFailed} onRetry={readStatus} onChanged={readStatus} />
       ) : null}
       {desktop ? (
         <section aria-label={t.audit.verification}>
           <h2>{t.audit.verification}</h2>
+          <HelpLink section="audit/verification" label={t.audit.verification} />
           <button type="button" disabled={running} onClick={verify}>
             {running ? t.audit.verifying : t.audit.verify}
           </button>

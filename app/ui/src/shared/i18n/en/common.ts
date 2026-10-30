@@ -2,6 +2,8 @@
 export const common = {
   cancel: 'Cancel',
   close: 'Close',
+  help: 'Help',
+  help_for: (name: string) => `Help: ${name}`,
   save: 'Save',
   retry: 'Retry',
   language: 'Language',

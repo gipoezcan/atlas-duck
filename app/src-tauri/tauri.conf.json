@@ -24,7 +24,8 @@
         "running_scripts",
         "onboarding",
         "credential",
-        "setup"
+        "setup",
+        "help"
       ]
     }
   },

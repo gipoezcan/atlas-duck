@@ -41,6 +41,7 @@ const MEMBERS = [
   "atlas-duck-server",
   "atlas-duck-script-glue",
   "atlas-duck-server-e2e",
+  "atlas-duck-docgen",
 ];
 
 const memberId = (name) => `path+file:///ws/crates/${name}#${name}@0.1.0`;
@@ -80,6 +81,7 @@ function baseEdges() {
     ],
     "atlas-duck-script-glue": ["atlas-duck-core", "atlas-duck-ipc", "atlas-duck-sandbox-host"],
     "atlas-duck-server-e2e": [{ name: "atlas-duck-audit", kind: "dev" }],
+    "atlas-duck-docgen": [],
   };
 }
 
@@ -178,6 +180,7 @@ const manifests = (over = {}) => ({
     "atlas-duck-server": LINTS_OK,
     "atlas-duck-script-glue": LINTS_OK,
     "atlas-duck-server-e2e": LINTS_OK,
+    "atlas-duck-docgen": LINTS_OK,
   },
   ...over,
 });
@@ -990,6 +993,15 @@ test("script-glue and server-e2e are lint packages", () => {
 test("server and mcp-tools are lint packages", () => {
   assert.ok(LINT_PACKAGES.includes("atlas-duck-server"));
   assert.ok(LINT_PACKAGES.includes("atlas-duck-mcp-tools"));
+});
+
+// ---------- M16 docgen ----------
+
+test("docgen is a leaf lint package", () => {
+  const e = baseEdges();
+  e["atlas-duck-docgen"] = ["atlas-duck-convert"];
+  assert.deepEqual(graph(e), ["atlas-duck-docgen: must not depend on atlas-duck-convert (§2.2)"]);
+  assert.ok(LINT_PACKAGES.includes("atlas-duck-docgen"));
 });
 
 // ---------- the real workspace ----------

@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Übersicht - Atlas Duck Hilfe</title>
+<link rel="stylesheet" href="assets/help.css">
+<script src="assets/search-index.js" defer></script>
+<script src="assets/help.js" defer></script>
+</head>
+<body>
+<header class="bar">
+<a class="brand" href="/docs/de/">Atlas Duck Hilfe</a>
+<div class="search" hidden>
+<label class="visually-hidden" for="help-search">Hilfe durchsuchen</label>
+<input id="help-search" type="search" placeholder="Hilfe durchsuchen" autocomplete="off" data-empty="Keine Treffer">
+<ul id="help-results" hidden></ul>
+</div>
+<a class="lang-switch" lang="en" hreflang="en" href="/docs/en/">English</a>
+</header>
+<div class="layout">
+<nav class="toc" aria-label="Inhalt">
+<ul>
+<li><a href="/docs/de/" aria-current="page">Übersicht</a>
+<ul>
+<li><a href="#what-is-atlas-duck">Was atlas-duck ist</a></li>
+<li><a href="#how-it-works">So läuft eine Anfrage ab</a></li>
+<li><a href="#where-to-start">Wo Sie anfangen</a></li>
+</ul>
+</li>
+<li><a href="/docs/de/getting-started-server">Erste Schritte (Server)</a></li>
+<li><a href="/docs/de/instances-and-tokens">Instanzen und Tokens</a></li>
+<li><a href="/docs/de/agents-server">Agents (Server)</a></li>
+<li><a href="/docs/de/approvals">Freigaben</a></li>
+<li><a href="/docs/de/scripts">Skripte</a></li>
+<li><a href="/docs/de/audit">Audit-Protokoll</a></li>
+<li><a href="/docs/de/settings">Einstellungen</a></li>
+<li><a href="/docs/de/admin">Administration</a></li>
+<li><a href="/docs/de/auditor">Auditor</a></li>
+<li><a href="/docs/de/troubleshooting">Fehlerbehebung</a></li>
+<li><a href="/docs/de/error-reference">Fehlerreferenz</a></li>
+</ul>
+</nav>
+<main>
+<h1>Übersicht</h1>
+<p>Dieses Handbuch richtet sich an alle, die atlas-duck verwenden: Benutzer und im Servermodus auch Administratoren und Auditoren.</p>
+<h2 id="what-is-atlas-duck">Was atlas-duck ist</h2>
+<p>atlas-duck lässt KI-Agents Jira und Confluence Data Center lesen und Schreibvorgänge vorschlagen, die Sie freigeben. Jede Aktion wird in einer manipulationssicheren Audit-Kette festgehalten.</p>
+<p>Es gibt zwei Betriebsarten:</p>
+<ul>
+<li><strong>Desktopmodus</strong>: atlas-duck ist auf Ihrem eigenen Computer installiert und läuft dort. Es bedient Sie und die Agents, die auf diesem Computer laufen.</li>
+<li><strong>Servermodus</strong>: Ihre Organisation betreibt atlas-duck einmal in ihrem eigenen Netz. Es bedient viele Benutzer und ihre Agents. Auf Ihrem Computer wird nichts installiert, Sie arbeiten im Browser.</li>
+</ul>
+<p>Für Sie funktionieren beide Modi gleich. Diese Begriffe kehren auf jeder Seite wieder:</p>
+<table>
+<thead><tr><th>Begriff</th><th>Bedeutung</th></tr></thead>
+<tbody>
+<tr><td>Agent</td><td>Ein KI-Programm, das über atlas-duck in Ihrem Auftrag handelt. Es schlägt Schreibvorgänge vor, gibt aber nie etwas frei.</td></tr>
+<tr><td>Instanz</td><td>Ein Jira- oder Confluence-Data-Center-Server, mit dem atlas-duck spricht, bekannt unter einem Alias.</td></tr>
+<tr><td>Persönliches Zugriffstoken (PAT)</td><td>Ihr eigenes Jira- oder Confluence-Token. atlas-duck handelt immer als Sie, nie als gemeinsames Dienstkonto.</td></tr>
+<tr><td>Freigabe</td><td>Ihr ausdrückliches Ja oder Nein zu einem vorgeschlagenen Schreibvorgang, bevor er eine Instanz erreicht. Jeder Schreibvorgang braucht eine, in beiden Modi.</td></tr>
+<tr><td>Audit-Kette</td><td>Ihr manipulationssicherer Nachweis über alles, was atlas-duck für Sie getan hat. Jeder Benutzer hat eine, in beiden Modi.</td></tr>
+</tbody></table>
+<p>Im Servermodus kommen drei weitere Begriffe hinzu:</p>
+<table>
+<thead><tr><th>Begriff</th><th>Bedeutung</th></tr></thead>
+<tbody>
+<tr><td>Domänenanmeldung</td><td>Sie melden sich mit Benutzername und Passwort aus dem Verzeichnis Ihrer Organisation an. Das Passwort wird gegen das Verzeichnis geprüft und nie gespeichert.</td></tr>
+<tr><td>Rolle</td><td>Was Sie tun dürfen: Benutzer, Auditor oder Administrator. Die Rollen ergeben sich aus Ihren Verzeichnisgruppen.</td></tr>
+<tr><td>API-Schlüssel</td><td>Ein Geheimnis, das Sie mit Berechtigungen und Ablaufdatum erstellen und mit dem ein Agent ohne Browser-Anmeldung für Sie handeln kann.</td></tr>
+</tbody></table>
+<h2 id="how-it-works">So läuft eine Anfrage ab</h2>
+<ol>
+<li>Ein Agent bittet atlas-duck um etwas, zum Beispiel ein Jira-Ticket zu lesen oder zu ändern.</li>
+<li>Die Anfrage erscheint in Ihren Freigaben. Noch erreicht nichts die Instanz.</li>
+<li>Sie entscheiden. Sie geben einen Schreibvorgang frei, übergeben das Ergebnis eines Lesezugriffs oder eines Skripts an den Agent oder lehnen die Anfrage ab. Ein Agent kann nie etwas freigeben.</li>
+<li>Nach Ihrer Freigabe sendet atlas-duck die Anfrage als Sie an die Instanz, mit Ihrem eigenen persönlichen Zugriffstoken.</li>
+<li>atlas-duck hält fest, was geschehen ist, und zwar in Ihrer Audit-Kette.</li>
+</ol>
+<p>Eine Anfrage, über die niemand entscheidet, läuft ab.</p>
+<h2 id="where-to-start">Wo Sie anfangen</h2>
+<ol>
+<li><a href="/docs/de/getting-started-server">Erste Schritte (Server)</a> behandelt die Anmeldung, Ihre Tokens und Ihren ersten Agent.</li>
+<li><a href="/docs/de/instances-and-tokens">Instanzen und Tokens</a> erklärt die Seite Zugangsdaten.</li>
+<li><a href="/docs/de/agents-server">Agents (Server)</a> behandelt API-Schlüssel und verbundene Apps.</li>
+</ol>
+<p>Lesen Sie danach <a href="/docs/de/approvals">Freigaben</a>, die Seite, die Sie am häufigsten brauchen, und <a href="/docs/de/audit">Audit-Protokoll</a>. Wenn etwas schiefgeht, helfen <a href="/docs/de/troubleshooting">Fehlerbehebung</a> und die <a href="/docs/de/error-reference">Fehlerreferenz</a>.</p>
+</main>
+</div>
+</body>
+</html>

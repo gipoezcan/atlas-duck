@@ -32,6 +32,7 @@ export const PKG = {
   server: "atlas-duck-server",
   scriptGlue: "atlas-duck-script-glue",
   serverE2e: "atlas-duck-server-e2e",
+  docgen: "atlas-duck-docgen",
 };
 
 // §2.2, read as workspace-internal normal/build edges (dev-dependencies ignored).
@@ -66,6 +67,8 @@ export const INTERNAL_RULES = [
   { pkg: PKG.scriptGlue, allowed: [PKG.core, PKG.ipc, PKG.sandboxHost] },
   // M14 PD-260: the e2e suite has dev-dependencies only.
   { pkg: PKG.serverE2e, allowed: [] },
+  // M16 PD-326: the user guide generator is a leaf tool (pulldown-cmark only).
+  { pkg: PKG.docgen, allowed: [] },
 ];
 
 // M14 PD-260: test-only packages; no workspace member has a normal or build edge to one.
@@ -190,6 +193,7 @@ export const LINT_PACKAGES = [
   PKG.server,
   PKG.scriptGlue,
   PKG.serverE2e,
+  PKG.docgen,
 ];
 export const REQUIRED_DENY_LINTS = ["unwrap_used", "expect_used"];
 

@@ -1125,6 +1125,10 @@ jobs:
       - name: Command surface check (C.10, PD-66)
         run: node ci/check-commands.mjs
 
+      # M16 T2: the committed help sets are what the generator makes of docs/user-guide.
+      - name: User guide output is current (M16, PD-326)
+        run: cargo run -p atlas-duck-docgen --locked -- --src docs/user-guide --desktop-out app/ui/public/help --server-out app/ui/public-server/docs --check
+
       - name: Native-dialog proofs (L54, 10.3)
         run: node ci/check-dialog-proofs.mjs
 
@@ -2051,6 +2055,10 @@ jobs:
           node ci/check-i18n.mjs
           node ci/check-control-bytes.mjs
 
+      # M16 T3: both languages, error reference, UI links and internal links of the user guide.
+      - name: User guide consistency (M16, PD-321, PD-327)
+        run: node ci/check-user-guide.mjs
+
       - name: Isolation hook tests (payload allowlist, 2 MiB cap)
         run: node --test app/isolation/hook.test.mjs
 
@@ -2210,7 +2218,9 @@ jobs:
           Write-Output "::notice::e2e cargo exit code $rc"
           if ($rc -ne 0) {
             # The job log needs a login; the tail as annotations shows the failure on the public API.
-            Get-Content $log -Tail 40 | Where-Object { $_.Trim() } | ForEach-Object { Write-Output "::error::$($_ -replace '::', ':')" }
+            # GitHub keeps 10 error annotations per step: failure lines first, then the tail.
+            $hits = @(Select-String -Path $log -Pattern 'FAILED|panicked|^failures:|^    [a-z_:0-9]+$|test result' | ForEach-Object { $_.Line })
+            @($hits + @(Get-Content $log -Tail 20)) | Where-Object { $_.Trim() } | Select-Object -First 10 | ForEach-Object { Write-Output "::error::$($_ -replace '::', ':')" }
             exit $rc
           }
           cargo @a -- --list 2>$null | Set-Content -Path $list -Encoding utf8

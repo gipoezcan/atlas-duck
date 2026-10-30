@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import uiLinks from '../../../../../docs/user-guide/ui-links.json';
 import { isConsentDetails, isConsentRedirect } from '../http';
 import { nav } from '../shell/RequireSession';
 import { en } from '../../shared/i18n/dict';
@@ -57,6 +58,16 @@ describe('Consent', () => {
     expect(screen.getByText(`(${CONSENT_TEXT.unverified})`)).toBeTruthy();
     expect(screen.getByText('127.0.0.1').tagName).toBe('STRONG');
     expect(screen.getByText(/Run read-only scripts/)).toBeTruthy();
+  });
+
+  it('has_a_question_mark_to_the_consent_section_of_the_guide', async () => {
+    fetchMock.mockResolvedValueOnce(json(200, DETAILS));
+    render(<Consent req="r1" />);
+    await flush();
+    const q = screen.getByRole('link', { name: `Help: ${CONSENT_TEXT.title}` });
+    expect(q.getAttribute('href')).toBe(`/docs/en/${uiLinks.server['/oauth/consent']}`);
+    expect(q.getAttribute('target')).toBe('_blank');
+    expect(q.getAttribute('rel')).toBe('noreferrer');
   });
 
   it('allow_sends_the_checked_scopes_and_follows_the_redirect', async () => {

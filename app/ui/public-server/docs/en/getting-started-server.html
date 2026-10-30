@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Getting started (server) - Atlas Duck Help</title>
+<link rel="stylesheet" href="assets/help.css">
+<script src="assets/search-index.js" defer></script>
+<script src="assets/help.js" defer></script>
+</head>
+<body>
+<header class="bar">
+<a class="brand" href="/docs/en/">Atlas Duck Help</a>
+<div class="search" hidden>
+<label class="visually-hidden" for="help-search">Search help</label>
+<input id="help-search" type="search" placeholder="Search help" autocomplete="off" data-empty="No results">
+<ul id="help-results" hidden></ul>
+</div>
+<a class="lang-switch" lang="de" hreflang="de" href="/docs/de/getting-started-server">Deutsch</a>
+</header>
+<div class="layout">
+<nav class="toc" aria-label="Contents">
+<ul>
+<li><a href="/docs/en/">Overview</a></li>
+<li><a href="/docs/en/getting-started-server" aria-current="page">Getting started (server)</a>
+<ul>
+<li><a href="#sign-in">Sign in</a></li>
+<li><a href="#add-credentials">Store your tokens</a></li>
+<li><a href="#connect-agent">Connect an agent</a></li>
+<li><a href="#roles">Roles</a></li>
+</ul>
+</li>
+<li><a href="/docs/en/instances-and-tokens">Instances and tokens</a></li>
+<li><a href="/docs/en/agents-server">Agents (server)</a></li>
+<li><a href="/docs/en/approvals">Approvals</a></li>
+<li><a href="/docs/en/scripts">Scripts</a></li>
+<li><a href="/docs/en/audit">Audit log</a></li>
+<li><a href="/docs/en/settings">Settings</a></li>
+<li><a href="/docs/en/admin">Administration</a></li>
+<li><a href="/docs/en/auditor">Auditor</a></li>
+<li><a href="/docs/en/troubleshooting">Troubleshooting</a></li>
+<li><a href="/docs/en/error-reference">Error reference</a></li>
+</ul>
+</nav>
+<main>
+<h1>Getting started (server)</h1>
+<h2 id="sign-in">Sign in</h2>
+<p>Open the address of atlas-duck that your organisation gave you. The page &quot;Sign in to atlas-duck&quot; asks for your username and password. These are your organisation's directory credentials (a domain login). atlas-duck checks the password against the directory and never stores it.</p>
+<table>
+<thead><tr><th>Message</th><th>What it means</th></tr></thead>
+<tbody>
+<tr><td>Username or password is wrong.</td><td>The directory did not accept the credentials.</td></tr>
+<tr><td>Too many attempts. Try again in N minutes.</td><td>There is a limit on failed sign-ins. Wait for the time shown.</td></tr>
+<tr><td>The directory cannot be reached. Try again later.</td><td>The organisation's directory does not answer.</td></tr>
+<tr><td>Your account is not permitted to use atlas-duck.</td><td>Your account is in none of the directory groups that atlas-duck accepts, or it is disabled. Ask your administrator.</td></tr>
+<tr><td>Signing in failed. Try again.</td><td>Any other failure.</td></tr>
+</tbody></table>
+<p>After you sign in, your browser holds a session. A session is short-lived: it ends after a period without activity and after a maximum lifetime, both set by the people who run the server (by default 30 minutes idle and 8 hours in total). Then you sign in again. &quot;Sign out&quot; in the header ends it at once.</p>
+<p>The header links to the pages you can use: Approvals, Credentials, API keys, Connected apps, My audit, and, if you have the role, Auditor and Admin. It also has the language choice and the Help entry.</p>
+<h2 id="add-credentials">Store your tokens</h2>
+<p>atlas-duck acts towards Jira and Confluence as you, with your own personal access token for each instance. The instances themselves are set up by an admin. Open &quot;Credentials&quot; in the header:</p>
+<ol>
+<li>If the page says &quot;No instance is configured yet. An admin adds instances.&quot;, ask your admin first.</li>
+<li>Choose &quot;Add token&quot; next to an instance, paste the token and choose &quot;Check and save&quot;. atlas-duck tests the token against the instance before it stores it.</li>
+<li>The row now shows &quot;Token stored&quot;, with the Atlassian user it belongs to.</li>
+</ol>
+<p>How to create the token, what the states mean and what the errors say is in <a href="/docs/en/instances-and-tokens#credentials-page">Instances and tokens</a>.</p>
+<h2 id="connect-agent">Connect an agent</h2>
+<p>An agent reaches atlas-duck over MCP in one of two ways:</p>
+<ul>
+<li>With an <strong>API key</strong> that you create under &quot;API keys&quot;. A key has scopes (read, propose_write, scripts), expires after 1 to 90 days and can be revoked. See <a href="/docs/en/agents-server#api-keys">Agents (server)</a>.</li>
+<li>Through <strong>OAuth</strong>, unless your operator has switched it off: an MCP client that supports it sends you to atlas-duck to allow it. You answer on the consent page and can revoke the app later under &quot;Connected apps&quot;. See <a href="/docs/en/agents-server#oauth-consent">Agents (server)</a>.</li>
+</ul>
+<p>Neither an API key nor a connected app can approve anything. You decide on the &quot;Approvals&quot; page: see <a href="/docs/en/approvals">Approvals</a>. To be alerted when something waits for you, choose &quot;Enable notifications&quot; there (<a href="/docs/en/settings#notifications">Settings</a>).</p>
+<h2 id="roles">Roles</h2>
+<p>What you may do depends on your role, and your roles come from your directory groups when you sign in.</p>
+<table>
+<thead><tr><th>Role</th><th>What it may do</th></tr></thead>
+<tbody>
+<tr><td>User</td><td>Everyone who can sign in. You own your tokens, approve your agents' writes and own your audit chain.</td></tr>
+<tr><td>Auditor</td><td>Reads and exports every user's audit chain. Each such read is recorded in the auditor's own chain. See <a href="/docs/en/auditor">Auditor</a>.</td></tr>
+<tr><td>Admin</td><td>Operates the deployment: instances, keys, backups. An admin has no access to users' tokens or audit contents. See <a href="/docs/en/admin">Administration</a>.</td></tr>
+</tbody></table>
+<p>The &quot;Auditor&quot; and &quot;Admin&quot; links appear in the header only if you hold the role. A person in none of the configured groups cannot sign in.</p>
+</main>
+</div>
+</body>
+</html>

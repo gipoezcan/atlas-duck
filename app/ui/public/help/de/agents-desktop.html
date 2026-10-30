@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agents (Desktop) - Atlas Duck Hilfe</title>
+<link rel="stylesheet" href="assets/help.css">
+<script src="assets/search-index.js" defer></script>
+<script src="assets/help.js" defer></script>
+</head>
+<body>
+<header class="bar">
+<a class="brand" href="index.html">Atlas Duck Hilfe</a>
+<div class="search" hidden>
+<label class="visually-hidden" for="help-search">Hilfe durchsuchen</label>
+<input id="help-search" type="search" placeholder="Hilfe durchsuchen" autocomplete="off" data-empty="Keine Treffer">
+<ul id="help-results" hidden></ul>
+</div>
+<a class="lang-switch" lang="en" hreflang="en" href="../en/agents-desktop.html">English</a>
+</header>
+<div class="layout">
+<nav class="toc" aria-label="Inhalt">
+<ul>
+<li><a href="index.html">Übersicht</a></li>
+<li><a href="getting-started-desktop.html">Erste Schritte (Desktop)</a></li>
+<li><a href="instances-and-tokens.html">Instanzen und Tokens</a></li>
+<li><a href="agents-desktop.html" aria-current="page">Agents (Desktop)</a>
+<ul>
+<li><a href="#launcher">Einen Agenten starten</a></li>
+<li><a href="#cli">Die Befehlszeile</a></li>
+<li><a href="#mcp">MCP-Clients</a></li>
+<li><a href="#envelope">Das Antwortformat</a></li>
+</ul>
+</li>
+<li><a href="approvals.html">Freigaben</a></li>
+<li><a href="scripts.html">Skripte</a></li>
+<li><a href="audit.html">Audit-Protokoll</a></li>
+<li><a href="settings.html">Einstellungen</a></li>
+<li><a href="troubleshooting.html">Fehlerbehebung</a></li>
+<li><a href="error-reference.html">Fehlerreferenz</a></li>
+</ul>
+</nav>
+<main>
+<h1>Agents (Desktop)</h1>
+<h2 id="launcher">Einen Agenten starten</h2>
+<p>Ein Agent erreicht atlas-duck über den Befehl <code>atlas-duck</code>. Er braucht dafür kein eigenes Passwort und kein eigenes Token. Er spricht mit der laufenden Desktop-App auf Ihrem Rechner, und jede Anfrage landet in Ihrer Warteschlange.</p>
+<p>Läuft die App nicht, startet der Befehl sie und wartet bis zu 20 Sekunden. Dafür braucht es eine Desktop-Sitzung und eine installierte App; fehlt eines davon, scheitert der Befehl mit <code>launch_timeout</code> oder <code>unreachable</code>.</p>
+<p>Das Fenster „Einführung“ liefert Ihnen fertige Anweisungen für den Agenten. Kopieren Sie sie in die Datei <code>CLAUDE.md</code> oder <code>AGENTS.md</code> Ihres Projekts. Es sind Regeln, die der Agent befolgt (die Liste richtet sich an den Agenten, Sie müssen nichts ausführen):</p>
+<ul>
+<li>Setzen Sie den Namen des Agenten mit <code>ATLAS_DUCK_AGENT</code>, zum Beispiel <code>&lt;Tool&gt;-&lt;Repository&gt;</code>, und geben Sie immer <code>--reason</code> an, damit Sie sehen, warum der Agent anfragt.</li>
+<li>Setzen Sie <code>--timeout</code> mindestens 10 Sekunden unter die Zeit, nach der das Tool des Agenten abgebrochen wird. Oder verwenden Sie <code>--timeout 0</code>, um die Anfrage einzureichen und sofort zurückzukehren, und holen Sie die Antwort später mit <code>await</code> ab.</li>
+<li>Reichen Sie eine ausstehende Anfrage nie erneut ein. Ihre ID finden Sie mit <code>requests list</code>; warten Sie dann auf sie.</li>
+<li>Prüfen Sie <code>redacted</code>, <code>edited</code> und <code>meta</code> in der Antwort. Sie haben möglicherweise geändert, was der Agent erhält.</li>
+<li>Entscheiden Sie anhand von <code>status</code>, <code>error.code</code> und <code>error.retryable</code>. Bei Exit-Code 9 versuchen Sie es nicht in einer Schleife erneut: Sie müssen zuerst die App entsperren oder ein Token hinzufügen.</li>
+<li>Blättern Sie durch lange Ergebnisse nur mit <code>meta.page.next_start</code>.</li>
+<li>Nennen Sie bei Schreibzugriffen die Dinge so, wie ein Mensch sie nennt, damit Sie die Anfrage lesen können.</li>
+<li>Fassen Sie viele Lesezugriffe in einem Skript zusammen und führen Sie es zuerst als Probelauf aus. Siehe <a href="scripts.html#what-are-scripts">Skripte</a>.</li>
+<li>Geben Sie unter Windows Dateipfade an. Rufen Sie in WSL das Windows-Programm <code>atlas-duck.exe</code> auf.</li>
+</ul>
+<h2 id="cli">Die Befehlszeile</h2>
+<pre><code>atlas-duck [Optionen] &lt;Befehl&gt;
+</code></pre>
+<p>Optionen für jeden Befehl:</p>
+<table>
+<thead><tr><th>Option</th><th>Bedeutung</th></tr></thead>
+<tbody>
+<tr><td><code>--agent NAME</code></td><td>Der Name des Agenten; auch <code>ATLAS_DUCK_AGENT</code>.</td></tr>
+<tr><td><code>--reason TEXT</code></td><td>Warum der Agent anfragt. Sie lesen es in der Warteschlange.</td></tr>
+<tr><td><code>--timeout SEKUNDEN</code></td><td>Wie lange auf Ihre Entscheidung gewartet wird. Standard 100. <code>0</code> reicht ein und kehrt sofort mit <code>pending</code> zurück.</td></tr>
+<tr><td><code>--instance ALIAS</code></td><td>Welche Instanz verwendet wird.</td></tr>
+<tr><td><code>--output json|text</code></td><td>Das Format der Antwort.</td></tr>
+<tr><td><code>--help</code></td><td>Hilfe.</td></tr>
+</tbody></table>
+<p>Befehle:</p>
+<table>
+<thead><tr><th>Befehl</th><th>Zweck</th></tr></thead>
+<tbody>
+<tr><td><code>call &lt;op-id&gt; --params '&lt;json&gt;'</code></td><td>Einen Vorgang ausführen. Für eine Datei oder die Standardeingabe verwenden Sie <code>--params-file &lt;Pfad&gt;</code> oder <code>-</code> statt <code>--params</code>.</td></tr>
+<tr><td><code>script run &lt;Datei&gt; [--args &lt;json&gt;] [--limits &lt;json&gt;] [--dry-run[=full|sparse]]</code></td><td>Ein Skript ausführen. Siehe <a href="scripts.html#running-scripts">Skripte</a>.</td></tr>
+<tr><td><code>ops list</code>, <code>ops describe &lt;op-id&gt;</code></td><td>Die Vorgänge finden und beschreiben.</td></tr>
+<tr><td><code>instances</code></td><td>Ihre Instanzen auflisten.</td></tr>
+<tr><td><code>await &lt;id&gt;</code></td><td>Auf eine noch offene Anfrage warten.</td></tr>
+<tr><td><code>status &lt;id&gt;</code></td><td>Eine Anfrage sofort anzeigen.</td></tr>
+<tr><td><code>cancel &lt;id&gt;</code></td><td>Eine Anfrage zurückziehen.</td></tr>
+<tr><td><code>requests list [--agent NAME] [--state pending|recent] [--match-params-file &lt;Pfad|-&gt;]</code></td><td>Anfragen auflisten; damit finden Sie eine Anfrage, die noch aussteht.</td></tr>
+<tr><td><code>doctor</code></td><td>Die Einrichtung prüfen.</td></tr>
+<tr><td><code>mcp</code></td><td>Den MCP-Server starten, siehe unten.</td></tr>
+<tr><td><code>verify-export</code></td><td>Eine exportierte Audit-Datei prüfen. Siehe <a href="audit.html#verify">Audit-Protokoll</a>.</td></tr>
+</tbody></table>
+<p>Schreib- und Lesezugriffe warten immer auf Ihre Entscheidung. Ein Agent, der <code>pending</code> sieht, muss warten und darf nicht erneut anfragen.</p>
+<h2 id="mcp">MCP-Clients</h2>
+<p>Viele Agents sprechen MCP. Tragen Sie atlas-duck in die MCP-Einstellungen des Agenten als Programm ein, das über Standardeingabe und Standardausgabe gestartet wird:</p>
+<pre><code>atlas-duck mcp [--tools full|generic] [--instance ALIAS] [--agent NAME]
+</code></pre>
+<p>Auf der Standardausgabe erscheinen nur JSON-RPC-Nachrichten.</p>
+<ul>
+<li><code>--tools full</code> (Standard) bietet je Vorgang ein Tool, dazu <code>script_run</code>, <code>request_await</code>, <code>request_status</code>, <code>request_cancel</code>, <code>request_list</code>, <code>ops_list</code>, <code>ops_describe</code> und <code>instances_list</code>.</li>
+<li><code>--tools generic</code> bietet das einzelne Tool <code>call</code> und dieselben acht Hilfs-Tools. Der Agent nennt den Vorgang dann als Parameter.</li>
+</ul>
+<p>Der Agent übergibt <code>reason</code> bei jedem Tool-Aufruf. Die Umgebungsvariable <code>ATLAS_DUCK_MCP_TIMEOUT</code> legt in Sekunden fest, wie lange ein Tool-Aufruf auf Sie wartet. Standard ist 50; <code>0</code> kehrt sofort mit <code>pending</code> zurück. <code>ATLAS_DUCK_AGENT</code> setzt den Agentennamen.</p>
+<p>Starten Sie den MCP-Server im Agenten nach einem Update von atlas-duck neu, damit der Agent die neue Version verwendet.</p>
+<h2 id="envelope">Das Antwortformat</h2>
+<p>Jeder Befehl gibt auf der Standardausgabe ein JSON-Objekt aus, die Hülle (Envelope). Ihre Schlüssel sind immer dieselben:</p>
+<table>
+<thead><tr><th>Schlüssel</th><th>Inhalt</th></tr></thead>
+<tbody>
+<tr><td><code>request_id</code></td><td>Die ID der Anfrage.</td></tr>
+<tr><td><code>op_id</code></td><td>Der Vorgang.</td></tr>
+<tr><td><code>instance</code></td><td>Die Instanz.</td></tr>
+<tr><td><code>status</code></td><td><code>pending</code>, <code>executing</code>, <code>succeeded</code>, <code>released</code>, <code>denied</code>, <code>expired</code>, <code>cancelled</code>, <code>failed</code>, <code>outcome_unknown</code> oder <code>abandoned</code>.</td></tr>
+<tr><td><code>data</code></td><td>Das Ergebnis, falls es eines gibt.</td></tr>
+<tr><td><code>edited</code></td><td>Ob Sie die Anfrage vor der Freigabe geändert haben.</td></tr>
+<tr><td><code>redacted</code></td><td>Ob Sie das Ergebnis geschwärzt haben.</td></tr>
+<tr><td><code>redaction_note</code></td><td>Ein Hinweis zur Schwärzung.</td></tr>
+<tr><td><code>message</code></td><td>Ein kurzer Text.</td></tr>
+<tr><td><code>error</code></td><td><code>{code, retryable, message, details?}</code>, wenn etwas schiefging.</td></tr>
+<tr><td><code>meta</code></td><td>Zusätzliche Angaben wie Blättern und <code>dry_run</code>.</td></tr>
+</tbody></table>
+<p>Der Exit-Code des Befehls fasst das Ergebnis zusammen:</p>
+<table>
+<thead><tr><th>Exit-Code</th><th>Bedeutung</th></tr></thead>
+<tbody>
+<tr><td>0</td><td><code>succeeded</code> oder <code>released</code>; ein Ergebnis mit einem Skriptfehler endet jedoch mit 8, auch wenn Sie es übergeben haben.</td></tr>
+<tr><td>1</td><td><code>failed</code> oder ein interner Fehler.</td></tr>
+<tr><td>2</td><td>Falsche Verwendung oder ungültige Eingabe.</td></tr>
+<tr><td>3</td><td><code>denied</code>.</td></tr>
+<tr><td>4</td><td>Noch <code>pending</code> oder <code>executing</code>.</td></tr>
+<tr><td>5</td><td>atlas-duck ist nicht erreichbar.</td></tr>
+<tr><td>6</td><td>Die Instanz ist fehlgeschlagen, oder das Ergebnis ist unbekannt.</td></tr>
+<tr><td>7</td><td><code>expired</code>, <code>cancelled</code> oder <code>abandoned</code>.</td></tr>
+<tr><td>8</td><td>Ein Skriptfehler oder -limit, oder keine Sandbox.</td></tr>
+<tr><td>9</td><td>Die App ist gesperrt, nicht eingerichtet oder braucht ein Token.</td></tr>
+<tr><td>10</td><td>Das Ergebnis ist nicht mehr gespeichert.</td></tr>
+<tr><td>11</td><td>atlas-duck ist ausgelastet.</td></tr>
+</tbody></table>
+<p><code>status</code> endet mit 0, sobald es die Anfrage kennt. <code>verify-export</code> hat eigene Codes: 0, 20, 21 und 22. Was die einzelnen <code>error.code</code> bedeuten, steht in der <a href="error-reference.html">Fehlerreferenz</a>.</p>
+</main>
+</div>
+</body>
+</html>

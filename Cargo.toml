@@ -15,6 +15,7 @@ members = [
     "crates/server",
     "crates/script-glue",
     "crates/server-e2e",
+    "crates/docgen",
     "app/src-tauri",
 ]
 

@@ -355,7 +355,7 @@ async fn run(config: Config) -> u8 {
         sessions,
         login,
         registry: registry.clone(),
-        web: WebDir(config.web_dir.clone()),
+        web: WebDir::new(config.web_dir.clone()),
         health: Arc::new(
             Health::new(store.clone(), directory, true)
                 .with_master(master.clone())

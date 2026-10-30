@@ -2,15 +2,16 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { Header } from './Header';
-import { openWindow, quit } from './ipc/invoke';
+import { helpOpen, openWindow, quit } from './ipc/invoke';
 import statusLines from './ipc/fixtures/status_line.json';
 import type { StatusLine } from './ipc/types';
 
-vi.mock('./ipc/invoke', () => ({ openWindow: vi.fn(), quit: vi.fn() }));
+vi.mock('./ipc/invoke', () => ({ openWindow: vi.fn(), quit: vi.fn(), helpOpen: vi.fn() }));
 
 beforeEach(() => {
   vi.mocked(openWindow).mockReset().mockResolvedValue(null);
   vi.mocked(quit).mockReset().mockResolvedValue(null);
+  vi.mocked(helpOpen).mockReset().mockResolvedValue(null);
 });
 
 describe('Header', () => {
@@ -54,5 +55,11 @@ describe('Header', () => {
     expect(quit).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: 'Quit' }));
     expect(quit).toHaveBeenCalledTimes(1);
+  });
+
+  it('help_button_opens_the_approvals_page', () => {
+    render(<Header lines={[]} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Help' }));
+    expect(helpOpen).toHaveBeenCalledWith('approvals', 'queue');
   });
 });

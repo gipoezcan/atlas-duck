@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { HelpButton } from '../shared/HelpLink';
 import { useText } from '../shared/i18n/context';
 import type { Dict } from '../shared/i18n';
 import { useLang } from '../shared/i18n/context';
@@ -136,6 +137,7 @@ export function Running() {
     return (
       <main className="window window-running">
         <h1>{t.approvals.window_titles.running_scripts}</h1>
+        <HelpButton window="running_scripts" />
         {failed ? (
           <p role="alert">
             {t.running.load_failed}{' '}
@@ -153,6 +155,7 @@ export function Running() {
   return (
     <main className="window window-running">
       <h1>{t.approvals.window_titles.running_scripts}</h1>
+      <HelpButton window="running_scripts" />
       {failed ? (
         <p role="alert">
           {t.running.load_failed}{' '}

@@ -1,10 +1,11 @@
 import { type FormEvent, useState } from 'react';
 
 import type { Dict } from '../../shared/i18n';
-import { useText } from '../../shared/i18n/context';
+import { useLang, useText } from '../../shared/i18n/context';
 import { en } from '../../shared/i18n/dict';
 
 import { nav } from '../shell/RequireSession';
+import { docsHref, serverTarget } from '../shell/ServerHelp';
 
 const HOME = '/approvals';
 
@@ -56,6 +57,7 @@ async function codeOf(res: Response): Promise<string | undefined> {
 
 export function Login({ next }: { next: string | null }) {
   const t = useText();
+  const lang = useLang();
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -120,6 +122,11 @@ export function Login({ next }: { next: string | null }) {
         </button>
         {error !== null ? <p role="alert" className="notice notice-danger">{error}</p> : null}
       </form>
+      <p>
+        <a href={docsHref(lang, serverTarget('/login'))} target="_blank" rel="noreferrer">
+          {t.server.login.help}
+        </a>
+      </p>
     </main>
   );
 }

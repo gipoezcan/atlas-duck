@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Instances and tokens - Atlas Duck Help</title>
+<link rel="stylesheet" href="assets/help.css">
+<script src="assets/search-index.js" defer></script>
+<script src="assets/help.js" defer></script>
+</head>
+<body>
+<header class="bar">
+<a class="brand" href="index.html">Atlas Duck Help</a>
+<div class="search" hidden>
+<label class="visually-hidden" for="help-search">Search help</label>
+<input id="help-search" type="search" placeholder="Search help" autocomplete="off" data-empty="No results">
+<ul id="help-results" hidden></ul>
+</div>
+<a class="lang-switch" lang="de" hreflang="de" href="../de/instances-and-tokens.html">Deutsch</a>
+</header>
+<div class="layout">
+<nav class="toc" aria-label="Contents">
+<ul>
+<li><a href="index.html">Overview</a></li>
+<li><a href="getting-started-desktop.html">Getting started (desktop)</a></li>
+<li><a href="instances-and-tokens.html" aria-current="page">Instances and tokens</a>
+<ul>
+<li><a href="#instances">Instances</a></li>
+<li><a href="#add-instance">Add an instance</a></li>
+<li><a href="#tokens">Tokens</a></li>
+<li><a href="#token-storage">Where tokens are stored</a></li>
+<li><a href="#credential-window">The credential window</a></li>
+</ul>
+</li>
+<li><a href="agents-desktop.html">Agents (desktop)</a></li>
+<li><a href="approvals.html">Approvals</a></li>
+<li><a href="scripts.html">Scripts</a></li>
+<li><a href="audit.html">Audit log</a></li>
+<li><a href="settings.html">Settings</a></li>
+<li><a href="troubleshooting.html">Troubleshooting</a></li>
+<li><a href="error-reference.html">Error reference</a></li>
+</ul>
+</nav>
+<main>
+<h1>Instances and tokens</h1>
+<h2 id="instances">Instances</h2>
+<p>An instance is one Jira or Confluence Data Center server that atlas-duck talks to. It is known by an alias, for example the short name of the server.</p>
+<p>In desktop mode you define your own instances. Settings lists them under &quot;Instances&quot;:</p>
+<table>
+<thead><tr><th>Column</th><th>Content</th></tr></thead>
+<tbody>
+<tr><td>Alias</td><td>The name you gave the instance.</td></tr>
+<tr><td>Product</td><td>Jira or Confluence.</td></tr>
+<tr><td>Origin</td><td>The confirmed address of the server, or &quot;(not confirmed)&quot;.</td></tr>
+<tr><td>State</td><td>See below.</td></tr>
+<tr><td>Executes as</td><td>The Atlassian user your token belongs to.</td></tr>
+<tr><td>Token expiry</td><td>The expiry date you entered, if any.</td></tr>
+<tr><td>Proxy</td><td>The proxy of this instance, or &quot;OS setting or none&quot;.</td></tr>
+</tbody></table>
+<p>The state tells you whether the instance can be used:</p>
+<table>
+<thead><tr><th>State</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>ok</td><td>Ready.</td></tr>
+<tr><td>needs token</td><td>No token is stored yet. Use &quot;Add token&quot;.</td></tr>
+<tr><td>unconfirmed</td><td>You have not confirmed the origin yet. Use &quot;Confirm instance&quot;.</td></tr>
+<tr><td>insecure scheme (http)</td><td>The URL starts with http. atlas-duck requires https. If your server uses an internal certificate authority, add it as the instance's custom CA.</td></tr>
+<tr><td>identity header missing</td><td>&quot;X-AUSERNAME not received, possibly stripped by a reverse proxy in front of Jira; ask the Jira administrator&quot;.</td></tr>
+<tr><td>identity header mismatch</td><td>The X-AUSERNAME header does not match the user of the token.</td></tr>
+</tbody></table>
+<h2 id="add-instance">Add an instance</h2>
+<p>Open Settings, &quot;Add an instance&quot; (the setup window has the same form), and fill in:</p>
+<ul>
+<li><strong>Alias</strong> and <strong>Product</strong> (Jira or Confluence).</li>
+<li><strong>Base URL (https, with the context path)</strong>. atlas-duck requires https.</li>
+<li><strong>Proxy</strong>, as host:port, <code>direct</code>, or empty for the OS setting. If your system uses a proxy auto-config script, atlas-duck does not evaluate it: set the proxy of the instance here.</li>
+<li><strong>Use a custom CA certificate</strong> if your server uses an internal certificate authority. atlas-duck asks for the file.</li>
+<li><strong>Default instance for its product</strong>. A product can have only one default instance.</li>
+</ul>
+<p>Choose &quot;Add instance&quot;. atlas-duck then shows the alias and the origin in its own dialog; confirm it. The message &quot;The instance was added. Add its token next.&quot; follows. A row also offers &quot;Change URL&quot; and &quot;Apply proxy&quot; later.</p>
+<h2 id="tokens">Tokens</h2>
+<p>atlas-duck always acts as you, with your own personal access token (PAT), never with a shared service account. Create the token in Jira or Confluence (Profile → Personal Access Tokens) and give it only the permissions your work needs. Whatever the token may not do in Jira or Confluence, an agent cannot do either.</p>
+<p>Enter the token in the <a href="#credential-window">credential window</a>. You can also enter an optional expiry date. atlas-duck then warns you ahead of time (&quot;Token expires in N days&quot;, &quot;Token expires today&quot;, &quot;Token expired on ...&quot;). This is only a warning: the server decides whether a token works.</p>
+<p>On each instance row of Settings:</p>
+<ul>
+<li>&quot;Add token&quot; or &quot;Replace token&quot; opens the credential window.</li>
+<li>&quot;Re-test stored token&quot; asks the server again. The answer is &quot;Connected as ...&quot;, or &quot;The re-test failed:&quot; with the reason.</li>
+</ul>
+<p>When you store a token, atlas-duck first tests it against the instance. These are the reasons for a refusal:</p>
+<table>
+<thead><tr><th>Reason</th><th>What to do</th></tr></thead>
+<tbody>
+<tr><td>The server rejected the token (401).</td><td>Check that it is a valid personal access token that has not expired.</td></tr>
+<tr><td>The token belongs to another user.</td><td>A token is already stored for a different Atlassian user. Remove the stored token first.</td></tr>
+<tr><td>The TLS certificate of the server could not be verified.</td><td>If your server uses an internal CA, the instance needs it as its custom CA.</td></tr>
+<tr><td>A proxy blocked or changed the connection.</td><td>Check the proxy settings.</td></tr>
+<tr><td>The server could not be reached.</td><td>Try again later.</td></tr>
+<tr><td>The server version is below the minimum atlas-duck supports.</td><td>The instance has to be upgraded.</td></tr>
+</tbody></table>
+<h2 id="token-storage">Where tokens are stored</h2>
+<p>Your tokens are kept in the operating system keychain of this computer. atlas-duck never shows a stored token again. Backups never contain tokens: after a restore, every instance needs its token again. &quot;Prepare for removal&quot; in Settings deletes the stored tokens and then asks you to revoke each token on its server.</p>
+<p>Tokens give access to Jira and Confluence in your name. Rotate them regularly, and revoke a token on its server when you no longer need it.</p>
+<h2 id="credential-window">The credential window</h2>
+<p>Tokens and passphrases are typed in a separate window, the credential window, and nowhere else. For a token it is titled &quot;Add token&quot; or &quot;Replace token&quot;. Before you type, it shows the Instance, the Product and the Address, so you can check that you are talking to the right server. If some characters of the address are unusual, they are shown as escapes with a warning: check the address before you continue.</p>
+<ol>
+<li>Paste the token into &quot;Personal access token&quot;. Optionally fill in &quot;Token expires on (optional)&quot;.</li>
+<li>Choose &quot;Test and store&quot;.</li>
+<li>On success the window says &quot;Connected as <em>user</em>, <em>product</em> <em>version</em>. You can close this window.&quot;</li>
+</ol>
+<p>The same window asks for the recovery passphrase, to unlock atlas-duck and to restore a backup.</p>
+</main>
+</div>
+</body>
+</html>

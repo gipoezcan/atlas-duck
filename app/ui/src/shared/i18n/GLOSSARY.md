@@ -106,3 +106,5 @@ never translated. A German leaf equal to its English one needs an allowlist entr
 | envelope (the CLI/MCP answer) | Antwortformat | the onboarding title "Das Antwortformat"; the wire field names stay |
 | organisation CA | Organisations-CA | "CA-Bundle der Organisation" in the long form |
 | default (instance) | Standard | "Standardinstanz" |
+| domain sign-in | Domänenanmeldung | signing in to the server with the username and password of the organisation's directory |
+| mode (desktop or server) | Betriebsart | the two are the "Desktopmodus" and the "Servermodus" (CONTEXT.md: Desktop mode, Server mode); "Modus" stands alone only in compounds that the windows already use: "Benachrichtigungsmodus", "Präsentationsmodus", "Wartungsmodus" |

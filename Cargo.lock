@@ -545,6 +545,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlas-duck-docgen"
+version = "0.1.0"
+dependencies = [
+ "pulldown-cmark",
+]
+
+[[package]]
 name = "atlas-duck-ipc"
 version = "0.1.0"
 dependencies = [

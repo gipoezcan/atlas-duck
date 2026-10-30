@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audit log - Atlas Duck Help</title>
+<link rel="stylesheet" href="assets/help.css">
+<script src="assets/search-index.js" defer></script>
+<script src="assets/help.js" defer></script>
+</head>
+<body>
+<header class="bar">
+<a class="brand" href="/docs/en/">Atlas Duck Help</a>
+<div class="search" hidden>
+<label class="visually-hidden" for="help-search">Search help</label>
+<input id="help-search" type="search" placeholder="Search help" autocomplete="off" data-empty="No results">
+<ul id="help-results" hidden></ul>
+</div>
+<a class="lang-switch" lang="de" hreflang="de" href="/docs/de/audit">Deutsch</a>
+</header>
+<div class="layout">
+<nav class="toc" aria-label="Contents">
+<ul>
+<li><a href="/docs/en/">Overview</a></li>
+<li><a href="/docs/en/getting-started-server">Getting started (server)</a></li>
+<li><a href="/docs/en/instances-and-tokens">Instances and tokens</a></li>
+<li><a href="/docs/en/agents-server">Agents (server)</a></li>
+<li><a href="/docs/en/approvals">Approvals</a></li>
+<li><a href="/docs/en/scripts">Scripts</a></li>
+<li><a href="/docs/en/audit" aria-current="page">Audit log</a>
+<ul>
+<li><a href="#audit-log">What the audit log records</a></li>
+<li><a href="#verify">Verify the chain</a></li>
+<li><a href="#export">Export the log</a></li>
+<li><a href="#verify-export">Check an export with verify-export</a></li>
+<li><a href="#retention">Retention and legal hold</a></li>
+<li><a href="#integrity-incident">Integrity incidents</a></li>
+</ul>
+</li>
+<li><a href="/docs/en/settings">Settings</a></li>
+<li><a href="/docs/en/admin">Administration</a></li>
+<li><a href="/docs/en/auditor">Auditor</a></li>
+<li><a href="/docs/en/troubleshooting">Troubleshooting</a></li>
+<li><a href="/docs/en/error-reference">Error reference</a></li>
+</ul>
+</nav>
+<main>
+<h1>Audit log</h1>
+<h2 id="audit-log">What the audit log records</h2>
+<p>atlas-duck keeps a record of everything that happens around a request: that it arrived, what you saw, what you decided, what was sent to the instance and what came back, and what the agent received. The records are chained: each one contains a fingerprint of the one before, so a changed or removed record breaks the chain and can be found. The content of each record (the &quot;payload&quot;) is stored encrypted.</p>
+<p>Every user has a separate audit log of their own. The page &quot;My audit&quot; in the header shows yours: the list of records with filters, the trail of a request and the payload of a record. Reading your own log is not recorded. Verification, acknowledging incidents, backup and the anchor directory belong to the desktop app; on the server the operator looks after them. Users with the auditor role can read other users' logs, see <a href="/docs/en/auditor#auditor-role">The auditor role</a>.</p>
+<p><strong>Filters.</strong> You can filter by time range (&quot;From (UTC)&quot;, &quot;To (UTC)&quot;), &quot;Agent name&quot;, &quot;Operation&quot;, &quot;Class&quot;, &quot;Instance id&quot;, &quot;Target (starts with)&quot;, &quot;Decision&quot; and &quot;Flags (any of)&quot;. Filters match only the plaintext columns of a record; payloads are not searched. &quot;Load more&quot; continues a search.</p>
+<p><strong>Decisions</strong> in the log are: approve, approve (edited), release, release (redacted), deny, expire, cancel and reject. <strong>Flags</strong> are: edited, redacted, batch, stale, clock backwards, clock forward, clock behind and integrity incident. The clock flags mark records written while the computer's clock went backwards, jumped ahead or was behind the date that the servers reported. They exist so that a wrong clock cannot shorten retention.</p>
+<p><strong>A record.</strong> &quot;Open record&quot; shows the fields: Time (UTC), Event, Request, Operation, Class, Instance id, Target, Decision, Flags, Agent name and where it came from, Client, Connection, Peer process id, Peer program, Origin program, OS user, Atlassian user and &quot;Payload bytes&quot;. &quot;Show the decrypted payload&quot; opens the content page by page.</p>
+<p><strong>Request trail.</strong> &quot;Request trail&quot; shows every record of one request in order. &quot;Delivered N times&quot; counts how often the answer was handed over. &quot;delivered more than once&quot; and &quot;delivered to a different program&quot; are advisory: they compare the program that asked with the program that received the answer, and they point at something to check, not at proof.</p>
+<p><strong>What the log can and cannot do.</strong> The log shows who decided what and when, and it reveals later changes. It does not stop anyone from acting. It does not protect against malware that runs as your own user while you are logged in: such code can read the keys and rewrite the log. The audited user can also delete the log or confirm destructive actions. Protection against that needs an anchor directory that you cannot rewrite, see <a href="/docs/en/audit#verify">Verify the chain</a>.</p>
+<p>The log contains personal data, for example names and comments from Jira and Confluence. Handle exports accordingly.</p>
+<h2 id="verify">Verify the chain</h2>
+<p>Verification checks that the chain is complete and unchanged: every record belongs to its predecessor, the payloads match their fingerprints, and the log head matches the copies kept elsewhere.</p>
+<p>The server does not verify chains in the web pages. Besides each user's chain, the server keeps an <strong>anchor chain</strong> that records the head of every user's chain, at intervals of 15 minutes at most. The operator can run <code>admin anchor verify</code>: it recomputes the anchor chain and compares each user's latest anchored head with that user's log. It reports a chain that was cut short, a replaced head record or a missing log. It does not check a user's whole chain or the payloads, and it cannot find a change made before the anchored head. Nothing is detected by itself: a finding appears only when the operator runs the command. The anchor chain is also written by the server, so it protects against a user's mistakes and against partial damage, but not against someone who controls the server and its keys.</p>
+<h2 id="export">Export the log</h2>
+<p>An export copies records of a time range, with their decrypted payloads, so that someone else can check them, for example an auditor or the compliance owner. The files are readable by anyone who can open them. Keep them as safe as the original data.</p>
+<p>Open the export function on &quot;My audit&quot;. Choose &quot;All records&quot; or &quot;From date (UTC)&quot;, then &quot;Start export&quot;. When &quot;The export is ready&quot; appears, use &quot;Download&quot;. The download is a tar file with the records, the decrypted payloads and the other files that the verifier needs. The page also shows the &quot;Manifest SHA-256&quot; and the &quot;Anchor head&quot;. Give both to the recipient by another channel than the archive.</p>
+<p>Only one export of the same log runs at a time (&quot;An export is already running&quot;). The server deletes export files after 24 hours by default; after that, &quot;This export is no longer available. Start a new one.&quot;</p>
+<p>Auditors can export any user's log in the same way, see <a href="/docs/en/auditor#auditor-exports">Exports</a>.</p>
+<h2 id="verify-export">Check an export with verify-export</h2>
+<p>The recipient checks an export with the command <code>atlas-duck verify-export</code>. It needs no access to your computer or server, and it works offline.</p>
+<pre><code>atlas-duck verify-export &lt;dir&gt; [--manifest-sha256 &lt;hex&gt;] [--anchor-dir &lt;dir&gt;]
+</code></pre>
+<p>It recomputes every record fingerprint and the chain, checks that the decrypted payloads match their fingerprints, and compares the result with what you give it as a <strong>trust root</strong>:</p>
+<ul>
+<li><code>--manifest-sha256</code> is the fingerprint that you passed on separately. It proves that the files are those that were exported.</li>
+<li><code>--anchor-dir</code> is a copy of the anchor directory. It shows that the history matches what was written there earlier.</li>
+</ul>
+<p>Both are optional, but without any trust root the result can only be &quot;consistent in itself&quot; (exit 20).</p>
+<p>For a server export, the page shows the full command, including <code>--anchor-chain &lt;dir&gt;/anchor-chain.jsonl</code> and <code>--anchor-chain-head &lt;seq&gt;:&lt;hash&gt;</code>. The anchor chain in the archive is only an excerpt. Without the head you pin, it is reported as unanchored and counts for nothing, because a consistent excerpt can be made up completely. Take the head from the export page or from the operator, not from the archive. The server image also has the verifier: <code>atlas-duck-server verify-export …</code>.</p>
+<p>The exit code tells you how far to trust the result:</p>
+<table>
+<thead><tr><th>Exit code</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>Verified against a trust root that covers the whole export.</td></tr>
+<tr><td>20</td><td>Consistent in itself, but no trust root covers all of it. The command says &quot;internally consistent; trust root NOT verified&quot;. Treat this as not verified.</td></tr>
+<tr><td>21</td><td>Tampering, or a fork: two exports that share a start but diverge.</td></tr>
+<tr><td>22</td><td>The command could not run: wrong usage (for example <code>--anchor-dir</code> together with <code>--anchor-chain</code>), unreadable files, an unfinished <code>.partial</code> folder, or the atlas-duck app was not found.</td></tr>
+</tbody></table>
+<p>A fork is not necessarily an attack. It happens when a log was restored from a backup while the old installation kept running. The old installation should be shut down.</p>
+<h2 id="retention">Retention and legal hold</h2>
+<p>The audit log is not kept forever. The retention period says how long records stay.</p>
+<p>On the server, the operator sets the retention period, not the individual user, and the log of an active user is kept. This guide describes what the server does when a user is deactivated, for example because they left the organisation: their log stays available to auditors for 365 days by default. After that period the server deletes it, including the user's keys, and records the deletion in the anchor chain. An auditor who needs a log for longer must export it before then. Backups are not touched by this: a backup taken earlier still contains the deleted log, so the operator has to remove old backups too.</p>
+<h2 id="integrity-incident">Integrity incidents</h2>
+<p>An integrity incident means that a check found something that should not be. Possible causes range from a harmless one, such as restoring a backup, to tampering. atlas-duck cannot tell which one it is.</p>
+<p>Integrity incidents, with a banner and an acknowledgement, exist only in the desktop app. The server does not show them on the web pages. When the operator runs <code>admin anchor verify</code>, it reports findings that name the user and the sequence number, and exits with an error. If you think that your log is affected, tell your administrator.</p>
+</main>
+</div>
+</body>
+</html>

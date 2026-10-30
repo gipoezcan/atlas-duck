@@ -4,6 +4,7 @@
   "windows": ["onboarding"],
   "permissions": [
     "allow-onboarding-text",
+    "allow-help-open",
     "allow-ui-lang-get"
   ]
 }

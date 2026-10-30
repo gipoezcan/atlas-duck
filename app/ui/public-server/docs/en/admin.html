@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Administration - Atlas Duck Help</title>
+<link rel="stylesheet" href="assets/help.css">
+<script src="assets/search-index.js" defer></script>
+<script src="assets/help.js" defer></script>
+</head>
+<body>
+<header class="bar">
+<a class="brand" href="/docs/en/">Atlas Duck Help</a>
+<div class="search" hidden>
+<label class="visually-hidden" for="help-search">Search help</label>
+<input id="help-search" type="search" placeholder="Search help" autocomplete="off" data-empty="No results">
+<ul id="help-results" hidden></ul>
+</div>
+<a class="lang-switch" lang="de" hreflang="de" href="/docs/de/admin">Deutsch</a>
+</header>
+<div class="layout">
+<nav class="toc" aria-label="Contents">
+<ul>
+<li><a href="/docs/en/">Overview</a></li>
+<li><a href="/docs/en/getting-started-server">Getting started (server)</a></li>
+<li><a href="/docs/en/instances-and-tokens">Instances and tokens</a></li>
+<li><a href="/docs/en/agents-server">Agents (server)</a></li>
+<li><a href="/docs/en/approvals">Approvals</a></li>
+<li><a href="/docs/en/scripts">Scripts</a></li>
+<li><a href="/docs/en/audit">Audit log</a></li>
+<li><a href="/docs/en/settings">Settings</a></li>
+<li><a href="/docs/en/admin" aria-current="page">Administration</a>
+<ul>
+<li><a href="#users-and-roles">Users and roles</a></li>
+<li><a href="#instances-admin">Manage instances</a></li>
+<li><a href="#maintenance">Maintenance</a></li>
+</ul>
+</li>
+<li><a href="/docs/en/auditor">Auditor</a></li>
+<li><a href="/docs/en/troubleshooting">Troubleshooting</a></li>
+<li><a href="/docs/en/error-reference">Error reference</a></li>
+</ul>
+</nav>
+<main>
+<h1>Administration</h1>
+<h2 id="users-and-roles">Users and roles</h2>
+<p>The server has three roles: user, admin and auditor. atlas-duck does not keep passwords or a list of roles of its own. A person signs in with their directory account, and the groups of that account decide the role. Your operator has linked one directory group to each role (<code>GROUP_USERS</code>, <code>GROUP_ADMINS</code>, <code>GROUP_AUDITORS</code>). To give or take a role, change the group membership in the directory. A person who is in none of the groups cannot sign in.</p>
+<table>
+<thead><tr><th>Role</th><th>Can</th></tr></thead>
+<tbody>
+<tr><td>User</td><td>Use the approval queue, store their own tokens, create API keys and read their own audit log.</td></tr>
+<tr><td>Admin</td><td>Everything a user can, and manage the instances on the &quot;Admin&quot; page.</td></tr>
+<tr><td>Auditor</td><td>Read the audit log of any user, see <a href="/docs/en/auditor#auditor-role">The auditor role</a>.</td></tr>
+</tbody></table>
+<p>Admins have no access to other users' audit logs. An admin also does not see anyone's stored token; nobody does, because atlas-duck never shows a stored token.</p>
+<p><strong>Deactivating a user.</strong> When someone leaves the organisation, the operator deactivates the account with <code>admin users deactivate &lt;username&gt;</code>. There is no button for this on the web pages. Deactivating is final and does the following at once: the person's sessions end, their API keys and OAuth grants are revoked, and their stored tokens are deleted. The revocation of the keys and of the OAuth grants and the deletion of the tokens are recorded in the person's audit log, and the final state of that log is anchored in the anchor chain as the user's deactivation. A deactivated person cannot sign in again, even if the directory still lists them. <code>admin users list</code> shows every user with roles, last login and state: active, deactivated or deleted.</p>
+<p>Whether the server notices departed users by itself depends on how your operator set it up. Without a read-only directory account, the server refuses a disabled account only at its next login, and until then the person's API keys keep working. Deactivating by hand on the day someone leaves is then an operator duty. Ask your operator which case applies to you.</p>
+<h2 id="instances-admin">Manage instances</h2>
+<p>As an admin you define the Jira and Confluence instances for everybody. Open &quot;Admin&quot; in the header. The page &quot;Instances&quot; says: &quot;Every user sees these instances and enters their own token for each.&quot; Users do not add instances themselves, see <a href="/docs/en/instances-and-tokens">Instances and tokens</a>.</p>
+<p>The table lists each instance with URL, Proxy, &quot;Org CA&quot; and &quot;Default&quot;. To add one, fill in &quot;Add an instance&quot;:</p>
+<table>
+<thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>Alias</td><td>The short name that users and agents use. Letters, digits, <code>-</code> and <code>_</code>.</td></tr>
+<tr><td>Product</td><td>Jira or Confluence.</td></tr>
+<tr><td>Base URL</td><td>The address of the server. It must start with <code>https://</code>.</td></tr>
+<tr><td>Proxy (optional: direct, system or a proxy URL)</td><td>How atlas-duck reaches the server.</td></tr>
+<tr><td>Use the organisation CA bundle</td><td>Check the server certificate against the organisation's certificate authority, which your operator has installed. Use this for servers with an internal certificate.</td></tr>
+<tr><td>Default instance for this product</td><td>Marks the default instance of its product. A product can have only one default.</td></tr>
+</tbody></table>
+<p>Choose &quot;Add instance&quot;. The messages tell you what is wrong: the alias exists already, the instance is not valid, or the change failed.</p>
+<p>&quot;Remove&quot; removes an instance for everybody. atlas-duck asks first: &quot;Remove the instance ALIAS? Every user's token for this instance will be deleted.&quot; Each user must then store a new token if the instance comes back. Removing is recorded in the audit log of each affected user.</p>
+<p>Instances can also be managed from the command line inside the server container with <code>admin instances list</code>, <code>add</code> and <code>remove</code>.</p>
+<h2 id="maintenance">Maintenance</h2>
+<p>Some work needs the server to stand still, for example restoring a backup. The operator switches the server into maintenance mode with <code>admin maintenance on</code>. While it is on, every page and request except the health probes and the metrics answers with 503, and the pages say &quot;The server is in maintenance.&quot; Nothing is lost; try again later. The operator switches maintenance off after the work.</p>
+<p>What the operator does is described in the operations documents that come with the server: backup and restore, rotating the master key, offboarding and the daily retention sweep. They need access to the server container and are not part of the web pages. If maintenance takes longer than expected, ask your operator.</p>
+</main>
+</div>
+</body>
+</html>

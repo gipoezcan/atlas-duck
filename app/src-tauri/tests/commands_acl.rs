@@ -5295,8 +5295,8 @@ mod raw_pages {
 
 // ---- M6 T31 (§13 Security Frontend row, S-09 mock-runtime half; §10.3) ----
 
-/// The seven window labels (C.10 + Δ1, PD-72).
-const S09_LABELS: [&str; 7] = [
+/// The eight window labels (C.10 + Δ1, PD-72, M16 PD-328).
+const S09_LABELS: [&str; 8] = [
     "approvals",
     "settings",
     "audit",
@@ -5304,12 +5304,13 @@ const S09_LABELS: [&str; 7] = [
     "onboarding",
     "credential",
     "setup",
+    "help",
 ];
 
 /// The commands each window holds (C.10 + Δ1 table), written out here on purpose: a second source
 /// next to `ci/check-commands.mjs`, compared with the capability files below, never derived from
 /// them. A window outside its row is refused by Tauri's ACL.
-const S09_GRANTS: [(&str, &[&str]); 7] = [
+const S09_GRANTS: [(&str, &[&str]); 8] = [
     (
         "approvals",
         &[
@@ -5329,6 +5330,8 @@ const S09_GRANTS: [(&str, &[&str]); 7] = [
             "app_status",
             // M15 T3 (PD-294): the UI language, in every React window.
             "ui_lang_get",
+            // M16 (PD-328): opens the Help window, which holds nothing itself.
+            "help_open",
         ],
     ),
     (
@@ -5367,6 +5370,7 @@ const S09_GRANTS: [(&str, &[&str]); 7] = [
             "orphan_installs",
             "forget_install",
             "ui_lang_get",
+            "help_open",
         ],
     ),
     (
@@ -5384,13 +5388,17 @@ const S09_GRANTS: [(&str, &[&str]); 7] = [
             "export_cancel",
             "backup_trigger",
             "ui_lang_get",
+            "help_open",
         ],
     ),
     (
         "running_scripts",
-        &["running_list", "running_kill", "ui_lang_get"],
+        &["running_list", "running_kill", "ui_lang_get", "help_open"],
     ),
-    ("onboarding", &["onboarding_text", "ui_lang_get"]),
+    (
+        "onboarding",
+        &["onboarding_text", "ui_lang_get", "help_open"],
+    ),
     (
         "credential",
         &[
@@ -5427,8 +5435,11 @@ const S09_GRANTS: [(&str, &[&str]); 7] = [
             "onboarding_text",
             "quit",
             "ui_lang_get",
+            "help_open",
         ],
     ),
+    // M16 (PD-328): the Help window holds no app permission at all.
+    ("help", &[]),
 ];
 
 /// The window of label: the one already open, or a new one.
@@ -5461,9 +5472,9 @@ fn s09_permissions(capability: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// §13 / §10.3 (S-09): for each of the seven windows, every command of `COMMANDS` outside its row
+/// §13 / §10.3 (S-09): for each of the eight windows, every command of `COMMANDS` outside its row
 /// of the Δ1 table is refused by the runtime's authority (Tauri's ACL, before any command layer),
-/// and the table itself is the capability files' content, one file per window. A tenth window label
+/// and the table itself is the capability files' content, one file per window. A ninth window label
 /// holds nothing.
 #[test]
 fn s09_command_outside_grant_rejected_every_window() -> TestResult {
@@ -5526,9 +5537,9 @@ fn s09_command_outside_grant_rejected_every_window() -> TestResult {
             refusals += 1;
         }
     }
-    // 8 labels x every command, less the table's grants (a command two windows hold counts twice).
+    // 9 labels x every command, less the table's grants (a command two windows hold counts twice).
     let grants: usize = S09_GRANTS.iter().map(|(_, c)| c.len()).sum();
-    assert_eq!(refusals, 8 * COMMANDS.len() - grants);
+    assert_eq!(refusals, 9 * COMMANDS.len() - grants);
 
     // The event commands follow the same authority: the windows that listen hold both, the others
     // neither. The Audit window listens since M10 T12 (`audit_job` progress, `audit_changed`).
@@ -5556,7 +5567,7 @@ fn s09_command_outside_grant_rejected_every_window() -> TestResult {
 
 /// M8 T22 (Δ8, §10.3): the kill answer grows from `{killed}` to `{answer}` and the window's columns
 /// grow, but the Running-scripts window's grants do not: exactly the two commands and the two event
-/// permissions it had, and no other window holds either command.
+/// permissions it had (plus M16's help_open), and no other window holds either command.
 #[test]
 fn s09_running_scripts_grants_unchanged() -> TestResult {
     let capability = s09_capability("running_scripts")?;
@@ -5566,6 +5577,7 @@ fn s09_running_scripts_grants_unchanged() -> TestResult {
         [
             "allow-running-kill",
             "allow-running-list",
+            "allow-help-open",
             "allow-ui-lang-get",
             "core:event:allow-listen",
             "core:event:allow-unlisten",
@@ -6247,6 +6259,13 @@ fn s09_cases() -> Vec<S09Case> {
         case("settings_get", "settings", json!({}), whole(), pad()),
         case("ui_lang_get", "settings", json!({}), whole(), pad()),
         case(
+            "help_open",
+            "settings",
+            json!({"page": "index"}),
+            (Some("page"), json!(7)),
+            (Some("page"), huge()),
+        ),
+        case(
             "submit_secret",
             "credential",
             json!({"secret": "canary-s09"}),
@@ -6389,7 +6408,12 @@ fn dialog_and_notification_plugin_commands_granted_to_none() -> TestResult {
     for label in S09_LABELS {
         let capability = s09_capability(label)?;
         let permissions = s09_permissions(&capability);
-        assert!(!permissions.is_empty(), "{label}: no permissions read");
+        // The Help window holds no permission at all (M16, PD-328).
+        assert_eq!(
+            permissions.is_empty(),
+            label == "help",
+            "{label}: permissions read"
+        );
         for p in &permissions {
             let lower = p.to_lowercase();
             assert!(

@@ -243,6 +243,16 @@ pub fn router(state: AppState) -> Router {
     for (path, _) in static_files::PAGES {
         r = r.route(path, get(page));
     }
+    // M16 (PD-323): the user guide is public static content: no session, no Origin or CSRF
+    // check (GET and HEAD only, nothing it serves depends on the caller).
+    r = r
+        .route("/docs", get(docs_root))
+        .route("/docs/", get(docs_root))
+        .route("/docs/{lang}", get(docs_add_slash))
+        .route("/docs/{lang}/", get(docs_lang_root))
+        .route("/docs/{lang}/{page}", get(docs_page))
+        .route("/docs/{lang}/assets/{name}", get(docs_asset))
+        .route("/docs/{lang}/{page}/{*rest}", get(docs_miss));
     r.merge(crate::mcp::routes(&state))
         .fallback(|| async { ApiError::NOT_FOUND })
         .layer(middleware::from_fn_with_state(state.clone(), api_guard))
@@ -299,6 +309,42 @@ async fn count_requests(State(st): State<AppState>, req: Request, next: Next) ->
 
 async fn page(State(st): State<AppState>, uri: axum::http::Uri) -> Response {
     static_files::page(&st.web, uri.path()).await
+}
+
+async fn docs_root(headers: HeaderMap) -> Response {
+    static_files::docs_redirect(pref_routes::accept_language(&headers))
+}
+
+async fn docs_miss() -> Response {
+    static_files::not_found()
+}
+
+async fn docs_add_slash(
+    State(st): State<AppState>,
+    axum::extract::Path(lang): axum::extract::Path<String>,
+) -> Response {
+    static_files::docs_add_slash(&st.web, &lang)
+}
+
+async fn docs_lang_root(
+    State(st): State<AppState>,
+    axum::extract::Path(lang): axum::extract::Path<String>,
+) -> Response {
+    static_files::docs_page(&st.web, &lang, None).await
+}
+
+async fn docs_page(
+    State(st): State<AppState>,
+    axum::extract::Path((lang, page)): axum::extract::Path<(String, String)>,
+) -> Response {
+    static_files::docs_page(&st.web, &lang, Some(&page)).await
+}
+
+async fn docs_asset(
+    State(st): State<AppState>,
+    axum::extract::Path((lang, name)): axum::extract::Path<(String, String)>,
+) -> Response {
+    static_files::docs_asset(&st.web, &lang, &name).await
 }
 
 async fn asset(

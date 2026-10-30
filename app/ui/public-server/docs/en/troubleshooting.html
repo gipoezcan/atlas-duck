@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Troubleshooting - Atlas Duck Help</title>
+<link rel="stylesheet" href="assets/help.css">
+<script src="assets/search-index.js" defer></script>
+<script src="assets/help.js" defer></script>
+</head>
+<body>
+<header class="bar">
+<a class="brand" href="/docs/en/">Atlas Duck Help</a>
+<div class="search" hidden>
+<label class="visually-hidden" for="help-search">Search help</label>
+<input id="help-search" type="search" placeholder="Search help" autocomplete="off" data-empty="No results">
+<ul id="help-results" hidden></ul>
+</div>
+<a class="lang-switch" lang="de" hreflang="de" href="/docs/de/troubleshooting">Deutsch</a>
+</header>
+<div class="layout">
+<nav class="toc" aria-label="Contents">
+<ul>
+<li><a href="/docs/en/">Overview</a></li>
+<li><a href="/docs/en/getting-started-server">Getting started (server)</a></li>
+<li><a href="/docs/en/instances-and-tokens">Instances and tokens</a></li>
+<li><a href="/docs/en/agents-server">Agents (server)</a></li>
+<li><a href="/docs/en/approvals">Approvals</a></li>
+<li><a href="/docs/en/scripts">Scripts</a></li>
+<li><a href="/docs/en/audit">Audit log</a></li>
+<li><a href="/docs/en/settings">Settings</a></li>
+<li><a href="/docs/en/admin">Administration</a></li>
+<li><a href="/docs/en/auditor">Auditor</a></li>
+<li><a href="/docs/en/troubleshooting" aria-current="page">Troubleshooting</a>
+<ul>
+<li><a href="#cannot-connect">An instance cannot be reached</a></li>
+<li><a href="#token-rejected">A token is rejected</a></li>
+<li><a href="#nothing-happens">A request stays pending</a></li>
+<li><a href="#locked">The app is locked</a></li>
+<li><a href="#audit-storage">The audit storage is low</a></li>
+</ul>
+</li>
+<li><a href="/docs/en/error-reference">Error reference</a></li>
+</ul>
+</nav>
+<main>
+<h1>Troubleshooting</h1>
+<h2 id="cannot-connect">An instance cannot be reached</h2>
+<p>Symptoms: agents get <code>unreachable</code>, <code>upstream_network</code> or <code>upstream_unavailable</code>; a token check says that the instance cannot be reached (<code>pat/instance_unreachable</code> on the server).</p>
+<p>First separate two cases. Every <code>unreachable</code> error concerns the app, not the instance: the command line cannot reach the app. See the reasons in <a href="/docs/en/error-reference#err-unreachable"><code>unreachable</code></a>. Only <code>upstream_network</code>, <code>upstream_unavailable</code> and <code>pat/instance_unreachable</code> point at the instance. Then the instance is the problem:</p>
+<ol>
+<li>Open the address of the instance in a browser on the same computer. If it does not load, the cause is the network, the VPN or the instance itself. atlas-duck cannot do more than your browser can.</li>
+<li>Check the state of the instance. On the desktop, Settings lists it under &quot;Instances&quot;. The states &quot;unconfirmed&quot;, &quot;needs token&quot; and &quot;insecure scheme (http)&quot; say what to do, see <a href="/docs/en/instances-and-tokens">Instances and tokens</a>.</li>
+<li>If the instance uses an internal certificate authority, add it as the custom CA of the instance, or, on the server, ask the administrator to use the organisation CA bundle.</li>
+<li>If you need a proxy, set it for the instance. The desktop app does not evaluate proxy auto-config scripts: enter the proxy as host and port.</li>
+<li><code>upstream_unavailable</code> with <code>identity_header_missing</code> or <code>identity_header_mismatch</code> means that a proxy in front of Jira removes or changes the <code>X-AUSERNAME</code> header. Ask the Jira administrator.</li>
+</ol>
+<p>A request that failed with <code>upstream_network</code> before it was sent can simply be sent again.</p>
+<h2 id="token-rejected">A token is rejected</h2>
+<p>Symptoms: &quot;The token was refused by the instance.&quot;, state &quot;needs token&quot;, agents get <code>needs_token</code>.</p>
+<ul>
+<li>The token may be mistyped or cut off when you copied it. Paste it again.</li>
+<li>The token may have expired or been revoked in Jira or Confluence. Create a new personal access token there and replace the stored one.</li>
+<li>The token must belong to your own account. If you replace it by a token of another Atlassian user, atlas-duck refuses it: &quot;This token belongs to another Atlassian user. Remove the stored token first.&quot;</li>
+<li>On the server, the page &quot;Credentials&quot; shows &quot;Token stored, not usable&quot; when the instance refuses the stored token.</li>
+</ul>
+<p>See <a href="/docs/en/instances-and-tokens">Instances and tokens</a>. Agents must not retry <code>needs_token</code> in a loop: it will not heal by itself, see <a href="/docs/en/error-reference#err-needs-token"><code>needs_token</code></a>.</p>
+<h2 id="nothing-happens">A request stays pending</h2>
+<p>A request waits until you decide. It is not stuck, it waits for you. Check:</p>
+<ol>
+<li>Open the Approvals window and look in &quot;Pending approvals&quot;. The request may wait there, perhaps below others.</li>
+<li>If nothing is listed, the request may have expired, been denied or cancelled. Look under &quot;Recently decided (24 h)&quot;.</li>
+<li>If the agent does not see your decision, it may have stopped waiting. An agent that submitted with a short <code>--timeout</code> gets <code>pending</code> and has to fetch the result with <code>await &lt;id&gt;</code>. It must never submit the request again.</li>
+<li>If the agent lost the id, it can find the request with <code>requests list</code>.</li>
+<li>After a restart of the app, a request that was pending is no longer pending: it became <code>abandoned</code>, see <a href="/docs/en/error-reference#err-abandoned"><code>abandoned</code></a>.</li>
+</ol>
+<p>A write that you approved can show &quot;executing&quot; for a while. If it ends as <code>outcome_unknown</code>, check the target yourself, see <a href="/docs/en/error-reference#err-upstream-unknown-outcome"><code>upstream_unknown_outcome</code></a>.</p>
+<h2 id="locked">The app is locked</h2>
+<p>Symptoms: agents get <code>locked</code> (exit 9); the tray shows &quot;Waiting for keyring&quot; or a locked message.</p>
+<p>This is about the desktop app. The app is locked when it cannot get the key to its audit log. The <code>details.reason</code> tells you which case it is:</p>
+<ul>
+<li><strong><code>keychain_unavailable</code></strong>: the system keychain is not ready yet, which can happen right after login. atlas-duck retries for one to two minutes and then offers a manual retry. Unlock or start your keychain; on Linux this needs a Secret Service provider such as GNOME Keyring or KWallet.</li>
+<li><strong><code>keychain_lost</code></strong>: the keychain entries are gone, for example after a password reset, a profile wipe or a reinstall. The log is intact. The credential window offers &quot;Recover this log&quot;: enter your recovery passphrase. Afterwards every instance needs its token again, and an integrity incident is recorded that you acknowledge, see <a href="/docs/en/audit#integrity-incident">Integrity incidents</a>. Without the passphrase the only alternative is to archive the old log and start fresh; the old log is then kept aside and you must keep it for its retention period.</li>
+<li><strong><code>keyring_not_local</code></strong>: the keyring files lie on a network drive. atlas-duck does not use such a keyring, because two computers would overwrite each other's entries. Use a local home directory.</li>
+</ul>
+<p>Never delete the keychain entries or the data directory to get unlocked: that loses the audit log. See <a href="/docs/en/error-reference#err-locked"><code>locked</code></a>.</p>
+<h2 id="audit-storage">The audit storage is low</h2>
+<p>Symptoms: agents get <code>audit_storage_low</code>; a warning shows in the app and in the tray; decisions fail with an audit error.</p>
+<p>This is about the desktop app; on the server the operator watches the storage. atlas-duck only acts when it can record it. When the free space of the drive that holds the audit log falls under a threshold (by default 2 GiB), it refuses new requests. System entries and pruning continue.</p>
+<ol>
+<li>Free disk space on that drive. Empty the trash, remove old downloads, backups and exports that you no longer need.</li>
+<li>Check &quot;Retention and legal hold&quot; in Settings. If a legal hold is on, nothing is pruned. A long retention period keeps more data.</li>
+<li>Try again. Requests that were refused were not queued, so the agent has to submit them again.</li>
+</ol>
+<p>See <a href="/docs/en/error-reference#err-audit-storage-low"><code>audit_storage_low</code></a> and <a href="/docs/en/audit#retention">Retention and legal hold</a>.</p>
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,40 @@
+/* Help controls (M16): the window "Help" button after the title and the "?" next to a section
+   (desktop buttons, server links). Only tokens, so the dark scheme follows; the focus ring is the
+   base rule's. */
+h1:has(+ .help-button) {
+  display: inline-block;
+  margin-inline-end: var(--space-4);
+}
+.help-button {
+  min-height: calc(var(--control-height) - var(--space-1));
+  padding: 0 var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--accent);
+  vertical-align: middle;
+}
+h1 + .help-button {
+  margin-block-end: var(--space-3);
+}
+.help-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 1.5rem;
+  min-height: 1.5rem;
+  margin-inline-start: var(--space-2);
+  padding: 0;
+  border: var(--border-width) solid var(--accent);
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--accent);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-bold);
+  line-height: 1;
+  text-decoration: none;
+  vertical-align: middle;
+  cursor: pointer;
+}
+.help-link:hover {
+  background: var(--accent-subtle);
+}

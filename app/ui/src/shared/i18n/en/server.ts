@@ -6,6 +6,7 @@ export const server = {
     username: 'Username',
     password: 'Password',
     submit: 'Sign in',
+    help: 'Help',
     invalid_credentials: 'Username or password is wrong.',
     rate_limited: (minutes: number) =>
       `Too many attempts. Try again in ${minutes} ${minutes === 1 ? 'minute' : 'minutes'}.`,
@@ -26,6 +27,7 @@ export const server = {
     auditor: 'Auditor',
     sign_out: 'Sign out',
     sign_out_failed: 'Signing out failed. Try again.',
+    help: 'Help',
   },
   /** The API-key page (SM-3.2). */
   api_keys: {

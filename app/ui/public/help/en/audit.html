@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audit log - Atlas Duck Help</title>
+<link rel="stylesheet" href="assets/help.css">
+<script src="assets/search-index.js" defer></script>
+<script src="assets/help.js" defer></script>
+</head>
+<body>
+<header class="bar">
+<a class="brand" href="index.html">Atlas Duck Help</a>
+<div class="search" hidden>
+<label class="visually-hidden" for="help-search">Search help</label>
+<input id="help-search" type="search" placeholder="Search help" autocomplete="off" data-empty="No results">
+<ul id="help-results" hidden></ul>
+</div>
+<a class="lang-switch" lang="de" hreflang="de" href="../de/audit.html">Deutsch</a>
+</header>
+<div class="layout">
+<nav class="toc" aria-label="Contents">
+<ul>
+<li><a href="index.html">Overview</a></li>
+<li><a href="getting-started-desktop.html">Getting started (desktop)</a></li>
+<li><a href="instances-and-tokens.html">Instances and tokens</a></li>
+<li><a href="agents-desktop.html">Agents (desktop)</a></li>
+<li><a href="approvals.html">Approvals</a></li>
+<li><a href="scripts.html">Scripts</a></li>
+<li><a href="audit.html" aria-current="page">Audit log</a>
+<ul>
+<li><a href="#audit-log">What the audit log records</a></li>
+<li><a href="#verify">Verify the chain</a></li>
+<li><a href="#export">Export the log</a></li>
+<li><a href="#verify-export">Check an export with verify-export</a></li>
+<li><a href="#retention">Retention and legal hold</a></li>
+<li><a href="#integrity-incident">Integrity incidents</a></li>
+</ul>
+</li>
+<li><a href="settings.html">Settings</a></li>
+<li><a href="troubleshooting.html">Troubleshooting</a></li>
+<li><a href="error-reference.html">Error reference</a></li>
+</ul>
+</nav>
+<main>
+<h1>Audit log</h1>
+<h2 id="audit-log">What the audit log records</h2>
+<p>atlas-duck keeps a record of everything that happens around a request: that it arrived, what you saw, what you decided, what was sent to the instance and what came back, and what the agent received. The records are chained: each one contains a fingerprint of the one before, so a changed or removed record breaks the chain and can be found. The content of each record (the &quot;payload&quot;) is stored encrypted.</p>
+<p>The log is yours, on your computer. Open it with &quot;Audit&quot; in the header of the Approvals window. The window has these parts:</p>
+<ul>
+<li>&quot;Verification&quot; with &quot;Verify now&quot; (see <a href="audit.html#verify">Verify the chain</a>) and the list of &quot;Integrity incidents&quot;;</li>
+<li>&quot;Anchor directory&quot;: the folder that holds extra copies of the log head, or &quot;none&quot; (see below);</li>
+<li>&quot;Records&quot;: the list of records, newest first, with &quot;Filters&quot;;</li>
+<li>&quot;Export and backup&quot; (see <a href="audit.html#export">Export the log</a>).</li>
+</ul>
+<p><strong>Filters.</strong> You can filter by time range (&quot;From (UTC)&quot;, &quot;To (UTC)&quot;), &quot;Agent name&quot;, &quot;Operation&quot;, &quot;Class&quot;, &quot;Instance id&quot;, &quot;Target (starts with)&quot;, &quot;Decision&quot; and &quot;Flags (any of)&quot;. Filters match only the plaintext columns of a record; payloads are not searched. &quot;Load more&quot; continues a search.</p>
+<p><strong>Decisions</strong> in the log are: approve, approve (edited), release, release (redacted), deny, expire, cancel and reject. <strong>Flags</strong> are: edited, redacted, batch, stale, clock backwards, clock forward, clock behind and integrity incident. The clock flags mark records written while the computer's clock went backwards, jumped ahead or was behind the date that the servers reported. They exist so that a wrong clock cannot shorten retention.</p>
+<p><strong>A record.</strong> &quot;Open record&quot; shows the fields: Time (UTC), Event, Request, Operation, Class, Instance id, Target, Decision, Flags, Agent name and where it came from, Client, Connection, Peer process id, Peer program, Origin program, OS user, Atlassian user and &quot;Payload bytes&quot;. &quot;Show the decrypted payload&quot; opens the content page by page.</p>
+<p><strong>Request trail.</strong> &quot;Request trail&quot; shows every record of one request in order. &quot;Delivered N times&quot; counts how often the answer was handed over. &quot;delivered more than once&quot; and &quot;delivered to a different program&quot; are advisory: they compare the program that asked with the program that received the answer, and they point at something to check, not at proof.</p>
+<p><strong>What the log can and cannot do.</strong> The log shows who decided what and when, and it reveals later changes. It does not stop anyone from acting. It does not protect against malware that runs as your own user while you are logged in: such code can read the keys and rewrite the log. The audited user can also delete the log or confirm destructive actions. Protection against that needs an anchor directory that you cannot rewrite, see <a href="audit.html#verify">Verify the chain</a>.</p>
+<p>The log contains personal data, for example names and comments from Jira and Confluence. Handle exports accordingly.</p>
+<h2 id="verify">Verify the chain</h2>
+<p>Verification checks that the chain is complete and unchanged: every record belongs to its predecessor, the payloads match their fingerprints, and the log head matches the copies kept elsewhere.</p>
+<p>atlas-duck verifies the log when it starts and once a day in the background. &quot;Verify now&quot; runs it on demand. The result is one of:</p>
+<table>
+<thead><tr><th>Result</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>verified</td><td>The chain is intact.</td></tr>
+<tr><td>verification did not complete</td><td>atlas-duck could not finish the check. This is not a finding that something is wrong; try again.</td></tr>
+<tr><td>integrity incident: see Audit</td><td>The check found something wrong. See <a href="audit.html#integrity-incident">Integrity incidents</a>.</td></tr>
+</tbody></table>
+<p>Two kinds of copies protect the head of the chain. atlas-duck keeps one in the system keychain of your computer. That detects a log that was cut short, but anyone who controls your account can change the keychain too. For more, set an <strong>anchor directory</strong> in Settings (&quot;External anchor directory&quot;, &quot;Set anchor directory…&quot;): atlas-duck then writes copies of the log head into a folder, once a day and after important changes such as retention or legal hold changes. This protects against a rewritten history only if you cannot rewrite the folder yourself, for example a share that someone else administers and that only accepts appends. atlas-duck asks you to confirm every change of the anchor directory in its own dialog, because changing or removing it weakens the protection. &quot;Anchor directory&quot; in the Audit window tells you if writing to it fails; the lines then wait and are retried.</p>
+<h2 id="export">Export the log</h2>
+<p>An export copies records of a time range, with their decrypted payloads, so that someone else can check them, for example an auditor or the compliance owner. The files are readable by anyone who can open them. Keep them as safe as the original data.</p>
+<p>In the Audit window, &quot;Compliance export&quot; under &quot;Export and backup&quot; has the fields &quot;Export from (UTC)&quot; and &quot;Export to (UTC)&quot;. Leave both empty for the whole log. Choose &quot;Export…&quot;. atlas-duck shows a warning and asks for the folder in its own dialogs. It writes the export into a new folder and gives it its final name only when everything has been written. A folder whose name still ends in &quot;.partial&quot; is unfinished and must not be handed over. If atlas-duck says that the export is complete but the folder kept its name, remove &quot;.partial&quot; from the end of the name yourself before you hand it over, and do not export again.</p>
+<p>When the export is done, atlas-duck shows a SHA-256 of the manifest, the fingerprint that binds the files together. Give it to the recipient <strong>by another channel</strong> than the files. Without it the recipient cannot be sure that the files are the ones you made.</p>
+<p>&quot;Full backup&quot; with &quot;Back up now…&quot; is something else: it saves the whole log with its recovery data, so that you can restore it. A backup never contains stored tokens, so after a restore every instance needs its token again. Backups and exports are outside retention; keeping and deleting them is up to you.</p>
+<h2 id="verify-export">Check an export with verify-export</h2>
+<p>The recipient checks an export with the command <code>atlas-duck verify-export</code>. It needs no access to your computer or server, and it works offline.</p>
+<pre><code>atlas-duck verify-export &lt;dir&gt; [--manifest-sha256 &lt;hex&gt;] [--anchor-dir &lt;dir&gt;]
+</code></pre>
+<p>It recomputes every record fingerprint and the chain, checks that the decrypted payloads match their fingerprints, and compares the result with what you give it as a <strong>trust root</strong>:</p>
+<ul>
+<li><code>--manifest-sha256</code> is the fingerprint that you passed on separately. It proves that the files are those that were exported.</li>
+<li><code>--anchor-dir</code> is a copy of the anchor directory. It shows that the history matches what was written there earlier.</li>
+</ul>
+<p>Both are optional, but without any trust root the result can only be &quot;consistent in itself&quot; (exit 20).</p>
+<p>The exit code tells you how far to trust the result:</p>
+<table>
+<thead><tr><th>Exit code</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>Verified against a trust root that covers the whole export.</td></tr>
+<tr><td>20</td><td>Consistent in itself, but no trust root covers all of it. The command says &quot;internally consistent; trust root NOT verified&quot;. Treat this as not verified.</td></tr>
+<tr><td>21</td><td>Tampering, or a fork: two exports that share a start but diverge.</td></tr>
+<tr><td>22</td><td>The command could not run: wrong usage (for example <code>--anchor-dir</code> together with <code>--anchor-chain</code>), unreadable files, an unfinished <code>.partial</code> folder, or the atlas-duck app was not found.</td></tr>
+</tbody></table>
+<p>A fork is not necessarily an attack. It happens when a log was restored from a backup while the old installation kept running. The old installation should be shut down.</p>
+<h2 id="retention">Retention and legal hold</h2>
+<p>The audit log is not kept forever. The retention period says how long records stay.</p>
+<p>In Settings, &quot;Retention and legal hold&quot; has &quot;Audit retention (days)&quot;. The default is 100 days and the minimum is 92. atlas-duck deletes the oldest records only after they are older than the period, and only from the start of the log, so that the chain stays checkable. Each deletion is itself recorded. The payloads are protected by keys per month. A month's key is destroyed when no record needs it any more, so that the deleted records cannot be read from leftovers (crypto-shredding).</p>
+<p>&quot;Legal hold (pruning stops)&quot; stops all deletion, and the keys stay. Use it when you must keep records, for example for an investigation. Switching it on or off is recorded in the log and in the anchor directory. Lifting it, or lowering the retention period, needs your confirmation in the app; a change in the configuration file alone does not do it.</p>
+<p>Settings shows &quot;Pruning&quot;. If atlas-duck was off for a longer time, it catches up slowly, and the page says &quot;pruning is N days behind&quot;. &quot;Prune backlog now&quot; lets you catch up at once after you confirm. If pruning was skipped, Settings gives the reason, for example &quot;legal hold is on&quot;, &quot;no server date has confirmed the current date yet&quot;, or &quot;the system clock is behind the server date&quot;. atlas-duck trusts a date only when an Atlassian server has confirmed it, so that a wrong clock cannot delete records early.</p>
+<p>Retention does not reach backups, exports, or copies of your data that the operating system made, such as snapshots. They can still hold records that were deleted. Remove them yourself when they are no longer needed. Uninstalling atlas-duck does not delete the log either. &quot;Prepare for removal&quot; tells you how long the newest record has to be kept.</p>
+<h2 id="integrity-incident">Integrity incidents</h2>
+<p>An integrity incident means that a check found something that should not be. Possible causes range from a harmless one, such as restoring a backup, to tampering. atlas-duck cannot tell which one it is.</p>
+<p>When it happens, atlas-duck records the finding in the log before it does anything else, and shows a red banner in the app and in the tray. The Audit window lists it under &quot;Integrity incidents&quot; with its &quot;Result&quot; and when it was &quot;Detected&quot;.</p>
+<p>What to do:</p>
+<ol>
+<li>Do not ignore it, and do not acknowledge it before you know the cause. Tell your compliance owner or administrator.</li>
+<li>Make an export of the log, so that the state is kept, see <a href="audit.html#export">Export the log</a>.</li>
+<li>Find the cause. Typical reasons are: a restore from an older backup, a lost keychain entry, or a used anchor directory that belongs to an earlier installation.</li>
+<li>When you understand it, choose &quot;Acknowledge integrity incident&quot;, write a note (up to 1000 characters) and confirm in atlas-duck's own dialog. The note and your user name are recorded. The red banner then disappears for this incident.</li>
+</ol>
+<p>Acknowledging does not repair anything. It records that you have seen the incident and what you concluded. The incident itself stays in the log.</p>
+<p>If Settings reports that an anchor entry is missing in the keychain, &quot;Re-anchor…&quot; writes it again from the log as it is now. That is only safe when you trust the log, and it is recorded as an integrity incident that you then acknowledge.</p>
+</main>
+</div>
+</body>
+</html>

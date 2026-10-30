@@ -257,7 +257,7 @@ describe('Wizard', () => {
     await show(STOPPED);
     expect(screen.getByRole('alert').textContent).toBe(STOPPED.stopped_text);
     const buttons = screen.getAllByRole('button');
-    expect(buttons.map((b) => b.textContent)).toEqual([T.quit]);
+    expect(buttons.map((b) => b.textContent)).toEqual(['Help', T.quit]);
     vi.mocked(quit).mockResolvedValue(null);
     await click(T.quit);
     expect(quit).toHaveBeenCalledTimes(1);
@@ -586,7 +586,7 @@ describe('Wizard (1b)', () => {
     expect(screen.getByText(T.restore_working)).toBeTruthy();
     expect(screen.getByText(T.restore_cancel_hint)).toBeTruthy();
     expect(document.querySelector('input')).toBeNull();
-    expect(screen.getAllByRole('button').map((b) => b.textContent)).toEqual([T.quit]);
+    expect(screen.getAllByRole('button').map((b) => b.textContent)).toEqual(['Help', T.quit]);
   });
 
   it('a restore that ends without a log goes back to the step with a fixed text for its class', async () => {

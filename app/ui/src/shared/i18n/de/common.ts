@@ -3,6 +3,8 @@ import type { Dict } from '../index';
 export const common: Dict['common'] = {
   cancel: 'Abbrechen',
   close: 'Schließen',
+  help: 'Hilfe',
+  help_for: (name) => `Hilfe: ${name}`,
   save: 'Speichern',
   retry: 'Erneut versuchen',
   language: 'Sprache',

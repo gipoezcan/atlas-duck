@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react';
+import { HelpLink } from '../shared/HelpLink';
 import { useText } from '../shared/i18n/context';
 import type { Dict } from '../shared/i18n';
 import { en } from '../shared/i18n/dict';
@@ -131,6 +132,7 @@ export function ExportBackup({ job }: Props) {
   return (
     <section className="audit-jobs" aria-label={t.audit.jobs}>
       <h2>{t.audit.jobs}</h2>
+      <HelpLink section="audit/jobs" label={t.audit.jobs} />
       <h3>{t.audit.export}</h3>
       <p>{t.audit.export_intro}</p>
       <div className="audit-fields">

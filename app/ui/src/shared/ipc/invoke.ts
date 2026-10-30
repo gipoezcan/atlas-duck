@@ -143,6 +143,11 @@ export function openWindow(window: OpenableWindow): Promise<null | undefined> {
   return call('open_window', { window }, isNothing);
 }
 
+/** `help_open` (M16): the Help window at a page of the user guide, in the UI language. */
+export function helpOpen(page: string, anchor?: string): Promise<null | undefined> {
+  return call('help_open', anchor === undefined ? { page } : { page, anchor }, isNothing);
+}
+
 export function quit(): Promise<null | undefined> {
   return call('quit', {}, isNothing);
 }

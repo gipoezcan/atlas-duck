@@ -4,6 +4,7 @@ import { LANG_PREFS, type LangPref } from '../../shared/i18n';
 import { useText } from '../../shared/i18n/context';
 import { csrf, loadSession } from '../../shared/ipc/transport-http';
 import { nav, useSession } from './RequireSession';
+import { ServerHelpIndex, ServerHelpLink, type ServerPath, serverTarget } from './ServerHelp';
 import { saveLangPref, useServerLangPref } from './ServerLangRoot';
 
 /** `POST /api/logout` (cookie + CSRF + Origin), then the login page. */
@@ -73,6 +74,22 @@ export function ServerHeader() {
       if (mine === latest.current) setPending(null);
     });
   };
+  // The page's name as the header's own link calls it; the "?" carries it ("Help: Credentials").
+  const pageName: Record<ServerPath, string> = {
+    '/': h.approvals,
+    '/login': h.approvals,
+    '/approvals': h.approvals,
+    '/credentials': h.credentials,
+    '/api-keys': h.api_keys,
+    '/admin': h.admin,
+    '/oauth/consent': h.connected_apps,
+    '/connected-apps': h.connected_apps,
+    '/audit': h.my_audit,
+    '/auditor': h.auditor,
+  };
+  // `/credentials/` is the same page as `/credentials`.
+  const path = window.location.pathname.replace(/(.)\/+$/, '$1');
+  const here = serverTarget(path) === undefined ? undefined : (path as ServerPath);
   const admin = session?.roles.includes('admin') ?? false;
   const auditor = session?.roles.includes('auditor') ?? false;
   return (
@@ -103,6 +120,8 @@ export function ServerHeader() {
             </select>
           </label>
         )}
+        <ServerHelpIndex />
+        {here === undefined ? null : <ServerHelpLink path={here} label={pageName[here]} />}
         <span className="server-user">{session?.user ?? ''}</span>
         <button
           type="button"

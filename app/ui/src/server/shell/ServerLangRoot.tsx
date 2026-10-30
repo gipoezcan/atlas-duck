@@ -1,6 +1,7 @@
 import { createContext, type ReactNode, useContext, useMemo, useState } from 'react';
 
 import { type LangPref, resolveLang } from '../../shared/i18n';
+import { HelpMode } from '../../shared/HelpLink';
 import { LangProvider } from '../../shared/i18n/context';
 import { csrf } from '../../shared/ipc/transport-http';
 
@@ -31,7 +32,9 @@ export function ServerLangRoot({ children }: { children: ReactNode }) {
   const value = useMemo(() => ({ pref, setPref }), [pref]);
   return (
     <PrefContext.Provider value={value}>
-      <LangProvider lang={resolveLang(pref, browserLocale())}>{children}</LangProvider>
+      <HelpMode.Provider value="server">
+        <LangProvider lang={resolveLang(pref, browserLocale())}>{children}</LangProvider>
+      </HelpMode.Provider>
     </PrefContext.Provider>
   );
 }

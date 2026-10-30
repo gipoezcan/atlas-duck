@@ -6,6 +6,7 @@ export const server: Dict['server'] = {
     username: 'Benutzername',
     password: 'Passwort',
     submit: 'Anmelden',
+    help: 'Hilfe',
     invalid_credentials: 'Benutzername oder Passwort ist falsch.',
     rate_limited: (minutes) =>
       `Zu viele Versuche. Versuchen Sie es in ${minutes} ${minutes === 1 ? 'Minute' : 'Minuten'} erneut.`,
@@ -25,6 +26,7 @@ export const server: Dict['server'] = {
     auditor: 'Auditor',
     sign_out: 'Abmelden',
     sign_out_failed: 'Das Abmelden ist fehlgeschlagen. Versuchen Sie es erneut.',
+    help: 'Hilfe',
   },
   api_keys: {
     title: 'API-Schlüssel',

@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Settings - Atlas Duck Help</title>
+<link rel="stylesheet" href="assets/help.css">
+<script src="assets/search-index.js" defer></script>
+<script src="assets/help.js" defer></script>
+</head>
+<body>
+<header class="bar">
+<a class="brand" href="/docs/en/">Atlas Duck Help</a>
+<div class="search" hidden>
+<label class="visually-hidden" for="help-search">Search help</label>
+<input id="help-search" type="search" placeholder="Search help" autocomplete="off" data-empty="No results">
+<ul id="help-results" hidden></ul>
+</div>
+<a class="lang-switch" lang="de" hreflang="de" href="/docs/de/settings">Deutsch</a>
+</header>
+<div class="layout">
+<nav class="toc" aria-label="Contents">
+<ul>
+<li><a href="/docs/en/">Overview</a></li>
+<li><a href="/docs/en/getting-started-server">Getting started (server)</a></li>
+<li><a href="/docs/en/instances-and-tokens">Instances and tokens</a></li>
+<li><a href="/docs/en/agents-server">Agents (server)</a></li>
+<li><a href="/docs/en/approvals">Approvals</a></li>
+<li><a href="/docs/en/scripts">Scripts</a></li>
+<li><a href="/docs/en/audit">Audit log</a></li>
+<li><a href="/docs/en/settings" aria-current="page">Settings</a>
+<ul>
+<li><a href="#language">Language</a></li>
+<li><a href="#notifications">Notifications and attention</a></li>
+</ul>
+</li>
+<li><a href="/docs/en/admin">Administration</a></li>
+<li><a href="/docs/en/auditor">Auditor</a></li>
+<li><a href="/docs/en/troubleshooting">Troubleshooting</a></li>
+<li><a href="/docs/en/error-reference">Error reference</a></li>
+</ul>
+</nav>
+<main>
+<h1>Settings</h1>
+<p>In server mode there is no settings page. The choices that are yours, the language and notifications, sit in the header and on the Approvals page. Instances, keys and the rest of the deployment belong to the admins (<a href="/docs/en/admin">Administration</a>).</p>
+<h2 id="language">Language</h2>
+<p>atlas-duck is available in English and German. The language applies to the windows and pages, notifications and native dialogs, and to this guide. Text that agents read, audit records, logs, the command line and the operations documentation stay in English.</p>
+<p>The choices are:</p>
+<ul>
+<li><strong>Automatic</strong>: German if the language of your operating system (desktop) or browser (server) is German, otherwise English.</li>
+<li><strong>Deutsch</strong></li>
+<li><strong>English</strong></li>
+</ul>
+<p>Use the &quot;Language&quot; menu in the header of any page. The page switches without reloading. The choice is saved for you, so it applies on every browser you sign in from, and it is not audited. If saving fails, atlas-duck says &quot;Saving the language failed. Try again.&quot;</p>
+<p>Every page of this guide has a link to the same page in the other language, so you can switch here as well.</p>
+<h2 id="notifications">Notifications and attention</h2>
+<p>On the Approvals page, choose &quot;Enable notifications&quot; to let your browser alert you when a request needs your decision. Your browser asks for permission. The page then says &quot;Notifications are on.&quot;, or &quot;Notifications are blocked in this browser.&quot; if you refused. The notification has the fixed title &quot;atlas-duck: approval needed&quot; and shows only the operation id, never text written by an agent.</p>
+</main>
+</div>
+</body>
+</html>

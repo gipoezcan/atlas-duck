@@ -18,7 +18,7 @@ import { readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
-/** The seven window labels (C.10 + Δ1, PD-72); one capability file each. */
+/** The eight window labels (C.10 + Δ1, PD-72, M16 PD-328); one capability file each. */
 export const LABELS = [
   "approvals",
   "settings",
@@ -27,6 +27,7 @@ export const LABELS = [
   "onboarding",
   "credential",
   "setup",
+  "help",
 ];
 
 // C.10 + Δ1 (master plan, M6 plan "Contract deltas"): the windows each command may exist in.
@@ -49,6 +50,7 @@ export const WINDOW_COMMANDS = {
     "quit",
     "app_status",
     "ui_lang_get",
+    "help_open",
   ],
   settings: [
     "settings_get",
@@ -86,6 +88,7 @@ export const WINDOW_COMMANDS = {
     "forget_install",
     // M15 T3 (PD-294): the UI language, read by every React window (not the credential page, PD-71).
     "ui_lang_get",
+    "help_open",
   ],
   // M6: `verify_now` (P8); M10 T12 (Δ-M10-3, L201): the queries, the payload view, the incident
   // acknowledgement and the export/backup triggers (`backup_trigger` also in settings, T13).
@@ -100,9 +103,10 @@ export const WINDOW_COMMANDS = {
     "export_cancel",
     "backup_trigger",
     "ui_lang_get",
+    "help_open",
   ],
-  running_scripts: ["running_list", "running_kill", "ui_lang_get"],
-  onboarding: ["onboarding_text", "ui_lang_get"],
+  running_scripts: ["running_list", "running_kill", "ui_lang_get", "help_open"],
+  onboarding: ["onboarding_text", "ui_lang_get", "help_open"],
   credential: [
     "submit_secret",
     "credential_context",
@@ -135,7 +139,12 @@ export const WINDOW_COMMANDS = {
     "onboarding_text",
     "quit",
     "ui_lang_get",
+    "help_open",
   ],
+  // M16 PD-328: the Help window runs static pages and holds no app permission at all; only
+  // `help_open` (granted to the other windows but `credential`, which keeps its secrets-only
+  // surface) opens it.
+  help: [],
 };
 
 /**
@@ -322,7 +331,7 @@ export function checkSurface({ commands, handlerLists, caps, securityCapabilitie
     for (const h of handlers) if (!commandSet.has(h)) errors.push(`generate_handler! registers ${h}, which COMMANDS does not list`);
   }
 
-  // tauri.conf.json lists the seven capabilities explicitly (an empty list means "every file").
+  // tauri.conf.json lists the eight capabilities explicitly (an empty list means "every file").
   const listed = Array.isArray(securityCapabilities) ? securityCapabilities : null;
   if (!listed || [...listed].sort().join() !== [...LABELS].sort().join() || listed.length !== LABELS.length) {
     errors.push(`tauri.conf.json: app.security.capabilities must be exactly ${JSON.stringify(LABELS)}`);

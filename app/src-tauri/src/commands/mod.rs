@@ -18,6 +18,7 @@ pub mod capture;
 pub mod credential;
 pub mod dto;
 mod errors;
+pub mod help;
 mod names;
 pub mod onboarding;
 pub mod running;
@@ -74,6 +75,7 @@ pub fn register<R: Runtime>(builder: Builder<R>) -> Builder<R> {
         credential::retry_keychain,
         credential::save_recovery_note,
         credential::submit_secret,
+        help::help_open,
         onboarding::onboarding_text,
         running::running_kill,
         running::running_list,

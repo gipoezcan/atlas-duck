@@ -24,6 +24,8 @@ WORKDIR /src/app/ui
 COPY app/ui/package.json app/ui/package-lock.json app/ui/.npmrc ./
 RUN npm ci --ignore-scripts
 COPY app/ui/ ./
+# M16: the Help links' page map, imported by the UI from outside app/ui.
+COPY docs/user-guide/ui-links.json /src/docs/user-guide/ui-links.json
 RUN npm run build:server
 
 FROM rust:1.95.0-bookworm AS build

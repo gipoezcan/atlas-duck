@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Einstellungen - Atlas Duck Hilfe</title>
+<link rel="stylesheet" href="assets/help.css">
+<script src="assets/search-index.js" defer></script>
+<script src="assets/help.js" defer></script>
+</head>
+<body>
+<header class="bar">
+<a class="brand" href="/docs/de/">Atlas Duck Hilfe</a>
+<div class="search" hidden>
+<label class="visually-hidden" for="help-search">Hilfe durchsuchen</label>
+<input id="help-search" type="search" placeholder="Hilfe durchsuchen" autocomplete="off" data-empty="Keine Treffer">
+<ul id="help-results" hidden></ul>
+</div>
+<a class="lang-switch" lang="en" hreflang="en" href="/docs/en/settings">English</a>
+</header>
+<div class="layout">
+<nav class="toc" aria-label="Inhalt">
+<ul>
+<li><a href="/docs/de/">Übersicht</a></li>
+<li><a href="/docs/de/getting-started-server">Erste Schritte (Server)</a></li>
+<li><a href="/docs/de/instances-and-tokens">Instanzen und Tokens</a></li>
+<li><a href="/docs/de/agents-server">Agents (Server)</a></li>
+<li><a href="/docs/de/approvals">Freigaben</a></li>
+<li><a href="/docs/de/scripts">Skripte</a></li>
+<li><a href="/docs/de/audit">Audit-Protokoll</a></li>
+<li><a href="/docs/de/settings" aria-current="page">Einstellungen</a>
+<ul>
+<li><a href="#language">Sprache</a></li>
+<li><a href="#notifications">Benachrichtigungen und Aufmerksamkeit</a></li>
+</ul>
+</li>
+<li><a href="/docs/de/admin">Administration</a></li>
+<li><a href="/docs/de/auditor">Auditor</a></li>
+<li><a href="/docs/de/troubleshooting">Fehlerbehebung</a></li>
+<li><a href="/docs/de/error-reference">Fehlerreferenz</a></li>
+</ul>
+</nav>
+<main>
+<h1>Einstellungen</h1>
+<p>Im Servermodus gibt es keine Einstellungsseite. Was Sie selbst einstellen können, Sprache und Benachrichtigungen, finden Sie in der Kopfzeile und auf der Seite Freigaben. Instanzen, Schlüssel und der Rest der Installation gehören zu den Aufgaben der Administratoren (<a href="/docs/de/admin">Administration</a>).</p>
+<h2 id="language">Sprache</h2>
+<p>atlas-duck gibt es auf Englisch und auf Deutsch. Die Sprache gilt für die Fenster und Seiten, die Benachrichtigungen und die nativen Dialoge sowie für dieses Handbuch. Texte, die Agents lesen, Audit-Datensätze, Protokolle, die Befehlszeile und die Betriebsdokumentation bleiben Englisch.</p>
+<p>Zur Wahl stehen:</p>
+<ul>
+<li><strong>Automatisch</strong>: Deutsch, wenn die Sprache Ihres Betriebssystems (Desktop) oder Ihres Browsers (Server) Deutsch ist, sonst Englisch.</li>
+<li><strong>Deutsch</strong></li>
+<li><strong>English</strong></li>
+</ul>
+<p>Verwenden Sie das Menü &quot;Sprache&quot; in der Kopfzeile einer beliebigen Seite. Die Seite wechselt ohne Neuladen. Die Wahl wird für Sie gespeichert, gilt also in jedem Browser, in dem Sie sich anmelden, und wird nicht protokolliert. Schlägt das Speichern fehl, meldet atlas-duck &quot;Die Sprache konnte nicht gespeichert werden. Versuchen Sie es erneut.&quot;</p>
+<p>Jede Seite dieses Handbuchs hat einen Link auf dieselbe Seite in der anderen Sprache, sodass Sie auch hier wechseln können.</p>
+<h2 id="notifications">Benachrichtigungen und Aufmerksamkeit</h2>
+<p>Wählen Sie auf der Seite Freigaben &quot;Benachrichtigungen aktivieren&quot;, damit Ihr Browser Sie meldet, wenn eine Anfrage Ihre Entscheidung braucht. Ihr Browser fragt nach der Erlaubnis. Die Seite meldet dann &quot;Benachrichtigungen sind aktiv.&quot; oder, wenn Sie abgelehnt haben, &quot;Benachrichtigungen sind in diesem Browser blockiert.&quot; Die Benachrichtigung hat den festen Titel &quot;atlas-duck: Freigabe erforderlich&quot; und zeigt nur die Vorgangs-ID, nie einen von einem Agent geschriebenen Text.</p>
+</main>
+</div>
+</body>
+</html>

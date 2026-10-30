@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fehlerbehebung - Atlas Duck Hilfe</title>
+<link rel="stylesheet" href="assets/help.css">
+<script src="assets/search-index.js" defer></script>
+<script src="assets/help.js" defer></script>
+</head>
+<body>
+<header class="bar">
+<a class="brand" href="index.html">Atlas Duck Hilfe</a>
+<div class="search" hidden>
+<label class="visually-hidden" for="help-search">Hilfe durchsuchen</label>
+<input id="help-search" type="search" placeholder="Hilfe durchsuchen" autocomplete="off" data-empty="Keine Treffer">
+<ul id="help-results" hidden></ul>
+</div>
+<a class="lang-switch" lang="en" hreflang="en" href="../en/troubleshooting.html">English</a>
+</header>
+<div class="layout">
+<nav class="toc" aria-label="Inhalt">
+<ul>
+<li><a href="index.html">Übersicht</a></li>
+<li><a href="getting-started-desktop.html">Erste Schritte (Desktop)</a></li>
+<li><a href="instances-and-tokens.html">Instanzen und Tokens</a></li>
+<li><a href="agents-desktop.html">Agents (Desktop)</a></li>
+<li><a href="approvals.html">Freigaben</a></li>
+<li><a href="scripts.html">Skripte</a></li>
+<li><a href="audit.html">Audit-Protokoll</a></li>
+<li><a href="settings.html">Einstellungen</a></li>
+<li><a href="troubleshooting.html" aria-current="page">Fehlerbehebung</a>
+<ul>
+<li><a href="#cannot-connect">Eine Instanz ist nicht erreichbar</a></li>
+<li><a href="#token-rejected">Ein Token wird zurückgewiesen</a></li>
+<li><a href="#nothing-happens">Eine Anfrage bleibt offen</a></li>
+<li><a href="#locked">Die App ist gesperrt</a></li>
+<li><a href="#audit-storage">Der Speicher für das Audit-Protokoll ist knapp</a></li>
+</ul>
+</li>
+<li><a href="error-reference.html">Fehlerreferenz</a></li>
+</ul>
+</nav>
+<main>
+<h1>Fehlerbehebung</h1>
+<h2 id="cannot-connect">Eine Instanz ist nicht erreichbar</h2>
+<p>Anzeichen: Agents erhalten <code>unreachable</code>, <code>upstream_network</code> oder <code>upstream_unavailable</code>; eine Token-Prüfung meldet, dass die Instanz nicht erreichbar ist (<code>pat/instance_unreachable</code> auf dem Server).</p>
+<p>Unterscheiden Sie zuerst zwei Fälle. Jeder Fehler <code>unreachable</code> betrifft die App, nicht die Instanz: Die Befehlszeile erreicht die App nicht. Die Gründe stehen unter <a href="error-reference.html#err-unreachable"><code>unreachable</code></a>. Nur <code>upstream_network</code>, <code>upstream_unavailable</code> und <code>pat/instance_unreachable</code> weisen auf die Instanz. Dann liegt es an der Instanz:</p>
+<ol>
+<li>Öffnen Sie die Adresse der Instanz in einem Browser auf demselben Computer. Lädt sie nicht, liegt die Ursache beim Netzwerk, beim VPN oder bei der Instanz selbst. atlas-duck kann nicht mehr als Ihr Browser.</li>
+<li>Prüfen Sie den Status der Instanz. Auf dem Desktop listen die Einstellungen ihn unter „Instanzen“ auf. Die Status „unbestätigt“, „braucht Token“ und „unsicheres Schema (http)“ sagen, was zu tun ist, siehe <a href="instances-and-tokens.html">Instanzen und Tokens</a>.</li>
+<li>Nutzt die Instanz eine interne Zertifizierungsstelle, fügen Sie sie als eigene CA der Instanz hinzu oder bitten Sie auf dem Server den Administrator, das CA-Bundle der Organisation zu verwenden.</li>
+<li>Brauchen Sie einen Proxy, legen Sie ihn für die Instanz fest. Die Desktop-App wertet keine Proxy-Auto-Config-Skripte aus: Geben Sie den Proxy als Host und Port an.</li>
+<li><code>upstream_unavailable</code> mit <code>identity_header_missing</code> oder <code>identity_header_mismatch</code> bedeutet, dass ein Proxy vor Jira den Header <code>X-AUSERNAME</code> entfernt oder verändert. Fragen Sie die Jira-Administration.</li>
+</ol>
+<p>Eine Anfrage, die mit <code>upstream_network</code> scheiterte, bevor sie gesendet wurde, lässt sich einfach erneut senden.</p>
+<h2 id="token-rejected">Ein Token wird zurückgewiesen</h2>
+<p>Anzeichen: „Die Instanz hat das Token zurückgewiesen.“, Status „braucht Token“, Agents erhalten <code>needs_token</code>.</p>
+<ul>
+<li>Das Token ist möglicherweise falsch eingegeben oder beim Kopieren abgeschnitten worden. Fügen Sie es erneut ein.</li>
+<li>Das Token ist möglicherweise in Jira oder Confluence abgelaufen oder widerrufen worden. Erstellen Sie dort ein neues persönliches Zugriffstoken und ersetzen Sie das gespeicherte.</li>
+<li>Das Token muss zu Ihrem eigenen Konto gehören. Ersetzen Sie es durch das Token eines anderen Atlassian-Benutzers, weist atlas-duck es zurück: „Dieses Token gehört einem anderen Atlassian-Benutzer. Entfernen Sie zuerst das gespeicherte Token.“</li>
+<li>Auf dem Server zeigt die Seite „Zugangsdaten“ „Token gespeichert, nicht verwendbar“, wenn die Instanz das gespeicherte Token zurückweist.</li>
+</ul>
+<p>Siehe <a href="instances-and-tokens.html">Instanzen und Tokens</a>. Agents dürfen <code>needs_token</code> nicht in einer Schleife wiederholen: Es heilt nicht von selbst, siehe <a href="error-reference.html#err-needs-token"><code>needs_token</code></a>.</p>
+<h2 id="nothing-happens">Eine Anfrage bleibt offen</h2>
+<p>Eine Anfrage wartet, bis Sie entscheiden. Sie hängt nicht, sie wartet auf Sie. Prüfen Sie:</p>
+<ol>
+<li>Öffnen Sie das Fenster „Freigaben“ und sehen Sie unter „Ausstehende Freigaben“ nach. Die Anfrage wartet vielleicht dort, womöglich unter anderen.</li>
+<li>Ist nichts aufgelistet, ist die Anfrage möglicherweise abgelaufen, abgelehnt oder storniert worden. Sehen Sie unter „Zuletzt entschieden (24 Std.)“ nach.</li>
+<li>Sieht der Agent Ihre Entscheidung nicht, hat er möglicherweise aufgehört zu warten. Ein Agent, der mit einem kurzen <code>--timeout</code> eingereicht hat, erhält <code>pending</code> und muss das Ergebnis mit <code>await &lt;id&gt;</code> holen. Er darf die Anfrage nie erneut einreichen.</li>
+<li>Hat der Agent die ID verloren, findet er die Anfrage mit <code>requests list</code>.</li>
+<li>Nach einem Neustart der App steht eine zuvor ausstehende Anfrage nicht mehr aus: Sie wurde <code>abandoned</code>, siehe <a href="error-reference.html#err-abandoned"><code>abandoned</code></a>.</li>
+</ol>
+<p>Ein Schreibzugriff, den Sie freigegeben haben, kann eine Weile „wird ausgeführt“ zeigen. Endet er als <code>outcome_unknown</code>, prüfen Sie das Ziel selbst, siehe <a href="error-reference.html#err-upstream-unknown-outcome"><code>upstream_unknown_outcome</code></a>.</p>
+<h2 id="locked">Die App ist gesperrt</h2>
+<p>Anzeichen: Agents erhalten <code>locked</code> (Exit 9); das Tray zeigt eine Wartemeldung oder eine Sperrmeldung.</p>
+<p>Dies betrifft die Desktop-App. Die App ist gesperrt, wenn sie den Schlüssel zu ihrem Audit-Protokoll nicht bekommt. <code>details.reason</code> sagt Ihnen, um welchen Fall es sich handelt:</p>
+<ul>
+<li><strong><code>keychain_unavailable</code></strong>: Der Schlüsselbund des Systems ist noch nicht bereit, was direkt nach der Anmeldung vorkommen kann. atlas-duck versucht es ein bis zwei Minuten lang erneut und bietet dann einen manuellen neuen Versuch an. Entsperren oder starten Sie Ihren Schlüsselbund; unter Linux braucht das einen Secret-Service-Anbieter wie GNOME Keyring oder KWallet.</li>
+<li><strong><code>keychain_lost</code></strong>: Die Schlüsselbund-Einträge sind weg, zum Beispiel nach einem Passwort-Reset, dem Löschen des Profils oder einer Neuinstallation. Das Protokoll ist unversehrt. Das Fenster für die Zugangsdaten bietet an, das Protokoll wiederherzustellen: Geben Sie Ihre Wiederherstellungs-Passphrase ein. Danach braucht jede Instanz wieder ihr Token, und es wird ein Integritätsvorfall festgehalten, den Sie zur Kenntnis nehmen, siehe <a href="audit.html#integrity-incident">Integritätsvorfälle</a>. Ohne die Passphrase bleibt nur, das alte Protokoll zu archivieren und neu zu beginnen; das alte Protokoll wird dann beiseitegelegt, und Sie müssen es für seine Aufbewahrungsfrist behalten.</li>
+<li><strong><code>keyring_not_local</code></strong>: Die Dateien des Schlüsselbunds liegen auf einem Netzlaufwerk. atlas-duck verwendet einen solchen Schlüsselbund nicht, weil zwei Computer ihre Einträge gegenseitig überschreiben würden. Verwenden Sie ein lokales Home-Verzeichnis.</li>
+</ul>
+<p>Löschen Sie nie die Schlüsselbund-Einträge oder das Datenverzeichnis, um die Sperre loszuwerden: Damit verlieren Sie das Audit-Protokoll. Siehe <a href="error-reference.html#err-locked"><code>locked</code></a>.</p>
+<h2 id="audit-storage">Der Speicher für das Audit-Protokoll ist knapp</h2>
+<p>Anzeichen: Agents erhalten <code>audit_storage_low</code>; in der App und im Tray erscheint eine Warnung; Entscheidungen scheitern mit einem Audit-Fehler.</p>
+<p>Dies betrifft die Desktop-App; auf dem Server überwacht der Betreiber den Speicher. atlas-duck handelt nur, wenn es das festhalten kann. Fällt der freie Platz auf dem Laufwerk mit dem Audit-Protokoll unter eine Schwelle (standardmäßig 2 GiB), weist es neue Anfragen zurück. Systemeinträge und die Bereinigung laufen weiter.</p>
+<ol>
+<li>Schaffen Sie auf diesem Laufwerk Platz. Leeren Sie den Papierkorb, entfernen Sie alte Downloads, Backups und Exporte, die Sie nicht mehr brauchen.</li>
+<li>Prüfen Sie „Aufbewahrung und Legal Hold“ in den Einstellungen. Ist ein Legal Hold aktiv, wird nichts bereinigt. Eine lange Aufbewahrungsfrist behält mehr Daten.</li>
+<li>Versuchen Sie es erneut. Zurückgewiesene Anfragen wurden nicht eingereiht, der Agent muss sie also erneut einreichen.</li>
+</ol>
+<p>Siehe <a href="error-reference.html#err-audit-storage-low"><code>audit_storage_low</code></a> und <a href="audit.html#retention">Aufbewahrung und Legal Hold</a>.</p>
+</main>
+</div>
+</body>
+</html>
